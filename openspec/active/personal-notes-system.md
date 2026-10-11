@@ -127,13 +127,13 @@
   - 依赖：M3.1
 
 ### 里程碑 M4：Android GTD
-- [ ] M4.1 org 解析器（TODO/agenda/tag/优先级）
+- [x] M4.1 org 解析器（TODO/agenda/tag/优先级）
   - 验收：给定含 TODO/优先级/tag 的 org 样例，解析出对应结构化结果，单测覆盖
   - 依赖：无（纯解析，可独立）
-- [ ] M4.2 agenda/TODO 视图
+- [x] M4.2 agenda/TODO 视图
   - 验收：展示 agenda 列表、TODO 状态、优先级、tag 过滤
   - 依赖：M4.1
-- [ ] M4.3 读写 org 文件 + WebDAV 同步
+- [x] M4.3 读写 org 文件 + WebDAV 同步
   - 验收：修改 TODO 状态后写回 org 文件并经 WebDAV 同步到服务端
   - 依赖：M1.1, M4.1
 

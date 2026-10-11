@@ -6,6 +6,7 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import com.notes.app.gtd.GtdActivity
 import com.notes.app.importer.BookImporter
 import com.notes.app.reader.EpubReaderActivity
 import com.notes.app.reader.PdfReaderActivity
@@ -54,6 +55,9 @@ class MainActivity : AppCompatActivity() {
         }
         findViewById<Button>(R.id.importButton).setOnClickListener {
             pickImport.launch(arrayOf("*/*"))
+        }
+        findViewById<Button>(R.id.openGtdButton).setOnClickListener {
+            startActivity(GtdActivity.intent(this))
         }
     }
 

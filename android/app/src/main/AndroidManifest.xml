@@ -30,6 +30,12 @@
             android:name=".reader.PdfReaderActivity"
             android:exported="false"
             android:label="@string/title_pdf_reader" />
+
+        <!-- GTD agenda / TODO 视图（M4.2）：仅应用内启动，不对外导出 -->
+        <activity
+            android:name=".gtd.GtdActivity"
+            android:exported="false"
+            android:label="@string/title_gtd" />
     </application>
 
 </manifest>

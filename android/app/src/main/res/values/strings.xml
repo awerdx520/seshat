@@ -41,4 +41,22 @@
     <string name="import_needs_conversion_format">MOBI 需先转换为 EPUB 才能阅读：%1$s</string>
     <string name="import_failed_format">导入失败：%1$s</string>
     <string name="import_success_format">已导入：%1$s</string>
+
+    <!-- GTD agenda / TODO 视图（M4.2） -->
+    <string name="main_open_gtd">打开 GTD</string>
+    <string name="title_gtd">GTD</string>
+    <string name="gtd_filter_all">全部</string>
+    <string name="gtd_empty">无匹配条目</string>
+    <string name="gtd_load_failed">加载示例 org 失败：%1$s</string>
+    <string name="gtd_priority_format">[#%1$s]</string>
+    <string name="gtd_deadline_format">DEADLINE: %1$s</string>
+    <string name="gtd_no_title">（无标题）</string>
+
+    <!-- GTD 读写 org + WebDAV 同步（M4.3） -->
+    <string name="gtd_sync">同步</string>
+    <string name="gtd_syncing">正在同步…</string>
+    <string name="gtd_sync_success">同步成功（HTTP %1$d）</string>
+    <string name="gtd_sync_failed">同步失败：%1$s</string>
+    <string name="gtd_sync_not_configured">未配置同步服务器（server_url / auth_token）</string>
+    <string name="gtd_toggle_failed">切换 TODO 失败：%1$s</string>
 </resources>

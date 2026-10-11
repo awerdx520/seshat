@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical">
+
+    <!-- 操作栏：把本地 org 文件同步到 WebDAV 服务端（M4.3） -->
+    <LinearLayout
+        android:id="@+id/gtdActionBar"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="end"
+        android:orientation="horizontal"
+        android:paddingStart="8dp"
+        android:paddingTop="8dp"
+        android:paddingEnd="8dp">
+
+        <Button
+            android:id="@+id/gtdSyncButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/gtd_sync" />
+    </LinearLayout>
+
+    <!-- 顶部过滤栏：TODO 状态 / 优先级 / 标签，均为 Spinner，首项「全部」 -->
+    <LinearLayout
+        android:id="@+id/gtdFilterBar"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:padding="8dp">
+
+        <Spinner
+            android:id="@+id/filterTodoState"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1" />
+
+        <Spinner
+            android:id="@+id/filterPriority"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1" />
+
+        <Spinner
+            android:id="@+id/filterTag"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1" />
+    </LinearLayout>
+
+    <!-- 空态提示：无匹配条目时显示 -->
+    <TextView
+        android:id="@+id/gtdEmptyText"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center"
+        android:padding="16dp"
+        android:text="@string/gtd_empty"
+        android:visibility="gone" />
+
+    <!-- 条目列表 -->
+    <androidx.recyclerview.widget.RecyclerView
+        android:id="@+id/gtdList"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:clipToPadding="false"
+        android:paddingBottom="8dp" />
+
+</LinearLayout>

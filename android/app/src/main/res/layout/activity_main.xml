@@ -38,4 +38,11 @@
         android:layout_marginTop="8dp"
         android:text="@string/main_import_file" />
 
+    <Button
+        android:id="@+id/openGtdButton"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:text="@string/main_open_gtd" />
+
 </LinearLayout>

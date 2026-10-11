@@ -1,0 +1,18 @@
+#+TITLE: 示例 GTD 文档
+#+FILETAGS: :notes:
+
+* 项目：Notes 应用
+** TODO [#A] 实现 GTD agenda 视图 :android:feature:
+   DEADLINE: <2026-10-20 Tue>
+   展示 org 条目的 TODO 列表，支持按状态 / 优先级 / 标签过滤。
+** DONE [#B] 实现 org 解析器 :android:core:
+   SCHEDULED: <2026-10-10 Sat>
+   解析标题层级、TODO 状态、优先级、标签与计划时间。
+** TODO 接入同步 :sync:
+   DEADLINE: <2026-10-31 Sat>
+* 个人
+** TODO [#C] 阅读《第一性原理》 :reading:
+   SCHEDULED: <2026-10-12 Mon>
+** DONE 购买牛奶 :@home:
+** NEXT 给妈妈打电话 :@phone:
+** WAITING 等待快递 :@home:
