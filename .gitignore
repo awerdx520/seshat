@@ -1,6 +1,7 @@
 # 敏感文件（密钥/令牌/密码，禁止进入 git）
 .env
 .env.*
+*.env
 *.key
 *.pem
 secrets/

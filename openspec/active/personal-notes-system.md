@@ -56,22 +56,22 @@
 ## 任务
 
 ### 里程碑 M0：项目脚手架与基础设施
-- [ ] M0.1 初始化仓库结构：Go 模块、目录约定（cmd/、internal/、docs/、openspec/）、.gitignore、README.md 骨架
+- [x] M0.1 初始化仓库结构：Go 模块、目录约定（cmd/、internal/、docs/、openspec/）、.gitignore、README.md 骨架
   - 验收：`go build ./...` 通过；目录结构符合约定
   - 依赖：无
-- [ ] M0.2 配置管理：密钥/令牌从环境变量注入，配置加载（config.yaml + 环境变量覆盖）
+- [x] M0.2 配置管理：密钥/令牌从环境变量注入，配置加载（config.yaml + 环境变量覆盖）
   - 验收：配置加载单测通过；敏感值不落盘、不进入 git；`docs/configuration.md` 列出全部配置项
   - 依赖：M0.1
-- [ ] M0.3 单用户认证：Bearer 令牌签发与校验中间件
+- [x] M0.3 单用户认证：Bearer 令牌签发与校验中间件
   - 验收：认证中间件单测（正确/错误/缺失令牌）；WebDAV Basic Auth 复用同一令牌
   - 依赖：M0.2
-- [ ] M0.4 存储层初始化：SQLite + SQLCipher，schema 迁移机制
+- [x] M0.4 存储层初始化：SQLite + SQLCipher，schema 迁移机制
   - 验收：数据库加密创建成功；迁移脚本可执行；`go test ./...` 通过
   - 依赖：M0.1
-- [ ] M0.5 日志与错误处理骨架
+- [x] M0.5 日志与错误处理骨架
   - 验收：结构化日志（含请求 ID）输出；错误统一包装
   - 依赖：M0.1
-- [ ] M0.6 密钥管理：SQLCipher 密钥、LUKS 密钥、API 令牌的生成、注入（systemd EnvironmentFile/密钥文件）、权限、备份、恢复演练
+- [x] M0.6 密钥管理：SQLCipher 密钥、LUKS 密钥、API 令牌的生成、注入（systemd EnvironmentFile/密钥文件）、权限、备份、恢复演练
   - 验收：密钥可安全注入且重启后服务自动可用；备份/恢复演练文档齐全；`docs/security.md` 密钥管理专节完成
   - 依赖：M0.2, M0.4
 
