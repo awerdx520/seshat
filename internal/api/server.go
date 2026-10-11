@@ -11,9 +11,11 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"notes/internal/auth"
+	"notes/internal/gitver"
 	"notes/internal/logging"
 	"notes/internal/storage"
 )
@@ -21,6 +23,10 @@ import (
 // Server 封装 REST 处理器的依赖。
 type Server struct {
 	db *storage.DB
+
+	// repo 提供版本查询能力（文件历史、某版本内容、共同祖先）；
+	// 为 nil 时不注册版本查询路由（仅挂载状态同步端点）。
+	repo *gitver.Repo
 }
 
 // progressResponse 是阅读进度的对外表示。
@@ -70,10 +76,54 @@ type errorPayload struct {
 	Message string `json:"message"`
 }
 
-// NewHandler 构造 REST 处理器：内部用 http.ServeMux 路由，整体套 Bearer 认证中间件。
-func NewHandler(db *storage.DB, a *auth.Authenticator) http.Handler {
-	s := &Server{db: db}
+// fileHistoryResponse 是文件历史查询的响应体：当前 HEAD 与含该文件的提交列表。
+type fileHistoryResponse struct {
+	Head    string                 `json:"head"`
+	History []historyEntryResponse `json:"history"`
+}
 
+// historyEntryResponse 是单个历史提交的对外表示。
+type historyEntryResponse struct {
+	Hash    string `json:"hash"`
+	Message string `json:"message"`
+	When    string `json:"when"`
+}
+
+// fileContentResponse 是某版本文件内容的响应体。
+type fileContentResponse struct {
+	Hash    string `json:"hash"`
+	Content string `json:"content"`
+}
+
+// mergeBaseResponse 是两个版本共同祖先的响应体。
+type mergeBaseResponse struct {
+	MergeBase string `json:"merge_base"`
+}
+
+// NewHandler 构造 REST 处理器：内部用 http.ServeMux 路由，整体套 Bearer 认证中间件。
+//
+// 该入口保持既有签名不变，仅挂载状态同步端点（进度/批注）；需要版本查询
+// 端点（文件历史、某版本内容、共同祖先）时改用 NewHandlerWithRepo。
+func NewHandler(db *storage.DB, a *auth.Authenticator) http.Handler {
+	return a.Middleware(newServer(db, nil).routes())
+}
+
+// NewHandlerWithRepo 在 NewHandler 的基础上追加版本查询端点，复用同一套 mux
+// 与 Bearer 认证中间件。
+//
+// repo 提供文件历史/某版本内容/共同祖先能力；repo 为 nil 时不注册版本查询
+// 路由（请求落到 ServeMux 默认 404）。
+func NewHandlerWithRepo(db *storage.DB, repo *gitver.Repo, a *auth.Authenticator) http.Handler {
+	return a.Middleware(newServer(db, repo).routes())
+}
+
+// newServer 组装处理器依赖。
+func newServer(db *storage.DB, repo *gitver.Repo) *Server {
+	return &Server{db: db, repo: repo}
+}
+
+// routes 构建全部 REST 路由；版本查询路由仅在 repo 非 nil 时注册。
+func (s *Server) routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/progress/{document_id}", s.handleGetProgress)
 	mux.HandleFunc("PUT /api/progress/{document_id}", s.handlePutProgress)
@@ -82,7 +132,16 @@ func NewHandler(db *storage.DB, a *auth.Authenticator) http.Handler {
 	mux.HandleFunc("PUT /api/annotations/{id}", s.handleUpdateAnnotation)
 	mux.HandleFunc("DELETE /api/annotations/{id}", s.handleDeleteAnnotation)
 
-	return a.Middleware(mux)
+	if s.repo != nil {
+		// {path...} 匹配含子目录的多段路径（如 sub/a.org），文件历史与某版本
+		// 内容共用此单一通配路由，由 hash 查询参数区分（见 handleVersion）。
+		// 不设 {path}/{hash} 两段式路由：它只匹配两段，子目录文件的
+		// GET /api/versions/sub/a.org/<hash>（3 段）会落到历史处理器，内容端点
+		// 不可达；改用查询参数传 hash 后，任意深度路径均可取到指定版本内容。
+		mux.HandleFunc("GET /api/merge-base", s.handleMergeBase)
+		mux.HandleFunc("GET /api/versions/{path...}", s.handleVersion)
+	}
+	return mux
 }
 
 // handleGetProgress 返回文档的最新阅读进度；携带 If-Modified-Since 且进度未更新时返回 304。
@@ -201,6 +260,103 @@ func (s *Server) handleDeleteAnnotation(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleVersion 是 GET /api/versions/{path...} 的统一处理器，由 hash 查询
+// 参数分派两种语义：
+//
+//   - 无 hash：返回文件历史 {"head":"<hash>","history":[{hash,message,when}]}；
+//   - 有 hash：返回该版本的内容 {"hash":"...","content":"..."}（文件不存在
+//     404、版本无法解析 400）。
+//
+// 之所以把「历史」与「某版本内容」合并为单一路由、以查询参数区分，是因为
+// 两段式 {path}/{hash} 只匹配两层路径，含子目录的文件（如 sub/a.org）无法
+// 拼出其内容端点；查询参数形式对任意深度路径均可用。
+func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
+	if hash := r.URL.Query().Get("hash"); hash != "" {
+		s.handleFileContent(w, r, hash)
+		return
+	}
+	s.handleFileHistory(w, r)
+}
+
+// handleFileHistory 返回文件的历史提交列表与当前 HEAD。
+//
+// 响应形如 {"head":"<hash>","history":[{"hash","message","when"}]}，历史按
+// 提交时间倒序（新到旧）。仓库尚无提交时为 {"head":"","history":[]}。
+func (s *Server) handleFileHistory(w http.ResponseWriter, r *http.Request) {
+	path := r.PathValue("path")
+
+	// HEAD 取最近一次提交的 hash（Log(1) 返回 "<hash> <message>"）。
+	head := ""
+	if entries, err := s.repo.Log(1); err != nil {
+		writeError(w, err)
+		return
+	} else if len(entries) > 0 {
+		head, _, _ = strings.Cut(entries[0], " ")
+	}
+
+	history, err := s.repo.FileHistory(path)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+
+	items := make([]historyEntryResponse, 0, len(history))
+	for _, entry := range history {
+		items = append(items, historyEntryResponse{
+			Hash:    entry.Hash,
+			Message: entry.Message,
+			When:    entry.When.Format(time.RFC3339),
+		})
+	}
+	writeJSON(w, http.StatusOK, fileHistoryResponse{Head: head, History: items})
+}
+
+// handleFileContent 返回文件在指定版本处的内容；hash 由 handleVersion 从
+// hash 查询参数解析后传入，路径取自 {path...}。
+//
+// 响应形如 {"hash":"...","content":"..."}；文件在该版本不存在时返回 404，
+// 版本无法解析时返回 400。
+func (s *Server) handleFileContent(w http.ResponseWriter, r *http.Request, hash string) {
+	path := r.PathValue("path")
+
+	content, err := s.repo.FileContent(path, hash)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, fileContentResponse{Hash: hash, Content: content})
+}
+
+// handleMergeBase 返回两个版本的共同祖先。
+//
+// 查询参数 a、b 为 git revision 字符串；响应形如 {"merge_base":"<hash>"}。
+// 缺少参数或版本无法解析时返回 400；两者无共同祖先时返回 409。
+func (s *Server) handleMergeBase(w http.ResponseWriter, r *http.Request) {
+	a := r.URL.Query().Get("a")
+	b := r.URL.Query().Get("b")
+	if a == "" || b == "" {
+		writeError(w, logging.NewAppError(logging.ErrInvalidArgument,
+			"查询参数 a 与 b 均为必填"))
+		return
+	}
+
+	base, err := s.repo.MergeBase(a, b)
+	if err != nil {
+		// gitver.MergeBase 对「无共同祖先」返回未包装的普通 error（其余情形
+		// 为带错误码的 AppError，如版本无法解析）。据此把无共同祖先映射为 409。
+		var appErr *logging.AppError
+		if errors.As(err, &appErr) {
+			writeError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusConflict, errorResponse{
+			Error: errorPayload{Code: string(logging.ErrConflict), Message: err.Error()},
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, mergeBaseResponse{MergeBase: base})
 }
 
 // parseAnnotationID 将路径参数中的批注 id 解析为正整数。
