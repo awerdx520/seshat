@@ -100,6 +100,52 @@ type mergeBaseResponse struct {
 	MergeBase string `json:"merge_base"`
 }
 
+// llmTaskCreateRequest 是创建 LLM 任务的请求体；route 缺省为 cloud。
+type llmTaskCreateRequest struct {
+	Kind    string `json:"kind"`
+	Payload string `json:"payload"`
+	Route   string `json:"route"`
+}
+
+// llmTaskCreatedResponse 是创建任务的响应体：新任务的 id 与初始状态。
+type llmTaskCreatedResponse struct {
+	ID     int64  `json:"id"`
+	Status string `json:"status"`
+}
+
+// llmTaskResponse 是任务的对外表示（节点轮询领取时返回完整内容）。
+type llmTaskResponse struct {
+	ID        int64  `json:"id"`
+	Kind      string `json:"kind"`
+	Payload   string `json:"payload"`
+	Route     string `json:"route"`
+	Status    string `json:"status"`
+	Result    string `json:"result"`
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+// llmTaskResultRequest 是节点回传任务结果的请求体。
+//
+// result 与 error 至少提供一个：error 非空时任务标记为 failed（error 作为失败原因），
+// 否则标记为 done（result 作为结果正文，允许为空字符串）。
+type llmTaskResultRequest struct {
+	Result string `json:"result"`
+	Error  string `json:"error"`
+}
+
+// nodeRegisterRequest 是本地处理节点注册的请求体。
+type nodeRegisterRequest struct {
+	NodeName string `json:"node_name"`
+}
+
+// nodeRegisterResponse 是节点注册的响应体。
+type nodeRegisterResponse struct {
+	NodeName     string `json:"node_name"`
+	Status       string `json:"status"`
+	RegisteredAt string `json:"registered_at"`
+}
+
 // NewHandler 构造 REST 处理器：内部用 http.ServeMux 路由，整体套 Bearer 认证中间件。
 //
 // 该入口保持既有签名不变，仅挂载状态同步端点（进度/批注）；需要版本查询
@@ -131,6 +177,13 @@ func (s *Server) routes() *http.ServeMux {
 	mux.HandleFunc("GET /api/annotations", s.handleListAnnotations)
 	mux.HandleFunc("PUT /api/annotations/{id}", s.handleUpdateAnnotation)
 	mux.HandleFunc("DELETE /api/annotations/{id}", s.handleDeleteAnnotation)
+
+	// LLM 任务队列端点（M6.2）：任务创建、本地处理节点轮询、结果回传与节点注册。
+	// 四者均复用同一 Bearer 认证中间件与统一 JSON 错误体。
+	mux.HandleFunc("POST /api/llm/tasks", s.handleCreateLLMTask)
+	mux.HandleFunc("GET /api/llm/tasks/poll", s.handlePollLLMTask)
+	mux.HandleFunc("POST /api/llm/tasks/{id}/result", s.handleLLMTaskResult)
+	mux.HandleFunc("POST /api/llm/nodes/register", s.handleRegisterNode)
 
 	if s.repo != nil {
 		// {path...} 匹配含子目录的多段路径（如 sub/a.org），文件历史与某版本
@@ -359,14 +412,148 @@ func (s *Server) handleMergeBase(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, mergeBaseResponse{MergeBase: base})
 }
 
+// handleCreateLLMTask 创建一条 LLM 任务并入队，成功返回 201 + {id,status:"pending"}。
+//
+// route 缺省为 cloud（默认走云端 API）；标记 route=local 的任务进入本地处理节点
+// 的轮询队列（见 handlePollLLMTask）。kind 与 payload 为必填：payload 是任务请求体
+// 的原始 JSON 文本，对队列透明，由任务类型与执行方（云端调用方或本地节点）解释。
+func (s *Server) handleCreateLLMTask(w http.ResponseWriter, r *http.Request) {
+	var req llmTaskCreateRequest
+	if err := decodeBody(r, &req); err != nil {
+		writeError(w, err)
+		return
+	}
+
+	id, err := s.db.CreateLLMTask(req.Kind, req.Payload, req.Route)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, llmTaskCreatedResponse{ID: id, Status: storage.LLMTaskPending})
+}
+
+// handlePollLLMTask 供本地处理节点轮询领取一条待办的本地任务，领取时置为 running。
+//
+// 有任务返回 200 + 完整任务内容（含 payload）；无待办任务返回 204（无响应体），
+// 节点据此休眠数秒后再试——「暂无任务」是轮询的正常结果，不是错误。
+func (s *Server) handlePollLLMTask(w http.ResponseWriter, r *http.Request) {
+	task, err := s.db.PollLLMTask()
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if task == nil {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	writeJSON(w, http.StatusOK, toLLMTaskResponse(task))
+}
+
+// handleLLMTaskResult 接收节点回传的任务结果：error 非空时标记 failed（error 为失败原因），
+// 否则标记 done（result 为结果正文）。成功返回 204（无响应体）。
+func (s *Server) handleLLMTaskResult(w http.ResponseWriter, r *http.Request) {
+	id, err := parsePositiveID(r.PathValue("id"), "任务")
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+
+	var req llmTaskResultRequest
+	if err := decodeBody(r, &req); err != nil {
+		writeError(w, err)
+		return
+	}
+
+	if strings.TrimSpace(req.Error) != "" {
+		if err := s.db.FailLLMTask(id, req.Error); err != nil {
+			writeError(w, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	if err := s.db.CompleteLLMTask(id, req.Result); err != nil {
+		writeError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleRegisterNode 记录本地处理节点的注册，成功返回 200 + 注册信息。
+//
+// MVP 实现：把节点最近一次注册时间写入 meta 表（键 llm_node:<name>）并记日志，
+// 不维护心跳与在线状态（是否在线由后续轮询行为推断）。node_name 为空返回 400。
+func (s *Server) handleRegisterNode(w http.ResponseWriter, r *http.Request) {
+	var req nodeRegisterRequest
+	if err := decodeBody(r, &req); err != nil {
+		writeError(w, err)
+		return
+	}
+	if strings.TrimSpace(req.NodeName) == "" {
+		writeError(w, logging.NewAppError(logging.ErrInvalidArgument, "node_name 不能为空"))
+		return
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	if err := s.recordNodeRegistration(req.NodeName, now); err != nil {
+		writeError(w, err)
+		return
+	}
+	slog.Info("api: 本地处理节点注册", "node_name", req.NodeName)
+	writeJSON(w, http.StatusOK, nodeRegisterResponse{
+		NodeName:     req.NodeName,
+		Status:       "registered",
+		RegisteredAt: now,
+	})
+}
+
+// recordNodeRegistration 把节点最近一次注册时间写入 meta 表（后写覆盖）。
+//
+// 此处经 storage.DB.SQL() 直接操作 meta 表：该表是简单键值映射，尚无专门领域方法，
+// 正是 SQL() 访问器声明的适用场景（见 storage 包注释）。
+func (s *Server) recordNodeRegistration(name, at string) error {
+	sqlDB := s.db.SQL()
+	if sqlDB == nil {
+		return nil
+	}
+	_, err := sqlDB.Exec(
+		`INSERT INTO meta(key, value) VALUES(?, ?)
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+		"llm_node:"+name, at)
+	if err != nil {
+		return logging.Wrap(err, logging.ErrInternal, "记录节点注册失败")
+	}
+	return nil
+}
+
+// toLLMTaskResponse 将存储层任务转换为对外表示。
+func toLLMTaskResponse(t *storage.LLMTask) llmTaskResponse {
+	return llmTaskResponse{
+		ID:        t.ID,
+		Kind:      t.Kind,
+		Payload:   t.Payload,
+		Route:     t.Route,
+		Status:    t.Status,
+		Result:    t.Result,
+		CreatedAt: t.CreatedAt,
+		UpdatedAt: t.UpdatedAt,
+	}
+}
+
 // parseAnnotationID 将路径参数中的批注 id 解析为正整数。
 func parseAnnotationID(raw string) (int64, error) {
+	return parsePositiveID(raw, "批注")
+}
+
+// parsePositiveID 将路径参数解析为正整数资源 id（label 为错误信息中的资源名，如「批注」「任务」）。
+func parsePositiveID(raw, label string) (int64, error) {
 	id, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil {
-		return 0, logging.Wrap(err, logging.ErrInvalidArgument, "批注 id 必须是正整数")
+		return 0, logging.Wrap(err, logging.ErrInvalidArgument, label+" id 必须是正整数")
 	}
 	if id <= 0 {
-		return 0, logging.NewAppError(logging.ErrInvalidArgument, "批注 id 必须是正整数")
+		return 0, logging.NewAppError(logging.ErrInvalidArgument, label+" id 必须是正整数")
 	}
 	return id, nil
 }

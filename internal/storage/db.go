@@ -30,7 +30,7 @@ const driverName = "sqlite"
 // 语义：migrations 中第 i 条脚本将 user_version 从 i 迁移到 i+1，因此
 // schemaVersion 必须恒等于 len(migrations)（由 TestMigrationsLengthMatchesVersion 守卫）。
 // 新增迁移时：追加脚本到 migrations 末尾，并把 schemaVersion 加一。
-const schemaVersion = 4
+const schemaVersion = 5
 
 // migrations 按版本顺序保存 schema 迁移脚本。
 //
@@ -83,6 +83,23 @@ CREATE INDEX IF NOT EXISTS idx_annotations_document ON annotations(document_id);
 	`CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
     path UNINDEXED,
     content
+);`,
+	// v5：LLM 任务队列表（M6.2 本地处理节点 worker）。
+	//
+	// 混合 LLM 后端的任务分发基础：需要本地推理的任务以 route='local' 入队，由
+	// 家庭机器 / NAS 上的处理节点轮询领取（status: pending → running → done/failed）；
+	// route='cloud' 的任务由服务端直接调云端 API，不进入节点轮询。payload 为任务
+	// 请求体的原始 JSON 文本（对队列透明，由任务类型与节点共同解释）；result 承载
+	// 节点的结果正文，或失败时的错误信息（明文存储，无端到端加密）。
+	`CREATE TABLE IF NOT EXISTS llm_tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    route TEXT NOT NULL,
+    status TEXT NOT NULL,
+    result TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );`,
 }
 
