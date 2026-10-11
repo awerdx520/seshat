@@ -17,6 +17,7 @@ files/objects/
 /bin/
 /dist/
 *.exe
+/server
 
 # 编辑器/系统
 .DS_Store

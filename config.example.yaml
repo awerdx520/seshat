@@ -1,0 +1,31 @@
+# notes 服务示例配置
+#
+# 复制为 config.yaml 后按需修改。所有路径均相对于服务进程的工作目录。
+# 敏感值（数据库密钥、API 令牌、LLM API key）禁止写入本文件或任何落盘文件，
+# 只能通过环境变量注入，详见 docs/configuration.md。
+
+server:
+  # HTTP 监听地址。
+  addr: ":8080"
+  # 读超时，Go duration 字符串（如 30s、1m30s）。
+  read_timeout: 30s
+  # 写超时。
+  write_timeout: 30s
+
+db:
+  # SQLite 数据库文件路径。
+  path: "./data/notes.db"
+  # 数据库密钥：敏感，从环境变量 NOTES_DB_KEY 读取，不在此处配置。
+
+webdav:
+  # 笔记根目录。
+  root: "./data/notes"
+  # 对外公开的出口目录（WebDAV 公开范围）。
+  public: "./data/notes/public"
+
+llm:
+  # 本地 LLM 节点 URL，留空表示不启用本地节点。
+  local_node_url: ""
+  # 云端 LLM API key：敏感，从环境变量 NOTES_LLM_API_KEY 读取，不在此处配置。
+
+# API 访问令牌：敏感，从环境变量 NOTES_AUTH_TOKEN 读取，不在此处配置。
