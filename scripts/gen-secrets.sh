@@ -8,7 +8,8 @@
 # 输出路径默认为 ./data/secrets.env，可用第一个参数覆盖。
 #
 # 行为：
-#   - 生成数据库密钥（openssl rand -hex 32）与 API 访问令牌（openssl rand -base64 32）；
+#   - 生成数据库密钥（openssl rand -hex 32）、API 访问令牌与本地 LLM 节点令牌
+#     （均 openssl rand -base64 32）；
 #   - 写入输出文件，文件权限强制为 600，目标目录不存在时自动创建；
 #   - 不向 stdout 回显任何密钥值，仅输出不含值的摘要；
 #   - 目标文件已存在时默认拒绝覆盖（静态加密下丢失密钥 = 数据永久丢失），
@@ -34,6 +35,7 @@ mkdir -p -- "$out_dir"
 # 生成密钥；仅在变量/管道中流转，绝不写入 stdout。
 db_key="$(openssl rand -hex 32)"
 auth_token="$(openssl rand -base64 32)"
+node_token="$(openssl rand -base64 32)"
 
 # 以私有 umask 创建文件，再显式收紧权限到 600。
 umask 077
@@ -48,6 +50,9 @@ umask 077
     printf '# API 访问令牌（单用户）：REST Bearer 与 WebDAV Basic Auth 共用。\n'
     printf 'NOTES_AUTH_TOKEN=%s\n' "$auth_token"
     printf '\n'
+    printf '# 本地 LLM 节点专用令牌：仅保护节点端点（注册/轮询/回传，最小权限）；未配置则回退主令牌。\n'
+    printf 'NOTES_NODE_TOKEN=%s\n' "$node_token"
+    printf '\n'
     printf '# 云端 LLM API key：由用户从服务商获取，脚本不生成；未启用云端 LLM 时留空。\n'
     printf 'NOTES_LLM_API_KEY=\n'
 } > "$out"
@@ -57,6 +62,7 @@ chmod 600 -- "$out"
 # 清空内存中的密钥副本（尽力而为）。
 db_key=""
 auth_token=""
+node_token=""
 
-echo "已生成 2 个密钥并写入 $out（权限 600）：NOTES_DB_KEY、NOTES_AUTH_TOKEN；NOTES_LLM_API_KEY 留空待填写。"
+echo "已生成 3 个密钥并写入 $out（权限 600）：NOTES_DB_KEY、NOTES_AUTH_TOKEN、NOTES_NODE_TOKEN；NOTES_LLM_API_KEY 留空待填写。"
 echo "提示：systemd 部署请复制到 /etc/notes/secrets.env 并保持 600 权限；禁止提交到 git。"

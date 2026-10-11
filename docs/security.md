@@ -48,12 +48,19 @@ amalgamation**（包内 `sqlite3.c` + tomcrypt 源码），编译只需 CGO + gc
 
 ## 2. 认证
 
-单用户模型，服务端只认一个身份：
+单用户模型：客户端身份由**主令牌**统一承担，本地 LLM 处理节点可选使用独立的
+**节点令牌**，两类令牌经 `internal/auth` 的 `NodeMiddleware` 相互隔离。
 
-- **REST API**：HTTP `Authorization: Bearer <NOTES_AUTH_TOKEN>`。
-- **WebDAV**：HTTP Basic 认证，用户名任意，**密码为同一个 `NOTES_AUTH_TOKEN`**
-  （对外标准出口与内部同步通道共用该令牌）。
-- 令牌由环境变量 `NOTES_AUTH_TOKEN` 注入（见第 3 节），不落盘、不进 git。
+- **主令牌**（`NOTES_AUTH_TOKEN`）：面向客户端与通用接口。
+  - **REST API**：HTTP `Authorization: Bearer <NOTES_AUTH_TOKEN>`。
+  - **WebDAV**：HTTP Basic 认证，用户名任意，**密码为同一个 `NOTES_AUTH_TOKEN`**
+    （对外标准出口与内部同步通道共用该令牌）。
+- **节点令牌**（`NOTES_NODE_TOKEN`，可选）：本地 LLM 处理节点专用，仅保护节点端点
+  （注册 / 轮询 / 回传，最小权限）。`auth.NodeMiddleware` 使两类令牌互不越权——
+  主令牌访问节点端点返回 `401`，节点令牌访问普通端点也返回 `401`。
+  **未配置节点令牌时，节点端点回退接受主令牌**（向后兼容既有单令牌部署；
+  此时隔离失效，生产环境建议显式配置节点令牌）。
+- 令牌由环境变量注入（见第 3 节），不落盘、不进 git。
 - 缺失或错误的令牌返回 `unauthorized`（见 `internal/logging` 错误码），
   不区分「缺失」与「错误」以免泄露信息。
 
@@ -68,9 +75,10 @@ amalgamation**（包内 `sqlite3.c` + tomcrypt 源码），编译只需 CGO + gc
 |---|---|---|---|
 | `NOTES_DB_KEY` | 存储层数据库密钥（32 字节 hex） | `scripts/gen-secrets.sh` | 脚本生成 |
 | `NOTES_AUTH_TOKEN` | REST Bearer + WebDAV Basic 令牌 | `scripts/gen-secrets.sh` | 脚本生成 |
+| `NOTES_NODE_TOKEN` | 本地 LLM 节点专用令牌（节点端点，最小权限） | `scripts/gen-secrets.sh` | 脚本生成 |
 | `NOTES_LLM_API_KEY` | 云端 LLM API key | 脚本不生成 | LLM 服务商 |
 
-三者均为敏感值，对应结构体字段标记为 `yaml:"-"`，只能通过环境变量注入
+四者均为敏感值，对应结构体字段标记为 `yaml:"-"`，只能通过环境变量注入
 （详见 [配置说明](configuration.md)）。
 
 ### 3.2 生成
