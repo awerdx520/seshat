@@ -91,6 +91,11 @@ type DBConfig struct {
 type WebDAVConfig struct {
 	Root   string `yaml:"root"`
 	Public string `yaml:"public"`
+	// PublicReadOnly 控制对外公开出口是否只读；默认 false（可读写）。
+	PublicReadOnly bool `yaml:"public_read_only"`
+	// PublicAllowExts 是对外公开出口允许写入的文件扩展名白名单
+	// （如 [".org", ".md", ".pdf", ".epub"]）；为空表示不限制扩展名，读操作不受其约束。
+	PublicAllowExts []string `yaml:"public_allow_exts"`
 }
 
 // LLMConfig 是 LLM 后端配置。

@@ -18,6 +18,8 @@ notes 服务的配置由三部分组成，优先级从低到高：
 | SQLite 路径 | `db.path` | — | `"./data/notes.db"` | 否 |
 | 笔记根目录 | `webdav.root` | — | `"./data/notes"` | 否 |
 | 公开出口目录 | `webdav.public` | — | `"./data/notes/public"` | 否 |
+| 对外出口只读 | `webdav.public_read_only` | — | `false` | 否 |
+| 对外出口写扩展名白名单 | `webdav.public_allow_exts` | — | 空（不限制） | 否 |
 | 数据库密钥 | 不可配置（不落盘） | `NOTES_DB_KEY` | 空 | **是** |
 | API 访问令牌 | 不可配置（不落盘） | `NOTES_AUTH_TOKEN` | 空 | **是** |
 | LLM API key | 不可配置（不落盘） | `NOTES_LLM_API_KEY` | 空 | **是** |
@@ -27,6 +29,9 @@ notes 服务的配置由三部分组成，优先级从低到高：
 
 - `read_timeout` / `write_timeout` 使用 Go `time.ParseDuration` 支持的字符串格式（如 `30s`、`1m30s`）。
 - `server.addr` 等非敏感项当前仅由配置文件控制；敏感项的 YAML 键被忽略，只能通过环境变量提供。
+- `webdav.public_read_only` 只作用于对外公开出口（内部同步通道不受影响）。置为 `true` 后对外出口的全部写操作（PUT/MKCOL/DELETE/MOVE/COPY 等）被拒绝，读操作（GET/PROPFIND/HEAD 等）不受影响。
+- `webdav.public_allow_exts` 是允许对外出口写入的文件扩展名白名单（如 `[".org", ".md", ".pdf", ".epub"]`），仅在写文件时校验，读操作不受限制；置空表示不限制扩展名。扩展名比较忽略大小写，前导点可省略。
+- 两项同时配置时只读优先：只要 `public_read_only` 为 `true`，任何写操作都被拒绝。
 
 ## 敏感值处理
 

@@ -22,6 +22,12 @@ webdav:
   root: "./data/notes"
   # 对外公开的出口目录（WebDAV 公开范围）。
   public: "./data/notes/public"
+  # 对外出口是否只读：true 时对外出口拒绝一切写操作，默认 false（可读写）。
+  public_read_only: false
+  # 对外出口允许写入的文件扩展名白名单，例如：
+  #   public_allow_exts: [".org", ".md", ".pdf", ".epub"]
+  # 留空表示不限制扩展名（读操作始终不受限制）。
+  public_allow_exts: []
 
 llm:
   # 本地 LLM 节点 URL，留空表示不启用本地节点。

@@ -164,3 +164,39 @@ func TestSensitiveEmptyWithoutEnv(t *testing.T) {
 		t.Errorf("db.key = %q, 期望空（YAML 不得提供敏感值）", cfg.DB.Key)
 	}
 }
+
+// TestLoadWebDAVPublicPolicy 验证对外出口策略项可经 YAML 配置，
+// 未出现时保留默认（只读 false、白名单为空即不限制）。
+func TestLoadWebDAVPublicPolicy(t *testing.T) {
+	// 默认值：可读写、不限扩展名。
+	cfg, err := Load(filepath.Join(t.TempDir(), "not-exist.yaml"))
+	if err != nil {
+		t.Fatalf("Load 返回错误: %v", err)
+	}
+	if cfg.WebDAV.PublicReadOnly {
+		t.Error("webdav.public_read_only 默认应为 false（可读写）")
+	}
+	if len(cfg.WebDAV.PublicAllowExts) != 0 {
+		t.Errorf("webdav.public_allow_exts 默认应为空，实际 %v", cfg.WebDAV.PublicAllowExts)
+	}
+
+	// YAML 覆盖。
+	path := writeConfig(t, `
+webdav:
+  public_read_only: true
+  public_allow_exts:
+    - ".org"
+    - ".md"
+`)
+
+	cfg, err = Load(path)
+	if err != nil {
+		t.Fatalf("Load 返回错误: %v", err)
+	}
+	if !cfg.WebDAV.PublicReadOnly {
+		t.Error("webdav.public_read_only = false, 期望 true")
+	}
+	if got := cfg.WebDAV.PublicAllowExts; len(got) != 2 || got[0] != ".org" || got[1] != ".md" {
+		t.Errorf("webdav.public_allow_exts = %v, 期望 [\".org\" \".md\"]", got)
+	}
+}
