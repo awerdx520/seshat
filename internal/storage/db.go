@@ -30,7 +30,7 @@ const driverName = "sqlite"
 // 语义：migrations 中第 i 条脚本将 user_version 从 i 迁移到 i+1，因此
 // schemaVersion 必须恒等于 len(migrations)（由 TestMigrationsLengthMatchesVersion 守卫）。
 // 新增迁移时：追加脚本到 migrations 末尾，并把 schemaVersion 加一。
-const schemaVersion = 1
+const schemaVersion = 4
 
 // migrations 按版本顺序保存 schema 迁移脚本。
 //
@@ -39,9 +39,51 @@ const schemaVersion = 1
 var migrations = []string{
 	// v1：元数据表，用于存放系统级键值对；后续里程碑在此基础上扩展其它表。
 	`CREATE TABLE IF NOT EXISTS meta (
-		key   TEXT PRIMARY KEY,
-		value TEXT NOT NULL
-	)`,
+	key   TEXT PRIMARY KEY,
+	value TEXT NOT NULL
+)`,
+	// v2：阅读进度与批注表（M1.4 REST 状态同步的数据基础）。
+	//
+	// reading_progress 以 document_id 为主键，即每个文档只保留最新进度（后写覆盖）；
+	// annotations 单条一行，按 document_id 建索引以支撑「按文档列举」这一主要查询。
+	// updated_at/created_at 为 RFC3339 文本，由调用方（服务端或客户端）提供的
+	// 时间戳决定，便于与客户端协商增量同步。
+	`CREATE TABLE IF NOT EXISTS reading_progress (
+	document_id TEXT PRIMARY KEY,
+	position    TEXT NOT NULL,
+	updated_at  TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS annotations (
+	id          INTEGER PRIMARY KEY AUTOINCREMENT,
+	document_id TEXT NOT NULL,
+	location    TEXT NOT NULL,
+	text        TEXT NOT NULL,
+	created_at  TEXT NOT NULL,
+	updated_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_annotations_document ON annotations(document_id);`,
+	// v3：附件内容寻址表（M1.5）。
+	//
+	// hash 为附件内容的 SHA256 十六进制串，既是主键也是对象库中的文件名；path 为
+	// 对象在对象库中的完整路径（root/前两位/hash 分片）；size 为字节数；created_at
+	// 为首次入库时的 RFC3339（UTC）时间。该表是「附件清单」文件的数据来源，清单
+	// 随笔记目录内的写操作纳入 git 追踪。
+	`CREATE TABLE IF NOT EXISTS attachments (
+    hash TEXT PRIMARY KEY,
+    path TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);`,
+	// v4：全文索引虚表（M1.6）。
+	//
+	// 用 FTS5 虚表承载笔记正文的全文索引，由纯 Go 驱动 modernc.org/sqlite 提供
+	// FTS5 扩展支持。path 列标为 UNINDEXED：只随结果回填、用于定位文件，不参与
+	// 分词；content 列为被索引的正文。增量更新策略为「按 path 先删后插」，封装于
+	// internal/index 包，使同一文件的索引始终反映最新内容。
+	`CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
+    path UNINDEXED,
+    content
+);`,
 }
 
 // errEmptyPath 表示调用方传入了空的数据库路径。
@@ -98,6 +140,19 @@ func (d *DB) Close() error {
 		return nil
 	}
 	return d.db.Close()
+}
+
+// SQL 返回底层 *sql.DB，供 storage 包外的模块（如 internal/attach 附件对象库）
+// 直接执行对应表的 SQL；对 nil 接收者返回 nil。
+//
+// 设计说明：storage 包内的领域读写（进度、批注等）仍封装为包内方法；此访问器
+// 仅供尚无专门领域方法、且以「表即简单键值映射」为主的场景使用，避免为每张表都
+// 新增一层薄封装。连接池已被限制为单连接（见 Open），调用方无需额外串行化。
+func (d *DB) SQL() *sql.DB {
+	if d == nil {
+		return nil
+	}
+	return d.db
 }
 
 // buildDSN 为 SQLite 文件路径附加连接级 PRAGMA 参数。

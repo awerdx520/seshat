@@ -133,3 +133,24 @@ func TestCloseIsNilSafe(t *testing.T) {
 		t.Fatalf("nil 接收者 Close() 返回错误: %v", err)
 	}
 }
+
+// TestFTS5TableUsable 验证迁移 v4 创建的 FTS5 虚表 notes_fts 可用：
+// 底层驱动 modernc.org/sqlite 提供 FTS5 扩展，可写入并按 MATCH 命中。
+// 若本测试失败，说明驱动不支持 FTS5，M1.6 需按阻塞处理，不得降级。
+func TestFTS5TableUsable(t *testing.T) {
+	db := openTestDB(t)
+
+	if _, err := db.db.Exec(
+		`INSERT INTO notes_fts(path, content) VALUES(?, ?)`, "a.org", "hello world"); err != nil {
+		t.Fatalf("写入 FTS5 表失败（驱动可能不支持 FTS5）: %v", err)
+	}
+
+	var path string
+	if err := db.db.QueryRow(
+		`SELECT path FROM notes_fts WHERE notes_fts MATCH ?`, "hello").Scan(&path); err != nil {
+		t.Fatalf("FTS5 MATCH 查询失败: %v", err)
+	}
+	if path != "a.org" {
+		t.Fatalf("命中 path = %q, 期望 %q", path, "a.org")
+	}
+}

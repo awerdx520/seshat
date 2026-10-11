@@ -76,22 +76,22 @@
   - 依赖：M0.2, M0.4
 
 ### 里程碑 M1：服务端核心
-- [ ] M1.1 WebDAV 服务：golang.org/x/net/webdav，挂载笔记目录，认证 + 范围限制（精确到「笔记目录 + 文件类型白名单」）+ 内部/对外端点划分 + 写操作来源标记
+- [x] M1.1 WebDAV 服务：golang.org/x/net/webdav，挂载笔记目录，认证 + 范围限制（精确到「笔记目录 + 文件类型白名单」）+ 内部/对外端点划分 + 写操作来源标记
   - 验收：PROPFIND/GET/PUT/DELETE 可用；无法访问 .git/、配置、附件原始库；对外端点仅暴露笔记目录；写操作来源标记（自有客户端/外部应用）可区分
   - 依赖：M0.3
-- [ ] M1.2 git 版本化集成：libgit2，写操作后自动 commit，ETag = 工作区当前内容即时计算的 git blob hash（`sha1("blob <size>\0<content>")`），并发写串行化（服务端写锁）
+- [x] M1.2 git 版本化集成：libgit2，写操作后自动 commit，ETag = 工作区当前内容即时计算的 git blob hash（`sha1("blob <size>\0<content>")`），并发写串行化（服务端写锁）
   - 验收：PUT 后自动 commit；ETag 稳定且与 commit 时序解耦；并发 PUT 不产生损坏 commit、不丢数据；历史可遍历
   - 依赖：M1.1
-- [ ] M1.3 三方合并支持：merge-base + merge API，供自有客户端拉取共同祖先与最新版
+- [x] M1.3 三方合并支持：merge-base + merge API，供自有客户端拉取共同祖先与最新版
   - 验收：可获取 merge-base；模拟冲突场景能返回共同祖先 + 最新版
   - 依赖：M1.2
-- [ ] M1.4 REST API：阅读进度/批注 CRUD + If-Modified-Since 增量；产出 docs/api.md 与 docs/errors.md
+- [x] M1.4 REST API：阅读进度/批注 CRUD + If-Modified-Since 增量；产出 docs/api.md 与 docs/errors.md
   - 验收：API 单测 + 集成测试通过；docs/api.md 覆盖全部端点、docs/errors.md 覆盖错误码
   - 依赖：M0.3, M0.4
-- [ ] M1.5 附件内容寻址存储：SHA256 去重，附件存独立对象库（files/objects/），hash→路径映射存 SQLCipher DB，「附件清单」文件纳入 git
+- [x] M1.5 附件内容寻址存储：SHA256 去重，附件存独立对象库（files/objects/），hash→路径映射存 SQLCipher DB，「附件清单」文件纳入 git
   - 验收：重复附件只存一份；清单变更可 git 追溯；hash 映射可查询
   - 依赖：M1.2
-- [ ] M1.6 全文索引：SQLite FTS5，org 变更后增量索引（变更入口 = WebDAV 写入）
+- [x] M1.6 全文索引：SQLite FTS5，org 变更后增量索引（变更入口 = WebDAV 写入）
   - 验收：全文搜索命中 org 内容；增量索引正确反映最新内容
   - 依赖：M1.1, M1.2, M0.4
 
