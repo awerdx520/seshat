@@ -26,6 +26,10 @@ const (
 	EnvAuthToken = "NOTES_AUTH_TOKEN"
 	// EnvLLMAPIKey 提供 Config.LLM.CloudAPIKey（云端 LLM API key）。
 	EnvLLMAPIKey = "NOTES_LLM_API_KEY"
+	// EnvNodeToken 提供 Config.LLM.NodeToken（本地 LLM 节点专用令牌）。
+	// 与主访问令牌分离，使节点只能访问节点端点（最小权限）；为空时节点
+	// 端点回退接受主令牌（向后兼容）。
+	EnvNodeToken = "NOTES_NODE_TOKEN"
 )
 
 // 各配置项的默认值。
@@ -101,7 +105,12 @@ type WebDAVConfig struct {
 // LLMConfig 是 LLM 后端配置。
 type LLMConfig struct {
 	// CloudAPIKey 是云端 LLM API key，敏感，仅从环境变量 NOTES_LLM_API_KEY 读取。
-	CloudAPIKey  string `yaml:"-"`
+	CloudAPIKey string `yaml:"-"`
+	// NodeToken 是本地处理节点专用令牌，敏感，仅从环境变量 NOTES_NODE_TOKEN 读取。
+	// 用于将节点（cmd/llmnode）与普通客户端的主令牌隔离：节点令牌只能访问节点
+	// 端点（任务轮询/回传/注册），主令牌不能访问节点端点（当本项配置时）。
+	// 为空时节点端点回退接受主令牌（向后兼容）。
+	NodeToken    string `yaml:"-"`
 	LocalNodeURL string `yaml:"local_node_url"`
 }
 
@@ -160,4 +169,5 @@ func applyEnv(cfg *Config) {
 	cfg.DB.Key = os.Getenv(EnvDBKey)
 	cfg.Auth.Token = os.Getenv(EnvAuthToken)
 	cfg.LLM.CloudAPIKey = os.Getenv(EnvLLMAPIKey)
+	cfg.LLM.NodeToken = os.Getenv(EnvNodeToken)
 }

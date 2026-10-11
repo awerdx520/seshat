@@ -527,3 +527,49 @@ func TestUnauthorizedDoesNotWrite(t *testing.T) {
 		t.Fatalf("读取状态码 = %d, 期望 404（未认证请求不应写入）", got.Code)
 	}
 }
+
+// TestProgressConflictReturns409 验证基于旧时间戳的进度写入返回 409 conflict，
+// 且服务端记录不被覆盖。
+func TestProgressConflictReturns409(t *testing.T) {
+	h := newTestHandler(t)
+
+	put := do(t, h, http.MethodPut, "/api/progress/doc", testToken, map[string]string{
+		"position":   "p-new",
+		"updated_at": "2026-10-11T11:00:00Z",
+	}, nil)
+	if put.Code != http.StatusOK {
+		t.Fatalf("首次 PUT 状态码 = %d, 期望 200 (body=%q)", put.Code, put.Body.String())
+	}
+
+	stale := do(t, h, http.MethodPut, "/api/progress/doc", testToken, map[string]string{
+		"position":   "p-stale",
+		"updated_at": "2026-10-11T10:00:00Z",
+	}, nil)
+	assertErrorCode(t, stale, http.StatusConflict, "conflict")
+
+	get := do(t, h, http.MethodGet, "/api/progress/doc", testToken, nil, nil)
+	if got := decodeJSON(t, get)["position"]; got != "p-new" {
+		t.Fatalf("冲突后 position = %v, 期望保持 p-new（不被旧时间戳覆盖）", got)
+	}
+}
+
+// TestAnnotationConflictReturns409 验证批注更新携带旧 updated_at 时返回 409 conflict。
+func TestAnnotationConflictReturns409(t *testing.T) {
+	h := newTestHandler(t)
+
+	created := do(t, h, http.MethodPost, "/api/annotations", testToken, map[string]string{
+		"document_id": "doc",
+		"location":    "loc",
+		"text":        "原始",
+	}, nil)
+	if _, ok := decodeJSON(t, created)["id"].(float64); !ok {
+		t.Fatalf("创建响应缺少 id: %q", created.Body.String())
+	}
+
+	update := do(t, h, http.MethodPut, "/api/annotations/1", testToken, map[string]string{
+		"location":   "loc-2",
+		"text":       "修改",
+		"updated_at": "2000-01-01T00:00:00Z",
+	}, nil)
+	assertErrorCode(t, update, http.StatusConflict, "conflict")
+}

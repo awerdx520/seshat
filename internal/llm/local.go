@@ -18,17 +18,24 @@ type LocalNodeClient struct {
 	model string
 	// http 是执行请求的 HTTP 客户端。
 	http *http.Client
+	// urlConfigured 记录构造时是否显式提供了节点 URL；false 表示回退到默认地址。
+	// 供 Router.LocalDirectAvailable 判断「同步直连」是否已配置（见 backend.go）。
+	urlConfigured bool
 }
 
-// NewLocal 构造 LocalNodeClient。nodeURL 为空时使用默认值 http://localhost:11434。
+// NewLocal 构造 LocalNodeClient。nodeURL 为空（或仅含空白）时使用默认值
+// http://localhost:11434，并把该实例标记为「未显式配置 URL」
+// （Router.LocalDirectAvailable 据此返回 false）。
 // 默认不带模型名，可用 WithModel 指定（如 "qwen2.5:7b"）。
 func NewLocal(nodeURL string) *LocalNodeClient {
-	if nodeURL == "" {
+	configured := strings.TrimSpace(nodeURL) != ""
+	if !configured {
 		nodeURL = defaultLocalNodeURL
 	}
 	return &LocalNodeClient{
-		baseURL: strings.TrimRight(nodeURL, "/"),
-		http:    &http.Client{Timeout: defaultTimeout},
+		baseURL:       strings.TrimRight(nodeURL, "/"),
+		http:          &http.Client{Timeout: defaultTimeout},
+		urlConfigured: configured,
 	}
 }
 

@@ -25,11 +25,12 @@ func TestLoadConfig(t *testing.T) {
 		t.Fatal("缺少 NOTES_SERVER_URL 应返回错误")
 	}
 
-	// 缺失必填项：NOTES_AUTH_TOKEN。
+	// 缺失必填项：NOTES_NODE_TOKEN 与 NOTES_AUTH_TOKEN 均未设置。
 	t.Setenv("NOTES_SERVER_URL", "https://notes.example.com/")
 	t.Setenv("NOTES_AUTH_TOKEN", "")
+	t.Setenv("NOTES_NODE_TOKEN", "")
 	if _, err := loadConfig(); err == nil {
-		t.Fatal("缺少 NOTES_AUTH_TOKEN 应返回错误")
+		t.Fatal("缺少令牌应返回错误")
 	}
 
 	// 齐全：serverURL 去掉尾部斜杠，OLLAMA_URL 取默认值，NODE_NAME 回退主机名。
@@ -264,5 +265,51 @@ func TestProcessOneInvalidPayload(t *testing.T) {
 	}
 	if ollama.model != "" || len(ollama.messages) != 0 {
 		t.Fatalf("payload 非法时不应调用 Ollama: model=%q messages=%+v", ollama.model, ollama.messages)
+	}
+}
+
+// TestNodeAuthTokenSelection 验证节点令牌选择：优先 NOTES_NODE_TOKEN，
+// 未配置或为空白时回退 NOTES_AUTH_TOKEN，两者皆空时返回空。
+func TestNodeAuthTokenSelection(t *testing.T) {
+	// 两者都配置：优先节点令牌。
+	t.Setenv("NOTES_NODE_TOKEN", "node-tok")
+	t.Setenv("NOTES_AUTH_TOKEN", "main-tok")
+	if got := nodeAuthToken(); got != "node-tok" {
+		t.Fatalf("nodeAuthToken() = %q, 期望优先取 NOTES_NODE_TOKEN", got)
+	}
+
+	// 仅配置主令牌：回退主令牌。
+	t.Setenv("NOTES_NODE_TOKEN", "")
+	t.Setenv("NOTES_AUTH_TOKEN", "main-tok")
+	if got := nodeAuthToken(); got != "main-tok" {
+		t.Fatalf("nodeAuthToken() = %q, 期望回退 NOTES_AUTH_TOKEN", got)
+	}
+
+	// 节点令牌为空白：同样回退主令牌。
+	t.Setenv("NOTES_NODE_TOKEN", "  ")
+	t.Setenv("NOTES_AUTH_TOKEN", "main-tok")
+	if got := nodeAuthToken(); got != "main-tok" {
+		t.Fatalf("空白 NOTES_NODE_TOKEN 应回退主令牌, got %q", got)
+	}
+
+	// 均未配置：返回空。
+	t.Setenv("NOTES_NODE_TOKEN", "")
+	t.Setenv("NOTES_AUTH_TOKEN", "")
+	if got := nodeAuthToken(); got != "" {
+		t.Fatalf("均未配置应返回空, got %q", got)
+	}
+}
+
+// TestLoadConfigUsesNodeToken 验证 loadConfig 采用（优先的）节点令牌。
+func TestLoadConfigUsesNodeToken(t *testing.T) {
+	t.Setenv("NOTES_SERVER_URL", "https://notes.example.com")
+	t.Setenv("NOTES_NODE_TOKEN", "node-tok")
+	t.Setenv("NOTES_AUTH_TOKEN", "main-tok")
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig() 返回错误: %v", err)
+	}
+	if cfg.authToken != "node-tok" {
+		t.Fatalf("authToken = %q, 期望节点令牌", cfg.authToken)
 	}
 }

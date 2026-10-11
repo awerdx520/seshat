@@ -1,29 +1,28 @@
 // Package storage 提供笔记系统的 SQLite 持久化层：打开数据库、执行 schema
 // 迁移与关闭连接。
 //
-// 驱动选择：本包使用纯 Go 驱动 modernc.org/sqlite（无需 CGO）。原计划使用
-// SQLCipher（github.com/mutecomm/go-sqlcipher）实现 DB 层静态加密，但当前构建
-// 环境缺少系统 libsqlcipher（pkg-config 与 ldconfig 均未发现），而 SQLCipher 的
-// Go 绑定必须依赖 CGO + 系统库，故本实现将「DB 层加密」降级为待办：加密交由
-// M0.6（密钥管理）与磁盘 LUKS 加密兜底。届时若环境具备 libsqlcipher，可在此
-// 包内替换驱动并启用 Open 的 key 参数，调用方接口无需变更。
+// 驱动选择：本包通过 build tag 支持双驱动，Open 的调用方接口在两种构建下保持一致：
+//
+//   - 默认构建（无 tag）：使用纯 Go 驱动 modernc.org/sqlite（无需 CGO），驱动名
+//     为 "sqlite"，不支持 DB 层加密，Open 的非空 key 被忽略并告警。
+//   - `-tags sqlcipher` 构建：使用 github.com/mutecomm/go-sqlcipher/v4（CGO，包内
+//     自带 SQLCipher amalgamation，无需系统 libsqlcipher），驱动名为 "sqlite3"，
+//     Open 的非空 key 经 PRAGMA key 启用 DB 层加密。因 schema 迁移 v4 依赖 FTS5
+//     虚表、而该驱动默认未编入 FTS5，加密构建须同时加 fts5 tag，即
+//     `-tags "sqlcipher sqlite_fts5"`。
+//
+// 驱动导入与 DSN 构造分别位于 driver_modernc.go 与 driver_sqlcipher.go，本文件
+// 仅保留与驱动无关的公共逻辑（Open/Close/迁移）。
 package storage
 
 import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"log/slog"
 	"strings"
-
-	// 注册纯 Go SQLite 驱动，驱动名为 "sqlite"。
-	_ "modernc.org/sqlite"
 
 	"notes/internal/logging"
 )
-
-// driverName 是 modernc.org/sqlite 注册到 database/sql 的驱动名。
-const driverName = "sqlite"
 
 // schemaVersion 是当前程序期望的 schema 版本号。
 //
@@ -114,22 +113,18 @@ type DB struct {
 
 // Open 打开（或创建）位于 path 的 SQLite 数据库，并自动执行尚未应用的 schema 迁移。
 //
-// key 为数据库加密密钥，原设计用于 SQLCipher 的 DB 层加密。当前构建环境缺少系统
-// libsqlcipher，本实现基于纯 Go 驱动、不启用 DB 层加密：key 为空时按明文库打开，
-// key 非空时仅记录降级告警、密钥被忽略。该参数保留以维持调用方接口稳定，待 M0.6
-// 补全密钥管理与加密后启用。
+// key 为数据库加密密钥，其语义随构建而定：默认构建不启用 DB 层加密，非空 key 被
+// 忽略并告警；`-tags sqlcipher` 构建下非空 key 通过 PRAGMA key 启用加密，空 key
+// 则以明文打开并告警（见 warnKeyMode 与 buildDSN 的驱动实现）。该参数在两种构建下
+// 保持同一签名，调用方无需为是否加密而改动。
 func Open(path, key string) (*DB, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, logging.Wrap(errEmptyPath, logging.ErrInvalidArgument, "打开数据库失败")
 	}
 
-	if key == "" {
-		slog.Warn("storage: 未提供数据库加密密钥，数据库以明文存储", "path", path)
-	} else {
-		slog.Warn("storage: SQLCipher 不可用，加密密钥被忽略，DB 层加密降级为待办", "path", path)
-	}
+	warnKeyMode(path, key)
 
-	db, err := sql.Open(driverName, buildDSN(path))
+	db, err := sql.Open(driverName(), buildDSN(path, key))
 	if err != nil {
 		return nil, logging.Wrap(err, logging.ErrInternal, "打开数据库失败")
 	}
@@ -170,16 +165,6 @@ func (d *DB) SQL() *sql.DB {
 		return nil
 	}
 	return d.db
-}
-
-// buildDSN 为 SQLite 文件路径附加连接级 PRAGMA 参数。
-//
-// 内存库或已带查询串的路径原样返回，避免破坏调用方的自定义设置。
-func buildDSN(path string) string {
-	if path == ":memory:" || strings.Contains(path, "?") {
-		return path
-	}
-	return path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"
 }
 
 // applyMigrations 读取当前 user_version，并按序执行所有未应用的迁移。

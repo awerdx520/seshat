@@ -55,15 +55,34 @@
   :type 'string
   :group 'notes-sync)
 
-(defun notes-sync--curl-args (method url extra-args)
+(defun notes-sync--make-config-file ()
+  "创建仅含 Basic Auth 凭据的临时 curl 配置文件，返回其绝对路径。
+文件内容为 `user = \"用户名:令牌\"'，以 0600 权限（仅属主可读写）写入，
+凭据因此不再出现在命令行参数中，避免暴露于进程列表（ps 可见）。
+调用方负责使用后删除该文件（见 `notes-sync--request'）。"
+  (let ((file (make-temp-file "notes-sync-" nil ".curlrc"))
+        (credential (format "%s:%s" notes-sync-username notes-sync-token)))
+    (condition-case err
+        (progn
+          (with-temp-file file
+            ;; %S 输出带双引号并转义 \\ 与 \"，与 curl 配置文件语法兼容。
+            (insert (format "user = %S\n" credential)))
+          (set-file-modes file #o600)
+          file)
+      (error
+       (delete-file file)
+       (signal (car err) (cdr err))))))
+
+(defun notes-sync--curl-args (method url extra-args config-file)
   "构造 curl 命令行参数列表。
 METHOD 为 HTTP 方法字符串，例如 \"PROPFIND\"；
 URL 为请求地址；
-EXTRA-ARGS 为附加参数列表，例如 (\"-o\" \"file\") 或 (\"-H\" \"Depth: 1\")。
-返回值固定包含 -s、-X METHOD 以及 Basic Auth 的 -u \"user:token\" 参数，
+EXTRA-ARGS 为附加参数列表，例如 (\"-o\" \"file\") 或 (\"-H\" \"Depth: 1\")；
+CONFIG-FILE 为含 Basic Auth 凭据的临时配置文件路径，凭据经 curl 的
+--config CONFIG-FILE 读取，不再以 -u \"user:token\" 形式出现在命令行中。
+返回值固定包含 -s、-X METHOD 以及 --config CONFIG-FILE 参数，
 末尾追加 URL。"
-  (append (list "-s" "-X" method
-                "-u" (format "%s:%s" notes-sync-username notes-sync-token))
+  (append (list "-s" "-X" method "--config" config-file)
           extra-args
           (list url)))
 
@@ -80,12 +99,20 @@ REMOTE-PATH 为相对远端笔记目录的路径，可以带或不带前导斜�
 (defun notes-sync--request (method url extra-args)
   "调用 curl 执行一次 WebDAV 请求。
 METHOD 为 HTTP 方法，URL 为请求地址，EXTRA-ARGS 为附加参数列表。
+Basic Auth 凭据写入 0600 权限的临时 curl 配置文件，经 --config 传给
+curl，避免令牌出现在命令行参数中；请求结束后立即删除该临时文件，
+unwind-protect 保证即使子进程调用出错也会删除。
 返回 (EXIT-CODE . OUTPUT) 形式的 cons，其中 EXIT-CODE 为 curl 退出码
 （0 表示成功），OUTPUT 为子进程写入标准输出/标准错误的内容。"
-  (with-temp-buffer
-    (let ((code (apply #'call-process "curl" nil (current-buffer) nil
-                       (notes-sync--curl-args method url extra-args))))
-      (cons code (buffer-string)))))
+  (let ((config-file (notes-sync--make-config-file)))
+    (unwind-protect
+        (with-temp-buffer
+          (let ((code (apply #'call-process "curl" nil (current-buffer) nil
+                             (notes-sync--curl-args method url extra-args
+                                                    config-file))))
+            (cons code (buffer-string))))
+      (when (file-exists-p config-file)
+        (delete-file config-file)))))
 
 (defun notes-sync-profind (remote-path)
   "对远端 REMOTE-PATH 执行 PROPFIND 请求（Depth: 1）。

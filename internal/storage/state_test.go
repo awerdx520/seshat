@@ -204,3 +204,141 @@ func TestAnnotationsSurviveReopen(t *testing.T) {
 		t.Fatalf("重开后批注 = %+v, err = %v", items, err)
 	}
 }
+
+// TestProgressConflictDetection 验证进度写入的乐观冲突检测：
+// 传入旧于已存记录的时间戳返回 ErrConflict 且不覆盖；相等或更新则正常覆盖；
+// 无已存记录时正常写入。
+func TestProgressConflictDetection(t *testing.T) {
+	db := openTestDB(t)
+
+	const first = "2026-10-11T10:00:00Z"
+	const second = "2026-10-11T11:00:00Z"
+	const stale = "2026-10-11T09:00:00Z"
+
+	// 无已存记录：正常写入。
+	if err := db.SetProgress("doc", "p1", first); err != nil {
+		t.Fatalf("首次 SetProgress() 返回错误: %v", err)
+	}
+
+	// 新于已存：正常覆盖。
+	if err := db.SetProgress("doc", "p2", second); err != nil {
+		t.Fatalf("较新 SetProgress() 返回错误: %v", err)
+	}
+	got, err := db.GetProgress("doc")
+	if err != nil {
+		t.Fatalf("GetProgress() 返回错误: %v", err)
+	}
+	if got.Position != "p2" || got.UpdatedAt != second {
+		t.Fatalf("较新写入未覆盖: %+v", got)
+	}
+
+	// 旧于已存：ErrConflict，且内容保持不被覆盖。
+	assertCode(t, db.SetProgress("doc", "p-stale", stale), logging.ErrConflict)
+	got, err = db.GetProgress("doc")
+	if err != nil {
+		t.Fatalf("冲突后 GetProgress() 返回错误: %v", err)
+	}
+	if got.Position != "p2" || got.UpdatedAt != second {
+		t.Fatalf("冲突写入不应覆盖: %+v", got)
+	}
+
+	// 等于已存：视为幂等重放，不返回冲突。
+	if err := db.SetProgress("doc", "p2", second); err != nil {
+		t.Fatalf("相同时间戳 SetProgress() 返回错误: %v", err)
+	}
+}
+
+// TestProgressEmptyTimestampUnconditional 验证空 updatedAt 为无条件写入（向后兼容）：
+// 即使已存记录更新，仍覆盖并回填当前 UTC 时间。
+func TestProgressEmptyTimestampUnconditional(t *testing.T) {
+	db := openTestDB(t)
+
+	if err := db.SetProgress("doc", "p1", "2026-10-11T11:00:00Z"); err != nil {
+		t.Fatalf("SetProgress() 返回错误: %v", err)
+	}
+	if err := db.SetProgress("doc", "p2", ""); err != nil {
+		t.Fatalf("空时间戳 SetProgress() 应无条件成功，实际: %v", err)
+	}
+	got, err := db.GetProgress("doc")
+	if err != nil {
+		t.Fatalf("GetProgress() 返回错误: %v", err)
+	}
+	if got.Position != "p2" {
+		t.Fatalf("空时间戳未覆盖: %+v", got)
+	}
+	ts, err := time.Parse(time.RFC3339, got.UpdatedAt)
+	if err != nil {
+		t.Fatalf("回填时间戳不是 RFC3339: %q", got.UpdatedAt)
+	}
+	if delta := time.Since(ts); delta < 0 || delta > time.Minute {
+		t.Fatalf("回填时间戳偏差过大: %v", delta)
+	}
+}
+
+// TestAnnotationConflictDetection 验证批注更新的乐观冲突检测（UpdateAnnotationAt）：
+// 旧时间戳 → ErrConflict 且不覆盖；新时间戳 → 覆盖并采用客户端时间戳；
+// 空时间戳与旧签名 UpdateAnnotation 均无条件覆盖（向后兼容）。
+func TestAnnotationConflictDetection(t *testing.T) {
+	db := openTestDB(t)
+
+	created, err := db.CreateAnnotation("doc", "loc", "原始文本")
+	if err != nil {
+		t.Fatalf("CreateAnnotation() 返回错误: %v", err)
+	}
+	base, err := time.Parse(time.RFC3339, created.UpdatedAt)
+	if err != nil {
+		t.Fatalf("created.UpdatedAt 不是 RFC3339: %q", created.UpdatedAt)
+	}
+	older := base.Add(-time.Hour).Format(time.RFC3339)
+	newer := base.Add(time.Hour).Format(time.RFC3339)
+
+	// 旧于已存：ErrConflict，记录保持原样。
+	_, err = db.UpdateAnnotationAt(created.ID, "loc-stale", "陈旧文本", older)
+	assertCode(t, err, logging.ErrConflict)
+	items, err := db.ListAnnotations("doc")
+	if err != nil {
+		t.Fatalf("ListAnnotations() 返回错误: %v", err)
+	}
+	if len(items) != 1 || items[0].Text != "原始文本" || items[0].Location != "loc" {
+		t.Fatalf("冲突更新不应改动记录: %+v", items)
+	}
+
+	// 新于已存：正常覆盖，updated_at 采用客户端值。
+	updated, err := db.UpdateAnnotationAt(created.ID, "loc-new", "新文本", newer)
+	if err != nil {
+		t.Fatalf("较新 UpdateAnnotationAt() 返回错误: %v", err)
+	}
+	if updated.Text != "新文本" || updated.Location != "loc-new" || updated.UpdatedAt != newer {
+		t.Fatalf("较新更新结果不符: %+v", updated)
+	}
+	if updated.CreatedAt != created.CreatedAt {
+		t.Fatalf("created_at 不应变化: %q → %q", created.CreatedAt, updated.CreatedAt)
+	}
+
+	// 空时间戳：无条件覆盖。
+	updated, err = db.UpdateAnnotationAt(created.ID, "loc-empty", "空时间文本", "")
+	if err != nil {
+		t.Fatalf("空时间戳 UpdateAnnotationAt() 返回错误: %v", err)
+	}
+	if updated.Text != "空时间文本" {
+		t.Fatalf("空时间戳未覆盖: %+v", updated)
+	}
+
+	// 旧签名 UpdateAnnotation：无条件覆盖（向后兼容）。
+	updated, err = db.UpdateAnnotation(created.ID, "loc-legacy", "旧签名文本")
+	if err != nil {
+		t.Fatalf("UpdateAnnotation() 返回错误: %v", err)
+	}
+	if updated.Text != "旧签名文本" {
+		t.Fatalf("旧签名未覆盖: %+v", updated)
+	}
+}
+
+// TestAnnotationUpdateAtMissing 验证带时间戳更新不存在的批注返回 ErrNotFound，
+// 即「无记录即可写」的冲突检测分支不会把缺失误判为成功。
+func TestAnnotationUpdateAtMissing(t *testing.T) {
+	db := openTestDB(t)
+
+	_, err := db.UpdateAnnotationAt(404, "loc", "文本", "2026-10-11T10:00:00Z")
+	assertCode(t, err, logging.ErrNotFound)
+}

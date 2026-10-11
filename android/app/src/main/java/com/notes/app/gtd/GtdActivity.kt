@@ -15,6 +15,7 @@ import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.notes.app.R
 import com.notes.app.sync.NotesConfig
+import com.notes.app.sync.SecurePrefs
 import com.notes.app.sync.WebDavClient
 import java.io.File
 
@@ -190,14 +191,15 @@ class GtdActivity : AppCompatActivity() {
     /**
      * 读取同步服务器配置。
      *
-     * MVP 约定：从 SharedPreferences [SYNC_PREFS] 读取 `server_url`（服务端根地址）与
-     * `auth_token`（即服务端 `NOTES_AUTH_TOKEN`，WebDAV 用作 Basic 密码）。
+     * 经 [SecurePrefs] 读取 `server_url`（服务端根地址）与 `auth_token`（即服务端
+     * `NOTES_AUTH_TOKEN`，WebDAV 用作 Basic 密码）：令牌以 EncryptedSharedPreferences
+     * 加密保存，首次读取时自动把旧的明文配置迁移到加密存储。
      * 任一项缺失或为空时返回 `null`，由调用方提示用户「未配置同步服务器」。
      */
     private fun readSyncConfig(): NotesConfig? {
-        val prefs = getSharedPreferences(SYNC_PREFS, MODE_PRIVATE)
-        val serverUrl = prefs.getString(KEY_SERVER_URL, null)?.trim().orEmpty()
-        val token = prefs.getString(KEY_AUTH_TOKEN, null)?.trim().orEmpty()
+        val prefs = SecurePrefs.open(this)
+        val serverUrl = prefs.getString(SecurePrefs.KEY_SERVER_URL)?.trim().orEmpty()
+        val token = prefs.getString(SecurePrefs.KEY_AUTH_TOKEN)?.trim().orEmpty()
         if (serverUrl.isEmpty() || token.isEmpty()) return null
         return NotesConfig(serverUrl = serverUrl, token = token, remoteDir = REMOTE_DIR)
     }
@@ -267,11 +269,6 @@ class GtdActivity : AppCompatActivity() {
 
         /** org 文件上传时的 Content-Type。 */
         private const val ORG_CONTENT_TYPE = "text/plain; charset=utf-8"
-
-        /** 同步配置的 SharedPreferences 名称与键（MVP 约定）。 */
-        private const val SYNC_PREFS = "notes_sync"
-        private const val KEY_SERVER_URL = "server_url"
-        private const val KEY_AUTH_TOKEN = "auth_token"
 
         private const val STATE_TODO = "TODO"
         private const val STATE_DONE = "DONE"

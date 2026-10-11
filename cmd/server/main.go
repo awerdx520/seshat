@@ -107,8 +107,12 @@ func run() error {
 	//    待后续里程碑接入附件上传/下载端点。
 	attachStore := attach.NewStore(defaultAttachDir, db)
 
-	// 7. 认证：单用户令牌，REST 用 Bearer、WebDAV 用 Basic，共用同一令牌。
+	// 7. 认证：主令牌保护普通 REST 端点与 WebDAV（REST 用 Bearer、WebDAV 用
+	//    Basic）；节点令牌（NOTES_NODE_TOKEN）单独保护本地处理节点端点（任务
+	//    轮询/回传、节点注册），实现节点与客户端的最小权限隔离。nodeAuth 承载
+	//    节点令牌，未配置时节点端点回退接受主令牌（向后兼容既有部署）。
 	authenticator := auth.New(cfg.Auth.Token)
+	nodeAuth := auth.NewWithNodeToken(cfg.Auth.Token, cfg.LLM.NodeToken)
 
 	// 8. LLM 路由：云端 + 本地节点。当前 REST 端点尚未消费，仅初始化备用（任务
 	//    明确要求暂不接入 api）。
@@ -118,7 +122,7 @@ func run() error {
 	)
 
 	// 9. 组装 HTTP 路由。
-	mux, err := buildMux(cfg, db, repo, indexer, authenticator)
+	mux, err := buildMux(cfg, db, repo, indexer, authenticator, nodeAuth)
 	if err != nil {
 		return err
 	}
@@ -148,6 +152,7 @@ func run() error {
 		"webdav_public", cfg.WebDAV.Public,
 		"attach_dir", defaultAttachDir,
 		"auth_configured", cfg.Auth.Token != "",
+		"node_token_configured", cfg.LLM.NodeToken != "",
 		"cloud_llm_configured", cfg.LLM.CloudAPIKey != "",
 		"local_llm_url", cfg.LLM.LocalNodeURL,
 	)
@@ -184,13 +189,14 @@ func run() error {
 //   - /public/：对外 WebDAV（公开出口），按配置施加只读/扩展名白名单策略，
 //     并同样叠加 git 版本化与全文索引；其 handler 前缀为 "/public"，使响应
 //     href 与挂载点一致。
-func buildMux(cfg *config.Config, db *storage.DB, repo *gitver.Repo, indexer *index.Indexer, authenticator *auth.Authenticator) (*http.ServeMux, error) {
+func buildMux(cfg *config.Config, db *storage.DB, repo *gitver.Repo, indexer *index.Indexer, authenticator, nodeAuth *auth.Authenticator) (*http.ServeMux, error) {
 	mux := http.NewServeMux()
 
 	// REST API + Web UI。internal/api 的处理器自带 /api/ 认证中间件与 / 首页、
 	// /static/ 静态资源；挂在 "/api/" 与 "/" 两个前缀下，使 /api/* 走 API、
 	// / 与 /static/* 走 Web UI（更具体的 /dav/、/public/ 优先匹配，互不干扰）。
-	apiHandler := api.NewHandlerFull(db, repo, indexer, authenticator)
+	// 普通端点由主令牌认证，节点端点（轮询/回传/注册）由 nodeAuth 的节点令牌认证。
+	apiHandler := api.NewHandlerFullWithNodeAuth(db, repo, indexer, authenticator, nodeAuth)
 	mux.Handle("/api/", apiHandler)
 	mux.Handle("/", apiHandler)
 

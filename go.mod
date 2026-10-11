@@ -4,6 +4,7 @@ go 1.27.1
 
 require (
 	github.com/go-git/go-git/v5 v5.19.3
+	github.com/mutecomm/go-sqlcipher/v4 v4.4.2
 	golang.org/x/net v0.61.0
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.60.1

@@ -19,6 +19,7 @@ LLM 能力由两类后端提供，二者都通过统一的 `Client` 接口接入
 - `Client` 接口只有 `Chat(ctx, []Message)`；`Message` 为 `{Role, Content}`，`Role` 取值
   `system` / `user` / `assistant`。
 - 本包只负责传输与协议适配，不含业务语义；消息内容不经加密（明文传输，TLS 由链路层保证）。
+- 两套**本地**交互机制（同步直连 vs 异步任务队列）的分工与选择依据见下文「后端选择契约」。
 
 ## 路由策略
 
@@ -30,6 +31,51 @@ LLM 能力由两类后端提供，二者都通过统一的 `Client` 接口接入
 - 目标后端未配置（为 `nil`）时返回错误（`llm: 云端后端未配置` / `llm: 本地后端未配置`）。
 
 路由规则可配置，默认云端；需本地模型的任务显式标记 `route=local` 即走本地处理节点。
+
+## 后端选择契约
+
+系统并存两套**本地** LLM 交互机制，定位不同、互补而非替代（对应 `openspec/tech-debt.md`
+#2）。二者**不互相打通**：同步直连不写队列，异步队列不回调直连，由调用方按场景显式选择。
+
+| 维度 | 同步直连 | 异步任务队列 |
+|---|---|---|
+| 实现 | `LocalNodeClient`（`internal/llm/local.go`） | `llm_tasks` 表 + `cmd/llmnode` worker（`internal/storage` / `internal/api`） |
+| 适用场景 | 本地节点与服务端**同机**；需要**即时**返回结果的短任务 | 本地节点在**另一台机器（家庭网络）**；**长耗时**任务（大文档解析等） |
+| 调用方式 | 能力函数传入 `Router`，`route=local` 时同步调用 `{nodeURL}/v1/chat/completions` | 入队 `POST /api/llm/tasks` → 节点轮询领取 → 推理 → 回传 → 客户端异步取 |
+| 结果获取 | 调用即返回 | 提交得任务 id，稍后按 id 取结果（异步） |
+| 前置条件 | 已显式配置 `llm.local_node_url`（见下） | 有本地节点 worker 轮询该服务端 |
+| 失败语义 | 同步返回错误（`llm: 本地后端未配置` / HTTP 错误） | 任务标记 `failed`，原因写入 `result` 列 |
+
+**选择依据**：① 节点与服务端同机、且需即时结果 → 同步直连（能力函数当前走此路径）；
+② 节点跨机（家庭网络）或任务长耗时 → 异步任务队列，避免服务端 HTTP 请求长时间挂起。
+
+### 可用性判断 `Router.LocalDirectAvailable`
+
+`internal/llm/backend.go` 提供 `Router.LocalDirectAvailable() bool`，报告「同步直连是否
+已配置」：
+
+- 持有**显式配置了 URL** 的 `LocalNodeClient`（`NewLocal("http://…")`）→ `true`；
+- `NewLocal("")`（URL 回退默认 `http://localhost:11434`）→ `false`，此时应按「本地节点
+  可能不在本机」处理，改用异步入队；
+- 未提供本地后端（`NewRouter` 的 `local` 为 `nil`）→ `false`。
+
+> 该方法描述的是「是否显式配置」，不代表 `LocalNodeClient` 不可调用——URL 未配置时它
+> 仍会打到默认地址。`route=local` 的实际可路由性仍由 `ChatRoute` 的错误返回判定。
+
+### 异步入队契约 `TaskSubmitter`
+
+`internal/llm` 在 `backend.go` 定义提交接口 `TaskSubmitter`，供「长任务异步入队」使用：
+
+```go
+type TaskSubmitter interface {
+    SubmitLLMTask(ctx context.Context, kind string, payload []byte, route Route) (int64, error)
+}
+```
+
+该接口由 `internal/llm` 定义、由 **api 层注入实现**（典型实现包裹
+`internal/storage.CreateLLMTask`，完成 `Route` → `route` 字符串与 `[]byte` → payload 字符串
+的适配），使 `internal/llm` 不反向依赖 `storage` / `api`。当前能力函数统一走同步直连，
+异步入队路径待上层按场景接入。
 
 ## 配置项
 
@@ -110,7 +156,7 @@ SM-2 易度因子下限 1.3、默认 2.5，判定「答对」的最低评分为 
 
 ## 相关文件
 
-- 接入层与路由：[`internal/llm/`](../internal/llm/)（`client.go` / `cloud.go` / `local.go` / `router.go`）
+- 接入层与路由：[`internal/llm/`](../internal/llm/)（`client.go` / `cloud.go` / `local.go` / `router.go` / `backend.go`）
 - 能力实现：[`internal/llm/analyze.go`](../internal/llm/analyze.go)、`review.go`、`summarize.go`、`reading.go`、`schedule.go`
 - 任务队列数据层：[`internal/storage/llmtask.go`](../internal/storage/llmtask.go)
 - 服务端端点：[`internal/api/server.go`](../internal/api/server.go)

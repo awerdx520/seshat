@@ -36,8 +36,11 @@ type Annotation struct {
 
 // SetProgress 写入或覆盖文档的阅读进度（同 document_id 后写覆盖）。
 //
-// updatedAt 为空时回填当前 UTC 时间；非 RFC3339 格式、或 documentID/position
-// 为空时返回 ErrInvalidArgument 包装的错误。
+// 乐观冲突检测：当客户端显式提供 updatedAt（非空）且服务端已存记录的
+// updated_at 晚于该值（即客户端基于旧版本写入）时，返回 ErrConflict 且不覆盖；
+// 相等或更新则正常覆盖。updatedAt 为空时回填当前 UTC 时间并视为无条件写入，
+// 以保持向后兼容。非 RFC3339 格式、或 documentID/position 为空时返回
+// ErrInvalidArgument 包装的错误。
 func (d *DB) SetProgress(documentID, position, updatedAt string) error {
 	if strings.TrimSpace(documentID) == "" {
 		return logging.NewAppError(logging.ErrInvalidArgument, "document_id 不能为空")
@@ -48,6 +51,14 @@ func (d *DB) SetProgress(documentID, position, updatedAt string) error {
 	ts, err := normalizeTimestamp(updatedAt)
 	if err != nil {
 		return err
+	}
+
+	// 仅在客户端带了时间戳时做冲突检测；空时间戳表示无条件写入。
+	if strings.TrimSpace(updatedAt) != "" {
+		if err := d.assertNotStale(
+			`SELECT updated_at FROM reading_progress WHERE document_id = ?`, documentID, ts); err != nil {
+			return err
+		}
 	}
 
 	// UPSERT：document_id 为主键，冲突时覆盖 position 与 updated_at（后写覆盖语义）。
@@ -146,7 +157,21 @@ func (d *DB) ListAnnotations(documentID string) ([]Annotation, error) {
 
 // UpdateAnnotation 整体替换批注的 location 与 text，保留 created_at 并刷新 updated_at。
 // 目标 id 不存在时返回 ErrNotFound，必填字段为空时返回 ErrInvalidArgument。
+//
+// 该方法是 UpdateAnnotationAt(id, location, text, "") 的便捷形式：不携带客户端
+// 时间戳，即无条件覆盖（保持向后兼容）。
 func (d *DB) UpdateAnnotation(id int64, location, text string) (*Annotation, error) {
+	return d.UpdateAnnotationAt(id, location, text, "")
+}
+
+// UpdateAnnotationAt 整体替换批注的 location 与 text，保留 created_at。
+//
+// 乐观冲突检测：updatedAt 非空时既作为新的 updated_at，又用于比较——若服务端
+// 已存记录的 updated_at 晚于该值（客户端基于旧版本写入），返回 ErrConflict 且
+// 不覆盖。updatedAt 为空时由服务端回填当前 UTC 时间并视为无条件覆盖（等价于
+// UpdateAnnotation）。目标 id 不存在时返回 ErrNotFound，必填字段为空或时间戳
+// 格式非法时返回 ErrInvalidArgument。
+func (d *DB) UpdateAnnotationAt(id int64, location, text, updatedAt string) (*Annotation, error) {
 	if id <= 0 {
 		return nil, logging.NewAppError(logging.ErrInvalidArgument, "批注 id 非法")
 	}
@@ -156,11 +181,23 @@ func (d *DB) UpdateAnnotation(id int64, location, text string) (*Annotation, err
 	if text == "" {
 		return nil, logging.NewAppError(logging.ErrInvalidArgument, "text 不能为空")
 	}
+	ts, err := normalizeTimestamp(updatedAt)
+	if err != nil {
+		return nil, err
+	}
 
-	now := time.Now().UTC().Format(timestampLayout)
+	// 仅在客户端带了时间戳时做冲突检测；空时间戳表示无条件覆盖。
+	// 目标 id 不存在时 assertNotStale 视作可写，随后 UPDATE 影响 0 行会返回 ErrNotFound。
+	if strings.TrimSpace(updatedAt) != "" {
+		if err := d.assertNotStale(
+			`SELECT updated_at FROM annotations WHERE id = ?`, id, ts); err != nil {
+			return nil, err
+		}
+	}
+
 	res, err := d.db.Exec(
 		`UPDATE annotations SET location = ?, text = ?, updated_at = ? WHERE id = ?`,
-		location, text, now, id)
+		location, text, ts, id)
 	if err != nil {
 		return nil, logging.Wrap(err, logging.ErrInternal, "更新批注失败")
 	}
@@ -221,4 +258,25 @@ func normalizeTimestamp(ts string) (string, error) {
 		return "", logging.Wrap(err, logging.ErrInvalidArgument, "updated_at 必须是 RFC3339 时间戳")
 	}
 	return parsed.UTC().Format(timestampLayout), nil
+}
+
+// assertNotStale 读取 query 命中的现有 updated_at，若其晚于 incoming 则返回
+// ErrConflict（乐观冲突检测）；无现有记录时视为可写（返回 nil）。
+//
+// query 必须按单个参数查询并只返回 updated_at 一列；incoming 需是经
+// normalizeTimestamp 规范化的 RFC3339 UTC 文本，与库中存储格式一致——两者均
+// 以 Z 结尾且定长，故字典序比较等价于时间序比较。
+func (d *DB) assertNotStale(query string, key any, incoming string) error {
+	var existing string
+	err := d.db.QueryRow(query, key).Scan(&existing)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return nil
+	case err != nil:
+		return logging.Wrap(err, logging.ErrInternal, "读取现有 updated_at 失败")
+	}
+	if existing > incoming {
+		return logging.NewAppError(logging.ErrConflict, "客户端 updated_at 早于服务端记录，拒绝覆盖")
+	}
+	return nil
 }

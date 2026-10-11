@@ -35,6 +35,11 @@ type Server struct {
 	// indexer 提供笔记正文的全文检索能力（M5.1）；为 nil 时搜索端点返回 503
 	// （能力未启用），其余端点不受影响。
 	indexer *index.Indexer
+
+	// nodeAuth 为本地处理节点端点提供独立认证（节点令牌）。为 nil 时节点端点
+	// 回退使用主 Authenticator（此时若其未配置节点令牌，则回退接受主令牌，
+	// 即既有单令牌行为）。
+	nodeAuth *auth.Authenticator
 }
 
 // progressResponse 是阅读进度的对外表示。
@@ -71,6 +76,9 @@ type annotationCreateRequest struct {
 type annotationUpdateRequest struct {
 	Location string `json:"location"`
 	Text     string `json:"text"`
+	// UpdatedAt 是客户端视角的批注版本时间戳：非空时用于乐观冲突检测，
+	// 早于服务端记录则返回 409；为空时由服务端回填当前时间（无条件覆盖）。
+	UpdatedAt string `json:"updated_at"`
 }
 
 // errorResponse 是统一错误响应体。
@@ -182,7 +190,7 @@ type nodeRegisterResponse struct {
 // 端点（文件历史、某版本内容、共同祖先）时改用 NewHandlerWithRepo，需要
 // 全文搜索端点时改用 NewHandlerFull。
 func NewHandler(db *storage.DB, a *auth.Authenticator) http.Handler {
-	return newServer(db, nil, nil).handler(a)
+	return newServer(db, nil, nil, nil).handler(a)
 }
 
 // NewHandlerWithRepo 在 NewHandler 的基础上追加版本查询端点，复用同一套 mux
@@ -191,7 +199,7 @@ func NewHandler(db *storage.DB, a *auth.Authenticator) http.Handler {
 // repo 提供文件历史/某版本内容/共同祖先能力；repo 为 nil 时不注册版本查询
 // 路由（请求落到 ServeMux 默认 404）。
 func NewHandlerWithRepo(db *storage.DB, repo *gitver.Repo, a *auth.Authenticator) http.Handler {
-	return newServer(db, repo, nil).handler(a)
+	return newServer(db, repo, nil, nil).handler(a)
 }
 
 // NewHandlerFull 构造包含全部能力的 REST 处理器：在 NewHandlerWithRepo 的基础上
@@ -199,22 +207,50 @@ func NewHandlerWithRepo(db *storage.DB, repo *gitver.Repo, a *auth.Authenticator
 //
 // indexer 为 nil 时仍注册搜索端点，但调用返回 503（检索能力未启用）。Web UI
 // 静态资源为公开资源（不走 Bearer 认证），其页面内脚本再携带令牌调用 /api/*。
+//
+// 节点端点（轮询/回传/注册）复用主 Authenticator 的节点令牌校验：当 a 由
+// NewWithNodeToken 构造并配置了节点令牌时按节点令牌认证，否则回退主令牌。
+// 需要节点令牌与主令牌使用不同 Authenticator 实例时改用 NewHandlerFullWithNodeAuth。
 func NewHandlerFull(db *storage.DB, repo *gitver.Repo, indexer *index.Indexer, a *auth.Authenticator) http.Handler {
-	return newServer(db, repo, indexer).handler(a)
+	return newServer(db, repo, indexer, nil).handler(a)
+}
+
+// NewHandlerFullWithNodeAuth 在 NewHandlerFull 的基础上，为节点端点（任务轮询、
+// 结果回传、节点注册）单独指定认证器 nodeAuth（承载节点令牌）。
+//
+// 其余 /api/ 端点仍由主 Authenticator a 保护，从而将节点与客户端令牌隔离：
+// 主令牌不能访问节点端点（当 nodeAuth 配置了节点令牌时），节点令牌也不能访问
+// 普通端点。nodeAuth 为 nil 时回退使用 a（等价于 NewHandlerFull）。
+func NewHandlerFullWithNodeAuth(db *storage.DB, repo *gitver.Repo, indexer *index.Indexer, a, nodeAuth *auth.Authenticator) http.Handler {
+	return newServer(db, repo, indexer, nodeAuth).handler(a)
 }
 
 // newServer 组装处理器依赖。
-func newServer(db *storage.DB, repo *gitver.Repo, indexer *index.Indexer) *Server {
-	return &Server{db: db, repo: repo, indexer: indexer}
+func newServer(db *storage.DB, repo *gitver.Repo, indexer *index.Indexer, nodeAuth *auth.Authenticator) *Server {
+	return &Server{db: db, repo: repo, indexer: indexer, nodeAuth: nodeAuth}
 }
 
-// handler 组装顶层处理器：API 路由（/api/）整体套 Bearer 认证中间件，
-// Web UI 静态资源（/ 首页与 /static/）公开提供。
+// handler 组装顶层处理器：普通 API 路由（/api/）整体套主 Bearer 认证中间件，
+// 节点端点（任务轮询/回传、节点注册）单独套节点令牌认证中间件，Web UI 静态资源
+// （/ 首页与 /static/）公开提供。
 //
 // 之所以把静态资源排除在认证之外：浏览器导航无法携带 Authorization 头，
 // 页面内的 JS 再从 localStorage 读取令牌调用受保护的 /api/* 端点。
 func (s *Server) handler(a *auth.Authenticator) http.Handler {
 	root := http.NewServeMux()
+
+	// 节点端点使用独立的节点令牌认证：优先用 nodeAuth（承载节点令牌），未注入时
+	// 回退主认证器 a。这些模式比 "/api/" 更具体，Go 1.22 的 ServeMux 会优先匹配，
+	// 从而把节点端点从主认证中间件中分离出来——当节点令牌已配置时，主令牌访问
+	// 节点端点返回 401；节点令牌也不能访问普通端点，实现节点与客户端的最小权限隔离。
+	nodeAuth := s.nodeAuth
+	if nodeAuth == nil {
+		nodeAuth = a
+	}
+	root.Handle("GET /api/llm/tasks/poll", nodeAuth.NodeMiddleware(http.HandlerFunc(s.handlePollLLMTask)))
+	root.Handle("POST /api/llm/tasks/{id}/result", nodeAuth.NodeMiddleware(http.HandlerFunc(s.handleLLMTaskResult)))
+	root.Handle("POST /api/llm/nodes/register", nodeAuth.NodeMiddleware(http.HandlerFunc(s.handleRegisterNode)))
+
 	root.Handle("/api/", a.Middleware(s.routes()))
 	// GET /{$} 精确匹配根路径（不含其下子路径），避免与 "/api/" 子树路由冲突。
 	root.Handle("GET /{$}", webIndexHandler())
@@ -235,12 +271,10 @@ func (s *Server) routes() *http.ServeMux {
 	// 全文搜索端点（M5.1）：命中返回 path 列表；indexer 为 nil 时返回 503。
 	mux.HandleFunc("GET /api/search", s.handleSearch)
 
-	// LLM 任务队列端点（M6.2）：任务创建、本地处理节点轮询、结果回传与节点注册。
-	// 四者均复用同一 Bearer 认证中间件与统一 JSON 错误体。
+	// LLM 任务创建端点（M6.2）：客户端（主令牌）提交任务入队。本地处理节点
+	// 端点（任务轮询、结果回传、节点注册）不使用主认证中间件，改由 handler
+	// 单独以节点令牌认证（见 handler 中的节点路由注册）。
 	mux.HandleFunc("POST /api/llm/tasks", s.handleCreateLLMTask)
-	mux.HandleFunc("GET /api/llm/tasks/poll", s.handlePollLLMTask)
-	mux.HandleFunc("POST /api/llm/tasks/{id}/result", s.handleLLMTaskResult)
-	mux.HandleFunc("POST /api/llm/nodes/register", s.handleRegisterNode)
 
 	if s.repo != nil {
 		// {path...} 匹配含子目录的多段路径（如 sub/a.org），文件历史与某版本
@@ -343,6 +377,7 @@ func (s *Server) handleListAnnotations(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleUpdateAnnotation 整体替换批注内容（created_at 保持不变）。
+// 请求体带 updated_at 时做乐观冲突检测：旧于服务端记录返回 409。
 func (s *Server) handleUpdateAnnotation(w http.ResponseWriter, r *http.Request) {
 	id, err := parseAnnotationID(r.PathValue("id"))
 	if err != nil {
@@ -356,7 +391,7 @@ func (s *Server) handleUpdateAnnotation(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	annotation, err := s.db.UpdateAnnotation(id, req.Location, req.Text)
+	annotation, err := s.db.UpdateAnnotationAt(id, req.Location, req.Text, req.UpdatedAt)
 	if err != nil {
 		writeError(w, err)
 		return

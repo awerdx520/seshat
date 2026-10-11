@@ -54,6 +54,9 @@ dependencies {
     // JSON：kotlinx.serialization
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
 
+    // 安全存储：同步令牌（auth_token）经 EncryptedSharedPreferences 加密保存
+    implementation("androidx.security:security-crypto:1.1.0-alpha06")
+
     // 阅读：章节分页（左右滑动切换章节）
     implementation("androidx.viewpager2:viewpager2:1.1.0")
     // 阅读：WebViewAssetLoader —— 以 https 虚拟域提供 epub 内资源，规避 file:// 访问限制

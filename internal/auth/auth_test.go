@@ -173,3 +173,72 @@ func TestMiddlewareAuthenticated(t *testing.T) {
 		t.Errorf("状态码 = %d, 期望 %d（next 的响应）", rec.Code, http.StatusTeapot)
 	}
 }
+
+// TestAuthenticateNodeUsesNodeToken 验证配置节点令牌后，节点端点校验节点令牌：
+// 节点令牌通过、主令牌被拒绝（角色隔离）。
+func TestAuthenticateNodeUsesNodeToken(t *testing.T) {
+	a := NewWithNodeToken("main", "node")
+	if !a.AuthenticateNode(newRequest(t, "Bearer node")) {
+		t.Error("节点令牌应通过节点端点认证")
+	}
+	if a.AuthenticateNode(newRequest(t, "Bearer main")) {
+		t.Error("主令牌不应通过节点端点认证")
+	}
+}
+
+// TestAuthenticateNodeFallsBackToMainToken 验证未配置节点令牌时节点端点回退接受主令牌。
+func TestAuthenticateNodeFallsBackToMainToken(t *testing.T) {
+	a := NewWithNodeToken("main", "")
+	if !a.AuthenticateNode(newRequest(t, "Bearer main")) {
+		t.Error("未配置节点令牌时应回退接受主令牌")
+	}
+}
+
+// TestAuthenticateNodeEmptyRejectsAll 验证主令牌与节点令牌均未配置时节点端点拒绝所有请求。
+func TestAuthenticateNodeEmptyRejectsAll(t *testing.T) {
+	a := NewWithNodeToken("", "")
+	if a.AuthenticateNode(newRequest(t, "Bearer anything")) {
+		t.Error("未配置任何令牌时节点端点应拒绝请求")
+	}
+}
+
+// TestMainTokenRejectsNodeToken 验证主令牌端点不接受节点令牌（反向隔离）。
+func TestMainTokenRejectsNodeToken(t *testing.T) {
+	a := NewWithNodeToken("main", "node")
+	if a.Authenticate(newRequest(t, "Bearer node")) {
+		t.Error("节点令牌不应通过主端点认证")
+	}
+	if !a.Authenticate(newRequest(t, "Bearer main")) {
+		t.Error("主令牌应通过主端点认证")
+	}
+}
+
+// TestNodeMiddleware 验证节点中间件：节点令牌透传、主令牌返回 401 且不透传。
+func TestNodeMiddleware(t *testing.T) {
+	a := NewWithNodeToken("main", "node")
+
+	called := false
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusTeapot)
+	})
+
+	// 节点令牌：透传。
+	rec := httptest.NewRecorder()
+	a.NodeMiddleware(next).ServeHTTP(rec, newRequest(t, "Bearer node"))
+	if !called || rec.Code != http.StatusTeapot {
+		t.Errorf("节点令牌应透传到 next: called=%v code=%d", called, rec.Code)
+	}
+
+	// 主令牌：401 且不透传。
+	called = false
+	rec = httptest.NewRecorder()
+	a.NodeMiddleware(next).ServeHTTP(rec, newRequest(t, "Bearer main"))
+	if called {
+		t.Error("主令牌不应透传到节点 handler")
+	}
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("状态码 = %d, 期望 %d", rec.Code, http.StatusUnauthorized)
+	}
+	assertUnauthorizedJSON(t, rec)
+}
