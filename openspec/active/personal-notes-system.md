@@ -110,19 +110,19 @@
   - 依赖：M2.1, M2.2, M2.3
 
 ### 里程碑 M3：Android 阅读器
-- [ ] M3.1 Kotlin 项目骨架 + WebDAV/REST 客户端
+- [x] M3.1 Kotlin 项目骨架 + WebDAV/REST 客户端
   - 验收：项目可编译；WebDAV PROPFIND/GET/PUT、REST CRUD 单测通过
   - 依赖：M1.1, M1.4
-- [ ] M3.2 epub 阅读（Readium）+ 批注 + 进度
+- [x] M3.2 epub 阅读（Readium）+ 批注 + 进度
   - 验收：可打开 epub、翻页、添加批注、记录进度（设备内持久化）
   - 依赖：M3.1
-- [ ] M3.3 pdf 阅读（MuPDF）+ 批注 + 进度
+- [x] M3.3 pdf 阅读（MuPDF）+ 批注 + 进度
   - 验收：可打开 pdf、翻页、批注、进度持久化
   - 依赖：M3.1
-- [ ] M3.4 进度/批注 REST 同步
+- [x] M3.4 进度/批注 REST 同步
   - 验收：阅读器进度/批注与 M1.4 服务端往返同步一致
   - 依赖：M1.4, M3.2, M3.3
-- [ ] M3.5 mobi 转 epub 导入
+- [x] M3.5 mobi 转 epub 导入
   - 验收：mobi 文件可转 epub 并导入阅读器（无 DRM 文件）
   - 依赖：M3.1
 

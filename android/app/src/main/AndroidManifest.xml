@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- 访问自托管笔记服务端（WebDAV + REST）需要网络权限 -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <application
+        android:allowBackup="true"
+        android:icon="@drawable/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.Notes">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- epub 阅读器：仅应用内启动，不对外导出 -->
+        <activity
+            android:name=".reader.EpubReaderActivity"
+            android:exported="false" />
+
+        <!-- pdf 阅读器（M3.3）：仅应用内启动，不对外导出 -->
+        <activity
+            android:name=".reader.PdfReaderActivity"
+            android:exported="false"
+            android:label="@string/title_pdf_reader" />
+    </application>
+
+</manifest>

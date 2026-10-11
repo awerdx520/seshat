@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 应用主题：Material3 日夜模式、无 ActionBar（后续阅读器需全屏阅读区） -->
+    <style name="Theme.Notes" parent="Theme.Material3.DayNight.NoActionBar" />
+</resources>
