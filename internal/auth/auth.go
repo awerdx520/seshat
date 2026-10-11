@@ -23,6 +23,11 @@ type Authenticator struct {
 	token string
 }
 
+// unauthorizedBody 是未认证请求的响应体：统一 JSON 错误格式
+// {"error":{"code":"unauthorized","message":"Unauthorized"}}，与 internal/api
+// 对外错误体（{"error":{"code","message"}}）保持一致，便于客户端统一解析。
+const unauthorizedBody = `{"error":{"code":"unauthorized","message":"Unauthorized"}}` + "\n"
+
 // New 构造 Authenticator。token 为空（未配置）时所有请求都会被拒绝。
 func New(token string) *Authenticator {
 	return &Authenticator{token: token}
@@ -82,13 +87,16 @@ func basicPassword(encoded string) string {
 	return password
 }
 
-// Middleware 包装 handler：未通过认证的请求返回 401 并附带
-// WWW-Authenticate: Bearer 响应头，认证通过则透传到 next。
+// Middleware 包装 handler：未通过认证的请求返回 401，响应体为统一 JSON 错误体
+// （Content-Type: application/json）并附带 WWW-Authenticate: Bearer 响应头，
+// 认证通过则透传到 next。
 func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !a.Authenticate(r) {
 			w.Header().Set("WWW-Authenticate", "Bearer")
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(unauthorizedBody))
 			return
 		}
 		next.ServeHTTP(w, r)

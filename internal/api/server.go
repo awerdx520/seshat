@@ -289,7 +289,7 @@ func (s *Server) handleGetProgress(w http.ResponseWriter, r *http.Request) {
 // handlePutProgress 设置（覆盖）文档的阅读进度。
 func (s *Server) handlePutProgress(w http.ResponseWriter, r *http.Request) {
 	var req progressRequest
-	if err := decodeBody(r, &req); err != nil {
+	if err := decodeBody(w, r, &req); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -312,7 +312,7 @@ func (s *Server) handlePutProgress(w http.ResponseWriter, r *http.Request) {
 // handleCreateAnnotation 创建批注并返回 201 + 完整记录（含服务端生成的 id 与时间戳）。
 func (s *Server) handleCreateAnnotation(w http.ResponseWriter, r *http.Request) {
 	var req annotationCreateRequest
-	if err := decodeBody(r, &req); err != nil {
+	if err := decodeBody(w, r, &req); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -351,7 +351,7 @@ func (s *Server) handleUpdateAnnotation(w http.ResponseWriter, r *http.Request) 
 	}
 
 	var req annotationUpdateRequest
-	if err := decodeBody(r, &req); err != nil {
+	if err := decodeBody(w, r, &req); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -501,7 +501,7 @@ func (s *Server) handleDiff(w http.ResponseWriter, r *http.Request, path string)
 // 返回 400；文件在该版本不存在返回 404；版本无法解析返回 400。
 func (s *Server) handleRevert(w http.ResponseWriter, r *http.Request) {
 	var req revertRequest
-	if err := decodeBody(r, &req); err != nil {
+	if err := decodeBody(w, r, &req); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -603,7 +603,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 // 的原始 JSON 文本，对队列透明，由任务类型与执行方（云端调用方或本地节点）解释。
 func (s *Server) handleCreateLLMTask(w http.ResponseWriter, r *http.Request) {
 	var req llmTaskCreateRequest
-	if err := decodeBody(r, &req); err != nil {
+	if err := decodeBody(w, r, &req); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -643,7 +643,7 @@ func (s *Server) handleLLMTaskResult(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req llmTaskResultRequest
-	if err := decodeBody(r, &req); err != nil {
+	if err := decodeBody(w, r, &req); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -670,7 +670,7 @@ func (s *Server) handleLLMTaskResult(w http.ResponseWriter, r *http.Request) {
 // 不维护心跳与在线状态（是否在线由后续轮询行为推断）。node_name 为空返回 400。
 func (s *Server) handleRegisterNode(w http.ResponseWriter, r *http.Request) {
 	var req nodeRegisterRequest
-	if err := decodeBody(r, &req); err != nil {
+	if err := decodeBody(w, r, &req); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -742,10 +742,24 @@ func parsePositiveID(raw, label string) (int64, error) {
 	return id, nil
 }
 
-// decodeBody 解析请求体 JSON；非法请求体返回 ErrInvalidArgument。
-func decodeBody(r *http.Request, dst any) error {
+// maxBodyBytes 是单个请求体的字节上限（1 MiB）。超过上限的请求在解码阶段即被
+// 拒绝（400），避免超大请求被完整读入内存。
+const maxBodyBytes = 1 << 20
+
+// decodeBody 解析请求体 JSON；请求体超过 maxBodyBytes 或不是合法 JSON 时返回
+// ErrInvalidArgument（映射为 400）。
+//
+// 用 http.MaxBytesReader 限制可读取的字节数（超限时 Decode 返回 *http.MaxBytesError）；
+// 用 DisallowUnknownFields 拒绝目标结构体未声明的字段，尽早暴露客户端字段拼写错误。
+func decodeBody(w http.ResponseWriter, r *http.Request, dst any) error {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(dst); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			return logging.NewAppError(logging.ErrInvalidArgument, "请求体超过 1 MiB 上限")
+		}
 		return logging.Wrap(err, logging.ErrInvalidArgument, "请求体不是合法 JSON")
 	}
 	return nil

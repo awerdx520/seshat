@@ -1,9 +1,11 @@
 package index
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 
+	"notes/internal/logging"
 	"notes/internal/storage"
 )
 
@@ -199,5 +201,28 @@ func TestIndexRejectsEmptyPath(t *testing.T) {
 
 	if err := ix.Index("", "content"); err == nil {
 		t.Fatal("Index 空 path 应返回错误，实际返回 nil")
+	}
+}
+
+// TestSearchInvalidMATCHReturnsInvalidArgument 验证非法 FTS5 MATCH 表达式
+// （如未闭合引号）被映射为 ErrInvalidArgument（而非 ErrInternal），使 API 层
+// 能据此返回 400 而非 500。用户输入直接作为 MATCH 表达式时语法错误属客户端错误。
+func TestSearchInvalidMATCHReturnsInvalidArgument(t *testing.T) {
+	ix := newTestIndexer(t)
+	if err := ix.Index("note.org", "hello world"); err != nil {
+		t.Fatalf("Index 失败: %v", err)
+	}
+
+	// 未闭合的双引号是 FTS5 非法语法。
+	_, err := ix.Search(`"unclosed`, 10)
+	if err == nil {
+		t.Fatal("非法 MATCH 表达式应返回错误，实际返回 nil")
+	}
+	var appErr *logging.AppError
+	if !errors.As(err, &appErr) {
+		t.Fatalf("错误类型 = %T, 期望 *logging.AppError (%v)", err, err)
+	}
+	if appErr.Code != logging.ErrInvalidArgument {
+		t.Errorf("错误码 = %q, 期望 %q", appErr.Code, logging.ErrInvalidArgument)
 	}
 }

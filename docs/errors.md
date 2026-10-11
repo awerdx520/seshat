@@ -21,7 +21,7 @@
 
 ## 2. 错误响应体
 
-除认证中间件产生的 401 外，REST 错误统一为 JSON：
+REST 错误统一为 JSON（含认证中间件产生的 401）：
 
 ```json
 {
@@ -35,19 +35,21 @@
 - `code`：稳定标识，见上表；客户端按它分支处理，不要依赖 `message` 文本。
 - `message`：面向用户的可读信息，可能随版本调整；不含底层错误细节。
 
-### 2.1 认证失败（401）的例外格式
+### 2.1 认证失败（401）
 
-认证由 `internal/auth` 的中间件统一返回，早于 JSON 编码层：
+认证由 `internal/auth` 的中间件统一返回，响应体与其他 REST 错误一致：
 
 ```
 HTTP/1.1 401 Unauthorized
 WWW-Authenticate: Bearer
-Content-Type: text/plain; charset=utf-8
+Content-Type: application/json; charset=utf-8
 
-Unauthorized
+{"error":{"code":"unauthorized","message":"Unauthorized"}}
 ```
 
-即 401 的响应体为纯文本 `Unauthorized`，客户端不应按 JSON 解析。
+即 401 返回 JSON 错误体
+`{"error":{"code":"unauthorized","message":"Unauthorized"}}`，并保留
+`WWW-Authenticate: Bearer` 响应头；客户端可按 JSON 错误体统一解析。
 
 ## 3. 各端点错误码
 

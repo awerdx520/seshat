@@ -2,8 +2,10 @@ package auth
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -84,7 +86,8 @@ func TestAuthenticateEmptyTokenRejectsAll(t *testing.T) {
 	}
 }
 
-// TestMiddlewareUnauthorized 验证未认证请求返回 401、WWW-Authenticate 头且不透传。
+// TestMiddlewareUnauthorized 验证未认证请求返回 401、统一 JSON 错误体、
+// WWW-Authenticate 头且不透传。
 func TestMiddlewareUnauthorized(t *testing.T) {
 	a := New("s3cret")
 	called := false
@@ -104,6 +107,32 @@ func TestMiddlewareUnauthorized(t *testing.T) {
 	if got := rec.Header().Get("WWW-Authenticate"); got != "Bearer" {
 		t.Errorf("WWW-Authenticate = %q, 期望 \"Bearer\"", got)
 	}
+	assertUnauthorizedJSON(t, rec)
+}
+
+// assertUnauthorizedJSON 断言 401 响应体是统一格式的 JSON 错误体
+// {"error":{"code":"unauthorized","message":...}}，Content-Type 为 application/json。
+// 与 internal/api 的统一错误体保持一致，便于客户端统一解析。
+func assertUnauthorizedJSON(t *testing.T, rec *httptest.ResponseRecorder) {
+	t.Helper()
+	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
+		t.Errorf("Content-Type = %q, 期望含 application/json", ct)
+	}
+	var body struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("401 响应体不是合法 JSON: %v (body=%q)", err, rec.Body.String())
+	}
+	if body.Error.Code != "unauthorized" {
+		t.Errorf("error.code = %q, 期望 \"unauthorized\"", body.Error.Code)
+	}
+	if body.Error.Message == "" {
+		t.Error("error.message 不应为空")
+	}
 }
 
 // TestMiddlewareEmptyTokenUnauthorized 验证未配置令牌时中间件仍返回 401。
@@ -122,6 +151,7 @@ func TestMiddlewareEmptyTokenUnauthorized(t *testing.T) {
 	if got := rec.Header().Get("WWW-Authenticate"); got != "Bearer" {
 		t.Errorf("WWW-Authenticate = %q, 期望 \"Bearer\"", got)
 	}
+	assertUnauthorizedJSON(t, rec)
 }
 
 // TestMiddlewareAuthenticated 验证认证通过后透传到 next。

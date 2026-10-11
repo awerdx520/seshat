@@ -15,8 +15,8 @@
 | 时间格式 | RFC 3339（UTC），如 `2026-10-11T10:00:00Z` |
 | 错误体 | `{"error":{"code":"<code>","message":"<message>"}}`，错误码见 [errors.md](errors.md) |
 
-认证失败由公共认证中间件产生：状态 `401`、响应头 `WWW-Authenticate: Bearer`、
-响应体为纯文本 `Unauthorized`（**不是**上述 JSON 错误体）。
+认证失败由公共认证中间件产生：状态 `401`、响应头 `WWW-Authenticate: Bearer`，
+响应体为统一 JSON 错误体 `{"error":{"code":"unauthorized","message":"Unauthorized"}}`。
 
 ## 2. 端点总览
 

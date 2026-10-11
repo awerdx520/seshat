@@ -31,9 +31,9 @@
 ;; 当作 URL 路径中的单个路径段，不能包含斜杠；本模块统一用 `url-hexify-string'
 ;; 对标识做 URL 编码后再拼接路径。
 ;;
-;; 认证失败（401）由服务端公共认证中间件产生，响应体是纯文本 "Unauthorized"，
-;; 不是 `docs/api.md' 所述的 JSON 错误体；因此响应体不保证可被 JSON 解析，
-;; 调用方应先看状态码再解析。
+;; 认证失败（401）由服务端公共认证中间件产生，响应体是 JSON 错误体
+;; {"error":{"code":"unauthorized","message":"Unauthorized"}}（并保留
+;; `WWW-Authenticate' 头）；调用方仍应先看状态码，再按 JSON 解析错误体。
 
 ;;; Code:
 

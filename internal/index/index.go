@@ -87,8 +87,9 @@ func (ix *Indexer) Delete(path string) error {
 // 后返回命中的 path 列表，最多 limit 条（limit<=0 时取默认值 defaultLimit）。
 //
 // query 作为整体参数绑定到 MATCH，不做字符串拼接，因而注入不可能；但 FTS5 的
-// MATCH 表达式本身对语法敏感，非法表达式（如未闭合引号）会由 SQLite 报错并原样
-// 返回。空 query（仅空白）直接返回 nil，避免 FTS5 对空 MATCH 表达式报语法错误。
+// MATCH 表达式本身对语法敏感，非法表达式（如未闭合引号）会由 SQLite 报错——该
+// 情形属客户端输入错误，映射为 ErrInvalidArgument（API 层返回 400）而非内部错误。
+// 空 query（仅空白）直接返回 nil，避免 FTS5 对空 MATCH 表达式报语法错误。
 func (ix *Indexer) Search(query string, limit int) ([]string, error) {
 	if ix == nil || ix.db == nil {
 		return nil, logging.NewAppError(logging.ErrInvalidArgument, "索引器未初始化")
@@ -104,6 +105,12 @@ func (ix *Indexer) Search(query string, limit int) ([]string, error) {
 		`SELECT path FROM notes_fts WHERE notes_fts MATCH ? ORDER BY rank LIMIT ?`,
 		query, limit)
 	if err != nil {
+		// 用户输入直接作为 FTS5 MATCH 表达式（整体绑定，无注入）；非法语法
+		// （未闭合引号、悬空操作符等）是客户端错误，映射为 ErrInvalidArgument，
+		// 让 API 层返回 400，而非把输入问题当作服务端内部错误（500）。
+		if isInvalidMatchError(err) {
+			return nil, logging.Wrap(err, logging.ErrInvalidArgument, "全文检索查询语法非法")
+		}
 		return nil, logging.Wrap(err, logging.ErrInternal, "全文检索失败")
 	}
 	defer func() { _ = rows.Close() }()
@@ -120,4 +127,19 @@ func (ix *Indexer) Search(query string, limit int) ([]string, error) {
 		return nil, logging.Wrap(err, logging.ErrInternal, "遍历检索结果失败")
 	}
 	return paths, nil
+}
+
+// isInvalidMatchError 判断错误是否来自 FTS5 的 MATCH 表达式语法错误。
+// modernc.org/sqlite 把 FTS5 语法错误包装为形如
+// "SQL logic error: fts5: syntax error near ..." 的消息，据此按关键字识别。
+// 仅在错误确实来自 MATCH 语法时返回 true，避免把其它内部错误误判为客户端错误。
+func isInvalidMatchError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "fts5") ||
+		strings.Contains(msg, "syntax error") ||
+		strings.Contains(msg, "unterminated") ||
+		strings.Contains(msg, "malformed match")
 }

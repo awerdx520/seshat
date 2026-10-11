@@ -92,6 +92,37 @@ HREF 可为完整 URL、以 \"/\" 开头的绝对路径或相对路径。处理�
           (unless (string-empty-p rel)
             rel))))))
 
+(defun notes-sync-cmd--safe-local-path (rel)
+  "把远端返回的相对路径 REL 规范化为安全的本地相对路径。
+REL 为已按百分号解码的相对路径。返回规范化后的相对路径（以 \"/\" 分隔，
+不含 \".\" 与 \"..\" 段）；下列情况视为越界/不安全并返回 nil：
+
+  - REL 为空；
+  - REL 为绝对路径（以 \"/\" 开头）、以 \"~\" 开头（`expand-file-name'
+    会把它展开到家目录）或带 Windows 盘符前缀（如 \"C:\"）；
+  - REL 经规范化（消去 \".\"/\"..\" 段）后上溯到起始目录之外，例如
+    \"../x\"、\"a/../../b\"。
+
+该函数不触碰文件系统，是纯函数，便于单元测试；调用方（`notes-sync-pull-all'）
+仍应再用 `expand-file-name' + `file-in-directory-p' 在落盘前做一次边界校验，
+以覆盖符号链接等运行时情形。"
+  (when (and (stringp rel)
+             (not (string-empty-p rel))
+             (not (string-prefix-p "/" rel))
+             (not (string-prefix-p "~" rel))
+             (not (string-match-p "\\`[A-Za-z]:" rel)))
+    (let ((stack nil)
+          (escape nil))
+      (dolist (seg (split-string rel "/" t))
+        (cond
+         ((string= seg ".") nil)
+         ((string= seg "..")
+          (if stack (pop stack) (setq escape t)))
+         (t (push seg stack))))
+      (unless escape
+        (when stack
+          (mapconcat #'identity (nreverse stack) "/"))))))
+
 
 ;;; 顶层命令
 
@@ -99,21 +130,37 @@ HREF 可为完整 URL、以 \"/\" 开头的绝对路径或相对路径。处理�
   "拉取远端笔记目录下的全部文件到本地目录。
 对远端笔记目录（`notes-sync-remote-dir'）执行 PROPFIND（Depth: 1），从响应
 XML 提取全部 href 条目，跳过目录项，逐个 GET 到 `notes-sync-local-dir' 下
-对应的相对路径（必要时自动创建子目录）。返回成功拉取的文件数。"
+对应的相对路径（必要时自动创建子目录）。返回成功拉取的文件数。
+
+安全防御：服务端返回的 href 不可信，经 `notes-sync-cmd--safe-local-path'
+规范化并配合 `expand-file-name' + `file-in-directory-p' 校验，凡含 \"..\"、
+为绝对路径或以其他方式逃逸出 `notes-sync-local-dir' 的条目一律跳过并告警，
+不写入本地磁盘。"
   (interactive)
   (let* ((xml (notes-sync-profind ""))
          (hrefs (notes-sync-cmd--extract-hrefs xml))
          (local-dir (file-name-as-directory
                      (expand-file-name notes-sync-local-dir)))
          (count 0))
+    ;; 先确保本地目录存在，`file-in-directory-p' 在目录不存在时会误判为 nil。
+    (make-directory local-dir t)
     (dolist (href hrefs)
       (let ((rel (notes-sync-cmd--href-relative href)))
         ;; rel 为 nil 表示目录项或不在远端目录内，跳过。
         (when (and rel (not (string-suffix-p "/" rel)))
-          (let ((target (expand-file-name (url-unhex-string rel) local-dir)))
-            (make-directory (file-name-directory target) t)
-            (when (eql 0 (notes-sync-get rel target))
-              (setq count (1+ count)))))))
+          (let* ((decoded (url-unhex-string rel))
+                 (safe (notes-sync-cmd--safe-local-path decoded))
+                 (target (and safe (expand-file-name safe local-dir))))
+            (cond
+             ((null safe)
+              (message "notes-sync: 跳过不安全的远端路径 %s（疑似路径穿越）"
+                       href))
+             ((not (file-in-directory-p target local-dir))
+              (message "notes-sync: 跳过越界的远端路径 %s" href))
+             (t
+              (make-directory (file-name-directory target) t)
+              (when (eql 0 (notes-sync-get rel target))
+                (setq count (1+ count)))))))))
     (message "notes-sync: 已从远端拉取 %d 个文件" count)
     count))
 

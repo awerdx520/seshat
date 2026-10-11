@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -351,6 +352,30 @@ func TestAnnotationMalformedJSON(t *testing.T) {
 	assertErrorCode(t, rec, http.StatusBadRequest, "invalid_argument")
 }
 
+// TestRequestBodyTooLarge 验证请求体超过 1 MiB 上限时返回 400（而非 500），
+// 且错误码为 invalid_argument。
+func TestRequestBodyTooLarge(t *testing.T) {
+	h := newTestHandler(t)
+
+	// text 字段承载超过 1 MiB 的填充数据，使整个 JSON 主体超出上限。
+	big := strings.Repeat("a", 1<<20+1024)
+	payload, err := json.Marshal(map[string]string{
+		"document_id": "book-1",
+		"location":    "loc",
+		"text":        big,
+	})
+	if err != nil {
+		t.Fatalf("序列化请求体失败: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/annotations", bytes.NewReader(payload))
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	assertErrorCode(t, rec, http.StatusBadRequest, "invalid_argument")
+}
+
 // TestUnauthorized 验证缺失或错误令牌一律返回 401，且不触碰存储。
 func TestUnauthorized(t *testing.T) {
 	h := newTestHandler(t)
@@ -371,6 +396,8 @@ func TestUnauthorized(t *testing.T) {
 			if got := rec.Header().Get("WWW-Authenticate"); got == "" {
 				t.Fatalf("401 响应应带 WWW-Authenticate 头")
 			}
+			// 401 响应体为统一 JSON 错误体（code=unauthorized），便于客户端统一解析。
+			assertErrorCode(t, rec, http.StatusUnauthorized, "unauthorized")
 
 			rec = do(t, h, http.MethodPost, "/api/annotations", tc.token, map[string]string{
 				"document_id": "book-1",
