@@ -1,0 +1,52 @@
+# =============================================================================
+# notes 服务端部署编排（自托管单用户知识中枢）
+#
+# 前置准备：
+#   1. cp config.example.yaml config.yaml    # 按需修改（数据路径默认 ./data/...）
+#   2. mkdir -p data
+#   3. 写入 data/secrets.env（权限 600，禁止提交），敏感值仅经环境变量注入：
+#        NOTES_DB_KEY=...        # 数据库密钥（SQLCipher）
+#        NOTES_AUTH_TOKEN=...    # API/WebDAV 主令牌
+#        NOTES_NODE_TOKEN=...    # 可选：本地节点专用令牌（未配置则节点端点回退主令牌）
+#        NOTES_LLM_API_KEY=...   # 可选：云端 LLM API key
+#   4. docker compose up -d --build
+#
+# 数据持久化：./data → /app/data（notes.db + notes/ + files/objects/）
+# 配置：      ./config.yaml → /app/config.yaml（只读挂载）
+# 监听：      8080（server.addr，见 config.yaml）
+# =============================================================================
+services:
+  notes:
+    build: .
+    image: notes-server:local
+    container_name: notes
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/app/data
+      - ./config.yaml:/app/config.yaml:ro
+    env_file:
+      - ./data/secrets.env
+    working_dir: /app
+    restart: unless-stopped
+    # 宿主 ./data 属主 uid 与镜像内 notes 用户（默认 1000）不一致时，改为带 build args 构建：
+    #   docker build --build-arg UID=$(id -u) --build-arg GID=$(id -g) -t notes-server:local .
+
+  # ---------------------------------------------------------------------------
+  # 本地处理节点（在家庭机器 / NAS 上运行，通常不在服务器部署，故默认注释）。
+  # 取消注释前需确认 NOTES_SERVER_URL 指向可达的服务端，且容器能访问本机 Ollama。
+  # ---------------------------------------------------------------------------
+  # llmnode:
+  #   image: notes-server:local
+  #   build: .
+  #   container_name: notes-llmnode
+  #   command: ["/usr/local/bin/notes-llmnode"]
+  #   environment:
+  #     NOTES_SERVER_URL: "https://notes.example.com"    # 必填：服务端根地址
+  #     NOTES_NODE_TOKEN: "..."                          # 节点令牌（未配置则回退 NOTES_AUTH_TOKEN）
+  #     OLLAMA_URL: "http://host.docker.internal:11434"  # 本机 Ollama（Linux 可改用宿主 IP 或 network_mode: host）
+  #     OLLAMA_MODEL: "qwen2.5:7b"                       # 可选：默认本地模型
+  #     NODE_NAME: "home-nas"                            # 可选：默认取主机名
+  #   extra_hosts:
+  #     - "host.docker.internal:host-gateway"
+  #   restart: unless-stopped

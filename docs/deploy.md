@@ -360,23 +360,188 @@ systemctl is-active notes    # 期望输出 active
   [安全说明 · 4. 备份与恢复演练](security.md#4-备份与恢复演练)。
 - 建议：部署时执行一次完整恢复演练，此后每季度或每次密钥/数据盘变更后复演。
 
-## 10. 部署检查清单
+## 10. Docker 部署（替代 systemd）
+
+第 2–9 节描述 systemd 原生部署；本节提供**完全自包含的 Docker 替代方式**：镜像以
+加密构建产出（SQLCipher + FTS5），数据与密钥经卷 / 环境变量注入，**不烘焙进镜像**。
+两种方式二选一，数据布局与配置文件保持一致（检查清单见第 11 节）。
+
+相关文件：[`Dockerfile`](../Dockerfile)、[`docker-compose.yml`](../docker-compose.yml)、
+[`.dockerignore`](../.dockerignore)。
+
+### 10.1 前置要求
+
+Docker（含 Compose v2 插件）已安装：
+
+```bash
+docker --version
+docker compose version
+```
+
+复制并修改配置（容器内工作目录为 `/app`，配置默认路径 `./config.yaml`，数据路径
+`./data/...`，与 `config.example.yaml` 默认值一致）：
+
+```bash
+cp config.example.yaml config.yaml
+```
+
+生成密钥并收紧权限（`scripts/gen-secrets.sh` 默认输出 `./data/secrets.env`，且脚本已
+自动设为 600；此处显式 `chmod 600` 以确保权限正确）：
+
+```bash
+scripts/gen-secrets.sh data/secrets.env
+chmod 600 data/secrets.env
+```
+
+> 密钥文件 `data/secrets.env` 经 compose 的 `env_file` 注入（第 10.3 节），内含
+> `NOTES_DB_KEY` / `NOTES_AUTH_TOKEN` / `NOTES_NODE_TOKEN` / `NOTES_LLM_API_KEY`；
+> **禁止提交到 git**（第 4.2 节、[安全说明 · 3.3 注入方式](security.md#33-注入方式)）。
+
+### 10.2 构建与启动
+
+```bash
+# 构建镜像（多阶段；首次需下载 Go 模块 + CGO 编译，耗时较长）
+docker compose build
+
+# 后台启动 notes 服务
+docker compose up -d
+
+# 跟踪日志
+docker compose logs -f notes
+```
+
+或一步构建并启动：`docker compose up -d --build`。
+
+常用运维命令：
+
+```bash
+docker compose ps        # 查看容器状态
+docker compose restart   # 重启
+docker compose down      # 停止并移除容器（数据保留在 ./data）
+```
+
+### 10.3 卷与环境变量
+
+| 宿主 | 容器 | 说明 |
+|---|---|---|
+| `./data` | `/app/data` | **数据卷**：`notes.db`（SQLCipher 库）、笔记目录 `notes/`、附件对象库 `files/objects/`，以及密钥文件 `secrets.env` |
+| `./config.yaml` | `/app/config.yaml`（`:ro`） | **只读**挂载配置文件；容器工作目录 `/app` 与默认配置路径 `./config.yaml` 对齐 |
+| `./data/secrets.env` | —（`env_file`） | 注入 `NOTES_DB_KEY` / `NOTES_AUTH_TOKEN` / `NOTES_NODE_TOKEN` / `NOTES_LLM_API_KEY`，**不进镜像层** |
+
+> 端口映射 `8080:8080`（对应 `server.addr`，第 5 节）。生产环境应改用反向代理终止
+> TLS（第 7 节），避免将明文端口直接暴露公网。
+
+### 10.4 镜像说明
+
+- **多阶段构建**：`golang:1.27.1`（构建）→ `debian:trixie-slim`（运行），与本地 Go
+  版本（`go.mod` 要求 `go 1.27.1`）一致。
+- **加密构建**：`CGO_ENABLED=1` + `-tags "sqlcipher sqlite_fts5"`，与第 3.1 节本地命令
+  保持一致；同时产出 `notes-server` 与 `notes-llmnode` 两个二进制。
+- **非 root 运行**：容器内以 `notes` 用户（uid/gid 默认 **1000**）运行；Dockerfile
+  预建 `/app/data`，`EXPOSE 8080`，`ENTRYPOINT` 为 `notes-server`。
+- **GOPROXY 可覆盖**：构建默认使用 `https://goproxy.cn,direct`（容器内直连
+  `proxy.golang.org` 常被网络策略阻断）；如需其它源或内网代理：
+
+  ```bash
+  docker build --build-arg GOPROXY=https://goproxy.io,direct -t notes-server:local .
+  ```
+
+- **依赖层缓存**：先 `COPY go.mod go.sum` 并 `go mod download`，仅源码变更时复用缓存。
+- **glibc 一致**：runtime 与 builder 同为 Debian 13（trixie）/ glibc 2.41，
+  CGO 二进制动态链接无前向不兼容（规避 `GLIBC_x.y not found`）。
+- **宿主 uid 不一致时**：若宿主 `./data` 属主 uid 非 1000，带 build-arg 构建：
+
+  ```bash
+  docker build --build-arg UID=$(id -u) --build-arg GID=$(id -g) -t notes-server:local .
+  ```
+
+### 10.5 本地 LLM 节点（可选）
+
+本地处理节点（`cmd/llmnode`）通常运行在**家庭机器 / NAS**，而非云服务器，故
+`docker-compose.yml` 中的 `llmnode` 服务默认以**注释**形式提供，`docker compose up`
+仅启动 `notes`。若确需同机运行，取消注释并按需配置：
+
+- `NOTES_SERVER_URL`：**必填**，服务端根地址（如 `https://notes.example.com`）。
+- `NOTES_NODE_TOKEN`：节点专用令牌；未配置则回退 `NOTES_AUTH_TOKEN`。
+- `OLLAMA_URL` / `OLLAMA_MODEL`：本机 Ollama 地址与模型。Linux 下
+  `host.docker.internal` 依赖 `extra_hosts: "host.docker.internal:host-gateway"`；
+  不可用时改用宿主 IP 或 `network_mode: host`。
+- `NODE_NAME`：节点名，默认取主机名。
+
+镜像内已含 `notes-llmnode`，该服务通过 `command: ["/usr/local/bin/notes-llmnode"]`
+覆盖默认入口。
+
+### 10.6 systemd 与 Docker 对比
+
+| 维度 | systemd（第 2–9 节） | Docker（本节） |
+|---|---|---|
+| 隔离性 | 进程级；systemd 加固（`NoNewPrivileges` / `ProtectSystem=strict` / `ProtectHome` / `PrivateTmp` / `ReadWritePaths`） | 容器级；独立命名空间 + 非 root 用户（uid 1000） |
+| 部署复杂度 | 需装 Go 工具链、CGO 编译、手写单元文件、安装二进制、配置数据盘挂载 | 装 Docker 后 `docker compose up -d --build` 一条命令 |
+| 数据位置 | 本地目录 `/srv/notes/data`（建议置于 LUKS 加密盘） | 卷 `./data:/app/data`（宿主目录，同样建议置于加密盘） |
+| 密钥注入 | systemd `EnvironmentFile=/etc/notes/secrets.env` | compose `env_file: ./data/secrets.env` |
+| 加密构建 | 宿主 `CGO_ENABLED=1 go build -tags "sqlcipher sqlite_fts5"` | 镜像内多阶段构建，同为 `CGO_ENABLED=1` + 相同 tags |
+| 适用场景 | 长期稳定 VPS、精确资源/权限控制、已有 systemd 运维习惯 | 快速部署与迁移、环境一致性、不愿在宿主安装 Go 工具链 |
+
+> 两种方式共用同一份二进制、同一 `config.yaml` 与环境变量，数据布局一致；密钥管理、
+> LUKS 兜底与备份要求不变（第 2、4 节与[数据备份与恢复](backup.md)）。
+
+### 10.7 验证
+
+```bash
+# 1) 首页（Web UI）：期望 200
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8080/
+
+# 2) 未认证访问 REST：期望 401（缺失令牌被中间件拒绝）
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8080/api/
+
+# 3) 容器状态与日志
+docker compose ps
+docker compose logs -f notes
+```
+
+确认数据库为 **SQLCipher 密文**（非明文）——SQLCipher 库文件头不再是
+`SQLite format 3`：
+
+```bash
+# 文件头应为随机字节，而非 "SQLite format 3\x00"
+head -c 16 data/notes.db | xxd
+
+# 或用 file 探测：期望 not a SQLite database
+file data/notes.db
+```
+
+> 若 `data/notes.db` 头部仍为 `SQLite format 3`，说明镜像未启用 `sqlcipher` tag 或未
+> 注入 `NOTES_DB_KEY`，返回第 10.4 / 10.3 节排查。
+
+## 11. 部署检查清单
+
+> 部署方式**二选一**：systemd（第 2–9 节）或 Docker（第 10 节）。带 `[systemd]` /
+> `[Docker]` 前缀的条目只需核对所选方式；其余为两种方式通用。
 
 - [ ] VPS 与域名已就绪，域名解析指向本机
 - [ ] **LUKS 已启用**：数据盘 `cryptsetup luksFormat` + `luksOpen` + 挂载，
       且 `cryptsetup status` / `findmnt` 验证通过；开机自动解锁已写入 `/etc/crypttab`
+      （Docker 方式下 `./data` 所在盘亦须为加密盘）
 - [ ] 服务端已构建（加密构建 `-tags "sqlcipher sqlite_fts5"`，或非加密回退 + LUKS 兜底）
-- [ ] `/etc/notes/secrets.env` **权限为 0600**、属主 `root:notes`
 - [ ] **密钥已离线备份**：`NOTES_DB_KEY`（丢失 = 数据永久丢失）与 LUKS 口令/头部
       分离存放于异地离线介质
+- [ ] **密钥文件权限 0600**：`[systemd]` `/etc/notes/secrets.env` 属主 `root:notes`；
+      `[Docker]` `./data/secrets.env`（`scripts/gen-secrets.sh` 生成后 `chmod 600`）
 - [ ] `config.yaml` 已就位，`server.addr` 为 `127.0.0.1:8080`，
       `webdav.root`/`public`/`public_read_only`/`public_allow_exts` 符合预期
-- [ ] systemd 单元已部署（专用用户 `notes`、`EnvironmentFile`、`ExecStart`、
-      `Restart=on-failure`）
+- [ ] **部署方式已落地（二选一）**：
+      `[systemd]` systemd 单元已部署（专用用户 `notes`、`EnvironmentFile`、
+      `ExecStart`、`Restart=on-failure`）；
+      `[Docker]` `docker compose build` / `docker compose up -d` 成功、`docker compose ps`
+      显示 `notes` 运行中（`./data`、`./config.yaml` 卷与 `env_file: ./data/secrets.env`
+      已就位，容器以非 root uid 1000 运行）
 - [ ] **TLS 已配置**：反向代理终止 HTTPS，证书有效期正常，明文端口未暴露公网
-- [ ] 启动验证通过：`/api` 未认证返回 401、`PROPFIND /dav/` 返回 207、搜索端点返回 200
-- [ ] **服务自启**：`systemctl enable` 已执行，重启后 `systemctl is-active notes`
-      为 `active`
+- [ ] 启动验证通过：`[systemd]` `/api` 未认证返回 401、`PROPFIND /dav/` 返回 207、
+      搜索端点返回 200；`[Docker]` `curl /` 返回 200、`/api/` 返回 401
+- [ ] **SQLCipher 生效**：`data/notes.db` 文件头不是 `SQLite format 3`（非明文）
+- [ ] **服务自启**：`[systemd]` `systemctl enable` 已执行，重启后
+      `systemctl is-active notes` 为 `active`；`[Docker]` `restart: unless-stopped`
+      已配置，重启后容器自动拉起
 - [ ] **备份定时任务**已配置（cron 调用 `scripts/backup.sh`），并完成一次恢复演练
 
 ## 相关文档
@@ -387,4 +552,6 @@ systemctl is-active notes    # 期望输出 active
 - [架构设计](architecture.md) — 数据布局与存储层
 - [`deploy/notes.service.example`](../deploy/notes.service.example) — systemd 单元模板
 - [`deploy/notes.env.example`](../deploy/notes.env.example) — 环境变量模板
+- [`Dockerfile`](../Dockerfile) / [`docker-compose.yml`](../docker-compose.yml) —
+  Docker 部署（第 10 节）
 - [`scripts/gen-secrets.sh`](../scripts/gen-secrets.sh) / [`scripts/backup.sh`](../scripts/backup.sh)

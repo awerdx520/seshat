@@ -8,3 +8,7 @@ build/
 /captures
 .externalNativeBuild
 .cxx
+
+# release 签名材料（本地生成，不入 git）
+release.keystore
+keystore.properties

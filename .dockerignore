@@ -1,0 +1,50 @@
+# =============================================================================
+# 构建上下文排除清单：只保留 Go 源码与依赖清单（cmd/、internal/、go.mod、go.sum）。
+# =============================================================================
+
+# 版本控制与工具
+.git/
+.gitignore
+.github/
+
+# 非 Go 端（客户端/编辑器集成，构建镜像不需要）
+android/
+emacs/
+gradle/
+gradlew
+gradlew.bat
+*.apk
+*.aab
+build/
+release.keystore
+keystore.properties
+local.properties
+
+# 运行时数据（由 volume 挂载，不进镜像）
+data/
+*.db
+*.db-wal
+*.db-shm
+files/
+secrets/
+
+# 文档与计划工件
+docs/
+openspec/
+deploy/
+*.md
+Readme.org
+
+# 构建产物
+/bin/
+/dist/
+*.exe
+/server
+server
+notes-server
+notes-llmnode
+
+# 编辑器/系统垃圾
+.DS_Store
+*~
+*.log
