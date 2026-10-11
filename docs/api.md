@@ -9,7 +9,7 @@
 | 项 | 约定 |
 |---|---|
 | Base path | `/api` |
-| 认证 | 全部端点要求请求头 `Authorization: Bearer <token>`（令牌即 `NOTES_AUTH_TOKEN`）；缺失或错误返回 `401` |
+| 认证 | 全部端点要求请求头 `Authorization: Bearer <token>`（令牌即 `NOTES_AUTH_TOKEN`）；节点端点（`/api/llm/tasks/poll`、`/api/llm/tasks/{id}/result`、`/api/llm/nodes/register`）接受 `NOTES_NODE_TOKEN`（未配置时回退 `NOTES_AUTH_TOKEN`）；缺失或错误返回 `401` |
 | 请求体 | `application/json` |
 | 响应体 | `application/json; charset=utf-8` |
 | 时间格式 | RFC 3339（UTC），如 `2026-10-11T10:00:00Z` |

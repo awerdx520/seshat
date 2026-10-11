@@ -169,7 +169,7 @@ sudo systemctl status notes
 
 ## 5. 密钥备份
 
-密钥（`NOTES_DB_KEY`、`NOTES_AUTH_TOKEN`、`NOTES_LLM_API_KEY`）**不随数据备份迁移**，
+密钥（`NOTES_DB_KEY`、`NOTES_AUTH_TOKEN`、`NOTES_NODE_TOKEN`、`NOTES_LLM_API_KEY`）**不随数据备份迁移**，
 必须单独离线保管：
 
 - 生成：`scripts/gen-secrets.sh`（见 [安全说明 · 3.2 生成](security.md#32-生成)）；

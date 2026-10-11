@@ -19,7 +19,7 @@ Type=simple
 User=notes
 Group=notes
 WorkingDirectory=/var/lib/notes
-# 敏感环境变量（NOTES_DB_KEY / NOTES_AUTH_TOKEN / NOTES_LLM_API_KEY）由此文件注入。
+# 敏感环境变量（NOTES_DB_KEY / NOTES_AUTH_TOKEN / NOTES_NODE_TOKEN / NOTES_LLM_API_KEY）由此文件注入。
 EnvironmentFile=/etc/notes/secrets.env
 ExecStart=/usr/local/bin/notes server
 Restart=on-failure

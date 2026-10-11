@@ -146,12 +146,13 @@ sudo chown root:notes /etc/notes/secrets.env
 sudo chmod 600 /etc/notes/secrets.env
 ```
 
-脚本产出三个变量（模板见 [`deploy/notes.env.example`](../deploy/notes.env.example)）：
+密钥清单（模板见 [`deploy/notes.env.example`](../deploy/notes.env.example)）：
 
 | 变量 | 用途 | 来源 |
 |---|---|---|
 | `NOTES_DB_KEY` | 存储层数据库密钥（32 字节 hex） | 脚本生成 |
 | `NOTES_AUTH_TOKEN` | REST Bearer + WebDAV Basic 令牌 | 脚本生成 |
+| `NOTES_NODE_TOKEN` | 本地 LLM 节点专用令牌（节点端点，最小权限） | 脚本生成 |
 | `NOTES_LLM_API_KEY` | 云端 LLM API key | 脚本不生成，未启用云端 LLM 时留空 |
 
 脚本默认拒绝覆盖已存在的文件（避免误覆盖密钥），确需重生成时先删除或设 `FORCE=1`。
@@ -220,7 +221,7 @@ sudo install -d -o notes -g notes /srv/notes
 
 - `User=notes` / `Group=notes`：专用运行用户，不以 root 运行。
 - `EnvironmentFile=/etc/notes/secrets.env`：注入 `NOTES_DB_KEY` /
-  `NOTES_AUTH_TOKEN` / `NOTES_LLM_API_KEY`（权限 600，属主 `root:notes`）。
+  `NOTES_AUTH_TOKEN` / `NOTES_NODE_TOKEN` / `NOTES_LLM_API_KEY`（权限 600，属主 `root:notes`）。
 - `ExecStart=/usr/local/bin/notes-server`、`WorkingDirectory=/srv/notes`。
 - `Restart=on-failure` / `RestartSec=5s`：异常退出自动重启。
 - 最小权限加固：`NoNewPrivileges=true`、`PrivateTmp=true`、

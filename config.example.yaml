@@ -35,3 +35,4 @@ llm:
   # 云端 LLM API key：敏感，从环境变量 NOTES_LLM_API_KEY 读取，不在此处配置。
 
 # API 访问令牌：敏感，从环境变量 NOTES_AUTH_TOKEN 读取，不在此处配置。
+# LLM 节点令牌：敏感，从环境变量 NOTES_NODE_TOKEN 读取，仅保护节点端点（未配置则回退主令牌）。
