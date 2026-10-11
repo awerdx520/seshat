@@ -1,0 +1,23 @@
+# 敏感文件（密钥/令牌/密码，禁止进入 git）
+.env
+.env.*
+*.key
+*.pem
+secrets/
+
+# 数据库与本地状态
+*.db
+*.db-wal
+*.db-shm
+
+# 二进制附件对象库（运行时生成）
+files/objects/
+
+# 构建产物
+/bin/
+/dist/
+*.exe
+
+# 编辑器/系统
+.DS_Store
+*~
