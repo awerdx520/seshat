@@ -19,8 +19,24 @@ import (
 	"notes/internal/auth"
 )
 
-// davPrefix 是 WebDAV 端点使用的 URL 前缀，需与路由挂载路径一致。
+// davPrefix 是 WebDAV 端点使用的默认 URL 前缀，需与路由挂载路径一致。
+//
+// 各构造函数默认使用它；对外出口等挂载在其它前缀下的端点，可通过带 prefix
+// 参数的构造函数（如 NewPolicyVersionedHandler）覆盖，从而使 PROPFIND 等
+// 响应生成的 href 与真实挂载点一致。
 const davPrefix = "/dav"
+
+// newDAVHandler 用给定 URL 前缀与文件系统构造底层 webdav.Handler。
+//
+// prefix 必须与 handler 的挂载路径一致：webdav.Handler 以它剥掉请求路径前缀，
+// 并以它拼接 PROPFIND 等响应中的 href；前缀不匹配的请求会返回 404。
+func newDAVHandler(prefix string, fs webdav.FileSystem) *webdav.Handler {
+	return &webdav.Handler{
+		Prefix:     prefix,
+		FileSystem: fs,
+		LockSystem: webdav.NewMemLS(),
+	}
+}
 
 // Source 标记一次 WebDAV 请求的来源，供写入后的 git commit 记录使用。
 type Source string
@@ -47,12 +63,7 @@ var sourceKey = contextKey{}
 // 处理顺序：认证中间件 → 注入来源标记 → webdav.Handler，即先拒绝未认证
 // 请求，再为已认证请求附加来源标记，最后交给 WebDAV 处理器。
 func NewHandler(root string, authenticator *auth.Authenticator, source Source) http.Handler {
-	handler := &webdav.Handler{
-		Prefix:     davPrefix,
-		FileSystem: webdav.Dir(root),
-		LockSystem: webdav.NewMemLS(),
-	}
-
+	handler := newDAVHandler(davPrefix, webdav.Dir(root))
 	return authenticator.Middleware(injectSource(source, handler))
 }
 

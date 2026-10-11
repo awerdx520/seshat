@@ -3,6 +3,7 @@ package storage
 import (
 	"database/sql"
 	"testing"
+	"time"
 
 	"notes/internal/logging"
 )
@@ -248,5 +249,146 @@ func TestLLMTaskPersistsAcrossReopen(t *testing.T) {
 	}
 	if task == nil || task.ID != id {
 		t.Fatalf("重开后应领取到任务 id=%d, 实际 %+v", id, task)
+	}
+}
+
+// TestLLMTaskPollReclaimsExpiredRunning 验证节点崩溃 / 失联后遗留的孤儿 running 任务在
+// 租约过期后被 PollLLMTask 回收为 pending 并重新领取；租约未过期的 running 任务不会被抢走。
+func TestLLMTaskPollReclaimsExpiredRunning(t *testing.T) {
+	db := openTestDB(t)
+
+	id, err := db.CreateLLMTask("summarize", `{"a":1}`, LLMRouteLocal)
+	if err != nil {
+		t.Fatalf("CreateLLMTask() 返回错误: %v", err)
+	}
+
+	// 首次领取：任务置为 running。
+	first, err := db.PollLLMTask()
+	if err != nil || first == nil || first.ID != id {
+		t.Fatalf("首次领取失败: task=%+v err=%v", first, err)
+	}
+
+	// 租约未过期：running 任务不应被回收，第二次轮询无任务可领。
+	if again, err := db.PollLLMTask(); err != nil {
+		t.Fatalf("租约未过期时轮询返回错误: %v", err)
+	} else if again != nil {
+		t.Fatalf("租约未过期的 running 任务不应被回收, 实际领到 id=%d", again.ID)
+	}
+
+	// 模拟节点崩溃：把 updated_at 回拨到租约截止时间之前。
+	expired := time.Now().UTC().Add(-llmTaskLeaseTTL - time.Minute).Format(timestampLayout)
+	if _, err := db.db.Exec(
+		`UPDATE llm_tasks SET updated_at = ? WHERE id = ?`, expired, id); err != nil {
+		t.Fatalf("回拨 updated_at 失败: %v", err)
+	}
+
+	// 租约过期后再轮询：孤儿任务被回收为 pending 并重新领取。
+	reclaimed, err := db.PollLLMTask()
+	if err != nil {
+		t.Fatalf("回收轮询返回错误: %v", err)
+	}
+	if reclaimed == nil || reclaimed.ID != id {
+		t.Fatalf("过期孤儿任务应被重新领取, 实际 %+v", reclaimed)
+	}
+	if reclaimed.Status != LLMTaskRunning {
+		t.Fatalf("重新领取后状态 = %q, 期望 %q", reclaimed.Status, LLMTaskRunning)
+	}
+}
+
+// TestLLMTaskCompleteRejectsNonRunning 验证 Complete/Fail 只允许从 running 转移：
+// 对仍是 pending（未领取）的任务回传结果返回 ErrConflict，且状态与结果不被覆盖。
+func TestLLMTaskCompleteRejectsNonRunning(t *testing.T) {
+	db := openTestDB(t)
+
+	id, err := db.CreateLLMTask("summarize", `{"a":1}`, LLMRouteLocal)
+	if err != nil {
+		t.Fatalf("CreateLLMTask() 返回错误: %v", err)
+	}
+
+	assertCode(t, db.CompleteLLMTask(id, "r"), logging.ErrConflict)
+	assertCode(t, db.FailLLMTask(id, "boom"), logging.ErrConflict)
+
+	var status string
+	var result sql.NullString
+	if err := db.db.QueryRow(
+		`SELECT status, result FROM llm_tasks WHERE id = ?`, id).Scan(&status, &result); err != nil {
+		t.Fatalf("读取任务失败: %v", err)
+	}
+	if status != LLMTaskPending || result.Valid {
+		t.Fatalf("冲突回传不应改变状态/结果: status=%q result=%+v", status, result)
+	}
+}
+
+// TestLLMTaskCompleteDuplicateIsConflict 验证重复回传第二次返回 ErrConflict，
+// 且首次结果不被覆盖；已完成任务再回传失败也返回 ErrConflict。
+func TestLLMTaskCompleteDuplicateIsConflict(t *testing.T) {
+	db := openTestDB(t)
+
+	id, err := db.CreateLLMTask("summarize", `{"a":1}`, LLMRouteLocal)
+	if err != nil {
+		t.Fatalf("CreateLLMTask() 返回错误: %v", err)
+	}
+	if _, err := db.PollLLMTask(); err != nil {
+		t.Fatalf("PollLLMTask() 返回错误: %v", err)
+	}
+
+	if err := db.CompleteLLMTask(id, "第一次结果"); err != nil {
+		t.Fatalf("首次 CompleteLLMTask() 返回错误: %v", err)
+	}
+	// 第二次回传：状态已是 done → conflict，结果不被覆盖。
+	assertCode(t, db.CompleteLLMTask(id, "第二次结果"), logging.ErrConflict)
+	// done 之后再回传失败 → conflict。
+	assertCode(t, db.FailLLMTask(id, "失败"), logging.ErrConflict)
+
+	var status, result string
+	if err := db.db.QueryRow(
+		`SELECT status, result FROM llm_tasks WHERE id = ?`, id).Scan(&status, &result); err != nil {
+		t.Fatalf("读取任务失败: %v", err)
+	}
+	if status != LLMTaskDone || result != "第一次结果" {
+		t.Fatalf("重复回传后被覆盖: status=%q result=%q", status, result)
+	}
+}
+
+// TestLLMTaskRunningTransitionsStillSucceed 回归护栏：running → done 与 running → failed
+// 两条合法转移在新的状态校验下仍成功。
+func TestLLMTaskRunningTransitionsStillSucceed(t *testing.T) {
+	db := openTestDB(t)
+
+	doneID, err := db.CreateLLMTask("k1", `{"a":1}`, LLMRouteLocal)
+	if err != nil {
+		t.Fatalf("CreateLLMTask() 返回错误: %v", err)
+	}
+	failedID, err := db.CreateLLMTask("k2", `{"a":2}`, LLMRouteLocal)
+	if err != nil {
+		t.Fatalf("CreateLLMTask() 返回错误: %v", err)
+	}
+
+	if _, err := db.PollLLMTask(); err != nil { // 领取 doneID
+		t.Fatalf("首次 PollLLMTask() 返回错误: %v", err)
+	}
+	if _, err := db.PollLLMTask(); err != nil { // 领取 failedID
+		t.Fatalf("二次 PollLLMTask() 返回错误: %v", err)
+	}
+
+	if err := db.CompleteLLMTask(doneID, "结果正文"); err != nil {
+		t.Fatalf("running→done 应成功, 实际: %v", err)
+	}
+	if err := db.FailLLMTask(failedID, "连接超时"); err != nil {
+		t.Fatalf("running→failed 应成功, 实际: %v", err)
+	}
+
+	var status string
+	if err := db.db.QueryRow(`SELECT status FROM llm_tasks WHERE id = ?`, doneID).Scan(&status); err != nil {
+		t.Fatalf("读取 done 任务失败: %v", err)
+	}
+	if status != LLMTaskDone {
+		t.Fatalf("done 任务状态 = %q, 期望 %q", status, LLMTaskDone)
+	}
+	if err := db.db.QueryRow(`SELECT status FROM llm_tasks WHERE id = ?`, failedID).Scan(&status); err != nil {
+		t.Fatalf("读取 failed 任务失败: %v", err)
+	}
+	if status != LLMTaskFailed {
+		t.Fatalf("failed 任务状态 = %q, 期望 %q", status, LLMTaskFailed)
 	}
 }

@@ -43,11 +43,7 @@ var writeMethods = map[string]bool{
 // repo 为目标 git 仓库（Open 自同一 root）。NewHandler 保持原签名不变，
 // 本函数是新增入口。
 func VersionedHandler(root string, authenticator *auth.Authenticator, source Source, repo *gitver.Repo) http.Handler {
-	handler := &webdav.Handler{
-		Prefix:     davPrefix,
-		FileSystem: newVersionedFS(root, repo),
-		LockSystem: webdav.NewMemLS(),
-	}
+	handler := newDAVHandler(davPrefix, newVersionedFS(root, repo))
 	return authenticator.Middleware(commitAfterWrite(source, repo, handler))
 }
 
@@ -86,21 +82,16 @@ const orgSuffix = ".org"
 // 与 commit 失败的处理一致。repo 或 indexer 为 nil 时对应环节自动跳过。
 //
 // root、authenticator、source、repo 语义同 VersionedHandler；indexer 为全文
-// 索引器。原 VersionedHandler 签名保持不变，本函数是新增入口。
+// 索引器。原 VersionedHandler 签名保持不变，本函数是新增入口；
+// 前缀固定为默认的 davPrefix，需要自定义前缀时用 NewPolicyVersionedHandler。
 func VersionedHandlerWithIndex(root string, authenticator *auth.Authenticator, source Source, repo *gitver.Repo, indexer *index.Indexer) http.Handler {
-	handler := &webdav.Handler{
-		Prefix:     davPrefix,
-		FileSystem: newVersionedFS(root, repo),
-		LockSystem: webdav.NewMemLS(),
-	}
-	inner := commitAfterWrite(source, repo, handler)
-	return authenticator.Middleware(indexAfterWrite(root, indexer, inner))
+	return newPolicyVersionedHandler(root, authenticator, source, PolicyOptions{}, repo, indexer, davPrefix)
 }
 
 // indexAfterWrite 包装 next：请求处理完成后，若为成功响应（2xx）则按写方法
 // 维护相应的全文索引。以状态码为准可避免失败的写请求（文件未变更却返回 4xx/5xx）
-// 误删或误写索引。
-func indexAfterWrite(root string, indexer *index.Indexer, next http.Handler) http.Handler {
+// 误删或误写索引。prefix 用于把请求路径还原为仓库内相对路径。
+func indexAfterWrite(root, prefix string, indexer *index.Indexer, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rec := &statusRecorder{ResponseWriter: w}
 		next.ServeHTTP(rec, r)
@@ -110,7 +101,7 @@ func indexAfterWrite(root string, indexer *index.Indexer, next http.Handler) htt
 		if rec.status < http.StatusOK || rec.status >= http.StatusMultipleChoices {
 			return
 		}
-		updateIndexAfterWrite(root, indexer, r)
+		updateIndexAfterWrite(root, prefix, indexer, r)
 	})
 }
 
@@ -137,27 +128,28 @@ func (rec *statusRecorder) Write(b []byte) (int, error) {
 }
 
 // updateIndexAfterWrite 依据请求方法与路径更新全文索引。仅在 next 返回后调用
-// （此时写操作已完成、文件已落盘），索引失败仅记日志。
-func updateIndexAfterWrite(root string, indexer *index.Indexer, r *http.Request) {
+// （此时写操作已完成、文件已落盘），索引失败仅记日志。prefix 为该 handler 的
+// URL 前缀，用于把请求路径还原为仓库内相对路径。
+func updateIndexAfterWrite(root, prefix string, indexer *index.Indexer, r *http.Request) {
 	switch strings.ToUpper(r.Method) {
 	case http.MethodPut:
-		rel := indexRelPath(r.URL.Path)
+		rel := indexRelPath(prefix, r.URL.Path)
 		if !strings.HasSuffix(rel, orgSuffix) {
 			return
 		}
 		indexFile(root, indexer, rel)
 	case http.MethodDelete:
-		if err := indexer.Delete(indexRelPath(r.URL.Path)); err != nil {
+		if err := indexer.Delete(indexRelPath(prefix, r.URL.Path)); err != nil {
 			log.Printf("webdav: DELETE %s 后删除索引失败: %v", r.URL.Path, err)
 		}
 	case "MOVE", "COPY":
 		// MOVE 后源已不存在，删除其索引；COPY 源仍保留，不动其索引。
 		if strings.EqualFold(r.Method, "MOVE") {
-			if err := indexer.Delete(indexRelPath(r.URL.Path)); err != nil {
+			if err := indexer.Delete(indexRelPath(prefix, r.URL.Path)); err != nil {
 				log.Printf("webdav: MOVE %s 后删除源索引失败: %v", r.URL.Path, err)
 			}
 		}
-		dst := indexRelPath(r.Header.Get("Destination"))
+		dst := indexRelPath(prefix, r.Header.Get("Destination"))
 		if strings.HasSuffix(dst, orgSuffix) {
 			indexFile(root, indexer, dst)
 		}
@@ -178,36 +170,44 @@ func indexFile(root string, indexer *index.Indexer, rel string) {
 
 // indexRelPath 把 WebDAV 的请求路径或 Destination 头规范化为仓库内相对路径。
 // 输入可能是绝对 URL（MOVE/COPY 的 Destination）或绝对路径，统一取 Path 部分、
-// 剥掉 davPrefix 后再交由 blobPath 归一。无法解析时返回空串。
-func indexRelPath(raw string) string {
+// 剥掉 prefix（该 handler 的 URL 前缀，如 "/dav" 或 "/public"）后再交由 blobPath
+// 归一。无法解析时返回空串。
+func indexRelPath(prefix, raw string) string {
 	if raw == "" {
 		return ""
 	}
 	if u, err := url.Parse(raw); err == nil && u.Path != "" {
 		raw = u.Path
 	}
-	return blobPath(strings.TrimPrefix(raw, davPrefix))
+	return blobPath(strings.TrimPrefix(raw, prefix))
 }
 
-// versionedFS 包装 webdav.Dir，让返回的 FileInfo 携带 blob hash ETag。
+// versionedFS 包装任意 webdav.FileSystem，让返回的 FileInfo 携带 blob hash ETag。
 type versionedFS struct {
-	dir  webdav.Dir
+	fs   webdav.FileSystem
 	repo *gitver.Repo
 }
 
 // newVersionedFS 以 root 为挂载根构造 versionedFS。
 func newVersionedFS(root string, repo *gitver.Repo) versionedFS {
-	return versionedFS{dir: webdav.Dir(root), repo: repo}
+	return wrapVersionedFS(webdav.Dir(root), repo)
 }
 
-// Mkdir 创建目录（直接委托底层的 webdav.Dir）。
+// wrapVersionedFS 在底层文件系统 fs 之上叠加 ETag 能力，构造 versionedFS。
+// 可包装 webdav.Dir，也可包装访问策略包装（如 ReadOnlyFS/ExtWhitelistFS），
+// 使「策略 + 版本化」可叠加组合。
+func wrapVersionedFS(fs webdav.FileSystem, repo *gitver.Repo) versionedFS {
+	return versionedFS{fs: fs, repo: repo}
+}
+
+// Mkdir 创建目录（直接委托底层文件系统）。
 func (fs versionedFS) Mkdir(ctx context.Context, name string, perm os.FileMode) error {
-	return fs.dir.Mkdir(ctx, name, perm)
+	return fs.fs.Mkdir(ctx, name, perm)
 }
 
 // OpenFile 打开文件，并把返回的 File 包装成带 ETag 能力的实现。
 func (fs versionedFS) OpenFile(ctx context.Context, name string, flag int, perm os.FileMode) (webdav.File, error) {
-	f, err := fs.dir.OpenFile(ctx, name, flag, perm)
+	f, err := fs.fs.OpenFile(ctx, name, flag, perm)
 	if err != nil {
 		return nil, err
 	}
@@ -216,17 +216,17 @@ func (fs versionedFS) OpenFile(ctx context.Context, name string, flag int, perm 
 
 // RemoveAll 删除文件或目录。
 func (fs versionedFS) RemoveAll(ctx context.Context, name string) error {
-	return fs.dir.RemoveAll(ctx, name)
+	return fs.fs.RemoveAll(ctx, name)
 }
 
 // Rename 重命名/移动资源。
 func (fs versionedFS) Rename(ctx context.Context, oldName, newName string) error {
-	return fs.dir.Rename(ctx, oldName, newName)
+	return fs.fs.Rename(ctx, oldName, newName)
 }
 
 // Stat 返回文件信息，包装后的 FileInfo 实现 webdav.ETager。
 func (fs versionedFS) Stat(ctx context.Context, name string) (os.FileInfo, error) {
-	fi, err := fs.dir.Stat(ctx, name)
+	fi, err := fs.fs.Stat(ctx, name)
 	if err != nil {
 		return nil, err
 	}

@@ -17,6 +17,8 @@ import (
 	"golang.org/x/net/webdav"
 
 	"notes/internal/auth"
+	"notes/internal/gitver"
+	"notes/internal/index"
 )
 
 // isWriteFlag 判断 OpenFile 的 flag 是否含写意图。
@@ -162,13 +164,11 @@ type PolicyOptions struct {
 	AllowExts []string
 }
 
-// NewPolicyHandler 构造带访问策略的对外 WebDAV handler。
-//
-// 在裸 webdav.Dir 之上按 PolicyOptions 叠加包装：先扩展名白名单、后只读，
-// 使只读位于最外层——只读时任何写操作都最先被拒，不依赖白名单是否命中。
-// 读操作始终放行。认证与来源注入链路与 NewHandler 完全一致（先认证，再注入
-// 来源标记，最后交给 WebDAV 处理器）。
-func NewPolicyHandler(root string, authenticator *auth.Authenticator, source Source, opts PolicyOptions) http.Handler {
+// policyFS 在裸 webdav.Dir(root) 之上按 opts 叠加访问策略包装：先扩展名白名单、
+// 后只读，使只读位于最外层——只读时任何写操作都最先被拒，不依赖白名单是否命中。
+// 读操作始终放行。返回的 FileSystem 可再交给版本化包装（wrapVersionedFS）叠加
+// ETag 能力。
+func policyFS(root string, opts PolicyOptions) webdav.FileSystem {
 	var fs webdav.FileSystem = webdav.Dir(root)
 	if len(opts.AllowExts) > 0 {
 		fs = NewExtWhitelistFS(fs, opts.AllowExts)
@@ -176,11 +176,41 @@ func NewPolicyHandler(root string, authenticator *auth.Authenticator, source Sou
 	if opts.ReadOnly {
 		fs = NewReadOnlyFS(fs)
 	}
+	return fs
+}
 
-	handler := &webdav.Handler{
-		Prefix:     davPrefix,
-		FileSystem: fs,
-		LockSystem: webdav.NewMemLS(),
-	}
+// NewPolicyHandler 构造带访问策略的对外 WebDAV handler。
+//
+// 在裸 webdav.Dir 之上按 PolicyOptions 叠加包装：先扩展名白名单、后只读，
+// 使只读位于最外层——只读时任何写操作都最先被拒，不依赖白名单是否命中。
+// 读操作始终放行。认证与来源注入链路与 NewHandler 完全一致（先认证，再注入
+// 来源标记，最后交给 WebDAV 处理器）。前缀固定为默认的 davPrefix。
+func NewPolicyHandler(root string, authenticator *auth.Authenticator, source Source, opts PolicyOptions) http.Handler {
+	handler := newDAVHandler(davPrefix, policyFS(root, opts))
 	return authenticator.Middleware(injectSource(source, handler))
+}
+
+// NewPolicyVersionedHandler 构造「访问策略 + git 版本化 + 全文索引」的对外 WebDAV
+// handler：在 NewPolicyHandler 的访问策略之上叠加 versionedFS（ETag 绑定工作区
+// blob hash）与写后钩子——写方法处理完成后自动提交一次工作区变更，并按方法维护
+// FTS 全文索引（复用本包 commitAfterWrite / indexAfterWrite 逻辑）。
+//
+// prefix 为该 handler 的 URL 前缀，必须与其挂载路径一致（对外出口通常为
+// "/public"）；webdav.Handler 以它剥掉请求路径前缀，并据此拼接 PROPFIND 等响应
+// 中的 href，从而使 href 与真实挂载点对齐而非越界到默认的 "/dav"。
+//
+// 策略包装位于版本化包装之内层：只读出口的写操作仍最先被拒；随后 commit 钩子对
+// 无变更工作区为 no-op，不产生空提交，索引钩子对非 2xx 响应直接跳过。repo /
+// indexer 为 nil 时对应环节自动跳过；opts 为零值时等价于无访问策略
+// （与 VersionedHandlerWithIndex 行为一致）。
+func NewPolicyVersionedHandler(root string, authenticator *auth.Authenticator, source Source, opts PolicyOptions, repo *gitver.Repo, indexer *index.Indexer, prefix string) http.Handler {
+	return newPolicyVersionedHandler(root, authenticator, source, opts, repo, indexer, prefix)
+}
+
+// newPolicyVersionedHandler 是 NewPolicyVersionedHandler 与 VersionedHandlerWithIndex
+// 的共享实现：组装「认证 → 可选策略 → 版本化 FS → 写后 commit → 全文索引」处理链。
+func newPolicyVersionedHandler(root string, authenticator *auth.Authenticator, source Source, opts PolicyOptions, repo *gitver.Repo, indexer *index.Indexer, prefix string) http.Handler {
+	fs := wrapVersionedFS(policyFS(root, opts), repo)
+	inner := commitAfterWrite(source, repo, newDAVHandler(prefix, fs))
+	return authenticator.Middleware(indexAfterWrite(root, prefix, indexer, inner))
 }

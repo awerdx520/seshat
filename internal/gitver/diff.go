@@ -2,17 +2,13 @@
 // 与把工作区文件恢复到指定版本（Revert）。
 //
 // 两个方法都复用 merge.go 中已有的 FileContent 读取历史内容，因此不重复
-// 实现版本解析与路径规范化；写入路径（Revert）遵循与 webdav 端点一致的
-// 模式——先改工作区文件，再调用 Repo.Commit 追加一条提交，历史只增不改。
+// 实现版本解析与路径规范化；写入路径（Revert）经 WriteAndCommit 在单一
+// 临界区内完成「写工作区文件 + 提交」，避免与并发写交错，历史只增不改。
 package gitver
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
-
-	"notes/internal/logging"
 )
 
 // maxDiffCells 是逐行 diff 使用动态规划表的单元数上限。
@@ -72,27 +68,17 @@ func (r *Repo) Diff(name, fromHash, toHash string) (string, error) {
 // 文件不存在（工作区或该版本中）时自动创建（含父目录）。文件在该版本不存在
 // 返回 logging.ErrNotFound，版本无法解析返回 logging.ErrInvalidArgument。
 // 恢复到与当前内容相同的版本时不产生新提交（沿用 Commit 的语义）。
+//
+// 「写文件 + 提交」在 WriteAndCommit 的同一临界区内完成：FileContent 读取
+// 历史内容后即释放锁，若此处「先写文件、再单独 Commit」，两步之间会留出
+// 时间窗，并发写请求可覆盖同一文件（TOCTOU）；WriteAndCommit 消除了该窗口。
 func (r *Repo) Revert(name, hash string) error {
 	content, err := r.FileContent(name, hash)
 	if err != nil {
 		return err
 	}
-
-	full, err := r.resolve(name)
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
-		return logging.Wrap(err, logging.ErrInternal,
-			fmt.Sprintf("恢复 %s 时创建目录失败", name))
-	}
-	// 与 webdav 端点的写入路径一致：先落盘工作区文件，再提交一次，
-	// 提交阶段由 Repo.Commit 自行持锁串行化。
-	if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
-		return logging.Wrap(err, logging.ErrInternal,
-			fmt.Sprintf("恢复 %s 到版本 %s 失败", name, hash))
-	}
-	return r.Commit(fmt.Sprintf("revert: %s 恢复到 %s", cleanTreePath(name), shortHash(hash)))
+	return r.WriteAndCommit(name, content,
+		fmt.Sprintf("revert: %s 恢复到 %s", cleanTreePath(name), shortHash(hash)))
 }
 
 // splitLines 把内容按行切分；内容以换行结尾时去掉末尾的空元素，

@@ -38,6 +38,13 @@ const (
 	LLMTaskFailed = "failed"
 )
 
+// llmTaskLeaseTTL 是 running 任务的租约时长。
+//
+// 节点领取任务后若超过该时长仍未回传结果，视为节点崩溃 / 失联（断电、进程被 kill、
+// 网络中断等）遗留的孤儿任务；PollLLMTask 会把这类任务回收为 pending，使其重新可被
+// 其他节点领取，避免任务永久卡在 running。
+const llmTaskLeaseTTL = 5 * time.Minute
+
 // LLMTask 是队列中的一条 LLM 任务记录。
 type LLMTask struct {
 	ID        int64
@@ -85,6 +92,11 @@ func (d *DB) CreateLLMTask(kind, payload, route string) (int64, error) {
 // PollLLMTask 领取一条待处理的本地任务：按 id 升序取最早的一条 route='local' 且
 // status='pending' 的记录，在同一事务内将其置为 running 并返回（含更新后的状态与时间戳）。
 //
+// 领取前先执行租约回收：把 route='local'、status='running' 且 updated_at 早于
+// now-llmTaskLeaseTTL 的记录回退为 pending，使其重新可领——覆盖节点崩溃 / 失联后任务
+// 永久停留在 running 的情况。updated_at 与租约截止时间同为 RFC3339 UTC 定长字符串，
+// 故字典序比较等价于时间先后比较。
+//
 // 无待办任务时返回 (nil, nil)——「暂无任务」是轮询的正常结果，不是错误，调用方据此
 // 休眠后再试；事务内条件更新（WHERE status='pending'）保证同一条任务不会被重复领取。
 func (d *DB) PollLLMTask() (*LLMTask, error) {
@@ -93,6 +105,18 @@ func (d *DB) PollLLMTask() (*LLMTask, error) {
 		return nil, logging.Wrap(err, logging.ErrInternal, "开始领取 LLM 任务事务失败")
 	}
 	defer func() { _ = tx.Rollback() }()
+
+	nowTime := time.Now().UTC()
+	now := nowTime.Format(timestampLayout)
+
+	// 租约回收：把超过 TTL 仍未回传结果的孤儿 running 任务回退为 pending。
+	leaseDeadline := nowTime.Add(-llmTaskLeaseTTL).Format(timestampLayout)
+	if _, err := tx.Exec(
+		`UPDATE llm_tasks SET status = ?, updated_at = ?
+		 WHERE route = ? AND status = ? AND updated_at < ?`,
+		LLMTaskPending, now, LLMRouteLocal, LLMTaskRunning, leaseDeadline); err != nil {
+		return nil, logging.Wrap(err, logging.ErrInternal, "回收超时 LLM 任务失败")
+	}
 
 	var (
 		t      LLMTask
@@ -111,7 +135,6 @@ func (d *DB) PollLLMTask() (*LLMTask, error) {
 	}
 	t.Result = result.String
 
-	now := time.Now().UTC().Format(timestampLayout)
 	if _, err := tx.Exec(
 		`UPDATE llm_tasks SET status = ?, updated_at = ? WHERE id = ? AND status = ?`,
 		LLMTaskRunning, now, t.ID, LLMTaskPending); err != nil {
@@ -126,8 +149,12 @@ func (d *DB) PollLLMTask() (*LLMTask, error) {
 	return &t, nil
 }
 
-// CompleteLLMTask 将任务标记为成功并把 result 记为结果正文；任务不存在时返回 ErrNotFound，
-// id 非正整数时返回 ErrInvalidArgument。
+// CompleteLLMTask 将任务从 running 标记为成功，并把 result 记为结果正文。
+//
+// 仅允许 running → done 的合法转移（WHERE status='running'）：状态机不允许从 pending
+// 或已终态（done/failed，含租约回收后重新领取前的旧回传）直接跳到 done。条件更新未命中
+// 时区分两种情况：任务不存在返回 ErrNotFound；任务存在但当前状态不是 running 返回
+// ErrConflict。id 非正整数时返回 ErrInvalidArgument。
 func (d *DB) CompleteLLMTask(id int64, result string) error {
 	if id <= 0 {
 		return logging.NewAppError(logging.ErrInvalidArgument, "任务 id 必须是正整数")
@@ -135,8 +162,9 @@ func (d *DB) CompleteLLMTask(id int64, result string) error {
 
 	now := time.Now().UTC().Format(timestampLayout)
 	res, err := d.db.Exec(
-		`UPDATE llm_tasks SET status = ?, result = ?, updated_at = ? WHERE id = ?`,
-		LLMTaskDone, result, now, id)
+		`UPDATE llm_tasks SET status = ?, result = ?, updated_at = ?
+		 WHERE id = ? AND status = ?`,
+		LLMTaskDone, result, now, id, LLMTaskRunning)
 	if err != nil {
 		return logging.Wrap(err, logging.ErrInternal, "回传 LLM 任务结果失败")
 	}
@@ -145,13 +173,16 @@ func (d *DB) CompleteLLMTask(id int64, result string) error {
 		return logging.Wrap(err, logging.ErrInternal, "读取更新影响行数失败")
 	}
 	if affected == 0 {
-		return logging.Wrap(sql.ErrNoRows, logging.ErrNotFound, "LLM 任务不存在")
+		return d.llmTaskTransitionMiss(id, "LLM 任务状态已不是 running，无法回传成功结果")
 	}
 	return nil
 }
 
-// FailLLMTask 将任务标记为失败，并把 errMsg 记入 result 列作为失败原因；
-// errMsg 为空时返回 ErrInvalidArgument，任务不存在时返回 ErrNotFound。
+// FailLLMTask 将任务从 running 标记为失败，并把 errMsg 记入 result 列作为失败原因。
+//
+// 与 CompleteLLMTask 对称，仅允许 running → failed 的合法转移（WHERE status='running'）。
+// errMsg 为空时返回 ErrInvalidArgument；任务不存在时返回 ErrNotFound；任务存在但状态不是
+// running 时返回 ErrConflict。
 func (d *DB) FailLLMTask(id int64, errMsg string) error {
 	if id <= 0 {
 		return logging.NewAppError(logging.ErrInvalidArgument, "任务 id 必须是正整数")
@@ -162,8 +193,9 @@ func (d *DB) FailLLMTask(id int64, errMsg string) error {
 
 	now := time.Now().UTC().Format(timestampLayout)
 	res, err := d.db.Exec(
-		`UPDATE llm_tasks SET status = ?, result = ?, updated_at = ? WHERE id = ?`,
-		LLMTaskFailed, errMsg, now, id)
+		`UPDATE llm_tasks SET status = ?, result = ?, updated_at = ?
+		 WHERE id = ? AND status = ?`,
+		LLMTaskFailed, errMsg, now, id, LLMTaskRunning)
 	if err != nil {
 		return logging.Wrap(err, logging.ErrInternal, "标记 LLM 任务失败失败")
 	}
@@ -172,7 +204,22 @@ func (d *DB) FailLLMTask(id int64, errMsg string) error {
 		return logging.Wrap(err, logging.ErrInternal, "读取更新影响行数失败")
 	}
 	if affected == 0 {
-		return logging.Wrap(sql.ErrNoRows, logging.ErrNotFound, "LLM 任务不存在")
+		return d.llmTaskTransitionMiss(id, "LLM 任务状态已不是 running，无法回传失败结果")
 	}
 	return nil
+}
+
+// llmTaskTransitionMiss 在条件更新（WHERE status='running'）未命中任何行时判定原因：
+// 任务不存在返回 ErrNotFound；任务存在但状态不是 running 返回 ErrConflict（message 描述场景）。
+func (d *DB) llmTaskTransitionMiss(id int64, message string) error {
+	var status string
+	err := d.db.QueryRow(`SELECT status FROM llm_tasks WHERE id = ?`, id).Scan(&status)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return logging.Wrap(sql.ErrNoRows, logging.ErrNotFound, "LLM 任务不存在")
+	case err != nil:
+		return logging.Wrap(err, logging.ErrInternal, "查询 LLM 任务状态失败")
+	default:
+		return logging.NewAppError(logging.ErrConflict, message)
+	}
 }

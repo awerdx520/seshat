@@ -5,8 +5,12 @@
 //     写入始终作用于工作区文件，提交由调用方在写操作完成后显式触发。
 //   - ETag 与提交时序解耦：BlobHash 直接由工作区当前内容计算 git blob
 //     hash（sha1("blob <size>\0<content>")），未提交的内容也有稳定 ETag。
-//   - 并发串行化：提交与内容哈希共用一把互斥锁，避免「读内容」与
-//     「暂存/提交」交错导致的竞态，写请求因此串行落地。
+//   - 并发串行化：一把互斥锁串行化所有涉及工作区与 git 索引的操作（提交、
+//     内容哈希、历史读取，以及在锁内完成「写工作区文件 + 提交」的
+//     WriteAndCommit），避免「读内容」与「暂存/提交」交错导致的竞态。
+//     注意：若调用方绕过本锁直接改工作区文件、再单独调用 Commit（例如
+//     webdav 端点自行落盘），其「落盘 + 提交」不在同一临界区内，本锁不
+//     覆盖该时间窗；需要「写文件 + 提交」原子性的调用方应改用 WriteAndCommit。
 package gitver
 
 import (
@@ -26,6 +30,8 @@ import (
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/go-git/go-git/v5/plumbing/storer"
+
+	"notes/internal/logging"
 )
 
 // identityName / identityEmail 是版本化仓库的默认提交身份。
@@ -41,7 +47,8 @@ type Repo struct {
 	// root 是工作区根目录的绝对路径，BlobHash 用它定位工作区文件。
 	root string
 
-	// mu 串行化所有涉及工作区/索引的操作（提交与内容哈希）。
+	// mu 串行化所有涉及工作区/索引的操作：提交、内容哈希、历史读取，
+	// 以及在锁内完成「写工作区文件 + 提交」的 WriteAndCommit。
 	mu sync.Mutex
 }
 
@@ -94,12 +101,19 @@ func (r *Repo) Root() string {
 
 // Commit 把工作区的全部变更暂存并提交，commit message 为 message。
 //
-// 无任何变更时直接返回 nil，不产生空提交。全程持锁，
-// 因此并发写请求产生的提交被串行化，不会互相覆盖索引。
+// 无任何变更时直接返回 nil，不产生空提交。提交本身全程持锁，因此并发提交
+// 被串行化，不会互相覆盖索引。注意：本方法只保护「暂存 + 提交」，不覆盖
+// 调用方在调用前对工作区文件的写入；需要「写文件 + 提交」原子性的调用方
+// 应使用 WriteAndCommit。
 func (r *Repo) Commit(message string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return r.commitLocked(message)
+}
 
+// commitLocked 是 Commit 的持锁实现，假定调用方已持有 r.mu。
+// sync.Mutex 不可重入，故拆出无锁版本供 WriteAndCommit 等在临界区内复用。
+func (r *Repo) commitLocked(message string) error {
 	wt, err := r.repo.Worktree()
 	if err != nil {
 		return fmt.Errorf("获取工作区失败: %w", err)
@@ -126,6 +140,37 @@ func (r *Repo) Commit(message string) error {
 		return fmt.Errorf("提交失败: %w", err)
 	}
 	return nil
+}
+
+// WriteAndCommit 在同一个持锁临界区内把 content 写入工作区文件 name，
+// 随后提交一次，commit message 为 msg。
+//
+// name 为仓库内相对路径（允许前导 "/"），与 BlobHash/Revert 同策略规范化，
+// ".." 无法逃出仓库根；父目录不存在时自动创建（含多级）。「写文件」与
+// 「提交」构成单一临界区，因此与其它经同一把锁串行化的操作（Commit、
+// WriteAndCommit、Revert、BlobHash 等）之间不存在「已写文件、尚未提交」的
+// 时间窗，避免并发写覆盖同一文件（TOCTOU）。写入内容与当前一致时，
+// commitLocked 不会产生新提交，语义同 Commit。
+func (r *Repo) WriteAndCommit(name, content, msg string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.writeAndCommitLocked(name, content, msg)
+}
+
+// writeAndCommitLocked 是 WriteAndCommit 的持锁实现，假定调用方已持有 r.mu。
+func (r *Repo) writeAndCommitLocked(name, content, msg string) error {
+	full, err := r.resolve(name)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		return logging.Wrap(err, logging.ErrInternal,
+			fmt.Sprintf("写入 %s 时创建父目录失败", name))
+	}
+	if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
+		return logging.Wrap(err, logging.ErrInternal, fmt.Sprintf("写入 %s 失败", name))
+	}
+	return r.commitLocked(msg)
 }
 
 // BlobHash 返回工作区文件内容的 git blob hash（十六进制）：

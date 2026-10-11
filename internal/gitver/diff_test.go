@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"notes/internal/logging"
@@ -172,5 +173,86 @@ func TestRevertErrors(t *testing.T) {
 		assertAppErrorCode(t, err, logging.ErrInvalidArgument)
 	} else {
 		t.Error("Revert(版本非法) 期望错误，得到 nil")
+	}
+}
+
+// TestRevertConcurrentWithCommit 验证并发 Revert 与 Commit 交错执行时不 panic、
+// -race 干净、工作区与提交历史均无损坏。
+//
+// Revert 的「写文件 + 提交」在 WriteAndCommit 的同一临界区内完成；若两步分离
+// （写完文件、尚未提交时被并发 Commit 抢先），就可能提交到写了一半的工作区
+// 状态。本测试断言每个提交里 a.org 的内容都是某个版本的完整内容。
+func TestRevertConcurrentWithCommit(t *testing.T) {
+	repo, root, c1, c2 := diffFixture(t)
+
+	c1Content := "第一行\n第二行\n第三行\n"
+	c2Content := "第一行\n第二行改\n第三行\n第四行\n"
+	valid := map[string]bool{c1Content: true, c2Content: true}
+
+	const workers = 8
+	const rounds = 5
+
+	var wg sync.WaitGroup
+	errs := make(chan error, workers+1)
+
+	// 并发 Revert：奇偶 worker 交替恢复到 c1 / c2。
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			target := c1
+			if i%2 == 0 {
+				target = c2
+			}
+			for j := 0; j < rounds; j++ {
+				if err := repo.Revert("a.org", target); err != nil {
+					errs <- err
+					return
+				}
+			}
+		}(i)
+	}
+
+	// 并发的「外部提交」，模拟 webdav 端点写文件后的自动提交路径。
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for j := 0; j < workers*rounds; j++ {
+			if err := repo.Commit("并发提交"); err != nil {
+				errs <- err
+				return
+			}
+		}
+	}()
+
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Errorf("并发操作失败: %v", err)
+	}
+
+	// 工作区内容必为某个版本的完整内容（无半写/撕裂）。
+	got, err := os.ReadFile(filepath.Join(root, "a.org"))
+	if err != nil {
+		t.Fatalf("读取工作区文件失败: %v", err)
+	}
+	if !valid[string(got)] {
+		t.Errorf("工作区内容 = %q, 不是任何合法版本的完整内容", string(got))
+	}
+
+	// 提交历史完整可读，且每个提交中 a.org 的内容都是合法版本（无损坏）。
+	entries, err := repo.Log(0)
+	if err != nil {
+		t.Fatalf("Log 失败: %v", err)
+	}
+	for _, e := range entries {
+		hash := strings.SplitN(e, " ", 2)[0]
+		content, err := repo.FileContent("a.org", hash)
+		if err != nil {
+			t.Fatalf("读取提交 %s 中 a.org 失败: %v", hash, err)
+		}
+		if !valid[content] {
+			t.Errorf("提交 %s 中 a.org 内容 = %q, 不是合法版本", hash, content)
+		}
 	}
 }
