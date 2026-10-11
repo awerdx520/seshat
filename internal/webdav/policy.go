@@ -199,18 +199,26 @@ func NewPolicyHandler(root string, authenticator *auth.Authenticator, source Sou
 // "/public"）；webdav.Handler 以它剥掉请求路径前缀，并据此拼接 PROPFIND 等响应
 // 中的 href，从而使 href 与真实挂载点对齐而非越界到默认的 "/dav"。
 //
+// offset 为挂载根 root 相对 git 仓库根（repo root）的偏移，形如 "public"；空串
+// 表示 root 即仓库根（内部端点与「Public == 笔记根」的场景）。对外出口挂载在
+// 笔记根的子目录时，请求路径是「挂载根相对路径」而 BlobHash/索引 key 需要
+// 「仓库内相对路径」，故必须以 offset 前缀补齐，否则 ETag 会解析到仓库中不存在
+// 的路径（blob hash 为空、getetag 退化为 mtime 启发式），索引 key 也会与内部
+// 端点（以仓库根为基准）错位冲突。
+//
 // 策略包装位于版本化包装之内层：只读出口的写操作仍最先被拒；随后 commit 钩子对
 // 无变更工作区为 no-op，不产生空提交，索引钩子对非 2xx 响应直接跳过。repo /
 // indexer 为 nil 时对应环节自动跳过；opts 为零值时等价于无访问策略
 // （与 VersionedHandlerWithIndex 行为一致）。
-func NewPolicyVersionedHandler(root string, authenticator *auth.Authenticator, source Source, opts PolicyOptions, repo *gitver.Repo, indexer *index.Indexer, prefix string) http.Handler {
-	return newPolicyVersionedHandler(root, authenticator, source, opts, repo, indexer, prefix)
+func NewPolicyVersionedHandler(root string, authenticator *auth.Authenticator, source Source, opts PolicyOptions, repo *gitver.Repo, indexer *index.Indexer, prefix, offset string) http.Handler {
+	return newPolicyVersionedHandler(root, authenticator, source, opts, repo, indexer, prefix, offset)
 }
 
 // newPolicyVersionedHandler 是 NewPolicyVersionedHandler 与 VersionedHandlerWithIndex
 // 的共享实现：组装「认证 → 可选策略 → 版本化 FS → 写后 commit → 全文索引」处理链。
-func newPolicyVersionedHandler(root string, authenticator *auth.Authenticator, source Source, opts PolicyOptions, repo *gitver.Repo, indexer *index.Indexer, prefix string) http.Handler {
-	fs := wrapVersionedFS(policyFS(root, opts), repo)
+// offset 为挂载根相对仓库根的偏移，透传给 versionedFS 与索引钩子。
+func newPolicyVersionedHandler(root string, authenticator *auth.Authenticator, source Source, opts PolicyOptions, repo *gitver.Repo, indexer *index.Indexer, prefix, offset string) http.Handler {
+	fs := wrapVersionedFS(policyFS(root, opts), repo, offset)
 	inner := commitAfterWrite(source, repo, newDAVHandler(prefix, fs))
-	return authenticator.Middleware(indexAfterWrite(root, prefix, indexer, inner))
+	return authenticator.Middleware(indexAfterWrite(root, prefix, offset, indexer, inner))
 }

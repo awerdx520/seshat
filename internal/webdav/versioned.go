@@ -83,15 +83,20 @@ const orgSuffix = ".org"
 //
 // root、authenticator、source、repo 语义同 VersionedHandler；indexer 为全文
 // 索引器。原 VersionedHandler 签名保持不变，本函数是新增入口；
-// 前缀固定为默认的 davPrefix，需要自定义前缀时用 NewPolicyVersionedHandler。
+// 前缀固定为默认的 davPrefix，且挂载根即仓库根（offset 为空），需要自定义前缀
+// 或挂载根为仓库子目录时用 NewPolicyVersionedHandler。
 func VersionedHandlerWithIndex(root string, authenticator *auth.Authenticator, source Source, repo *gitver.Repo, indexer *index.Indexer) http.Handler {
-	return newPolicyVersionedHandler(root, authenticator, source, PolicyOptions{}, repo, indexer, davPrefix)
+	return newPolicyVersionedHandler(root, authenticator, source, PolicyOptions{}, repo, indexer, davPrefix, "")
 }
 
 // indexAfterWrite 包装 next：请求处理完成后，若为成功响应（2xx）则按写方法
 // 维护相应的全文索引。以状态码为准可避免失败的写请求（文件未变更却返回 4xx/5xx）
-// 误删或误写索引。prefix 用于把请求路径还原为仓库内相对路径。
-func indexAfterWrite(root, prefix string, indexer *index.Indexer, next http.Handler) http.Handler {
+// 误删或误写索引。
+//
+// root 为 handler 的挂载根；prefix 为该 handler 的 URL 前缀；offset 为挂载根相对
+// 仓库根（repo root）的偏移，用于把请求路径还原为「仓库内相对路径」作为索引 key
+// （读文件仍以挂载根为基准，见 updateIndexAfterWrite）。
+func indexAfterWrite(root, prefix, offset string, indexer *index.Indexer, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rec := &statusRecorder{ResponseWriter: w}
 		next.ServeHTTP(rec, r)
@@ -101,7 +106,7 @@ func indexAfterWrite(root, prefix string, indexer *index.Indexer, next http.Hand
 		if rec.status < http.StatusOK || rec.status >= http.StatusMultipleChoices {
 			return
 		}
-		updateIndexAfterWrite(root, prefix, indexer, r)
+		updateIndexAfterWrite(root, prefix, offset, indexer, r)
 	})
 }
 
@@ -128,50 +133,71 @@ func (rec *statusRecorder) Write(b []byte) (int, error) {
 }
 
 // updateIndexAfterWrite 依据请求方法与路径更新全文索引。仅在 next 返回后调用
-// （此时写操作已完成、文件已落盘），索引失败仅记日志。prefix 为该 handler 的
-// URL 前缀，用于把请求路径还原为仓库内相对路径。
-func updateIndexAfterWrite(root, prefix string, indexer *index.Indexer, r *http.Request) {
+// （此时写操作已完成、文件已落盘），索引失败仅记日志。
+//
+// prefix 为该 handler 的 URL 前缀，offset 为挂载根相对仓库根的偏移；两者共同把
+// 请求路径映射为索引 key：
+//
+//	挂载根相对路径（读文件用，基于 root）= indexRelPath(prefix, raw)
+//	仓库相对路径（索引 key）= path.Join(offset, 挂载根相对路径)
+//
+// offset 为空（挂载根即仓库根）时索引 key 与挂载根相对路径相同，与内部端点一致。
+func updateIndexAfterWrite(root, prefix, offset string, indexer *index.Indexer, r *http.Request) {
+	// keyOf 返回索引 key：仓库内相对路径。rel 为空（无法解析）时返回空串，
+	// 避免把 offset 本身当成路径误删/误写。
+	keyOf := func(raw string) string {
+		rel := indexRelPath(prefix, raw)
+		if rel == "" {
+			return ""
+		}
+		return path.Join(offset, rel)
+	}
+
 	switch strings.ToUpper(r.Method) {
 	case http.MethodPut:
 		rel := indexRelPath(prefix, r.URL.Path)
 		if !strings.HasSuffix(rel, orgSuffix) {
 			return
 		}
-		indexFile(root, indexer, rel)
+		indexFile(root, indexer, offset, rel)
 	case http.MethodDelete:
-		if err := indexer.Delete(indexRelPath(prefix, r.URL.Path)); err != nil {
+		if err := indexer.Delete(keyOf(r.URL.Path)); err != nil {
 			log.Printf("webdav: DELETE %s 后删除索引失败: %v", r.URL.Path, err)
 		}
 	case "MOVE", "COPY":
 		// MOVE 后源已不存在，删除其索引；COPY 源仍保留，不动其索引。
 		if strings.EqualFold(r.Method, "MOVE") {
-			if err := indexer.Delete(indexRelPath(prefix, r.URL.Path)); err != nil {
+			if err := indexer.Delete(keyOf(r.URL.Path)); err != nil {
 				log.Printf("webdav: MOVE %s 后删除源索引失败: %v", r.URL.Path, err)
 			}
 		}
 		dst := indexRelPath(prefix, r.Header.Get("Destination"))
 		if strings.HasSuffix(dst, orgSuffix) {
-			indexFile(root, indexer, dst)
+			indexFile(root, indexer, offset, dst)
 		}
 	}
 }
 
-// indexFile 读取 root 下 rel 对应的文件内容并更新其全文索引，失败仅记日志。
-func indexFile(root string, indexer *index.Indexer, rel string) {
+// indexFile 读取挂载根 root 下 rel 对应的文件内容并更新其全文索引，失败仅记日志。
+// rel 是挂载根相对路径（用于定位文件），offset 是挂载根相对仓库根的偏移，二者拼出
+// 索引 key（仓库内相对路径）。
+func indexFile(root string, indexer *index.Indexer, offset, rel string) {
+	key := path.Join(offset, rel)
 	content, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(rel)))
 	if err != nil {
-		log.Printf("webdav: 读取 %s 以更新索引失败: %v", rel, err)
+		log.Printf("webdav: 读取 %s 以更新索引失败: %v", key, err)
 		return
 	}
-	if err := indexer.Index(rel, string(content)); err != nil {
-		log.Printf("webdav: 更新 %s 索引失败: %v", rel, err)
+	if err := indexer.Index(key, string(content)); err != nil {
+		log.Printf("webdav: 更新 %s 索引失败: %v", key, err)
 	}
 }
 
-// indexRelPath 把 WebDAV 的请求路径或 Destination 头规范化为仓库内相对路径。
+// indexRelPath 把 WebDAV 的请求路径或 Destination 头规范化为挂载根相对路径。
 // 输入可能是绝对 URL（MOVE/COPY 的 Destination）或绝对路径，统一取 Path 部分、
 // 剥掉 prefix（该 handler 的 URL 前缀，如 "/dav" 或 "/public"）后再交由 blobPath
-// 归一。无法解析时返回空串。
+// 归一。无法解析时返回空串。对对外出口（挂载根为仓库子目录）而言，该结果是
+// 「挂载根相对路径」，需再叠加 offset 才是仓库内相对路径（见 updateIndexAfterWrite）。
 func indexRelPath(prefix, raw string) string {
 	if raw == "" {
 		return ""
@@ -183,21 +209,30 @@ func indexRelPath(prefix, raw string) string {
 }
 
 // versionedFS 包装任意 webdav.FileSystem，让返回的 FileInfo 携带 blob hash ETag。
+//
+// offset 是该文件系统挂载根相对 git 仓库根（repo root）的偏移，形如 "public"；
+// 空串表示挂载根即仓库根。webdav 请求路径是「挂载根相对路径」，而 repo.BlobHash
+// 需要「仓库内相对路径」，故 ETag 计算时须拼上 offset，否则对外出口（挂载在仓库
+// 子目录）会解析到仓库中不存在的路径，blob hash 退化为空、getetag 回退到启发式。
 type versionedFS struct {
-	fs   webdav.FileSystem
-	repo *gitver.Repo
+	fs     webdav.FileSystem
+	repo   *gitver.Repo
+	offset string
 }
 
-// newVersionedFS 以 root 为挂载根构造 versionedFS。
+// newVersionedFS 以 root 为挂载根构造 versionedFS。root 即仓库根，偏移为空。
 func newVersionedFS(root string, repo *gitver.Repo) versionedFS {
-	return wrapVersionedFS(webdav.Dir(root), repo)
+	return wrapVersionedFS(webdav.Dir(root), repo, "")
 }
 
 // wrapVersionedFS 在底层文件系统 fs 之上叠加 ETag 能力，构造 versionedFS。
 // 可包装 webdav.Dir，也可包装访问策略包装（如 ReadOnlyFS/ExtWhitelistFS），
 // 使「策略 + 版本化」可叠加组合。
-func wrapVersionedFS(fs webdav.FileSystem, repo *gitver.Repo) versionedFS {
-	return versionedFS{fs: fs, repo: repo}
+//
+// offset 为 fs 挂载根相对仓库根的偏移（空表示挂载根即仓库根），用于把请求路径
+// 映射为仓库内相对路径后计算 blob hash。
+func wrapVersionedFS(fs webdav.FileSystem, repo *gitver.Repo, offset string) versionedFS {
+	return versionedFS{fs: fs, repo: repo, offset: offset}
 }
 
 // Mkdir 创建目录（直接委托底层文件系统）。
@@ -273,6 +308,9 @@ type versionedInfo struct {
 
 // ETag 返回 `"<blob hash>"`。
 //
+// 请求路径经 blobPath 归一后叠加 offset（挂载根相对仓库根的偏移）得到仓库内
+// 相对路径；offset 为空时与仓库根路径一致。
+//
 // 目录与非普通文件不适合内容哈希，返回 webdav.ErrNotImplemented，
 // 由调用方回退到默认实现（mtime+size 启发式）；此时 getetag 属性
 // 也不会向 DAV collection 广告。
@@ -281,7 +319,7 @@ func (info versionedInfo) ETag(ctx context.Context) (string, error) {
 		return "", webdav.ErrNotImplemented
 	}
 
-	hash, err := info.fs.repo.BlobHash(blobPath(info.name))
+	hash, err := info.fs.repo.BlobHash(path.Join(info.fs.offset, blobPath(info.name)))
 	if err != nil {
 		return "", err
 	}

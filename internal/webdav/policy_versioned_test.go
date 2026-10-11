@@ -4,6 +4,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -15,13 +16,22 @@ import (
 )
 
 // newPolicyVersionedServer 在 root 上以 opts 策略、prefix 前缀构造「访问策略 +
-// git 版本化 + 全文索引」的对外 handler 并启动测试服务器，返回 base URL、索引器
-// 与仓库。
+// git 版本化 + 全文索引」的对外 handler 并启动测试服务器（挂载根即仓库根，
+// offset 为空），返回 base URL、索引器与仓库。
 func newPolicyVersionedServer(t *testing.T, root string, opts PolicyOptions, prefix string) (string, *index.Indexer, *gitver.Repo) {
 	t.Helper()
-	repo, err := gitver.Open(root)
+	return newPolicyVersionedServerAt(t, root, root, opts, prefix, "")
+}
+
+// newPolicyVersionedServerAt 以 repoRoot 打开 git 仓库与全文索引，在 mountRoot
+// 上挂载对外 handler：offset 为 mountRoot 相对 repoRoot 的仓库内偏移（空串表示
+// 两者相同）。用于覆盖「公开出口为笔记根子目录」的场景。返回 base URL、索引器
+// 与仓库。
+func newPolicyVersionedServerAt(t *testing.T, repoRoot, mountRoot string, opts PolicyOptions, prefix, offset string) (string, *index.Indexer, *gitver.Repo) {
+	t.Helper()
+	repo, err := gitver.Open(repoRoot)
 	if err != nil {
-		t.Fatalf("gitver.Open(%s) 失败: %v", root, err)
+		t.Fatalf("gitver.Open(%s) 失败: %v", repoRoot, err)
 	}
 	db, err := storage.Open(filepath.Join(t.TempDir(), "index.db"), "")
 	if err != nil {
@@ -31,7 +41,7 @@ func newPolicyVersionedServer(t *testing.T, root string, opts PolicyOptions, pre
 
 	ix := index.New(db)
 	srv := httptest.NewServer(NewPolicyVersionedHandler(
-		root, auth.New(testToken), SourceExternal, opts, repo, ix, prefix))
+		mountRoot, auth.New(testToken), SourceExternal, opts, repo, ix, prefix, offset))
 	t.Cleanup(srv.Close)
 	return srv.URL, ix, repo
 }
@@ -132,5 +142,84 @@ func TestPolicyVersionedReadOnlyNoWrite(t *testing.T) {
 	}
 	if len(paths) != 0 {
 		t.Errorf("只读写请求后索引非空: %v", paths)
+	}
+}
+
+// TestPolicyVersionedSubdirETagAndIndex 验证公开出口挂载在笔记根的子目录时，offset
+// 被正确用于 ETag 与索引 key：
+//
+//   - PROPFIND 的 getetag 返回按「仓库内真实路径」（带 offset 前缀）计算的 blob
+//     hash，而非 mtime/size 启发式；
+//   - 全文索引 key 同样带 offset，与内部端点（以笔记根为基准）对齐，不再与内部
+//     端点的同名文件发生 key 冲突。
+func TestPolicyVersionedSubdirETagAndIndex(t *testing.T) {
+	const content = "* public subdir token\n"
+	const propfindBody = `<?xml version="1.0" encoding="utf-8"?>` +
+		`<D:propfind xmlns:D="DAV:"><D:prop><D:getetag/></D:prop></D:propfind>`
+
+	repoRoot := t.TempDir()
+	mountRoot := filepath.Join(repoRoot, "public")
+	if err := os.MkdirAll(mountRoot, 0o755); err != nil {
+		t.Fatalf("创建公开出口目录失败: %v", err)
+	}
+	base, ix, repo := newPolicyVersionedServerAt(t, repoRoot, mountRoot,
+		PolicyOptions{AllowExts: []string{".org"}}, "/public", "public")
+
+	resp := doRequest(t, http.MethodPut, base+"/public/note.org", content, basicAuthHeader(testToken))
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT 状态码 = %d, 期望 %d", resp.StatusCode, http.StatusCreated)
+	}
+
+	// 文件确实落在笔记根的子目录内（即 git 仓库工作区内）。
+	if _, err := os.Stat(filepath.Join(mountRoot, "note.org")); err != nil {
+		t.Fatalf("PUT 后文件未落在公开出口目录: %v", err)
+	}
+
+	// 索引 key 为仓库内相对路径（带 offset），与内部端点一致；不得使用裸文件名。
+	paths, err := ix.Search("subdir", 10)
+	if err != nil {
+		t.Fatalf("Search 失败: %v", err)
+	}
+	if !containsPath(paths, "public/note.org") {
+		t.Errorf("索引 key 未带 offset（期望 public/note.org）: %v", paths)
+	}
+	if containsPath(paths, "note.org") {
+		t.Errorf("索引 key 出现不带 offset 的裸路径，会与内部端点冲突: %v", paths)
+	}
+
+	// PROPFIND 的 getetag 应为仓库内路径 public/note.org 的 blob hash。
+	req, err := http.NewRequest("PROPFIND", base+"/public/note.org", strings.NewReader(propfindBody))
+	if err != nil {
+		t.Fatalf("构造 PROPFIND 请求失败: %v", err)
+	}
+	req.Header.Set("Authorization", basicAuthHeader(testToken))
+	req.Header.Set("Depth", "0")
+	req.Header.Set("Content-Type", "application/xml")
+
+	pfResp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("PROPFIND 请求失败: %v", err)
+	}
+	defer pfResp.Body.Close()
+	if pfResp.StatusCode != http.StatusMultiStatus {
+		t.Fatalf("PROPFIND 状态码 = %d, 期望 %d", pfResp.StatusCode, http.StatusMultiStatus)
+	}
+
+	body, err := io.ReadAll(pfResp.Body)
+	if err != nil {
+		t.Fatalf("读取 PROPFIND 响应失败: %v", err)
+	}
+
+	hash, err := repo.BlobHash("public/note.org")
+	if err != nil {
+		t.Fatalf("BlobHash(public/note.org) 失败: %v", err)
+	}
+	if hash == "" {
+		t.Fatal("BlobHash(public/note.org) 返回空串，说明文件不在仓库路径上")
+	}
+	want := `"` + hash + `"`
+	if !strings.Contains(string(body), want) {
+		t.Errorf("PROPFIND 响应未包含仓库内路径的 ETag %s（疑似回退到启发式）:\n%s", want, body)
 	}
 }

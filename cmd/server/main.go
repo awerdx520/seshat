@@ -205,17 +205,50 @@ func buildMux(cfg *config.Config, db *storage.DB, repo *gitver.Repo, indexer *in
 		if err := os.MkdirAll(cfg.WebDAV.Public, 0o755); err != nil {
 			return nil, fmt.Errorf("创建公开出口目录 %s: %w", cfg.WebDAV.Public, err)
 		}
+		// 公开出口通常是笔记根（git 仓库工作区）下的子目录，如 <root>/public。
+		// webdav 包以「仓库内相对路径」计算 ETag 的 blob hash 与全文索引 key，
+		// 而对外请求路径是「公开出口相对路径」，故需传入两者之间的偏移；否则
+		// ETag 会解析到仓库中不存在的路径（退化为 mtime 启发式），索引 key 也会
+		// 与内部端点（以笔记根为基准）错位冲突。
+		offset := publicOffset(cfg.WebDAV.Root, cfg.WebDAV.Public)
 		publicHandler := webdav.NewPolicyVersionedHandler(
 			cfg.WebDAV.Public, authenticator, webdav.SourceExternal,
 			webdav.PolicyOptions{
 				ReadOnly:  cfg.WebDAV.PublicReadOnly,
 				AllowExts: cfg.WebDAV.PublicAllowExts,
 			},
-			repo, indexer, publicPrefix)
+			repo, indexer, publicPrefix, offset)
 		mux.Handle(publicMount, publicHandler)
 	}
 
 	return mux, nil
+}
+
+// publicOffset 返回公开出口目录相对笔记根（git 仓库工作区根）的偏移，形如
+// "public"；公开出口即笔记根、或两者关系无法确定时返回空串（空串表示挂载根
+// 即仓库根）。
+//
+// 公开出口位于笔记根之外时（相对路径以 ".." 开头）返回空串并告警：此时对外
+// 写入落在 git 仓库工作区之外，写后自动 commit 不会覆盖这些文件，ETag 也无法
+// 按仓库内路径计算 blob hash（getetag 将退化为 mtime 启发式）。
+func publicOffset(root, public string) string {
+	rel, err := filepath.Rel(root, public)
+	if err != nil {
+		slog.Warn("公开出口与笔记根的相对关系无法确定，ETag 与索引将按笔记根路径解析",
+			"webdav_root", root, "webdav_public", public, "error", err)
+		return ""
+	}
+	switch {
+	case rel == ".":
+		// 公开出口即笔记根：无偏移。
+		return ""
+	case rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)):
+		slog.Warn("公开出口不在笔记根目录内：对外写入不在 git 仓库工作区内，写后不会产生 commit，ETag 亦将退化为 mtime 启发式",
+			"webdav_root", root, "webdav_public", public)
+		return ""
+	default:
+		return filepath.ToSlash(rel)
+	}
 }
 
 // envOr 返回环境变量值；未设置或全为空白时返回 fallback。
