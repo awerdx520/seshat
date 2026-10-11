@@ -62,12 +62,12 @@
 
 ### 技术债
 
-已知技术债与待办详见 [openspec/tech-debt.md](openspec/tech-debt.md)，当前 7 条：
+已知技术债详见 [openspec/tech-debt.md](openspec/tech-debt.md)，当前 7 条**均已解决或明确分工**（历史记录保留）：
 
-1. SQLCipher 降级——系统未装 libsqlcipher，DB 层暂用无加密驱动，兜底依赖磁盘 LUKS（M0.4）。
-2. LLM 双后端未打通——`LocalNodeClient` 直连 Ollama 与任务队列轮询是两套机制（M6）。
-3. REST 状态同步缺时间戳冲突检测——`SetProgress`/`UpdateAnnotation` 为纯后写覆盖（M1.4）。
-4. 单令牌无角色区分——LLM 节点复用同一令牌，poll/result 端点无节点身份绑定。
-5. Android 令牌明文存 SharedPreferences——待改用 EncryptedSharedPreferences。
-6. elisp 令牌经 curl 命令行传递——令牌短暂暴露于进程列表，待改用 `--netrc-file` / `--config`。
-7. 部署即明文风险——SQLCipher 降级下若未启用 LUKS，数据明文落盘，需在部署清单设为硬性步骤。
+1. SQLCipher 降级——**已解决**：`internal/storage` 改为 build tag 双驱动，`-tags "sqlcipher sqlite_fts5"` 启用加密（go-sqlcipher 自带 amalgamation，无需系统 libsqlcipher），无该 tag 为明文 + LUKS 兜底（M0.4）。
+2. LLM 双后端未打通——**已明确分工**：同步直连（`LocalNodeClient`）与异步任务队列（`llm_tasks` + `cmd/llmnode`）界定边界与选择依据，契约见 `docs/llm.md`（M6）。
+3. REST 状态同步缺时间戳冲突检测——**已解决**：`SetProgress`/`UpdateAnnotation` 增加乐观冲突检测，客户端 `updated_at` 早于服务端记录时返回 409 且不覆盖（M1.4）。
+4. 单令牌无角色区分——**已解决**：引入独立节点令牌 `NOTES_NODE_TOKEN`，节点端点经 `auth.NodeMiddleware` 校验，实现节点与主令牌的最小权限隔离。
+5. Android 令牌明文存 SharedPreferences——**已解决**：改用 `EncryptedSharedPreferences`（Android Keystore 主密钥，`androidx.security:security-crypto`）。
+6. elisp 令牌经 curl 命令行传递——**已解决**：改用 `curl --config`（0600 权限临时配置文件），令牌不再出现在命令行与进程列表。
+7. 部署即明文风险——**已解决**：`docs/deploy.md` 将数据盘 LUKS 加密设为硬性步骤并纳入部署检查清单。

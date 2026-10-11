@@ -21,10 +21,11 @@
 - 落地：internal/llm/backend.go 定义双后端契约与选择依据；新增 Router.LocalDirectAvailable()（报告本地直连 URL 是否显式配置）供能力层判断能否同步直连；定义 TaskSubmitter 接口（由 api 层注入实现，本包不反向依赖 storage/api）。契约文档见 docs/llm.md「后端选择契约」。
 - 遗留：能力函数当前仍统一走同步直连，异步入队路径待 api 层注入 TaskSubmitter 实现后由上层按场景接入。
 
-## REST 状态同步缺时间戳冲突检测（M1.4，minor #6）
-- 现象：storage/state.go 的 SetProgress/UpdateAnnotation 是纯 UPSERT 后写覆盖，未比较客户端 updated_at 与已存值。
-- 现状：计划同步协议声称「后写覆盖 + 时间戳冲突检测」，实现只有后写覆盖。
-- 待办：补充乐观冲突检测（比较 updated_at，冲突返回 409）或修正文档。
+## REST 状态同步缺时间戳冲突检测（M1.4，minor #6）——已解决（乐观冲突检测，2026-10-11）
+- 现象（历史）：storage/state.go 的 SetProgress/UpdateAnnotation 是纯 UPSERT 后写覆盖，未比较客户端 updated_at 与已存值。
+- 现状（历史）：计划同步协议声称「后写覆盖 + 时间戳冲突检测」，实现只有后写覆盖。
+- 解决：新增 assertNotStale 乐观冲突检测——客户端传入的 updated_at 早于服务端已存值时拒绝覆盖并返回 ErrConflict，API 层映射为 HTTP 409（internal/api/server.go）；相等或更新则正常覆盖并采用客户端时间戳。覆盖 SetProgress 与 UpdateAnnotationAt。
+- 验证：internal/storage（TestProgressConflictDetection / TestAnnotationConflictDetection）与 internal/api（TestProgressConflictReturns409 / TestAnnotationConflictReturns409）均有测试覆盖。
 
 ## 单令牌无角色区分（minor #8）——已解决（独立节点令牌，2026-10-11）
 - 现象：LLM 节点复用同一个 NOTES_AUTH_TOKEN，poll/result 端点无节点身份绑定，任何持令牌方可领取任务并读取 payload（可能含发往 LLM 的敏感笔记片段）。
@@ -32,15 +33,18 @@
 - 向后兼容：服务端未配置节点令牌时，节点端点回退接受主令牌；cmd/llmnode 优先使用 NOTES_NODE_TOKEN，未配置时回退 NOTES_AUTH_TOKEN。
 - 验证：internal/auth（AuthenticateNode/NodeMiddleware 的回退与隔离）、internal/api（节点端点接受节点令牌、主令牌访问 401、未配置回退）、cmd/llmnode（令牌选择优先级与回退）均有测试覆盖。
 
-## Android 令牌明文存 SharedPreferences（minor #9）
-- 现象：gtd/GtdActivity.kt 把 auth_token 存普通 MODE_PRIVATE 文件。
-- 待办：改用 Keystore 支持的 EncryptedSharedPreferences。
+## Android 令牌明文存 SharedPreferences（minor #9）——已解决（EncryptedSharedPreferences，2026-10-11）
+- 现象（历史）：gtd/GtdActivity.kt 把 auth_token 存普通 MODE_PRIVATE 文件。
+- 解决：新增 sync/SecurePrefs.kt，令牌经 EncryptedSharedPreferences（MasterKey AES256_GCM，来自 Android Keystore；键 AES256_SIV、值 AES256_GCM）加密保存。首次读取时把旧明文文件（notes_sync）中的同名键迁移到加密文件（notes_sync_secure）并清除明文旧值；设备不支持硬件密钥库 / 密钥库损坏 / 解密失败时回退普通 SharedPreferences 并告警（isEncrypted=false），保证可用性。
+- 依赖：androidx.security:security-crypto（见 android/app/build.gradle.kts）。
+- 验证：assembleDebug / testDebugUnitTest 通过。EncryptedSharedPreferences 依赖 Android Keystore 无法在 JVM 单测实例化，故 SecurePrefsTest 注入内存 SharedPreferences 覆盖读/写/迁移/回退逻辑（含 FakeSharedPreferences）。
 
-## elisp 令牌经 curl 命令行传递（minor #10）
-- 现象：emacs/notes-sync.el 用 `-u "user:token"` 传递令牌，令牌短暂暴露于进程列表；notes-sync-token/notes-rest-token 以 defcustom 明文存 Emacs 配置。
-- 现状：单用户桌面可接受。
-- 待办：用 curl --netrc-file 或 --config 传递凭据。
+## elisp 令牌经 curl 命令行传递（minor #10）——已解决（curl --config，2026-10-11）
+- 现象（历史）：emacs/notes-sync.el 用 `-u "user:token"` 传递令牌，令牌短暂暴露于进程列表；notes-sync-token/notes-rest-token 以 defcustom 明文存 Emacs 配置。
+- 现状（历史）：单用户桌面可接受。
+- 解决：notes-sync.el 的 WebDAV 请求改为把 Basic 凭据写入 0600 权限的临时 curl 配置文件，经 `curl --config` 传入，`-u "user:token"` 形式已移除，令牌不再出现在命令行 / 进程列表；请求结束（含出错）后经 unwind-protect 立即删除临时文件。notes-rest.el 的 REST 请求走 Emacs 内置 `url-retrieve-synchronously`（进程内，非 curl），令牌在请求头中传递，不进入命令行。
+- 遗留：`notes-sync-token` / `notes-rest-token` 仍为 defcustom，令牌以明文存于 Emacs 配置，属单用户桌面客户端既有约定；本项仅消除「命令行 / 进程列表短暂暴露」。
 
-## 部署即明文风险（code-reviewer 安全专项）
-- 现象：SQLCipher 降级下，若运维未启用 LUKS，数据库与笔记明文落盘，威胁模型失效。
-- 待办：部署文档强制要求 LUKS 启用检查（已部分在 docs/security.md，需在部署清单中设为硬性步骤）。
+## 部署即明文风险（code-reviewer 安全专项）——已解决（部署清单硬性 LUKS 步骤，2026-10-11）
+- 现象（历史）：SQLCipher 降级下，若运维未启用 LUKS，数据库与笔记明文落盘，威胁模型失效。
+- 解决：docs/deploy.md 第 2 节标题即为「磁盘加密（LUKS，硬性）」，明确「任何部署都必须对数据盘启用 LUKS」；部署检查清单（第 10 节）含「LUKS 已启用」「服务端已构建（加密构建 `-tags "sqlcipher sqlite_fts5"`，或非加密回退 + LUKS 兜底）」等硬性勾选项。同时 docs/security.md 更新 SQLCipher 为 build tag 启用加密（go-sqlcipher 自带 amalgamation），无该 tag 时为明文 + LUKS 兜底。

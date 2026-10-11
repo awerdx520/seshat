@@ -11,7 +11,7 @@
 | 层 | 机制 | 状态 |
 |---|---|---|
 | 磁盘层 | LUKS 全盘/分区加密（云 VPS 数据盘） | 部署时启用 |
-| 数据库层 | SQLCipher（`internal/storage`，DB 文件级加密） | 当前降级（见下） |
+| 数据库层 | SQLCipher（`internal/storage`，DB 文件级加密） | `-tags "sqlcipher sqlite_fts5"` 启用（见下） |
 | 传输层 | TLS（见第 5 节） | 部署时启用 |
 
 ### 1.1 磁盘层（LUKS）
@@ -20,18 +20,24 @@
 使用 LUKS 加密。这是当前**兜底的静态加密手段**：即使 DB 层加密未启用，
 磁盘离线数据也不可读。解密密钥在实例启动时解锁，不落盘于实例内部。
 
-### 1.2 数据库层（SQLCipher，当前降级）
+### 1.2 数据库层（SQLCipher）
 
-原设计由 `github.com/mutecomm/go-sqlcipher` 对 SQLite 数据库文件做加密，
-`storage.Open(path, key)` 的 `key` 参数即 `NOTES_DB_KEY`。当前构建环境缺少
-系统 `libsqlcipher`（`pkg-config` 探测 NOT found），暂用纯 Go 驱动
-`modernc.org/sqlite`（不加密）：`key` 为空时按明文库打开，`key` 非空时仅记录
-降级告警、密钥被忽略。
+SQLite 数据库文件加密由 `github.com/mutecomm/go-sqlcipher/v4` 提供，
+`storage.Open(path, key)` 的 `key` 参数即 `NOTES_DB_KEY`。该库**自带 SQLCipher
+amalgamation**（包内 `sqlite3.c` + tomcrypt 源码），编译只需 CGO + gcc，
+**无需系统安装 `libsqlcipher-dev`**。存储层按 build tag 选择驱动：
 
-- 现状与待办：见 [`openspec/tech-debt.md`](../openspec/tech-debt.md)「SQLCipher 降级」。
-- 恢复路径：部署时安装 `libsqlcipher-dev` → 切换 `go-sqlcipher` → 启用 `Open` 的
-  `key` 参数（调用方接口不变）→ 补「错误 key 打开失败」加密测试。
-- 影响：在 DB 层加密恢复前，数据库文件的机密性完全依赖磁盘 LUKS。
+- **启用加密**：以 `-tags "sqlcipher sqlite_fts5"` 构建（`sqlite_fts5` 为迁移 v4
+  创建 FTS5 虚表所需；go-sqlcipher 默认未编入 FTS5，缺该 tag 会在运行期报
+  `no such module: fts5`），此时 `key` 经 DSN `_pragma_key` → `PRAGMA key`
+  对 DB 文件启用加密。
+- **无该 tag**：默认构建使用纯 Go 驱动 `modernc.org/sqlite`（明文），非空 key
+  被忽略并告警，作为可部署回退。
+
+- 现状：见 [`openspec/tech-debt.md`](../openspec/tech-debt.md)「SQLCipher 降级（已解决）」。
+- 加密构建命令：`CGO_ENABLED=1 go build -tags "sqlcipher sqlite_fts5" ./cmd/...`（需 gcc）。
+- 影响：未启用加密构建（或构建环境缺 gcc）时，数据库文件为明文，机密性依赖磁盘
+  LUKS 兜底。
 
 ### 1.3 边界与限制
 
