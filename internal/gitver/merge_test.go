@@ -10,7 +10,7 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/filemode"
 	"github.com/go-git/go-git/v5/plumbing/object"
 
-	"notes/internal/logging"
+	"seshat/internal/logging"
 )
 
 // commitContent 写入 name 后提交，返回新提交的完整 hash。

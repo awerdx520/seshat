@@ -6,17 +6,17 @@ import (
 	"strings"
 	"testing"
 
-	"notes/internal/api"
-	"notes/internal/auth"
-	"notes/internal/index"
-	"notes/internal/storage"
+	"seshat/internal/api"
+	"seshat/internal/auth"
+	"seshat/internal/index"
+	"seshat/internal/storage"
 )
 
 // newSearchHandler 构造挂载全文索引器的处理器：在临时目录打开存储库、建索引器
 // 并用 seed 预置索引（path → 正文），最后经 NewHandlerFull 组装。
 func newSearchHandler(t *testing.T, seed map[string]string) http.Handler {
 	t.Helper()
-	db, err := storage.Open(filepath.Join(t.TempDir(), "notes.db"), "")
+	db, err := storage.Open(filepath.Join(t.TempDir(), "seshat.db"), "")
 	if err != nil {
 		t.Fatalf("打开测试数据库失败: %v", err)
 	}
@@ -34,7 +34,7 @@ func newSearchHandler(t *testing.T, seed map[string]string) http.Handler {
 // TestSearchEndpointHits 验证索引后经 /api/search 可检索到对应文件路径。
 func TestSearchEndpointHits(t *testing.T) {
 	h := newSearchHandler(t, map[string]string{
-		"note.org":     "hello world from notes",
+		"note.org":     "hello world from seshat",
 		"sub/book.org": "another hello note",
 	})
 
@@ -92,7 +92,7 @@ func TestSearchEndpointInvalidLimit(t *testing.T) {
 
 // TestSearchEndpointWithoutIndexer 验证未启用索引器时搜索端点返回 503。
 func TestSearchEndpointWithoutIndexer(t *testing.T) {
-	db, err := storage.Open(filepath.Join(t.TempDir(), "notes.db"), "")
+	db, err := storage.Open(filepath.Join(t.TempDir(), "seshat.db"), "")
 	if err != nil {
 		t.Fatalf("打开测试数据库失败: %v", err)
 	}

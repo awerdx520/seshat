@@ -4,9 +4,9 @@
 //
 // 运行参数全部来自环境变量：
 //
-//	NOTES_SERVER_URL  服务端根地址，必填，如 https://notes.example.com
-//	NOTES_NODE_TOKEN  服务端节点令牌，优先使用（节点端点的专用令牌，最小权限）
-//	NOTES_AUTH_TOKEN  服务端访问令牌，未配置 NOTES_NODE_TOKEN 时回退使用
+//	SESHAT_SERVER_URL  服务端根地址，必填，如 https://seshat.example.com
+//	SESHAT_NODE_TOKEN  服务端节点令牌，优先使用（节点端点的专用令牌，最小权限）
+//	SESHAT_AUTH_TOKEN  服务端访问令牌，未配置 SESHAT_NODE_TOKEN 时回退使用
 //	OLLAMA_URL        本机 Ollama 根地址，可选，默认 http://localhost:11434
 //	OLLAMA_MODEL      默认本地模型名，可选；仅当任务 payload 未自带 model 时使用
 //	NODE_NAME         节点名，可选，默认取主机名
@@ -61,17 +61,17 @@ type config struct {
 // loadConfig 从环境变量装配配置并校验必填项；节点名缺省时回退到主机名。
 func loadConfig() (config, error) {
 	cfg := config{
-		serverURL: strings.TrimRight(strings.TrimSpace(os.Getenv("NOTES_SERVER_URL")), "/"),
+		serverURL: strings.TrimRight(strings.TrimSpace(os.Getenv("SESHAT_SERVER_URL")), "/"),
 		authToken: nodeAuthToken(),
 		ollamaURL: strings.TrimRight(envOr("OLLAMA_URL", defaultOllamaURL), "/"),
 		model:     strings.TrimSpace(os.Getenv("OLLAMA_MODEL")),
 		nodeName:  strings.TrimSpace(os.Getenv("NODE_NAME")),
 	}
 	if cfg.serverURL == "" {
-		return config{}, errors.New("环境变量 NOTES_SERVER_URL 未设置")
+		return config{}, errors.New("环境变量 SESHAT_SERVER_URL 未设置")
 	}
 	if cfg.authToken == "" {
-		return config{}, errors.New("环境变量 NOTES_NODE_TOKEN 与 NOTES_AUTH_TOKEN 均未设置")
+		return config{}, errors.New("环境变量 SESHAT_NODE_TOKEN 与 SESHAT_AUTH_TOKEN 均未设置")
 	}
 	if cfg.nodeName == "" {
 		if host, err := os.Hostname(); err == nil && host != "" {
@@ -91,13 +91,13 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
-// nodeAuthToken 返回节点用于认证的令牌：优先 NOTES_NODE_TOKEN（节点专用令牌，
-// 最小权限），未配置或全为空白时回退 NOTES_AUTH_TOKEN，兼容既有单令牌部署。
+// nodeAuthToken 返回节点用于认证的令牌：优先 SESHAT_NODE_TOKEN（节点专用令牌，
+// 最小权限），未配置或全为空白时回退 SESHAT_AUTH_TOKEN，兼容既有单令牌部署。
 func nodeAuthToken() string {
-	if tok := strings.TrimSpace(os.Getenv("NOTES_NODE_TOKEN")); tok != "" {
+	if tok := strings.TrimSpace(os.Getenv("SESHAT_NODE_TOKEN")); tok != "" {
 		return tok
 	}
-	return strings.TrimSpace(os.Getenv("NOTES_AUTH_TOKEN"))
+	return strings.TrimSpace(os.Getenv("SESHAT_AUTH_TOKEN"))
 }
 
 // message 是一条对话消息（OpenAI 兼容协议的 role/content）。

@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"notes/internal/logging"
+	"seshat/internal/logging"
 )
 
 // assertCode 断言 err 是被 AppError 包装的指定错误码。
@@ -174,7 +174,7 @@ func TestAnnotationErrors(t *testing.T) {
 
 // TestAnnotationsSurviveReopen 验证批注与进度经一次关闭/重开（迁移幂等）后仍存在。
 func TestAnnotationsSurviveReopen(t *testing.T) {
-	path := t.TempDir() + "/notes.db"
+	path := t.TempDir() + "/seshat.db"
 
 	db, err := Open(path, "")
 	if err != nil {

@@ -9,10 +9,10 @@ import (
 	"strings"
 	"testing"
 
-	"notes/internal/auth"
-	"notes/internal/gitver"
-	"notes/internal/index"
-	"notes/internal/storage"
+	"seshat/internal/auth"
+	"seshat/internal/gitver"
+	"seshat/internal/index"
+	"seshat/internal/storage"
 )
 
 // newPolicyVersionedServer 在 root 上以 opts 策略、prefix 前缀构造「访问策略 +

@@ -6,10 +6,10 @@ import (
 	"path/filepath"
 	"testing"
 
-	"notes/internal/auth"
-	"notes/internal/gitver"
-	"notes/internal/index"
-	"notes/internal/storage"
+	"seshat/internal/auth"
+	"seshat/internal/gitver"
+	"seshat/internal/index"
+	"seshat/internal/storage"
 )
 
 // newIndexedServer 在 root 上打开版本化仓库与全文索引，启动带索引的测试服务器，

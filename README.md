@@ -1,4 +1,4 @@
-# Notes — 个人笔记同步系统
+# Seshat — 个人笔记同步系统
 
 单用户、云 VPS 自托管的个人知识中枢，三端协作 + LLM 增值。
 
@@ -15,7 +15,7 @@
 
 ## 文档
 - 架构设计：docs/architecture.md
-- 实施计划：openspec/active/personal-notes-system.md
+- 实施计划：openspec/completed/personal-notes-system.md
 - 决策日志：openspec/decisions.md
 - ADR：docs/adr/
 

@@ -21,7 +21,7 @@ import (
 	"fmt"
 	"strings"
 
-	"notes/internal/logging"
+	"seshat/internal/logging"
 )
 
 // schemaVersion 是当前程序期望的 schema 版本号。

@@ -24,8 +24,8 @@ import (
 	"strings"
 	"time"
 
-	"notes/internal/logging"
-	"notes/internal/storage"
+	"seshat/internal/logging"
+	"seshat/internal/storage"
 )
 
 // ManifestFileName 是附件清单文件的文件名（位于笔记目录内）。

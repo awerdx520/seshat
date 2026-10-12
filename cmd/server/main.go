@@ -1,4 +1,4 @@
-// Package main 是 notes 服务端入口：装配配置、日志、存储、git 版本库、全文索引、
+// Package main 是 seshat 服务端入口：装配配置、日志、存储、git 版本库、全文索引、
 // 附件对象库、认证与 LLM 后端，组装 REST API 与内部/对外 WebDAV 路由，并监听端口、
 // 处理进程退出信号完成优雅关闭。
 //
@@ -19,16 +19,16 @@ import (
 	"syscall"
 	"time"
 
-	"notes/internal/api"
-	"notes/internal/attach"
-	"notes/internal/auth"
-	"notes/internal/config"
-	"notes/internal/gitver"
-	"notes/internal/index"
-	"notes/internal/llm"
-	"notes/internal/logging"
-	"notes/internal/storage"
-	"notes/internal/webdav"
+	"seshat/internal/api"
+	"seshat/internal/attach"
+	"seshat/internal/auth"
+	"seshat/internal/config"
+	"seshat/internal/gitver"
+	"seshat/internal/index"
+	"seshat/internal/llm"
+	"seshat/internal/logging"
+	"seshat/internal/storage"
+	"seshat/internal/webdav"
 )
 
 const (
@@ -40,7 +40,7 @@ const (
 	defaultAttachDir = "./data/files/objects"
 
 	// envLogLevel 是日志级别的环境变量名；未设置或无法识别时回退 info。
-	envLogLevel = "NOTES_LOG_LEVEL"
+	envLogLevel = "SESHAT_LOG_LEVEL"
 
 	// internalMount 是内部 WebDAV（笔记根目录）的对外挂载前缀。webdav 包内部
 	// handler 的默认 Prefix 恰为 "/dav"，故挂载点与之天然对齐。
@@ -61,7 +61,7 @@ const (
 // main 调用 run 并在失败时以非零码退出。
 func main() {
 	if err := run(); err != nil {
-		slog.Error("notes 服务退出", "error", err)
+		slog.Error("seshat 服务退出", "error", err)
 		os.Exit(1)
 	}
 }
@@ -108,7 +108,7 @@ func run() error {
 	attachStore := attach.NewStore(defaultAttachDir, db)
 
 	// 7. 认证：主令牌保护普通 REST 端点与 WebDAV（REST 用 Bearer、WebDAV 用
-	//    Basic）；节点令牌（NOTES_NODE_TOKEN）单独保护本地处理节点端点（任务
+	//    Basic）；节点令牌（SESHAT_NODE_TOKEN）单独保护本地处理节点端点（任务
 	//    轮询/回传、节点注册），实现节点与客户端的最小权限隔离。nodeAuth 承载
 	//    节点令牌，未配置时节点端点回退接受主令牌（向后兼容既有部署）。
 	authenticator := auth.New(cfg.Auth.Token)
@@ -145,7 +145,7 @@ func run() error {
 	defer stop()
 
 	// 11. 启动日志：仅记录关键路由与「是否已配置」的布尔元信息，绝不输出令牌/密钥值。
-	logger.Info("notes 服务启动",
+	logger.Info("seshat 服务启动",
 		"addr", cfg.Server.Addr,
 		"db_path", cfg.DB.Path,
 		"webdav_root", cfg.WebDAV.Root,

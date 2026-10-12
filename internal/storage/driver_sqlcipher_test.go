@@ -20,7 +20,7 @@ func isSQLiteHeader(b []byte) bool {
 // TestSQLCipherEncryptedRoundTrip 验证 -tags sqlcipher 构建下 DB 层加密生效：
 // 正确 key 可读写，且磁盘文件为密文（不含明文 SQLite 头）。
 func TestSQLCipherEncryptedRoundTrip(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "notes.db")
+	path := filepath.Join(t.TempDir(), "seshat.db")
 
 	db, err := Open(path, sqlcipherTestKey)
 	if err != nil {
@@ -59,7 +59,7 @@ func TestSQLCipherEncryptedRoundTrip(t *testing.T) {
 
 // TestSQLCipherWrongKeyFails 验证以错误 key 打开加密库会失败。
 func TestSQLCipherWrongKeyFails(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "notes.db")
+	path := filepath.Join(t.TempDir(), "seshat.db")
 
 	db, err := Open(path, sqlcipherTestKey)
 	if err != nil {
@@ -81,7 +81,7 @@ func TestSQLCipherWrongKeyFails(t *testing.T) {
 
 // TestSQLCipherEmptyKeyFailsOnEncryptedDB 验证未提供 key 时无法读取已加密库。
 func TestSQLCipherEmptyKeyFailsOnEncryptedDB(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "notes.db")
+	path := filepath.Join(t.TempDir(), "seshat.db")
 
 	db, err := Open(path, sqlcipherTestKey)
 	if err != nil {

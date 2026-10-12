@@ -1,4 +1,4 @@
-// Package llm 提供 notes 的 LLM 接入层：统一的对话客户端抽象与路由策略。
+// Package llm 提供 seshat 的 LLM 接入层：统一的对话客户端抽象与路由策略。
 //
 // 按 ADR-002 的混合后端设计，LLM 能力由两类后端提供：
 //   - 云端 API：DeepSeek 等 OpenAI 兼容的 chat/completions 服务（见 CloudClient）；

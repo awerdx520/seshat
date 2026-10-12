@@ -1,4 +1,4 @@
-// Package api 实现 notes 服务端的 REST 接口：阅读进度与批注的 CRUD、版本查询、
+// Package api 实现 seshat 服务端的 REST 接口：阅读进度与批注的 CRUD、版本查询、
 // 全文搜索，并内嵌提供 Web UI 静态资源。
 //
 // 定位：文件内容（org/附件/电子书）走 WebDAV 同步，本包只承载「结构化小状态」。
@@ -17,11 +17,11 @@ import (
 	"strings"
 	"time"
 
-	"notes/internal/auth"
-	"notes/internal/gitver"
-	"notes/internal/index"
-	"notes/internal/logging"
-	"notes/internal/storage"
+	"seshat/internal/auth"
+	"seshat/internal/gitver"
+	"seshat/internal/index"
+	"seshat/internal/logging"
+	"seshat/internal/storage"
 )
 
 // Server 封装 REST 处理器的依赖。

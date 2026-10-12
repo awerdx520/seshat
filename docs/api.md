@@ -1,6 +1,6 @@
 # REST API 规范
 
-本文件描述 notes 服务端的**状态同步 REST 接口**（阅读进度、批注）。
+本文件描述 seshat 服务端的**状态同步 REST 接口**（阅读进度、批注）。
 文件内容（org/附件/电子书）走 WebDAV，不在此接口范围。
 相关文档：[错误码规范](errors.md)、[架构设计](architecture.md)、[安全说明](security.md)。
 
@@ -9,7 +9,7 @@
 | 项 | 约定 |
 |---|---|
 | Base path | `/api` |
-| 认证 | 全部端点要求请求头 `Authorization: Bearer <token>`（令牌即 `NOTES_AUTH_TOKEN`）；节点端点（`/api/llm/tasks/poll`、`/api/llm/tasks/{id}/result`、`/api/llm/nodes/register`）接受 `NOTES_NODE_TOKEN`（未配置时回退 `NOTES_AUTH_TOKEN`）；缺失或错误返回 `401` |
+| 认证 | 全部端点要求请求头 `Authorization: Bearer <token>`（令牌即 `SESHAT_AUTH_TOKEN`）；节点端点（`/api/llm/tasks/poll`、`/api/llm/tasks/{id}/result`、`/api/llm/nodes/register`）接受 `SESHAT_NODE_TOKEN`（未配置时回退 `SESHAT_AUTH_TOKEN`）；缺失或错误返回 `401` |
 | 请求体 | `application/json` |
 | 响应体 | `application/json; charset=utf-8` |
 | 时间格式 | RFC 3339（UTC），如 `2026-10-11T10:00:00Z` |
@@ -57,7 +57,7 @@ GET /api/progress/{document_id}
 - 错误：`401`（未认证）、`404`（该文档尚无进度）、`500`。
 
 ```bash
-curl -s -H "Authorization: Bearer $NOTES_AUTH_TOKEN" \
+curl -s -H "Authorization: Bearer $SESHAT_AUTH_TOKEN" \
   http://127.0.0.1:8080/api/progress/book-1
 ```
 
@@ -86,7 +86,7 @@ PUT /api/progress/{document_id}
 - 错误：`400`（`position` 为空或 `updated_at` 非 RFC 3339）、`401`、`500`。
 
 ```bash
-curl -s -X PUT -H "Authorization: Bearer $NOTES_AUTH_TOKEN" \
+curl -s -X PUT -H "Authorization: Bearer $SESHAT_AUTH_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"position":"chapter-3:42","updated_at":"2026-10-11T10:00:00Z"}' \
   http://127.0.0.1:8080/api/progress/book-1
@@ -129,7 +129,7 @@ POST /api/annotations
 - 错误：`400`（字段为空或请求体非法 JSON）、`401`、`500`。
 
 ```bash
-curl -s -X POST -H "Authorization: Bearer $NOTES_AUTH_TOKEN" \
+curl -s -X POST -H "Authorization: Bearer $SESHAT_AUTH_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"document_id":"book-1","location":"chapter-1:10","text":"第一条批注"}' \
   http://127.0.0.1:8080/api/annotations
@@ -159,7 +159,7 @@ GET /api/annotations?document_id={id}
 - 错误：`400`（缺少 `document_id` 查询参数）、`401`、`500`。
 
 ```bash
-curl -s -H "Authorization: Bearer $NOTES_AUTH_TOKEN" \
+curl -s -H "Authorization: Bearer $SESHAT_AUTH_TOKEN" \
   "http://127.0.0.1:8080/api/annotations?document_id=book-1"
 ```
 
@@ -188,7 +188,7 @@ PUT /api/annotations/{id}
 - 错误：`400`（`id` 非正整数、字段为空或请求体非法 JSON）、`401`、`404`（批注不存在）、`500`。
 
 ```bash
-curl -s -X PUT -H "Authorization: Bearer $NOTES_AUTH_TOKEN" \
+curl -s -X PUT -H "Authorization: Bearer $SESHAT_AUTH_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"location":"chapter-1:12","text":"修改后的批注"}' \
   http://127.0.0.1:8080/api/annotations/1
@@ -204,7 +204,7 @@ DELETE /api/annotations/{id}
 - 错误：`400`（`id` 非正整数）、`401`、`404`（批注不存在）、`500`。
 
 ```bash
-curl -s -X DELETE -H "Authorization: Bearer $NOTES_AUTH_TOKEN" \
+curl -s -X DELETE -H "Authorization: Bearer $SESHAT_AUTH_TOKEN" \
   http://127.0.0.1:8080/api/annotations/1
 ```
 

@@ -41,8 +41,8 @@ Readme.org
 *.exe
 /server
 server
-notes-server
-notes-llmnode
+seshat-server
+seshat-llmnode
 
 # 编辑器/系统垃圾
 .DS_Store

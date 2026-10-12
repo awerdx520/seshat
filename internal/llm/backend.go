@@ -1,4 +1,4 @@
-// 本文件明确 notes 的 LLM 双后端契约，消除「LocalNodeClient 同步直连」与
+// 本文件明确 seshat 的 LLM 双后端契约，消除「LocalNodeClient 同步直连」与
 // 「llm_tasks 异步任务队列」两套机制并存的认知混乱（见 openspec/tech-debt.md #2）。
 //
 // 两套机制定位不同、互补而非替代，按场景二选一：

@@ -9,7 +9,7 @@ import (
 // openTestDB 在临时目录中打开一个全新的测试库，并注册测试结束后的清理。
 func openTestDB(t *testing.T) *DB {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "notes.db")
+	path := filepath.Join(t.TempDir(), "seshat.db")
 	db, err := Open(path, "")
 	if err != nil {
 		t.Fatalf("Open() 返回错误: %v", err)
@@ -20,7 +20,7 @@ func openTestDB(t *testing.T) *DB {
 
 // TestOpenCreatesDatabaseFile 验证 Open 会创建数据库文件。
 func TestOpenCreatesDatabaseFile(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "notes.db")
+	path := filepath.Join(t.TempDir(), "seshat.db")
 
 	db, err := Open(path, "")
 	if err != nil {
@@ -62,7 +62,7 @@ func TestMigrationsLengthMatchesVersion(t *testing.T) {
 
 // TestMigrationIdempotent 验证重复 Open 不会重复执行迁移（数据与版本号均保持）。
 func TestMigrationIdempotent(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "notes.db")
+	path := filepath.Join(t.TempDir(), "seshat.db")
 
 	db1, err := Open(path, "")
 	if err != nil {
@@ -103,7 +103,7 @@ func TestMigrationIdempotent(t *testing.T) {
 func TestMetaReadWrite(t *testing.T) {
 	db := openTestDB(t)
 
-	if _, err := db.db.Exec("INSERT INTO meta(key, value) VALUES(?, ?)", "schema_owner", "notes"); err != nil {
+	if _, err := db.db.Exec("INSERT INTO meta(key, value) VALUES(?, ?)", "schema_owner", "seshat"); err != nil {
 		t.Fatalf("写入 meta 失败: %v", err)
 	}
 
@@ -111,18 +111,18 @@ func TestMetaReadWrite(t *testing.T) {
 	if err := db.db.QueryRow("SELECT value FROM meta WHERE key = ?", "schema_owner").Scan(&got); err != nil {
 		t.Fatalf("读取 meta 失败: %v", err)
 	}
-	if got != "notes" {
-		t.Fatalf("读取值 = %q, 期望 %q", got, "notes")
+	if got != "seshat" {
+		t.Fatalf("读取值 = %q, 期望 %q", got, "seshat")
 	}
 
-	if _, err := db.db.Exec("UPDATE meta SET value = ? WHERE key = ?", "notes-v2", "schema_owner"); err != nil {
+	if _, err := db.db.Exec("UPDATE meta SET value = ? WHERE key = ?", "seshat-v2", "schema_owner"); err != nil {
 		t.Fatalf("更新 meta 失败: %v", err)
 	}
 	if err := db.db.QueryRow("SELECT value FROM meta WHERE key = ?", "schema_owner").Scan(&got); err != nil {
 		t.Fatalf("更新后读取 meta 失败: %v", err)
 	}
-	if got != "notes-v2" {
-		t.Fatalf("更新后读取值 = %q, 期望 %q", got, "notes-v2")
+	if got != "seshat-v2" {
+		t.Fatalf("更新后读取值 = %q, 期望 %q", got, "seshat-v2")
 	}
 }
 

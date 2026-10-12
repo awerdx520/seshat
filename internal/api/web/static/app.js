@@ -1,11 +1,11 @@
-// notes 管理界面前端逻辑：调用 /api/search 全文检索并渲染结果。
+// Seshat 管理界面前端逻辑：调用 /api/search 全文检索并渲染结果。
 // 页面本身为公开资源（浏览器导航无法携带 Authorization 头），故访问令牌从
 // localStorage 读取后附在 fetch 请求头上（见下方 token()）。
 (function () {
   "use strict";
 
   // TOKEN_KEY 是 localStorage 中访问令牌的键名。
-  var TOKEN_KEY = "notes.token";
+  var TOKEN_KEY = "seshat.token";
 
   var form = document.getElementById("search-form");
   var input = document.getElementById("q");

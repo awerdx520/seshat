@@ -15,9 +15,9 @@ import (
 
 	"golang.org/x/net/webdav"
 
-	"notes/internal/auth"
-	"notes/internal/gitver"
-	"notes/internal/index"
+	"seshat/internal/auth"
+	"seshat/internal/gitver"
+	"seshat/internal/index"
 )
 
 // writeMethods 是会产生工作区变更、因此需要在处理后自动提交的 HTTP 方法。

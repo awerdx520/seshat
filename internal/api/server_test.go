@@ -15,9 +15,9 @@ import (
 	"testing"
 	"time"
 
-	"notes/internal/api"
-	"notes/internal/auth"
-	"notes/internal/storage"
+	"seshat/internal/api"
+	"seshat/internal/auth"
+	"seshat/internal/storage"
 )
 
 // testToken 是测试用访问令牌，与 New 构造的 Authenticator 保持一致。
@@ -26,7 +26,7 @@ const testToken = "test-token"
 // newTestHandler 构造挂载了临时数据库与测试令牌的 REST 处理器。
 func newTestHandler(t *testing.T) http.Handler {
 	t.Helper()
-	db, err := storage.Open(filepath.Join(t.TempDir(), "notes.db"), "")
+	db, err := storage.Open(filepath.Join(t.TempDir(), "seshat.db"), "")
 	if err != nil {
 		t.Fatalf("打开测试数据库失败: %v", err)
 	}
@@ -415,7 +415,7 @@ func TestUnauthorized(t *testing.T) {
 // 冒烟验证关键路径，覆盖 ResponseRecorder 无法反映的传输层语义（304/204 的空响应体、
 // 响应头与状态码组合）。
 func TestServerEndToEndOverRealHTTP(t *testing.T) {
-	db, err := storage.Open(filepath.Join(t.TempDir(), "notes.db"), "")
+	db, err := storage.Open(filepath.Join(t.TempDir(), "seshat.db"), "")
 	if err != nil {
 		t.Fatalf("打开测试数据库失败: %v", err)
 	}

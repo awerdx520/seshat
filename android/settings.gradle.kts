@@ -16,6 +16,6 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "notes-android"
+rootProject.name = "seshat-android"
 
 include(":app")

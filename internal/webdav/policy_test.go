@@ -12,7 +12,7 @@ import (
 
 	"golang.org/x/net/webdav"
 
-	"notes/internal/auth"
+	"seshat/internal/auth"
 )
 
 // newPolicyTestServer 以 opts 策略在 root 上启动对外出口测试服务器，返回 base URL。

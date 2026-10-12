@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# backup.sh — notes 服务数据备份脚本（**不含密钥**）。
+# backup.sh — seshat 服务数据备份脚本（**不含密钥**）。
 #
 # 用法：
 #     scripts/backup.sh [备份目录]
@@ -8,14 +8,14 @@
 # 备份目录默认为 ./backups，可用第一个参数覆盖。
 #
 # 备份内容：
-#   - 数据库文件（默认 ./data/notes.db，含 -wal/-shm）：sqlite3 可用时优先用
+#   - 数据库文件（默认 ./data/seshat.db，含 -wal/-shm）：sqlite3 可用时优先用
 #     `.backup` 生成在线一致性快照（已合并 WAL），否则退化为 cp 直拷
 #     （连同 -wal/-shm 一起拷）。
-#   - 笔记目录（默认 ./data/notes）：其中包含的 .git 版本库随目录一并打包。
+#   - 笔记目录（默认 ./data/seshat）：其中包含的 .git 版本库随目录一并打包。
 #   - 附件对象库（默认 ./data/files/objects）。
 #   - MANIFEST：记录备份时间、各路径、备份方式与恢复提示。
 #
-# 备份格式：tar.gz，文件名 notes-backup-<UTC 时间戳>.tar.gz。
+# 备份格式：tar.gz，文件名 seshat-backup-<UTC 时间戳>.tar.gz。
 #
 # 保留策略：默认保留最近 7 份，更旧的自动删除；BACKUP_KEEP 可覆盖（>=1）。
 #
@@ -25,16 +25,16 @@
 #
 # 可配置环境变量：
 #   BACKUP_KEEP   保留份数（默认 7）
-#   DB_PATH       数据库文件路径（默认 ./data/notes.db）
-#   NOTES_DIR     笔记目录（默认 ./data/notes）
+#   DB_PATH       数据库文件路径（默认 ./data/seshat.db）
+#   SESHAT_DIR    笔记目录（默认 ./data/seshat）
 #   OBJECTS_DIR   附件对象库目录（默认 ./data/files/objects）
 
 set -euo pipefail
 
 backup_root="${1:-./backups}"
 keep="${BACKUP_KEEP:-7}"
-db_path="${DB_PATH:-./data/notes.db}"
-notes_dir="${NOTES_DIR:-./data/notes}"
+db_path="${DB_PATH:-./data/seshat.db}"
+seshat_dir="${SESHAT_DIR:-./data/seshat}"
 objects_dir="${OBJECTS_DIR:-./data/files/objects}"
 
 # —— 校验保留份数 ——
@@ -58,9 +58,9 @@ for tool in tar date find awk; do
 done
 
 # —— 至少有一个数据源存在 ——
-if [ ! -f "$db_path" ] && [ ! -d "$notes_dir" ] && [ ! -d "$objects_dir" ]; then
-    echo "错误：未找到任何数据源（$db_path / $notes_dir / $objects_dir）。" >&2
-    echo "请确认在数据目录下运行，或用 DB_PATH/NOTES_DIR/OBJECTS_DIR 覆盖路径。" >&2
+if [ ! -f "$db_path" ] && [ ! -d "$seshat_dir" ] && [ ! -d "$objects_dir" ]; then
+    echo "错误：未找到任何数据源（$db_path / $seshat_dir / $objects_dir）。" >&2
+    echo "请确认在数据目录下运行，或用 DB_PATH/SESHAT_DIR/OBJECTS_DIR 覆盖路径。" >&2
     exit 1
 fi
 
@@ -68,11 +68,11 @@ mkdir -p -- "$backup_root"
 backup_root="$(cd -- "$backup_root" && pwd)"
 
 ts="$(date -u +%Y%m%dT%H%M%SZ)"
-out="$backup_root/notes-backup-$ts.tar.gz"
+out="$backup_root/seshat-backup-$ts.tar.gz"
 
 # 暂存目录：只放数据库快照与 MANIFEST；笔记/附件直接从源打包，
 # 避免整份镜像导致的磁盘双倍占用。
-stage="$(mktemp -d "${TMPDIR:-/tmp}/notes-backup.XXXXXX")"
+stage="$(mktemp -d "${TMPDIR:-/tmp}/seshat-backup.XXXXXX")"
 trap 'rm -rf -- "$stage"' EXIT
 mkdir -p -- "$stage/db"
 
@@ -111,7 +111,7 @@ src_abs() {
 # —— 写 MANIFEST ——
 manifest="$stage/MANIFEST"
 {
-    printf 'notes 数据备份 MANIFEST\n'
+    printf 'seshat 数据备份 MANIFEST\n'
     printf '========================\n'
     printf '备份时间（UTC）: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     printf '备份主机: %s\n' "$(uname -n 2>/dev/null || echo unknown)"
@@ -124,8 +124,8 @@ manifest="$stage/MANIFEST"
     if [ -f "$db_path" ]; then
         printf '  %-28s <- 源: %s（%s）\n' "$(basename -- "$db_path")" "$(src_abs "$db_path")" "$db_how"
     fi
-    if [ -d "$notes_dir" ]; then
-        printf '  %-28s <- 源: %s（笔记目录，含其中 .git 版本库）\n' "$(basename -- "$notes_dir")/" "$(src_abs "$notes_dir")"
+    if [ -d "$seshat_dir" ]; then
+        printf '  %-28s <- 源: %s（笔记目录，含其中 .git 版本库）\n' "$(basename -- "$seshat_dir")/" "$(src_abs "$seshat_dir")"
     fi
     if [ -d "$objects_dir" ]; then
         printf '  %-28s <- 源: %s（附件对象库）\n' "$(basename -- "$objects_dir")/" "$(src_abs "$objects_dir")"
@@ -137,8 +137,8 @@ manifest="$stage/MANIFEST"
     printf '  详见 docs/security.md「4. 备份与恢复演练」与 docs/backup.md。\n'
     printf '\n'
     printf '恢复提示:\n'
-    printf '  解包后：%s -> <数据目录>/notes.db；%s/ -> <数据目录>/notes/；\n' \
-        "$(basename -- "$db_path")" "$(basename -- "$notes_dir")"
+    printf '  解包后：%s -> <数据目录>/seshat.db；%s/ -> <数据目录>/seshat/；\n' \
+        "$(basename -- "$db_path")" "$(basename -- "$seshat_dir")"
     printf '  %s/ -> <数据目录>/files/objects/。详见 docs/backup.md。\n' "$(basename -- "$objects_dir")"
 } > "$manifest"
 
@@ -147,8 +147,8 @@ tar_args=(-czf "$out" -C "$stage" MANIFEST)
 if [ "${#db_files[@]}" -gt 0 ]; then
     tar_args+=(-C "$stage/db" "${db_files[@]}")
 fi
-if [ -d "$notes_dir" ]; then
-    tar_args+=(-C "$(dirname -- "$notes_dir")" "$(basename -- "$notes_dir")")
+if [ -d "$seshat_dir" ]; then
+    tar_args+=(-C "$(dirname -- "$seshat_dir")" "$(basename -- "$seshat_dir")")
 fi
 if [ -d "$objects_dir" ]; then
     tar_args+=(-C "$(dirname -- "$objects_dir")" "$(basename -- "$objects_dir")")
@@ -174,7 +174,7 @@ while IFS= read -r old; do
     rm -f -- "$old"
     echo "已删除旧备份：$old"
 done < <(
-    find "$backup_root" -maxdepth 1 -type f -name 'notes-backup-*.tar.gz' -printf '%T@ %p\n' 2>/dev/null \
+    find "$backup_root" -maxdepth 1 -type f -name 'seshat-backup-*.tar.gz' -printf '%T@ %p\n' 2>/dev/null \
         | sort -rn \
         | awk -v k="$keep" 'NR > k { sub(/^[^ ]+ /, ""); print }'
 )

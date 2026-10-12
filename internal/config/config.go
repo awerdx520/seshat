@@ -1,4 +1,4 @@
-// Package config 负责加载与合并 notes 服务的配置。
+// Package config 负责加载与合并 seshat 服务的配置。
 //
 // 配置来源与优先级（后者覆盖前者）：
 //  1. 内置默认值
@@ -21,24 +21,24 @@ import (
 // 敏感配置项对应的环境变量名。
 const (
 	// EnvDBKey 提供 Config.DB.Key（数据库密钥）。
-	EnvDBKey = "NOTES_DB_KEY"
+	EnvDBKey = "SESHAT_DB_KEY"
 	// EnvAuthToken 提供 Config.Auth.Token（API 访问令牌）。
-	EnvAuthToken = "NOTES_AUTH_TOKEN"
+	EnvAuthToken = "SESHAT_AUTH_TOKEN"
 	// EnvLLMAPIKey 提供 Config.LLM.CloudAPIKey（云端 LLM API key）。
-	EnvLLMAPIKey = "NOTES_LLM_API_KEY"
+	EnvLLMAPIKey = "SESHAT_LLM_API_KEY"
 	// EnvNodeToken 提供 Config.LLM.NodeToken（本地 LLM 节点专用令牌）。
 	// 与主访问令牌分离，使节点只能访问节点端点（最小权限）；为空时节点
 	// 端点回退接受主令牌（向后兼容）。
-	EnvNodeToken = "NOTES_NODE_TOKEN"
+	EnvNodeToken = "SESHAT_NODE_TOKEN"
 )
 
 // 各配置项的默认值。
 const (
 	defaultServerAddr    = ":8080"
 	defaultServerTimeout = 30 * time.Second
-	defaultDBPath        = "./data/notes.db"
-	defaultWebDAVRoot    = "./data/notes"
-	defaultWebDAVPublic  = "./data/notes/public"
+	defaultDBPath        = "./data/seshat.db"
+	defaultWebDAVRoot    = "./data/seshat"
+	defaultWebDAVPublic  = "./data/seshat/public"
 )
 
 // Duration 包装 time.Duration，使其在 YAML 中支持 "30s" 这类字符串写法。
@@ -68,7 +68,7 @@ func (d Duration) Standard() time.Duration {
 	return time.Duration(d)
 }
 
-// Config 是 notes 服务的完整配置。
+// Config 是 seshat 服务的完整配置。
 type Config struct {
 	Server ServerConfig `yaml:"server"`
 	DB     DBConfig     `yaml:"db"`
@@ -87,7 +87,7 @@ type ServerConfig struct {
 // DBConfig 是 SQLite 数据库配置。
 type DBConfig struct {
 	Path string `yaml:"path"`
-	// Key 是数据库密钥，敏感，仅从环境变量 NOTES_DB_KEY 读取。
+	// Key 是数据库密钥，敏感，仅从环境变量 SESHAT_DB_KEY 读取。
 	Key string `yaml:"-"`
 }
 
@@ -104,9 +104,9 @@ type WebDAVConfig struct {
 
 // LLMConfig 是 LLM 后端配置。
 type LLMConfig struct {
-	// CloudAPIKey 是云端 LLM API key，敏感，仅从环境变量 NOTES_LLM_API_KEY 读取。
+	// CloudAPIKey 是云端 LLM API key，敏感，仅从环境变量 SESHAT_LLM_API_KEY 读取。
 	CloudAPIKey string `yaml:"-"`
-	// NodeToken 是本地处理节点专用令牌，敏感，仅从环境变量 NOTES_NODE_TOKEN 读取。
+	// NodeToken 是本地处理节点专用令牌，敏感，仅从环境变量 SESHAT_NODE_TOKEN 读取。
 	// 用于将节点（cmd/llmnode）与普通客户端的主令牌隔离：节点令牌只能访问节点
 	// 端点（任务轮询/回传/注册），主令牌不能访问节点端点（当本项配置时）。
 	// 为空时节点端点回退接受主令牌（向后兼容）。
@@ -116,7 +116,7 @@ type LLMConfig struct {
 
 // AuthConfig 是访问令牌配置。
 type AuthConfig struct {
-	// Token 是 API 访问令牌，敏感，仅从环境变量 NOTES_AUTH_TOKEN 读取。
+	// Token 是 API 访问令牌，敏感，仅从环境变量 SESHAT_AUTH_TOKEN 读取。
 	Token string `yaml:"-"`
 }
 

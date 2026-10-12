@@ -16,9 +16,9 @@ import (
 
 	"golang.org/x/net/webdav"
 
-	"notes/internal/auth"
-	"notes/internal/gitver"
-	"notes/internal/index"
+	"seshat/internal/auth"
+	"seshat/internal/gitver"
+	"seshat/internal/index"
 )
 
 // isWriteFlag 判断 OpenFile 的 flag 是否含写意图。

@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">Notes</string>
+    <string name="app_name">Seshat</string>
 
     <!-- 阅读器（M3.2 epub MVP） -->
     <string name="reader_open_sample">打开示例 EPUB</string>

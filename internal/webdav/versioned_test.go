@@ -11,8 +11,8 @@ import (
 
 	"golang.org/x/net/webdav"
 
-	"notes/internal/auth"
-	"notes/internal/gitver"
+	"seshat/internal/auth"
+	"seshat/internal/gitver"
 )
 
 // newVersionedServer 在 root 上打开版本化仓库并启动测试服务器。

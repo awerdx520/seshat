@@ -15,7 +15,7 @@ import (
 	"strings"
 	"time"
 
-	"notes/internal/logging"
+	"seshat/internal/logging"
 )
 
 // LLM 任务的路由目标常量。

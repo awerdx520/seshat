@@ -18,10 +18,10 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/filemode"
 	"github.com/go-git/go-git/v5/plumbing/object"
 
-	"notes/internal/api"
-	"notes/internal/auth"
-	"notes/internal/gitver"
-	"notes/internal/storage"
+	"seshat/internal/api"
+	"seshat/internal/auth"
+	"seshat/internal/gitver"
+	"seshat/internal/storage"
 )
 
 // writeRepoFile 在工作区写入文件（自动创建父目录）。
@@ -64,7 +64,7 @@ func openRepo(t *testing.T) (*gitver.Repo, string) {
 // newVersionHandler 组装挂载了版本查询端点与测试令牌的处理器。
 func newVersionHandler(t *testing.T, repo *gitver.Repo) http.Handler {
 	t.Helper()
-	db, err := storage.Open(filepath.Join(t.TempDir(), "notes.db"), "")
+	db, err := storage.Open(filepath.Join(t.TempDir(), "seshat.db"), "")
 	if err != nil {
 		t.Fatalf("打开测试数据库失败: %v", err)
 	}
@@ -316,7 +316,7 @@ func TestVersionsUnauthorized(t *testing.T) {
 
 // TestNewHandlerWithoutRepoOmitsVersionRoutes 验证不传 repo 时版本查询路由不注册。
 func TestNewHandlerWithoutRepoOmitsVersionRoutes(t *testing.T) {
-	db, err := storage.Open(filepath.Join(t.TempDir(), "notes.db"), "")
+	db, err := storage.Open(filepath.Join(t.TempDir(), "seshat.db"), "")
 	if err != nil {
 		t.Fatalf("打开测试数据库失败: %v", err)
 	}
@@ -371,7 +371,7 @@ func writeOrphanCommit(t *testing.T, root, name, content, message string) string
 		t.Fatalf("保存 tree 失败: %v", err)
 	}
 
-	sig := object.Signature{Name: "notes", Email: "notes@local", When: time.Now()}
+	sig := object.Signature{Name: "seshat", Email: "seshat@local", When: time.Now()}
 	commit := &object.Commit{
 		Author:    sig,
 		Committer: sig,

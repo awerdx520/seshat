@@ -1,4 +1,4 @@
-module notes
+module seshat
 
 go 1.27.1
 

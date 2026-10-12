@@ -1,6 +1,6 @@
 # 错误码规范
 
-本文件定义 notes 服务端对外暴露的稳定错误码、HTTP 状态映射与典型产生场景。
+本文件定义 seshat 服务端对外暴露的稳定错误码、HTTP 状态映射与典型产生场景。
 相关文档：[REST API 规范](api.md)、[架构设计](architecture.md)、[安全说明](security.md)。
 
 ## 1. 错误码与 HTTP 状态映射

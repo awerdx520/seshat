@@ -5,14 +5,14 @@ import (
 	"path/filepath"
 	"testing"
 
-	"notes/internal/logging"
-	"notes/internal/storage"
+	"seshat/internal/logging"
+	"seshat/internal/storage"
 )
 
 // newTestIndexer 在临时目录打开全新存储库并返回索引器，注册清理。
 func newTestIndexer(t *testing.T) *Indexer {
 	t.Helper()
-	db, err := storage.Open(filepath.Join(t.TempDir(), "notes.db"), "")
+	db, err := storage.Open(filepath.Join(t.TempDir(), "seshat.db"), "")
 	if err != nil {
 		t.Fatalf("storage.Open 失败: %v", err)
 	}
@@ -34,7 +34,7 @@ func contains(paths []string, want string) bool {
 func TestIndexThenSearchHits(t *testing.T) {
 	ix := newTestIndexer(t)
 
-	if err := ix.Index("note.org", "hello world from notes"); err != nil {
+	if err := ix.Index("note.org", "hello world from seshat"); err != nil {
 		t.Fatalf("Index 失败: %v", err)
 	}
 

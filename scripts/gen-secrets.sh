@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# gen-secrets.sh — 生成 notes 服务所需密钥并写入受保护的 env 文件。
+# gen-secrets.sh — 生成 seshat 服务所需密钥并写入受保护的 env 文件。
 #
 # 用法：
 #     scripts/gen-secrets.sh [输出路径]
@@ -40,21 +40,21 @@ node_token="$(openssl rand -base64 32)"
 # 以私有 umask 创建文件，再显式收紧权限到 600。
 umask 077
 {
-    printf '# notes 服务密钥文件（由 scripts/gen-secrets.sh 生成）\n'
+    printf '# seshat 服务密钥文件（由 scripts/gen-secrets.sh 生成）\n'
     printf '# 权限应为 600；仅部署用户可读；禁止提交到 git。\n'
     printf '# 生成时间（UTC）：%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     printf '\n'
     printf '# 数据库密钥（32 字节 hex）：存储层加密使用。\n'
-    printf 'NOTES_DB_KEY=%s\n' "$db_key"
+    printf 'SESHAT_DB_KEY=%s\n' "$db_key"
     printf '\n'
     printf '# API 访问令牌（单用户）：REST Bearer 与 WebDAV Basic Auth 共用。\n'
-    printf 'NOTES_AUTH_TOKEN=%s\n' "$auth_token"
+    printf 'SESHAT_AUTH_TOKEN=%s\n' "$auth_token"
     printf '\n'
     printf '# 本地 LLM 节点专用令牌：仅保护节点端点（注册/轮询/回传，最小权限）；未配置则回退主令牌。\n'
-    printf 'NOTES_NODE_TOKEN=%s\n' "$node_token"
+    printf 'SESHAT_NODE_TOKEN=%s\n' "$node_token"
     printf '\n'
     printf '# 云端 LLM API key：由用户从服务商获取，脚本不生成；未启用云端 LLM 时留空。\n'
-    printf 'NOTES_LLM_API_KEY=\n'
+    printf 'SESHAT_LLM_API_KEY=\n'
 } > "$out"
 
 chmod 600 -- "$out"
@@ -64,5 +64,5 @@ db_key=""
 auth_token=""
 node_token=""
 
-echo "已生成 3 个密钥并写入 $out（权限 600）：NOTES_DB_KEY、NOTES_AUTH_TOKEN、NOTES_NODE_TOKEN；NOTES_LLM_API_KEY 留空待填写。"
-echo "提示：systemd 部署请复制到 /etc/notes/secrets.env 并保持 600 权限；禁止提交到 git。"
+echo "已生成 3 个密钥并写入 $out（权限 600）：SESHAT_DB_KEY、SESHAT_AUTH_TOKEN、SESHAT_NODE_TOKEN；SESHAT_LLM_API_KEY 留空待填写。"
+echo "提示：systemd 部署请复制到 /etc/seshat/secrets.env 并保持 600 权限；禁止提交到 git。"

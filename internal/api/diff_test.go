@@ -14,16 +14,16 @@ import (
 	"strings"
 	"testing"
 
-	"notes/internal/api"
-	"notes/internal/auth"
-	"notes/internal/gitver"
-	"notes/internal/storage"
+	"seshat/internal/api"
+	"seshat/internal/auth"
+	"seshat/internal/gitver"
+	"seshat/internal/storage"
 )
 
 // newFullHandler 用 NewHandlerFull 组装处理器（indexer 为 nil，仅验证版本相关端点）。
 func newFullHandler(t *testing.T, repo *gitver.Repo) http.Handler {
 	t.Helper()
-	db, err := storage.Open(filepath.Join(t.TempDir(), "notes.db"), "")
+	db, err := storage.Open(filepath.Join(t.TempDir(), "seshat.db"), "")
 	if err != nil {
 		t.Fatalf("打开测试数据库失败: %v", err)
 	}

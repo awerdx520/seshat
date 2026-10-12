@@ -13,7 +13,7 @@ import (
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
 
-	"notes/internal/logging"
+	"seshat/internal/logging"
 )
 
 // HistoryEntry 描述某文件在一次提交中的出现：提交 hash、提交信息与提交时间。

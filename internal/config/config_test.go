@@ -38,14 +38,14 @@ func TestLoadDefaultsWhenFileMissing(t *testing.T) {
 	if cfg.Server.WriteTimeout.Standard() != 30*time.Second {
 		t.Errorf("server.write_timeout = %v, 期望 30s", cfg.Server.WriteTimeout)
 	}
-	if cfg.DB.Path != "./data/notes.db" {
-		t.Errorf("db.path = %q, 期望 \"./data/notes.db\"", cfg.DB.Path)
+	if cfg.DB.Path != "./data/seshat.db" {
+		t.Errorf("db.path = %q, 期望 \"./data/seshat.db\"", cfg.DB.Path)
 	}
-	if cfg.WebDAV.Root != "./data/notes" {
-		t.Errorf("webdav.root = %q, 期望 \"./data/notes\"", cfg.WebDAV.Root)
+	if cfg.WebDAV.Root != "./data/seshat" {
+		t.Errorf("webdav.root = %q, 期望 \"./data/seshat\"", cfg.WebDAV.Root)
 	}
-	if cfg.WebDAV.Public != "./data/notes/public" {
-		t.Errorf("webdav.public = %q, 期望 \"./data/notes/public\"", cfg.WebDAV.Public)
+	if cfg.WebDAV.Public != "./data/seshat/public" {
+		t.Errorf("webdav.public = %q, 期望 \"./data/seshat/public\"", cfg.WebDAV.Public)
 	}
 	if cfg.LLM.LocalNodeURL != "" {
 		t.Errorf("llm.local_node_url = %q, 期望空", cfg.LLM.LocalNodeURL)
@@ -82,7 +82,7 @@ llm:
 	if cfg.DB.Path != "./tmp/test.db" {
 		t.Errorf("db.path = %q, 期望 \"./tmp/test.db\"", cfg.DB.Path)
 	}
-	if cfg.WebDAV.Root != "./data/notes" {
+	if cfg.WebDAV.Root != "./data/seshat" {
 		t.Errorf("webdav.root = %q, 期望保留默认", cfg.WebDAV.Root)
 	}
 	if cfg.LLM.LocalNodeURL != "http://localhost:11434" {

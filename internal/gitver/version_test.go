@@ -63,8 +63,8 @@ func TestOpenInitializesRepo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("读取配置失败: %v", err)
 	}
-	if cfg.User.Name != "notes" || cfg.User.Email != "notes@local" {
-		t.Errorf("默认身份 = %q <%q>, 期望 notes <notes@local>", cfg.User.Name, cfg.User.Email)
+	if cfg.User.Name != "seshat" || cfg.User.Email != "seshat@local" {
+		t.Errorf("默认身份 = %q <%q>, 期望 seshat <seshat@local>", cfg.User.Name, cfg.User.Email)
 	}
 
 	// 再次 Open 应当打开已存在的仓库，而不是重新初始化。

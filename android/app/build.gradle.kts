@@ -17,7 +17,7 @@ val keystoreProperties = Properties().apply {
 }
 
 android {
-    namespace = "com.notes.app"
+    namespace = "com.seshat.app"
     compileSdk = 35
 
     // release 签名配置（仅当 android/keystore.properties 存在时创建）
@@ -33,7 +33,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.notes.app"
+        applicationId = "com.seshat.app"
         minSdk = 26
         targetSdk = 35
         versionCode = 1

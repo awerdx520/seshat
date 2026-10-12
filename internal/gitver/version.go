@@ -31,13 +31,13 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/go-git/go-git/v5/plumbing/storer"
 
-	"notes/internal/logging"
+	"seshat/internal/logging"
 )
 
 // identityName / identityEmail 是版本化仓库的默认提交身份。
 const (
-	identityName  = "notes"
-	identityEmail = "notes@local"
+	identityName  = "seshat"
+	identityEmail = "seshat@local"
 )
 
 // Repo 是一个受并发保护的 git 工作区仓库。
@@ -54,7 +54,7 @@ type Repo struct {
 
 // Open 打开 path 下的 git 仓库；若该路径下不存在仓库（无 .git），
 // 则用 git.PlainInit 就地初始化，并写入默认提交身份
-// （user.name=notes、user.email=notes@local）。
+// （user.name=seshat、user.email=seshat@local）。
 func Open(path string) (*Repo, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {

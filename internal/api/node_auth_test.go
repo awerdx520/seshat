@@ -8,9 +8,9 @@ import (
 	"path/filepath"
 	"testing"
 
-	"notes/internal/api"
-	"notes/internal/auth"
-	"notes/internal/storage"
+	"seshat/internal/api"
+	"seshat/internal/auth"
+	"seshat/internal/storage"
 )
 
 // 节点端点测试用的主令牌与节点令牌。
@@ -24,7 +24,7 @@ const (
 // 为空表示未配置节点令牌，节点端点回退接受主令牌（向后兼容）。
 func newNodeAuthHandler(t *testing.T, nodeToken string) http.Handler {
 	t.Helper()
-	db, err := storage.Open(filepath.Join(t.TempDir(), "notes.db"), "")
+	db, err := storage.Open(filepath.Join(t.TempDir(), "seshat.db"), "")
 	if err != nil {
 		t.Fatalf("打开测试数据库失败: %v", err)
 	}

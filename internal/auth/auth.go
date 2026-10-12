@@ -1,7 +1,7 @@
-// Package auth 提供 notes 服务的单用户令牌认证。
+// Package auth 提供 seshat 服务的单用户令牌认证。
 //
-// 服务主令牌（由配置从环境变量 NOTES_AUTH_TOKEN 注入）保护普通端点；此外可配置
-// 独立的节点令牌（NOTES_NODE_TOKEN），仅用于本地处理节点端点
+// 服务主令牌（由配置从环境变量 SESHAT_AUTH_TOKEN 注入）保护普通端点；此外可配置
+// 独立的节点令牌（SESHAT_NODE_TOKEN），仅用于本地处理节点端点
 // （/api/llm/tasks/poll、/api/llm/tasks/{id}/result、/api/llm/nodes/register），
 // 实现节点与客户端的最小权限隔离。认证即校验请求是否携带期望令牌。支持两种 scheme：
 //   - Bearer：Authorization: Bearer <token>（REST 接口）

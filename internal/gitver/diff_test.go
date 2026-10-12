@@ -9,7 +9,7 @@ import (
 	"sync"
 	"testing"
 
-	"notes/internal/logging"
+	"seshat/internal/logging"
 )
 
 // assertAppErrorCode 断言 err 是带指定错误码的 AppError（跨测试文件共用）。

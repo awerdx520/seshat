@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"notes/internal/logging"
+	"seshat/internal/logging"
 )
 
 // timestampLayout 是进度/批注时间列的存储格式。

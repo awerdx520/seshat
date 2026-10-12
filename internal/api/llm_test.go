@@ -9,16 +9,16 @@ import (
 	"strconv"
 	"testing"
 
-	"notes/internal/api"
-	"notes/internal/auth"
-	"notes/internal/storage"
+	"seshat/internal/api"
+	"seshat/internal/auth"
+	"seshat/internal/storage"
 )
 
 // newLLMTestHandler 构造挂载临时数据库与测试令牌的处理器，并返回底层 DB 以便断言
 // 任务表状态（响应体之外的可观察事实）。
 func newLLMTestHandler(t *testing.T) (http.Handler, *storage.DB) {
 	t.Helper()
-	db, err := storage.Open(filepath.Join(t.TempDir(), "notes.db"), "")
+	db, err := storage.Open(filepath.Join(t.TempDir(), "seshat.db"), "")
 	if err != nil {
 		t.Fatalf("打开测试数据库失败: %v", err)
 	}

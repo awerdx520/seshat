@@ -15,8 +15,8 @@ package index
 import (
 	"strings"
 
-	"notes/internal/logging"
-	"notes/internal/storage"
+	"seshat/internal/logging"
+	"seshat/internal/storage"
 )
 
 // defaultLimit 是 Search 未显式指定上限（limit<=0）时返回的最大结果数。

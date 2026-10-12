@@ -1,4 +1,4 @@
-// Package webdav 提供 notes 服务的 WebDAV 端点。
+// Package webdav 提供 seshat 服务的 WebDAV 端点。
 //
 // 端点的双重定位：内部同步通道（自有客户端，SourceInternal）与对外标准出口
 // （外部应用，SourceExternal）。两者复用同一套认证与处理逻辑，差别只在
@@ -16,7 +16,7 @@ import (
 
 	"golang.org/x/net/webdav"
 
-	"notes/internal/auth"
+	"seshat/internal/auth"
 )
 
 // davPrefix 是 WebDAV 端点使用的默认 URL 前缀，需与路由挂载路径一致。

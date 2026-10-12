@@ -81,7 +81,7 @@ type TaskSubmitter interface {
 
 | 配置项 | 位置 | 默认值 | 敏感 | 说明 |
 |---|---|---|---|---|
-| `NOTES_LLM_API_KEY` | 环境变量 | 空 | **是** | 云端 LLM API key（→ `Config.LLM.CloudAPIKey`），不落盘、不进 git |
+| `SESHAT_LLM_API_KEY` | 环境变量 | 空 | **是** | 云端 LLM API key（→ `Config.LLM.CloudAPIKey`），不落盘、不进 git |
 | `llm.local_node_url` | `config.yaml` | 空 | 否 | 本地处理节点 URL；留空表示不启用本地节点 |
 
 > 说明：本地节点 URL 仅通过 YAML 键 `llm.local_node_url` 配置，**没有**对应的环境变量；
@@ -92,19 +92,19 @@ type TaskSubmitter interface {
 
 | 环境变量 | 必填 | 默认值 | 说明 |
 |---|---|---|---|
-| `NOTES_SERVER_URL` | 是 | — | 服务端根地址，如 `https://notes.example.com` |
-| `NOTES_NODE_TOKEN` | 是 | — | 节点专用令牌（对应 `Config.LLM.NodeToken`，仅可访问节点端点：注册 / 轮询 / 回传，最小权限）；未配置时回退 `NOTES_AUTH_TOKEN` |
-| `NOTES_AUTH_TOKEN` | 否 | — | 服务端主访问令牌；仅在未配置 `NOTES_NODE_TOKEN` 时作为节点认证回退（向后兼容既有单令牌部署） |
+| `SESHAT_SERVER_URL` | 是 | — | 服务端根地址，如 `https://seshat.example.com` |
+| `SESHAT_NODE_TOKEN` | 是 | — | 节点专用令牌（对应 `Config.LLM.NodeToken`，仅可访问节点端点：注册 / 轮询 / 回传，最小权限）；未配置时回退 `SESHAT_AUTH_TOKEN` |
+| `SESHAT_AUTH_TOKEN` | 否 | — | 服务端主访问令牌；仅在未配置 `SESHAT_NODE_TOKEN` 时作为节点认证回退（向后兼容既有单令牌部署） |
 | `OLLAMA_URL` | 否 | `http://localhost:11434` | 本机 Ollama 根地址 |
 | `OLLAMA_MODEL` | 否 | 空 | 默认本地模型名；仅当任务 payload 未自带 `model` 时使用 |
 | `NODE_NAME` | 否 | 主机名 | 节点名，注册时上报 |
 
 > **节点令牌 vs 主令牌**：节点（`cmd/llmnode`）访问节点端点（`POST /api/llm/nodes/register`、
-> `GET /api/llm/tasks/poll`、`POST /api/llm/tasks/{id}/result`）应使用 `NOTES_NODE_TOKEN`
-> （对应服务端 `Config.LLM.NodeToken`，通常经环境变量 `NOTES_NODE_TOKEN` 注入），二者经
+> `GET /api/llm/tasks/poll`、`POST /api/llm/tasks/{id}/result`）应使用 `SESHAT_NODE_TOKEN`
+> （对应服务端 `Config.LLM.NodeToken`，通常经环境变量 `SESHAT_NODE_TOKEN` 注入），二者经
 > `auth.NodeMiddleware` 与主令牌端点相互隔离（主令牌访问节点端点返回 `401`，节点令牌访问
 > 普通端点亦被拒），实现节点与客户端的最小权限隔离。服务端**未配置**节点令牌时，节点端点
-> 回退接受主令牌以兼容既有部署；此时 `cmd/llmnode` 也回退使用 `NOTES_AUTH_TOKEN`。
+> 回退接受主令牌以兼容既有部署；此时 `cmd/llmnode` 也回退使用 `SESHAT_AUTH_TOKEN`。
 
 ## 能力清单
 
@@ -154,7 +154,7 @@ SM-2 易度因子下限 1.3、默认 2.5，判定「答对」的最低评分为 
 
 `cmd/llmnode`（仅标准库，无外部依赖）：
 
-1. 启动时用 `NOTES_NODE_TOKEN`（未配置时回退 `NOTES_AUTH_TOKEN`）向 `/api/llm/nodes/register` 注册一次（失败只告警不退出）；
+1. 启动时用 `SESHAT_NODE_TOKEN`（未配置时回退 `SESHAT_AUTH_TOKEN`）向 `/api/llm/nodes/register` 注册一次（失败只告警不退出）；
 2. 轮询 `GET /api/llm/tasks/poll`；
 3. 有任务则调用 `POST {OLLAMA_URL}/v1/chat/completions` 本地推理（payload 约定
    `{"messages":[…], "model"?}`，`model` 缺省回退 `OLLAMA_MODEL`）；

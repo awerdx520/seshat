@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"notes/internal/logging"
+	"seshat/internal/logging"
 )
 
 // TestLLMTaskCreateAndPoll 验证本地任务创建后可被轮询领取，且领取时状态置为 running、
@@ -223,7 +223,7 @@ func TestLLMTaskTerminalErrors(t *testing.T) {
 
 // TestLLMTaskPersistsAcrossReopen 验证任务数据在关闭/重开（迁移幂等）后仍存在。
 func TestLLMTaskPersistsAcrossReopen(t *testing.T) {
-	path := t.TempDir() + "/notes.db"
+	path := t.TempDir() + "/seshat.db"
 
 	db1, err := Open(path, "")
 	if err != nil {

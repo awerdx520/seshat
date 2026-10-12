@@ -9,13 +9,13 @@ import (
 	"strings"
 	"testing"
 
-	"notes/internal/storage"
+	"seshat/internal/storage"
 )
 
 // openTestDB 在临时目录打开一个全新的测试库，并注册测试结束后的清理。
 func openTestDB(t *testing.T) *storage.DB {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "notes.db")
+	path := filepath.Join(t.TempDir(), "seshat.db")
 	db, err := storage.Open(path, "")
 	if err != nil {
 		t.Fatalf("storage.Open() 返回错误: %v", err)
@@ -179,7 +179,7 @@ func TestWriteManifest(t *testing.T) {
 		t.Fatalf("Store(beta) 返回错误: %v", err)
 	}
 
-	dir := filepath.Join(t.TempDir(), "notes-root")
+	dir := filepath.Join(t.TempDir(), "seshat-root")
 	if err := WriteManifest(dir, db); err != nil {
 		t.Fatalf("WriteManifest() 返回错误: %v", err)
 	}
@@ -229,7 +229,7 @@ func TestWriteManifest(t *testing.T) {
 // TestWriteManifestEmpty 验证无附件时仍生成空清单文件（幂等，便于 git 追踪「清空」）。
 func TestWriteManifestEmpty(t *testing.T) {
 	db := openTestDB(t)
-	dir := filepath.Join(t.TempDir(), "notes-root")
+	dir := filepath.Join(t.TempDir(), "seshat-root")
 	if err := WriteManifest(dir, db); err != nil {
 		t.Fatalf("WriteManifest() 返回错误: %v", err)
 	}

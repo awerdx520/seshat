@@ -1,7 +1,7 @@
 #+TITLE: 示例 GTD 文档
 #+FILETAGS: :notes:
 
-* 项目：Notes 应用
+* 项目：Seshat 应用
 ** TODO [#A] 实现 GTD agenda 视图 :android:feature:
    DEADLINE: <2026-10-20 Tue>
    展示 org 条目的 TODO 列表，支持按状态 / 优先级 / 标签过滤。

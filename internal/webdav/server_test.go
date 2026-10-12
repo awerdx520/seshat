@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	"notes/internal/auth"
+	"seshat/internal/auth"
 )
 
 // testToken 是测试用的访问令牌（用户名任意，密码为该令牌）。
