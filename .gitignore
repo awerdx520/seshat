@@ -27,3 +27,6 @@ files/objects/
 # 编辑器/系统
 .DS_Store
 *~
+
+# 大体积个人参考 PDF（不入库）
+*.pdf
