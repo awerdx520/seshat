@@ -162,6 +162,32 @@ SM-2 易度因子下限 1.3、默认 2.5，判定「答对」的最低评分为 
    `running`；
 5. 无任务时休眠数秒（默认 5s）再轮询；收到 `SIGINT` / `SIGTERM` 时优雅退出。
 
+## 客户端接入（Emacs：go-translate + posframe）
+
+> **现状**：服务端 LLM 增值层（上文五类能力：文档解析、笔记审查、归纳总结、阅读行为
+> 分析、遗忘性复习）**尚未暴露客户端 HTTP 接口**（`internal/api/server.go` 中零命中）。
+> 因此 Emacs 客户端当前**不经过服务端**，直接复用本地已配置的 **go-translate（gt）** 与
+> **posframe** 完成「选区翻译 / 解释」。
+
+阅读器侧入口为 `emacs/seshat-reader/seshat-reader-translate.el`，提供三个命令：
+
+| 命令 | 快捷键 | 作用 |
+|---|---|---|
+| `seshat-reader-translate-selection` | `C-c C-t` | 翻译当前鼠标选区文本，posframe 弹出译文 |
+| `seshat-reader-translate-explain-selection` | `C-c C-e` | 对当前选区文本做 LLM 解释，posframe 弹出结果 |
+| `seshat-reader-translate-save-as-annotation` | `M-x` | 把最近一次译文 / 解释存为服务端批注（复用 M11.3 链路） |
+
+**引擎**：翻译走 youdao-dict + google（gt 预设 `reader`）；解释走 `gt-chatgpt-engine`
+（gt 预设 `reader-explain`，可指向任意 OpenAI 兼容端点，如 DeepSeek）。两个预设**定义在
+用户配置侧**（`thomas-emacs/lisp/init-tools.el`），阅读器按预设名取用、缺失时回退内置默认。
+
+**隐私提示**：**选中的文本会发送到所配置的引擎 / 端点**（翻译默认的 youdao/google 与解释
+默认的 OpenAI 兼容端点均可能为云端服务）。如需本地处理，可改用本地模型端点（例如把
+`reader-explain` 预设指向本机 Ollama 的 OpenAI 兼容接口）。
+
+**后续计划**：待服务端补齐 LLM HTTP 端点后，可把阅读器翻译 / 解释切换为「服务端统一入口 +
+本地节点路由」（见 [`openspec/tech-debt.md`](../openspec/tech-debt.md)「服务端 LLM 端点缺口」条）。
+
 ## 相关文件
 
 - 接入层与路由：[`internal/llm/`](../internal/llm/)（`client.go` / `cloud.go` / `local.go` / `router.go` / `backend.go`）

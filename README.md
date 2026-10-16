@@ -19,5 +19,10 @@
 - 决策日志：openspec/decisions.md
 - ADR：docs/adr/
 
+## 开发
+- 克隆后先安装提交前钩子（密钥扫描，详见 docs/security.md §6）：`pre-commit install`
+- 钩子全量运行：`pre-commit run --all-files`；但 gitleaks 只扫暂存区，需全量/历史内容检查时见 docs/security.md §6.3
+
 ## 快速开始
-（待 M0 里程碑完成后补充）
+- 生成密钥：`scripts/gen-secrets.sh`（输出 `./data/secrets.env`，权限 600）
+- 部署与启动：见 docs/deploy.md

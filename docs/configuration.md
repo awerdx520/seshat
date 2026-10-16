@@ -52,6 +52,62 @@ export SESHAT_LLM_API_KEY=...   # → Config.LLM.CloudAPIKey
 export SESHAT_NODE_TOKEN=...    # → Config.LLM.NodeToken
 ```
 
+## Emacs 客户端配置（批注侧车）
+
+> 本节为**客户端侧**配置（`notes/emacs/`），与服务端 `config.yaml` / 环境变量无关，不影响服务端行为。
+
+Emacs 端通过 `seshat-reader-annotation` 采集 PDF 页面选区并同步为服务端批注（侧车，不写回 PDF）。相关变量：
+
+| 变量 | 说明 |
+|---|---|
+| `seshat-reader-annotation-roots` | 书库根映射：`("<标签>" . "<根目录>")` 的 alist。批注的 `document_id` 由 **`<标签>:<相对路径>`** 组成（相对路径 = 文件相对所命中根目录的路径）。多根命中时取**最长**匹配根；文件不在任何根下时降级为 `local:<绝对路径>`，并在提示中说明该批注**不跨端共享**。 |
+| `seshat-rest-base-url` | 服务端 REST 基地址（不含末尾斜杠），如 `"https://example.com"`。 |
+| `seshat-rest-token` | REST Bearer 令牌（即服务端 `SESHAT_AUTH_TOKEN`）。令牌从环境变量 `SESHAT_AUTH_TOKEN` 读取（`(getenv "SESHAT_AUTH_TOKEN")`），**不得写入配置文件**。 |
+
+配置示例：
+
+```elisp
+(setq seshat-rest-base-url "https://example.com"
+      seshat-rest-token (or (getenv "SESHAT_AUTH_TOKEN") "")
+      seshat-reader-annotation-roots '(("ebook" . "~/WorkSpace/e-book/")))
+```
+
+### 阅读器翻译 / 解释（go-translate 预设）
+
+> 与批注侧车同属**客户端侧**配置（由 `seshat-reader-translate` 模块读取），与服务端无关。
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `seshat-reader-translate-preset` | `reader` | 「翻译」使用的 gt 预设名（阅读器按名从 `gt-preset-translators` 取用） |
+| `seshat-reader-translate-explain-preset` | `reader-explain` | 「解释」使用的 gt 预设名（通常指向 `gt-chatgpt-engine`） |
+| `seshat-reader-translate-fallback-langs` | `(en zh)` | 语言回退：源语言取本列表首项，目标语言由此推导（可由命令前缀参数覆盖） |
+| `seshat-reader-translate-render` | `pop` | posframe 呈现方式：`pop`（弹出，超时自动消失）或 `pin`（固定停留） |
+
+说明：
+
+- `reader` / `reader-explain` 两个 gt 预设**需在用户配置侧定义**（示例见 `thomas-emacs/lisp/init-tools.el`）；阅读器侧只按预设名取用，缺失时回退内置默认（翻译回退 youdao/google，解释需显式配置端点）。
+- gt 的 key（如 `gt-chatgpt-key`）**一律走 authinfo / 环境变量**（本项目经 `DEEPSEEK_API_KEY` 环境变量注入），**禁止写入配置文件**。
+
+### 批注离线队列（服务不可用时的本地暂存）
+
+> 与批注侧车同属**客户端侧**配置（由 `seshat-reader-annotation-queue` 模块读取），与服务端无关。
+
+服务端不可用时，批注的创建/删除不再报错，而是写入本地队列暂存；服务端恢复后自动推进同步。
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `seshat-reader-annotation-queue-file` | `~/.local/share/seshat/annotation-queue.eld` | 离线队列文件路径 |
+| `seshat-reader-annotation-queue-auto-sync` | `t` | 是否启用自动同步（服务恢复后自动推进） |
+| `seshat-reader-annotation-queue-sync-interval` | `300` | 周期同步间隔（秒） |
+| `seshat-reader-annotation-queue-initial-delay` | `10` | Emacs 启动后首次自动同步的延迟（秒） |
+| `seshat-reader-annotation-queue-max-entries` | `1000` | 队列条目上限（达上限时拒绝入队） |
+
+说明：
+
+- 服务端不可用时，批注/删除操作写入本地队列（**不报「服务不可用」**）；用户得到的是「已存入本地，待联网同步」。批注**列表**在离线时仍显示本地待同步项并标 `[待同步]`。
+- 服务恢复后，同步由以下时机推进：**启动后 `initial-delay`（默认 10 秒）首次 + 每 `sync-interval`（默认 300 秒）周期 + 手动 `M-x seshat-reader-annotation-queue-sync` + `list`/`create` 成功后的机会性同步**。
+- 队列文件为 elisp 数据（`prin1` 写出的 plist 列表），采用**原子写**：先把内容写入同目录唯一临时文件，再 `rename-file` 原子覆盖目标文件，避免写入中途崩溃留下损坏内容；读取到损坏文件时保留原文件不覆盖并报错。
+
 ## 相关文件
 
 - 示例配置：[`config.example.yaml`](../config.example.yaml)
