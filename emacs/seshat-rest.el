@@ -148,7 +148,7 @@ DOCUMENT-ID 为不含斜杠的稳定标识，会先做 URL 编码。
 
 (defun seshat-rest-create-annotation (document-id location text)
   "为文档 DOCUMENT-ID 在位置 LOCATION 创建内容为 TEXT 的批注。
-LOCATION 与 TEXT 均不可为空。DOCUMENT-ID 会先做 URL 编码（用于请求体）。
+LOCATION 与 TEXT 均不可为空。DOCUMENT-ID 原样放入 JSON 请求体（JSON 请求体无需 URL 编码）。
 成功（201）返回服务端创建的完整批注对象（alist，含 id 与时间戳）；
 非 2xx 响应返回 nil。"
   (seshat-rest--json
@@ -157,6 +157,19 @@ LOCATION 与 TEXT 均不可为空。DOCUMENT-ID 会先做 URL 编码（用于请
     "/api/annotations"
     (json-encode `((document_id . ,document-id)
                    (location . ,location)
+                   (text . ,text))))))
+
+(defun seshat-rest-update-annotation (id location text)
+  "更新编号为 ID 的批注的 LOCATION 与 TEXT。
+ID 为服务端分配的批注标识（字符串），会先做 URL 编码（用于请求路径）。
+LOCATION 与 TEXT 均不可为空。
+成功（200）返回服务端更新后的完整批注对象（alist，含 id 与时间戳）；
+非 2xx 响应（如批注不存在 404）返回 nil。"
+  (seshat-rest--json
+   (seshat-rest--request
+    "PUT"
+    (format "/api/annotations/%s" (url-hexify-string id))
+    (json-encode `((location . ,location)
                    (text . ,text))))))
 
 (defun seshat-rest-list-annotations (document-id)
@@ -172,11 +185,13 @@ DOCUMENT-ID 会先做 URL 编码后作为查询参数 `document_id' 发送。
 
 (defun seshat-rest-delete-annotation (id)
   "删除编号为 ID 的批注。
-ID 为服务端分配的批注标识（正整数或字符串）。
+ID 为服务端分配的批注标识（正整数或字符串），会先字符串化再做 URL 编码
+（用于请求路径）。
 成功（2xx，通常为 204）返回 t，否则返回 nil。"
   (let ((status (car (seshat-rest--request
                       "DELETE"
-                      (format "/api/annotations/%s" id)))))
+                      (format "/api/annotations/%s"
+                              (url-hexify-string (format "%s" id)))))))
     (and (integerp status)
          (>= status 200)
          (< status 300))))
