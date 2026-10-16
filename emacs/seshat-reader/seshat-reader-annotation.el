@@ -1,0 +1,551 @@
+;;; seshat-reader-annotation.el --- Annotations for seshat-reader documents  -*- lexical-binding: t; -*-
+
+;; Copyright (C) 2026  Seshat contributors
+
+;; Author: Seshat contributors
+;; Keywords: lisp, files, tools
+;; Version: 0.1.0
+;; Package-Requires: ((emacs "29.1"))
+
+;; This program is free software; you can redistribute it and/or modify
+;; it under the terms of the GNU General Public License as published by
+;; the Free Software Foundation, either version 3 of the License, or
+;; (at your option) any later version.
+
+;; This program is distributed in the hope that it will be useful,
+;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;; GNU General Public License for more details.
+
+;; You should have received a copy of the GNU General Public License
+;; along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+;;; Commentary:
+
+;; `seshat-reader' 文档的批注采集与侧车同步。
+;;
+;; 批注是**侧车（sidecar）**数据：保存在服务端（`POST /api/annotations'），
+;; 不写回文档文件；阅读器只负责采集与展示，从不修改用户文档。
+;;
+;; 文档标识（`document_id'）由本模块单点派生，约定为
+;; \"<根标签>:<相对路径>\"，其中根标签到根目录的映射由
+;; `seshat-reader-annotation-roots' 配置；未命中任何已配置根的文档降级为
+;; \"local:<绝对路径>\"（只在本地可见，不跨端共享）。
+;;
+;; 位置（`location'）约定为 \"page:<n>;rect:<x0>,<y0>,<x1>,<y1>\"：页码
+;; `<n>' 为 **1-based** 十进制整数，矩形为**页面坐标**（PDF point 空间、
+;; 原点左上、y 向下），不含缩放与旋转，四个坐标各保留两位小数。
+;;
+;; 服务端契约（端点、字段与错误码）见项目 `docs/api.md'。
+;;
+;; 交互入口（键位加在 `seshat-reader-mode-map'）：
+;;
+;;   `C-c C-a'  `seshat-reader-annotation-create'
+;;     把最近一次鼠标选区（`seshat-reader-select-last'）作为内容创建批注；
+;;     带前缀参数（`C-u'）时在迷你缓冲区读取正文。创建成功后**不清除**
+;;     选区，因此可对同一选区连续创建多条批注。
+;;
+;;   `C-c C-l'  `seshat-reader-annotation-list'
+;;     列出当前文档的批注，渲染到 `*Seshat Annotations*'（页码 + 正文
+;;     摘要）；列表缓冲区中 `RET' 跳页、`d' 删除。
+;;
+;; 列表缓冲区使用 `special-mode' 派生的内部 mode
+;; `seshat-reader-annotation-list-mode'，`RET' 与 `d' 经其 local keymap
+;; 用 `define-key' 绑定，不引入 evil 依赖。在 evil 环境下这两个键可能被
+;; evil 接管（evil 会覆盖 `special-mode' 系的这两个键），需要用户在配置
+;; 侧处理（真机验证由 M11.3 的 T11 覆盖）。
+
+;;; Code:
+
+(require 'url-util)
+(require 'seshat-rest)
+(require 'seshat-reader)
+
+;; 离线队列模块（`seshat-reader-annotation-queue'）在加载时会
+;; `(require 'seshat-reader-annotation)'，因此本文件**不得**在顶部 require
+;; 它（会形成循环 require）。改为在此声明其公开函数，并在真正需要时于函数
+;; 体内 `require'——Emacs 会缓存 feature，重复 require 只是一次查表。
+(declare-function seshat-reader-annotation-queue-enqueue "seshat-reader-annotation-queue")
+(declare-function seshat-reader-annotation-queue-remove "seshat-reader-annotation-queue")
+(declare-function seshat-reader-annotation-queue-count "seshat-reader-annotation-queue")
+(declare-function seshat-reader-annotation-queue-entries "seshat-reader-annotation-queue")
+(declare-function seshat-reader-annotation-queue-sync "seshat-reader-annotation-queue")
+
+(defvar seshat-reader-select-last nil
+  "最近一次鼠标选区，正式定义与完整语义见 `seshat-reader-select'.
+此处声明仅用于避免字节编译告警，并保证在 `seshat-reader-select' 尚未
+加载时该变量仍有 nil 绑定，使 `seshat-reader-annotation-create' 的
+“无选区”检查走 `user-error' 而不是 void-variable 崩溃。")
+
+(defgroup seshat-reader-annotation nil
+  "批注采集与侧车同步（seshat-reader 文档）."
+  :group 'seshat-reader
+  :prefix "seshat-reader-annotation-")
+
+(defcustom seshat-reader-annotation-roots nil
+  "已配置的文档根列表，用于把文件路径派生为批注用的 `document_id'.
+每个元素形如 (标签 . 根目录)：标签是简短字符串，用于组成
+`document_id' 的 \"<标签>:<相对路径>\"；根目录是书库目录的绝对路径
+（可含 `~'，比较前经 `expand-file-name' 展开）。
+文件命中某个根时取 \"<标签>:<相对路径>\"；多个根同时命中时取**最长
+（最具体）的根**优先。
+未命中任何已配置根的文档降级为 \"local:<绝对路径>\"，其批注只在本地
+可见、不跨端共享。"
+  :type '(alist :key-type (string :tag "根标签")
+                :value-type (directory :tag "根目录"))
+  :group 'seshat-reader-annotation)
+
+(defun seshat-reader-annotation--doc-id (file)
+  "由文件路径 FILE 派生批注用的文档标识.
+先把 FILE 归一化为绝对真实路径（`file-truename' 展开 `~'、相对路径与
+符号链接），再依次与 `seshat-reader-annotation-roots' 中的每个根比较：
+命中时返回 \"<标签>:<相对路径>\"，多个根命中时取**最长（最具体）的根**。
+未命中任何根时把结果降级为 \"local:<绝对路径>\"，并 `message' 一条警告
+提示该标识不跨端共享。
+
+FILE 为文档文件路径，可以是相对路径。返回的字符串可直接作为服务端
+`document_id' 使用。"
+  (let* ((truename (file-truename (expand-file-name file)))
+         (best-tag nil)
+         (best-root nil)
+         (best-length -1))
+    (dolist (entry seshat-reader-annotation-roots)
+      (let* ((tag (car entry))
+             (root (file-name-as-directory
+                    (file-truename (expand-file-name (cdr entry)))))
+             (length (length root)))
+        (when (and (file-in-directory-p truename root)
+                   (> length best-length))
+          (setq best-tag tag
+                best-root root
+                best-length length))))
+    (if best-tag
+        (concat best-tag ":" (file-relative-name truename best-root))
+      (let ((fallback (concat "local:" truename)))
+        (message "Seshat Reader annotation: %s 不在任何已配置的文档根内，降级为 %s（不跨端共享）"
+                 truename fallback)
+        fallback))))
+
+(defun seshat-reader-annotation--location (page rect)
+  "由 PAGE 与 RECT 构造批注位置字符串.
+PAGE 为 **1-based 正整数**页码；RECT 为四元素列表 (X0 Y0 X1 Y1)，元素为
+**页面坐标**浮点数（顺序不做重排，由调用方保证已归一）。返回
+\"page:<n>;rect:<x0>,<y0>,<x1>,<y1>\"，其中页码为 1-based 十进制整数，
+四个坐标各保留两位小数（`%.2f'）。PAGE 不是正整数时以 `user-error' 明确
+报错，不以 1 兜底。"
+  (unless (and (integerp page) (> page 0))
+    (user-error "Seshat Reader annotation: page 必须是正整数（1-based），实际为 %S"
+                page))
+  (let ((x0 (nth 0 rect))
+        (y0 (nth 1 rect))
+        (x1 (nth 2 rect))
+        (y1 (nth 3 rect)))
+    (format "page:%d;rect:%.2f,%.2f,%.2f,%.2f" page x0 y0 x1 y1)))
+
+;;; 离线队列接入
+
+(defun seshat-reader-annotation--require-queue ()
+  "按需加载离线队列模块并返回 t.
+本文件不在顶部 `require' `seshat-reader-annotation-queue'（后者加载时会
+`require' 本文件，顶部 require 会形成循环）；因此所有对队列模块公开函数
+与选项的访问都先经本函数按需加载。`require' 对已加载 feature 只是一次
+查表，开销可忽略。"
+  (require 'seshat-reader-annotation-queue)
+  t)
+
+(defun seshat-reader-annotation--enqueue (entry what)
+  "把一条批注操作 ENTRY 存入离线队列并提示待同步条数.
+WHAT 是描述该操作的短语（如 \"批注\"、\"删除操作\"），用于拼出提示语
+「WHAT已存入本地待同步队列（N 条待同步）」，其中 N 由
+`seshat-reader-annotation-queue-count' 现算。提示语刻意只陈述「已本地暂存」
+这一事实，不描述服务端状态（离线是预期路径，不是错误）。"
+  (seshat-reader-annotation--require-queue)
+  (seshat-reader-annotation-queue-enqueue entry)
+  (message "Seshat Reader annotation: %s已存入本地待同步队列（%d 条待同步）"
+           what (seshat-reader-annotation-queue-count)))
+
+(defun seshat-reader-annotation--maybe-sync-queue ()
+  "队列非空且启用自动同步时，机会性同步一次离线队列.
+先按需加载队列模块，再在 `seshat-reader-annotation-queue-auto-sync' 非 nil
+且 `seshat-reader-annotation-queue-count' 大于 0 时调用
+`seshat-reader-annotation-queue-sync'。同步自身的网络失败已被其吞掉，此处
+再用 `ignore-errors' 兜住队列文件损坏等异常，以免影响调用方的正常结果。"
+  (seshat-reader-annotation--require-queue)
+  (when (and (symbol-value 'seshat-reader-annotation-queue-auto-sync)
+             (> (seshat-reader-annotation-queue-count) 0))
+    (ignore-errors (seshat-reader-annotation-queue-sync))))
+
+(defun seshat-reader-annotation--queued-create-entries (document-id)
+  "返回 DOCUMENT-ID 在本地离线队列中待同步的 create 条目列表.
+按需加载队列模块后取 `seshat-reader-annotation-queue-entries' 中 `:action'
+为 `create' 的条目（`delete' 条目没有可展示的位置与正文），保持入队顺序；
+没有匹配条目时返回 nil。"
+  (seshat-reader-annotation--require-queue)
+  (let (result)
+    (dolist (entry (seshat-reader-annotation-queue-entries document-id))
+      (when (eq (plist-get entry :action) 'create)
+        (push entry result)))
+    (nreverse result)))
+
+;;; 交互式采集
+
+(defun seshat-reader-annotation-create (&optional body)
+  "为最近一次鼠标选区创建一条服务端批注.
+BODY 为批注正文；为 nil 或去掉空白后为空串时退回使用最近一次选区的
+文本（`seshat-reader-select-last' 的 :text）；两者皆空时 `user-error'。
+
+交互调用：不带前缀参数时直接使用选区文本，带前缀参数（`C-u'）时在
+迷你缓冲区读取正文。
+
+运行前置：必须先用鼠标拖拽选中页面文本，使 `seshat-reader-select-last'
+非 nil；该变量在创建成功后**不会被清除**，因此可对同一选区连续创建多条
+批注（这是有意的语义）。旋转页面上的选区不受支持。
+
+服务端返回含 `id' 的结果时 `message' 报告该 `id'，并在本地队列非空时
+机会性地触发一次队列同步（同步失败不影响本次创建成功的结果）。服务端
+不可用时**不**报错：把 `(:action create …)' 条目存入本地离线队列，并
+`message' 提示已本地暂存及待同步条数，稍后由
+`seshat-reader-annotation-queue-sync' 自动同步到服务端。"
+  (interactive (list (when current-prefix-arg (read-string "批注正文: "))))
+  (let ((selection seshat-reader-select-last))
+    (unless selection
+      (user-error "Seshat Reader annotation: 尚无选区，请先用鼠标（down-mouse-1）拖拽选中页面文本"))
+    (let ((file (plist-get selection :file)))
+      (unless file
+        (user-error "Seshat Reader annotation: 选区未记录文档文件，无法派生文档标识"))
+      (let* ((page (plist-get selection :page))
+             (rect (plist-get selection :rect))
+             (selection-text (plist-get selection :text))
+             (text (if (and (stringp body) (not (string-empty-p (string-trim body))))
+                       body
+                     selection-text))
+             (document-id (seshat-reader-annotation--doc-id file))
+             (location (seshat-reader-annotation--location page rect)))
+        (when (or (null text) (string-empty-p (string-trim text)))
+          (user-error "Seshat Reader annotation: 选区没有文本，可先用 C-u 输入批注正文"))
+        (condition-case nil
+            (let ((response (seshat-rest-create-annotation document-id location text)))
+              (if (and (listp response) (alist-get 'id response))
+                  (progn
+                    (message "Seshat Reader annotation: 已创建批注 %s（%s，%s）"
+                             (format "%s" (alist-get 'id response))
+                             document-id location)
+                    ;; 机会性同步：服务端此刻可达，顺手把积压的本地队列推进一次。
+                    (seshat-reader-annotation--require-queue)
+                    (when (> (seshat-reader-annotation-queue-count) 0)
+                      (ignore-errors (seshat-reader-annotation-queue-sync))))
+                (seshat-reader-annotation--enqueue
+                 (list :action 'create
+                       :document-id document-id
+                       :location location
+                       :text text)
+                 "批注")))
+          (error
+           (seshat-reader-annotation--enqueue
+            (list :action 'create
+                  :document-id document-id
+                  :location location
+                  :text text)
+            "批注")))))))
+
+
+;;; 列表与删除
+
+(defconst seshat-reader-annotation-list-buffer-name "*Seshat Annotations*"
+  "批注列表缓冲区名称.")
+
+(defconst seshat-reader-annotation-list-summary-width 60
+  "批注列表中正文摘要的最大字符数，超出部分以 \"…\" 截断.")
+
+(defconst seshat-reader-annotation--fetch-error 'seshat-reader-annotation--fetch-error
+  "`seshat-reader-annotation--fetch' 在拉取失败时返回的哨兵值.")
+
+(defvar-local seshat-reader-annotation-list-document-id nil
+  "列表缓冲区所展示批注的文档标识，供刷新时重新拉取.")
+
+(defvar-local seshat-reader-annotation-list-source nil
+  "发起列表的 seshat-reader 文档缓冲区，供 `RET' 跳页使用.")
+
+(defvar-local seshat-reader-annotation-list-entries nil
+  "列表缓冲区最近一次渲染的服务端批注列表（仅内存缓存）.
+`seshat-reader-annotation-list-delete' 在取消本地待同步批注后重渲染列表时
+复用本缓存，从而无需再次拉取服务端（即不发起任何 HTTP）。")
+
+(defun seshat-reader-annotation--page-from-location (location)
+  "从 LOCATION 中解析 **1-based** 页码；解析失败时返回 nil.
+LOCATION 的约定为 \"page:<n>;rect:...\"，其中 <n> 为 1-based 十进制
+整数；本函数用正则 `page:\\([0-9]+\\)' 提取该整数。"
+  (when (and (stringp location)
+             (string-match "page:\\([0-9]+\\)" location))
+    (string-to-number (match-string 1 location))))
+
+(defun seshat-reader-annotation--summary (text)
+  "把 TEXT 压缩为单行摘要，超过配置宽度时以 \"…\" 截断.
+TEXT 中的换行、回车与制表符被替换为空格；TEXT 为 nil 时返回空串。"
+  (let* ((flat (if (stringp text)
+                   (replace-regexp-in-string "[\n\r\t]+" " " text)
+                 ""))
+         (trimmed (string-trim flat)))
+    (if (> (length trimmed) seshat-reader-annotation-list-summary-width)
+        (concat (substring trimmed 0 seshat-reader-annotation-list-summary-width) "…")
+      trimmed)))
+
+(defun seshat-reader-annotation--insert-entry (annotation &optional queued-uuid)
+  "把一条批注 ANNOTATION 插入当前缓冲区的一行.
+ANNOTATION 为服务端返回的 alist，含 `id'、`location'、`text' 等字段。
+该行以 **1-based** 页码开头（无法解析时显示 \"?\" 并在行尾标注），后接
+正文摘要；整行携带 `seshat-reader-annotation-id' 与
+`seshat-reader-annotation-page' 两个文本属性，供 `RET' 与 `d' 使用。
+
+QUEUED-UUID 非 nil 时表示该条来自本地离线队列、尚未同步到服务端：行尾
+追加 \"[待同步]\" 标记，且该行携带值为 QUEUED-UUID 的
+`seshat-reader-annotation-queue-uuid' 文本属性。服务端返回的批注调用本
+函数时不传 QUEUED-UUID，该属性因此为 nil，供
+`seshat-reader-annotation-list-delete' 区分「取消本地条目」与「删除服务端
+批注」两条路径。"
+  (let* ((id (alist-get 'id annotation))
+         (location (alist-get 'location annotation))
+         (text (alist-get 'text annotation))
+         (page (seshat-reader-annotation--page-from-location location))
+         (start (point)))
+    (insert (format "  %5s  %s%s%s\n"
+                    (if page (number-to-string page) "?")
+                    (let ((summary (seshat-reader-annotation--summary text)))
+                      (if (string-empty-p summary) "（无正文）" summary))
+                    (if page "" "  [无法从 location 解析页码]")
+                    (if queued-uuid "  [待同步]" "")))
+    (add-text-properties start (point)
+                         (list 'seshat-reader-annotation-id id
+                               'seshat-reader-annotation-page page
+                               'seshat-reader-annotation-queue-uuid queued-uuid))))
+
+(defun seshat-reader-annotation--fetch (document-id)
+  "拉取 DOCUMENT-ID 的批注列表，失败时提示并返回失败哨兵.
+本函数直接查 HTTP 状态码，因此非 2xx 与「真正无批注」不会混为一谈：
+2xx 时用 `seshat-rest--json' 解析响应并返回批注列表（无批注为 nil，
+属合法结果，由调用方渲染为提示行）；HTTP 非 2xx（如 401 鉴权失败、
+500 服务端错误）时 `message' 一条**含状态码**的提示，并返回
+`seshat-reader-annotation--fetch-error'。服务端不可用、网络失败或响应
+无法解析等异常情形同样 `message' 提示并返回该哨兵。哨兵只用于让调用
+方跳过渲染、保留既有列表，绝不把异常冒泡成 backtrace。"
+  (condition-case err
+      (let* ((response (seshat-rest--request
+                        "GET"
+                        (format "/api/annotations?document_id=%s"
+                                (url-hexify-string document-id))))
+             (status (car response)))
+        (if (and (integerp status) (>= status 200) (< status 300))
+            (seshat-rest--json response)
+          (message "Seshat Reader annotation: 拉取批注列表失败（HTTP %s）"
+                   status)
+          seshat-reader-annotation--fetch-error))
+    (error
+     (message "Seshat Reader annotation: 拉取批注列表失败（请求失败或响应异常）：%s"
+              (error-message-string err))
+     seshat-reader-annotation--fetch-error)))
+
+(defun seshat-reader-annotation--render-list (document-id source annotations
+                                                         &optional queued)
+  "在 `*Seshat Annotations*' 中渲染批注列表.
+DOCUMENT-ID 为文档标识，SOURCE 为发起列表的 seshat-reader 文档缓冲区；
+二者都以 buffer-local 形式记入列表缓冲区，供 `d' 刷新与 `RET' 跳页
+复用，ANNOTATIONS 也一并缓存到
+`seshat-reader-annotation-list-entries' 供免 HTTP 重渲染。
+
+ANNOTATIONS 为服务端返回的批注列表，先逐条渲染；QUEUED 为本地离线队列中
+待同步的 create 条目列表（plist 列表，见
+`seshat-reader-annotation--queued-create-entries'），随后逐条以
+\"[待同步]\" 标记渲染，并携带各自的 `seshat-reader-annotation-queue-uuid'
+属性。因此列表中**服务端项在前、本地待同步项在后**。
+
+ANNOTATIONS 与 QUEUED 都为空时渲染一行明确提示。"
+  (with-current-buffer (get-buffer-create seshat-reader-annotation-list-buffer-name)
+    (let ((inhibit-read-only t))
+      (erase-buffer)
+      ;; 仅首次进入时调用派生 mode，避免每次刷新重复触发 mode hook。
+      (unless (derived-mode-p 'seshat-reader-annotation-list-mode)
+        (seshat-reader-annotation-list-mode))
+      (setq-local seshat-reader-annotation-list-document-id document-id)
+      (setq-local seshat-reader-annotation-list-source source)
+      (setq-local seshat-reader-annotation-list-entries annotations)
+      (if (and (null annotations) (null queued))
+          (insert "（该文档没有批注）\n")
+        (dolist (annotation annotations)
+          (seshat-reader-annotation--insert-entry annotation))
+        (dolist (entry queued)
+          (seshat-reader-annotation--insert-entry
+           (list (cons 'location (plist-get entry :location))
+                 (cons 'text (plist-get entry :text)))
+           (plist-get entry :uuid))))
+      (goto-char (point-min)))
+    (pop-to-buffer (current-buffer))))
+
+(defun seshat-reader-annotation--refresh-list (document-id &optional source)
+  "按 DOCUMENT-ID 重新拉取批注并刷新列表缓冲区.
+SOURCE 为发起列表的 seshat-reader 文档缓冲区（可为 nil）。
+
+服务端批注渲染在前，本地离线队列中尚未同步的 create 条目以 \"[待同步]\"
+追加在后（见 `seshat-reader-annotation--render-list'）——本地项只读队列
+文件，不受拉取结果影响。
+
+拉取成功（返回的不是失败哨兵）时渲染服务端项与本地项，随后在
+`seshat-reader-annotation-queue-auto-sync' 非 nil 且队列非空时机会性地
+尝试一次队列同步；同步发生在本轮渲染之后，故本轮不刷新、已同步条目仍会
+显示到下次刷新为止（这样避免了渲染—同步—再渲染的递归与竞态）。
+
+拉取失败（返回 `seshat-reader-annotation--fetch-error' 哨兵）时**不**
+清空列表：仍渲染本地待同步条目并提示当前只显示本地批注；队列也为空时只
+提示当前没有可显示的批注。两种情形都不会抛出 backtrace。"
+  (let* ((queued (seshat-reader-annotation--queued-create-entries document-id))
+         (result (seshat-reader-annotation--fetch document-id)))
+    (if (eq result seshat-reader-annotation--fetch-error)
+        (progn
+          (seshat-reader-annotation--render-list document-id source nil queued)
+          (if queued
+              (message "Seshat Reader annotation: 批注列表（离线）仅显示本地待同步批注 %d 条"
+                       (length queued))
+            (message "Seshat Reader annotation: 当前没有可显示的批注（本地也没有待同步条目）。")))
+      (seshat-reader-annotation--render-list document-id source result queued)
+      (seshat-reader-annotation--maybe-sync-queue))))
+
+(defun seshat-reader-annotation-list-goto ()
+  "跳转到当前行批注所在的页面.
+页码取自该行的 `seshat-reader-annotation-page' 文本属性（**1-based**），
+跳转复用 `seshat-reader-goto-page'。原始文档缓冲区已关闭、不再是
+seshat-reader 视图、页码缺失或跳转抛错时只 `message' 提示，不抛出
+backtrace。"
+  (interactive)
+  (let ((page (get-text-property (line-beginning-position)
+                                 'seshat-reader-annotation-page))
+        (source (buffer-local-value 'seshat-reader-annotation-list-source
+                                    (current-buffer))))
+    (cond
+     ((null page)
+      (message "Seshat Reader annotation: 当前行没有可跳转的页码。"))
+     ((not (buffer-live-p source))
+      (message "Seshat Reader annotation: 原始文档缓冲区已不存在，请重新打开文档后再跳页。"))
+     ((not (eq (buffer-local-value 'major-mode source) 'seshat-reader-mode))
+      (message "Seshat Reader annotation: 原始缓冲区已不是 seshat-reader 视图，无法跳页。"))
+     (t
+      (pop-to-buffer source)
+      (condition-case err
+          (seshat-reader-goto-page page)
+        (error
+         (message "Seshat Reader annotation: 跳转到第 %d 页失败：%s"
+                  page (error-message-string err))))))))
+
+(defun seshat-reader-annotation-list-delete ()
+  "删除当前行对应的批注，成功后刷新列表.
+按当前行的属性分两条路径：
+
+- 行上有 `seshat-reader-annotation-queue-uuid'（即本地待同步项，见
+  `seshat-reader-annotation--insert-entry'）时，用
+  `seshat-reader-annotation-queue-remove' 按该 UUID 从本地队列取消并重渲染
+  列表——**不发起任何 HTTP**；重渲染复用已缓存的服务端项
+  （`seshat-reader-annotation-list-entries'），因此也不会触网。提示按
+  `seshat-reader-annotation-queue-remove' 的返回值区分：返回 t 时 `message'
+  「已取消本地待同步批注」，返回 nil（该条目已不在队列，可能已同步移除）时
+  `message' 「该批注已不在本地队列（可能已同步）」；两种情况都刷新列表。
+- 行上没有该属性时，取其 `seshat-reader-annotation-id' 交给
+  `seshat-reader-annotation-delete' 删除服务端批注，成功后刷新列表。
+
+当前行既无 UUID 也无批注 `id' 时只 `message' 提示。"
+  (interactive)
+  (let ((uuid (get-text-property (line-beginning-position)
+                                 'seshat-reader-annotation-queue-uuid))
+        (id (get-text-property (line-beginning-position)
+                               'seshat-reader-annotation-id))
+        (document-id (buffer-local-value 'seshat-reader-annotation-list-document-id
+                                         (current-buffer)))
+        (source (buffer-local-value 'seshat-reader-annotation-list-source
+                                    (current-buffer))))
+    (cond
+     (uuid
+      (seshat-reader-annotation--require-queue)
+      (if (seshat-reader-annotation-queue-remove uuid)
+          (message "Seshat Reader annotation: 已取消本地待同步批注")
+        (message "Seshat Reader annotation: 该批注已不在本地队列（可能已同步），列表将刷新"))
+      (seshat-reader-annotation--render-list
+       document-id source
+       (buffer-local-value 'seshat-reader-annotation-list-entries
+                           (current-buffer))
+       (seshat-reader-annotation--queued-create-entries document-id)))
+     ((null id)
+      (message "Seshat Reader annotation: 当前行没有关联批注，无法删除。"))
+     (t
+      (when (seshat-reader-annotation-delete id)
+        (seshat-reader-annotation--refresh-list document-id source))))))
+
+(defun seshat-reader-annotation-delete (id)
+  "删除编号为 ID 的批注并报告结果.
+ID 可为整数或字符串（服务端列表返回的 `id' 可能是整数），发送前一律用
+`(format \"%s\" id)' 字符串化，以统一整数/字符串入参。成功时 `message'
+报告已删除并返回 t。
+
+失败（非 2xx 或请求异常）时**不**报错：把 `(:action delete :id ID)' 条目
+存入本地离线队列（ID 保留入参的原始类型，序列化与同步侧用
+`(format \"%s\" id)'），`message' 提示「删除操作已存入本地待同步队列
+（N 条待同步）」，并返回 nil。稍后由
+`seshat-reader-annotation-queue-sync' 自动同步到服务端。"
+  (interactive "s批注 ID: ")
+  (let ((id-string (format "%s" id)))
+    (condition-case nil
+        (if (seshat-rest-delete-annotation id-string)
+            (progn
+              (message "Seshat Reader annotation: 已删除批注 %s。" id-string)
+              t)
+          (seshat-reader-annotation--enqueue
+           (list :action 'delete :id id)
+           "删除操作")
+          nil)
+      (error
+       (seshat-reader-annotation--enqueue
+        (list :action 'delete :id id)
+        "删除操作")
+       nil))))
+
+(define-derived-mode seshat-reader-annotation-list-mode special-mode "Seshat-Annotations"
+  "Major mode for the `*Seshat Annotations*' buffer.
+
+Keybindings:
+\\{seshat-reader-annotation-list-mode-map}"
+  (setq-local truncate-lines t))
+
+(define-key seshat-reader-annotation-list-mode-map (kbd "RET")
+            #'seshat-reader-annotation-list-goto)
+(define-key seshat-reader-annotation-list-mode-map (kbd "d")
+            #'seshat-reader-annotation-list-delete)
+
+(defun seshat-reader-annotation-list ()
+  "列出当前文档的全部批注.
+从当前缓冲区的 variable `buffer-file-name' 派生文档标识，向服务端拉取批注并
+渲染到 `*Seshat Annotations*'；每行显示 **1-based** 页码与正文摘要
+（摘要按 `seshat-reader-annotation-list-summary-width' 截断并以 \"…\"
+结尾）。服务端批注在前，本地离线队列中待同步的 create 条目以
+\"[待同步]\" 追加在后。
+
+列表缓冲区中 `RET' 跳转到该行批注所在页面（复用
+`seshat-reader-goto-page'），`d' 删除该行批注并刷新列表——服务端项走
+`seshat-reader-annotation-delete'，本地 \"[待同步]\" 项则由
+`seshat-reader-annotation-list-delete' 直接取消本地条目、不发 HTTP。这两个
+键经 `seshat-reader-annotation-list-mode' 的 local keymap 绑定，不依赖
+evil；在 evil 环境下它们可能被 evil 接管（evil 会覆盖 `special-mode' 系的
+这两个键），需要用户在配置侧处理。
+
+服务端暂时拉不到时**不**报错也不清空列表：仍展示本地待同步条目并提示
+「（离线）仅显示本地待同步批注 N 条」；本地也为空时只提示当前没有可显示
+的批注。当前缓冲区没有关联文件时 `message' 提示，不会抛出 backtrace。"
+  (interactive)
+  (let ((file (buffer-file-name)))
+    (if file
+        (seshat-reader-annotation--refresh-list
+         (seshat-reader-annotation--doc-id file)
+         (current-buffer))
+      (message "Seshat Reader annotation: 当前缓冲区没有关联文件，无法确定文档标识。"))))
+
+(with-eval-after-load 'seshat-reader
+  (define-key seshat-reader-mode-map (kbd "C-c C-a") #'seshat-reader-annotation-create)
+  (define-key seshat-reader-mode-map (kbd "C-c C-l") #'seshat-reader-annotation-list))
+
+(provide 'seshat-reader-annotation)
+;;; seshat-reader-annotation.el ends here

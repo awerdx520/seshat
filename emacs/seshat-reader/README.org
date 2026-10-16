@@ -1,0 +1,202 @@
+#+begin_quote
+本地说明（2026-10-12）：本目录为 Seshat 项目自研化的派生包，源码源自上游 emacs-reader
+（见 VENDORED.md）。包内 feature 与全部 elisp 符号、文件名已改名为 seshat-reader-*，
+构建产物为 seshat-render-core.so。下文的 upstream 说明保留作为来源参考，其中的符号名
+与文件名与当前代码不一致。
+#+end_quote
+
+#+TITLE: The GNU Emacs Reader
+#+OPTIONS: toc:nil
+
+#+begin_src org :exports none
+Copyright (C) 2025-2026  Divya Ranjan Pattanaik
+Copyright (C) 2025-2026  Tushar
+
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or (at
+your option) any later version.
+
+This program is distributed in the hope that it will be useful, but
+WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+#+end_src
+
+[[file:extras/emacs-reader-logo.png]]
+
+An all-in-one document reader for GNU Emacs, supporting all [[* Supported Formats][major document formats]]. This package intends to take from =doc-view=, =nov.el=, and =pdf-tools= and make them better. And as such, it is effectively a *drop-in replacement* for them.
+
+* Emacs Reader at Emacsconf 2025
+
+[[https://media.emacsconf.org/2025/emacsconf-2025-reader--an-introduction-to-the-emacs-reader--divy--main.webm]]
+
+* Supported Formats
+The Emacs Reader (via MuPDF) can open all the formats below.
+
+** Well-supported Formats
++ PDF
++ EPUB
++ MOBI
++ FB2
++ XPS/OpenXPS
++ CBZ
+
+** Office Document Formats
+These formats below are not really for document reading, and as such while they are supported by MuPDF and can be opened fine, it’s just not going to be that good of an experience. It should only be used for quickly checking the textual contents of the document, and certainly cannot be edited inside Emacs. (You may use LibreOffice for that.)
+
+*** Open Document Formats (LibreOffice)
++ ODT
++ ODS
++ ODP
++ ODG
+
+*** Proprietary Micro$oft Formats
+Using these formats is heavily discouraged, you should /always/ prefer the above formats from LibreOffice (Which can also you help you edit these formats if you need to). But since MuPDF does come with some very minimal support for these proprietary formats as well, they can also be viewed:
+
++ DOCX
++ PPTX
++ XLSX
+
+* Dependencies
+The only thing this package depends on is =mupdf=, at minimum =v1.26.0=.
+
+* Installation
+For now, until the package has been published to GNU ELPA, the only way to install and use it is through locally cloning the repo and building it. This is different across platforms:
+
+** GNU/Linux
+On GNU/Linux, all you need is: =gcc= and =make=. Then you can simply install through the Emacs’ built-in =package-vc= (available in Emacs 30.1 or higher)or the [[https://github.com/radian-software/straight.el][straight]] package manager.
+
+- =use-package= with =package-vc=:
+   #+begin_src emacs-lisp
+     (use-package reader
+       :vc (:url "https://codeberg.org/MonadicSheep/emacs-reader"))
+   #+end_src
+
+-  =use-package= with =straight=
+   #+begin_src emacs-lisp
+     (use-package reader
+       :straight '(reader :type git :host codeberg :repo "MonadicSheep/emacs-reader"))
+   #+end_src
+
+The first time you use reader, you will need to build the dynamic module, you can either manually run =make= in reader's directory, or run the =M-x reader-build RET= command. But reader will run the command for you if you don't.
+
+#+begin_center
+Note that sometimes you may need to run =make clean all= to get rid of
+old artifacts before recompiling.
+#+end_center
+
+*** Debian GNU/Linux
+Follow this [[https://codeberg.org/divyaranjan/emacs-reader/issues/122#issuecomment-9315806][write up]].
+*** GNU Guix
+Using the [[https://guix.gnu.org/][GNU Guix]] package manager, you can get emacs-reader through the [[https://codeberg.org/divyaranjan/divya-lambda][divya-lambda]] Guix channel. Follow the instructions there to add the Guix channel to your configuration. Then all that remains to do is,
+#+begin_src bash
+  guix install emacs-reader
+#+end_src
+
+This will get the latest release of emacs-reader. However, if you want to get latest features, bug fixes (and bugs!) to help us with testing emacs-reader, you should use the master branch. You can instruct Guix to get it for you, like so,
+#+begin_src bash
+  guix install emacs-reader --with-branch=emacs-reader=master
+#+end_src
+
+You can also upgrade an already installed package with,
+#+begin_src bash
+  guix upgrade emacs-reader --with-branch=emacs-reader=master
+#+end_src
+
+You may replace the branch name as you need.
+
+*** Nix
+Follow the instructions [[https://codeberg.org/divyaranjan/emacs-reader/issues/115][here]].
+
+** MacOS
+Install MuPDF using Homebrew,
+#+begin_src sh
+  brew install gcc
+  brew install make
+  brew install mupdf
+#+end_src
+
+And then use the straight or package-vc recipe from the [[* GNU/Linux][GNU/Linux]] section.
+
+Find more information [[https://codeberg.org/divyaranjan/emacs-reader/issues/142#issuecomment-8854941][here]].
+
+** Windows
+With Windows, you need MSYS2 toolchain, first install MSYS2, then choose one of the environment that MSYS2 provided, on a modern 64bit Windows system, you want either =MINGW64= or =UCRT64=. If you have never tried MSYS2 before, we recommend =MINGW64= since this is the environment that used to build the official GNU Emacs' Windows version.
+
+The following steps assume you use =MINGW64=:
+
+First install the build dependencies:
+#+begin_src shell
+pacman -S make mingw-w64-x86_64-gcc git pkg-config mingw-w64-x86_64-libmupdf
+#+end_src
+
+And then use the straight or package-vc recipe from the [[* GNU/Linux][GNU/Linux]] section.
+
+** Manual
+1. Clone the repository into ~~/.emacs.d/user-lisp/~, you may also
+   symlink an existing checkout here.
+2. You may now run =M-x prepare-user-lisp RET= or restart Emacs.
+3. You also need to build the dynamic module, for this we provide the =M-x reader-build RET=. But you can also run =make= directly yourself.
+
+You can also utilize =use-package= to do the same,
+#+begin_src emacs-lisp
+  (use-package reader
+    :vc t
+    :load-path "/path/to/emacs-reader")
+#+end_src
+
+To test emacs-reader in a default Emacs config, first generate the auto loads using =make autoloads=.
+#+begin_src shell
+  emacs -Q -L . -l reader-autoloads.el
+#+end_src
+This command adds the current directory to path, and loads =reader-autoloads.el=.
+
+* Key Bindings
+- =n= for going to next page
+- =p=  for going to previous page
+- =C-n= for scrolling down.
+- =C-p= for scrolling up.
+- =C-b= for scrolling left.
+- =C-f= for scrolling right.
+- =Q= for closing the Emacs Reader buffer.
+- =M-<= for going to the first page.
+- =M->= for going to the last page.
+- =M-g g= for going to a particular page.
+- =M-v= or =Page Up=  for scrolling to the top of the page.
+- =C-v=  or =Page Down= for scrolling to the end of the page.
+- =SPC=, =S-SPC= , and =DEL= make the above two commands keep scrolling the pages.
+- ===, =+=, and =C-<wheel-up>= for zooming into the page.
+- =-= and =C-<wheel-down>= for zooming out of the page.
+- =H= to make the page fit the height of the current window.
+- =W= to make the page fit the width of the current window.
+
+* How It Works
+This package is entirely distinct from =DocView= and =pdf-tools= in both its architecture and implementation. It leverages Emacs’ dynamic/native modules which allows it to interoperate with other programming languages outside of its Emacs Lisp environment.
+
+Thus, we rely on the efficient MuPDF library as a shared object with which our dynamic modules work. All the tasks that require manual memory management, efficiently dealing with the rendered pages, and so on are delegated to the C backend, and Emacs takes care of exclusively what it’s good at: displaying produced pages, buffer management, and all round integration with the rest of Emacs.
+
+For understanding how dynamic modules work within Emacs, please consult the following article I wrote:
+
+https://www.phimulambda.org/blog/emacs-dynamic-module.html
+
+* Live Streams
+
+I have been streaming the development of this package on [[https://tv.dyne.org/c/phimulambda/][my PeerTube channel: (phi (mu (lambda)))]].
+
+[[https://tv.dyne.org/w/p/2A6UVt21hayJ3dVj5cU4yA][The streams]] happen on *Sundays, biweekly at around 2:30 PM UTC*. Follow the channel on Peertube or my [[https://mathstodon.xyz/@divyaranjan][Mastodon]] to be notified when I stream. You can also find some stream notes [[file:doc/][here]].
+
+If you wish to join the discussion for the package, you should join the IRC channel =#phi-mu-lambda= on [[https://libera.chat/][Libera]].
+
+* License
+Unless another license is listed, all files in emacs-reader are licensed under the GNU General Public License version 3 (or at your option, any later version). See [[file:COPYING][COPYING]] and [[file:CONTRIBUTORS][CONTRIBUTORS]] for further details.
+
+The logo of the project was made by Divya Ranjan Pattanaik and is shared under [[http://creativecommons.org/licenses/by-sa/4.0/][CC-BY-SA-4.0]]. The logo uses the following artworks from GNU:
+
+- [[https://www.gnu.org/graphics/heckert_gnu.html][A Bold GNU Head by Aurélio A. Heckert]]
+- [[https://commons.wikimedia.org/wiki/File:Emacs_512.png][Icon for Emacs 23 by Kentaro Ohkouchi]]
+
+The interesting history of different Emacs logos is outlined by Luis Fernandes, in his article on [[https://www.ee.torontomu.ca/~elf/emacs/logo/][The Design of the Emacs Logo]].

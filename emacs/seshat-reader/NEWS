@@ -1,0 +1,34 @@
+;;; -*- mode: auto-fill; mode: org; -*-
+See =(info "(standards) NEWS File")=. User facing changes per release
+are to be recorded here.
+
+* Version 0.4.0
+- Per window pages, zooming, etc. support, which means that it is now
+  possible to view different pages of the same document (from the same
+  buffer) on different windows.
+- Change 'screenful' to 'screen' in command names.
+- Make =reader-reset-size= interactive.
+- Overall stability improvements when opening files, accessing
+  bookmarks, and outlines.
+- Remove F5 keybinding for =reader-presentation-mode=.
+- Remove =reader-mode= as an interactive command.
+- Fix weird page border artifacts when using the mouse.
+- Add =reader-build= command to automatically build the dynamic module.
+
+* Version 0.3.2
+- Fix reader-outline when original source buffer is killed.
+- Correct keybindings for C-v/M-v.
+- Enhance build system on GNU/Linux and MS Windows.
+
+* Version 0.3.1
+- Start NEWS file.
+- Fix MS Windows build.
+- Fix the order of reader outline, where the last heading would show
+  up at the beginning, now they show up at the end.
+- Fix bug where setting the left-fringe-width would disable the
+  centering.
+- Add new customize option, =reader-default-fit=, for setting the
+  default fitting (fit to height or fit to width).
+- Add a new command, =reader-reset-size=, to reset scaling to 1.0.
+- Fix scrolling when =pixel-scroll-precision-mode= is enabled.
+- Fix =revert-buffer= to respect the theme, page and scale of the document.

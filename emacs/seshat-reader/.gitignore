@@ -1,0 +1,7 @@
+*.elc
+*.o
+*.so
+*.dylib
+*.dll
+seshat-reader-autoloads.el
+*~

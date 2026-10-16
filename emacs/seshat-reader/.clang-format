@@ -1,0 +1,21 @@
+# .clang-format
+
+BasedOnStyle: GNU
+
+# Basic layout
+IndentWidth: 8
+TabWidth: 8
+UseTab: Always
+BreakBeforeBraces: Allman
+
+# Function signatures
+AlwaysBreakAfterReturnType: TopLevel
+AlignAfterOpenBracket: Align
+AlignOperands: true
+
+# Pointer and reference style
+PointerAlignment: Right
+
+# Other
+ColumnLimit: 80
+SpaceBeforeParens: ControlStatements
