@@ -48,3 +48,85 @@
 ## 部署即明文风险（code-reviewer 安全专项）——已解决（部署清单硬性 LUKS 步骤，2026-10-11）
 - 现象（历史）：SQLCipher 降级下，若运维未启用 LUKS，数据库与笔记明文落盘，威胁模型失效。
 - 解决：docs/deploy.md 第 2 节标题即为「磁盘加密（LUKS，硬性）」，明确「任何部署都必须对数据盘启用 LUKS」；部署检查清单（第 10 节）含「LUKS 已启用」「服务端已构建（加密构建 `-tags "sqlcipher sqlite_fts5"`，或非加密回退 + LUKS 兜底）」等硬性勾选项。同时 docs/security.md 更新 SQLCipher 为 build tag 启用加密（go-sqlcipher 自带 amalgamation），无该 tag 时为明文 + LUKS 兜底。
+
+## 上游对照能力丧失（M11.2c，2026-10-12）
+- seshat-reader 改名后与上游 emacs-reader 无逐文件映射，上游修复无法机械合并，须人工比对。
+
+## evil 键位自维护（M11.2c，2026-10-12）
+- evil-collection 的 reader 支持绑定硬编码于 `reader-mode-map`（且以 `eval-after-load 'reader` 触发），改名后不再生效；本地在 `thomas-emacs/lisp/init-evil.el` 重建 49 条绑定（含 outline 6 条），上游更新不会自动同步。
+
+## C 源名与产物名不一致（M11.2c，2026-10-12）
+- 源码仍为 `render/render-core.c`，产物却为 `seshat-render-core.so`（有意保留以缩小改动面）。
+
+## native-comp 旧缓存残留（M11.2c，2026-10-12）
+- `thomas-emacs/.local/cache/eln-cache/*/` 与 `~/.emacs.d/eln-cache/*/` 下存在 `reader-*.eln` 等旧包缓存（无害垃圾，可随时删除或由重新编译自然替换）。
+
+## savehist 中的旧命令名（M11.2c，2026-10-12）
+- `thomas-emacs/.local/cache/savehist` 的 `extended-command-history` 中残留一条 `reader-mode`（历史数据，无害；用户可用 `M-x` 历史清理）。
+
+## docstring 列宽告警（M11.2c，2026-10-12）
+- 前缀变长使个别 docstring 超过 80 列（byte-compile warning，非 error；checkdoc 无告警）。
+
+## define-derived-mode 内重复运行 mode hook（M11.2c，2026-10-16）
+- `seshat-reader.el` 的 `define-derived-mode` 体内手工 `(run-hooks 'seshat-reader-mode-hook)`（由来：上游原样带入，经与上游源码逐行对照确认）；`define-derived-mode` 本身已自动执行 mode hook，理论上会执行两次。现有 hook 均幂等、无可见危害，改名未触碰该逻辑；若要修须单独评估行为影响。
+
+## 批注缺备注字段（M11.3，2026-10-16）
+- 服务端 annotations 表只有 `text`，Emacs 侧用「选中文本」作正文；高亮 + 备注的完整语义需 schema 扩展。
+
+## EPUB location 未定（M11.3，2026-10-16）
+- 本步只定义 PDF 的 `page:<n>;rect:…`；EPUB 约定（CFI vs `chapter:x`）仍待 M10.3。
+
+## 页面高亮缺口（M11.3，2026-10-16）
+- 批注在页面上无可视化，只能通过列表查看与跳页；需改 C 渲染器（另立里程碑）。
+
+## 离线队列缺失（M11.3，2026-10-16）
+- REST 失败即报错，无本地暂存与重试。
+
+## REST 封装的非 2xx 语义（M11.3，2026-10-16）
+- `seshat-rest--json` 对非 2xx 返回 nil 而非抛错，调用方无法区分「空结果」与「失败」；批注模块已绕开（自行判状态码），但该局限仍在封装层。
+
+## http_proxy 隐患（M11.3，2026-10-16）
+- 环境设置了 `http_proxy`，Emacs `url.el` 对本地地址会打印 "Using a proxy for http..."；依赖 `no_proxy` 才正确直连，配置本地服务端时需注意。
+
+## L3 端到端待补（M11.3，2026-10-16）
+- M11.3 的服务端闭环验证因服务端不可用而未执行，启动方式见 `docs/configuration.md` 与 `deploy/`（密钥不入库）。
+
+## evil 遮蔽 major-mode 的鼠标绑定（M11.3，2026-10-16）
+- evil 经 `emulation-mode-map-alists` 把 `[down-mouse-1]` 解析到 `evil-mouse-drag-region`，优先于 major-mode-map；`seshat-reader-mode-map` 上既有的 `<remap> mouse-drag-region → ignore` 亦无法拦截（evil 走的是 `evil-mouse-drag-region`，不是 `mouse-drag-region`）。
+- 影响所有依赖 `down-mouse-1` 的 major-mode 级交互（如 seshat-reader 的鼠标拖拽选区取文）。
+- 当前在 `thomas-emacs/lisp/init-evil.el` 侧以 normal state 显式重绑规避。
+- 根治需上游 evil 提供更细的 state 映射策略或改用 aux keymap 的更明确写法。
+
+## 服务端 LLM 端点缺口（M11.5，2026-10-16）
+- `internal/llm` 的 5 类能力（含云端/本地节点混合路由）尚未暴露任何客户端 HTTP 接口（`internal/api/server.go` 中零命中）；Emacs 侧因此暂时绕过服务端直连本地 gt。
+- 服务端补齐同步/异步对话端点后，应评估把阅读器翻译/解释切回统一入口。
+
+## 第三方翻译端点可用性（M11.5，2026-10-16）
+- 阅读器翻译默认走 gt 的 youdao-dict + google 免费端点，其可用性、限流与返回结构均由第三方决定，可能随时变化或需要代理（用户已自行配置 `gt-http-proxy`）。
+
+## `gt-chatgpt-engine` 的 key 管理（M11.5，2026-10-16）
+- 解释功能的 key 经 `gt-chatgpt-key`（本项目从环境变量 `DEEPSEEK_API_KEY` 注入）或 authinfo 提供；Emacs 侧存在明文 key 的运行时副本，与「密钥不落盘」原则存在张力，后续可评估改用 authinfo 专项目录条目。
+
+## 全局 render hook 的时间窗局限（M11.5，2026-10-16）
+- `seshat-reader-translate--capture-result` 挂在 gt 的全局 output hook 上；为防其它 gt 用法污染 `seshat-reader-translate-last-result`，采用「活动标记 + 时间窗（默认 120s）」守卫。局限：窗口内若用户使用其它 gt 功能（同样走 posframe 渲染），仍可能误捕获其译文；根治需子类化 gt 的 render 或改用请求级回调（上游若无此扩展点则需较大改造）。
+
+## 签名材料黑名单覆盖不全（2026-10-16）
+- `no-secret-files` 未覆盖 `.pk8`（Android 平台私钥）、`.der` 等格式；且 `.pem` 无法区分私钥与公钥证书，若将来提交 TLS 公钥证书（如 `deploy/cert.pem`）会被误拦。待实际需要时扩展正则或改用内容判定。
+
+## 远端 CI 兜底未部署（2026-10-16）
+- 本地 pre-commit 钩子可被 `git commit --no-verify` 绕过，且不覆盖其他克隆者与历史遗留内容；`openspec/decisions.md`（2026-10-16 条目）已声明该边界，远端 CI（如 GitHub Actions 调用 `gitleaks git --log-opts="--all"`）待后续决策。
+
+## 去重语义的局限（M11.6，2026-10-16）
+- create 幂等依赖服务端现有 `(location, text)` 比对，对「用户有意在同一位置提交相同文本两次」不敏感（视为同一条）；根治需服务端新增 `client_uuid` 字段。
+
+## 无服务端 client_uuid（M11.6，2026-10-16）
+- 离线队列的重试去重只能靠内容比对；若未来支持多端离线，需要服务端提供客户端幂等键。
+
+## 阅读进度未纳入离线（M11.6，2026-10-16）
+- 本步只覆盖批注；`/api/progress/{document_id}` 的离线缓存与自动同步仍待实现。
+
+## 队列无自动清理策略（M11.6，2026-10-16）
+- 队列有上限（`-max-entries`，默认 1000）并在达上限时拒绝入队，但**无自动清理/过期策略**；长期离线可能触达上限并拒绝新条目，需人工干预。
+
+## 队列写为无锁 read-modify-write（M11.6，2026-10-16）
+- 队列的 `-enqueue`/`-remove`/`-sync` 均为「读取 → 改内存 → 原子写回」，`--write` 只保证「不写坏文件」，**不保证「不丢更新」**：两个 Emacs 实例并发写同一队列文件时，后写会覆盖先写（单实例假设）。根治需文件锁（`lock-file`）或读回比较（CAS）；当前不做，仅记录。
