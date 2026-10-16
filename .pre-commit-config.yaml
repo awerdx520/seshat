@@ -1,0 +1,22 @@
+# 提交前密钥防护（说明见 docs/security.md §6）
+# 安装（每个克隆执行一次）：pre-commit install
+# 全量自查：pre-commit run --all-files
+repos:
+  - repo: local
+    hooks:
+      # 内容扫描：gitleaks 读取暂存区，命中即阻断（退出码 1）
+      - id: gitleaks
+        name: gitleaks 密钥扫描（暂存区）
+        entry: gitleaks git --staged --redact --no-banner
+        language: system
+        pass_filenames: false
+        always_run: true
+
+      # 文件名黑名单：拦截被 .gitignore 覆盖却被 git add -f 强制添加的文件
+      # 注：secrets/ 目录分支对齐 .gitignore 的 `secrets/` 规则，防止 git add -f 绕过文件名黑名单
+      - id: no-secret-files
+        name: 禁止提交敏感文件（keystore / env / 私钥）
+        entry: bash -c 'for f in "$@"; do echo "拒绝提交疑似密钥文件：$f"; done; exit 1' --
+        language: system
+        files: '(^|/)(keystore\.properties|local\.properties)$|(^|/)secrets/|\.(keystore|jks|p12|pfx|pem|key)$|\.env(\..*)?$'
+        exclude: '\.example(\.|$)'

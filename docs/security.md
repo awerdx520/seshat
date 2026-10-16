@@ -113,8 +113,8 @@ scripts/gen-secrets.sh /etc/seshat/secrets.env
 - 密钥文件权限必须为 `600`，属主为运行服务的专用用户（如 `root:seshat`）。
 - 存放位置限定在受保护路径（如 `/etc/seshat/`），不得置于 WebDAV 根目录、
   附件对象库或任何可被 HTTP 读到的目录内。
-- 仓库中的 `.gitignore` 排除 `.env`、`.env.*`、`*.env`、`*.key`、`*.pem`、`secrets/`；
-  仅 `.example` 后缀的模板可提交，且值必须为占位符。
+- 仓库中的 `.gitignore` 排除 `.env`、`.env.*`、`*.env`、`*.key`、`*.pem`、`secrets/`、
+  `*.keystore`、`*.jks`、`*.p12`、`*.pfx`；仅 `.example` 后缀的模板可提交，且值必须为占位符。
 
 ### 3.5 禁止事项
 
@@ -122,6 +122,9 @@ scripts/gen-secrets.sh /etc/seshat/secrets.env
 - 禁止将密钥文件提交到 git（含临时文件的误提交）。
 - 禁止在命令行内联、日志、错误信息或调试输出中回显密钥值。
 - 禁止在脚本中用 `${VAR:-default}` 形式探测密钥变量（会把值带进输出）。
+
+上述禁止事项与第 6 节的提交前自动检查相互补充——钩子在本机提交前做兜底拦截，
+但受 §6.4 的边界限制，不能替代本节的人工约束。
 
 ## 4. 备份与恢复演练
 
@@ -165,3 +168,70 @@ scripts/gen-secrets.sh /etc/seshat/secrets.env
 - 客户端侧：桌面 Emacs/Android 均校验服务端证书；Basic/Bearer 凭据只在 TLS
   通道内传输，禁止明文 HTTP。
 - HSTS 与安全响应头由反向代理统一设置。
+
+## 6. 提交前自动检查
+
+仓库通过 [pre-commit](https://pre-commit.com/) 钩子在本地提交前扫描密钥，
+钩子配置见根目录 [`.pre-commit-config.yaml`](../.pre-commit-config.yaml)。
+
+### 6.1 安装（每个克隆执行一次）
+
+**前置依赖**：使用前需已安装 `pre-commit` 与 `gitleaks`。钩子以
+`language: system` 调用本机 `gitleaks`；缺失时钩子会 fail-closed 直接阻断提交
+（不会静默放行）。
+
+**平台前提**：钩子脚本基于 bash，适用于 Linux / macOS / WSL；Windows 原生
+cmd / PowerShell 需通过 Git Bash 或 WSL 运行。
+
+```bash
+pre-commit install
+```
+
+该命令把钩子写入 `.git/hooks/pre-commit`。`.git/hooks/` 属于本地 git 目录、
+**不随仓库分发**，因此每次新克隆后都必须重新执行一次 `pre-commit install`，
+否则后续提交不会触发检查。
+
+### 6.2 两道检查
+
+| 钩子 id | 职责 |
+|---|---|
+| `gitleaks` | 扫描暂存区内容，识别 API key、私钥、令牌等凭证，命中即阻断提交（输出经 `--redact` 打码） |
+| `no-secret-files` | 文件名黑名单（keystore / env / 私钥类文件），专门拦截被 `.gitignore` 覆盖、却被 `git add -f` 强制添加的文件 |
+
+### 6.3 手动检查
+
+提交前钩子只作用于**暂存区**：`gitleaks` 钩子的 entry 固定为
+`gitleaks git --staged --redact --no-banner`，故 `pre-commit run --all-files`
+**不会**对全仓库内容做密钥扫描（该次 `Passed` 仅等价于「暂存区为空」）；它真正
+提供的是让 `no-secret-files` 按 **git 已跟踪的全部文件**做文件名检查。
+`pre-commit run --all-files` 只作用于已跟踪文件；未跟踪 / 被忽略的文件
+（如本机 `android/keystore.properties`）不在其列，这正是该项退出码 0 的原因。
+
+需要内容级检查时，用 gitleaks 独立命令：
+
+```bash
+# 全 git 历史：判定「仓库是否曾经泄漏」的权威命令
+gitleaks git --log-opts="--all" --redact --no-banner
+
+# 当前工作区全部文件（含未跟踪 / 被 .gitignore 忽略的本地文件）
+gitleaks dir . --redact --no-banner
+```
+
+实测边界：`gitleaks dir .` 会扫描**未跟踪的本地文件**（例如本机
+`android/keystore.properties`，含真实口令、被 `.gitignore` 忽略、从未提交），
+其非 0 退出属「本地文件命中」而非 git 泄漏；判定仓库是否泄漏以全历史命令为准。
+
+### 6.4 边界与绕过（如实声明）
+
+- 钩子只覆盖**本机提交**；`git commit --no-verify` 可绕过（见 §6.5，不作为常规手段）。
+- 其他克隆者、已安装钩子之前提交的内容、以及历史遗留内容，均不在覆盖范围。
+- 远端 CI 兜底**尚未部署**；因此 §3.5 的禁止事项仍是第一责任。
+
+### 6.5 误报处理
+
+- 临时跳过单个钩子：`SKIP=<hook-id> git commit ...`（如 `SKIP=gitleaks git commit -m ...`）。
+- 长期放行应调整 `.pre-commit-config.yaml` 中对应钩子的 `exclude`（在本节记录理由与日期）。
+- 明确禁止把 `--no-verify` 作为常规手段。
+- 已知正则宽化：`no-secret-files` 的 `.env(\..*)?$` 按「路径以 `.env.<后缀>` 结尾」
+  判定，比 `.gitignore` 的 `.env.*` 更宽，会连带拦下 `config.env.js` 一类命名。本项目为
+  Go / Elisp / Android，无此类命名；未来若引入，需评估调整正则或为其加 `exclude`。

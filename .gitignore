@@ -5,6 +5,10 @@
 *.key
 *.pem
 secrets/
+*.keystore
+*.jks
+*.p12
+*.pfx
 
 # 数据库与本地状态
 *.db
