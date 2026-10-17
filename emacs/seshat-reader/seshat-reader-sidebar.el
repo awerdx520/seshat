@@ -39,9 +39,10 @@
 ;; `seshat-reader-sidebar-height'。该状态仅**会话内**记忆，不持久化。
 ;;
 ;; 本模块**不渲染内容**：批注列表由 `seshat-reader-annotation--render-list'
-;; 渲染、译文由 go-translate 的 `gt-buffer-render' 渲染，本模块只负责
-;; **显示与参数**。渲染抽象不在本步引入：ETAF 阶段若需统一渲染层再抽象
-;; （记入 tech-debt）。
+;; 渲染（ETAF 可用时改由 `seshat-reader-etaf' 渲染卡片）、译文/解释由
+;; `seshat-reader-translate--render-panel' 写成只读 Markdown 文本 buffer
+;; （`gfm-view-mode' 降级链），本模块只负责**显示与参数**。渲染抽象不在本步
+;; 引入：若将来需统一渲染层再抽象（记入 tech-debt）。
 ;;
 ;; 模块零依赖：不 require 任何本项目/外部模块，只操作 buffer 与 window。
 ;;
@@ -82,7 +83,18 @@
 (defcustom seshat-reader-sidebar-height 0.35
   "信息面板高度，作为 `window-height' 参数（按比例）.
 仅对**新建**面板窗口生效：改动对已显示的窗口不会自动重排，需重开窗口或
-手动 `window-resize'。"
+手动 `window-resize'。该值在译文/解释面板上只作**首次显示/下限参考**——
+显示后 `seshat-reader-sidebar--fit-height-for-content' 会按内容实际行数覆盖
+它（上限见 `seshat-reader-sidebar-max-height'）；批注列表仍按本值固定高度。"
+  :type 'number
+  :group 'seshat-reader-sidebar)
+
+(defcustom seshat-reader-sidebar-max-height 0.8
+  "面板自适应高度的上限，按 `frame-height' 的**比例**计.
+仅对译文/解释（kind 为 `translate'）面板生效：面板显示后按内容实际行数调整
+高度（见 `seshat-reader-sidebar--fit-height-for-content'），调整后的窗口总高
+不超过本值 × `frame-height'（超出则面板内滚动）。批注列表固定高度不受影响，
+仍由 `seshat-reader-sidebar-height' 决定。"
   :type 'number
   :group 'seshat-reader-sidebar)
 
@@ -97,19 +109,22 @@
 参数）：**批注列表与译文面板都请求**——
 - 批注列表由 `seshat-reader-annotation--render-list' 在本命令内渲染完成后
   请求，此时内容已就绪；
-- 译文面板由 go-translate 的 `:then' 回调请求，该回调在翻译**完成后**才
-  被调用（gt 的中转 buffer 用 `(display-buffer-no-window)' 显示，不会出现
-  「空白 Loading 面板抢光标」），故此时跟随是安全的。
+- 译文/解释面板由 `seshat-reader-translate--render-panel' 请求：该函数在
+  写入 Markdown 正文之后才调 `show'，内容已就绪。
 
-ETAF 渲染层把内容写进面板 buffer 后再调 `show'，同样满足「内容就绪」前提。"
+渲染层（ETAF 批注卡片或 translate 的 Markdown 文本 buffer）把内容写进面板
+buffer 后再调 `show'，同样满足「内容就绪」前提。"
   :type 'boolean
   :group 'seshat-reader-sidebar)
 
 (defcustom seshat-reader-sidebar-translate-buffer-name "*Seshat Sidebar*"
-  "译文/解释面板的 buffer 名.
-同时作为 go-translate function `gt-buffer-render' 的 `:name' 槽取值，以及
-`gt-buffer-render-output-hook' 中**守卫判别**的依据（该 hook 在结果 buffer
-上下文内触发，按 buffer 名判定是否为本站面板、避免误捕获）。"
+  "译文/解释面板的**展示 buffer** 名.
+只用于承载最终呈现给用户的只读 Markdown 文本 buffer（由
+`seshat-reader-translate--render-panel' 写入），也是 popper 名单
+（`seshat-reader-sidebar-buffer-p'）判定的名字之一。**不再**用作 go-translate
+function `gt-buffer-render' 的 `:name'，也**不再**作为结果捕获的守卫依据：
+gt 的中转 buffer 改用隐藏 buffer ` \" *Seshat gt*\"'
+（`seshat-reader-translate--gt-buffer-name'），捕获在 `:then' 回调内直接完成。"
   :type 'string
   :group 'seshat-reader-sidebar)
 
@@ -121,10 +136,10 @@ require annotation，故在此另立常量（若上游改名需同步）。仅�
 buffer（见 `seshat-reader-sidebar-buffer-p'）。")
 
 (defvar seshat-reader-sidebar--last-kind nil
-  "最近一次经 `seshat-reader-sidebar-show' 显示的内容类型（通常为 `annotations'）.
-供 `seshat-reader-sidebar-toggle' 重新打开时恢复。译文由 go-translate function
-`gt-buffer-render' 自行显示、不经过 `seshat-reader-sidebar-show'，故不会记录在
-此。")
+  "最近一次经 `seshat-reader-sidebar-show' 显示的内容类型（`annotations' 或 `translate'）.
+供 `seshat-reader-sidebar-toggle' 重新打开时恢复。译文/解释面板现在也经
+`seshat-reader-sidebar-show' 显示（`seshat-reader-translate--render-panel' 调用
+并传 kind 为 `translate'），故关闭译文面板后 toggle 可原样重开。")
 
 (defvar seshat-reader-sidebar--last-buffer nil
   "最近一次显示的面板 buffer.
@@ -133,8 +148,10 @@ buffer（见 `seshat-reader-sidebar-buffer-p'）。")
 (defvar seshat-reader-sidebar--state nil
   "Per-kind 窗口高度记忆，形式为 alist（KIND -> 高度比例）.
 由 `seshat-reader-sidebar--capture-state' 在切换内容或关闭面板时写入，供
-`seshat-reader-sidebar--height-for-kind' 读取。仅会话内记忆，不持久化；为空时
-各 kind 一律使用 `seshat-reader-sidebar-height'。")
+`seshat-reader-sidebar--height-for-kind' 读取。**另**由
+`seshat-reader-sidebar--fit-height-for-content' 在按内容自适应调整译文/解释
+面板高度后写入（记忆的是调整后的实测比例，故下次切回该 kind 时沿用内容高度）。
+仅会话内记忆，不持久化；为空时各 kind 一律使用 `seshat-reader-sidebar-height'。")
 
 (defun seshat-reader-sidebar-window-p (window)
   "判断 WINDOW 是否本包信息面板窗口.
@@ -177,6 +194,73 @@ WINDOWS 省略时取全部本包面板窗口（`seshat-reader-sidebar--windows'�
                   (cons (cons kind (/ (float h) (float frame-h)))
                         (assq-delete-all kind seshat-reader-sidebar--state)))))))))
 
+(defun seshat-reader-sidebar--content-height (window)
+  "返回 WINDOW 的内容高度，以**行数**（整数）表示.
+实现：在 WINDOW 的 buffer 内取 `line-pixel-height' 作单行像素高（非正数或
+取不到时退回 `frame-char-height'），再用 `window-text-pixel-size' 测量从
+`point-min' 到 `point-max' 的像素高——测量上限取 40 行，避免超长内容测量
+耗时——最后按单行像素高向上取整换算为行数。任一环节失败返回 nil（调用方按
+最小高度处理）。"
+  (ignore-errors
+    (with-current-buffer (window-buffer window)
+      (let* ((raw (line-pixel-height))
+             (line-height (if (and (numberp raw) (> raw 0))
+                              raw
+                            (frame-char-height)))
+             (pixel (cdr (window-text-pixel-size
+                          window (point-min) (point-max)
+                          nil (* 40 line-height)))))
+        (ceiling pixel line-height)))))
+
+(defun seshat-reader-sidebar--fit-applicable-p (buffer &optional kind)
+  "判断面板 BUFFER 是否适用「按内容自适应高度」.
+KIND 省略时读 BUFFER 所在窗口的 `seshat-reader-sidebar-kind' window parameter。
+判据为**两重限制**：KIND 必须是 `translate'（批注列表固定高度、不参与自适应），
+且 BUFFER 未挂载 ETAF runtime（ETAF 画布自管 viewport，改窗口高度无意义；
+`etaf-runtime-for-buffer' 未定义时视为未挂载）。"
+  (and (buffer-live-p buffer)
+       (eq (or kind
+               (let ((win (get-buffer-window buffer t)))
+                 (and win (window-parameter win 'seshat-reader-sidebar-kind))))
+           'translate)
+       (not (ignore-errors
+              (and (fboundp 'etaf-runtime-for-buffer)
+                   (etaf-runtime-for-buffer buffer))))))
+
+(defun seshat-reader-sidebar--fit-height-for-content (window &optional kind)
+  "按内容高度调整面板 WINDOW 的高度（仅译文/解释面板）.
+先经 `seshat-reader-sidebar--fit-applicable-p' 过两重限制（KIND 必须是
+`translate'、且 buffer 未挂载 ETAF runtime；KIND 省略时取 WINDOW 的
+`seshat-reader-sidebar-kind' window parameter），再以
+`seshat-reader-sidebar--content-height' 的行数 + 2（header-line 与余量）为
+目标高度，下限 5 行、上限为 `seshat-reader-sidebar-max-height' 与
+`frame-height' 之积向下取整，用 `window-resize'（DELTA 按行、忽略固定尺寸
+约束）调整。
+调整后把最终比例 `window-total-height'/`frame-height' 写入
+`seshat-reader-sidebar--state'（同 KIND 先 `assq-delete-all' 再 `cons'，与
+`seshat-reader-sidebar--capture-state' 的写法一致），使下次切回该 KIND 时沿用。
+
+只调窗口高度、**不动** buffer 与阅读窗口对象。整个函数体由 `ignore-errors'
+包裹：测量或调整失败一律静默，不影响面板正常展示。"
+  (ignore-errors
+    (let* ((buffer (window-buffer window))
+           (kind (or kind
+                     (window-parameter window 'seshat-reader-sidebar-kind))))
+      (when (seshat-reader-sidebar--fit-applicable-p buffer kind)
+        (let* ((content (or (seshat-reader-sidebar--content-height window) 0))
+               (frame-h (frame-height))
+               (max-h (floor (* seshat-reader-sidebar-max-height
+                                (float frame-h))))
+               (target (max 5 (min max-h (+ content 2))))
+               (delta (- target (window-total-height window))))
+          (unless (zerop delta)
+            (window-resize window delta nil t))
+          (setq seshat-reader-sidebar--state
+                (cons (cons kind
+                            (/ (float (window-total-height window))
+                               (float frame-h)))
+                      (assq-delete-all kind seshat-reader-sidebar--state))))))))
+
 (defun seshat-reader-sidebar--display-params (&optional kind select)
   "生成 `display-buffer' 的弹出 action list.
 按 `seshat-reader-sidebar-position' 返回 `(display-buffer-below-selected)'
@@ -185,9 +269,9 @@ WINDOWS 省略时取全部本包面板窗口（`seshat-reader-sidebar--windows'�
 KIND 的记忆高度（见 `seshat-reader-sidebar--height-for-kind'；KIND 为 nil 时
 用 `seshat-reader-sidebar-height'），PARAMS 同时携带面板判据
 `(seshat-reader-sidebar . t)' 与 kind 标记
-`(seshat-reader-sidebar-kind . KIND)'。该返回值同时被
-`seshat-reader-sidebar--display' 与 go-translate function `gt-buffer-render' 的
-`:window-config' 槽使用，是面板参数的单一来源。
+`(seshat-reader-sidebar-kind . KIND)'。该返回值由
+`seshat-reader-sidebar--display' 使用，是面板参数的**单一来源**（gt 的中转
+buffer 改用 `(display-buffer-no-window)'，不再共用本 action list）。
 
 可选参数 SELECT 非 nil 表示调用方希望**命令结束时**把光标移入面板：此时若
 `seshat-reader-sidebar-select-window' 亦非 nil，在 action list 末尾追加
@@ -218,6 +302,11 @@ SELECT 由调用方按语义决定（见 `seshat-reader-sidebar-show' 的第三�
 3. 已有本包窗口但 kind 不同 → 先关闭本包全部窗口，再按 KIND 的记忆高度新建；
 4. 无本包窗口 → 按 KIND 的记忆高度新建。
 
+显示之后按内容自适应高度：`display-buffer' 的返回值（窗口）交给
+`seshat-reader-sidebar--fit-height-for-content'，由它自行判两重限制
+（KIND=`translate' 且 buffer 未挂载 ETAF runtime）后调整高度并把实测比例写入
+`seshat-reader-sidebar--state'；批注列表因此恒为固定高度，不受影响。
+
 光标跟随：SELECT 非 nil 时向 `seshat-reader-sidebar--display-params' 请求
 `(post-command-select-window . t)'（是否真正追加还受
 `seshat-reader-sidebar-select-window' 约束），命令结束时光标移入面板。
@@ -244,7 +333,9 @@ ACTION 实参——overriding-action 的优先级高于 `display-buffer-alist'�
     (unless same
       (dolist (win windows)
         (ignore-errors (delete-window win))))
-    (display-buffer buffer)))
+    (let ((window (display-buffer buffer)))
+      (seshat-reader-sidebar--fit-height-for-content window kind)
+      window)))
 
 (defun seshat-reader-sidebar-buffer-p (buffer)
   "判断 BUFFER 是否本包信息面板的 buffer.
@@ -291,18 +382,21 @@ ALIST 被忽略：面板布局参数一律由本包决定，不接受调用方�
 
 (defun seshat-reader-sidebar-show (buffer kind &optional select)
   "把 BUFFER 显示到信息面板的统一入口，返回窗口.
-批注列表与译文面板都经本函数显示（译文的 ETAF 渲染路径在
-`seshat-reader-translate--render-sidebar-etaf' 中调用它；非 ETAF 路径由
-go-translate function `gt-buffer-render' 经 `:window-config' 自行显示，不经过
-本函数）。KIND 用于记录最近显示的内容类型（供 `seshat-reader-sidebar-toggle'
+批注列表与译文/解释面板都经本函数显示：批注列表由
+`seshat-reader-annotation--render-list' 调用；译文/解释由
+`seshat-reader-translate--render-panel' 写入 Markdown 文本 buffer 后调用（kind
+为 `translate'）。只有 `pop' / `pin' 两条 posframe 回退路径不经本函数。
+KIND 用于记录最近显示的内容类型（供 `seshat-reader-sidebar-toggle'
 恢复时使用），并决定面板窗口的 kind 标记与**per-kind 高度记忆**：切换内容前
 先捕获当前窗口实测高度存给其 kind，再按目标 kind 记住的高度新建窗口，故切换
-回来时高度自动恢复；同一 kind 重复显示不重建窗口。
+回来时高度自动恢复；同一 kind 重复显示不重建窗口。显示后**译文/解释面板**
+还会按内容自适应高度（`seshat-reader-sidebar--fit-height-for-content'，上限
+`seshat-reader-sidebar-max-height'）；批注列表固定高度。
 `seshat-reader-sidebar-enabled' 为真时走 `seshat-reader-sidebar--display'；
 否则退回 `pop-to-buffer'（保证禁用时行为可回退）。
 
-SELECT 非 nil 表示「面板内容已就绪，可以跟随光标」：批注列表与译文面板的
-ETAF 渲染路径都在**渲染完成之后**调用本函数，故都传非 nil（是否真正跟随仍受
+SELECT 非 nil 表示「面板内容已就绪，可以跟随光标」：批注列表与译文/解释面板
+都在**内容写入 buffer 之后**调用本函数，故都传非 nil（是否真正跟随仍受
 `seshat-reader-sidebar-select-window' 约束）。T10 首轮反馈前这里按 KIND 硬编码
 （只对批注面板传非 nil），导致译文面板永远不跟随光标。"
   (if seshat-reader-sidebar-enabled

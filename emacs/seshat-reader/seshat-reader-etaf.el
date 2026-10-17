@@ -23,8 +23,8 @@
 ;;; Commentary:
 
 ;; seshat-reader 面板的 **ETAF 渲染层**：把批注列表渲染为卡片列表（标题栏 +
-;; 页码徽章 + 摘要 + 「待同步」标记 + 选中高亮 + 底部键位提示），把译文面板
-;; 渲染为排版布局（标题 + 可折叠原文 + 译文正文 + 操作提示）。
+;; 页码徽章 + 摘要 + 「待同步」标记 + 选中高亮 + 底部键位提示）。ETAF 只负责
+;; 批注列表；译文/解释由 `seshat-reader-translate' 以 Markdown 文本 buffer 渲染。
 ;;
 ;; 本模块**不负责显示**：仍由 `seshat-reader-sidebar' 统一投放到底部弹出
 ;; 窗口；buffer 名不变量（`*Seshat Annotations*'、`*Seshat Sidebar*'）由接入
@@ -59,9 +59,9 @@
 (require 'seshat-reader-annotation)
 
 ;; 动作命令复用的**底层能力**（本模块不调用依赖行文本属性的交互命令）：
-;; 服务端批注删除、本地队列取消、引用块组装与写文件，以及「译文存为批注」。
-;; 引用模块与译文模块按需加载（`require … nil t`），故此处只作声明，避免
-;; 字节编译告警，也避免在加载期引入循环 require。
+;; 服务端批注删除、本地队列取消、引用块组装与写文件。引用模块按需加载
+;; （`require … nil t`），故此处只作声明，避免字节编译告警，也避免在加载期
+;; 引入循环 require。
 (declare-function seshat-reader-annotation-queue-remove
                   "seshat-reader-annotation-queue" (uuid))
 (declare-function seshat-reader-reference--format-block
@@ -70,8 +70,6 @@
                   "seshat-reader-reference" ())
 (declare-function seshat-reader-reference--insert-into-file
                   "seshat-reader-reference" (text file))
-(declare-function seshat-reader-translate-save-as-annotation
-                  "seshat-reader-translate" ())
 
 (defgroup seshat-reader-etaf nil
   "ETAF rendering layer for seshat-reader panels."
@@ -107,30 +105,20 @@
 `etaf-runtime-flush' 时增量更新，故两者并行存在；写入点统一在
 `seshat-reader-etaf-render-annotations'。")
 
+(defvar seshat-reader-etaf--page (etaf-ref 1)
+  "批注列表当前显示的页码（**1-based**）.
+由 `seshat-reader-etaf-render-annotations' 写入（页码的权威来源在批注层：
+buffer-local 的 `seshat-reader-annotation-list-page'），视图经 `(expr …)' 读取
+它决定「只渲染当页哪 20 条」，故翻页后只做增量刷新（`etaf-runtime-flush'）。")
+
+(defvar seshat-reader-etaf--page-count (etaf-ref 1)
+  "批注列表的总页数（至少 1）.
+由 `seshat-reader-etaf-render-annotations' 写入（权威来源是
+`seshat-reader-annotation--page-count'，按全量条目数现算）；视图据此决定
+标题徽章显示「第 x/y 页」还是「N 条」.")
+
 (defvar seshat-reader-etaf--doc-source nil
   "发起面板的 seshat-reader 文档缓冲区，供动作命令跳页时使用.")
-
-(defvar seshat-reader-etaf--translate-title (etaf-ref "Seshat 译文")
-  "译文面板的标题文本.")
-
-(defvar seshat-reader-etaf--translate-meta (etaf-ref nil)
-  "译文面板标题栏徽章文本（引擎 / 语言），nil 时徽章不显示.")
-
-(defvar seshat-reader-etaf--translate-source (etaf-ref nil)
-  "译文面板「原文」区的文本（折叠状态下不显示）.")
-
-(defvar seshat-reader-etaf--translate-body (etaf-ref "")
-  "译文面板的译文正文，按空行分段渲染.")
-
-(defvar seshat-reader-etaf--translate-origin (etaf-ref nil)
-  "译文面板的「来源」行文本（如 \"来源：第 112 页\"）.")
-
-(defvar seshat-reader-etaf--translate-source-open (etaf-ref nil)
-  "译文面板「原文」区是否展开；由折叠按钮 `:on-press' 切换.")
-
-(defconst seshat-reader-etaf--translate-keys
-  '(("q" seshat-reader-etaf-quit "关闭"))
-  "译文面板的 ETAF `:keys' 绑定表，元素为 (KEY COMMAND LABEL).")
 
 (defconst seshat-reader-etaf--annotation-keys
   '(("RET" seshat-reader-etaf-annotation-goto "打开")
@@ -138,8 +126,13 @@
     ("C-c C-r" seshat-reader-etaf-annotation-reference "引用")
     ("q" seshat-reader-etaf-quit "关闭")
     ("n" seshat-reader-etaf-annotation-next "下一条")
-    ("p" seshat-reader-etaf-annotation-prev "上一条"))
-  "批注面板的 ETAF `:keys' 绑定表，元素为 (KEY COMMAND LABEL).")
+    ("p" seshat-reader-etaf-annotation-prev "上一条")
+    ("]" seshat-reader-annotation-list-next-page "下一页")
+    ("[" seshat-reader-annotation-list-prev-page "上一页"))
+  "批注面板的 ETAF `:keys' 绑定表，元素为 (KEY COMMAND LABEL).
+`]' / `[` 翻页（命令由批注层提供，翻页会重渲染并刷新
+`seshat-reader-etaf--page'）；`n' / `p' 移动选中，选中跨页时先切页再滚动。
+`q' 关闭面板。")
 
 (defun seshat-reader-etaf-available-p ()
   "Return non-nil when the ETAF rendering layer may be used.
@@ -288,7 +281,12 @@ COLORS 为 `seshat-reader-etaf--colors' 返回的 alist。一行一卡，列结�
   `▌'（U+258C）在 ETAF 里按 2 列测量，`(ch 1)' 的盒子会把它裁成空格（实测）；
 - 页码列宽固定 `(ch 6)'，`p.9' 与 `p.112' 因此右对齐在同一条竖线上；
 - 摘要单行截断（`seshat-reader-etaf--truncate'），不折行，行高一致；
-- 卡片之间用 `:border' 色的细底线分隔（不用 `etaf-divider'，避免过密）。"
+- 卡片之间用 `:border' 色的细底线分隔（不用 `etaf-divider'，避免过密）。
+
+本函数只负责**一张**卡片；哪些条目出卡片由 `seshat-reader-etaf--annotations-view'
+按当页切片（`seshat-reader-annotation--page-items'）决定，渲染层存的是**全量**
+条目。选中态（`▌' 与底色）取全量 `seshat-reader-etaf--selected'，故选中项不在
+当页时本页无标记，翻回该页时选中仍在——跨页选中不丢。"
   (let* ((page (seshat-reader-etaf--item-page it))
          (key (seshat-reader-etaf--item-key it))
          (selected (seshat-reader-etaf--item-selected-p it)))
@@ -335,20 +333,46 @@ KEY 为 nil 时清除选中；本函数只改 `seshat-reader-etaf--selected'，�
 
 ;;; 面板视图
 
+(defun seshat-reader-etaf--current-page ()
+  "Return the page number currently shown in the annotation panel (1-based).
+`seshat-reader-etaf--page' 尚未写入（nil）时按第 1 页处理——分页切片不允许
+nil 页号（见 `seshat-reader-annotation--page-items'）。"
+  (or (etaf-value seshat-reader-etaf--page) 1))
+
+(defun seshat-reader-etaf--badge-text (items)
+  "Return the header badge text of the annotation panel.
+多页（`seshat-reader-etaf--page-count' > 1）时返回 \"第 x/y 页\"；单页时返回
+条目总数 \"N 条\"（此时「页」的概念对用户无意义）。ITEMS 为首次渲染时的已知
+条目列表，仅作 ref 尚无值时（首次 mount 早期）的兜底来源。"
+  (let ((page-count (or (etaf-value seshat-reader-etaf--page-count) 1)))
+    (if (> page-count 1)
+        (format "第 %d/%d 页"
+                (seshat-reader-etaf--current-page) page-count)
+      (format "%d 条" (length (or (etaf-value seshat-reader-etaf--items)
+                                  items))))))
+
 (defun seshat-reader-etaf--annotations-view (items)
   "Return the annotation panel view for ITEMS, a list of plists.
-版式自上而下：标题栏（标题 + 右对齐计数徽章 + 细底线）→ 弱化的文档名 →
-卡片列表（可滚动，固定 12 行高）→ 底部键位提示（细顶线）。ITEMS 仅用于
-首次渲染时已知条目数；条目的**动态部分**（列表、计数、文档名）一律经
-`(expr …)' 读 `seshat-reader-etaf--items' / `--doc-label'，从而增量更新。
-`:keys' 挂在根 `column' 上，覆盖 ebox 默认滚动键 `n'/`p'。"
+版式自上而下：标题栏（标题 + 右对齐徽章 + 细底线）→ 弱化的文档名 →
+卡片列表（可滚动，固定 12 行高）→ 底部键位提示（细顶线）。
+
+**分页**：卡片列表只渲染**当页**条目——`seshat-reader-etaf--items' 存全量
+（选中、页号收敛与跨页移动都需要全量），经
+`seshat-reader-annotation--page-items' 按 `seshat-reader-etaf--page' 切片后才
+出卡片；徽章多页时显示「第 x/y 页」、单页时显示条目总数（见
+`seshat-reader-etaf--badge-text'）。
+
+条目的**动态部分**（列表、徽章、文档名）一律经 `(expr …)' 读
+`seshat-reader-etaf--items' / `--page' / `--page-count' / `--doc-label'，从而
+翻页与刷新只做增量更新（`etaf-runtime-flush'）。`:keys' 挂在根 `column' 上，
+覆盖 ebox 默认滚动键 `n'/`p'，并登记 `]'/`[' 翻页。"
   (let ((colors (seshat-reader-etaf--colors)))
     (etaf-view
      (column :class "seshat-etaf-annotations"
              :width 'stretch
              :item-gap '(lh 0)
              :keys seshat-reader-etaf--annotation-keys
-       ;; 标题栏：标题在左、计数徽章右对齐，下缘细线
+       ;; 标题栏：标题在左、徽章右对齐，下缘细线
        (box :width 'stretch
             :padding '((lh 1) (ch 1))
             :border-bottom-width '(px 1)
@@ -361,17 +385,14 @@ KEY 为 nil 时清除选中；本函数只改 `seshat-reader-etaf--selected'，�
            (box :color (alist-get :accent colors)
                 :background-color (alist-get :muted-bg colors)
                 :padding-inline '(ch 1)
-             (text (expr (format "%d 条"
-                                 (length (or (etaf-value
-                                              seshat-reader-etaf--items)
-                                             items))))))))
+             (text (expr (seshat-reader-etaf--badge-text items))))))
        ;; 文档名（弱化，交代上下文）
        (box :width 'stretch
             :padding '((lh 0) (ch 1))
          (expr (seshat-reader-etaf--text-view
                 (or (etaf-value seshat-reader-etaf--doc-label) "")
                 (alist-get :muted colors))))
-       ;; 卡片列表
+       ;; 卡片列表：只渲染当页（全量条目留在 `--items'，供选中与页号收敛）
        (column :class "seshat-etaf-list"
                :ref seshat-reader-etaf--list-ref
                :width 'stretch
@@ -380,7 +401,9 @@ KEY 为 nil 时清除选中；本函数只改 `seshat-reader-etaf--selected'，�
                :overflow 'scroll
          (expr (mapcar (lambda (it)
                          (seshat-reader-etaf--card it colors))
-                       (etaf-value seshat-reader-etaf--items))))
+                       (seshat-reader-annotation--page-items
+                        (etaf-value seshat-reader-etaf--items)
+                        (seshat-reader-etaf--current-page)))))
        ;; 底部键位提示
        (box :width 'stretch
             :padding '((lh 0) (ch 1))
@@ -406,28 +429,43 @@ BUFFER 已显示时取其窗口的像素宽度（不小于 40），否则用
 (defun seshat-reader-etaf--ensure-selection (items)
   "Keep `seshat-reader-etaf--selected' pointing at an item of ITEMS.
 原选中项已不在 ITEMS 中（或原本就没有选中）时改选首项；ITEMS 为空时清空
-选中。"
+选中。
+
+ITEMS 必须是**全量**条目（`seshat-reader-etaf--items'），而不是当页切片：
+选中是跨页状态，若用当页条目校正，翻页后选中会被误判为「已失效」并重置到
+首页首条。"
   (let* ((keys (mapcar #'seshat-reader-etaf--item-key items))
          (current (etaf-value seshat-reader-etaf--selected)))
     (unless (member current keys)
       (seshat-reader-etaf--select (car keys)))))
 
 (defun seshat-reader-etaf-render-annotations (buffer items doc-id
-                                                    &optional source)
+                                                    &optional source
+                                                    page page-count)
   "Render annotation ITEMS into BUFFER for DOC-ID, remembering SOURCE.
-ITEMS 为 plist 列表，元素可含 `:id'、`:uuid'、`:page'、`:text'、`:dirty'、
-`:location'；服务端项在前、本地待同步项在后。DOC-ID 为文档标识，SOURCE 为
-发起面板的文档缓冲区（供后续跳页使用）。
+ITEMS 为 plist 列表（**全量**条目，服务端项在前、本地待同步项在后），元素
+可含 `:id'、`:uuid'、`:page'、`:text'、`:dirty'、`:location'；视图按
+PAGE 只渲染当页切片，全量条目留给选中与页号收敛。DOC-ID 为文档标识，SOURCE
+为发起面板的文档缓冲区（供后续跳页使用）。PAGE 为 1-based 页码，缺省取 1；
+PAGE-COUNT 为总页数，缺省由 ITEMS 现算
+（`seshat-reader-annotation--page-count'）。
 
-幂等：BUFFER 已有挂载的 runtime 时只改 `seshat-reader-etaf--items' 触发
-增量刷新，不重建组件树；否则首次 `etaf-mount'，并必须传 viewport plist
-（`:viewport-width' 像素、`:viewport-height' 行），否则没有布局。
+两者写入 `seshat-reader-etaf--page' / `--page-count' ref：首次 mount 前
+`setf'（视图 mount 时就从 ref 取初值），幂等分支同样写入后 flush，因此
+翻页/刷新只做增量刷新，不重建组件树。
+
+幂等：BUFFER 已有挂载的 runtime 时只改 ref 并触发增量刷新；否则首次
+`etaf-mount'，并必须传 viewport plist（`:viewport-width' 像素、
+`:viewport-height' 行），否则没有布局。
 
 返回 BUFFER（buffer 对象）。"
   (setq seshat-reader-etaf--doc-id doc-id
         seshat-reader-etaf--doc-source source)
   (let* ((target (get-buffer-create buffer))
          (runtime (etaf-runtime-for-buffer target)))
+    (setf (etaf-value seshat-reader-etaf--page) (or page 1))
+    (setf (etaf-value seshat-reader-etaf--page-count)
+          (or page-count (seshat-reader-annotation--page-count items)))
     (setf (etaf-value seshat-reader-etaf--items) items)
     (setf (etaf-value seshat-reader-etaf--doc-label) doc-id)
     (seshat-reader-etaf--ensure-selection items)
@@ -462,19 +500,42 @@ KEY 省略时取当前选中项的 key。面板未挂载、无 runtime 或 key �
                        (equal key (seshat-reader-etaf--item-key it)))
                      (etaf-value seshat-reader-etaf--items)))))
 
+(defun seshat-reader-etaf--page-of-index (index)
+  "Return the 1-based page number that holds full-list INDEX.
+页大小取批注层的 `seshat-reader-annotation-page-size'（**防御 0**：取
+`max 1'，否则除零报错）。INDEX 为 nil 时按首项处理。"
+  (1+ (/ (max 0 (or index 0))
+         (max 1 seshat-reader-annotation-page-size))))
+
+(defun seshat-reader-etaf--sync-page-with-selection (index)
+  "Switch the panel to the page holding full-list INDEX, if needed.
+仅当该页与当前 `seshat-reader-etaf--page' 不同时才调
+`seshat-reader-annotation--set-list-page'——它重渲染当页并回写页号 ref（顺带
+把页号夹紧到合法范围），故随后 `--scroll-selected-into-view' 能在新页里找到
+卡片。同页移动只滚动，不重渲染。"
+  (let ((page (seshat-reader-etaf--page-of-index index)))
+    (unless (equal page (etaf-value seshat-reader-etaf--page))
+      (seshat-reader-annotation--set-list-page page))))
+
 (defun seshat-reader-etaf--move-selection (step)
   "Move the selection by STEP items and return the new key.
-到两端时夹紧，不循环；ITEMS 为空时返回 nil 且不清除选中。移动成功后把新
-选中项滚入可视区域（`etaf-scroll-into-view'，面板未挂载时静默跳过）。"
+到两端时夹紧，不循环；ITEMS 为空时返回 nil 且不清除选中。
+
+索引在**全量** `seshat-reader-etaf--items' 上计算（当页切片只影响渲染），
+因此选中可以跨页：新选中项所在页 `(1+ (/ index page-size))' 与当前页不同时，
+先 `seshat-reader-etaf--sync-page-with-selection' 切页（触发当页重渲染），再
+把新选中项滚入可视区域；同页则只滚动。滚动与切页都是体验增强，失败不得
+影响选中切换本身（面板未挂载时静默跳过）。"
   (let* ((items (etaf-value seshat-reader-etaf--items))
          (keys (mapcar #'seshat-reader-etaf--item-key items))
          (current (etaf-value seshat-reader-etaf--selected))
          (pos (cl-position current keys :test #'equal))
          (last (1- (length keys)))
-         (next (and keys
-                    (nth (max 0 (min last (+ (or pos 0) step))) keys))))
+         (index (and keys (max 0 (min last (+ (or pos 0) step)))))
+         (next (and keys (nth index keys))))
     (when next
       (seshat-reader-etaf--select next)
+      (seshat-reader-etaf--sync-page-with-selection index)
       (seshat-reader-etaf--scroll-selected-into-view next))
     next))
 
@@ -606,14 +667,14 @@ KEY 省略时取当前选中项的 key。面板未挂载、无 runtime 或 key �
                   (error-message-string err))))))))
 
 (defun seshat-reader-etaf-annotation-next ()
-  "选中下一条批注，并把它滚入可视区域.
-选中移动到面板末尾时夹紧（不循环）；滚动失败静默跳过。"
+  "选中下一条批注；选中跨页时先切到新页，再把它滚入可视区域.
+选中移动到面板末尾时夹紧（不循环）；切页与滚动失败静默跳过。"
   (interactive)
   (seshat-reader-etaf--move-selection 1))
 
 (defun seshat-reader-etaf-annotation-prev ()
-  "选中上一条批注，并把它滚入可视区域.
-选中移动到面板开头时夹紧（不循环）；滚动失败静默跳过。"
+  "选中上一条批注；选中跨页时先切到新页，再把它滚入可视区域.
+选中移动到面板开头时夹紧（不循环）；切页与滚动失败静默跳过。"
   (interactive)
   (seshat-reader-etaf--move-selection -1))
 
@@ -623,221 +684,6 @@ KEY 省略时取当前选中项的 key。面板未挂载、无 runtime 或 key �
 下次打开同类型面板时按记忆恢复。"
   (interactive)
   (seshat-reader-sidebar-toggle))
-
-;;; 译文面板
-
-(defun seshat-reader-etaf--paragraphs (text)
-  "Split TEXT into paragraphs for the translate panel.
-按空行（一个以上换行，允许行尾空白）分段，去掉每段首尾空白并丢弃空段；
-TEXT 为 nil 或全空白时返回 nil。"
-  (when (stringp text)
-    (let (result)
-      (dolist (para (split-string text "\n[ \t]*\n" t))
-        (let ((trimmed (string-trim para)))
-          (unless (string-empty-p trimmed)
-            (push trimmed result))))
-      (nreverse result))))
-
-(defconst seshat-reader-etaf--origin-line-regexp
-  "[ \t]*来源[：:]"
-  "匹配 gt 正文里可能与面板「来源」行重复的元信息行的**行首**部分.
-只锚定行首（不锚行尾）：重复行形如 \"来源：第 112 页\"，冒号后还有页码，
-锚行尾会一条也删不掉。")
-
-(defun seshat-reader-etaf--drop-origin-lines (text)
-  "Return TEXT without its 「来源：…」 metadata lines.
-译文面板的「来源：第 N 页」由视图**结构化**渲染一次
-（`seshat-reader-etaf--selection-origin'），故正文里若也带同一行就会重复
-显示——gt 的正文来自 `seshat-reader-translate--gt-buffer-text'（`gt-result'
-片段，提取不到时回退整个 gt buffer 的 `buffer-string'，含 gt 自己插入的
-原文/引擎区块），而 `seshat-reader-translate--clean-gt-text' 只剔除分隔线与
-多余空行，**不**过滤「来源」行，故该行会原样进入正文。此处在渲染前把它
-剔除，保证面板中「来源」只出现一次。TEXT 为 nil 时返回 nil。"
-  (when (stringp text)
-    (let ((kept (cl-remove-if
-                 (lambda (line)
-                   (string-match-p
-                    (concat "\\`" seshat-reader-etaf--origin-line-regexp)
-                    (string-trim line)))
-                 (split-string text "\n"))))
-      (string-trim (mapconcat #'identity kept "\n")))))
-
-(defun seshat-reader-etaf--translate-meta (engine langs)
-  "Compose the translate panel badge text from ENGINE and LANGS.
-ENGINE 为引擎名（字符串或符号，nil 表示未知），LANGS 为语言符号列表；两者
-都为空时返回 nil（徽章不显示）。都给出时返回 \"ENGINE → lang1→lang2\"。"
-  (let ((engine (and engine (format "%s" engine)))
-        (langs (and langs
-                    (mapconcat #'symbol-name (ensure-list langs) "→"))))
-    (cond
-     ((and engine langs) (format "%s → %s" engine langs))
-     (engine engine)
-     (langs langs)
-     (t nil))))
-
-(defun seshat-reader-etaf--selection-origin ()
-  "Return the translate panel's origin line for the last mouse selection.
-取 `seshat-reader-select-last' 的 `:page'（**1-based**）拼出
-\"来源：第 N 页\"；无选区或无页码时返回 \"来源：选区\"。"
-  (let ((page (plist-get seshat-reader-select-last :page)))
-    (if page (format "来源：第 %s 页" page) "来源：选区")))
-
-(defun seshat-reader-etaf--toggle-translate-source ()
-  "Toggle the translate panel's source section.
-只翻转 `seshat-reader-etaf--translate-source-open'，由渲染期的读取触发增量
-刷新；在渲染期之外调用（命令/回调内），符合 ETAF 的写状态约束。"
-  (setf (etaf-value seshat-reader-etaf--translate-source-open)
-        (not (etaf-value seshat-reader-etaf--translate-source-open))))
-
-(defun seshat-reader-etaf--save-translate-as-annotation ()
-  "Save the currently displayed translation as an annotation.
-把译文交给 `seshat-reader-translate-save-as-annotation'（侧车批注，不写回
-文档）；译文模块未加载时只 `message' 提示，不抛 void-function。"
-  (if (fboundp 'seshat-reader-translate-save-as-annotation)
-      (seshat-reader-translate-save-as-annotation)
-    (message "Seshat Reader: 译文模块未加载，无法存为批注")))
-
-(defconst seshat-reader-etaf--translate-source-excerpt-limit 200
-  "原文折叠区展开时显示的字符数上限.")
-
-(defun seshat-reader-etaf--translate-source-excerpt ()
-  "Return the first `…-limit' characters of the translate panel's source text.
-无原文时返回 nil。超出上限时以 \"…\" 结尾，避免长选区把面板撑满。"
-  (let ((source (etaf-value seshat-reader-etaf--translate-source)))
-    (when (and (stringp source) (not (string-empty-p (string-trim source))))
-      (let ((trimmed (string-trim source)))
-        (if (> (length trimmed)
-               seshat-reader-etaf--translate-source-excerpt-limit)
-            (concat (substring trimmed 0
-                               seshat-reader-etaf--translate-source-excerpt-limit)
-                    "…")
-          trimmed)))))
-
-(defun seshat-reader-etaf--translate-view ()
-  "Return the translate panel view, reading all content from refs.
-版式自上而下：标题栏（标题 + 右对齐引擎/语言徽章 + 细底线）→ 可折叠原文
-（折叠时只有一行按钮；展开后放进浅底 `box'，文字弱化）→ 译文正文（段落之间
-留 1 行，正常前景色）→ **唯一一处**「来源」行（弱化）→ 底部操作行（左
-「q 关闭」提示、右「存为批注」按钮，`flex :justify-content` 为
-`space-between'）。
-
-动态内容（标题、徽章、原文、正文、来源）全部经 `(expr …)' / `etaf-value'
-读取，故再次渲染同一 buffer 时只做增量更新——非 `expr' 的静态属性在 mount
-时求值一次，不会随 flush 变化（这是「第二次翻译后来源行不更新」的根因）。
-
-来源只出现一次：正文里的「来源：…」行在渲染前由
-`seshat-reader-etaf--drop-origin-lines' 剔除，仅保留这里结构化的一行。
-
-原文区默认折叠：展开状态由 `seshat-reader-etaf--translate-source-open'
-控制，按钮文字随状态在 \"▸ 原文\" 与 \"▾ 原文\" 之间切换。"
-  (let ((colors (seshat-reader-etaf--colors)))
-    (etaf-view
-     (column :class "seshat-etaf-translate"
-             :width 'stretch
-             :item-gap '(lh 0)
-             :padding '((lh 0) (ch 1))
-             :keys seshat-reader-etaf--translate-keys
-       ;; 标题栏
-       (box :width 'stretch
-            :padding '((lh 1) (ch 0))
-            :border-bottom-width '(px 1)
-            :border-bottom-style 'solid
-            :border-bottom-color (alist-get :divider colors)
-         (flex :width 'stretch :justify-content 'space-between
-               :align-items 'center
-           (expr (seshat-reader-etaf--text-view
-                  (etaf-value seshat-reader-etaf--translate-title)
-                  (alist-get :fg colors) 'bold))
-           (expr (when-let* ((meta (etaf-value seshat-reader-etaf--translate-meta)))
-                                       (etaf-view
-                                       (box :color (alist-get :accent colors)
-                                            :background-color (alist-get :muted-bg colors)
-                                            :padding-inline '(ch 1)
-                                         (text (expr meta))))))))
-       ;; 原文折叠开关（常态一行；展开后下方的浅底区块说明内容）
-       (box :width 'stretch
-            :padding '((lh 0) (ch 0))
-         (etaf-button :variant 'ghost
-                      :label (if (etaf-value
-                                  seshat-reader-etaf--translate-source-open)
-                                 "▾ 原文" "▸ 原文")
-                      :color (alist-get :muted colors)
-                      :on-press #'seshat-reader-etaf--toggle-translate-source))
-       (expr (when (etaf-value seshat-reader-etaf--translate-source-open)
-               (etaf-view
-                (box :width 'stretch
-                     :background-color (alist-get :muted-bg colors)
-                     :padding '((lh 0) (ch 1))
-                     :wrap-mode 'word
-                  (expr (seshat-reader-etaf--text-view
-                         (or (seshat-reader-etaf--translate-source-excerpt)
-                             "（无原文）")
-                         (alist-get :muted colors)))))))
-       ;; 译文正文：段落之间 1 行间距
-       (column :class "seshat-etaf-translate-body"
-               :width 'stretch
-               :item-gap '(lh 1)
-               :wrap-mode 'word
-               :padding '((lh 1) (ch 0))
-         (expr (mapcar (lambda (paragraph)
-                         (etaf-view
-                          (box :color (alist-get :fg colors)
-                            (text (expr paragraph)))))
-                       (seshat-reader-etaf--paragraphs
-                        (seshat-reader-etaf--drop-origin-lines
-                         (etaf-value seshat-reader-etaf--translate-body))))))
-       ;; 来源：全面板唯一一处
-       (expr (let ((origin (etaf-value seshat-reader-etaf--translate-origin)))
-               (when (and (stringp origin) (not (string-empty-p origin)))
-                 (etaf-view
-                  (box :width 'stretch
-                       :padding '((lh 0) (ch 0))
-                    (expr (seshat-reader-etaf--text-view
-                           origin (alist-get :muted colors))))))))
-       ;; 底部操作行：左提示、右按钮
-       (box :width 'stretch
-            :padding '((lh 0) (ch 0))
-            :border-top-width '(px 1)
-            :border-top-style 'solid
-            :border-top-color (alist-get :divider colors)
-         (flex :width 'stretch :justify-content 'space-between
-               :align-items 'center
-           (expr (seshat-reader-etaf--text-view "q 关闭"
-                                                (alist-get :muted colors)))
-           (etaf-button :variant 'ghost
-                        :label "存为批注"
-                        :color (alist-get :accent colors)
-                        :on-press
-                        #'seshat-reader-etaf--save-translate-as-annotation)))))))
-
-(cl-defun seshat-reader-etaf-render-translate
-    (buffer &key title source body engine langs)
-  "Render the translate panel into BUFFER.
-TITLE 为面板标题（默认 \"Seshat 译文\"），SOURCE 为原文（折叠区内容），
-BODY 为译文正文（按空行分段排版），ENGINE 与 LANGS 组成标题栏的引擎/语言
-徽章（都为空时不显示）。来源行取自最近一次选区的页码。
-
-幂等：BUFFER 已挂载 runtime 时只改各 ref 并 `etaf-runtime-flush' 做增量
-刷新，不重建组件树；否则首次 `etaf-mount'（必须带 viewport plist）。返回
-BUFFER（buffer 对象）。"
-  (let* ((target (get-buffer-create buffer))
-         (runtime (etaf-runtime-for-buffer target)))
-    (setf (etaf-value seshat-reader-etaf--translate-title) (or title "Seshat 译文"))
-    (setf (etaf-value seshat-reader-etaf--translate-meta)
-          (seshat-reader-etaf--translate-meta engine langs))
-    (setf (etaf-value seshat-reader-etaf--translate-source) source)
-    (setf (etaf-value seshat-reader-etaf--translate-body) (or body ""))
-    (setf (etaf-value seshat-reader-etaf--translate-origin)
-          (seshat-reader-etaf--selection-origin))
-    (if runtime
-        (etaf-runtime-flush runtime)
-      (etaf-mount target
-                  (seshat-reader-etaf--translate-view)
-                  (list :viewport-width
-                        (seshat-reader-etaf--viewport-width target)
-                        :viewport-height
-                        seshat-reader-etaf--default-viewport-height)))
-    target))
 
 (provide 'seshat-reader-etaf)
 

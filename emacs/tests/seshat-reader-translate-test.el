@@ -33,6 +33,12 @@
 ;; 并在用例结束时递归删除，因此测试可重复运行、不污染仓库。用例对共享
 ;; 变量（选区、预设、渲染方式、两个输出 hook）一律用 `let' 就地绑定，
 ;; 退出即恢复。
+;;
+;; 末尾两条 `--integration-*' 用例是**端到端**的：由辅助函数
+;; `seshat-reader-translate-test--panel-chain' 一次性走完「选区 → 翻译器
+;; 装配 → 渲染对象 `:then' → 面板 buffer」链路（`gt-start' 桩改为直接调用
+;; 渲染对象的 `:then'），再分别断言面板视图参数与「存为批注」的入参；同样
+;; 不触网、不写真实文件。
 
 ;;; Code:
 
@@ -292,6 +298,148 @@
       (should-not (seshat-reader-translate--capture-result))
       (should (equal seshat-reader-translate-last-result "OLD")))))
 
+;;; 面板内 Markdown 文本 buffer 渲染
+
+(ert-deftest seshat-reader-translate-test--render-panel-writes-text-and-view ()
+  "`--render-panel' 把译文写入面板 buffer、设只读视图与 header-line，并经 show 显示."
+  (skip-unless (require 'gt nil t))
+  (let* ((seshat-reader-sidebar-translate-buffer-name "*Seshat Test Panel*")
+         (seshat-reader-translate-show-source nil)
+         (seshat-reader-select-last nil)
+         (shown nil)
+         (text "**粗体**\n\n- 列表项一\n- 列表项二")
+         (buf nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'seshat-reader-sidebar-show)
+                   (lambda (b kind &optional select)
+                     (setq shown (list b kind select))
+                     'fake-win)))
+          (setq buf (seshat-reader-translate--render-panel text "Seshat 译文"))
+          (should (bufferp buf))
+          (should (equal (buffer-name buf) "*Seshat Test Panel*"))
+          (should (equal (with-current-buffer buf (buffer-string)) text))
+          (with-current-buffer buf
+            (should (null truncate-lines))
+            (should word-wrap)
+            (should buffer-read-only)
+            (should (equal header-line-format "Seshat 译文"))
+            (should seshat-reader-translate-panel-mode)
+            (should (= (point) (point-min))))
+          ;; 经统一显示入口、以 translate 类型显示、请求跟随光标
+          (should (eq (car shown) buf))
+          (should (eq (nth 1 shown) 'translate))
+          (should (nth 2 shown)))
+      (when (buffer-live-p buf) (kill-buffer buf)))))
+
+(ert-deftest seshat-reader-translate-test--render-panel-show-source ()
+  "`show-source' 为 t 时正文前插入完整（不截断）的 `> ' 引用块."
+  (skip-unless (require 'gt nil t))
+  (let* ((seshat-reader-sidebar-translate-buffer-name "*Seshat Test Panel*")
+         (seshat-reader-translate-show-source t)
+         (long (concat "长原文行" (make-string 260 ?字)))
+         (seshat-reader-select-last (list :text (concat long "\n第二行原文")))
+         (buf nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'seshat-reader-sidebar-show)
+                   (lambda (b &rest _args) b)))
+          (setq buf (seshat-reader-translate--render-panel "译文正文" "Seshat 译文"))
+          (with-current-buffer buf
+            (let ((content (buffer-string)))
+              ;; 引用块在正文之前，每行带 `> ' 前缀，与正文之间空一行
+              (should (string-prefix-p (concat "> " long "\n> 第二行原文\n\n")
+                                       content))
+              ;; 不截断
+              (should (string-match-p (regexp-quote long) content))
+              (should (string-suffix-p "译文正文" content)))))
+      (when (buffer-live-p buf) (kill-buffer buf)))))
+
+(ert-deftest seshat-reader-translate-test--render-panel-show-source-off ()
+  "`show-source' 为 nil（默认）时不插入引用块."
+  (skip-unless (require 'gt nil t))
+  (let* ((seshat-reader-sidebar-translate-buffer-name "*Seshat Test Panel*")
+         (seshat-reader-translate-show-source nil)
+         (seshat-reader-select-last (list :text "原文片段"))
+         (buf nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'seshat-reader-sidebar-show)
+                   (lambda (b &rest _args) b)))
+          (setq buf (seshat-reader-translate--render-panel "译文正文" "Seshat 译文"))
+          (should (equal (with-current-buffer buf (buffer-string)) "译文正文")))
+      (when (buffer-live-p buf) (kill-buffer buf)))))
+
+(ert-deftest seshat-reader-translate-test--panel-result-uses-record-result ()
+  "`--panel-result' 从中转 buffer 提取译文并写入 last-result；取不到时保留上次."
+  (skip-unless (require 'gt nil t))
+  (let ((gt-buffer (get-buffer-create seshat-reader-translate--gt-buffer-name))
+        (seshat-reader-translate-last-result "OLD"))
+    (unwind-protect
+        (progn
+          ;; ① 有 `gt-result' 片段：写入 last-result 并返回译文
+          (with-current-buffer gt-buffer
+            (erase-buffer)
+            (insert (propertize "面板译文" 'gt-result t)))
+          (should (equal (seshat-reader-translate--panel-result) "面板译文"))
+          (should (equal seshat-reader-translate-last-result "面板译文"))
+          ;; ② 无 `gt-result' 片段：提示失败、保留上次译文
+          (with-current-buffer gt-buffer
+            (erase-buffer)
+            (insert "没有任何属性的文本"))
+          (let ((messages nil))
+            (cl-letf (((symbol-function 'message)
+                       (lambda (fmt &rest args)
+                         (push (apply #'format fmt args) messages))))
+              (should-not (seshat-reader-translate--panel-result)))
+            (should messages))
+          (should (equal seshat-reader-translate-last-result "面板译文"))
+          ;; ③ 中转 buffer 不存在：返回 nil，不报错
+          (kill-buffer gt-buffer)
+          (should-not (seshat-reader-translate--panel-result))
+          (should (equal seshat-reader-translate-last-result "面板译文")))
+      (when (buffer-live-p gt-buffer) (kill-buffer gt-buffer)))))
+
+(ert-deftest seshat-reader-translate-test--render-object-title ()
+  "`--render-object' 的 sidebar 分支指向隐藏中转 buffer 并由 `:then' 接管面板."
+  (skip-unless (require 'gt nil t))
+  (skip-unless (require 'gt-render-buffer nil t))
+  (let* ((seshat-reader-sidebar-enabled t)
+         (obj (seshat-reader-translate--render-object 'sidebar "Seshat 解释"))
+         (window-config (slot-value obj 'window-config)))
+    (should (eq (eieio-object-class obj) 'gt-buffer-render))
+    (should (equal (slot-value obj 'name)
+                   seshat-reader-translate--gt-buffer-name))
+    (should (equal '(display-buffer-no-window) (car window-config)))
+    (should (member '(allow-no-window . t) window-config))
+    (should (functionp (slot-value obj 'then)))
+    ;; `enabled' 为 nil 时回退 posframe（与 `pop' 同款）
+    (let ((seshat-reader-sidebar-enabled nil))
+      (should (eq (eieio-object-class
+                   (seshat-reader-translate--render-object
+                    'sidebar "Seshat 解释"))
+                  'gt-posframe-pop-render)))))
+
+(ert-deftest seshat-reader-translate-test--install-capture-hook-for-mode-sidebar-no-hook ()
+  "sidebar + enabled 时不安装任何捕获 hook（捕获在 `:then' 内完成）."
+  (skip-unless (require 'gt nil t))
+  (let ((seshat-reader-translate-render 'sidebar)
+        (seshat-reader-sidebar-enabled t)
+        (gt-buffer-render-output-hook nil)
+        (gt-posframe-pop-render-output-hook nil)
+        (gt-posframe-pin-render-output-hook nil))
+    (seshat-reader-translate--install-capture-hook-for-mode)
+    (should-not gt-buffer-render-output-hook)
+    (should-not gt-posframe-pop-render-output-hook)
+    (should-not gt-posframe-pin-render-output-hook))
+  ;; 对照：posframe 路径（`pop'）仍安装两个 posframe 输出 hook
+  (let ((seshat-reader-translate-render 'pop)
+        (seshat-reader-sidebar-enabled t)
+        (gt-posframe-pop-render-output-hook nil)
+        (gt-posframe-pin-render-output-hook nil))
+    (seshat-reader-translate--install-capture-hook-for-mode)
+    (should (memq #'seshat-reader-translate--capture-result
+                  gt-posframe-pop-render-output-hook))
+    (should (memq #'seshat-reader-translate--capture-result
+                  gt-posframe-pin-render-output-hook))))
+
 ;;; 存为批注
 
 (ert-deftest seshat-reader-translate-test--save-as-annotation-posts ()
@@ -381,6 +529,183 @@
                         gt-posframe-pin-render-output-hook))
       (should (memq #'seshat-reader-translate--capture-result hook))
       (should (= 1 (cl-count #'seshat-reader-translate--capture-result hook))))))
+
+;;; 端到端集成（选区 → 译文 → 面板 → 批注）
+
+(defvar seshat-reader-translate-test--translated-text
+  "**译文标题**\n\n- 第一段译文\n- 第二段译文"
+  "集成用例里由 `gt-start' 桩写入隐藏中转 buffer 的译文（带 Markdown 标记）.
+带 Markdown 标记是有意为之：它让面板的视图模式断言（标题/列表被隐藏标记
+渲染）有实际意义，而不是只验证纯文本搬运。")
+
+(defun seshat-reader-translate-test--panel-chain ()
+  "跑一遍「选区 → 译文 → 面板」链路并返回结果 plist.
+返回 `(:panel B :render R :shown L :messages M)'：B 为面板 buffer，R 为装配
+出的 gt 渲染对象，L 为 `seshat-reader-sidebar-show' 的实参记录（逆序已恢复），
+M 为链路上 `message' 的文本。
+
+本函数把两个外部出口用 `cl-letf' 桩替：`gt-start' 改为「往隐藏中转 buffer
+（`seshat-reader-translate--gt-buffer-name'）写入带 `gt-result' 属性的译文，
+再调用渲染对象的 `:then' 回调」，`seshat-reader-sidebar-show' 改为记录显示
+请求；`message' 一并捕获以免刷屏。因此整条链路**不触网、不写真实文件**。
+面板 buffer 名、中转 buffer 名、选区与渲染方式都由调用方的 `let' 绑定决定；
+中转 buffer 在返回前删除，面板 buffer 留给调用方 `unwind-protect' 清理。"
+  (let ((gt-buffer (get-buffer-create seshat-reader-translate--gt-buffer-name))
+        (render nil)
+        (shown nil)
+        (messages nil))
+    (unwind-protect
+        (progn
+          (cl-letf (((symbol-function 'gt-start)
+                     (lambda (translator)
+                       (setq render (slot-value translator 'render))
+                       ;; gt 渲染完成：中转 buffer 已写入带 `gt-result' 的译文。
+                       (with-current-buffer gt-buffer
+                         (erase-buffer)
+                         (insert (propertize
+                                  seshat-reader-translate-test--translated-text
+                                  'gt-result t)))
+                       ;; 随后由渲染对象的 `:then' 回调把译文搬进信息面板。
+                       (funcall (slot-value render 'then))))
+                    ((symbol-function 'seshat-reader-sidebar-show)
+                     (lambda (buffer kind &optional select)
+                       (push (list buffer kind select) shown)
+                       'fake-window))
+                    ((symbol-function 'message)
+                     (lambda (fmt &rest args)
+                       (push (apply #'format fmt args) messages)
+                       nil)))
+            (seshat-reader-translate-selection))
+          (list :panel (get-buffer seshat-reader-sidebar-translate-buffer-name)
+                :render render
+                :shown (nreverse shown)
+                :messages (nreverse messages)))
+      (when (buffer-live-p gt-buffer) (kill-buffer gt-buffer)))))
+
+(ert-deftest seshat-reader-translate-test--integration-selection-to-panel ()
+  "端到端：选区经 gt 渲染后进入信息面板（只读 Markdown 视图 + header-line）.
+覆盖「选区 → 翻译器装配 → 渲染对象 `:then' → 面板 buffer → last-result」
+整条链路，断言面板内容、视图参数、只读、标题、显示类型与译文记录一致。"
+  (skip-unless (require 'gt nil t))
+  (skip-unless (require 'gt-render-buffer nil t))
+  ;; markdown-mode 是软依赖：它在 `load-path' 上时显式加载一次，使下面的视图
+  ;; 模式断言走到**真实 Markdown 分支**（`batch -Q' 不加载 autoloads，故
+  ;; `fboundp' 为 nil）；不在 `load-path' 上时静默返回 nil，由 `text-mode'
+  ;; 降级断言兜底——两条分支都必须通过。
+  (require 'markdown-mode nil t)
+  (let* ((seshat-reader-select-last
+          (list :text "Hello world" :page 3
+                :file seshat-reader-translate-test--selection-file))
+         (seshat-reader-translate-render 'sidebar)
+         (seshat-reader-sidebar-enabled t)
+         (seshat-reader-translate-show-source nil)
+         (seshat-reader-translate-preset 'reader)
+         (gt-preset-translators nil)
+         (seshat-reader-sidebar-translate-buffer-name "*Seshat T6 Panel*")
+         (seshat-reader-translate--gt-buffer-name " *Seshat T6 gt*")
+         (gt-posframe-pop-render-output-hook nil)
+         (gt-posframe-pin-render-output-hook nil)
+         (seshat-reader-translate-last-result nil)
+         (chain nil)
+         (panel nil))
+    (unwind-protect
+        (progn
+          (setq chain (seshat-reader-translate-test--panel-chain))
+          (setq panel (plist-get chain :panel))
+          ;; ① 渲染对象：隐藏中转 buffer 上的 `gt-buffer-render'
+          (let ((render (plist-get chain :render)))
+            (should (eq (eieio-object-class render) 'gt-buffer-render))
+            (should (equal (slot-value render 'name) " *Seshat T6 gt*"))
+            (should (member '(allow-no-window . t)
+                            (slot-value render 'window-config))))
+          ;; ② 面板 buffer 内容 = 译文全文（未开原文引用块）
+          (should (bufferp panel))
+          (should (equal (with-current-buffer panel (buffer-string))
+                         seshat-reader-translate-test--translated-text))
+          ;; ③ 只读 Markdown 视图：major-mode / 折行 / 只读 / header-line / 键位
+          (with-current-buffer panel
+            (if (or (fboundp 'gfm-view-mode) (fboundp 'markdown-view-mode))
+                (should (memq major-mode '(gfm-view-mode markdown-view-mode)))
+              (should (eq major-mode 'text-mode)))
+            (should (null truncate-lines))
+            (should word-wrap)
+            (should buffer-read-only)
+            (should (string-match-p "Seshat 译文"
+                                    (format "%s" header-line-format)))
+            (should seshat-reader-translate-panel-mode)
+            (should (= (point) (point-min))))
+          ;; ④ 译文同步写入 last-result（供存为批注使用）
+          (should (equal seshat-reader-translate-last-result
+                         seshat-reader-translate-test--translated-text))
+          ;; ⑤ 经统一显示入口、以 translate 类型显示、请求跟随光标
+          (should (equal (plist-get chain :shown)
+                         (list (list panel 'translate t))))
+          ;; ⑥ 链路上没有失败提示
+          (should-not (cl-some (lambda (msg) (string-match-p "失败" msg))
+                               (plist-get chain :messages))))
+      (when (buffer-live-p panel) (kill-buffer panel)))))
+
+(ert-deftest seshat-reader-translate-test--integration-panel-to-annotation ()
+  "端到端：面板里的译文存为服务端批注，document-id/location/text 正确.
+承接 `--integration-selection-to-panel' 的链路（同一份选区与译文），再走
+`seshat-reader-translate-save-as-annotation'，断言提交给
+`seshat-rest-create-annotation' 的三个实参由选区派生且正文取面板内容。"
+  (skip-unless (require 'gt nil t))
+  (skip-unless (require 'gt-render-buffer nil t))
+  (let* ((seshat-reader-select-last
+          (list :text "Hello world" :page 3
+                :rect '(10.0 20.0 30.0 40.0)
+                :file seshat-reader-translate-test--selection-file))
+         (seshat-reader-translate-render 'sidebar)
+         (seshat-reader-sidebar-enabled t)
+         (seshat-reader-translate-show-source nil)
+         (seshat-reader-translate-preset 'reader)
+         (gt-preset-translators nil)
+         (seshat-reader-sidebar-translate-buffer-name "*Seshat T6 Panel*")
+         (seshat-reader-translate--gt-buffer-name " *Seshat T6 gt*")
+         (seshat-reader-annotation-roots (list (cons "t6" "/tmp")))
+         (gt-posframe-pop-render-output-hook nil)
+         (gt-posframe-pin-render-output-hook nil)
+         (seshat-reader-translate-last-result nil)
+         (created nil)
+         (messages nil)
+         (chain nil)
+         (panel nil))
+    (unwind-protect
+        (progn
+          (setq chain (seshat-reader-translate-test--panel-chain))
+          (setq panel (plist-get chain :panel))
+          ;; 承接上一条：译文已在 last-result 中
+          (should (equal seshat-reader-translate-last-result
+                         seshat-reader-translate-test--translated-text))
+          (cl-letf (((symbol-function 'seshat-rest-create-annotation)
+                     (lambda (document-id location text)
+                       (push (list document-id location text) created)
+                       '((id . 42))))
+                    ((symbol-function 'message)
+                     (lambda (fmt &rest args)
+                       (push (apply #'format fmt args) messages)
+                       nil)))
+            (seshat-reader-translate-save-as-annotation))
+          (should (= 1 (length created)))
+          (let ((call (car created)))
+            ;; document-id 由选区文件经文档根派生（不写真实文件）
+            (should (equal (nth 0 call) "t6:seshat-translate-test.pdf"))
+            ;; location 带 page: 前缀，且 rect 按两位小数格式化
+            (should (string-prefix-p "page:3;" (nth 1 call)))
+            (should (equal (nth 1 call)
+                           "page:3;rect:10.00,20.00,30.00,40.00"))
+            ;; 正文取面板 buffer 的内容（面板 → 批注的同一份文本）
+            (should (equal (nth 2 call)
+                           (with-current-buffer panel (buffer-string))))
+            (should (equal (nth 2 call)
+                           seshat-reader-translate-test--translated-text)))
+          ;; 成功提示报告批注 id，且不出现「失败」
+          (should messages)
+          (should (string-match-p "42" (car messages)))
+          (should-not (cl-some (lambda (msg) (string-match-p "失败" msg))
+                               messages)))
+      (when (buffer-live-p panel) (kill-buffer panel)))))
 
 (provide 'seshat-reader-translate-test)
 ;;; seshat-reader-translate-test.el ends here

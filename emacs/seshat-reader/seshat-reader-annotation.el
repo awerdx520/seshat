@@ -81,7 +81,7 @@
 ;; 编译告警。
 (declare-function seshat-reader-etaf-available-p "seshat-reader-etaf" ())
 (declare-function seshat-reader-etaf-render-annotations "seshat-reader-etaf"
-                  (buffer items doc-id &optional source))
+                  (buffer items doc-id &optional source page page-count))
 ;; ETAF 已挂载判定用（`seshat-reader-annotation--etaf-mounted-p'）；同样只在
 ;; ETAF 已加载时才会被调用。
 (declare-function etaf-runtime-for-buffer "etaf-runtime" (buffer-or-name))
@@ -108,6 +108,14 @@
 可见、不跨端共享。"
   :type '(alist :key-type (string :tag "根标签")
                 :value-type (directory :tag "根目录"))
+  :group 'seshat-reader-annotation)
+
+(defcustom seshat-reader-annotation-page-size 20
+  "批注列表每页条数.
+服务端项与本地待同步项合并后统一切片：合并顺序为**服务端项在前、本地
+待同步项在后**（见 `seshat-reader-annotation--all-items'），切片按
+`seshat-reader-annotation--page-items' 的 1-based 页号进行。"
+  :type 'natnum
   :group 'seshat-reader-annotation)
 
 (defun seshat-reader-annotation--doc-id (file)
@@ -286,6 +294,13 @@ BODY 为批注正文；为 nil 或去掉空白后为空串时退回使用最近�
 `seshat-reader-annotation-list-delete' 在取消本地待同步批注后重渲染列表时
 复用本缓存，从而无需再次拉取服务端（即不发起任何 HTTP）。")
 
+(defvar-local seshat-reader-annotation-list-page 1
+  "列表缓冲区当前显示的页号（**1-based**，默认 1）.
+由翻页命令（`seshat-reader-annotation-list-next-page' 等）写入，并由渲染
+路径 `seshat-reader-annotation--render-list' 共同维护：每次渲染都按当页
+条目数把页号**夹紧**到 `[1, 页数]' 后写回，因此删除末页最后一条、刷新
+列表或切换文档后页号会自动收敛，不会停留在空页上。")
+
 (defun seshat-reader-annotation--page-from-location (location)
   "从 LOCATION 中解析 **1-based** 页码；解析失败时返回 nil.
 LOCATION 的约定为 \"page:<n>;rect:...\"，其中 <n> 为 1-based 十进制
@@ -403,10 +418,55 @@ ANNOTATIONS 为服务端返回的批注 alist 列表，QUEUED 为本地离线队
                      :dirty t)))
            queued)))
 
-(defun seshat-reader-annotation--render-list-etaf (items document-id source)
+(defun seshat-reader-annotation--all-items (annotations queued)
+  "返回分页用的全量条目列表，元素为 plist.
+ANNOTATIONS 为服务端批注列表，QUEUED 为本地离线队列中待同步的 create 条目
+列表。本函数**直接复用** `seshat-reader-annotation--etaf-items' 的合并结果
+（服务端项在前、本地待同步项在后），不另写一套合并逻辑，以免两条路径的
+顺序漂移。
+
+本函数是分页的**唯一**条目来源：页数（`--page-count'）、切片
+（`--page-items'）与页号夹紧（`--clamp-page'）都只接受本函数的返回值。"
+  (seshat-reader-annotation--etaf-items annotations queued))
+
+(defun seshat-reader-annotation--page-count (items)
+  "返回 ITEMS 的页数，至少 1 页.
+页大小取自 `seshat-reader-annotation-page-size'；ITEMS 为空时返回 1，使
+「空列表也是第 1 页」与页脚的 \"第 1/1 页\" 语义一致。页大小被防御性地
+下限到 1，避免用户把选项设为 0 时除零。"
+  (let ((size (max 1 seshat-reader-annotation-page-size)))
+    (max 1 (ceiling (length items) (float size)))))
+
+(defun seshat-reader-annotation--clamp-page (items page)
+  "把页号 PAGE 夹紧到 ITEMS 的合法范围 [1, 页数]，返回夹紧后的页号.
+ITEMS 为空时恒为 1。PAGE 非整数（如 nil）按 1 处理。"
+  (let ((page (if (integerp page) page 1)))
+    (max 1 (min page (seshat-reader-annotation--page-count items)))))
+
+(defun seshat-reader-annotation--page-items (items page)
+  "返回 ITEMS 中第 PAGE 页的条目切片（**1-based**）.
+页大小取自 `seshat-reader-annotation-page-size'；PAGE 超界时先经
+`seshat-reader-annotation--clamp-page' 夹紧到合法范围（超出末页取末页、
+小于 1 取首页），因此永不返回空切片。ITEMS 为空时返回 nil。"
+  (when items
+    (let* ((page (seshat-reader-annotation--clamp-page items page))
+           (size (max 1 seshat-reader-annotation-page-size))
+           (rest (nthcdr (* (1- page) size) items))
+           (slice nil))
+      (dotimes (_ size)
+        (when rest
+          (push (car rest) slice)
+          (setq rest (cdr rest))))
+      (nreverse slice))))
+
+(defun seshat-reader-annotation--render-list-etaf (items document-id source
+                                                        page page-count)
   "用 ETAF 渲染层把 ITEMS 渲染到当前缓冲区；成功返回 t，否则返回 nil.
-ITEMS 是 `seshat-reader-annotation--etaf-items' 的返回值；DOCUMENT-ID 与
-SOURCE 随渲染一并交给渲染层，供其动作命令（跳页 / 删除 / 引用）复用。
+ITEMS 是 `seshat-reader-annotation--etaf-items' 的返回值（**全量**条目，
+服务端项在前、本地待同步项在后）；PAGE 与 PAGE-COUNT 是当前页号与总页数，
+渲染层据此只渲染当页卡片并显示「第 x/y 页」徽章——全量条目仍完整交给渲染
+层，供跨页选中与页号收敛使用。DOCUMENT-ID 与 SOURCE 随渲染一并交给渲染层，
+供其动作命令（跳页 / 删除 / 引用）复用。
 
 渲染层未安装或加载失败时返回 nil，由调用方回退纯文本渲染。渲染**抛错**时
 `message' 一条警告后同样返回 nil——面板不得因为渲染失败而空白。"
@@ -414,7 +474,7 @@ SOURCE 随渲染一并交给渲染层，供其动作命令（跳页 / 删除 / �
       (if (require 'seshat-reader-etaf nil t)
           (progn
             (seshat-reader-etaf-render-annotations
-             (current-buffer) items document-id source)
+             (current-buffer) items document-id source page page-count)
             t)
         nil)
     (error
@@ -438,23 +498,41 @@ DOCUMENT-ID 为文档标识，SOURCE 为发起列表的 seshat-reader 文档缓�
 复用，ANNOTATIONS 也一并缓存到
 `seshat-reader-annotation-list-entries' 供免 HTTP 重渲染。
 
-ANNOTATIONS 为服务端返回的批注列表，先逐条渲染；QUEUED 为本地离线队列中
-待同步的 create 条目列表（plist 列表，见
-`seshat-reader-annotation--queued-create-entries'），随后逐条以
-\"[待同步]\" 标记渲染，并携带各自的 `seshat-reader-annotation-queue-uuid'
-属性。因此列表中**服务端项在前、本地待同步项在后**。
+ANNOTATIONS 为服务端返回的批注列表，QUEUED 为本地离线队列中待同步的
+create 条目列表（plist 列表，见
+`seshat-reader-annotation--queued-create-entries'），二者先合并为全量条目
+（`seshat-reader-annotation--all-items'，服务端项在前、本地待同步项在后），
+再按 `seshat-reader-annotation-page-size' 切片渲染**当页**条目：本地待同步
+项带 \"[待同步]\" 标记，并携带各自的
+`seshat-reader-annotation-queue-uuid' 属性。
 
-ANNOTATIONS 与 QUEUED 都为空时渲染一行明确提示。
+缓冲区 local 的页号 `seshat-reader-annotation-list-page' 由本函数统一维护：
+渲染前按全量条目数夹紧到 `[1, 页数]' 后 `setq-local' 写回，因此删除末页
+最后一条、刷新列表或换文档后，页号自动收敛，永不显示空页。
+
+全量条目为空时渲染一行明确提示（不显示页脚）；多于 1 页时在列表末尾插入
+页脚行 \"-- 第 当前页/总页数 页 --\"（不带任何批注文本属性，故 `RET' / `d'
+在页脚行上不生效）。只有 1 页时不显示页脚，避免单页列表出现无谓噪音。
 
 **ETAF 分流**：`seshat-reader-annotation--etaf-p' 为真时先用 ETAF 渲染层
 （`seshat-reader-etaf-render-annotations'）渲染卡片列表；渲染层不可用、
-加载失败或渲染抛错时回退下面的纯文本渲染（见
-`seshat-reader-annotation--render-list-etaf'）。两条路径都由
+加载失败或渲染抛错时回退上面的纯文本渲染（见
+`seshat-reader-annotation--render-list-etaf'）。ETAF 路径直接复用上面已
+合并好的 ALL-ITEMS（**不再**重复调用 `--etaf-items' 合并一次），把**全量**
+条目连同已经夹紧的页号 PAGE 与总页数 TOTAL-PAGES 一并交给渲染层：渲染层
+只把当页切片做成卡片（与文本路径的分页规则完全一致，本函数仍是页号的唯一
+权威与收敛点），全量条目留给渲染层维护跨页选中。两条路径都由
 `seshat-reader-sidebar-show' 以 `annotations' 类型统一显示，故面板位置、
 高度与 per-kind 记忆不变。"
   (with-current-buffer (get-buffer-create seshat-reader-annotation-list-buffer-name)
-    (let ((inhibit-read-only t)
-          (etaf-mounted (seshat-reader-annotation--etaf-mounted-p)))
+    (let* ((inhibit-read-only t)
+           (etaf-mounted (seshat-reader-annotation--etaf-mounted-p))
+           (all-items (seshat-reader-annotation--all-items annotations queued))
+           (total-pages (seshat-reader-annotation--page-count all-items))
+           (page (seshat-reader-annotation--clamp-page
+                  all-items
+                  (buffer-local-value 'seshat-reader-annotation-list-page
+                                      (current-buffer)))))
       ;; ETAF 已挂载时**不得** `erase-buffer'：ETAF runtime 的节点位置依赖
       ;; 缓冲区既有文本，清空后 `etaf-runtime-flush' 会报「Args out of range」
       ;; 从而整块回退文本渲染（刷新后面板降级）。增量刷新由渲染层自己 flush。
@@ -466,21 +544,23 @@ ANNOTATIONS 与 QUEUED 都为空时渲染一行明确提示。
       (setq-local seshat-reader-annotation-list-document-id document-id)
       (setq-local seshat-reader-annotation-list-source source)
       (setq-local seshat-reader-annotation-list-entries annotations)
+      ;; 页号夹紧后写回：删除末页最后一条 / 刷新 / 换文档后都不会停在空页。
+      (setq-local seshat-reader-annotation-list-page page)
       (unless (and (seshat-reader-annotation--etaf-p)
                    (seshat-reader-annotation--render-list-etaf
-                    (seshat-reader-annotation--etaf-items annotations queued)
-                    document-id source))
+                    all-items document-id source page total-pages))
         ;; 回退路径：渲染层可能已写入部分文本，故先清空再走文本渲染。
         (erase-buffer)
-        (if (and (null annotations) (null queued))
+        (if (null all-items)
             (insert "（该文档没有批注）\n")
-          (dolist (annotation annotations)
-            (seshat-reader-annotation--insert-entry annotation))
-          (dolist (entry queued)
+          (dolist (item (seshat-reader-annotation--page-items all-items page))
             (seshat-reader-annotation--insert-entry
-             (list (cons 'location (plist-get entry :location))
-                   (cons 'text (plist-get entry :text)))
-             (plist-get entry :uuid)))))
+             (list (cons 'id (plist-get item :id))
+                   (cons 'location (plist-get item :location))
+                   (cons 'text (plist-get item :text)))
+             (plist-get item :uuid)))
+          (when (> total-pages 1)
+            (insert (format "-- 第 %d/%d 页 --\n" page total-pages)))))
       (goto-char (point-min)))
     ;; 列表缓冲区在 `*Seshat Annotations*' 中渲染完毕后，经信息面板统一入口
     ;; 显示（启用面板时投到底部弹出窗口，禁用时 `show' 内部退回
@@ -514,6 +594,68 @@ SOURCE 为发起列表的 seshat-reader 文档缓冲区（可为 nil）。
             (message "Seshat Reader annotation: 当前没有可显示的批注（本地也没有待同步条目）。")))
       (seshat-reader-annotation--render-list document-id source result queued)
       (seshat-reader-annotation--maybe-sync-queue))))
+
+;;; 翻页
+
+(defun seshat-reader-annotation--list-items ()
+  "返回当前列表缓冲区的全量条目（服务端缓存项 + 本地待同步项）.
+服务端项取自 `seshat-reader-annotation-list-entries' 缓存，本地项取自离线
+队列（`seshat-reader-annotation-queue-entries'）；因此本函数**不发起任何
+HTTP**，只读内存与本地队列文件。"
+  (seshat-reader-annotation--all-items
+   (buffer-local-value 'seshat-reader-annotation-list-entries (current-buffer))
+   (seshat-reader-annotation--queued-create-entries
+    (buffer-local-value 'seshat-reader-annotation-list-document-id
+                        (current-buffer)))))
+
+(defun seshat-reader-annotation--set-list-page (page)
+  "把当前列表缓冲区的页号设为 PAGE（夹紧到合法范围）并重渲染当页.
+重渲染复用列表缓冲区的服务端项缓存与本地离线队列
+（`seshat-reader-annotation--queued-create-entries'），**绝不发 HTTP**——与
+`seshat-reader-annotation-list-delete' 的 uuid 分支同一写法。"
+  (let* ((document-id (buffer-local-value 'seshat-reader-annotation-list-document-id
+                                          (current-buffer)))
+         (source (buffer-local-value 'seshat-reader-annotation-list-source
+                                     (current-buffer)))
+         (annotations (buffer-local-value 'seshat-reader-annotation-list-entries
+                                          (current-buffer)))
+         (queued (seshat-reader-annotation--queued-create-entries document-id)))
+    (setq-local seshat-reader-annotation-list-page
+                (seshat-reader-annotation--clamp-page
+                 (seshat-reader-annotation--all-items annotations queued)
+                 page))
+    (seshat-reader-annotation--render-list document-id source annotations queued)))
+
+(defun seshat-reader-annotation-list-next-page ()
+  "在批注列表中显示下一页；已是最后一页时不动.
+页号改动后由 `seshat-reader-annotation--render-list' 重渲染当页，只读缓存
+与本地队列，不发起 HTTP。"
+  (interactive)
+  (seshat-reader-annotation--set-list-page
+   (1+ (buffer-local-value 'seshat-reader-annotation-list-page (current-buffer)))))
+
+(defun seshat-reader-annotation-list-prev-page ()
+  "在批注列表中显示上一页；已是第一页时不动.
+页号改动后由 `seshat-reader-annotation--render-list' 重渲染当页，只读缓存
+与本地队列，不发起 HTTP。"
+  (interactive)
+  (seshat-reader-annotation--set-list-page
+   (1- (buffer-local-value 'seshat-reader-annotation-list-page (current-buffer)))))
+
+(defun seshat-reader-annotation-list-first-page ()
+  "在批注列表中跳到第一页.
+页号改动后由 `seshat-reader-annotation--render-list' 重渲染当页，只读缓存
+与本地队列，不发起 HTTP。"
+  (interactive)
+  (seshat-reader-annotation--set-list-page 1))
+
+(defun seshat-reader-annotation-list-last-page ()
+  "在批注列表中跳到最后一页.
+末页页号由 `seshat-reader-annotation--page-count' 现算（条目数来自缓存与
+本地队列），因此与本文件的分页规则一致；重渲染同样不发 HTTP。"
+  (interactive)
+  (seshat-reader-annotation--set-list-page
+   (seshat-reader-annotation--page-count (seshat-reader-annotation--list-items))))
 
 (defun seshat-reader-annotation-list-goto ()
   "跳转到当前行批注所在的页面.
@@ -615,13 +757,21 @@ ID 可为整数或字符串（服务端列表返回的 `id' 可能是整数）�
   "Major mode for the `*Seshat Annotations*' buffer.
 
 Keybindings:
-\\{seshat-reader-annotation-list-mode-map}"
+\\{seshat-reader-annotation-list-mode-map}
+
+`RET' 跳转到当前行批注所在页面，`d' 删除当前行批注；
+`]' / `[' 显示下一页 / 上一页（页脚行 \"-- 第 N/M 页 --\" 不带批注文本
+属性，因此在页脚行上 `RET' / `d' 不生效）。"
   (setq-local truncate-lines t))
 
 (define-key seshat-reader-annotation-list-mode-map (kbd "RET")
             #'seshat-reader-annotation-list-goto)
 (define-key seshat-reader-annotation-list-mode-map (kbd "d")
             #'seshat-reader-annotation-list-delete)
+(define-key seshat-reader-annotation-list-mode-map (kbd "]")
+            #'seshat-reader-annotation-list-next-page)
+(define-key seshat-reader-annotation-list-mode-map (kbd "[")
+            #'seshat-reader-annotation-list-prev-page)
 
 (defun seshat-reader-annotation-list ()
   "列出当前文档的全部批注.
@@ -634,10 +784,14 @@ Keybindings:
 列表缓冲区中 `RET' 跳转到该行批注所在页面（复用
 `seshat-reader-goto-page'），`d' 删除该行批注并刷新列表——服务端项走
 `seshat-reader-annotation-delete'，本地 \"[待同步]\" 项则由
-`seshat-reader-annotation-list-delete' 直接取消本地条目、不发 HTTP。这两个
-键经 `seshat-reader-annotation-list-mode' 的 local keymap 绑定，不依赖
+`seshat-reader-annotation-list-delete' 直接取消本地条目、不发 HTTP。`]' /
+`[' 分别显示下一页 / 上一页：页大小由
+`seshat-reader-annotation-page-size' 控制（服务端项与本地待同步项合并后
+统一切片），当前页号记在 `seshat-reader-annotation-list-page'，列表多于
+1 页时末尾显示页脚 \"-- 第 N/M 页 --\"。这些键经
+`seshat-reader-annotation-list-mode' 的 local keymap 绑定，不依赖
 evil；在 evil 环境下它们可能被 evil 接管（evil 会覆盖 `special-mode' 系的
-这两个键），需要用户在配置侧处理。
+这几个键），需要用户在配置侧处理。
 
 服务端暂时拉不到时**不**报错也不清空列表：仍展示本地待同步条目并提示
 「（离线）仅显示本地待同步批注 N 条」；本地也为空时只提示当前没有可显示

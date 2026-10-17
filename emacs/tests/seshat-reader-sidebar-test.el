@@ -148,8 +148,8 @@ T10 第 1 轮反馈的验收：用户要求译文面板也跟随光标。分两�
 ① **管线**：`seshat-reader-sidebar-show'（两种 KIND）与 popper 重开走的
 `seshat-reader-sidebar-display-buffer'（两种 buffer 名）都把该项放进
 `display-buffer-overriding-action'；
-② **调用点**：批注渲染（`seshat-reader-annotation--render-list'）与译文渲染
-（`seshat-reader-translate--render-sidebar-etaf'）都实际传了 SELECT=t，故管道
+  ② **调用点**：批注渲染（`seshat-reader-annotation--render-list'）与译文渲染
+（`seshat-reader-translate--render-panel'）都实际传了 SELECT=t，故管道
 两侧闭合——任一侧漏传都会让译文面板不跟随光标。"
   (let ((seshat-reader-sidebar-enabled t)
         (seshat-reader-sidebar-position 'below-selected)
@@ -201,19 +201,15 @@ T10 第 1 轮反馈的验收：用户要求译文面板也跟随光标。分两�
                        (lambda (b k &optional s)
                          (push (list k s) calls) 'fake-win))
                       ((symbol-function 'seshat-reader-annotation--etaf-p)
-                       (lambda () nil))
-                      ((symbol-function 'seshat-reader-translate--gt-buffer-text)
-                       (lambda () "一句译文"))
-                      ((symbol-function 'seshat-reader-etaf-render-translate)
-                       (lambda (&rest _args) nil)))
+                       (lambda () nil)))
               ;; 批注：走文本回退路径，末尾仍经 `show' 以 annotations 显示
               (seshat-reader-annotation--render-list
                "doc-select" nil
                '(((id . 1) (location . "page:1;rect:0,0,0,0")
                   (text . "一条批注")))
                nil)
-              ;; 译文：不依赖 gt，只验 `show' 的第三个实参
-              (seshat-reader-translate--render-sidebar-etaf))
+              ;; 译文：面板缓冲写入 + `show'，不依赖 gt
+              (seshat-reader-translate--render-panel "一句译文" "Seshat 译文"))
             (should (equal (list 'annotations t) (assq 'annotations calls)))
             (should (equal (list 'translate t) (assq 'translate calls)))
             (dolist (call calls)
@@ -345,30 +341,21 @@ T10 第 1 轮反馈的验收：用户要求译文面板也跟随光标。分两�
 ;;; 译文面板渲染路径（--render-object）
 
 (ert-deftest seshat-reader-sidebar-test--translate-sidebar-render-object ()
-  "ETAF 不可用时 `sidebar' 分支用 go-translate function `gt-buffer-render'，其 `window-config' 槽等于 `--display-params'，不建 posframe."
+  "`sidebar' 分支（enabled 非 nil）让 gt 渲染到**隐藏中转 buffer**，由 `:then' 接管面板展示."
   (unless (require 'gt nil t) (ert-skip "gt 未加载"))
-  ;; 先让渲染层进入「已加载」态：无 ETAF 时这一步失败，渲染层保持未加载，
-  ;; 后续判断自然为 nil；有 ETAF 时先加载、再由下面的 `cl-letf' 桩成不可用。
-  ;; 顺序不能颠倒——`cl-letf' 的桩会被 `require' 期间执行的 `defun' 覆盖。
-  (ignore-errors (require 'seshat-reader-etaf nil t))
-  (let ((seshat-reader-sidebar-enabled t)
-        (seshat-reader-sidebar-position 'below-selected)
-        (seshat-reader-sidebar-height 0.35)
-        (seshat-reader-sidebar--state nil)
-        (obj nil))
-    ;; `--render-object' 现会按需 `require' 渲染层（M11.9 缺口修补：先翻译、
-    ;; 再开批注列表时 ETAF 排版不得静默失效），故「渲染层尚未加载」不再是
-    ;; 可靠前提。本用例要验的是 **ETAF 不可用**时的降级路径，因此显式把
-    ;; `available-p' 钉成 nil；模块不可加载与模块已加载但不可用两条情形都
-    ;; 落到 gt 直接渲染。
-    (cl-letf (((symbol-function 'seshat-reader-etaf-available-p)
-               (lambda () nil)))
-      (setq obj (seshat-reader-translate--render-object 'sidebar)))
+  (unless (require 'gt-render-buffer nil t) (ert-skip "gt-render-buffer 未加载"))
+  (let* ((seshat-reader-sidebar-enabled t)
+         (obj (seshat-reader-translate--render-object 'sidebar))
+         (window-config (slot-value obj 'window-config)))
     (should (eq (eieio-object-class obj) 'gt-buffer-render))
-    (should (equal (slot-value obj 'window-config)
-                   (seshat-reader-sidebar--display-params 'translate)))
+    ;; `:name' 是隐藏中转 buffer，不是展示用的面板 buffer
     (should (equal (slot-value obj 'name)
-                   seshat-reader-sidebar-translate-buffer-name))))
+                   seshat-reader-translate--gt-buffer-name))
+    (should-not (equal (slot-value obj 'name)
+                       seshat-reader-sidebar-translate-buffer-name))
+    (should (equal '(display-buffer-no-window) (car window-config)))
+    (should (member '(allow-no-window . t) window-config))
+    (should (functionp (slot-value obj 'then)))))
 
 (ert-deftest seshat-reader-sidebar-test--translate-pop-pin-render-object ()
   "`pop'/`pin' 分支分别返回弹出式/固定式 posframe 渲染器."
@@ -512,6 +499,161 @@ T10 第 1 轮反馈的验收：用户要求译文面板也跟随光标。分两�
           (should (= deleted 1))
           (should (equal (cdr (assq 'annotations seshat-reader-sidebar--state)) 0.4))
           (should (eq seshat-reader-sidebar--last-buffer buf)))
+      (kill-buffer buf))))
+
+;;; 内容自适应高度（T2）
+
+(defun seshat-reader-sidebar-test--fit-run (kind content-lines init-height
+                                                 &optional etaf-runtime)
+  "在桩环境下跑一次 `seshat-reader-sidebar--fit-height-for-content'.
+KIND 为面板内容类型，CONTENT-LINES 为桩出的内容行数，INIT-HEIGHT 为桩出的
+初始窗口总行数；ETAF-RUNTIME 非 nil 时把 `etaf-runtime-for-buffer' 桩成返回它
+（模拟「buffer 已挂载 ETAF runtime」）。返回 plist：`:resizes' 为
+`window-resize' 调用列表（元素 `(WINDOW DELTA)'）、`:state' 为执行后的
+`seshat-reader-sidebar--state'、`:final-height' 为执行后的窗口总行数。
+单行像素高固定桩为 10，`frame-height' 固定桩为 50。"
+  (let* ((buf (get-buffer-create "*seshat-sidebar-test-fit*"))
+         (win (selected-window))
+         (orig-buffer (window-buffer win))
+         (h init-height)
+         (line-height 10)
+         (resizes nil)
+         (result nil)
+         (etaf-defined (fboundp 'etaf-runtime-for-buffer))
+         (etaf-original (and etaf-defined
+                             (symbol-function 'etaf-runtime-for-buffer))))
+    (unwind-protect
+        (progn
+          (set-window-buffer win buf)
+          (when etaf-runtime
+            (fset 'etaf-runtime-for-buffer (lambda (_buffer) etaf-runtime)))
+          (let ((seshat-reader-sidebar--state nil))
+            (cl-letf (((symbol-function 'line-pixel-height)
+                       (lambda () line-height))
+                      ((symbol-function 'window-text-pixel-size)
+                       (lambda (&rest _)
+                         (cons 100 (* content-lines line-height))))
+                      ((symbol-function 'frame-height)
+                       (lambda (&rest _) 50))
+                      ((symbol-function 'window-total-height)
+                       (lambda (&rest _) h))
+                      ((symbol-function 'window-resize)
+                       (lambda (w delta &rest _)
+                         (push (list w delta) resizes)
+                         (cl-incf h delta))))
+              (seshat-reader-sidebar--fit-height-for-content win kind))
+            (setq result (list :resizes (nreverse resizes)
+                               :state seshat-reader-sidebar--state
+                               :final-height h))))
+      (when etaf-runtime
+        (if etaf-defined
+            (fset 'etaf-runtime-for-buffer etaf-original)
+          (fmakunbound 'etaf-runtime-for-buffer)))
+      (set-window-buffer win orig-buffer)
+      (kill-buffer buf))
+    result))
+
+(ert-deftest seshat-reader-sidebar-test--fit-height-for-content-translate-adjusts ()
+  "translate 面板按内容行数调整高度，并把最终比例写入 per-kind 记忆.
+桩内容 12 行 → 目标 = 12 + 2 = 14 行；初始 20 行 → DELTA = -6，最终 14 行，
+记忆比例 = 14/50 = 0.28。"
+  (let* ((result (seshat-reader-sidebar-test--fit-run 'translate 12 20))
+         (resizes (plist-get result :resizes))
+         (win (selected-window)))
+    (should (= (length resizes) 1))
+    (should (eq (caar resizes) win))
+    (should (= (cadar resizes) -6))
+    (should (= (plist-get result :final-height) 14))
+    (should (equal (cdr (assq 'translate (plist-get result :state)))
+                   0.28))
+    (should (assq 'translate (plist-get result :state)))))
+
+(ert-deftest seshat-reader-sidebar-test--fit-height-for-content-clamps-max ()
+  "内容超过上限时夹到 `(floor (* max-height (frame-height)))'."
+  (let* ((seshat-reader-sidebar-max-height 0.8)
+         (result (seshat-reader-sidebar-test--fit-run 'translate 100 20))
+         (resizes (plist-get result :resizes))
+         (expect (floor (* 0.8 50))))
+    (should (= expect 40))
+    (should (= (length resizes) 1))
+    (should (= (+ 20 (cadar resizes)) expect))
+    (should (= (plist-get result :final-height) expect))
+    (should (equal (cdr (assq 'translate (plist-get result :state)))
+                   (/ (float expect) 50.0)))))
+
+(ert-deftest seshat-reader-sidebar-test--fit-height-for-content-clamps-min ()
+  "内容极少时目标高度不低于 5 行."
+  (let* ((result (seshat-reader-sidebar-test--fit-run 'translate 1 20))
+         (resizes (plist-get result :resizes)))
+    (should (= (length resizes) 1))
+    (should (= (+ 20 (cadar resizes)) 5))
+    (should (= (plist-get result :final-height) 5))))
+
+(ert-deftest seshat-reader-sidebar-test--fit-height-for-content-skips-annotations ()
+  "kind 为 `annotations' 时面板高度不被调整、记忆不变."
+  (let ((result (seshat-reader-sidebar-test--fit-run 'annotations 12 20)))
+    (should-not (plist-get result :resizes))
+    (should-not (plist-get result :state))
+    (should (= (plist-get result :final-height) 20))))
+
+(ert-deftest seshat-reader-sidebar-test--fit-height-for-content-skips-etaf ()
+  "buffer 已挂载 ETAF runtime 时面板高度不被调整."
+  (let ((result (seshat-reader-sidebar-test--fit-run
+                 'translate 12 20 'fake-etaf-runtime)))
+    (should-not (plist-get result :resizes))
+    (should-not (plist-get result :state))))
+
+(ert-deftest seshat-reader-sidebar-test--fit-applicable-p ()
+  "两重限制判据：仅 translate 且未挂载 ETAF runtime 的 buffer 适用."
+  (let ((buf (get-buffer-create "*seshat-sidebar-test-applicable*"))
+        (etaf-defined (fboundp 'etaf-runtime-for-buffer))
+        (etaf-original (and (fboundp 'etaf-runtime-for-buffer)
+                            (symbol-function 'etaf-runtime-for-buffer))))
+    (unwind-protect
+        (progn
+          (should (seshat-reader-sidebar--fit-applicable-p buf 'translate))
+          (should-not (seshat-reader-sidebar--fit-applicable-p buf 'annotations))
+          (should-not (seshat-reader-sidebar--fit-applicable-p buf nil))
+          (fset 'etaf-runtime-for-buffer (lambda (_buffer) 'fake-runtime))
+          (should-not (seshat-reader-sidebar--fit-applicable-p buf 'translate)))
+      (if etaf-defined
+          (fset 'etaf-runtime-for-buffer etaf-original)
+        (fmakunbound 'etaf-runtime-for-buffer))
+      (kill-buffer buf))))
+
+(ert-deftest seshat-reader-sidebar-test--display-calls-fit-for-translate ()
+  "`--display' 显示 translate 面板后按内容调整高度，annotations 面板不调整."
+  (let* ((buf (get-buffer-create "*seshat-sidebar-test-display-fit*"))
+         (win (selected-window))
+         (orig-buffer (window-buffer win))
+         (h 20)
+         (line-height 10)
+         (resizes nil))
+    (unwind-protect
+        (progn
+          (set-window-buffer win buf)
+          (let ((seshat-reader-sidebar--state nil)
+                (seshat-reader-sidebar-position 'below-selected))
+            (cl-letf (((symbol-function 'display-buffer)
+                       (lambda (_buffer &optional _action) win))
+                      ((symbol-function 'line-pixel-height)
+                       (lambda () line-height))
+                      ((symbol-function 'window-text-pixel-size)
+                       (lambda (&rest _) (cons 100 (* 12 line-height))))
+                      ((symbol-function 'frame-height) (lambda (&rest _) 50))
+                      ((symbol-function 'window-total-height) (lambda (&rest _) h))
+                      ((symbol-function 'window-resize)
+                       (lambda (w delta &rest _)
+                         (push (list w delta) resizes)
+                         (cl-incf h delta))))
+              (seshat-reader-sidebar--display buf 'translate)
+              (should (= (length resizes) 1))
+              (should (equal (cdr (assq 'translate seshat-reader-sidebar--state))
+                             0.28))
+              (setq resizes nil)
+              (seshat-reader-sidebar--display buf 'annotations)
+              (should-not resizes))))
+      (set-window-buffer win orig-buffer)
       (kill-buffer buf))))
 
 (provide 'seshat-reader-sidebar-test)

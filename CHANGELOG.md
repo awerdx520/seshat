@@ -18,6 +18,9 @@
 - 新增阅读器双向引用（M11.4）：新模块 `emacs/seshat-reader/seshat-reader-reference.el`——注册 `seshat:` org 链接协议（`:follow` 打开书籍并跳页、`:store` 集成 `org-store-link`，链接格式 `seshat:<doc-id>#<location>`）；阅读器内 `C-c C-r` 把鼠标选区摘录插入笔记文件，批注列表 buffer 内 `C-c C-r` 插入该条批注的引用（服务端项与本地待同步项均支持，取值不触网）。**服务端零改动**，vendored 文件零改动（对 `annotation.el` 仅新增一处文本属性）。新增 ERT 测试 `emacs/tests/seshat-reader-reference-test.el`（29 用例，全绿）。
 - 新增阅读器底部信息面板（M11.7）：新模块 `emacs/seshat-reader/seshat-reader-sidebar.el`——pop 式底部弹出面板（`seshat-reader-sidebar-position` 可配 `below-selected`/`at-bottom`），单窗口 + per-kind 高度记忆（切换批注/译文各自恢复高度），`post-command-select-window` 实现光标跟随（`seshat-reader-sidebar-select-window` 可关），并提供 popper 分流显示函数（`seshat-reader-sidebar-buffer-p` / `seshat-reader-sidebar-display-buffer`）；批注列表与译文/解释统一投递到该面板，不再抢占阅读窗口、不再自动消失。新增 ERT 测试 `emacs/tests/seshat-reader-sidebar-test.el`（18 用例，全绿）。
 - 新增 ETAF 渲染层（M11.9，可选）：新模块 `emacs/seshat-reader/seshat-reader-etaf.el`——批注卡片化（页码徽章、`[待同步]` 标记、选中高亮、单行截断摘要）与译文排版（可折叠原文、分段正文、存为批注按钮），交互走 ETAF `:keys`（`RET`/`d`/`C-c C-r`/`q`）；配色用内置双色板随 `background-mode` 明暗自适应；ETAF 不可用或被关闭时自动回退纯文本渲染，功能不受影响。新增 ERT 测试 `emacs/tests/seshat-reader-etaf-test.el`（16 用例，全绿）。
+- 译文/解释面板的**高度自适应**（M11.10，2026-10-18）：新增 `seshat-reader-sidebar-max-height`（默认 `0.8`），仅对 `translate` 且未挂载 ETAF runtime 的面板按内容行数（`window-text-pixel-size` 换算，夹紧 5 行–`0.8×frame`）调整窗口高度，成功后写入 per-kind 高度记忆；批注列表仍用固定高度 `seshat-reader-sidebar-height`。同帧内面板增高会压缩上方阅读窗口（预期）。
+- 批注列表**分页**（M11.10，2026-10-18）：新增 `seshat-reader-annotation-page-size`（默认 `20`）与 buffer-local 当前页；`]` / `[` 翻页（ETAF `:keys` 与 `list-mode-map` 双路径），标题徽章多页显示「第 x/y 页」、单页显示「N 条」，`n` / `p` 跨页时自动切页，删除/刷新后页号收敛；纯文本回退路径页脚 `-- 第 x/y 页 --` 仅在多页时显示。
+- 译文/解释面板**可选显示原文**（M11.10，2026-10-18）：新增 `seshat-reader-translate-show-source`（默认 `nil`），非 nil 时在正文前插入选中原文的 Markdown 引用块（每行 `> ` 前缀、不截断）。
 
 ### 变更
 
@@ -30,11 +33,12 @@
 - **破坏性**：`seshat-reader-translate-render` 默认值由 `pop` 改为 `sidebar`——译文/解释默认渲染到底部面板（`seshat-reader-sidebar`）而非 posframe，避免 posframe 抢焦点与自动消失；可用 defcustom 切回 `pop`（posframe）/`pin`，或设 `seshat-reader-sidebar-enabled` 为 `nil` 退回旧行为。
 - `emacs/seshat-reader/Makefile`：新增可选 ETAF 依赖探测（`ETAF_ROOT ?= $(HOME)/WorkSpace/emacs-taf`），存在时把四仓库根与各自 `lisp/` 加入 `-L`；不存在时从编译与 checkdoc 列表中剔除 `seshat-reader-etaf.el`（`etaf-view` 为宏，编译期必须有 etaf-ui）。
 - `emacs/seshat-reader/` 包内新增 3 个自研扩展模块（`seshat-reader-reference.el` / `seshat-reader-sidebar.el` / `seshat-reader-etaf.el`），`VENDORED.md` 自研扩展表同步。
+- **阅读器面板渲染重构（M11.10，2026-10-18）**：译文/解释改为**面板内只读 Markdown 文本 buffer 完整渲染**——gt 只渲染到隐藏中转 buffer ` *Seshat gt*`（`:window-config` = `display-buffer-no-window` + `allow-no-window`），`:then` 回调取纯文本写入展示 buffer，以 `gfm-view-mode` → `markdown-view-mode` → `text-mode` 降级链显示（原生折行/滚动/复制/isearch）；`header-line` 显示「Seshat 译文」/「Seshat 解释」，面板内 `q`（关面板）/`C-c C-s`（存为批注）改由 minor mode `seshat-reader-translate-panel-mode` 承载。**删除**「来源：第 N 页」行与自绘「q 关闭」提示；`seshat-reader-translate-render` 的 `sidebar` 语义随之更新（面板内 Markdown 文本 buffer，非 ETAF 排版），`pop`/`pin` 仍为 posframe 回退。`seshat-reader-sidebar-translate-buffer-name` 改为**展示 buffer** 名（不再作 gt `:name` 与捕获守卫）。**ETAF 渲染层收敛为批注卡片**：译文排版组件树与 `seshat-reader-etaf-render-translate` 删除（`seshat-reader-etaf.el` 929 → 690 行），ETAF 只渲染批注列表 + 分页。
 
 ### 修复
 
 - 批注列表在 ETAF 已挂载时不再 `erase-buffer`（改为交给渲染层增量刷新）：此前任何刷新路径（含 uuid 删除）都会触发 `etaf-runtime-flush` 报 `Args out of range: 20, 20`，并整块降级为纯文本渲染。
-- 译文面板「来源：第 x 页」重复：正文管线渲染前剔除所有以 `来源：` 开头的行（gt 提取失败时会回退整个 buffer-string，把头部行与正文一起带出）；原文展开区不过滤，保持忠实摘录。
+- 译文面板「来源：第 x 页」重复：正文管线渲染前剔除所有以 `来源：` 开头的行（gt 提取失败时会回退整个 buffer-string，把头部行与正文一起带出）；原文展开区不过滤，保持忠实摘录。**M11.10（2026-10-18）起该过滤器与「来源」行一并从代码中删除**——面板 Markdown 路径不再生成「来源」行，也不再自绘「q 关闭」提示（键位由 minor mode `seshat-reader-translate-panel-mode` 承载）。
 
 ## [0.2.0] - 2026-10-12
 

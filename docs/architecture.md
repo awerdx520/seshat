@@ -68,9 +68,9 @@ Emacs 阅读器（`seshat-reader`）的批注同步在客户端侧叠加一层**
 
 **M7 uid 迁移点**：链接身份当前由 **doc-id 文本**承载。M7 引入 uid 后仅需替换两处——正向 `seshat-reader-annotation--doc-id`（文件 → doc-id）与反向 `seshat-reader-reference--file-from-doc-id`（doc-id → 绝对路径）；链接解析层可再加 uid 形式的回退分支。
 
-## 阅读器面板分层（M11.7–M11.9）
+## 阅读器面板分层（M11.7–M11.10）
 
-面板分为「承载层 / 渲染层 / 兜底渲染」三层，渲染层可选，任一层不可用时下层接管。
+面板分为「承载层 / 批注渲染层（ETAF，可选）/ 兜底渲染」三层，另有一条独立的**译文/解释 Markdown 文本 buffer 路径**（不经 ETAF）。
 
 **承载层 `seshat-reader-sidebar`（零依赖）**：
 
@@ -80,20 +80,33 @@ Emacs 阅读器（`seshat-reader`）的批注同步在客户端侧叠加一层**
 - **per-kind 高度记忆**：`seshat-reader-sidebar--state` 为内存 alist（零依赖）；切换内容前先捕获当前窗口高度（比例）存给其 kind，再用目标 kind 记住的高度新建窗口。仅会话内有效，不持久化。
 - **禁用 `window-toggle-side-windows`**：它是 frame 级全量开关（会连带删除/恢复 eca-chat、which-key 的侧窗），toggle 只对本包面板窗口做 `delete-window`。
 
-**渲染层 `seshat-reader-etaf`（可选，依赖 `etaf-ui`）**：
+**渲染层 `seshat-reader-etaf`（可选，依赖 `etaf-ui`；只负责批注卡片）**：
 
-- 组件树：标题栏（文档名 + 条数）、批注卡片（页码徽章 / 摘要 / `[待同步]` 标记 / 选中标记）、底部键位提示；译文为标题 + 可折叠原文 + 正文排版。
-- 交互：`:keys`（`RET` / `d` / `C-c C-r` / `q` / `n` / `p`）+ `:on-press`。Host keys 位于 `emulation-mode-map-alists` 最前，evil 不会吃掉——**但依赖加载顺序**：evil 先启用、面板再 mount 才成立；运行期 toggle evil 需重新 mount 面板。
+- 职责（M11.10 起）：**仅渲染批注卡片列表**——标题栏（文档名 + 条数/页码徽章）、批注卡片（页码徽章 / 摘要 / `[待同步]` 标记 / 选中标记）、底部键位提示与分页。**译文/解释不经过本层**（原「译文排版」组件树已删除）。
+- 交互：`:keys`（`RET` / `d` / `C-c C-r` / `q` / `n` / `p` / `]` / `[`）+ `:on-press`。Host keys 位于 `emulation-mode-map-alists` 最前，evil 不会吃掉——**但依赖加载顺序**：evil 先启用、面板再 mount 才成立；运行期 toggle evil 需重新 mount 面板。
 - 双色板：按 `background-mode` 取内置明/暗配色，文字一律用普通 `text` + 父 Host 样式（`etaf-label` / `etaf-badge` 自带颜色会覆盖父 Host，故不用）；换主题后需重新渲染面板。
-- 增量更新：状态（items / 选中项 / 文档标签）放在 `etaf-ref` 中，改 ref 由 ETAF 做 keyed patch + 行级 diff，不整树重渲染。
-- 降级：未安装 / `require` 抛错 / 渲染抛错三态均回退兜底渲染（细节见 [`docs/configuration.md`](configuration.md)「ETAF 渲染层」）。
+- 增量更新：状态（items / 选中项 / 文档标签 / 当前页）放在 `etaf-ref` 中，改 ref 由 ETAF 做 keyed patch + 行级 diff，不整树重渲染。
+- 降级：未安装 / `require` 抛错 / 渲染抛错三态均回退兜底渲染（细节见 [`docs/configuration.md`](configuration.md)「ETAF 渲染层」）；**降级只影响批注列表观感，译文/解释不受影响**。
+
+**译文/解释渲染（Markdown 文本 buffer，不经 ETAF）**：
+
+- `seshat-reader-translate--render-panel` 把 gt 在隐藏中转 buffer（` *Seshat gt*`，`:window-config` = `(display-buffer-no-window)` + `allow-no-window`）中渲染出的纯文本写入**展示 buffer**（`seshat-reader-sidebar-translate-buffer-name`），以 `gfm-view-mode` → `markdown-view-mode` → `text-mode` 降级链设视图，`truncate-lines`=nil + 显式 `word-wrap`=t，并写 `header-line`（「Seshat 译文」/「Seshat 解释」）。
+- 键位 `q`（关面板）/ `C-c C-s`（存为批注）由 minor mode `seshat-reader-translate-panel-mode` 承载，不污染 Markdown 视图共享键位表。理由见 [`openspec/decisions.md`](../openspec/decisions.md)（ETAF 画布固定 viewport 裁剪、内容不可选中复制、CJK 2 列测量风险）。
+
+**分页状态（annotation 层）**：
+
+- `seshat-reader-annotation-page-size`（默认 20）+ buffer-local 当前页；`]` / `[` 翻页走两条路径（ETAF `:keys` 与 `list-mode-map`），`n` / `p` 跨页自动切页，删除/刷新后页号收敛；标题徽章多页显示「第 x/y 页」、单页显示「N 条」；纯文本回退路径页脚 `-- 第 x/y 页 --` 仅多页时出现。
+
+**高度自适应（sidebar 层）**：
+
+- 仅对 kind=`translate` 且**未挂载 ETAF runtime** 的面板生效：`seshat-reader-sidebar--fit-height-for-content` 用 `window-text-pixel-size` 换算内容行数，夹紧 5 行到 `seshat-reader-sidebar-max-height`（默认 0.8），成功后把实测比例写入 per-kind 高度记忆；批注列表固定用 `seshat-reader-sidebar-height`。同帧内面板增高会压缩上方阅读窗口（预期）。
 
 **兜底渲染**：
 
 - 批注列表：`seshat-reader-annotation--render-list` 的纯文本 + 文本属性渲染，行携带 `id` / `page` / `queue-uuid` / `location` 属性。ETAF 已挂载时该函数**不再 `erase-buffer`**（交给渲染层增量刷新），否则随后的 `etaf-runtime-flush` 会因缓冲区被清空报 `Args out of range`。
-- 译文：gt 自带的 `gt-buffer-render`（`sidebar` 渲染方式下中转 buffer 被隐藏，`pop` / `pin` 仍走 posframe）。
+- 译文/解释：`seshat-reader-translate--render-panel` 的 Markdown 文本 buffer 路径（见上一小节）；只有 `seshat-reader-translate-render` 取 `pop` / `pin`（或禁用面板）时回退 posframe，由 gt 的 `gt-posframe-pop-render` / `gt-posframe-pin-render` 承载。
 
-**数据流**：`seshat-reader-annotation--refresh-list`（拉服务端批注 + 读本地队列）→ items（服务端项在前、本地待同步项在后；本地项以 `:uuid` 标识、无 `:id`）→ 渲染层（ETAF）或兜底文本渲染 → `seshat-reader-sidebar-show` → `display-buffer`（参数单一来源、幂等、可选光标跟随）。
+**数据流**：`seshat-reader-annotation--refresh-list`（拉服务端批注 + 读本地队列）→ items（服务端项在前、本地待同步项在后；本地项以 `:uuid` 标识、无 `:id`）→ **分页切片**（`seshat-reader-annotation-page-size`）→ 渲染层（ETAF 批注卡片）或兜底文本渲染 → `seshat-reader-sidebar-show` → `display-buffer`（参数单一来源、幂等、可选光标跟随）；译文/解释的数据流为 gt → 隐藏中转 buffer → `:then` 回调 → `seshat-reader-translate--render-panel` → 同一 `sidebar-show`。
 
 ## 数据流
 

@@ -103,9 +103,7 @@
 ;; runtime」编译告警。
 (declare-function seshat-reader-etaf-available-p "seshat-reader-etaf" ())
 (declare-function seshat-reader-etaf-render-annotations "seshat-reader-etaf"
-                  (buffer items doc-id &optional source))
-(declare-function seshat-reader-etaf-render-translate "seshat-reader-etaf"
-                  (buffer &rest args))
+                  (buffer items doc-id &optional source page page-count))
 (declare-function seshat-reader-etaf-annotation-goto "seshat-reader-etaf" ())
 (declare-function seshat-reader-etaf-annotation-delete "seshat-reader-etaf" ())
 (declare-function etaf-ref "etaf-reactive" (initial-value &rest args))
@@ -146,6 +144,26 @@
     (when (get-buffer name)
       (kill-buffer name))
     name))
+
+(defun seshat-reader-etaf-test--many-items (n)
+  "Return N synthetic annotation items with distinguishable summaries.
+每条摘要形如 \"批注条目-01\"，用于断言「面板只渲染当页条目」。条目不带
+`:page' / `:location'，故卡片页列显示 `p.?'，不会与页码断言互相干扰。"
+  (cl-loop for i from 1 to n
+           collect (list :id i :uuid nil :page nil :location nil
+                         :text (format "批注条目-%02d" i) :dirty nil)))
+
+(defun seshat-reader-etaf-test--mount-annotations-view (items)
+  "Mount the annotations panel view for ITEMS into a fresh buffer, return it.
+调用方必须**自行** `let' 绑定 `seshat-reader-etaf--items' / `--page' /
+`--page-count' / `--selected' / `--doc-label' 等 ref 后再调用本函数（视图在
+`etaf-mount' 期间读这些 ref 取初值）。调用方负责 `kill-buffer'。"
+  (let ((buf (get-buffer-create " *seshat-etaf-test-view*")))
+    (etaf-mount buf (seshat-reader-etaf--annotations-view items)
+                (list :viewport-width 600
+                      :viewport-height
+                      seshat-reader-etaf--default-viewport-height))
+    buf))
 
 (defun seshat-reader-etaf-test--fetch-etaf-module ()
   "Load the ETAF rendering layer, returning t on success.
@@ -420,81 +438,6 @@
       (when (buffer-live-p buf)
         (kill-buffer buf)))))
 
-(ert-deftest seshat-reader-etaf-test--render-translate-panel ()
-  "译文面板渲染出标题、徽章、正文、来源行与「存为批注」，原文默认折叠."
-  (skip-unless (seshat-reader-etaf-test--fetch-etaf-module))
-  (skip-unless (seshat-reader-etaf-available-p))
-  (let* ((buf (get-buffer-create "*seshat-etaf-test-translate*"))
-         (seshat-reader-select-last (list :page 112 :text "原文片段 ABC"))
-         (seshat-reader-etaf--translate-title (etaf-ref "Seshat 译文"))
-         (seshat-reader-etaf--translate-meta (etaf-ref nil))
-         (seshat-reader-etaf--translate-source (etaf-ref nil))
-         (seshat-reader-etaf--translate-body (etaf-ref ""))
-         (seshat-reader-etaf--translate-origin (etaf-ref nil))
-         (seshat-reader-etaf--translate-source-open (etaf-ref nil)))
-    (unwind-protect
-        (progn
-          (seshat-reader-etaf-render-translate
-           buf
-           :title "Seshat 译文"
-           :source "原文片段 ABC"
-           :body "第一段译文内容。\n\n第二段译文内容。"
-           :engine 'google :langs '(en zh))
-          (let* ((text (seshat-reader-etaf-test--buffer-text buf))
-                 (runtime (etaf-runtime-for-buffer buf))
-                 (sequences (and runtime
-                                 (gethash (etaf-runtime-keymap runtime)
-                                          etaf--keys-sequences))))
-            (should (string-match-p "Seshat 译文" text))
-            (should (string-match-p "google → en→zh" text))
-            (should (string-match-p "第一段译文内容" text))
-            (should (string-match-p "第二段译文内容" text))
-            (should (string-match-p "来源：第 112 页" text))
-            (should (string-match-p "存为批注" text))
-            ;; 原文区默认折叠
-            (should-not (string-match-p "原文片段 ABC" text))
-            ;; 译文面板的 `:keys' 只登记 q
-            (should (member (vconcat (kbd "q")) sequences))))
-      (when (buffer-live-p buf)
-        (kill-buffer buf)))))
-
-(ert-deftest seshat-reader-etaf-test--translate-origin-line-not-duplicated ()
-  "正文自带「来源：…」行时，面板里的「来源」仍只出现一次.
-gt 的正文在提取不到 `gt-result' 片段时会整体回退 `buffer-string'，其中含它
-自己插入的元信息，`seshat-reader-translate--clean-gt-text' 不过滤该行，故
-渲染前必须由 `seshat-reader-etaf--drop-origin-lines' 剔除；面板只保留结构化
-的一行 `seshat-reader-etaf--selection-origin'。"
-  (skip-unless (seshat-reader-etaf-test--fetch-etaf-module))
-  (skip-unless (seshat-reader-etaf-available-p))
-  (let* ((buf (get-buffer-create "*seshat-etaf-test-origin-dedupe*"))
-         (seshat-reader-select-last (list :page 112 :text "原文片段 ABC"))
-         (seshat-reader-etaf--translate-title (etaf-ref "Seshat 译文"))
-         (seshat-reader-etaf--translate-meta (etaf-ref nil))
-         (seshat-reader-etaf--translate-source (etaf-ref nil))
-         (seshat-reader-etaf--translate-body (etaf-ref ""))
-         (seshat-reader-etaf--translate-origin (etaf-ref nil))
-         (seshat-reader-etaf--translate-source-open (etaf-ref nil)))
-    (unwind-protect
-        (progn
-          (seshat-reader-etaf-render-translate
-           buf
-           :title "Seshat 译文"
-           :source "原文片段 ABC"
-           :body (concat "第一段译文内容。\n\n"
-                         "来源：第 112 页\n\n"
-                         "第二段译文内容。")
-           :engine 'google :langs '(en zh))
-          (let ((text (seshat-reader-etaf-test--buffer-text buf)))
-            ;; 关键不变量：结构化来源行只渲染一次，正文里的重复行被剔除
-            (should (= 1 (seshat-reader-etaf-test--count-matches "来源" text)))
-            (should (= 1 (seshat-reader-etaf-test--count-matches
-                          "来源：第 112 页" text)))
-            ;; 剔除的是「来源」整行，正文段落不受影响
-            (should (string-match-p "第一段译文内容" text))
-            (should (string-match-p "第二段译文内容" text))))
-      (when (buffer-live-p buf)
-        (kill-buffer buf)))))
-
 (ert-deftest seshat-reader-etaf-test--annotation-keys-registered ()
   "批注面板的 `:keys' 以 vector 形式登记，焦点在卡片时 `d' 解析为可执行命令."
   (skip-unless (seshat-reader-etaf-test--fetch-etaf-module))
@@ -529,12 +472,158 @@ gt 的正文在提取不到 `gt-result' 片段时会整体回退 `buffer-string'
       (when (buffer-live-p buf)
         (kill-buffer buf)))))
 
-(ert-deftest seshat-reader-etaf-test--sidebar-render-object-uses-hidden-gt-buffer ()
-  "`sidebar' 渲染对象在 ETAF 可用时指向隐藏中转 buffer，并带 `:then' 回调."
-  (skip-unless (require 'gt nil t))
-  (skip-unless (require 'gt-render-buffer nil t))
+;;; ⑨ 分页渲染（页码 ref、徽章、当页卡片、翻页键、跨页选中）
+
+(ert-deftest seshat-reader-etaf-test--render-annotations-stores-page ()
+  "`render-annotations' 把页码与总页数写入 ref；缺省时按第 1 页与全量条目数."
   (skip-unless (seshat-reader-etaf-test--fetch-etaf-module))
   (skip-unless (seshat-reader-etaf-available-p))
+  (let* ((items (seshat-reader-etaf-test--many-items 21))
+         (buf (get-buffer-create
+               (seshat-reader-etaf-test--reset-list-buffer)))
+         (seshat-reader-etaf--items (etaf-ref nil))
+         (seshat-reader-etaf--selected (etaf-ref nil))
+         (seshat-reader-etaf--page (etaf-ref nil))
+         (seshat-reader-etaf--page-count (etaf-ref nil))
+         (seshat-reader-annotation-page-size 20))
+    (unwind-protect
+        (progn
+          ;; 显式页码：首次 mount 分支
+          (seshat-reader-etaf-render-annotations buf items "doc-page" nil 2 2)
+          (should (= 2 (etaf-value seshat-reader-etaf--page)))
+          (should (= 2 (etaf-value seshat-reader-etaf--page-count)))
+          ;; 缺省参数：幂等（flush）分支，页号回 1，页数由 items 算出
+          (seshat-reader-etaf-render-annotations buf items "doc-page-default")
+          (should (= 1 (etaf-value seshat-reader-etaf--page)))
+          (should (= 2 (etaf-value seshat-reader-etaf--page-count))))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
+
+(ert-deftest seshat-reader-etaf-test--annotations-view-badge-multi-page ()
+  "多页时标题徽章显示「第 x/y 页」，单页时显示「N 条」且不出现「页」."
+  (skip-unless (seshat-reader-etaf-test--fetch-etaf-module))
+  (skip-unless (seshat-reader-etaf-available-p))
+  (let* ((items (seshat-reader-etaf-test--many-items 21))
+         (seshat-reader-etaf--items (etaf-ref items))
+         (seshat-reader-etaf--selected (etaf-ref nil))
+         (seshat-reader-etaf--doc-label (etaf-ref "doc-badge"))
+         (seshat-reader-etaf--page (etaf-ref 2))
+         (seshat-reader-etaf--page-count (etaf-ref 2))
+         (multi (seshat-reader-etaf-test--mount-annotations-view items)))
+    (unwind-protect
+        (let ((text (seshat-reader-etaf-test--buffer-text multi)))
+          (should (string-match-p "第 2/2 页" text))
+          ;; 多页时不显示条目总数
+          (should-not (string-match-p "21 条" text)))
+      (when (buffer-live-p multi)
+        (kill-buffer multi)))
+    ;; 单页：显示「N 条」且不出现「页」
+    (let* ((one-page (seshat-reader-etaf-test--many-items 3))
+           (seshat-reader-etaf--items (etaf-ref one-page))
+           (seshat-reader-etaf--selected (etaf-ref nil))
+           (seshat-reader-etaf--doc-label (etaf-ref "doc-badge-1"))
+           (seshat-reader-etaf--page (etaf-ref 1))
+           (seshat-reader-etaf--page-count (etaf-ref 1))
+           (single (seshat-reader-etaf-test--mount-annotations-view one-page)))
+      (unwind-protect
+          (let ((text (seshat-reader-etaf-test--buffer-text single)))
+            (should (string-match-p "3 条" text))
+            (should-not (string-match-p "页" text)))
+        (when (buffer-live-p single)
+          (kill-buffer single))))))
+
+(ert-deftest seshat-reader-etaf-test--annotations-view-renders-current-page ()
+  "卡片列表只渲染当页条目：第 2 页只含末条目，第 1 页只含首条目."
+  (skip-unless (seshat-reader-etaf-test--fetch-etaf-module))
+  (skip-unless (seshat-reader-etaf-available-p))
+  (let* ((items (seshat-reader-etaf-test--many-items 21))
+         (seshat-reader-etaf--items (etaf-ref items))
+         (seshat-reader-etaf--selected (etaf-ref nil))
+         (seshat-reader-etaf--doc-label (etaf-ref "doc-page-view"))
+         (seshat-reader-etaf--page (etaf-ref 2))
+         (seshat-reader-etaf--page-count (etaf-ref 2))
+         (seshat-reader-annotation-page-size 20)
+         (second (seshat-reader-etaf-test--mount-annotations-view items)))
+    (unwind-protect
+        (let ((text (seshat-reader-etaf-test--buffer-text second)))
+          (should (string-match-p "批注条目-21" text))
+          (should-not (string-match-p "批注条目-01" text))
+          (should-not (string-match-p "批注条目-20" text)))
+      (when (buffer-live-p second)
+        (kill-buffer second)))
+    (let* ((seshat-reader-etaf--items (etaf-ref items))
+           (seshat-reader-etaf--selected (etaf-ref nil))
+           (seshat-reader-etaf--doc-label (etaf-ref "doc-page-view-1"))
+           (seshat-reader-etaf--page (etaf-ref 1))
+           (seshat-reader-etaf--page-count (etaf-ref 2))
+           (seshat-reader-annotation-page-size 20)
+           (first (seshat-reader-etaf-test--mount-annotations-view items)))
+      (unwind-protect
+          (let ((text (seshat-reader-etaf-test--buffer-text first)))
+            (should (string-match-p "批注条目-01" text))
+            ;; 卡片列表容器固定 `(lh 12)' + `:overflow 'scroll'`，故第 1 页的
+            ;; 第 13–20 条被滚动窗口裁掉（页内仍可滚动），此处只断言分页边界：
+            ;; 第 21 条属第 2 页，绝不出现在第 1 页的面板文本里。
+            (should-not (string-match-p "批注条目-21" text)))
+        (when (buffer-live-p first)
+          (kill-buffer first))))))
+
+(ert-deftest seshat-reader-etaf-test--annotation-keys-bind-paging ()
+  "`--annotation-keys' 把 `]' / `[' 绑到下一页 / 上一页命令."
+  (skip-unless (seshat-reader-etaf-test--fetch-etaf-module))
+  (should (eq 'seshat-reader-annotation-list-next-page
+              (nth 1 (assoc "]" seshat-reader-etaf--annotation-keys))))
+  (should (eq 'seshat-reader-annotation-list-prev-page
+              (nth 1 (assoc "[" seshat-reader-etaf--annotation-keys)))))
+
+(ert-deftest seshat-reader-etaf-test--move-selection-crosses-page ()
+  "跨页 `n' 先切页再滚动：`--page' 跟随且选中项为第 21 条."
+  (skip-unless (seshat-reader-etaf-test--fetch-etaf-module))
+  (seshat-reader-etaf-test--reset-list-buffer)
+  (let* ((items (seshat-reader-etaf-test--many-items 21))
+         (seshat-reader-etaf--items (etaf-ref items))
+         (seshat-reader-etaf--selected (etaf-ref 20))
+         (seshat-reader-etaf--page (etaf-ref 1))
+         (seshat-reader-etaf--page-count (etaf-ref 2))
+         (seshat-reader-etaf--doc-id "doc-move")
+         (seshat-reader-annotation-page-size 20)
+         (calls nil)
+         (next nil))
+    ;; 桩替 `--set-list-page'：记录调用并手动回写 `--page' ref，避免真渲染
+    (cl-letf (((symbol-function 'seshat-reader-annotation--set-list-page)
+               (lambda (page)
+                 (push page calls)
+                 (setf (etaf-value seshat-reader-etaf--page) page))))
+      (setq next (seshat-reader-etaf--move-selection 1)))
+    (should (equal 21 next))
+    (should (equal 21 (etaf-value seshat-reader-etaf--selected)))
+    (should (equal '(2) calls))
+    (should (= 2 (etaf-value seshat-reader-etaf--page)))))
+
+(ert-deftest seshat-reader-etaf-test--move-selection-same-page-no-switch ()
+  "页内移动不触发翻页：`--set-list-page' 不被调用."
+  (skip-unless (seshat-reader-etaf-test--fetch-etaf-module))
+  (seshat-reader-etaf-test--reset-list-buffer)
+  (let* ((items (seshat-reader-etaf-test--many-items 21))
+         (seshat-reader-etaf--items (etaf-ref items))
+         (seshat-reader-etaf--selected (etaf-ref 1))
+         (seshat-reader-etaf--page (etaf-ref 1))
+         (seshat-reader-etaf--page-count (etaf-ref 2))
+         (seshat-reader-etaf--doc-id "doc-move-same")
+         (seshat-reader-annotation-page-size 20)
+         (calls nil))
+    (cl-letf (((symbol-function 'seshat-reader-annotation--set-list-page)
+               (lambda (page) (push page calls))))
+      (should (equal 2 (seshat-reader-etaf--move-selection 1))))
+    (should-not calls)
+    (should (= 1 (etaf-value seshat-reader-etaf--page)))))
+
+(ert-deftest seshat-reader-etaf-test--sidebar-render-object-uses-hidden-gt-buffer ()
+  "`sidebar' 渲染对象指向隐藏中转 buffer，并带 `:then' 回调.
+新实现不再依赖 ETAF 可用性（面板由 `seshat-reader-translate--render-panel'
+以 Markdown 文本 buffer 渲染），故此处不再 `skip-unless' ETAF。"
+  (skip-unless (require 'gt nil t))
+  (skip-unless (require 'gt-render-buffer nil t))
   (let* ((seshat-reader-sidebar-enabled t)
          (obj (seshat-reader-translate--render-object 'sidebar))
          (window-config (slot-value obj 'window-config)))

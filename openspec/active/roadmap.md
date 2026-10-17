@@ -120,6 +120,7 @@ M0–M6 已完成并归档，见 `openspec/completed/personal-notes-system.md`�
 | M11.7 | 阅读器信息面板（底部弹出，批注 / 译文 / 解释统一承载） | ✅ 完成（2026-10-17，含承载方式返工：底部弹出 + per-kind 高度）；见 openspec/completed/2026-10-16-m11.7-reader-sidebar.md |
 | M11.8 | 底部面板交互优化（光标跟随 · popper 开关 · 便捷键位） | 部分完成（2026-10-17）：光标跟随、popper 分流、面板内键位（由 M11.9 的 `:keys` 承担）已完成；**T6 全局 `SPC o P` 入口待办**；见 openspec/completed/2026-10-17-m11.8-sidebar-ux.md |
 | M11.9 | 面板 ETAF 渲染层（批注卡片化 + 译文排版，可选软依赖） | ✅ 完成（2026-10-17）；ETAF PoC 判可行（加载 0.09s / 首渲染 0.002s / 零 warning / 无 native 依赖）；见 openspec/completed/2026-10-17-m11.9-etaf-render.md |
+| M11.10 | 阅读器面板渲染重构：译文/解释改 Markdown 文本 buffer + 批注分页 | ✅ 完成（2026-10-18）；见 openspec/active/2026-10-18-reader-panel-markdown-and-paging.md |
 
 ## 风险登记
 

@@ -117,3 +117,11 @@
 **理由**：译文/解释与批注统一进同一面板，阅读区不被抢占；posframe 会抢焦点并在超时后自动消失（`gt-posframe-pop-render-timeout` 是全局 90s），阅读场景需要可停留、可回看的文本。
 
 **代价**：**破坏性变更**——升级后译文弹窗行为改变；用户若偏好 posframe 需显式设回 `pop`。且底部单窗口下译文会接管、顶掉批注列表（已确认为设计行为；若要同屏需另立 section 统一渲染方案）。
+
+## 2026-10-18 · 阅读器译文/解释改用面板内 Markdown 文本 buffer（ETAF 只保留批注卡片）
+
+**决策**：译文/解释的呈现由「ETAF 组件树排版」改为**面板内只读 Markdown 文本 buffer**——gt 只把纯文本渲染到隐藏中转 buffer（` *Seshat gt*`，`:window-config` = `(display-buffer-no-window)` + `allow-no-window`），由 `:then` 回调取文本写入展示 buffer（`seshat-reader-sidebar-translate-buffer-name`），以 `gfm-view-mode` → `markdown-view-mode` → `text-mode` 降级链设视图（`truncate-lines`=nil + 显式 `word-wrap`=t、`header-line` 区分译文/解释）；面板键位 `q` / `C-c C-s` 改由 minor mode `seshat-reader-translate-panel-mode` 承载。**ETAF 渲染层收敛为只渲染批注卡片列表**（含分页），`seshat-reader-etaf-render-translate` 及其译文组件树删除。
+
+**理由**：① ETAF 画布 viewport 固定，长译文被裁剪、无法原生滚动到全文；② 画布内容**不可选中复制**（阅读场景的核心诉求——摘录译文/搜索结果二次利用）；③ CJK 在 ETAF 中的 2 列宽度测量存在风险，长段落折行不可靠；④ Markdown 交给 `gfm-view-mode` 渲染可获得原生折行、滚动、复制、isearch，且无需在渲染层重复实现排版。**2026-10-18 用户确认。**
+
+**代价**：① markdown-mode 成为软依赖（缺失时降级 `text-mode`，不折行美化、不隐藏标记）；② 面板内无法用 ETAF 的 `:keys` 统一承载译文键位，改由 minor mode 承载；③ ETAF 的译文排版代码（约 240 行）删除，`seshat-reader-etaf.el` 由 929 行降至 690 行。
