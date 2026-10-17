@@ -109,14 +109,17 @@ M0–M6 已完成并归档，见 `openspec/completed/personal-notes-system.md`�
 
 | 子项 | 内容 | 备注 |
 |---|---|---|
-| M11.1 | emacs-reader 文本提取（C 模块扩展） | ✅ PoC 通过（2026-10-12）；见 notes/openspec/active/2026-10-12-m11.1-emacs-reader-text-poc.md |
+| M11.1 | emacs-reader 文本提取（C 模块扩展） | ✅ PoC 通过（2026-10-12）；见 notes/openspec/completed/2026-10-12-m11.1-emacs-reader-text-poc.md |
 | M11.2a | vendor reader 源码，建 seshat-reader 包 | ✅ vendor 与验证完成（2026-10-12），配置切换已完成（2026-10-12）；见 notes/openspec/completed/2026-10-12-seshat-reader-vendor.md |
 | M11.2b | 阅读器鼠标选区取文（Phase 1） | ✅ 完成（2026-10-12）；见 notes/openspec/completed/2026-10-12-m11.2b-reader-selection.md |
 | M11.2c | seshat-reader 包彻底自研化改名（feature/符号/文件名/C 模块名统一 seshat-reader-*） | ✅ 完成（2026-10-12）；见 notes/openspec/completed/2026-10-12-m11.2c-seshat-reader-rename.md |
 | M11.3 | Emacs 侧批注采集 + 侧车同步 | ✅ 完成（2026-10-16；L3 端到端待服务端可用时补验）；见 openspec/completed/2026-10-16-m11.3-reader-annotations.md |
-| M11.4 | 双向引用（笔记 ↔ 批注/书籍） | |
+| M11.4 | 双向引用（笔记 ↔ 批注/书籍） | ✅ 完成（2026-10-17）；见 openspec/completed/2026-10-16-m11.4-cross-references.md |
 | M11.5 | 阅读器翻译/解释（go-translate + posframe） | ✅ 完成（2026-10-16）；见 openspec/completed/2026-10-16-m11.5-reader-translate.md |
 | M11.6 | 批注离线优先 + 自动同步（本地队列、幂等去重、自动推进） | ✅ 完成（2026-10-16）；见 openspec/completed/2026-10-16-m11.6-annotation-offline.md |
+| M11.7 | 阅读器信息面板（底部弹出，批注 / 译文 / 解释统一承载） | ✅ 完成（2026-10-17，含承载方式返工：底部弹出 + per-kind 高度）；见 openspec/completed/2026-10-16-m11.7-reader-sidebar.md |
+| M11.8 | 底部面板交互优化（光标跟随 · popper 开关 · 便捷键位） | 部分完成（2026-10-17）：光标跟随、popper 分流、面板内键位（由 M11.9 的 `:keys` 承担）已完成；**T6 全局 `SPC o P` 入口待办**；见 openspec/completed/2026-10-17-m11.8-sidebar-ux.md |
+| M11.9 | 面板 ETAF 渲染层（批注卡片化 + 译文排版，可选软依赖） | ✅ 完成（2026-10-17）；ETAF PoC 判可行（加载 0.09s / 首渲染 0.002s / 零 warning / 无 native 依赖）；见 openspec/completed/2026-10-17-m11.9-etaf-render.md |
 
 ## 风险登记
 
@@ -134,6 +137,7 @@ M0–M6 已完成并归档，见 `openspec/completed/personal-notes-system.md`�
 2. GTD 深度（只读 / 可编辑 / repeater·DEADLINE·状态流转）—— M9.4 需要
 3. Reader「基础功能」清单（排除 TTS/词典/统计？）—— M10 需要
 4. EPUB 的 location 约定（CFI vs `chapter:x`）—— M10.3 需要
+5. M11.8 T6（`SPC o P` 全局键位）未做，属 UX 待办（见 tech-debt）
 
 ## 文档清单
 

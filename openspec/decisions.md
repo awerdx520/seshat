@@ -85,3 +85,35 @@
 **理由**：阅读/记录场景常在网络不稳或服务未启动时发生，网络状态不应决定用户能否做批注；「先记录、后同步」是离线优先的基本要求。用户明确要求「服务不可用时用本地缓存，不要报服务不可用」。
 
 **代价**：① 本地队列是 Emacs 侧的额外状态，需处理文件损坏（保留原文件不覆盖）与上限（默认 1000 条）；② 无服务端 `client_uuid`，去重依赖 `(location, text)` 内容比对，对「同位置同文本的有意重复」不敏感；③ 阅读进度仍未纳入离线（另议）；④ 队列与同步逻辑增加了客户端复杂度。
+
+## 2026-10-17 · `seshat:` 链接协议（笔记 ↔ 书籍/批注）
+
+**决策**：定义 org 链接协议 `seshat:<doc-id>#<location>`（`#<location>` 可省略）。`doc-id` 即批注的 `document_id`（`<书库标签>:<相对路径>`），`location` 与批注 `location` 同源同构（`page:<n>;rect:…`），不新增解析器；解析时取**最后一个** `#`（`string-match "#\\([^#]*\\)\\'"`）。注册 `:follow`（打开书籍并跳页，用 `find-buffer-visiting` 复用已有 reader buffer）与 `:store`（集成 `org-store-link`），**不做百分号转义**。
+
+**理由**：① location 与批注同构，解析/生成两端共用一套约定，无需第二套解析器；② 转义不可行——`url-hexify-string` 会转义 `:`/`/`（破坏 doc-id 结构），org 又会对 `%` 二次转义，双重转义不自洽；③ 因此把不变量前移到生成端：`doc-id` 含 `#`/`%` 时 `user-error` 并提示重命名文件，解析端只需「最后一个 `#` 分割」这一简单规则。
+
+**代价 / 迁移点**：① 含 `#`/`%` 的文档名无法生成引用（记 tech-debt）；② 链接以 **doc-id 文本**承载身份，电子书改名/移动会使既有链接失锚——M7 引入 uid 后只需替换两处：`seshat-reader-annotation--doc-id`（正向）与 `seshat-reader-reference--file-from-doc-id`（反向），解析层可加 uid 形式回退分支；③ 反向解析按 tag 精确匹配，同 tag 多根时只取第一个（tag 需唯一）。
+
+## 2026-10-17 · 阅读器面板：承载层与 popper 分工
+
+**决策**：阅读器信息面板采用 **pop 式底部弹出**（`display-buffer-below-selected` / `display-buffer-at-bottom`，由 `seshat-reader-sidebar-position` 切换），**单窗口 + per-kind 高度记忆**（批注与译文各自恢复高度，会话内 alist）；面板显示必须经 `display-buffer`（幂等），并用 `display-buffer-overriding-action` 保证本包布局优先于 `display-buffer-alist` 中的 popper 规则；popper 只负责**登记与开关**（`seshat-reader-sidebar-buffer-p` / `seshat-reader-sidebar-display-buffer` 分流），布局仍由本包掌控；用 `post-command-select-window` 实现光标跟随（`seshat-reader-sidebar-select-window` 可关）。
+
+**理由**：① 侧窗（side window）与 posframe 分别带来布局抢占与焦点/自动消失问题，pop 式底部窗口行为最接近用户预期的 `*Help*`；② `window-toggle-side-windows` 是 **frame 级**全量开关，会连带删除/恢复 eca-chat 与 which-key 的侧窗，故**禁用**，本包只做本包面板窗口的 `delete-window`；③ 首次显示走 overriding-action、popper 重开走 display-function 分流，二者落到同一布局，保证「开关前后布局不变」这一不变量。
+
+**代价**：① 底部单窗口下批注与译文互斥（后显示者接管）；② `window-height` 只对新建窗口生效，改高度对已显示面板不自动重排；③ popper 名单是硬编码正则，改 `seshat-reader-sidebar-translate-buffer-name` 后 popper 不再登记该面板；④ popper 的 `popper--delete-popup` 走 `quit-window`，不调本包 `--capture-state`，popper 关闭前的 resize 不会被记住（best-effort）。
+
+## 2026-10-17 · ETAF 作为可选渲染层（软依赖）
+
+**决策**：面板内容可选由 **ETAF** 渲染（`seshat-reader-etaf.el`），但 ETAF **四仓库不入 notes 仓库**——只 clone 到 `~/WorkSpace/emacs-taf/`，由用户配置侧 `load-path`（四仓库根 + 各自 `lisp/`）加载。模块内是**硬 `(require 'etaf-ui)`**，所有调用点用 `ignore-errors` 按需加载（`NOERROR` 只吞「找不到文件」）；降级四态（未安装 / 半损坏 / 渲染抛错 / 开关关闭）一律回退纯文本渲染，面板不空白、功能不中断。样式**不用** `etaf-ui` 的 label/badge/tag/divider，改用按 `background-mode` 取值的**内置双色板** + 普通 `text`（样式放父 Host），仅按钮用 `etaf-button`。
+
+**理由**：① PoC 判定可行（零 warning 编译、加载 0.09s、首渲染 0.002s、无 native 依赖、+6.7MB），性能与兼容性风险可控；② 依赖不入库可让仓库零新增依赖文件、未安装者零影响；③ `etaf-label`/`etaf-badge` 的文字色/底色写死（`#252A2E`/`#FFFDF8`）且**覆盖父 Host 的 `:color`**，暗色主题（如 `doom-vibrant`）下不可读，故弃用其排版组件。
+
+**代价**：① ETAF 0.x API 可能变动，需跟随上游；② pty/终端 frame 下 `etaf-mount` 会挂起（GUI frame 正常），终端用户可能不可用；③ 配色只用内置双色板、不跟随具体主题变量，换主题后需重新渲染面板；④ 依赖 ETAF 的加载顺序（evil 先启用再 mount 才能让 `:keys` 优先）。
+
+## 2026-10-17 · `seshat-reader-translate-render` 默认改为 `sidebar`
+
+**决策**：`seshat-reader-translate-render` 的默认值由 `pop` 改为 `sidebar`——译文/解释默认写入底部面板，而非 posframe。`pop`（posframe）/`pin` 保留，可随时切回；`seshat-reader-sidebar-enabled` 为 `nil` 时 `sidebar` 自动退回 posframe 行为。
+
+**理由**：译文/解释与批注统一进同一面板，阅读区不被抢占；posframe 会抢焦点并在超时后自动消失（`gt-posframe-pop-render-timeout` 是全局 90s），阅读场景需要可停留、可回看的文本。
+
+**代价**：**破坏性变更**——升级后译文弹窗行为改变；用户若偏好 posframe 需显式设回 `pop`。且底部单窗口下译文会接管、顶掉批注列表（已确认为设计行为；若要同屏需另立 section 统一渲染方案）。

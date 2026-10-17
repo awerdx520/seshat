@@ -60,6 +60,10 @@
 (require 'url-util)
 (require 'seshat-rest)
 (require 'seshat-reader)
+;; 信息面板承载体（`seshat-reader-sidebar'）为**零依赖**模块（只操作 buffer
+;; 与 window，不 require 任何本项目模块），因此在此 require 它不会与
+;; annotation 形成循环 require。
+(require 'seshat-reader-sidebar)
 
 ;; 离线队列模块（`seshat-reader-annotation-queue'）在加载时会
 ;; `(require 'seshat-reader-annotation)'，因此本文件**不得**在顶部 require
@@ -70,6 +74,17 @@
 (declare-function seshat-reader-annotation-queue-count "seshat-reader-annotation-queue")
 (declare-function seshat-reader-annotation-queue-entries "seshat-reader-annotation-queue")
 (declare-function seshat-reader-annotation-queue-sync "seshat-reader-annotation-queue")
+
+;; ETAF 渲染层是**软依赖**：本文件不在顶部 require 它（未安装 ETAF 时列表中
+;; 的批注仍需可用），渲染入口在 `seshat-reader-annotation--render-list-etaf'
+;; 内按需 `(require 'seshat-reader-etaf nil t)'。此处声明公开符号以避免字节
+;; 编译告警。
+(declare-function seshat-reader-etaf-available-p "seshat-reader-etaf" ())
+(declare-function seshat-reader-etaf-render-annotations "seshat-reader-etaf"
+                  (buffer items doc-id &optional source))
+;; ETAF 已挂载判定用（`seshat-reader-annotation--etaf-mounted-p'）；同样只在
+;; ETAF 已加载时才会被调用。
+(declare-function etaf-runtime-for-buffer "etaf-runtime" (buffer-or-name))
 
 (defvar seshat-reader-select-last nil
   "最近一次鼠标选区，正式定义与完整语义见 `seshat-reader-select'.
@@ -294,8 +309,8 @@ TEXT 中的换行、回车与制表符被替换为空格；TEXT 为 nil 时返�
   "把一条批注 ANNOTATION 插入当前缓冲区的一行.
 ANNOTATION 为服务端返回的 alist，含 `id'、`location'、`text' 等字段。
 该行以 **1-based** 页码开头（无法解析时显示 \"?\" 并在行尾标注），后接
-正文摘要；整行携带 `seshat-reader-annotation-id' 与
-`seshat-reader-annotation-page' 两个文本属性，供 `RET' 与 `d' 使用。
+正文摘要；整行携带 `seshat-reader-annotation-id'、`seshat-reader-annotation-page'
+与 `seshat-reader-annotation-location' 三个文本属性，供 `RET' 与 `d' 使用。
 
 QUEUED-UUID 非 nil 时表示该条来自本地离线队列、尚未同步到服务端：行尾
 追加 \"[待同步]\" 标记，且该行携带值为 QUEUED-UUID 的
@@ -317,7 +332,8 @@ QUEUED-UUID 非 nil 时表示该条来自本地离线队列、尚未同步到服
     (add-text-properties start (point)
                          (list 'seshat-reader-annotation-id id
                                'seshat-reader-annotation-page page
-                               'seshat-reader-annotation-queue-uuid queued-uuid))))
+                               'seshat-reader-annotation-queue-uuid queued-uuid
+                               'seshat-reader-annotation-location location))))
 
 (defun seshat-reader-annotation--fetch (document-id)
   "拉取 DOCUMENT-ID 的批注列表，失败时提示并返回失败哨兵.
@@ -344,6 +360,76 @@ QUEUED-UUID 非 nil 时表示该条来自本地离线队列、尚未同步到服
               (error-message-string err))
      seshat-reader-annotation--fetch-error)))
 
+;;; ETAF 渲染层接入
+
+(defun seshat-reader-annotation--etaf-p ()
+  "判断 ETAF 渲染层当前是否可用.
+判据是渲染层模块已加载（`seshat-reader-etaf-available-p' 已定义）且该函数
+返回非 nil（总开关打开并且 `etaf-ui' 加载成功）。渲染层是本包的**软依赖**：
+本文件不在顶部 require 它，因此未安装 ETAF 时本函数返回 nil，列表走既有
+纯文本渲染。"
+  (and (fboundp 'seshat-reader-etaf-available-p)
+       (seshat-reader-etaf-available-p)))
+
+(defun seshat-reader-annotation--etaf-items (annotations queued)
+  "把 ANNOTATIONS 与 QUEUED 合成为 ETAF 渲染层使用的 plist 列表.
+ANNOTATIONS 为服务端返回的批注 alist 列表，QUEUED 为本地离线队列中待同步
+的 create 条目 plist 列表。每个元素形如
+`(:id ID :uuid UUID :location LOCATION :page PAGE :text TEXT :dirty DIRTY)'：
+
+- 服务端项取 `:id'（`:uuid' 为 nil，`:dirty' 为 nil），页码由
+  `seshat-reader-annotation--page-from-location' 从 `:location' 解析；
+- 本地待同步项取队列条目的 `:uuid'（`:id' 为 nil，`:dirty' 为 t）。
+
+顺序与 `seshat-reader-annotation--render-list' 的文本渲染一致：**服务端项
+在前、本地待同步项在后**。"
+  (append
+   (mapcar (lambda (annotation)
+             (let ((location (alist-get 'location annotation)))
+               (list :id (alist-get 'id annotation)
+                     :uuid nil
+                     :location location
+                     :page (seshat-reader-annotation--page-from-location location)
+                     :text (alist-get 'text annotation)
+                     :dirty nil)))
+           annotations)
+   (mapcar (lambda (entry)
+             (let ((location (plist-get entry :location)))
+               (list :id nil
+                     :uuid (plist-get entry :uuid)
+                     :location location
+                     :page (seshat-reader-annotation--page-from-location location)
+                     :text (plist-get entry :text)
+                     :dirty t)))
+           queued)))
+
+(defun seshat-reader-annotation--render-list-etaf (items document-id source)
+  "用 ETAF 渲染层把 ITEMS 渲染到当前缓冲区；成功返回 t，否则返回 nil.
+ITEMS 是 `seshat-reader-annotation--etaf-items' 的返回值；DOCUMENT-ID 与
+SOURCE 随渲染一并交给渲染层，供其动作命令（跳页 / 删除 / 引用）复用。
+
+渲染层未安装或加载失败时返回 nil，由调用方回退纯文本渲染。渲染**抛错**时
+`message' 一条警告后同样返回 nil——面板不得因为渲染失败而空白。"
+  (condition-case err
+      (if (require 'seshat-reader-etaf nil t)
+          (progn
+            (seshat-reader-etaf-render-annotations
+             (current-buffer) items document-id source)
+            t)
+        nil)
+    (error
+     (message "Seshat Reader annotation: ETAF 渲染失败，回退文本渲染：%s"
+              (error-message-string err))
+     nil)))
+
+(defun seshat-reader-annotation--etaf-mounted-p ()
+  "判断当前缓冲区是否已挂载 ETAF runtime.
+`seshat-reader-annotation--render-list' 据此决定是否可以先 `erase-buffer'：
+ETAF 的 runtime 依赖缓冲区既有文本做增量刷新，清空后再 flush 会报错。
+ETAF 渲染层未加载（或尚未挂载）时返回 nil，调用方按文本渲染处理。"
+  (and (fboundp 'etaf-runtime-for-buffer)
+       (and (etaf-runtime-for-buffer (current-buffer)) t)))
+
 (defun seshat-reader-annotation--render-list (document-id source annotations
                                                          &optional queued)
   "在 `*Seshat Annotations*' 中渲染批注列表.
@@ -358,27 +444,48 @@ ANNOTATIONS 为服务端返回的批注列表，先逐条渲染；QUEUED 为本�
 \"[待同步]\" 标记渲染，并携带各自的 `seshat-reader-annotation-queue-uuid'
 属性。因此列表中**服务端项在前、本地待同步项在后**。
 
-ANNOTATIONS 与 QUEUED 都为空时渲染一行明确提示。"
+ANNOTATIONS 与 QUEUED 都为空时渲染一行明确提示。
+
+**ETAF 分流**：`seshat-reader-annotation--etaf-p' 为真时先用 ETAF 渲染层
+（`seshat-reader-etaf-render-annotations'）渲染卡片列表；渲染层不可用、
+加载失败或渲染抛错时回退下面的纯文本渲染（见
+`seshat-reader-annotation--render-list-etaf'）。两条路径都由
+`seshat-reader-sidebar-show' 以 `annotations' 类型统一显示，故面板位置、
+高度与 per-kind 记忆不变。"
   (with-current-buffer (get-buffer-create seshat-reader-annotation-list-buffer-name)
-    (let ((inhibit-read-only t))
-      (erase-buffer)
+    (let ((inhibit-read-only t)
+          (etaf-mounted (seshat-reader-annotation--etaf-mounted-p)))
+      ;; ETAF 已挂载时**不得** `erase-buffer'：ETAF runtime 的节点位置依赖
+      ;; 缓冲区既有文本，清空后 `etaf-runtime-flush' 会报「Args out of range」
+      ;; 从而整块回退文本渲染（刷新后面板降级）。增量刷新由渲染层自己 flush。
+      (unless etaf-mounted
+        (erase-buffer))
       ;; 仅首次进入时调用派生 mode，避免每次刷新重复触发 mode hook。
       (unless (derived-mode-p 'seshat-reader-annotation-list-mode)
         (seshat-reader-annotation-list-mode))
       (setq-local seshat-reader-annotation-list-document-id document-id)
       (setq-local seshat-reader-annotation-list-source source)
       (setq-local seshat-reader-annotation-list-entries annotations)
-      (if (and (null annotations) (null queued))
-          (insert "（该文档没有批注）\n")
-        (dolist (annotation annotations)
-          (seshat-reader-annotation--insert-entry annotation))
-        (dolist (entry queued)
-          (seshat-reader-annotation--insert-entry
-           (list (cons 'location (plist-get entry :location))
-                 (cons 'text (plist-get entry :text)))
-           (plist-get entry :uuid))))
+      (unless (and (seshat-reader-annotation--etaf-p)
+                   (seshat-reader-annotation--render-list-etaf
+                    (seshat-reader-annotation--etaf-items annotations queued)
+                    document-id source))
+        ;; 回退路径：渲染层可能已写入部分文本，故先清空再走文本渲染。
+        (erase-buffer)
+        (if (and (null annotations) (null queued))
+            (insert "（该文档没有批注）\n")
+          (dolist (annotation annotations)
+            (seshat-reader-annotation--insert-entry annotation))
+          (dolist (entry queued)
+            (seshat-reader-annotation--insert-entry
+             (list (cons 'location (plist-get entry :location))
+                   (cons 'text (plist-get entry :text)))
+             (plist-get entry :uuid)))))
       (goto-char (point-min)))
-    (pop-to-buffer (current-buffer))))
+    ;; 列表缓冲区在 `*Seshat Annotations*' 中渲染完毕后，经信息面板统一入口
+    ;; 显示（启用面板时投到底部弹出窗口，禁用时 `show' 内部退回
+    ;; `pop-to-buffer'）。此处 `(current-buffer)' 即列表缓冲区本身。
+    (seshat-reader-sidebar-show (current-buffer) 'annotations t)))
 
 (defun seshat-reader-annotation--refresh-list (document-id &optional source)
   "按 DOCUMENT-ID 重新拉取批注并刷新列表缓冲区.

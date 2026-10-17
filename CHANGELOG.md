@@ -15,6 +15,9 @@
 - 新增阅读器翻译/解释（M11.5）：新模块 `emacs/seshat-reader/seshat-reader-translate.el`——`C-c C-t` 翻译鼠标选区、`C-c C-e` 做 LLM 解释（译文/结果均经 posframe 弹出），`M-x seshat-reader-translate-save-as-annotation` 把最近一次结果存为服务端批注（复用 M11.3 链路）；翻译/解释复用本地 **go-translate（gt）**（翻译预设 `reader` = youdao-dict + google、解释预设 `reader-explain` = `gt-chatgpt-engine`，可指向任意 OpenAI 兼容端点）与 posframe，**不经过服务端 LLM 层**（服务端尚未暴露客户端 HTTP 接口）。新增 ERT 测试 `emacs/tests/seshat-reader-translate-test.el`（20 用例，全绿）。thomas-emacs 侧新增 `reader` / `reader-explain` 两个 gt 预设（位于用户配置，非本仓库）。
 - 新增提交前密钥防护：`.pre-commit-config.yaml` 内置 `gitleaks`（暂存区内容扫描）与 `no-secret-files`（keystore / env / 私钥文件名黑名单，拦截 `.gitignore` 忽略文件被 `git add -f` 强制添加）两个本地钩子；根 `.gitignore` 补 `*.keystore`/`*.jks`/`*.p12`/`*.pfx`；安装与边界说明见 `docs/security.md` §6。
 - 新增批注离线优先与自动同步（M11.6）：新模块 `emacs/seshat-reader/seshat-reader-annotation-queue.el`——服务端不可用时批注的创建/删除写入本地队列（`~/.local/share/seshat/annotation-queue.eld`，原子写），恢复后自动推进同步（启动后延迟首次 + 周期 + 手动 + 机会性）；`emacs/seshat-reader/seshat-reader-annotation.el` 三接入点改造（离线入队、列表合并展示本地项并标 `[待同步]`、按 uuid 取消本地待同步项）；同步侧幂等（create 比对已有 `(location, text)` 去重、delete 的 404 视为成功）。新增 ERT 测试 `emacs/tests/seshat-reader-annotation-queue-test.el`（23 用例，全绿）。**服务端零改动。**
+- 新增阅读器双向引用（M11.4）：新模块 `emacs/seshat-reader/seshat-reader-reference.el`——注册 `seshat:` org 链接协议（`:follow` 打开书籍并跳页、`:store` 集成 `org-store-link`，链接格式 `seshat:<doc-id>#<location>`）；阅读器内 `C-c C-r` 把鼠标选区摘录插入笔记文件，批注列表 buffer 内 `C-c C-r` 插入该条批注的引用（服务端项与本地待同步项均支持，取值不触网）。**服务端零改动**，vendored 文件零改动（对 `annotation.el` 仅新增一处文本属性）。新增 ERT 测试 `emacs/tests/seshat-reader-reference-test.el`（29 用例，全绿）。
+- 新增阅读器底部信息面板（M11.7）：新模块 `emacs/seshat-reader/seshat-reader-sidebar.el`——pop 式底部弹出面板（`seshat-reader-sidebar-position` 可配 `below-selected`/`at-bottom`），单窗口 + per-kind 高度记忆（切换批注/译文各自恢复高度），`post-command-select-window` 实现光标跟随（`seshat-reader-sidebar-select-window` 可关），并提供 popper 分流显示函数（`seshat-reader-sidebar-buffer-p` / `seshat-reader-sidebar-display-buffer`）；批注列表与译文/解释统一投递到该面板，不再抢占阅读窗口、不再自动消失。新增 ERT 测试 `emacs/tests/seshat-reader-sidebar-test.el`（18 用例，全绿）。
+- 新增 ETAF 渲染层（M11.9，可选）：新模块 `emacs/seshat-reader/seshat-reader-etaf.el`——批注卡片化（页码徽章、`[待同步]` 标记、选中高亮、单行截断摘要）与译文排版（可折叠原文、分段正文、存为批注按钮），交互走 ETAF `:keys`（`RET`/`d`/`C-c C-r`/`q`）；配色用内置双色板随 `background-mode` 明暗自适应；ETAF 不可用或被关闭时自动回退纯文本渲染，功能不受影响。新增 ERT 测试 `emacs/tests/seshat-reader-etaf-test.el`（16 用例，全绿）。
 
 ### 变更
 
@@ -24,6 +27,14 @@
 
 - Android 端构建源切换为国内镜像：`android/settings.gradle.kts` 的插件与依赖仓库改为阿里云镜像优先（官方源保留兜底），`gradle/wrapper/gradle-wrapper.properties` 的 Gradle 分发包仍为官方源（`services.gradle.org`），仅版本 `8.11 → 8.14.5`；AGP `8.5.2 → 8.13.2`；依赖版本与构建语义不变，已验证依赖解析无国外源请求、`assembleDebug` 构建通过。
 - M11.5 收尾修复：`reader-explain` 改用解释 prompt（不再误用翻译模板）、`gt-posframe-pop-render-timeout` 由 30s 调至 90s（展示时长与引擎请求超时对齐；注意 `gt-posframe-pop-render-timeout` 为**全局**变量，调至 90 秒后影响所有 gt posframe（word/sentence/paragraph/reader 等），不只是阅读器解释）、用户配置 `gt-htt-proxy` 拼写修正为 `gt-http-proxy`。
+- **破坏性**：`seshat-reader-translate-render` 默认值由 `pop` 改为 `sidebar`——译文/解释默认渲染到底部面板（`seshat-reader-sidebar`）而非 posframe，避免 posframe 抢焦点与自动消失；可用 defcustom 切回 `pop`（posframe）/`pin`，或设 `seshat-reader-sidebar-enabled` 为 `nil` 退回旧行为。
+- `emacs/seshat-reader/Makefile`：新增可选 ETAF 依赖探测（`ETAF_ROOT ?= $(HOME)/WorkSpace/emacs-taf`），存在时把四仓库根与各自 `lisp/` 加入 `-L`；不存在时从编译与 checkdoc 列表中剔除 `seshat-reader-etaf.el`（`etaf-view` 为宏，编译期必须有 etaf-ui）。
+- `emacs/seshat-reader/` 包内新增 3 个自研扩展模块（`seshat-reader-reference.el` / `seshat-reader-sidebar.el` / `seshat-reader-etaf.el`），`VENDORED.md` 自研扩展表同步。
+
+### 修复
+
+- 批注列表在 ETAF 已挂载时不再 `erase-buffer`（改为交给渲染层增量刷新）：此前任何刷新路径（含 uuid 删除）都会触发 `etaf-runtime-flush` 报 `Args out of range: 20, 20`，并整块降级为纯文本渲染。
+- 译文面板「来源：第 x 页」重复：正文管线渲染前剔除所有以 `来源：` 开头的行（gt 提取失败时会回退整个 buffer-string，把头部行与正文一起带出）；原文展开区不过滤，保持忠实摘录。
 
 ## [0.2.0] - 2026-10-12
 

@@ -81,7 +81,7 @@ Emacs 端通过 `seshat-reader-annotation` 采集 PDF 页面选区并同步为�
 | `seshat-reader-translate-preset` | `reader` | 「翻译」使用的 gt 预设名（阅读器按名从 `gt-preset-translators` 取用） |
 | `seshat-reader-translate-explain-preset` | `reader-explain` | 「解释」使用的 gt 预设名（通常指向 `gt-chatgpt-engine`） |
 | `seshat-reader-translate-fallback-langs` | `(en zh)` | 语言回退：源语言取本列表首项，目标语言由此推导（可由命令前缀参数覆盖） |
-| `seshat-reader-translate-render` | `pop` | posframe 呈现方式：`pop`（弹出，超时自动消失）或 `pin`（固定停留） |
+| `seshat-reader-translate-render` | `sidebar` | 译文呈现方式：`sidebar`（底部弹出面板，M11.7 起的默认值）、`pop`（posframe 弹出，超时自动消失）或 `pin`（posframe 固定停留）。取 `sidebar` 但 `seshat-reader-sidebar-enabled` 为 nil 时退回 `pop` 式 posframe |
 
 说明：
 
@@ -107,6 +107,80 @@ Emacs 端通过 `seshat-reader-annotation` 采集 PDF 页面选区并同步为�
 - 服务端不可用时，批注/删除操作写入本地队列（**不报「服务不可用」**）；用户得到的是「已存入本地，待联网同步」。批注**列表**在离线时仍显示本地待同步项并标 `[待同步]`。
 - 服务恢复后，同步由以下时机推进：**启动后 `initial-delay`（默认 10 秒）首次 + 每 `sync-interval`（默认 300 秒）周期 + 手动 `M-x seshat-reader-annotation-queue-sync` + `list`/`create` 成功后的机会性同步**。
 - 队列文件为 elisp 数据（`prin1` 写出的 plist 列表），采用**原子写**：先把内容写入同目录唯一临时文件，再 `rename-file` 原子覆盖目标文件，避免写入中途崩溃留下损坏内容；读取到损坏文件时保留原文件不覆盖并报错。
+
+### 阅读器面板（M11.7–M11.9）
+
+> 与批注侧车同属**客户端侧**配置（由 `seshat-reader-sidebar` 承载层读取，该模块零依赖、不渲染内容），与服务端无关。批注列表与译文/解释统一显示在底部弹出面板中。
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `seshat-reader-sidebar-enabled` | `t` | 是否用面板展示批注列表与译文/解释；`nil` 时批注列表退回 `pop-to-buffer`，译文按 `seshat-reader-translate-render` 处理（取 `sidebar` 时退回 `pop` 式 posframe） |
+| `seshat-reader-sidebar-position` | `below-selected` | 面板弹出位置：`below-selected`（当前窗口下方分割，形如 `*Help*`）或 `at-bottom`（frame 底部整宽） |
+| `seshat-reader-sidebar-height` | `0.35` | 面板高度，作为 `display-buffer` 的 `window-height`（按比例）；仅对**新建**面板窗口生效，改动对已显示窗口不自动重排 |
+| `seshat-reader-sidebar-select-window` | `t` | 面板显示后是否在**命令结束时**把光标移入面板（`display-buffer` 的 `post-command-select-window`）；`nil` 时光标留在原窗口 |
+| `seshat-reader-sidebar-translate-buffer-name` | `"*Seshat Sidebar*"` | 译文/解释面板的 buffer 名，同时作为 `gt-buffer-render` 的 `:name` 与结果捕获时的 buffer 名判别依据 |
+
+说明：
+
+- **底部弹出、单窗口**：批注列表与译文共用同一个底部窗口，**后显示者接管**（这是 pop 式面板的既有语义，非缺陷）；需要两者同屏需另立方案。
+- **per-kind 高度记忆（仅会话内）**：同一时刻只有一个面板窗口，但 `annotations` 与 `translate` **各自记住自己的高度**——切换内容前先把当前窗口的实际高度（比例）记给它的类型，再用目标类型记住的高度新建窗口；同一类型重复显示走 `display-buffer` 复用，不重建、也不重置用户手动调整过的窗口高度。某类型首次显示时使用 `seshat-reader-sidebar-height`。状态保存在内存 alist 中，**重启 Emacs 后回到默认值**。
+- **关闭**：面板是非固定窗口，`q` 可关闭；`seshat-reader-sidebar-toggle` 可开合（关闭本包面板窗口，打开时按最近一次的内容类型重开）。toggle **不使用** `window-toggle-side-windows`——它是 frame 级全量开关，会连带删除/恢复 eca-chat、which-key 的侧窗。
+- **popper 集成**：`*Seshat Annotations*` 与 `*Seshat Sidebar*` 两个 buffer 名已在 `thomas-emacs/lisp/init-window.el` 登记为 popper popup，可用 `C-'` 或 `` M-` `` 开关；popper 重开时经 `seshat-reader-sidebar-display-buffer` 分流回本包的显示逻辑，因此**布局（`position` / `height` / per-kind 高度）仍由本包掌控**，不会被 popper 的默认 bottom side window 规则改写。该分流由用户配置侧（`init-window.el`）接入，本包只提供函数。
+
+### 双向引用（M11.4）
+
+> 客户端侧配置（由 `seshat-reader-reference` 读取），与服务端无关。链接仅以 **doc-id 文本**承载身份，不依赖尚未实现的服务端 uid。
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `seshat-reader-reference-target-file` | `nil` | 摘录/引用写入的目标 org 笔记文件。`nil` 时首次交互询问落点文件，并把所选文件**仅在会话内记忆**（不写回用户配置）；也可直接设为固定路径（可含 `~`）。插入位置统一为文件末尾 |
+| `seshat-reader-reference-format` | `"#+begin_quote\n%s\n#+end_quote\n来源：[[%s][%s]]\n"` | 摘录块模板，三个 `%s` 依次为**正文文本**、**链接**、**链接描述**；正文为空时以空串填充 |
+
+说明：
+
+- 链接格式为 **`seshat:<doc-id>#<location>`**（`#<location>` 可省略），例如 `seshat:ebook:d2l-zh-pytorch.pdf#page:112`。`doc-id` 即批注的 `document_id`（`<书库标签>:<相对路径>`，由 `seshat-reader-annotation-roots` 决定），`location` 与批注的 `location` **同源同构**，不新增解析器。
+- **`doc-id` 不得包含 `#` 或 `%`**：含这两个字符时生成链接会 `user-error` 并提示重命名文件（本实现不做百分号转义，理由见 [`docs/architecture.md`](architecture.md) 的「`seshat:` 引用协议」小节）。
+- 键位：阅读器内 `C-c C-r` 插入**选区摘录**；批注列表 buffer 内 `C-c C-r` 插入**该条批注的引用**（服务端项与本地待同步项都支持，取值不触网）。
+- 阅读器内执行 `M-x org-store-link` 可直接把当前文档（或当前页）存为 `seshat:` 链接；在笔记里 `C-c C-o` 即可跳回对应文档与页码。
+
+### ETAF 渲染层（M11.9，可选）
+
+> 面板内容的可选渲染层（`seshat-reader-etaf`），依赖 `etaf-ui`。**ETAF 四仓库不入 notes 仓库**，仅通过 `load-path` 加载；未安装时功能完全不受影响。
+
+安装：
+
+```bash
+# 首次安装：四个仓库 clone 到 ~/WorkSpace/emacs-taf/
+for repo in ecss ebox etaf etaf-ui; do
+  git clone --depth 1 "https://github.com/emacs-taf/$repo.git" ~/WorkSpace/emacs-taf/$repo
+done
+
+# 编译（四仓库均为纯 Elisp，无 native 依赖）
+for repo in ecss ebox etaf etaf-ui; do
+  make -C ~/WorkSpace/emacs-taf/$repo compile
+done
+```
+
+`thomas-emacs/lisp/init-reader.el` 已自动把四个仓库根目录**及各自的 `lisp/`** 加入 `load-path`（**目录存在才加**），并 `(require 'seshat-reader-etaf nil t)`；未安装时该段自动跳过。
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `seshat-reader-etaf-enabled` | `t` | 是否在 ETAF 可用时用它渲染面板；`nil` 时直接走纯文本渲染（批注 `--render-list`、译文 gt 自身渲染），行为与未安装一致 |
+
+降级三态（均**不影响**翻译与批注功能，面板不空白）：
+
+| 条件 | 行为 |
+|---|---|
+| **未安装**（四仓库不在 `load-path`） | `(require 'etaf-ui nil t)` 失败 → 回退纯文本渲染，仅 `message` 提示一次 |
+| **半损坏**（`require` 抛错） | `condition-case` 兜底 → 回退纯文本渲染，不中断命令 |
+| **渲染抛错**（组件树或 `etaf-mount` 异常） | `condition-case` 捕获 → `message` 警告 + 回退纯文本渲染 |
+| `seshat-reader-etaf-enabled` = `nil` | 不进入渲染层，行为同「未安装」 |
+
+已知限制：
+
+- **配色不跟随具体主题**：只使用按 `background-mode` 取值的**内置双色板**（明/暗两套），不读取用户主题变量；切换明暗主题后需重新打开（重新渲染）面板才会用上新色。
+- **终端 frame 可能不可用**：pty / `emacs -nw` 下 `etaf-mount` 可能挂起（真机 GUI frame 正常），建议在 GUI frame 使用。
+- **gt 中转 buffer 已隐藏**：`" *Seshat gt*"` 由 `init-reader.el` 的 `display-buffer-alist` 规则隐藏（规则含 `(allow-no-window . t)`，缺它会回退默认动作而仍然弹窗），用户无需自行配置。
 
 ## 相关文件
 

@@ -62,6 +62,20 @@ CFLAGS += -Wall -Wextra -fPIC
 LDFLAGS :=
 EMACS = emacs --batch -Q --eval '(setq enable-dir-local-variables nil)' -L . -L ..
 
+# --- 可选外部依赖：ETAF（面板 ETAF 渲染层）---
+# ETAF 不 vendored 进本仓库（见 openspec/completed/2026-10-17-m11.9-etaf-render.md），
+# 只在本地存在时加入 load-path；不存在时 seshat-reader-etaf.el 不参与 .elc 编译
+# （运行期由接入点 `(require 'seshat-reader-etaf nil t)` 软加载并降级）。
+# 可用 `make ETAF_ROOT=/path/to/emacs-taf` 覆盖位置。
+ETAF_ROOT ?= $(HOME)/WorkSpace/emacs-taf
+ETAF_LISP_DIRS := $(wildcard $(ETAF_ROOT)/ecss $(ETAF_ROOT)/ecss/lisp \
+                              $(ETAF_ROOT)/ebox $(ETAF_ROOT)/ebox/lisp \
+                              $(ETAF_ROOT)/etaf $(ETAF_ROOT)/etaf/lisp \
+                              $(ETAF_ROOT)/etaf-ui $(ETAF_ROOT)/etaf-ui/lisp)
+ifneq ($(ETAF_LISP_DIRS),)
+  EMACS += $(foreach dir,$(ETAF_LISP_DIRS),-L $(dir))
+endif
+
 ifeq ($(OS_NAME),Darwin)
   CFLAGS += -DMACOS
   LDFLAGS += -dynamiclib
@@ -116,6 +130,10 @@ SRCS := $(wildcard render/*.c)
 OBJS := $(SRCS:%.c=%.o)
 
 EL_SRCS := $(filter-out .* seshat-reader-autoloads.el,$(wildcard *.el))
+ifeq ($(ETAF_LISP_DIRS),)
+  # ETAF 缺失：跳过 ETAF 渲染层（硬依赖 etaf-ui，无法在无 ETAF 环境编译）
+  EL_SRCS := $(filter-out seshat-reader-etaf.el,$(EL_SRCS))
+endif
 ELC := $(EL_SRCS:%.el=%.elc)
 
 .PHONY: all clean checkdoc

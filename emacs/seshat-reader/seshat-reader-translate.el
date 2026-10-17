@@ -23,16 +23,28 @@
 ;;; Commentary:
 
 ;; 桥接 go-translate（gt）与阅读器选区：把最近一次鼠标拖拽选中的文本交给
-;; gt 翻译或解释，译文经 gt 的 posframe 渲染器弹出，渲染完成后由 output
-;; hook 捕获纯译文到 `seshat-reader-translate-last-result'。
+;; gt 翻译或解释，渲染完成后由 output hook 捕获纯译文到
+;; `seshat-reader-translate-last-result'。
 ;;
 ;; gt 是**软依赖**：本模块不在顶层 `require' gt，只在
 ;; `seshat-reader-translate--ensure-gt' 中按需加载；未安装 gt 时给出明确
 ;; `user-error'，不产生 void-function 崩溃。
 ;;
 ;; 译文的呈现方式由 gt 预设（`gt-preset-translators'）与
-;; `seshat-reader-translate-render' 共同决定：默认弹出 posframe（pop），
-;; 也可固定为常驻 posframe（pin）。捕获译文复用 gt 的渲染输出 hook：
+;; `seshat-reader-translate-render' 共同决定：
+;;
+;; - `sidebar'（**默认**）：把译文渲染到**底部弹出的信息面板** buffer
+;;   （`seshat-reader-sidebar-translate-buffer-name'，默认
+;;   \"*Seshat Sidebar*\"），面板位置与高度由 `seshat-reader-sidebar-position'
+;;   /`seshat-reader-sidebar-height' 决定；面板不再自动消失，可用 `q'（gt
+;;   buffer 自带键位）或 `seshat-reader-sidebar-toggle' 关闭；**不再弹
+;;   posframe**。渲染用 gt 官方推荐的 `gt-buffer-render'（只用公开槽
+;;   `:name'/`:window-config'）。
+;; - `pop'/`pin'：沿用 posframe（`gt-posframe-pop-render' 弹出、失焦即
+;;   消失 / `gt-posframe-pin-render' 常驻），可在配置侧切回。
+;;
+;; 捕获译文：面板路径复用 `gt-buffer-render-output-hook'（在该结果 buffer
+;; 上下文内触发，按 buffer 名判别，零误捕获）；posframe 路径复用
 ;; `gt-posframe-pop-render-output-hook'（弹出）与
 ;; `gt-posframe-pin-render-output-hook'（固定）。
 ;;
@@ -47,12 +59,22 @@
 (require 'seshat-reader)
 (require 'seshat-rest)
 (require 'seshat-reader-annotation)
+;; 信息面板承载体（零依赖模块）；本模块用它取面板 buffer 名、
+;; `--display-params' 与统一显示入口。
+(require 'seshat-reader-sidebar)
 
 (eval-when-compile
   ;; `oset'/`oref' 是内置 eieio 的宏，仅在**编译期**需要 eieio 才能正确
   ;; 展开为 `eieio-oset'/`eieio-oref'；运行时本模块不加载 gt/eieio，二者
   ;; 由 `seshat-reader-translate--ensure-gt' 按需加载 gt 时一并可用。
-  (require 'eieio))
+  (require 'eieio)
+  ;; gt 是软依赖，编译期不加载 gt，故 eieio 的槽名编译器宏
+  ;; （`eieio--check-slot-name'，判据是 `slot-name' 符号属性）会把
+  ;; `gt-translator' 的真实槽 `taker'、`render' 判为未知槽，各报一条
+  ;; 「Unknown slot」告警。这里在编译期登记这两个槽名，消除无意义告警；
+  ;; 只影响编译期判定，运行时语义不变。
+  (put 'taker 'slot-name t)
+  (put 'render 'slot-name t))
 
 (declare-function eieio-oset "eieio-core" (obj slot value))
 (declare-function eieio-oref "eieio-core" (obj slot))
@@ -64,9 +86,19 @@
 (declare-function gt-google-engine "gt-engine-google" (&rest args))
 (declare-function gt-posframe-pop-render "gt-render-posframe" (&rest args))
 (declare-function gt-posframe-pin-render "gt-render-posframe" (&rest args))
+(declare-function gt-buffer-render "gt-render-buffer" (&rest args))
 (declare-function gt-start "gt-core" (translator))
+;; ETAF 渲染层是本包的**软依赖**（接入点用 `(require 'seshat-reader-etaf nil t)'
+;; 按需加载并自行降级），故此处只声明公开符号，避免字节编译告警，也避免在
+;; 加载期引入对 ETAF 的硬依赖。
+(declare-function seshat-reader-etaf-available-p "seshat-reader-etaf" ())
+(declare-function seshat-reader-etaf-render-translate "seshat-reader-etaf"
+                  (buffer &rest args))
 
 (defvar gt-preset-translators)
+;; `gt-buffer-render-output-hook' 由软依赖 `gt-render-buffer' 定义；此处声明
+;; 以避免字节编译告警（面板路径挂载捕获函数时会用到）。
+(defvar gt-buffer-render-output-hook)
 
 (defvar seshat-reader-select-last nil
   "最近一次鼠标选区，正式定义与完整语义见 `seshat-reader-select'.
@@ -113,18 +145,27 @@ youdao/google 翻译器。"
 
 (defcustom seshat-reader-translate-fallback-langs '(en zh)
   "回退翻译器使用的目标语言列表.
-当预设缺失、需要自建回退翻译器时，以此列表作为 `gt-taker' 的
+当预设缺失、需要自建回退翻译器时，以此列表作为 gt function `gt-taker' 的
 `:langs'。列表第一个元素通常是源语言，其余为目标语言，例如 (en zh)
 表示英文译为中文。"
   :type '(repeat symbol)
   :group 'seshat-reader-translate)
 
-(defcustom seshat-reader-translate-render 'pop
+(defcustom seshat-reader-translate-render 'sidebar
   "译文的渲染方式.
-`pop' 表示弹出式 posframe（`gt-posframe-pop-render'，失焦即消失）；
-`pin' 表示常驻的固定 posframe（`gt-posframe-pin-render'）。取值只允许
-这两个符号之一。"
-  :type '(choice (const pop) (const pin))
+`sidebar'（**默认**）表示把译文渲染到**底部弹出的信息面板** buffer
+（`seshat-reader-sidebar-translate-buffer-name'，默认 \"*Seshat Sidebar*\"），
+面板位置与高度分别由 `seshat-reader-sidebar-position' 与
+`seshat-reader-sidebar-height' 决定；面板为常驻窗口，可用 `q'（gt buffer
+自带键位）或 `seshat-reader-sidebar-toggle' 关闭，**不再弹 posframe**。
+`pop' 表示弹出式 posframe（gt function `gt-posframe-pop-render'，失焦即消失）；
+`pin' 表示常驻的固定 posframe（gt function `gt-posframe-pin-render'）。
+
+回退行为：取 `sidebar' 但 `seshat-reader-sidebar-enabled' 为 nil 时，退回
+`pop' 同款的弹出式 posframe（即禁用面板后恢复旧行为）；取值为 nil 或其它
+未知值时同样按 `pop' 处理。需要恢复 posframe 时把本变量改为 `pop' 或
+`pin' 即可（posframe 相关参数一并恢复生效）。"
+  :type '(choice (const sidebar) (const pop) (const pin))
   :group 'seshat-reader-translate)
 
 (defcustom seshat-reader-translate-capture-window 120
@@ -147,6 +188,17 @@ youdao/google 翻译器。"
     (user-error "Seshat Reader translate: 未加载 go-translate（gt）；请安装/加载 gt 后再使用阅读器翻译"))
   t)
 
+(defun seshat-reader-translate--ensure-gt-buffer-render ()
+  "确保 go-translate 的 buffer 渲染器库（`gt-render-buffer'）已加载.
+go-translate function `gt-buffer-render' 是该库中定义的**类名**（不是库名），构造其实例前必须
+先加载其库 `gt-render-buffer'。用 `(require \\='gt-render-buffer nil t)'
+按需加载软依赖；加载失败（gt 安装不完整或不在 `load-path'）时抛出可操作
+的 `user-error'，风格与 `seshat-reader-translate--ensure-gt' 一致。成功时
+返回 t。"
+  (unless (require 'gt-render-buffer nil t)
+    (user-error "Seshat Reader translate: 未加载 gt-render-buffer（go-translate 的 buffer 渲染器）；请确认 gt 安装完整，或把 `seshat-reader-translate-render' 切回 `pop'/`pin' 以使用 posframe"))
+  t)
+
 (defun seshat-reader-translate--selection-text ()
   "返回最近一次鼠标选区的文本，无可用选区时报错.
 从 `seshat-reader-select-last' 的 `:text' 取选区文本；变量为 nil、缺少
@@ -157,14 +209,126 @@ youdao/google 翻译器。"
       (user-error "Seshat Reader translate: 请先用鼠标拖拽选中文本；扫描件需 OCR（M11.6）"))
     text))
 
+(defvar seshat-reader-translate--gt-buffer-name " *Seshat gt*"
+  "Go-translate function `gt-buffer-render' 的中转 buffer 名（ETAF 路径）.
+这是**隐藏 buffer**：不显示、不参与 popper 名单；名字两侧各一个空格是约定
+（gt 隐藏 buffer 的惯例），`seshat-reader-sidebar-buffer-p' 不匹配它。真正的
+展示 buffer 仍是 `seshat-reader-sidebar-translate-buffer-name'。")
+
+(defun seshat-reader-translate--gt-buffer-text ()
+  "Return the text go-translate wrote into its hidden buffer, or nil.
+定位 `seshat-reader-translate--gt-buffer-name' 指定的中转 buffer：优先取带
+`gt-result' 属性的片段（即纯译文，不含引擎标题与原文摘录）；提取不到时退回
+整个 buffer 文本。buffer 不存在或已删除时返回 nil。"
+  (let ((buffer (get-buffer seshat-reader-translate--gt-buffer-name)))
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (or (car (seshat-reader-translate--extract-result))
+            (buffer-string))))))
+
+(defun seshat-reader-translate--clean-gt-text (raw)
+  "Clean RAW text from the gt buffer into a body fit for the panel.
+去掉首尾空白、去掉 gt 用来分隔内容的分隔线行（连续三个以上的 `-'/`='/`—'
+一类字符），并把连续空行压成一个空行（面板按空行分段）。RAW 为 nil 或清理后
+为空时返回 nil。"
+  (when (and (stringp raw) (not (string-empty-p (string-trim raw))))
+    (let* ((lines (split-string (substring-no-properties raw) "\n"))
+           (kept (cl-remove-if
+                  (lambda (line)
+                    (string-match-p "\\`[-=_—–─━]\\{3,\\}\\'" (string-trim line)))
+                  lines))
+           (joined (mapconcat #'identity kept "\n")))
+      (setq joined (string-trim (replace-regexp-in-string "\n\\{3,\\}" "\n\n" joined)))
+      (unless (string-empty-p joined)
+        joined))))
+
+(defun seshat-reader-translate--selection-source-text ()
+  "Return the text of the last mouse selection, or nil.
+用于译文面板的「原文」折叠区；无选区、无 `:text' 或文本全空白时返回 nil
+（本函数不报错，与 `seshat-reader-translate--selection-text' 的 `user-error'
+语义不同）。"
+  (let ((text (plist-get seshat-reader-select-last :text)))
+    (and (stringp text)
+         (not (string-empty-p (string-trim text)))
+         text)))
+
+(defun seshat-reader-translate--render-sidebar-etaf ()
+  "Render the finished translation into the panel with the ETAF layer.
+由 go-translate function `gt-buffer-render' 的 `:then' 槽在渲染完成
+（translator state = 3）时调用：从中转 buffer 取译文 → 清理 → 交给
+`seshat-reader-etaf-render-translate' 排版 → 用
+`seshat-reader-sidebar-show' 以 `translate' 类型显示展示 buffer（面板位置、
+高度与 per-kind 记忆与批注面板共用）。
+
+译文非空时同时写入 `seshat-reader-translate-last-result'，从而
+`seshat-reader-translate-save-as-annotation' 仍可用；译文为空（翻译失败或
+流式尚未产出）时保留上一次的译文，不清空。"
+  (let* ((raw (seshat-reader-translate--gt-buffer-text))
+         (text (seshat-reader-translate--clean-gt-text raw))
+         (buffer (get-buffer-create
+                  seshat-reader-sidebar-translate-buffer-name)))
+    (when text
+      (setq seshat-reader-translate-last-result text))
+    (seshat-reader-etaf-render-translate
+     buffer
+     :title "Seshat 译文"
+     :source (seshat-reader-translate--selection-source-text)
+     :body (or text "")
+     :engine (and (boundp 'seshat-reader-translate-preset)
+                  seshat-reader-translate-preset))
+    (seshat-reader-sidebar-show buffer 'translate t)))
+
 (defun seshat-reader-translate--render-object (mode)
   "按 MODE 构造一个 gt 渲染对象.
-MODE 为 `pin' 时返回常驻 posframe 渲染器（`gt-posframe-pin-render'）；
-其它取值（含 nil）返回弹出式 posframe 渲染器
-（`gt-posframe-pop-render'）。"
-  (if (eq mode 'pin)
-      (gt-posframe-pin-render)
-    (gt-posframe-pop-render)))
+MODE 为 `sidebar' 且 `seshat-reader-sidebar-enabled' 为真时，返回把译文
+渲染到信息面板 buffer 的 go-translate function `gt-buffer-render'：
+`seshat-reader-sidebar-enabled' 为 nil 时退回弹出式 posframe（与 `pop'
+取值同款），以保留禁用面板时的旧行为。
+
+`sidebar' 分支内部再按 ETAF 渲染层可用性分流：
+
+- ETAF 可用（本函数先按需 `require' 渲染层，且
+  `seshat-reader-etaf-available-p' 为真）→
+  gt 先渲染到**隐藏**中转 buffer（`:name' 取
+  `seshat-reader-translate--gt-buffer-name'，`:window-config' 为
+  `(display-buffer-no-window)' + `(allow-no-window . t)'，缺后者时
+  `display-buffer' 会回退默认动作而弹窗），完成后经 `:then' 回调把纯文本
+  交给 `seshat-reader-etaf-render-translate' 排版并显示到展示 buffer；
+- ETAF 不可用 → 原路径：gt 直接渲染到展示 buffer，`:window-config' 取
+  `seshat-reader-sidebar--display-params'。
+
+MODE 为 `pin' 时返回常驻 posframe 渲染器（gt function
+`gt-posframe-pin-render'）；其它取值（含 `pop' 与 nil）返回弹出式
+posframe 渲染器（gt function `gt-posframe-pop-render'）。"
+  (pcase mode
+    ('pin (gt-posframe-pin-render))
+    ('sidebar
+     (if seshat-reader-sidebar-enabled
+         (progn
+           (seshat-reader-translate--ensure-gt-buffer-render)
+           ;; 渲染层是本包的软依赖模块（`seshat-reader-etaf.el' 顶部硬 require
+           ;; etaf-ui），此处按需加载并吞掉加载失败——失败即回退 gt 自带渲染，
+           ;; 不影响翻译本身。
+           ;;
+           ;; 必须**主动**加载：渲染层平时由批注列表的渲染路径
+           ;; （`seshat-reader-annotation--render-list'）首次拉起；若用户先
+           ;; `C-c C-t' 翻译、再开批注列表，渲染层尚未加载，下面的 `fboundp'
+           ;; 判据恒为 nil，ETAF 排版会静默失效（走 gt 原样渲染）。故 require
+           ;; 必须在 `fboundp' 判断**之前**。
+           (ignore-errors (require 'seshat-reader-etaf nil t))
+           (if (and (fboundp 'seshat-reader-etaf-render-translate)
+                    (seshat-reader-etaf-available-p))
+               (gt-buffer-render
+                :name seshat-reader-translate--gt-buffer-name
+                :window-config '((display-buffer-no-window)
+                                 (allow-no-window . t))
+                :then (lambda (&rest _args)
+                        (seshat-reader-translate--render-sidebar-etaf)))
+             (gt-buffer-render
+              :name seshat-reader-sidebar-translate-buffer-name
+              :window-config (seshat-reader-sidebar--display-params 'translate))))
+       (gt-posframe-pop-render)))
+    (_ (gt-posframe-pop-render))))
 
 (defun seshat-reader-translate--translator (preset text langs &optional context)
   "为 PRESET、TEXT 与 LANGS 构造一个可供 gt 使用的翻译器对象.
@@ -174,7 +338,7 @@ PRESET 是 `gt-preset-translators' 中的预设名（符号）；命中时**克�
 一律只把改动施加在克隆结果上。
 
 TEXT 为待翻译的纯文本；LANGS 为目标语言列表（如 (en zh)）。二者通过
-**重建 `gt-taker'** 注入，并显式设置 `:pick nil' 以避免 gt 回退到
+**重建 gt function `gt-taker'** 注入，并显式设置 `:pick nil' 以避免 gt 回退到
 `gt-taker-pick' 按段落切分传入的字符串。渲染方式取自
 `seshat-reader-translate-render'。返回设置好 taker 与 render 的
 translator 对象；调用前会先确保 gt 已加载。
@@ -223,12 +387,65 @@ TARGET-LANG 为 \"ja\" 且回退 langs 为 (en zh) 时返回 (en ja)）。
   (add-hook 'gt-posframe-pin-render-output-hook
             #'seshat-reader-translate--capture-result))
 
+(defun seshat-reader-translate--extract-result ()
+  "从当前缓冲区提取译文片段与失败标记.
+返回 `(TEXT . FAILED)'：TEXT 为所有带 `gt-result' 文本属性的片段以
+`string-join' 用换行拼接的字符串（无片段时为 nil）；FAILED 非 nil 表示
+渲染结果带 `gt-buffer-render-error-face'（翻译失败标记）。供 posframe 与
+面板两条捕获路径共用，避免逻辑重复。"
+  (let ((pieces nil)
+        (failed nil))
+    ;; 收集带 `gt-result' 属性的片段。
+    (save-excursion
+      (goto-char (point-min))
+      (while (let ((match (text-property-search-forward 'gt-result)))
+               (when match
+                 (push (buffer-substring-no-properties
+                        (prop-match-beginning match)
+                        (prop-match-end match))
+                       pieces)
+                 t))))
+    ;; 失败检测：只在带 `face' 属性的连续片段上遍历
+    ;; （`text-property-search-forward' 一次跳到下一个带 face 的区域），
+    ;; 避免逐字符推进在无 face 的长缓冲上退化为 O(n^2)。
+    (save-excursion
+      (goto-char (point-min))
+      (while (and (not failed)
+                  (let ((match (text-property-search-forward 'face)))
+                    (when match
+                      (let ((face (get-text-property
+                                   (prop-match-beginning match) 'face)))
+                        (when (or (eq face 'gt-buffer-render-error-face)
+                                  (and (consp face)
+                                       (memq 'gt-buffer-render-error-face face)))
+                          (setq failed t)))
+                      t)))))
+    (cons (when pieces (string-join (nreverse pieces) "\n")) failed)))
+
+(defun seshat-reader-translate--record-result (extracted)
+  "把 EXTRACTED（`seshat-reader-translate--extract-result' 的返回值）写入译文.
+EXTRACTED 为 `(TEXT . FAILED)'。翻译失败（FAILED 为真，或 TEXT 为 nil）时
+以 `message' 明确提示，且**不写入** `seshat-reader-translate-last-result'
+（保持上一次的译文）；成功时写入并返回 TEXT。两条捕获路径共用本函数以
+保证失败语义一致。"
+  (let ((text (car extracted))
+        (failed (cdr extracted)))
+    (cond
+     (failed
+      (message "Seshat Reader translate: 翻译失败（渲染结果带有错误标记），未记录译文。")
+      nil)
+     ((null text)
+      (message "Seshat Reader translate: 翻译失败（在渲染缓冲区中未找到译文）。")
+      nil)
+     (t
+      (setq seshat-reader-translate-last-result text)))))
+
 (defun seshat-reader-translate--capture-result ()
   "从当前缓冲区捕获纯译文并写入 `seshat-reader-translate-last-result'.
-设计为挂到 gt 的渲染输出 hook（`gt-posframe-pop-render-output-hook' 或
-`gt-posframe-pin-render-output-hook'）上；触发时 `current-buffer' 即
-渲染缓冲区。收集其中所有带 `gt-result' 文本属性的片段，用 `string-join'
-以换行拼接后写入 `seshat-reader-translate-last-result'。
+设计为挂到 gt 的 posframe 渲染输出 hook（`gt-posframe-pop-render-output-hook'
+或 `gt-posframe-pin-render-output-hook'）上；触发时 `current-buffer' 即
+渲染缓冲区。取 `seshat-reader-translate--extract-result' 的提取结果交给
+`seshat-reader-translate--record-result' 写入。
 
 由于这两个 hook 是**全局**的，其它 go-translate 用法也会触发本函数，若
 不加区分会把非本包的译文写进 `seshat-reader-translate-last-result'。故
@@ -237,7 +454,9 @@ TARGET-LANG 为 \"ja\" 且回退 langs 为 (en zh) 时返回 (en ja)）。
 超过 `seshat-reader-translate-capture-window' 秒时才继续捕获，否则直接
 返回 nil（既不写 `seshat-reader-translate-last-result'，也不 `message'）。
 **残留局限**：窗口内用户若使用其它走 posframe 渲染的 gt 功能，仍可能被
-误捕获；根治需子类化 gt 的 render 或改用请求级回调。
+误捕获；根治需子类化 gt 的 render 或改用请求级回调。走**面板（buffer）
+渲染**的路径不受此局限，改由
+`seshat-reader-translate--capture-result-sidebar' 按 buffer 名零误捕获。
 
 翻译失败时（没有任何 `gt-result' 片段，或存在带
 `gt-buffer-render-error-face' 属性的文本）以 `message' 明确提示，且**不
@@ -247,48 +466,50 @@ TARGET-LANG 为 \"ja\" 且回退 langs 为 (en zh) 时返回 (en ja)）。
           (and started
                (<= (- (float-time) started)
                    seshat-reader-translate-capture-window)))
-    (let ((pieces nil)
-          (failed nil))
-      ;; 收集带 `gt-result' 属性的片段。
-      (save-excursion
-        (goto-char (point-min))
-        (while (let ((match (text-property-search-forward 'gt-result)))
-                 (when match
-                   (push (buffer-substring-no-properties
-                          (prop-match-beginning match)
-                          (prop-match-end match))
-                         pieces)
-                   t))))
-      ;; 失败检测：只在带 `face' 属性的连续片段上遍历
-      ;; （`text-property-search-forward' 一次跳到下一个带 face 的区域），
-      ;; 避免逐字符推进在无 face 的长缓冲上退化为 O(n^2)。
-      (save-excursion
-        (goto-char (point-min))
-        (while (and (not failed)
-                    (let ((match (text-property-search-forward 'face)))
-                      (when match
-                        (let ((face (get-text-property
-                                     (prop-match-beginning match) 'face)))
-                          (when (or (eq face 'gt-buffer-render-error-face)
-                                    (and (consp face)
-                                         (memq 'gt-buffer-render-error-face face)))
-                            (setq failed t)))
-                        t)))))
-      (cond
-       (failed
-        (message "Seshat Reader translate: 翻译失败（渲染结果带有错误标记），未记录译文。")
-        nil)
-       ((null pieces)
-        (message "Seshat Reader translate: 翻译失败（在渲染缓冲区中未找到译文）。")
-        nil)
-       (t
-        (setq seshat-reader-translate-last-result
-              (string-join (nreverse pieces) "\n")))))))
+    (seshat-reader-translate--record-result
+     (seshat-reader-translate--extract-result))))
+
+(defun seshat-reader-translate--capture-result-sidebar ()
+  "在 `gt-buffer-render-output-hook' 中从译文面板缓冲区捕获译文.
+该 hook 在结果缓冲区上下文内、以**全局** hook 触发（见 gt 的
+`gt-render-buffer'），故 `current-buffer' 即结果缓冲区。**仅当**其 buffer
+名等于 `seshat-reader-sidebar-translate-buffer-name' 时才处理；否则直接
+返回 nil，避免把其它 go-translate 用法触发的渲染误写进
+`seshat-reader-translate-last-result'。面板路径用 gt `:name' 槽指定了专属
+buffer 名，故按 buffer 名判别即可零误捕获，**不需要**时间窗口守卫。
+
+成功与失败语义与 `seshat-reader-translate--capture-result' 一致：取
+`seshat-reader-translate--extract-result' 的提取结果交给
+`seshat-reader-translate--record-result'，带错误 face 或无 `gt-result'
+片段时 `message' 且**不写入** `seshat-reader-translate-last-result'。"
+  (when (equal (buffer-name (current-buffer))
+               seshat-reader-sidebar-translate-buffer-name)
+    (seshat-reader-translate--record-result
+     (seshat-reader-translate--extract-result))))
+
+(defun seshat-reader-translate--install-sidebar-capture-hook ()
+  "把面板捕获函数挂到 go-translate 的 `gt-buffer-render-output-hook'.
+使用 `add-hook'，重复调用天然幂等（不会重复挂载同一函数）。"
+  (add-hook 'gt-buffer-render-output-hook
+            #'seshat-reader-translate--capture-result-sidebar))
+
+(defun seshat-reader-translate--install-capture-hook-for-mode ()
+  "按 `seshat-reader-translate-render' 挂载对应的结果捕获 hook.
+取 `sidebar'（且 `seshat-reader-sidebar-enabled' 为真）时挂
+`gt-buffer-render-output-hook'（buffer 渲染路径）；取 `pop'/`pin'、或
+`sidebar' 因 `seshat-reader-sidebar-enabled' 为 nil 而回退到 posframe 时
+挂两个 posframe 输出 hook（`seshat-reader-translate--install-capture-hooks'），
+与 `seshat-reader-translate--render-object' 的选取保持一致。两种安装都经
+`add-hook'，重复调用幂等。"
+  (if (and (eq seshat-reader-translate-render 'sidebar)
+           seshat-reader-sidebar-enabled)
+      (seshat-reader-translate--install-sidebar-capture-hook)
+    (seshat-reader-translate--install-capture-hooks)))
 
 ;;; 交互式命令
 
 (defun seshat-reader-translate-selection (&optional target-lang)
-  "翻译最近一次鼠标选区，译文经 posframe 弹出.
+  "翻译最近一次鼠标选区，译文经信息面板展示（默认）或 posframe 弹出.
 TARGET-LANG 为非空字符串时用作目标语言：源语言取
 `seshat-reader-translate-fallback-langs' 的第一个元素，目标语言为
 `(intern TARGET-LANG)'（见 `seshat-reader-translate--target-langs'）；
@@ -297,8 +518,12 @@ TARGET-LANG 为 nil 时直接使用 `seshat-reader-translate-fallback-langs'
 （如 \"ja\"）。
 
 使用预设 `seshat-reader-translate-preset'；预设缺失时回退到内置的
-youdao/google 翻译器。译文经 gt 的 posframe 渲染弹出，渲染完成后由
-`seshat-reader-translate--capture-result' 存入
+youdao/google 翻译器。呈现方式见 `seshat-reader-translate-render'：默认
+`sidebar' 把译文渲染到**底部弹出的信息面板** buffer（不再弹 posframe），
+面板可用 `q' 或 `seshat-reader-sidebar-toggle' 关闭；取 `pop'/`pin' 时
+恢复 posframe。渲染完成后由对应的输出 hook
+（`seshat-reader-translate--capture-result' 或面板路径的
+`seshat-reader-translate--capture-result-sidebar'）存入
 `seshat-reader-translate-last-result'，可用
 `seshat-reader-translate-save-as-annotation' 把译文存为批注。
 
@@ -321,7 +546,7 @@ youdao/google 翻译器。译文经 gt 的 posframe 渲染弹出，渲染完成�
     (condition-case err
         (let ((trans (seshat-reader-translate--translator
                       seshat-reader-translate-preset text langs 'translate)))
-          (seshat-reader-translate--install-capture-hooks)
+          (seshat-reader-translate--install-capture-hook-for-mode)
           (setq seshat-reader-translate-last-result nil)
           (setq seshat-reader-translate--active (float-time))
           (gt-start trans))
@@ -332,7 +557,7 @@ youdao/google 翻译器。译文经 gt 的 posframe 渲染弹出，渲染完成�
                 (error-message-string err))))))
 
 (defun seshat-reader-translate-explain-selection (&optional target-lang)
-  "解释（而非纯翻译）最近一次鼠标选区，译文经 posframe 弹出.
+  "解释（而非纯翻译）最近一次鼠标选区，译文经信息面板展示（默认）或 posframe 弹出.
 TARGET-LANG 的语义与 `seshat-reader-translate-selection' 完全相同：非空
 字符串时用作目标语言（源语言取 `seshat-reader-translate-fallback-langs'
 的第一个元素，目标语言为 `(intern TARGET-LANG)'），nil 时使用
@@ -341,8 +566,10 @@ TARGET-LANG 的语义与 `seshat-reader-translate-selection' 完全相同：非�
 中提供，未提供时回退到内置的 youdao/google 翻译器）。交互调用时可用
 `C-u' 前缀参数在迷你缓冲区输入目标语言。
 
-译文经 gt 的 posframe 渲染弹出，渲染完成后由
-`seshat-reader-translate--capture-result' 存入
+呈现方式见 `seshat-reader-translate-render'：默认 `sidebar' 把结果渲染到
+**底部弹出的信息面板** buffer（不再弹 posframe），面板可用 `q' 或
+`seshat-reader-sidebar-toggle' 关闭；取 `pop'/`pin' 时恢复 posframe。
+渲染完成后由对应的输出 hook 存入
 `seshat-reader-translate-last-result'，可用
 `seshat-reader-translate-save-as-annotation' 把结果存为批注。错误处理与
 `seshat-reader-translate-selection' 一致：`user-error' 冒泡，其余一般
@@ -359,7 +586,7 @@ TARGET-LANG 的语义与 `seshat-reader-translate-selection' 完全相同：非�
     (condition-case err
         (let ((trans (seshat-reader-translate--translator
                       seshat-reader-translate-explain-preset text langs 'explain)))
-          (seshat-reader-translate--install-capture-hooks)
+          (seshat-reader-translate--install-capture-hook-for-mode)
           (setq seshat-reader-translate-last-result nil)
           (setq seshat-reader-translate--active (float-time))
           (gt-start trans))
