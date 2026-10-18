@@ -6,6 +6,7 @@ import android.graphics.Color
 import android.graphics.pdf.PdfRenderer
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import android.util.LruCache
 import android.view.ViewGroup
 import android.widget.FrameLayout
@@ -177,7 +178,12 @@ class PdfPageAdapter(
         holder.overlay.setInkEnabled(inkHost.isInkEnabled() || inkEnabled)
         holder.overlay.onStrokeFinished = { stroke -> inkHost.onInkStrokeFinished(position, stroke) }
 
-        if (holder.bindingAdapterPosition == RecyclerView.NO_POSITION) return
+        if (holder.bindingAdapterPosition == RecyclerView.NO_POSITION) {
+            // 绑定期间位置不可用：不渲染（无法判断写回目标）。保留一条告警，
+            // 该分支一旦命中会让本页停在白底状态，需据此排查。
+            Log.w(TAG, "bind pos=$position 跳过渲染：bindingAdapterPosition=NO_POSITION")
+            return
+        }
 
         // 竖向模式：把真实页高写回 item 根（FrameLayout），使连续滚动的内容高度稳定。
         // 注意：写在子 ImageView 上无效——子 View 是 MATCH_PARENT，item 高度由根决定。
@@ -200,15 +206,30 @@ class PdfPageAdapter(
         // 未命中：先清图（item 白底留作占位），再提交后台渲染。
         holder.imageView.setImageDrawable(null)
         runOnRender {
-            // 复用校验：滚动过程中同一页可能被重复提交，缓存里已有则跳过。
-            if (cache.get(position) != null) return@runOnRender
-            // catch 在 renderPage 内部处理（onDestroy 后 renderer 已关闭时不崩溃）。
-            val bitmap = renderPage(position) ?: return@runOnRender
-            cache.put(position, bitmap)
+            // 先查缓存：滚动中同一页可能被重复提交，已有位图时**省掉渲染**。
+            //
+            // 注意「省渲染」不等于「省写回」：本方法进入前已把 ImageView 清空，
+            // 而缓存的生产者 [preload] 只把位图放进缓存、明确不触碰任何 ViewHolder
+            // （见其 KDoc）。若此处缓存命中就直接 return，没有任何人再把位图交给
+            // ImageView —— 该页会永久停在「item 白底 + 仅手写层可见」的空白状态，
+            // 直到某次重新绑定恰好命中缓存为止。
+            //
+            // 触发条件：bind 提交的渲染任务排在 preload 的渲染任务之后执行，
+            // 且 preload 已经把同一页渲染进缓存（恢复进度直接落在末页时 preload
+            // 覆盖 `lastPage-2..lastPage`，与首绑同帧，命中率最高）。
+            val bitmap = cache.get(position)
+                ?: renderPage(position)?.also { cache.put(position, it) }
+                ?: return@runOnRender
             mainHandler.post {
                 // 复用校验：位置已变则不写回（ViewHolder 可能已被复用给别的页）。
                 if (holder.bindingAdapterPosition == position) {
                     holder.imageView.setImageBitmap(bitmap)
+                } else {
+                    Log.w(
+                        TAG,
+                        "render pos=$position 丢弃写回：bindingAdapterPosition=" +
+                            "${holder.bindingAdapterPosition}",
+                    )
                 }
             }
         }
@@ -278,6 +299,10 @@ class PdfPageAdapter(
     /** 缓存容量：堆内存 1/8。 */
     private fun cacheSizeBytes(): Int = (Runtime.getRuntime().maxMemory() / 8).toInt()
 
+    companion object {
+        private const val TAG = "PdfPageAdapter"
+    }
+
     /**
      * 竖向模式的占位高度：优先构造参数 [defaultItemHeight]（由 Activity 传屏高），
      * 否则退化为宿主屏幕高度；只解析一次，后续复用。
@@ -303,6 +328,7 @@ class PdfPageAdapter(
                 }
             } catch (e: Exception) {
                 // renderer 已关闭或页索引异常：保持 0，绑定时退化为占位高度。
+                Log.w(TAG, "computeHeights 第 $index 页失败（中止）", e)
                 return
             }
         }
@@ -328,6 +354,7 @@ class PdfPageAdapter(
                 }
             } catch (e: Exception) {
                 // onDestroy 后 renderer 已关闭时避免崩溃。
+                Log.w(TAG, "renderPage($index) 失败", e)
                 null
             }
         }
