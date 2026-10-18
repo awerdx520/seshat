@@ -51,6 +51,16 @@
             android:name=".ui.NotesEditActivity"
             android:exported="false"
             android:label="@string/notes_edit_title" />
+
+        <!-- 笔记阅读页（M10.7 T5）：仅应用内启动，不对外导出 -->
+        <activity
+            android:name=".ui.NoteViewActivity"
+            android:exported="false" />
+
+        <!-- 笔记源码编辑页（M10.7 T6b）：仅应用内启动，不对外导出 -->
+        <activity
+            android:name=".ui.NoteEditActivity"
+            android:exported="false" />
     </application>
 
 </manifest>

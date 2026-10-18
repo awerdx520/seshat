@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- 笔记列表（M10.6 B4b）：搜索框 + 笔记/Agenda 分段 + 树形列表 + 底部操作区 -->
+<!-- 笔记列表（M10.7 T7）：搜索框 + 刷新/选择目录 + 笔记/Agenda 分段 + 列表 -->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
@@ -44,6 +44,31 @@
             android:text="@string/notes_tab_agenda" />
     </com.google.android.material.button.MaterialButtonToggleGroup>
 
+    <!-- 顶部操作区（M10.7 T7）：刷新列表 / 选择外部目录（跳设置页） -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:paddingStart="8dp"
+        android:paddingEnd="8dp">
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/refreshNotesButton"
+            style="@style/Widget.Material3.Button.TextButton"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="@string/notes_refresh" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/pickNotesDirButton"
+            style="@style/Widget.Material3.Button.TextButton"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="@string/notes_pick_dir" />
+    </LinearLayout>
+
     <!-- 后台加载指示 -->
     <ProgressBar
         android:id="@+id/notesLoading"
@@ -63,7 +88,8 @@
         android:text="@string/notes_empty"
         android:visibility="gone" />
 
-    <!-- 树形列表；clipToPadding=false 让首个条目在滚动时也能用满 padding 区域 -->
+    <!-- 列表：笔记段一个文件一行（NoteFileAdapter），Agenda 段条目一行（NotesListAdapter）；
+         clipToPadding=false 让首个条目在滚动时也能用满 padding 区域 -->
     <androidx.recyclerview.widget.RecyclerView
         android:id="@+id/notesList"
         android:layout_width="match_parent"
@@ -71,20 +97,4 @@
         android:layout_weight="1"
         android:clipToPadding="false"
         android:padding="8dp" />
-
-    <!-- 底部操作区：同步（仅 Agenda 段显示）；GTD 页面已由 Agenda 段取代，不再提供入口按钮 -->
-    <LinearLayout
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:orientation="horizontal"
-        android:padding="8dp">
-
-        <com.google.android.material.button.MaterialButton
-            android:id="@+id/notesSyncButton"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:text="@string/notes_sync"
-            android:visibility="gone" />
-    </LinearLayout>
 </LinearLayout>

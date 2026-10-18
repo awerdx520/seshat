@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 笔记阅读页菜单（M10.7 T5）：仅本地文件显示「编辑源码」（SAF 文档只读） -->
+<menu xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto">
+
+    <item
+        android:id="@+id/action_edit_source"
+        android:title="@string/note_edit_source"
+        app:showAsAction="ifRoom" />
+
+</menu>

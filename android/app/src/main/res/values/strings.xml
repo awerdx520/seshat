@@ -104,6 +104,20 @@
     <string name="notes_meta_deadline">截止 %1$s</string>
     <string name="notes_todo_set">设为 TODO</string>
 
+    <!-- 笔记列表改造（M10.7 T7）：笔记库列表 + 刷新/选择目录入口 -->
+    <string name="notes_refresh">刷新</string>
+    <string name="notes_pick_dir">选择目录</string>
+    <string name="notes_agenda_readonly">Agenda 暂不支持直接切换（请在笔记中编辑）</string>
+    <string name="note_file_meta">%1$s · %2$s</string>
+
+    <!-- 笔记阅读页 + 源码编辑页（M10.7 T5/T6） -->
+    <string name="note_load_failed">无法读取笔记</string>
+    <string name="note_save_failed">保存失败：%1$s</string>
+    <string name="note_edit_source">编辑源码</string>
+    <string name="note_edit_save">保存</string>
+    <string name="note_edit_cancel">取消</string>
+    <string name="note_unsupported_format">不支持的笔记格式</string>
+
     <!-- 设置页（M9.1） -->
     <string name="settings_title">设置</string>
     <string name="settings_server_url_hint">服务端地址</string>
@@ -160,6 +174,13 @@
     <string name="settings_about_remote_dir">远程目录：%1$s</string>
     <string name="settings_value_configured">已配置</string>
     <string name="settings_value_missing">未配置</string>
+
+    <!-- 笔记外部目录（M10.7 T8，SAF） -->
+    <string name="settings_notes_dir_title">笔记外部目录</string>
+    <string name="settings_notes_dir_pick">选择目录</string>
+    <string name="settings_notes_dir_clear">清除</string>
+    <string name="settings_notes_dir_none">未设置</string>
+    <string name="settings_notes_dir_hint">仅读取所选目录第一层的 org / md 文件（只读）</string>
 
     <!-- PDF 手写批注与点击翻页（M10.5） -->
     <string name="pdf_ink_toggle">手写</string>

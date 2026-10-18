@@ -2,11 +2,13 @@ package com.seshat.app.settings
 
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
 import android.view.View
 import android.view.WindowManager
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import com.google.android.material.appbar.MaterialToolbar
 import com.google.android.material.button.MaterialButton
@@ -57,6 +59,30 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var textZoomValue: TextView
     private lateinit var connectionResultText: TextView
     private lateinit var aboutText: TextView
+
+    /** 笔记外部目录当前值（未设置显示「未设置」）。 */
+    private lateinit var notesDirValue: TextView
+
+    /**
+     * 选择笔记外部目录（SAF 目录树）。
+     *
+     * 回调里立即申请**持久读权限**：`ACTION_OPEN_DOCUMENT_TREE` 的授权默认只在本次
+     * 进程生命周期内有效，不 `takePersistableUriPermission` 的话重启后 URI 就不可读。
+     * 申请失败（provider 不支持）不阻断保存，只是下次启动需要重新选择。
+     */
+    private val pickNotesDir = registerForActivityResult(
+        ActivityResultContracts.OpenDocumentTree(),
+    ) { uri ->
+        if (uri == null) return@registerForActivityResult
+        runCatching {
+            contentResolver.takePersistableUriPermission(
+                uri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION,
+            )
+        }
+        appPreferences.setNotesExternalDir(uri.toString())
+        refreshNotesDir()
+    }
 
     /** 非机密偏好（不加密，不受 [showStorageUnavailable] 影响）。 */
     private lateinit var appPreferences: AppPreferences
@@ -112,6 +138,16 @@ class SettingsActivity : AppCompatActivity() {
         bindTextZoomSlider()
         findViewById<MaterialButton>(R.id.testConnectionButton).setOnClickListener { testConnection() }
         updateAbout()
+
+        // 笔记外部目录（SAF）：选择 / 清除都立即落盘（无需点「保存」）
+        notesDirValue = findViewById(R.id.notesDirValue)
+        refreshNotesDir()
+        findViewById<MaterialButton>(R.id.pickNotesDirButton).setOnClickListener {
+            pickNotesDir.launch(null)
+        }
+        findViewById<MaterialButton>(R.id.clearNotesDirButton).setOnClickListener {
+            clearNotesDir()
+        }
 
         store.loadServerUrl()?.let { serverUrlInput.setText(it) }
         updateTokenStatus()
@@ -376,6 +412,40 @@ class SettingsActivity : AppCompatActivity() {
             append('\n')
             append(getString(R.string.settings_about_remote_dir, appPreferences.remoteDir()))
         }
+    }
+
+    /**
+     * 刷新笔记外部目录的显示文案。
+     *
+     * 未设置 → 「未设置」；已设置 → 目录末段（SAF tree URI 的末段形如 `primary:notes`），
+     * 取不到时退回完整 URI 字符串。**不写日志**：URI 里可能含用户目录名。
+     */
+    private fun refreshNotesDir() {
+        val dir = appPreferences.notesExternalDir()
+        notesDirValue.text = if (dir.isBlank()) {
+            getString(R.string.settings_notes_dir_none)
+        } else {
+            runCatching { Uri.parse(dir).lastPathSegment }.getOrNull() ?: dir
+        }
+    }
+
+    /**
+     * 清除笔记外部目录：先释放持久读权限，再清空偏好（顺序不可反）。
+     *
+     * 释放失败不算错误（权限可能早已被系统回收），因此一律 `runCatching` 后继续清空。
+     */
+    private fun clearNotesDir() {
+        val old = appPreferences.notesExternalDir()
+        if (old.isNotBlank()) {
+            runCatching {
+                contentResolver.releasePersistableUriPermission(
+                    Uri.parse(old),
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                )
+            }
+        }
+        appPreferences.setNotesExternalDir("")
+        refreshNotesDir()
     }
 
     /**

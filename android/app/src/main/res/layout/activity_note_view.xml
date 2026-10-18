@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 笔记阅读页（M10.7 T5）：工具栏 + WebView 渲染区 + 加载指示 -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical">
+
+    <!--
+        工具栏：本项目全应用主题为 Theme.Material3.DayNight.NoActionBar，
+        没有 ActionBar 时 options menu 无处渲染，故按 MainActivity/SettingsActivity
+        的既有做法显式放一个 MaterialToolbar 并 setSupportActionBar。
+    -->
+    <com.google.android.material.appbar.MaterialToolbar
+        android:id="@+id/noteToolbar"
+        android:layout_width="match_parent"
+        android:layout_height="?attr/actionBarSize" />
+
+    <!-- 渲染区：WebView 铺满剩余高度，进度条居中 -->
+    <FrameLayout
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1">
+
+        <WebView
+            android:id="@+id/noteWebView"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent" />
+
+        <ProgressBar
+            android:id="@+id/noteLoading"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center" />
+    </FrameLayout>
+
+</LinearLayout>

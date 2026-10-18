@@ -78,6 +78,19 @@ class AppPreferences(
         write(KEY_PAGE_MODE, mode.name.lowercase())
     }
 
+    /**
+     * 笔记外部目录（SAF tree URI 字符串）；空串表示未设置。
+     *
+     * 只存 URI 字符串本身（不含路径明文），持久读权限由设置页在询问目录时
+     * `takePersistableUriPermission` 单独持有；URI 失效时上层按「无外部目录」处理。
+     */
+    fun notesExternalDir(): String = read(KEY_NOTES_EXTERNAL_DIR).orEmpty()
+
+    /** 保存笔记外部目录（空串表示清除；持久授权由设置页负责释放）。 */
+    fun setNotesExternalDir(uri: String) {
+        write(KEY_NOTES_EXTERNAL_DIR, uri)
+    }
+
     /** 清空全部非机密偏好（恢复默认：远程目录 `/`、主题跟随系统、字号 100、横向翻页）。 */
     fun clear() {
         write(KEY_REMOTE_DIR, "")
@@ -94,6 +107,9 @@ class AppPreferences(
         const val KEY_APP_THEME = "app_theme"
         const val KEY_TEXT_ZOOM = "reader_text_zoom"
         const val KEY_PAGE_MODE = "reader_page_mode"
+
+        /** 笔记外部目录（SAF tree URI 字符串）；空串表示未设置。 */
+        const val KEY_NOTES_EXTERNAL_DIR = "notes_external_dir"
 
         const val DEFAULT_TEXT_ZOOM = 100
         const val MIN_TEXT_ZOOM = 80
