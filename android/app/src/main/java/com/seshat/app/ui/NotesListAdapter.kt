@@ -91,7 +91,7 @@ class NotesListAdapter(
             holder.tags.visibility = View.GONE
         }
 
-        // 正文摘要：正文首个非空行；无则隐藏
+        // 正文摘要（跳过 planning 行与属性块行）；无可用行则隐藏
         val summary = OrgEntryDisplay.summaryOf(entry.body)
         if (summary != null) {
             holder.summary.visibility = View.VISIBLE

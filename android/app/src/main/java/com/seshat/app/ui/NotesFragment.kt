@@ -5,9 +5,11 @@ import android.content.Context
 import android.os.Bundle
 import android.text.Editable
 import android.text.TextWatcher
+import android.view.KeyEvent
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.view.inputmethod.EditorInfo
 import android.widget.EditText
 import android.widget.ProgressBar
 import android.widget.TextView
@@ -168,7 +170,15 @@ class NotesFragment : Fragment() {
      * 绑定搜索框。
      *
      * 项目此前未使用 `androidx.core.widget.doAfterTextChanged`，此处按任务约定手写 [TextWatcher]。
-     * 输入变化后 250ms 才重建列表（防抖），避免逐字符重建整棵树。
+     *
+     * 两条路径（B4 真机验收缺陷 2 修复）：
+     * - **有内容**：250ms 防抖后再重建，避免逐字重建整棵树；
+     * - **清空**（文本为空或纯空白）：**立即**重建恢复全量，不等防抖 —— 输入才需要防抖，
+     *   恢复全量没有这个负担；而若清空也挂防抖，IME 在清空后继续发出的文本事件会不断
+     *   `removeCallbacks` + 重投，定时器被反复重置，列表恢复被无限推迟（真机现象：清空后
+     *   仍停在「没有匹配的条目」，必须再按 ENTER）。
+     *
+     * 另：`imeOptions=actionSearch` 的 ENTER 也立即过滤（单独的快捷路径，不再是唯一路径）。
      */
     private fun setUpSearch() {
         notesSearch.addTextChangedListener(object : TextWatcher {
@@ -177,11 +187,33 @@ class NotesFragment : Fragment() {
             override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) = Unit
 
             override fun afterTextChanged(s: Editable?) {
-                query = s?.toString().orEmpty()
+                val text = s?.toString().orEmpty()
                 notesSearch.removeCallbacks(searchRunnable)
-                notesSearch.postDelayed(searchRunnable, SEARCH_DEBOUNCE_MS)
+                if (text.isBlank()) {
+                    // 清空 → 立即恢复全量（query 归零，rebuild 走非搜索分支）
+                    query = ""
+                    rebuild()
+                } else {
+                    query = text
+                    notesSearch.postDelayed(searchRunnable, SEARCH_DEBOUNCE_MS)
+                }
             }
         })
+
+        // ENTER（IME 搜索键 / 物理回车）立即过滤，跳过 250ms 防抖
+        notesSearch.setOnEditorActionListener { _, actionId, event ->
+            val byAction = actionId == EditorInfo.IME_ACTION_SEARCH
+            val byEnter = event?.keyCode == KeyEvent.KEYCODE_ENTER &&
+                event.action == KeyEvent.ACTION_DOWN
+            if (byAction || byEnter) {
+                notesSearch.removeCallbacks(searchRunnable)
+                query = notesSearch.text?.toString().orEmpty()
+                rebuild()
+                true
+            } else {
+                false
+            }
+        }
     }
 
     // ---------------------------------------------------------------- 加载
