@@ -12,11 +12,15 @@ import kotlinx.serialization.json.Json
  * @param read 读取键对应字符串（不存在返回 `null`）。
  * @param write 写入键值对。
  * @param json JSON 编解码器（默认忽略未知字段，容忍未来字段扩展）。
+ * @param keys 枚举该 prefs 文件的全部键（旧键清理用；默认空实现 → 清理为无操作）。
+ * @param remove 删除单个键（旧键清理用；默认空实现 → 清理为无操作）。
  */
 class PdfInkStore(
     private val read: (String) -> String?,
     private val write: (String, String) -> Unit,
     private val json: Json = defaultJson(),
+    private val keys: () -> Set<String> = { emptySet() },
+    private val remove: (String) -> Unit = {},
 ) {
 
     /** 读取整份文档（无记录或 JSON 损坏时返回空文档）。 */
@@ -71,6 +75,16 @@ class PdfInkStore(
         persist(docId, document.pages.filterNot { it.page == page })
     }
 
+    /**
+     * 一次性清理本 store 前缀下的旧键（M7 之前以 pdf uri 作 docId）。
+     *
+     * 幂等纯清理：多次调用结果一致；是否只跑一次由调用方用 `legacy_cleared` 标记控制。
+     * 旧数据**不迁移**（uid 映射需服务端 resolve，见 tech-debt）。
+     *
+     * @return 实际删除的键数量（未注入 [keys]/[remove] 时为 0）。
+     */
+    fun clearLegacy(): Int = LegacyKeys.clearByPrefix(PREFIX, keys, remove)
+
     /** 写回整份文档并刷新 [PdfInkDocument.updatedAt]。 */
     private fun persist(docId: String, pages: List<PdfInkPage>) {
         val updated = PdfInkDocument(
@@ -85,8 +99,11 @@ class PdfInkStore(
         /** 与批注/进度共用同一 prefs 文件，键空间由前缀隔离。 */
         const val PREFS_NAME = "pdf_reader"
 
+        /** 笔迹存储键前缀（PDF 命名空间，与 epub 隔离）。 */
+        private const val PREFIX = "pdf_ink_"
+
         /** 存储键：`pdf_ink_<docId>`。 */
-        fun key(docId: String): String = "pdf_ink_$docId"
+        fun key(docId: String): String = "$PREFIX$docId"
 
         /** 默认 JSON 配置：忽略未知字段、序列化默认值。 */
         fun defaultJson(): Json = Json {

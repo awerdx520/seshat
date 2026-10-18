@@ -90,4 +90,33 @@ class AnnotationStoreTest {
         assertEquals("fixed-id", saved.id)
         assertEquals(42L, saved.createdAt)
     }
+
+    @Test
+    fun clearLegacyDeletesLegacyKeysAndKeepsUidKeys() {
+        val hex = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        val uid = "0123456789ABCDEFGHJKMNPQRS"
+        val uri = "content://com.android.providers.downloads.documents/document/1"
+        prefs.putRaw(hex, "[]")
+        prefs.putRaw(uri, "[]")
+        prefs.putRaw(uid, "[]")
+        prefs.putRaw("legacy_other", "[]")
+
+        store.clearLegacy()
+
+        assertFalse(prefs.contains(hex))
+        assertFalse(prefs.contains(uri))
+        assertTrue(prefs.contains(uid))
+        // 任何 legacy_ 前缀键都保留（含清理标记本身）
+        assertTrue(prefs.contains("legacy_other"))
+    }
+
+    @Test
+    fun clearLegacyReturnsDeletedCount() {
+        prefs.putRaw("a1b2c3d4e5f60718293a4b5c6d7e8f90", "[]")
+        prefs.putRaw("file:///sdcard/a.pdf", "[]")
+        prefs.putRaw("0123456789ABCDEFGHJKMNPQRS", "[]")
+
+        assertEquals(2, store.clearLegacy())
+        assertEquals(0, store.clearLegacy())
+    }
 }

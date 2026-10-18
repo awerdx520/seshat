@@ -38,13 +38,10 @@ class ConnectivityTesterTest {
         val result = ConnectivityTester(config(), OkHttpClient(), requireHttps = false).test()
         assertEquals(ConnectivityResult.Ok, result)
 
-        // 探针请求形态：路径 + 查询参数 + Bearer 认证头。
+        // 探针请求形态：只读端点 GET /api/roots + Bearer 认证头（无查询参数）。
         val request = server.takeRequest()
         assertEquals("GET", request.method)
-        assertEquals(
-            "/api/annotations?document_id=${ConnectivityTester.PROBE_DOCUMENT_ID}",
-            request.path,
-        )
+        assertEquals("/api/roots", request.path)
         assertEquals("Bearer t", request.getHeader("Authorization"))
     }
 

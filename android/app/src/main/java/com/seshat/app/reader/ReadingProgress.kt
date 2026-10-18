@@ -54,6 +54,26 @@ class ReadingProgressStore(
         prefs.edit().remove(documentId).apply()
     }
 
+    /**
+     * 一次性清理旧键（M7 之前以 documentId 作键的记录）：32 位十六进制内容哈希或含 `:` 的 uri。
+     *
+     * 幂等纯清理：多次调用结果一致；是否只跑一次由调用方用 [LegacyKeys.CLEARED_FLAG] 标记控制。
+     * 旧数据**不迁移**（uid 映射需服务端 resolve，见 tech-debt）。
+     *
+     * @return 实际删除的键数量。
+     */
+    fun clearLegacy(): Int {
+        var removed = 0
+        // getAll() 返回快照，遍历期间删除原 prefs 键安全
+        for (key in prefs.all.keys.toList()) {
+            if (key.startsWith(LegacyKeys.FLAG_PREFIX)) continue
+            if (!LegacyKeys.isLegacyBase(key)) continue
+            prefs.edit().remove(key).apply()
+            removed++
+        }
+        return removed
+    }
+
     companion object {
         const val PREFS_NAME = "reading_progress"
 

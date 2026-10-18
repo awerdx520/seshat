@@ -1,6 +1,7 @@
 package com.seshat.app.reader
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -75,5 +76,34 @@ class PdfAnnotationStoreTest {
         val map = mutableMapOf(PdfAnnotationStore.key("doc1") to "{not valid json")
         val store = PdfAnnotationStore(read = { map[it] }, write = { k, v -> map[k] = v })
         assertTrue(store.list("doc1").isEmpty())
+    }
+
+    @Test
+    fun clearLegacyStripsPrefixBeforeJudging() {
+        val hex = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        val uid = "0123456789ABCDEFGHJKMNPQRS"
+        val uri = "content://media/external/document/7"
+        val map = mutableMapOf(
+            PdfAnnotationStore.key(hex) to "[]",
+            PdfAnnotationStore.key(uri) to "[]",
+            PdfAnnotationStore.key(uid) to "[]",
+            PdfAnnotationStore.key("doc1") to "[]",
+            // 其它 store 前缀的旧键不归本 store 管
+            PdfInkStore.key(hex) to "{}",
+        )
+        val store = PdfAnnotationStore(
+            read = { map[it] },
+            write = { k, v -> map[k] = v },
+            keys = { map.keys.toSet() },
+            remove = { map.remove(it) },
+        )
+
+        assertEquals(2, store.clearLegacy())
+
+        assertFalse(map.containsKey(PdfAnnotationStore.key(hex)))
+        assertFalse(map.containsKey(PdfAnnotationStore.key(uri)))
+        assertTrue(map.containsKey(PdfAnnotationStore.key(uid)))
+        assertTrue(map.containsKey(PdfAnnotationStore.key("doc1")))
+        assertTrue(map.containsKey(PdfInkStore.key(hex)))
     }
 }

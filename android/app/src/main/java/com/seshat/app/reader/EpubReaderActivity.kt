@@ -19,10 +19,21 @@ import androidx.recyclerview.widget.RecyclerView
 import androidx.viewpager2.adapter.FragmentStateAdapter
 import androidx.viewpager2.widget.ViewPager2
 import androidx.webkit.WebViewAssetLoader
+import android.util.Log
 import com.seshat.app.R
 import com.seshat.app.settings.AppPreferences
 import com.seshat.app.settings.ReaderPageMode
+import com.seshat.app.settings.SettingsStore
+import com.seshat.app.sync.EpubLocalSyncStore
+import com.seshat.app.sync.EpubSyncMapper
+import com.seshat.app.sync.RestClient
+import com.seshat.app.sync.RestClientSyncAdapter
+import com.seshat.app.sync.SecurePrefs
+import com.seshat.app.sync.SyncManager
+import com.seshat.app.sync.createReaderSync
 import java.io.File
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 
 /**
  * epub 阅读界面（MVP）。
@@ -43,9 +54,20 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
     var epubSource: EpubSource? = null
         private set
 
-    /** 文档标识（内容哈希），进度/批注的持久化 key。 */
+    /** 文档标识（内容哈希）；**不是** Store 键（见 [effectiveKey]）。 */
     var documentId: String = ""
         private set
+
+    /**
+     * Store 键（进度/批注的唯一键选择点）：有服务端 uid 用 uid，否则退回 [documentId]。
+     *
+     * 书籍解析完成后才有值（[onBookReady] 中赋值）。
+     */
+    var effectiveKey: String = ""
+        private set
+
+    /** 服务端 uid（Intent 携带；为空表示未登记/离线打开，走内容哈希键且不参与同步）。 */
+    private var uid: String? = null
 
     private lateinit var chapterTitleView: TextView
     private lateinit var pager: ViewPager2
@@ -74,6 +96,30 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
     /** 重锚进行中标记：避免测量回调互相触发形成抖动循环。 */
     private var pendingReanchor: Boolean = false
 
+    /**
+     * 阅读状态同步管理器。
+     *
+     * 仅当「有 uid」且「服务端已配置」时非 `null`（见 [setupSync]），无 uid / 未配置时始终保持
+     * `null`，所有推送入口都会直接返回，从而完全跳过网络。
+     */
+    private var syncManager: SyncManager<ReadingProgress, BookAnnotation>? = null
+
+    /**
+     * 同步专用单线程。
+     *
+     * **不复用渲染/打开线程**：网络请求可能耗时数秒（服务端慢或离线超时），复用渲染线程会让绘制与
+     * 章节加载一起卡住。单线程保证同一本书的拉取/推送串行执行，避免顺序错乱（如先推后拉的覆盖）。
+     */
+    private var syncExecutor: ExecutorService? = null
+
+    /**
+     * 上次「已成功推送」的进度标识（`"章序号:章内滚动"`，与 [EpubSyncMapper.encodePosition] 一致）。
+     *
+     * 只在同步线程（[syncExecutor] 的单线程）内读写：比较与更新都在同一个线程里完成，
+     * 不跨线程共享，因而无需额外同步。用途见下方推送方法的说明。
+     */
+    private var lastPushedPosition: String? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_epub_reader)
@@ -88,6 +134,9 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
         scrollView = findViewById(R.id.chapterScrollView)
         progressStore = ReadingProgressStore(this)
         annotationStore = AnnotationStore(this)
+        uid = intent.getStringExtra(EXTRA_UID)?.trim()?.takeIf { it.isNotEmpty() }
+        // 旧键一次性清理（幂等；每 prefs 文件各自标记，只跑第一次）
+        clearLegacyOnce()
 
         findViewById<Button>(R.id.prevChapterButton).setOnClickListener { moveBy(-1) }
         findViewById<Button>(R.id.nextChapterButton).setOnClickListener { moveBy(1) }
@@ -120,7 +169,23 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
         }
     }
 
+    override fun onStop() {
+        // 离开阅读器（切后台 / 退出）时推送一次进度：这是「同步」语义的唯一天然时点。
+        // 必须在 super.onStop() 之前入队，保证提交时同步线程仍存活且 Activity 尚未销毁。
+        enqueuePushProgress()
+        super.onStop()
+    }
+
     override fun onDestroy() {
+        // 先停同步线程（在 super.onDestroy() 之前）。
+        // 用 shutdown() 而非「立即中断」版本：后者会把队列里尚未执行的任务直接丢弃、并中断
+        // 正在执行的请求；而 [onStop] 刚入队的那次进度推送是本 Activity 生命周期内
+        // **唯一**一次推送（back 退出、旋转屏都会先 onStop 再 onDestroy），被丢弃就等于
+        // 最后一次阅读位置永远不同步。
+        // 代价：Activity 销毁后线程可能短暂存活，待已入队任务跑完即随线程池退出。
+        syncExecutor?.shutdown()
+        syncExecutor = null
+        syncManager = null
         super.onDestroy()
         // 先解绑竖向容器：确保所有 WebView 走 onViewRecycled 销毁，避免泄漏。
         if (::scrollView.isInitialized) {
@@ -181,12 +246,16 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
         epubSource = source
         book = parsed
         documentId = docId
+        // 键选择的唯一落点：有 uid 用 uid，否则用内容哈希
+        effectiveKey = uid ?: docId
         title = parsed.title
+        // 键确定之后再装配同步（setupSync 内部有三条守卫，任一不满足即完全跳过网络）。
+        setupSync()
 
         // 横向容器始终装配（竖向模式下不可见，也无副作用）。
         pager.adapter = ChapterPagerAdapter(this, parsed.chapters.size)
 
-        val saved = progressStore.load(docId)
+        val saved = progressStore.load(effectiveKey)
         startChapterIndex = saved?.chapterIndex?.coerceIn(0, parsed.chapters.size - 1) ?: 0
         startScrollY = saved?.scrollY ?: 0
         scrollByChapter[startChapterIndex] = startScrollY
@@ -201,6 +270,98 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
             pager.setCurrentItem(startChapterIndex, false)
         }
         updateChapterTitle(startChapterIndex)
+    }
+
+    /**
+     * 装配阅读状态同步（进度 + 批注）。
+     *
+     * **三条守卫**（任一不满足即安静返回，不提示、不报错）：
+     * 1. `uid` 非空——无 uid 时服务端 URL 里没有稳定身份，进度/批注无法归属；
+     * 2. `SettingsStore.toConfig()` 非空——服务端地址与访问令牌缺一不可；
+     * 3. [createReaderSync] 非空——上述两条的最终裁决点，未通过时不会构造 `RestClient`。
+     *
+     * **失败语义**：所有网络异常在 [syncExecutor] 线程内被 `runCatching` 吞掉并记一条 warn 日志——
+     * 阅读是本地优先功能，同步失败不得阻断或弹窗打扰。
+     *
+     * **已知限制**：拉取到的进度只写入本地 Store，**不立即跳转 UI**（当前阅读位置已按本地进度恢复，
+     * 中途跳转会让正在读的用户丢失位置）；远端进度在下次打开本书时生效。
+     *
+     * 线程约定：本方法只在主线程读配置，所有网络调用都在 [syncExecutor] 单线程上执行。
+     */
+    private fun setupSync() {
+        val id = uid ?: return // 无 uid：完全跳过网络（不提示、不报错）
+        val securePrefs = SecurePrefs.open(this)
+        val config = SettingsStore(
+            read = { key -> securePrefs.getString(key) },
+            write = { key, value -> securePrefs.putString(key, value) },
+            writeSecret = { key, value -> securePrefs.putSecret(key, value) },
+        ).toConfig() ?: return
+        val manager = createReaderSync(
+            uid = id,
+            config = config,
+            restFactory = { RestClientSyncAdapter(RestClient(it)) },
+            store = EpubLocalSyncStore(progressStore, annotationStore),
+            mapper = EpubSyncMapper(),
+        ) ?: return
+        syncManager = manager
+        val executor = Executors.newSingleThreadExecutor().also { syncExecutor = it }
+        executor.execute {
+            runCatching {
+                // 批注：合并（幂等，按 location + text 去重），远端新增写入本地
+                manager.pullAnnotations(id)
+                // 进度：仅本地没有进度时拉取（避免覆盖本机正在读的位置）
+                if (progressStore.load(id) == null) manager.pullProgress(id)
+                // 本地已有进度：推送上去（服务端 updated_at 会因此前进）
+                manager.pushProgress(id)
+            }.onFailure { Log.w(TAG, "拉取阅读状态失败（已忽略）", it) }
+        }
+    }
+
+    /**
+     * 异步推送一次进度（无同步管理器时直接返回，零网络行为）。
+     *
+     * **为什么不在 [persistProgress] 里推**：该方法每次翻页/滚动都会执行，若在其中推送，
+     * 翻 100 页就会向 `PUT /api/progress/{uid}` 排队 100 次请求（单线程 executor 串行积压，
+     * 服务端被无意义写爆）。故改为只在 [onStop] 推一次——「离开阅读器即同步」语义合理。
+     *
+     * **为什么比较放在 executor 内**：位置取值、与 [lastPushedPosition] 比较、推送三者都在
+     * 同步线程执行——主线程零网络、也不做额外的 prefs 读；单线程内读写天然串行，
+     * 不存在主线程与同步线程之间的竞态。该「同值跳过」是**防抖**（不重复推同一位置），
+     * 不是严格节流（不做时间窗限流）。
+     */
+    private fun enqueuePushProgress() {
+        val manager = syncManager ?: return
+        val id = effectiveKey
+        val executor = syncExecutor ?: return
+        // [onDestroy] 里的 shutdown() 之后 executor 拒绝新任务（RejectedExecutionException）：
+        // 正常时序下 onStop 先于 onDestroy 不会命中，但旋转屏/异常销毁等边缘时序可能让提交落在
+        // shutdown 之后——兜住异常，同步失败不得影响阅读器销毁。
+        runCatching {
+            executor.execute {
+                // 以本地已落盘的进度为准（persistProgress 已先写本地），读不到说明还没有进度。
+                val position = progressStore.load(id)
+                    ?.let { "${it.chapterIndex}:${it.scrollY}" } ?: return@execute
+                if (position == lastPushedPosition) return@execute
+                runCatching { manager.pushProgress(id) }
+                    // pushProgress 返回 Progress?：不抛异常即视为推送成功，此时才记住该位置。
+                    .onSuccess { lastPushedPosition = position }
+                    .onFailure { Log.w(TAG, "推送阅读进度失败（已忽略）", it) }
+            }
+        }.onFailure { Log.w(TAG, "同步任务提交失败（已忽略）", it) }
+    }
+
+    /** 新增批注后异步推送（无同步管理器时直接返回，零网络行为）。 */
+    private fun enqueuePushAnnotations() {
+        val manager = syncManager ?: return
+        val id = effectiveKey
+        val executor = syncExecutor ?: return
+        // 同 [enqueuePushProgress]：shutdown() 之后提交会被拒绝，异常一并兜住。
+        runCatching {
+            executor.execute {
+                runCatching { manager.pushAnnotations(id) }
+                    .onFailure { Log.w(TAG, "推送批注失败（已忽略）", it) }
+            }
+        }.onFailure { Log.w(TAG, "同步任务提交失败（已忽略）", it) }
     }
 
     /**
@@ -316,14 +477,34 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
     // ---- 进度 ----
 
     private fun persistProgress(chapterIndex: Int) {
-        if (documentId.isBlank() || book == null) return
+        if (effectiveKey.isBlank() || book == null) return
         progressStore.save(
             ReadingProgress(
-                documentId = documentId,
+                documentId = effectiveKey,
                 chapterIndex = chapterIndex,
                 scrollY = scrollByChapter[chapterIndex] ?: 0,
             ),
         )
+        // 本地已写成功；远端推送统一交给 onStop（每页推送会导致请求爆炸，见推送方法的说明）。
+    }
+
+    // ---- 旧键清理 ----
+
+    /**
+     * 旧键一次性清理：进度与批注两个 prefs 文件各自用 `legacy_cleared` 标记控制，互不影响。
+     *
+     * 同名 prefs 文件由系统缓存为同一实例，故此处读标记与 Store 内部的读写看到同一份数据。
+     */
+    private fun clearLegacyOnce() {
+        clearLegacyOnceFor(ReadingProgressStore.PREFS_NAME) { progressStore.clearLegacy() }
+        clearLegacyOnceFor(AnnotationStore.PREFS_NAME) { annotationStore.clearLegacy() }
+    }
+
+    private fun clearLegacyOnceFor(prefsName: String, clear: () -> Int) {
+        val prefs = getSharedPreferences(prefsName, MODE_PRIVATE)
+        if (prefs.getBoolean(LegacyKeys.CLEARED_FLAG, false)) return
+        clear()
+        prefs.edit().putBoolean(LegacyKeys.CLEARED_FLAG, true).apply()
     }
 
     // ---- 批注 ----
@@ -387,12 +568,14 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
             .setPositiveButton(android.R.string.ok) { _, _ ->
                 annotationStore.add(
                     BookAnnotation(
-                        documentId = documentId,
+                        documentId = effectiveKey,
                         chapterIndex = chapterIndex,
                         selectedText = selectedText,
                         note = input.text.toString(),
                     ),
                 )
+                // 本地已落盘，再异步推送（失败静默，下次推送会因幂等去重补齐）。
+                enqueuePushAnnotations()
                 Toast.makeText(this, R.string.reader_annotation_saved, Toast.LENGTH_SHORT).show()
             }
             .setNegativeButton(android.R.string.cancel, null)
@@ -423,15 +606,25 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
     }
 
     companion object {
+        /** 日志标签（本类此前无日志，同步失败是首类需要记录的事件）。 */
+        private const val TAG = "EpubReader"
+
         const val EXTRA_EPUB_PATH = "extra_epub_path"
         const val EXTRA_EPUB_URI = "extra_epub_uri"
 
-        /** 以本地文件路径打开（示例 epub 用）。 */
-        fun intentForFile(context: Context, file: File): Intent =
-            Intent(context, EpubReaderActivity::class.java).putExtra(EXTRA_EPUB_PATH, file.absolutePath)
+        /** Intent 中携带服务端 uid 的键（可选；为空则退回内容哈希键）。 */
+        const val EXTRA_UID = "extra_reader_uid"
 
-        /** 以 content Uri 打开（SAF 选择的 epub 用）。 */
-        fun intentForUri(context: Context, uri: Uri): Intent =
-            Intent(context, EpubReaderActivity::class.java).putExtra(EXTRA_EPUB_URI, uri.toString())
+        /** 以本地文件路径打开（示例 epub 用）。[uid] 非空时写入 [EXTRA_UID]。 */
+        fun intentForFile(context: Context, file: File, uid: String? = null): Intent =
+            Intent(context, EpubReaderActivity::class.java)
+                .putExtra(EXTRA_EPUB_PATH, file.absolutePath)
+                .apply { if (uid != null) putExtra(EXTRA_UID, uid) }
+
+        /** 以 content Uri 打开（SAF 选择的 epub 用）。[uid] 非空时写入 [EXTRA_UID]。 */
+        fun intentForUri(context: Context, uri: Uri, uid: String? = null): Intent =
+            Intent(context, EpubReaderActivity::class.java)
+                .putExtra(EXTRA_EPUB_URI, uri.toString())
+                .apply { if (uid != null) putExtra(EXTRA_UID, uid) }
     }
 }

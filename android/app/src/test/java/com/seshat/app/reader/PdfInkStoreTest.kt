@@ -128,4 +128,33 @@ class PdfInkStoreTest {
         // 与 PdfAnnotationStore / PdfProgressStore 共用 prefs 文件，靠键前缀隔离
         assertEquals("pdf_reader", PdfInkStore.PREFS_NAME)
     }
+
+    @Test
+    fun clearLegacyStripsPrefixBeforeJudging() {
+        val hex = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        val uid = "0123456789ABCDEFGHJKMNPQRS"
+        val uri = "content://media/external/document/7"
+        val map = mutableMapOf(
+            PdfInkStore.key(hex) to "{}",
+            PdfInkStore.key(uri) to "{}",
+            PdfInkStore.key(uid) to "{}",
+            PdfInkStore.key("d") to "{}",
+            // 其它 store 前缀的旧键不归本 store 管
+            PdfProgressStore.key(hex) to "1:1",
+        )
+        val legacyAwareStore = PdfInkStore(
+            read = { map[it] },
+            write = { k, v -> map[k] = v },
+            keys = { map.keys.toSet() },
+            remove = { map.remove(it) },
+        )
+
+        assertEquals(2, legacyAwareStore.clearLegacy())
+
+        assertFalse(map.containsKey(PdfInkStore.key(hex)))
+        assertFalse(map.containsKey(PdfInkStore.key(uri)))
+        assertTrue(map.containsKey(PdfInkStore.key(uid)))
+        assertTrue(map.containsKey(PdfInkStore.key("d")))
+        assertTrue(map.containsKey(PdfProgressStore.key(hex)))
+    }
 }

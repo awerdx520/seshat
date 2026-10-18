@@ -39,10 +39,14 @@ data class PdfProgress(
  *
  * @param read  读取键对应字符串（不存在返回 `null`）。
  * @param write 写入键值对。
+ * @param keys  枚举该 prefs 文件的全部键（旧键清理用；默认空实现 → 清理为无操作）。
+ * @param remove 删除单个键（旧键清理用；默认空实现 → 清理为无操作）。
  */
 class PdfProgressStore(
     private val read: (String) -> String?,
     private val write: (String, String) -> Unit,
+    private val keys: () -> Set<String> = { emptySet() },
+    private val remove: (String) -> Unit = {},
 ) {
     /** 读取指定文档的进度，无记录或记录损坏时返回 `null`。 */
     fun load(docId: String): PdfProgress? = PdfProgress.decode(read(key(docId)))
@@ -52,8 +56,21 @@ class PdfProgressStore(
         write(key(docId), progress.encode())
     }
 
+    /**
+     * 一次性清理本 store 前缀下的旧键（M7 之前以 pdf uri 作 docId）。
+     *
+     * 幂等纯清理：多次调用结果一致；是否只跑一次由调用方用 `legacy_cleared` 标记控制。
+     * 旧数据**不迁移**（uid 映射需服务端 resolve，见 tech-debt）。
+     *
+     * @return 实际删除的键数量（未注入 [keys]/[remove] 时为 0）。
+     */
+    fun clearLegacy(): Int = LegacyKeys.clearByPrefix(PREFIX, keys, remove)
+
     companion object {
-        /** 进度存储键（PDF 命名空间，与 epub 隔离）。 */
-        fun key(docId: String): String = "pdf_progress_$docId"
+        /** 进度存储键前缀（PDF 命名空间，与 epub 隔离）。 */
+        private const val PREFIX = "pdf_progress_"
+
+        /** 进度存储键。 */
+        fun key(docId: String): String = "$PREFIX$docId"
     }
 }

@@ -1,7 +1,9 @@
 package com.seshat.app.reader
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /** [PdfProgress] / [PdfProgressStore] 的纯 JVM 单元测试。 */
@@ -64,5 +66,43 @@ class PdfProgressTest {
         store.save("docB", PdfProgress(9, 2L))
         assertEquals(PdfProgress(1, 1L), store.load("docA"))
         assertEquals(PdfProgress(9, 2L), store.load("docB"))
+    }
+
+    @Test
+    fun clearLegacyStripsPrefixBeforeJudging() {
+        val hex = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        val uid = "0123456789ABCDEFGHJKMNPQRS"
+        val uri = "content://media/external/document/7"
+        val map = mutableMapOf(
+            PdfProgressStore.key(hex) to "1:1",
+            PdfProgressStore.key(uri) to "2:2",
+            PdfProgressStore.key(uid) to "3:3",
+            PdfProgressStore.key("doc1") to "4:4",
+            // 其它 store 前缀的旧键不归本 store 管
+            PdfAnnotationStore.key(hex) to "[]",
+            "legacy_cleared" to "true",
+        )
+        val store = PdfProgressStore(
+            read = { map[it] },
+            write = { k, v -> map[k] = v },
+            keys = { map.keys.toSet() },
+            remove = { map.remove(it) },
+        )
+
+        assertEquals(2, store.clearLegacy())
+
+        assertFalse(map.containsKey(PdfProgressStore.key(hex)))
+        assertFalse(map.containsKey(PdfProgressStore.key(uri)))
+        assertTrue(map.containsKey(PdfProgressStore.key(uid)))
+        assertTrue(map.containsKey(PdfProgressStore.key("doc1")))
+        assertTrue(map.containsKey(PdfAnnotationStore.key(hex)))
+        assertTrue(map.containsKey("legacy_cleared"))
+    }
+
+    @Test
+    fun clearLegacyWithoutInjectedChannelsReturnsZero() {
+        // 未注入 keys/remove 的默认实现：不抛异常、返回 0（保持既有构造兼容）
+        val (store, _) = newStore()
+        assertEquals(0, store.clearLegacy())
     }
 }

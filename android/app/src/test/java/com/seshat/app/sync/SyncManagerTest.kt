@@ -3,11 +3,13 @@ package com.seshat.app.sync
 import com.seshat.app.reader.AnnotationStore
 import com.seshat.app.reader.BookAnnotation
 import com.seshat.app.reader.FakeSharedPreferences
+import com.seshat.app.reader.PdfProgress
 import com.seshat.app.reader.ReadingProgress
 import com.seshat.app.reader.ReadingProgressStore
 import java.time.OffsetDateTime
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -15,37 +17,63 @@ import org.junit.Test
 /** [SyncManager] 的纯 JVM 单测：fake REST + 内存 store（复用 FakeSharedPreferences）。 */
 class SyncManagerTest {
 
-    /** 内存版服务端：记录进度与批注，模拟 M1.4 服务端的往返行为。 */
+    /** 内存版服务端：记录进度与批注，模拟 M1.4 服务端的往返行为，并统计调用次数。 */
     private class FakeRestSyncApi : RestSyncApi {
         val progressByDoc = mutableMapOf<String, Progress>()
         val annotationsByDoc = mutableMapOf<String, MutableList<Annotation>>()
         var lastSetPosition: String? = null
+
+        /** 最近一次 setProgress 收到的 uid（用于断言 uid 原样透传）。 */
+        var lastSetUid: String? = null
+
+        /** 最近一次 setProgress 收到的 updatedAt；null 表示未传（服务端填当前时间）。 */
+        var lastSetUpdatedAt: String? = null
+
+        /** 四个入口的调用计数：空白 uid 场景下必须全为 0（零网络请求）。 */
+        var getProgressCalls = 0
+        var setProgressCalls = 0
+        var createAnnotationCalls = 0
+        var listAnnotationsCalls = 0
+
+        /** 四个入口的总调用次数。 */
+        val totalCalls: Int
+            get() = getProgressCalls + setProgressCalls + createAnnotationCalls + listAnnotationsCalls
+
         private var nextId = 1L
 
-        override fun getProgress(documentId: String): Progress? = progressByDoc[documentId]
+        override fun getProgress(uid: String): Progress? {
+            getProgressCalls++
+            return progressByDoc[uid]
+        }
 
-        override fun setProgress(documentId: String, position: String): Progress {
+        override fun setProgress(uid: String, position: String, updatedAt: String?): Progress {
+            setProgressCalls++
+            lastSetUid = uid
             lastSetPosition = position
-            val saved = Progress(documentId, position, "2026-10-11T10:00:00Z")
-            progressByDoc[documentId] = saved
+            lastSetUpdatedAt = updatedAt
+            val saved = Progress(uid, position, "2026-10-11T10:00:00Z")
+            progressByDoc[uid] = saved
             return saved
         }
 
-        override fun createAnnotation(documentId: String, location: String, text: String): Annotation {
+        override fun createAnnotation(uid: String, location: String, text: String): Annotation {
+            createAnnotationCalls++
             val annotation = Annotation(
                 id = nextId++,
-                documentId = documentId,
+                uid = uid,
                 location = location,
                 text = text,
                 createdAt = "2026-10-11T10:00:00Z",
                 updatedAt = "2026-10-11T10:00:00Z",
             )
-            annotationsByDoc.getOrPut(documentId) { mutableListOf() }.add(annotation)
+            annotationsByDoc.getOrPut(uid) { mutableListOf() }.add(annotation)
             return annotation
         }
 
-        override fun listAnnotations(documentId: String): List<Annotation> =
-            annotationsByDoc[documentId]?.toList() ?: emptyList()
+        override fun listAnnotations(uid: String): List<Annotation> {
+            listAnnotationsCalls++
+            return annotationsByDoc[uid]?.toList() ?: emptyList()
+        }
     }
 
     /** 组装 epub 侧的一套依赖（store 分别用独立 prefs，模拟真实文件中不同 prefs 名）。 */
@@ -59,28 +87,52 @@ class SyncManagerTest {
             EpubSyncMapper(),
         )
 
-        fun seedLocalProgress(chapter: Int, scrollY: Int) {
+        fun seedLocalProgress(
+            chapter: Int,
+            scrollY: Int,
+            uid: String = "doc-1",
+            updatedAt: Long = 111L,
+        ) {
             progressStore.save(
-                ReadingProgress("doc-1", chapterIndex = chapter, scrollY = scrollY, updatedAt = 111L),
+                ReadingProgress(uid, chapterIndex = chapter, scrollY = scrollY, updatedAt = updatedAt),
             )
         }
 
-        fun seedLocalAnnotation(chapter: Int, note: String) {
+        fun seedLocalAnnotation(chapter: Int, note: String, uid: String = "doc-1") {
             annotationStore.add(
-                BookAnnotation(documentId = "doc-1", chapterIndex = chapter, selectedText = "选中", note = note),
+                BookAnnotation(documentId = uid, chapterIndex = chapter, selectedText = "选中", note = note),
             )
         }
 
-        fun seedRemoteAnnotation(id: Long, location: String, text: String) {
-            rest.annotationsByDoc.getOrPut("doc-1") { mutableListOf() }
-                .add(Annotation(id = id, documentId = "doc-1", location = location, text = text))
+        fun seedRemoteAnnotation(id: Long, location: String, text: String, uid: String = "doc-1") {
+            rest.annotationsByDoc.getOrPut(uid) { mutableListOf() }
+                .add(Annotation(id = id, uid = uid, location = location, text = text))
         }
+    }
+
+    /**
+     * 直接返回固定进度的 store：用于构造真实 store 无法表达的边界值（如 `updatedAt = 0`，
+     * [ReadingProgressStore] 会在 0 时补当前时间戳）。
+     */
+    private class FixedProgressStore(
+        private val progress: ReadingProgress,
+    ) : LocalSyncStore<ReadingProgress, BookAnnotation> {
+        override fun loadProgress(uid: String): ReadingProgress = progress
+
+        override fun saveProgress(uid: String, progress: ReadingProgress) = Unit
+
+        override fun loadAnnotations(uid: String): List<BookAnnotation> = emptyList()
+
+        override fun addAnnotation(uid: String, annotation: BookAnnotation) = Unit
     }
 
     private fun fixture(): Fixture = Fixture()
 
     private val oneHourMillis: Long =
         OffsetDateTime.parse("2026-10-11T10:00:00Z").toInstant().toEpochMilli()
+
+    /** 26 位 Crockford Base32 形态的 uid（含大小写与数字），用于验证 uid 原样透传。 */
+    private val crockfordUid = "01J8Z3K7QW9VX2M4N6P8R0T5YB"
 
     // ---- 进度 ----
 
@@ -93,7 +145,7 @@ class SyncManagerTest {
 
         assertEquals("3:42", f.rest.lastSetPosition)
         assertEquals("3:42", server?.position)
-        assertEquals("doc-1", server?.documentId)
+        assertEquals("doc-1", server?.uid)
         assertEquals("3:42", f.rest.progressByDoc["doc-1"]?.position)
     }
 
@@ -102,6 +154,91 @@ class SyncManagerTest {
         val f = fixture()
         assertNull(f.manager.pushProgress("doc-1"))
         assertNull(f.rest.lastSetPosition)
+    }
+
+    @Test
+    fun pushProgressPassesUpdatedAtRfc3339() {
+        val f = fixture()
+        // 刻意用毫秒非 0 的值：本地 updatedAt 来自 System.currentTimeMillis()，几乎从不整秒。
+        // 若推送字符串带小数秒，服务端按 Go time.RFC3339 严格解析会判 invalid_argument（400）。
+        val millis = 1_600_000_000_123L
+        f.seedLocalProgress(chapter = 1, scrollY = 0, updatedAt = millis)
+
+        f.manager.pushProgress("doc-1")
+
+        val pushed = f.rest.lastSetUpdatedAt
+        assertNotNull("本地 updatedAt 已知时必须透传，否则服务端无法做 409 冲突检测", pushed)
+        // 「无小数秒」是硬约束（不是宽松的可解析性断言）：服务端只接受整秒 RFC 3339。
+        assertFalse("推送的时间戳不得含小数秒：$pushed", pushed!!.contains('.'))
+        assertTrue(
+            "推送的时间戳必须是只到秒的 UTC RFC 3339：$pushed",
+            Regex("""^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$""").matches(pushed),
+        )
+        // 秒精度往返：毫秒被截断，秒级值保持一致
+        assertEquals(1_600_000_000_000L, OffsetDateTime.parse(pushed).toInstant().toEpochMilli())
+    }
+
+    @Test
+    fun pushProgressSendsNullUpdatedAtWhenUnknown() {
+        // epub 的 ReadingProgressStore 在 updatedAt=0 时会补当前时间戳，无法构造「未知」场景，
+        // 故用固定值 store 直接注入 updatedAt=0 的进度（pdf 侧 store 亦原样保留 0）。
+        val rest = FakeRestSyncApi()
+        val manager = SyncManager(
+            rest,
+            FixedProgressStore(ReadingProgress("doc-1", chapterIndex = 1, updatedAt = 0L)),
+            EpubSyncMapper(),
+        )
+
+        manager.pushProgress("doc-1")
+
+        assertEquals("updatedAt 未知时仍应推送（仅跳过冲突检测）", 1, rest.setProgressCalls)
+        assertNull("updatedAt=0 视为未知，必须传 null", rest.lastSetUpdatedAt)
+    }
+
+    @Test
+    fun uidIsPassedThroughVerbatim() {
+        val f = fixture()
+        f.seedLocalProgress(chapter = 2, scrollY = 5, uid = crockfordUid)
+
+        f.manager.pushProgress(crockfordUid)
+
+        assertEquals("uid 必须原样透传，不得回退为本地旧 documentId", crockfordUid, f.rest.lastSetUid)
+        assertNotNull(f.rest.progressByDoc[crockfordUid])
+        assertNull("不得把请求挂到旧 documentId 键上", f.rest.progressByDoc["doc-1"])
+    }
+
+    @Test
+    fun blankUidSendsNoRequests() {
+        val f = fixture()
+        f.seedLocalProgress(chapter = 1, scrollY = 1)
+        f.seedLocalAnnotation(chapter = 1, note = "本地批注")
+
+        for (blank in listOf("", "  ")) {
+            assertNull(f.manager.pushProgress(blank))
+            assertNull(f.manager.pullProgress(blank))
+            assertTrue(f.manager.pushAnnotations(blank).isEmpty())
+            assertTrue(f.manager.pullAnnotations(blank).isEmpty())
+            assertEquals("空白 uid 意味着没有服务端身份，必须零网络请求", 0, f.rest.totalCalls)
+            // 本地数据也不得被触碰（pull 分支不应写入）。
+            assertEquals(1, f.progressStore.load("doc-1")?.chapterIndex)
+            assertEquals(1, f.annotationStore.list("doc-1").size)
+        }
+    }
+
+    @Test
+    fun syncDocumentWithBlankUidReturnsEmptySummaryWithoutRequests() {
+        val f = fixture()
+        f.seedLocalProgress(chapter = 1, scrollY = 1)
+        f.seedLocalAnnotation(chapter = 1, note = "本地批注")
+
+        val summary = f.manager.syncDocument("  ")
+
+        assertEquals("  ", summary.uid)
+        assertNull(summary.pushedProgress)
+        assertFalse(summary.pulledProgress)
+        assertEquals(0, summary.pushedAnnotations)
+        assertEquals(0, summary.pulledAnnotations)
+        assertEquals(0, f.rest.totalCalls)
     }
 
     @Test
@@ -137,7 +274,7 @@ class SyncManagerTest {
         val remote = f.rest.listAnnotations("doc-1")
         assertEquals(listOf("chapter-1", "chapter-2"), remote.map { it.location })
         assertEquals(listOf("第一条", "第二条"), remote.map { it.text })
-        assertEquals(listOf("doc-1", "doc-1"), remote.map { it.documentId })
+        assertEquals(listOf("doc-1", "doc-1"), remote.map { it.uid })
     }
 
     @Test
@@ -211,7 +348,7 @@ class SyncManagerTest {
 
         val summary = f.manager.syncDocument("doc-1")
 
-        assertEquals("doc-1", summary.docId)
+        assertEquals("doc-1", summary.uid)
         assertEquals("2:10", summary.pushedProgress?.position)
         assertTrue(summary.pulledProgress)
         assertEquals(1, summary.pushedAnnotations)
@@ -257,14 +394,28 @@ class SyncManagerTest {
     }
 
     @Test
+    fun epubMapperReportsLocalUpdatedAt() {
+        val mapper = EpubSyncMapper()
+        assertEquals(123L, mapper.updatedAt(ReadingProgress("doc-1", 1, 2, 123L)))
+        assertEquals("未知时间戳原样返回 0", 0L, mapper.updatedAt(ReadingProgress("doc-1", 0, 0, 0L)))
+    }
+
+    @Test
+    fun pdfMapperReportsLocalUpdatedAt() {
+        val mapper = PdfSyncMapper()
+        assertEquals(456L, mapper.updatedAt(PdfProgress(page = 3, updatedAt = 456L)))
+        assertEquals(0L, mapper.updatedAt(PdfProgress(page = 1, updatedAt = 0L)))
+    }
+
+    @Test
     fun pdfMapperEncodesPageAndMapsAnnotation() {
         val mapper = PdfSyncMapper()
-        assertEquals("12", mapper.encodePosition(com.seshat.app.reader.PdfProgress(page = 12, updatedAt = 5L)))
+        assertEquals("12", mapper.encodePosition(PdfProgress(page = 12, updatedAt = 5L)))
         val decoded = mapper.decodeProgress("doc-1", "12", "2026-10-11T10:00:00Z")
         assertEquals(12, decoded.page)
         assertEquals(oneHourMillis, decoded.updatedAt)
 
-        val remote = Annotation(id = 7, documentId = "doc-1", location = "page:3", text = "pdf 批注")
+        val remote = Annotation(id = 7, uid = "doc-1", location = "page:3", text = "pdf 批注")
         val local = mapper.fromRemote(remote)
         assertEquals(7L, local.id)
         assertEquals("page:3", local.location)
