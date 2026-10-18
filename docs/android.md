@@ -1,6 +1,6 @@
 # Android 客户端结构
 
-本文描述 Android 客户端（`android/`）的 UI 结构与模块边界；构建与验证命令见第 8 节。
+本文描述 Android 客户端（`android/`）的 UI 结构与模块边界；构建与验证命令见第 9 节。
 
 ## 1. 三区骨架（M9.1）
 
@@ -20,12 +20,12 @@
 
 | tab | Fragment | 承载内容 |
 |---|---|---|
-| 笔记 | `ui/NotesFragment` | org 树列表（层级/折叠/搜索）+ 笔记/Agenda 分段（M10.6 B4，见 §8）：搜索框、Agenda 段点击切 TODO、Agenda 段同步按钮；点条目进 `ui/NotesEditActivity` 编辑 |
+| 笔记 | `ui/NotesFragment` | 笔记库列表 + 笔记/Agenda 分段（M10.7，见 §8）：搜索框（只搜标题与标签）、刷新/选择目录；点文件行进 `ui/NoteViewActivity` 渲染阅读（可再进 `ui/NoteEditActivity` 编辑源码） |
 | 阅读 | `ui/ReaderFragment` | 书架网格（M10.6 B3：扫描 `filesDir/books/`、过滤/排序、点书进阅读器，见 §7）+ 底部 3 个入口：导入书籍、选择 EPUB、示例 EPUB（PDF 由书架点击打开） |
 
 阅读器（`reader/EpubReaderActivity`、`reader/PdfReaderActivity`）仍是**独立全屏 Activity**，由 Fragment 内的入口启动——沉浸阅读不占内容区，且保证既有实现零改动。`gtd/GtdActivity`（三 Spinner 过滤的旧版 GTD 页）自 M10.6 B4d 起**不再有 Fragment 入口**（Notes 的 Agenda 段取代），保留为可独立启动的 Activity。
 
-## 3. 设置页（M9.1 起，M9.2 扩展到 8 项）
+## 3. 设置页（M9.1 起，M9.2 扩展到 8 项，M10.7 加第 9 项）
 
 `settings/SettingsActivity` 承载全部配置：
 
@@ -39,9 +39,10 @@
 | 6 | 翻页模式（横向翻页 / 竖向连续滚动） | `reader_page_mode` | 下次打开阅读器 |
 | 7 | 连通性测试 | 无存储 | 按下即测（`GET /api/roots`——无入参、只读，200 即证明「地址可达 + 令牌有效」。M7 起批注端点按 uid 查询且要求 uid 已登记，客户端没有可用的已登记 uid，故不再用批注端点探测；未升级到 M7 的旧服务端没有该路由，返回 404 → `ServerError(404)`，设置页应提示「服务端版本可能过旧」，见 §11） |
 | 8 | 关于 | 无存储 | 静态（版本号 + 配置状态） |
+| 9 | 笔记外部目录（SAF 目录树，只读） | `notes_external_dir`（只存 URI 字符串） | 下次扫描笔记（选择/清除立即落盘，无需点保存；持久读权限由设置页 `takePersistableUriPermission` 持有，清除时先释放权限再清偏好） |
 
 - 存储**分两层**：机密与同步配置走 `SecurePrefs`（EncryptedSharedPreferences，见 `docs/security.md` §7）；
-  远程目录 / 主题 / 字号 / 翻页模式走 `settings/AppPreferences`（普通 `seshat_app_prefs.xml`，不加密、参与系统备份）。
+  远程目录 / 主题 / 字号 / 翻页模式 / 笔记外部目录走 `settings/AppPreferences`（普通 `seshat_app_prefs.xml`，不加密、参与系统备份）。
   因此**加密存储不可用时，主题与阅读偏好仍可用**。
 - 服务端地址**仅接受 https**；带 userinfo（`https://real.com@evil.com`）、查询参数或锚点的地址会被拒绝，长度上限 2048。
 - **服务端是可选配置**：地址留空即「仅本地使用」，此时仍可保存远程目录/字号/翻页模式等本地偏好；令牌可单独保存（`SettingsStore.saveTokenOnly`）。清空地址**不会**删除已保存的服务端配置（要删除请用「重置本地配置」）。地址留空时「测试连接」会提示先填地址。
@@ -57,7 +58,8 @@
 | `settings/` | 配置校验与持久化 | 不做网络 |
 | `sync/` | 传输层（REST / WebDAV）与安全存储 | 被 `settings` 与阅读器复用 |
 | `reader/` | epub / pdf 阅读与本地进度、批注 | 由 `ReaderFragment` 启动 |
-| `gtd/` | org 解析、过滤、树构建/搜索、行区间改写、GTD 视图与 org 上传（`NotesSync`） | 由 `NotesFragment` 使用；`GtdActivity` 保留可独立启动 |
+| `gtd/` | org 解析、过滤、树构建/搜索、行区间改写、GTD 视图与 org 上传（`NotesSync`） | 由 `NotesFragment`（Agenda 段）使用；`GtdActivity` 保留可独立启动 |
+| `notes/` | 笔记扫描（私有目录 + SAF）、denote 名解析、按 `NoteRef` 读文本；`notes/render/` 做 org / markdown → HTML | `render/` 子包纯 JVM，**不得**引用任何 Android 框架类（单测直接断言 HTML 字符串）；只收 `.org` / `.md`，SAF 只遍历一层 |
 | `importer/` | 书籍导入 | 由 `ReaderFragment` 调用 |
 
 ## 5. 阅读器渲染管线（M9.2）
@@ -121,27 +123,35 @@
 4. `covers/` 无自动清理：书籍删除后封面与元数据缓存滞留（无容量上限）。
 5. 切 tab 不刷新书架：`show/hide` 不改变生命周期、`onResume` 不触发；从阅读器返回会刷新（`onResume` 里按需重扫）。
 
-## 8. Notes（M10.6 B4）
+## 8. Notes（M10.7 起：笔记库 + 渲染阅读）
 
-`ui/NotesFragment` 由 M9.1 的占位视图改为真实 org 列表。解析在 `gtd/OrgParser`、建树与扁平化在 `gtd/OrgTree`（`OrgTreeBuilder`）、搜索匹配在 `gtd/OrgSearchMatcher`、Agenda 排序在 `gtd/GtdSorter`、单条写回在 `gtd/OrgEditor`；页面本身只负责后台线程、渲染与 Toast。
+笔记 tab 自 M10.7 起是**两屏结构**：`ui/NotesFragment` 是笔记库列表（一个文件一行），点行进 `ui/NoteViewActivity` 渲染阅读，阅读页菜单「编辑源码」再进 `ui/NoteEditActivity`。扫描/解析在 `notes/` 包，渲染在 `notes/render/`。
 
 | 项 | 实现 |
 |---|---|
-| 数据源 | `filesDir/notes/*.org`（首次从 `assets/sample.org` 复制到 `filesDir/notes/sample.org`），**只读第一个文件**（按文件名排序）。M10.6 B4d 起 `GtdActivity` 读**同一路径**，双副本分叉消除；旧 `filesDir/sample.org` 保留但**不再读取** |
-| 列表 | 层级缩进（按标题星号深度）+ 折叠（有子节点的行可点箭头展开/收起）；每行「状态徽标 + 标题 + `:tag:` 同行 + 正文首行摘要」（`item_note_entry`） |
-| 搜索 | 标题 + 正文的**包含匹配**（大小写不敏感），命中保留祖先链并**强制展开**；输入 250ms 防抖后重建列表 |
-| 分段 | 笔记（树列表）/ Agenda（不套 `GtdFilter`，全量条目经 `GtdSorter.byEarliestDate` 扁平按最早日期升序，点击切 TODO 状态）。同步按钮仅在 Agenda 段可见 |
-| 同步 | `gtd/NotesSync.upload(context, file)` 上传到 `/dav` 下的 `<remoteDir>/seshat/<文件名>`（Content-Type `text/plain; charset=utf-8`）；结果 `Ok(code, path)` / `NotConfigured` / `Failed(msg)`，**阻塞**调用，线程与 Toast 由页面负责。与 `GtdActivity` 共用同一实现 |
-| 编辑页 | `ui/NotesEditActivity`：标题 / 正文 / TODO 状态可编辑并写回（`OrgEditor` 行区间改写）；优先级、计划、截止、标签、属性**只读展示** |
+| 数据源 | ① 私有目录 `filesDir/notes/`（默认，首启从 `assets/sample.org` 复制一份示例；**可写**）；② 设置页「笔记外部目录」选定的 SAF 目录树（`AppPreferences` 存 URI 字符串，读权限由设置页 `takePersistableUriPermission` 持久持有；**只读**）。两处**只收 `.org` / `.md`**（扩展名忽略大小写），不支持的文件静默跳过 |
+| 扫描 | `notes/NoteScanner`：`scanLocal` 只用 `java.io.File`（纯 JVM 可测），`scanSaf` 走 framework `DocumentsContract` 查询子文档（**不引 `androidx.documentfile`**）。两者共用「扩展名过滤 + 标题回退链 + 按修改时间倒序」规则；目录不存在或授权失效 → 空表，不抛 |
+| 标题回退链 | denote 文件名（`20240101T120000--标题__tag1_tag2.org`，`notes/DenoteName`）> 文件首个 heading > 文件名去扩展名。denote 命中时**不读文件内容**（省一次 IO，SAF 读流更贵） |
+| 列表行 | 「标题（单行省略）+ 元信息（`ORG`/`MD` · `yyyy-MM-dd HH:mm`）+ denote 标签 `:a:b:`」（`item_note_file`；无标签隐藏标签，provider 不给修改时间时显示 `-`） |
+| 搜索 | 只匹配**标题与标签**的包含（大小写不敏感），**不搜正文**；250ms 防抖后重建列表 |
+| 渲染（org） | 标题 1–5 级（`******` 以上按 h5，剥离 TODO 关键字 / `[#A]` 优先级 / 末尾 `:tag:`）、TODO 着色、行内 `*粗*` `/斜/` `_下_` `~代码~` `=等宽=` `+删除+`、有序/无序列表（2 空格缩进一层）、`#+BEGIN_SRC` / `BEGIN_EXAMPLE` / `BEGIN_QUOTE` 块、`[[link]]`、`:PROPERTIES:` 抽屉折叠为 `<details>`、`#+TITLE:` 等关键字行隐藏、`DEADLINE:`/`SCHEDULED:`/`CLOSED:` 计划行保留可见 |
+| 渲染（markdown） | ATX 1–6 级（闭合 `##` 剥掉、词内 `C#` 保留）、`**粗**` `*斜*` `` `代码` `` `~~删除~~`、列表、围栏代码块（内容只转义不解析；未闭合的围栏把余下内容全当代码）、`[t](u)`、`>` 引用、`---` / `***` / `___` 水平线 |
+| 安全顺序 | `notes/render/RenderSupport`：**先转义**（`& < > " '`）→ 抽出代码占位 → 抽出链接占位（URL 含 `/`，必须早于斜体规则）→ 替换强调 → 还原占位；占位符用 `\u0001` 控制字符，不会被强调正则命中。链接只允许 `http` / `https` / `mailto`，**其它 scheme 降级为纯文本**（不生成 `<a>`） |
+| 外壳与样式 | `notes/render/HtmlDocument` 只拼接固定 DOCTYPE / head / 内联 CSS（除 body 片段外不含任何源自笔记的字符）；`prefers-color-scheme` 提供亮/暗两套配色，代码块横向滚动不换行 |
+| 阅读页安全 | `NoteViewActivity` 的 `WebView`：`javaScriptEnabled=false`、`allowFileAccess=false`、`allowContentAccess=false`、`domStorageEnabled=false`，不注册 `addJavascriptInterface`；`loadDataWithBaseURL(null, …)` 载入；缩放可用（内置缩放控件隐藏） |
+| 编辑 | 阅读页菜单「编辑源码」→ `NoteEditActivity`：整份源码纯文本编辑、后台读写、**保留原行尾风格**（原文 CRLF 且改后只剩 `\n` 时写回前恢复 CRLF）；保存成功 `setResult(RESULT_OK)` 后阅读页重渲染，失败只 Toast 不退出（不丢输入）。**仅本地文件**（`NoteRef.LocalFile`）显示该菜单，SAF 文档只读 |
+| Agenda 分段 | 汇总**所有来源** org 文件的条目（`OrgParser` → `GtdSorter.byEarliestDate` 按最早日期升序），沿用 `NotesListAdapter`；笔记/Agenda 切换时才真正换 adapter。**只读**：跨文件写回需要「条目 → 文件」反查表，本版不做，点击只给提示（切 TODO 请在笔记内编辑或用 `gtd/GtdActivity`） |
+| 刷新 | 切分段、点「刷新」、从设置页/阅读页返回（`onResume`）都重新全量扫描；「选择目录」按钮跳设置页。扫描在后台单线程 executor 上执行，视图销毁时 `shutdownNow` |
 
 **已知限制**：
 
-1. 只读 `filesDir/notes/` 下的**第一个** org 文件，多文件切换未做。
-2. 搜索不含标签（`:tag:`）与其它 metadata；命中视图强制展开，此时点折叠箭头无反馈。
-3. 折叠状态以「条目在**当前解析结果**中的下标」为键，重新解析后可能漂移（已按当前树裁剪失效下标）。
-4. 列表无 `DiffUtil`：折叠 / 搜索 / 分段切换都是整表重绑，滚动位置会跳。
-5. 编辑页填写的新标题若含 `TODO`、`:tag:`、`[#A]`，保存后会被重新解析成语义（不是纯文本标题）。
-6. 正文摘要取首行，示例文档首行常是 `DEADLINE:` 这类计划行，摘要信息量低。
+1. 渲染只覆盖语法子集：**表格按普通文本**、图片不内联、无大纲；`#+BEGIN_SRC` 缺 `#+END_SRC` 会把余下全文吞进代码块。
+2. denote 未命中时要读文件首个 heading，**逐文件 IO**（未限读前 N KB，大文件全量读）。
+3. 大目录首次扫描慢：私有 + SAF 全量、**无缓存/无增量**，`onResume` 每次重扫；Agenda 段只解析前 50 个 org 文件。
+4. 正文不可搜：搜索只匹配标题与标签。
+5. SAF 授权失效**静默降级**为「没有外部笔记」，无用户提示（见 `openspec/tech-debt.md`）。
+6. SAF 只遍历所选目录**第一层**，不递归子目录；需要多层时再次添加目录。
+7. 无 `DiffUtil`：增删/搜索/分段切换都是 `notifyDataSetChanged` 整表重绑；阅读页 `baseUrl=null` 使相对链接与图片失效。
 
 ## 9. 构建与验证
 
@@ -166,7 +176,7 @@ M7 把服务端的文档身份从「客户端自定字符串」改成「服务�
 
 ## 11. 与 M7 服务端对接（M9.2 A 批）
 
-第 9 节描述的「已知不一致」是本批改造前的状态（保留作背景）；M9.2 A 批已解决 Android 侧：不再把内容哈希当 uid 发送，而是由服务端解析出 uid，无 uid 时完全离线。本批**只做只读协议 + 索引 + 增量 + 阅读器 uid 接入**，文件同步（书架）留 B 批。
+第 10 节描述的「已知不一致」是本批改造前的状态（保留作背景）；M9.2 A 批已解决 Android 侧：不再把内容哈希当 uid 发送，而是由服务端解析出 uid，无 uid 时完全离线。本批**只做只读协议 + 索引 + 增量 + 阅读器 uid 接入**，文件同步（书架）留 B 批。
 
 ### 11.1 uid 的来源与解析
 

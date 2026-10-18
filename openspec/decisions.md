@@ -299,3 +299,11 @@
 **理由**：消除双副本分叉（Notes 写 `filesDir/notes/sample.org`、GTD 写 `filesDir/sample.org`，两边改动互不可见）；下标 id 零成本且与 `OrgEditor` 的行号约定同源（解析顺序 = headline 顺序，一一对应）；metadata 写回需重写 headline 与计划行，收益低风险高（见 `openspec/tech-debt.md` 的 headline 规范化条目）。
 
 **代价**：① 重新解析后折叠状态可能漂移（已用 `pruneCollapsed` 裁剪失效下标，仍无法跟随条目移动）；② 单文件限制（只读第一个 org，多文件切换未做）；③ metadata 编辑需用户在外部编辑器完成。
+
+## 2026-10-18 · M10.7 笔记库与渲染
+
+**决策**：Notes 改为「多文件笔记库 + 渲染阅读」；渲染用 WebView + 自研 org/markdown → HTML 渲染器（零新增依赖）；数据源为私有目录 + 可选 SAF 外部目录（framework `DocumentsContract`，不引 `androidx.documentfile`）；编辑走新增的文件级 `NoteEditActivity`，不复用 entry 级编辑器。
+
+**理由**：用户笔记是整份 org/md 文档（部分无 TODO），需要阅读而非任务管理；WebView 的 CSS 能力可同时服务两种语法且排版可控；自研渲染器避免引入 markdown 库并保证「先转义再解析」的安全顺序。
+
+**代价**：渲染只覆盖语法子集（无表格/图片/大纲）；SAF 只遍历一层；Agenda 降级为只读；多文件逐个解析无缓存。

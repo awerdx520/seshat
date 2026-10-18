@@ -616,3 +616,48 @@
 - 现状：列表行的正文摘要取 `OrgEntry` body 的首个非空行。
 - 影响：org 文档里正文常以 `DEADLINE:` / `SCHEDULED:` 计划行开头，摘要就显示成「DEADLINE: <2026-10-20 周三>」，信息量低且误导（用户以为标题被换掉了）。
 - 建议：摘要跳过 `DEADLINE:` / `SCHEDULED:` / `CLOSED:` / `:PROPERTIES:` 等结构行，取首个纯文本行；无纯文本行时回退首个非空行。
+
+## Agenda 段点击降级为只读、笔记列表取消单文件同步（M10.7 T7，2026-10-19）
+- 现状：`NotesFragment` 改为「一个文件一行」的笔记库后，Agenda 段的行来自多个 org 文件的合并解析，`VisibleRow.node.index` 用全局计数器而非文件内下标（跨文件下标会冲突），点击已无法定位回原文件，因此降级为 Toast 提示；同时原「同步当前 org 文件」按钮随 `localOrgFile` 一并移除。
+- 影响：B4 的「Agenda 段点击切换 TODO 状态」与「单文件上传」两项能力在当前 UI 中不可达（状态改动只能进阅读页源码编辑；上传入口只剩 `GtdActivity`）。
+- 建议：给 `NoteItem` 建立 `entry → NoteItem` 的反查表（解析时记录每个条目的来源文件与文件内下标），点击时按「来源 item + 文件内下标」写回；同步按钮改为「同步全部本地 org」或按列表项长按上传，并补 `OrgEditor` 的跨文件算例。
+
+## 渲染保真度边界：表格按普通文本、图片不内联、org 语法子集（M10.7，2026-10-18）
+- 现状：`notes/render/OrgHtmlRenderer` / `MarkdownHtmlRenderer` 只覆盖「笔记阅读够用」的子集——`|a|b|` 表格按普通段落输出、图片语法不内联（不产出 `<img>`）、无大纲与跳转；`#+BEGIN_SRC` 缺少 `#+END_SRC` 时块扫描跑到文件末尾，余下全文被吞进代码块。
+- 影响：含表格/图片的笔记排版退化（信息可用但不可读）；一个漏写的 `#+END_SRC` 会让整篇后半段的标题、列表全变成代码块原文，用户会误以为笔记损坏。
+- 建议：表格后续可选渲染为 `<table>`（仍是纯 JVM 字符串拼接，可单测）；图片先只支持本地相对路径（需要 `baseUrl`，与「`baseUrl=null`」条目联动）；`BEGIN_SRC` 未闭合时降级为「按普通段落输出并补一行提示」，不要吞余下内容。
+
+## denote 解析失败时读文件首个 heading（逐文件 IO，未限读前 N KB）（M10.7，2026-10-18）
+- 现状：`NoteScanner` 的标题回退链是「denote 文件名 → 文件首个 heading → 文件名」，denote 命中可省一次 IO；未命中时为了找第一个 heading 会 `readText()`**整个文件**（`NoteReader` 无长度上限）。
+- 影响：非 denote 命名的大文件（数十 MB 的日志式 org）在扫描阶段被整份读入内存；SAF 目录下每个文件都要 open 一次流，首次扫描明显变慢、且有 OOM 风险。
+- 建议：改为「限读前 N KB（如 64 KB）」的分块读取，只解析到首个 heading 即停；本地文件用 `BufferedReader` 逐行读、SAF 用 `openInputStream` + 前缀缓冲，两者共用同一「读到 heading 就停」的纯函数。
+
+## 大目录扫描成本：全量、无缓存/增量，`onResume` 每次重扫（M10.7，2026-10-18）
+- 现状：`NotesFragment.loadNotes()` 每次都把私有目录 + SAF 目录**全量**扫一遍（`listFiles` / `DocumentsContract` 查询 + 逐文件标题回退），无缓存、无增量；`onResume` 无条件触发（从设置页、阅读页返回都重扫）；Agenda 段另需对所有 org 文件逐个 `read + parse`，目前用「只取前 50 个（按修改时间倒序）」止血。
+- 影响：笔记库达到数百文件后，每次返回笔记 tab 都有可见延迟；大 SAF 目录（云盘 provider）查询本身就要秒级，且 Agenda 段的前 50 个文件不一定是用户关心的那 50 个（无「全部 TODO」保证）。
+- 建议：引入基于 `(name, size, lastModified)` 的扫描缓存（内存 Map 即可，进程内有效），未变更文件跳过；Agenda 改为按需懒加载 + 增量解析（记录每文件的 `lastModified` 与解析结果）；`onResume` 改为「仅在外部目录设置变更或阅读页返回 `RESULT_OK` 时重扫」。
+
+## 正文搜索未做（只搜标题与标签）（M10.7，2026-10-18）
+- 现状：`NotesFragment.filterNotes` 只对 `NoteItem.title` 与 `NoteItem.tags` 做包含匹配，**不读正文**。
+- 影响：用户记得某段内容却记不住标题/标签时搜不到；B4 的「标题 + 正文」搜索能力实际退化（虽然 B4 只覆盖单文件）。
+- 建议：正文搜索做成显式入口（搜索框旁一个「含正文」开关）而非默认行为——默认全量全文搜索在大目录 + SAF 上的成本不可接受；实现上复用渲染器的文本提取（去掉标记）后建轻量倒排或直接线性扫（数百文件量级线性扫足够），仍保持纯 JVM 可测。
+
+## SAF 授权失效静默降级为「无外部笔记」，无用户提示（M10.7，2026-10-18）
+- 现状：`NoteScanner.scanSaf` 捕获 `SecurityException` 后返回空表；`NotesFragment` 把「外部目录读取失败」与「外部目录为空」视为同一状态（都只是没有外部笔记）。
+- 影响：用户撤销授权、换机恢复备份、或 provider 卸载后，外部笔记列表直接消失且没有任何提示，容易被当成「笔记丢了」（实际上文件仍在原目录）。
+- 建议：让 `scanSaf` 返回结果类型（`Ok(items)` / `PermissionLost` / `Failed(msg)`），UI 在 `PermissionLost` 时显示一条可点击的提示条（「外部目录授权已失效，点此重新选择」→ 跳设置页）；`Failed` 只记日志 + 提示「部分外部笔记读取失败」。
+
+## SAF 只遍历一层（不递归子目录）（M10.7，2026-10-18）
+- 现状：`scanSaf` 用 `buildChildDocumentsUriUsingTree` 查询所选树的直接子文档，遇到 `MIME_TYPE_DIR` 直接跳过，**不递归**。
+- 影响：用户在外部目录里按文件夹组织笔记时，子目录里的笔记完全不出现，看起来像「只同步了一部分」。
+- 建议：加一层可选递归（深度上限如 3 层）并在设置页说明；递归前先评估 provider 的查询成本（云盘 provider 每层都是一次远程调用），可用「用户显式开启 + 扫描进度提示」的方式权衡。
+
+## `NotesEditActivity` 暂无调用方（entry 级编辑器成死代码）（M10.7，2026-10-18）
+- 现状：M10.7 把编辑入口改为文件级 `NoteEditActivity`（整份源码纯文本编辑），B4 的 entry 级 `ui/NotesEditActivity`（`OrgEditor` 行区间改写）**已无任何启动点**（`AndroidManifest` 仍导出为应用内 Activity，代码与单测保留）。
+- 影响：`gtd/OrgEditor` 的唯一 UI 消费方消失，后续改动它时无法通过手工路径验证；文件体积与维护成本空转，新人容易误以为有两条编辑路径可用。
+- 建议：二选一收口——① 删除 `NotesEditActivity` 与 `OrgEditor`（连同单测），把「结构化编辑」作为未来需求重新设计；② 在渲染页长按标题项提供「编辑此条」入口，让 entry 级编辑器重新有调用方。在收口前先不动代码，只在文档标注现状（`docs/android.md` §8 已注明 SAF 只读、编辑走源码编辑）。
+
+## 无 `DiffUtil`（`NoteFileAdapter` 整表重绑）与 `baseUrl=null` 使相对链接/图片失效（M10.7，2026-10-18）
+- 现状：① `NoteFileAdapter.submit()` 用 `notifyDataSetChanged()` 整表重绑（与 `NotesListAdapter` 一致，搜索输入、刷新、扫描回调都全表刷）；② `NoteViewActivity` 用 `loadDataWithBaseURL(null, …)` 载入 HTML，页面内相对路径链接与图片没有可解析的基点。
+- 影响：① 列表刷新时滚动位置与动画丢失，长列表有可见跳动；② 笔记里的相对链接（`./other.org`）与本地图片（`images/x.png`）点击/加载都失效（白屏或 `ERR_UNKNOWN_URL_SCHEME`）。
+- 建议：① 两个 adapter 统一改用 `ListAdapter` + `DiffUtil.ItemCallback`（`NoteItem` 不可变，id 可用 `ref.toString() + modifiedAt`）；② 若要支持本地图片，用 `loadDataWithBaseURL(file://<父目录>/)` 提供基点并保留 `allowFileAccess=false` + `allowContentAccess=false` 的收紧策略（WebView 对 baseUrl 的 `file://` 读取需实测），或改为在渲染阶段把相对图片路径重写成 `content://` 并单独校验。

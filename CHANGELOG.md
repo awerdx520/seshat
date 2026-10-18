@@ -49,6 +49,7 @@
 - Android 笔记列表（M10.6 B4）：`ui/NotesFragment` 由占位视图改为真实 org 列表——`filesDir/notes/*.org` 经 `OrgParser` 解析 + `OrgTreeBuilder` 建树，按层级缩进展示、可折叠；每行为「状态徽标 + 标题 + `:tag:` 同行 + 正文首行摘要」（`item_note_entry`）；顶部搜索框对标题 + 正文做大小写不敏感的包含匹配（`OrgSearchMatcher`），命中保留祖先链并强制展开，输入 250ms 防抖；分段「笔记 / Agenda」——Agenda 段用 `GtdSorter.byEarliestDate` 扁平按最早日期排序，点击切换 TODO 状态。
 - Android 笔记编辑页（M10.6 B4）：新增 `ui/NotesEditActivity`，标题 / 正文 / TODO 状态可编辑并写回 org（`OrgEditor` 行区间改写）；优先级、计划、截止、标签、属性**只读展示**。
 - 抽取 `gtd/NotesSync` 并统一 GTD 数据源（M10.6 B4）：新增 `NotesSync.upload(context, file): NotesSyncResult`（`Ok` / `NotConfigured` / `Failed`）——阻塞、无 Toast、不建线程，经 `SecurePrefs` 取地址与令牌后 `PUT` 到 `remoteDir/seshat/<文件名>`；`GtdActivity` 与 Notes 的 Agenda 段共用该实现，删除重复的 `readSyncConfig()` / `joinPath()`。`GtdActivity` 改读 `filesDir/notes/sample.org`，与 Notes 列表**同一份文件**，旧 `filesDir/sample.org` 保留但不再读取。
+- Android 笔记库与渲染阅读（M10.7，2026-10-18）：① **多文件笔记库列表**——`notes/NoteScanner` 扫私有目录 `filesDir/notes/` 与设置页可选的外部目录（SAF tree URI + 持久读权限），一个 `.org`/`.md` 文件一行（标题 + 格式/修改时间 + denote 标签），标题回退链「denote 文件名 > 首个 heading > 文件名」；② **渲染阅读页**——新增 `ui/NoteViewActivity`，`notes/render/OrgHtmlRenderer` 与 `MarkdownHtmlRenderer` 自研把文本转 HTML（先转义再匹配行内标记、代码块只转义不解析、链接走 `http`/`https`/`mailto` 白名单），`HtmlDocument` 提供统一内联 CSS（`prefers-color-scheme` 亮/暗），WebView 关闭 JS 与 file/content access；③ **文件级源码编辑器**——新增 `ui/NoteEditActivity`，整份源码纯文本编辑、后台读写、保留原行尾风格，仅对可写本地文件显示入口；④ 设置页新增「笔记外部目录」（SAF 选择 + 持久授权 + 清除）。单测 468 → 562 例，**零新增依赖**（不引 `androidx.documentfile`、markdown 库）。**渲染效果需真机验收（本机无 AVD / 设备）。**
 
 ### 变更
 
@@ -67,6 +68,7 @@
 - **破坏性**（M11.13）：删除 `seshat-reader-annotation-page-size` 与批注列表的 `]` / `[` 翻页键；用户配置中引用该变量不再生效。`seshat-reader-translate-show-source` 默认值由 `nil` 改为 `t`（面板默认显示原文，内容更高）。
 - 状态 API 由文档标识改为 uid（Android，M9.2 A 批，2026-10-18）：`GET|PUT /api/progress/{uid}`、`GET /api/annotations?uid=`、`POST /api/annotations` 请求体字段，以及 `RestClient` / `SyncManager` 的参数名与 DTO 字段统一改名（`@SerialName("uid")`，无残留旧字段）；本地进度/批注的 Store 键在「有 uid」时改用 uid。
 - 连通性探测探针改为 `GET /api/roots`（Android，M9.2 A 批，2026-10-18）：原探针打批注端点并带自造的文档标识，M7 起批注按 uid 查询且要求 uid 已登记，客户端没有可用的已登记 uid，导致对 M7 服务端**恒失败**；`/api/roots` 无入参、只读、不写数据，200 即证明地址可达 + 令牌有效。旧服务端（无该路由）返回 404 → `ServerError(404)`，设置页应提示版本可能过旧。
+- 笔记 tab 改为「笔记库 + 渲染阅读」（Android，M10.7，2026-10-18）：原 B4 的「**单** org 文件 TODO 树」形态改为「多文件笔记库列表 + 渲染阅读页」——列表按文件列举所有 `.org`/`.md`，点行进渲染页；**笔记搜索改为只搜标题与标签**（不再搜正文，外部目录全文搜索成本高）；`Agenda` 段改为**跨文件 TODO 汇总**（所有来源 org 文件的条目并集，按最早日期升序）并**降级为只读**（点击提示，切 TODO 需在笔记内编辑或用 `GtdActivity`）；笔记段的「同步单个 org 文件」按钮随之移除（上传入口只剩 `GtdActivity`），`ui/NotesEditActivity` 暂保留但当前无调用方。
 
 ### 破坏性
 
