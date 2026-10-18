@@ -95,7 +95,7 @@ M0–M6 已完成并归档，见 `openspec/completed/personal-notes-system.md`�
 | 子项 | 内容 |
 |---|---|
 | M9.1 | 三区 UI 骨架（工具栏 / 内容区 / 底部 Notes·Reader 双 tab）+ 设置页 ✅ 完成（2026-10-18），见 openspec/completed/2026-10-18-m9.1-android-shell.md |
-| M9.2 | 数据源接入（uid + 增量 + 本地缓存 + 按需下载电子书）——A 批（Android 接 M7：uid 化 + 只读协议 + 索引 + 增量拉取）T0 前置验证已通过（2026-10-18），T1–T6 待实施，见 openspec/active/2026-10-18-m9.2-android-m7-client.md；B 批（文件同步）未开工 |
+| M9.2 | 数据源接入（uid + 增量 + 本地缓存 + 按需下载电子书）——A 批（Android 接 M7：uid 化 + 只读协议 + 索引 + 增量 + 阅读器 uid 接入）✅ 完成（2026-10-18），见 openspec/completed/2026-10-18-m9.2-android-m7-client.md；B 批（文件同步，支撑书架）待做 |
 | M9.3 | Notes：orgzly 风格列表 / 搜索 / 展开 / 编辑——计划已就绪（与书架、阅读器对齐合并为 M10.6），B4 待实施 |
 | M9.4 | GTD：agenda 视图增强（M4 基础上）——计划已就绪（与书架、阅读器对齐合并为 M10.6），B4 待实施 |
 | M9.1b | 设置项扩展（8 项）+ tab 图标 + 阅读器连续滚动（PDF/EPUB 竖向零间隙）✅ 完成（2026-10-18），见 openspec/completed/2026-10-18-m9.2-settings-and-reader-scroll.md（编号用 M9.1b 以免与上表已有的 M9.2「数据源接入」冲突） |

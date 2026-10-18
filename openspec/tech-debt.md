@@ -460,3 +460,58 @@
 - 现象：`internal/api/files.go` 的 `activeContentExts` 是一张**枚举式**黑名单（`.html`/`.htm`/`.xhtml`/`.shtml`/`.ehtml`/`.xht`/`.svg`/`.svgz`/`.xml`/`.xsl`/`.js`/`.mjs`/`.mht`/`.rdf`）。判定只按 `path.Ext` 精确匹配，名单之外的扩展名一律按「被动内容」内联返回（带按扩展名推断的 `Content-Type`）。
 - 影响：**漏项即形成 XSS 缝隙**。Go 内建 MIME 表会把 `.shtml`/`.ehtml` 映射为 `text/html`、`.xht` 映射为 `application/xhtml+xml`——这类扩展名一旦漏在名单外，服务端就会**显式声明**主动类型，`nosniff` 不阻止显式声明的类型被当作 HTML 执行，于是 `PUT` 一个 `evil.shtml` 再接 `GET /api/files/evil.shtml` 即可在服务端源下执行脚本（可读 `localStorage` 里的令牌）。本轮已补齐 6 项，但「下次 Go 新增映射」「其它厂商扩展名（如 `.xhtmlz`、`.htc`）」仍会重复此问题；WebDAV 出口连这层强制下载都没有。
 - 建议：反转为「安全类型**白名单**才内联」——只有明确的被动类型（文本笔记、图片、PDF 等）按其推断类型返回，其余一律 `application/octet-stream` + `attachment`；同时 WebDAV 侧对同一份名单同样强制 `attachment`（当前 `Content-Type` 由客户端自行解释，浏览器在 Basic 认证后可能按扩展名内联渲染），并把名单抽成单一真源供 REST / WebDAV 共用。
+
+## 阅读器进度推送仅在 onStop 触发一次（M9.2 T4c，2026-10-18）
+- 现状：Android 阅读器（EPUB / PDF）的进度推送只在 `onStop` 触发一次，没有定时/防抖队列；`lastPushedPosition` 的同值跳过只是防抖，不是严格节流。
+- 影响：进程被强杀（从最近任务划掉、系统低内存回收）时 `onStop` 可能不执行，最后一次位置可能不同步；下次打开时若本地有进度不会自动拉取远端（见 M9.2 A 批的「本地无进度才 pull」限制），远端会停留在旧值。
+- 建议：改为「离开时合并推送 + 失败重试」的后台任务（如 WorkManager 单次任务），并把 pull 策略从「本地无进度才拉」升级为「比较 `updated_at` 后取较新者」。
+
+## `ResourceIndex` 缓存无锁（M9.2 A 批代码审查，2026-10-18）
+- 现状：`ResourceIndex` 用一个惰性 `cached` 文档字段做读写缓存，读写全程加锁为 0 次；A 批明确假定「单线程串行调用」（同步流程在单一协程/线程内跑完），KDoc 已标注该前提。
+- 影响：一旦 B 批接线让同步流程跨线程（如 `SyncEngine.pull` 在 IO 线程、书架 UI 在主线程查 `findByUid`），`cached` 的「读—改—写」会互踩：条目丢失、`cursor` 回退，甚至整份文档被旧快照覆盖；`SharedPreferences` 自身的线程安全救不了这个内存缓存。
+- 建议：B 批接线时二选一——给 `ResourceIndex` 补 `@Synchronized` / `ReentrantLock`（简单，但与 IO 落盘同锁会拉长临界区），或强制所有访问串行到单一 dispatcher（`Dispatchers.Main.immediate` 或单线程 IO），并在文档里写成不变量 + 加一个跨线程测试。
+
+## 索引仍是单文件全量重写（M9.2 A 批代码审查，2026-10-18）
+- 现状：`upsertAll` 已把「一批 create/update 一次落盘」的写放大消掉（原逐条 `upsert` 是 O(N²)），但 `rename` / `markDeleted` / `setCursor` 依然是**单次全量重写**：一次 bootstrap 若被 rename/delete 事件打散成很多段，写盘次数仍随事件数增长。
+- 影响：面向「数千条资源 / 数百 KB」设计，条目上万后每次重写都要序列化整份 JSON 并 `apply()` 到 `SharedPreferences`，主线程外也会明显卡顿，且 GC 压力随条目数线性上涨。
+- 建议：万级以上（或需要按 `root`/`path` 索引查询、按 root 局部更新）时迁移到 Room/SQLite：`entries(uid PRIMARY KEY, root, path, blob, size, mtime, deleted, dirty)` + 单行 `cursor` 表，`upsertAll` 走单事务；迁移前可在 `rename`/`markDeleted` 上先做「批量版本」（同 `upsertAll` 思路）。
+
+## 离线键仍是旧形态，与 legacy 键无法区分（M9.2 A 批代码审查，2026-10-18）
+- 现状：无 uid（离线未登记）时，Store 的键仍是旧形态——32 位 hex 内容哈希，或含 `:` 的 uri 形态；这类键与迁移前的 legacy 键**在形态上完全一致**，无法从键本身判断「这是合法离线数据」还是「迁移遗留垃圾」。
+- 影响：清理逻辑的安全性完全依赖 `legacy_cleared` 这一次性标记。标记一旦被清除（用户清数据后重装、迁移中途崩溃后重跑、或有人手动清 prefs），下次启动就会把合法的离线进度/批注当成 legacy 一并删掉——**静默丢用户数据**，且无任何日志线索。
+- 建议：给离线键加可识别前缀（如 `local:` 或 `offline-<hash>`）并保留旧形态的**只读兼容读取**；`legacy_cleared` 从「布尔标记」升级为「带时间的版本号」，清理只针对版本低于当前迁移版本的键，且清理前记录一条将被删除的键数量日志。
+
+## `ConnectivityTester` 对旧服务端只报 `ServerError(404)`（M9.2 A 批代码审查，2026-10-18）
+- 现状：连接测试打的是 `/api/roots`；旧版本服务端没有该路由，返回 404，客户端统一映射为 `ServerError(404)`，与「路由存在但路径写错」无法区分。
+- 影响：用户升级 Android 端后连旧服务端，只会看到一条语焉不详的 404 错误，排查方向容易跑偏（去查 URL/令牌，而真实原因是服务端版本过旧）。
+- 建议：设置页对 `ServerError(404)` 给出专门文案「服务端版本可能过旧（需支持 `/api/roots`）」，并优先改用带版本号的探测端点（如 `/api/health` 或 `/api/version`）判断兼容性；条件允许时返回明确的状态码/错误码而非裸 404。
+
+## `pushAnnotations` 的 N+1 请求与 epub/pdf `updatedAt` 语义不一致（M9.2 A 批代码审查，2026-10-18）
+- 现状：`SyncManager.pushAnnotations` 每次同步都先 `listAnnotations` 拉全量再逐条 `createAnnotation`，新增 N 条批注即 N+1 次请求，且无增量游标；同时两侧进度的 `updatedAt` 语义不同——`ReadingProgressStore.save` 在 `updatedAt == 0` 时自动补当前时间（冲突检测恒生效、且每次保存都推进时间戳），`PdfProgressStore` 原样保留 0 → `mapUpdatedAt` 返回 `null` → 服务端不做冲突检测，「最后写胜」。
+- 影响：批注多的书同步耗时与流量随条数线性增长，弱网下极易半途失败（已推送的一部分留在远端、下次重跑靠 `location + text` 去重才收敛）；两侧冲突检测行为不一致会让「同一台设备上 epub 冲突被拒、pdf 冲突被覆盖」成为难以复现的怪现象。
+- 建议：批注推送改批量端点（`POST /api/annotations/batch`）或带 `since` 的增量拉取 + 客户端待推队列；`updatedAt` 语义统一为「0 = 未知、一律传 `null`」，把「补当前时间」的逻辑从 `ReadingProgressStore` 上移到 `SyncManager` 显式决策（并在 KDoc 写明两侧一致性约束）。
+
+## B 批文件同步未开工（M9.2 A 批，2026-10-18）
+- 现状：A 批只交付只读协议（`/api/roots`、`/api/resources`、`/api/resolve`、`/api/changes`）+ 本地索引 + 增量引擎，**未做任何文件读写**：`GET|PUT|DELETE /api/files`、`POST /api/resources/{uid}/move`、`GET /api/resources/{uid}`（补 `size`/`mtime`）均未接入，书架也尚未接线 `SyncEngine`（`ResourceIndex`/`SyncEngine` 当前无调用方）。
+- 影响：应用**不能通过服务端读写书籍文件**——只能打开本机 SAF 选择或导入的文件；远端新增的书不会出现在书架，`/api/changes` 带来的新条目 `size=0/mtime=0` 无法回填，按大小/时间排序与展示会失真；改名/移动后的路径也无法跟随。
+- 建议：B 批另立计划——先回填元数据（`GET /api/resources` 或 `GET /api/resources/{uid}`，回填后清 `dirty`），再实现 `/api/files` 的按需下载/上传与 `move`，最后把 `SyncEngine.bootstrap/pull` 接到「书架打开 + 下拉刷新」，并同步补 `ResourceIndex` 的并发保护（见「`ResourceIndex` 缓存无锁」条）。
+
+## 旧数据不迁移，`clearLegacy` 是真删除（M9.2 A 批，2026-10-18）
+- 现状：五个 Store（`ReadingProgressStore`、epub `AnnotationStore`、`PdfProgressStore`、`PdfAnnotationStore`、`PdfInkStore`）的 `clearLegacy()` 按「32 位十六进制 / 含 `:`」判定旧键并**物理删除**，不做迁移、不做双读，由各 prefs 文件的 `legacy_cleared` 一次性标记控制。
+- 影响：升级后旧键名下的本地进度、批注、PDF 笔迹**永久丢失**且无备份、无回滚路径。当前可接受（服务端与客户端均未部署，存量数据为零），但一旦有真实用户数据，「首启静默删除」就是不可恢复的数据事故；若删除时不记日志，事后连「丢了什么」都无从查证。
+- 建议：正式发布前二选一——① 改为「旧键保留只读 + 惰性迁移到 uid 名下」；② 保留删除语义但先写一条可审计日志（含删除键数量）并在首次启动给出可关闭的提示。另需配合「离线键仍是旧形态」条，避免清理逻辑误伤无 uid 的合法离线数据。
+
+## `/api/changes` 不含 `size` / `mtime`（M9.2 A 批，2026-10-18）
+- 现状：`GET /api/changes` 的事件只有 `seq`/`uid`/`op`/`root`/`path`/`old_path`/`blob`/`rev`/`changed_at`；`SyncEngine.buildEntry` 只能继承索引里已有的 `size`/`mtime`，全新 `create` 条目写 `size=0`、`mtime=0` 并置 `dirty=true`。
+- 影响：书架按大小或修改时间排序、展示「最近添加」都会失真（全部为 0 或顺序错乱）；`dirty` 条目的回填依赖一次额外的 `/api/resources` 查询，B 批若漏做，会表现为「新书全排在最前/最后」这类难以归因的 UI 现象，且 `dirty` 标记本身没有消费方时永远不清。
+- 建议：B 批在 `pull` 后对 `dirty` 条目批量调 `GET /api/resources?root=&limit=` 回填并清 `dirty`；或推动服务端在 `changes` 事件里附带 `size`/`mtime`（代价是事件体积与墓碑语义的额外定义）。
+
+## `PUT /api/files` 单次上限 32 MiB，`GET` 的 `Range` / `If-None-Match` 未接入（M9.2 A 批，2026-10-18）
+- 现状：服务端 `PUT /api/files/{path...}` 单次请求体上限 **32 MiB**，`GET` 支持单区间 `Range` 与 `If-None-Match`（304）；Android 客户端尚未实现文件上传/下载，`RestClient` 里也没有这两个端点的封装。
+- 影响：B 批实现上传时，超过 32 MiB 的 PDF/EPUB 会被服务端直接拒绝（需分片或改走 WebDAV），若客户端不预先检查就会表现为「大文件上传神秘失败」；不实现 `Range` 则无法断点续传，不实现 `If-None-Match` 则每次都要整份重下——书库场景下流量与耗时都不可接受。
+- 建议：B 批按「小文件直传 `PUT`，超限回退 WebDAV 或分片；下载用 `Range` + `If-None-Match`/ETag 做增量与断点续传」实现，并把 32 MiB 上限写成客户端常量（错误前置到选文件阶段）并写入 `docs/android.md`。
+
+## `SyncEngine` 丢弃了 `rev`（M9.2 A 批，2026-10-18）
+- 现状：`ChangeDto` 有 `rev`（40 位 git blob sha1），但本地 `ResourceEntry` 没有该字段，`SyncEngine.apply` 直接丢弃；`/api/resources` 返回的 `ResourceDto.rev` 同样未持久化。
+- 影响：**无法做条件更新**——`PUT /api/files` 的 `If-Match` 需要 ETag/`rev`，本地没有 `rev` 就只能无条件覆盖，并发写会互相静默覆盖（服务端 `412 etag_mismatch` 的乐观锁形同虚设）；也无法用「`rev` 未变」跳过重复下载，一致性判定只能依赖 `size`/`mtime` 这类弱信号。
+- 建议：B 批给 `ResourceEntry` 增加 `rev` 字段，create/update 时写入，上传/下载时用作 `If-Match` 与「是否已最新」的判据；schema 变更需处理旧索引 JSON 的缺省值（`rev = ""`）与依赖 `clear()` + `bootstrap()` 的重建路径。

@@ -275,3 +275,11 @@
 **理由**：用户明确「服务器是可选项」。原实现把空地址当错误并在 `save()` 最前 early-return，导致未配置服务端时**任何设置都存不进去**——真机实测：点「竖向连续滚动」+「保存」→ 提示「服务端地址不能为空」、Activity 不退出、prefs 无 `reader_page_mode`，属可用性阻断。
 
 **代价**：① 「地址留空 + 令牌有值」是半配置状态（同步不可用但不报错），需在文档提示；② `SettingsStore` 的写入路径从 1 条变 2 条（`save` / `saveTokenOnly`），测试面扩大；③ 删除 `UrlError.EMPTY` 后需同步清理 `urlErrorText` 分支与 `settings_err_url_empty` 文案（已做）。
+
+## 2026-10-18 · M9.2 A 批：本地资源索引用 prefs 单文件 JSON；SyncEngine 与 SyncManager 分层；A 批不接线
+
+**决策**：① 本地资源索引（uid ↔ `root`/`path`、`blob`/`size`/`mtime`、墓碑、`dirty`、单一 `cursor`）用 `SharedPreferences`（`seshat_resource_index`）的**单文件 JSON**（键 `index`）。② `SyncEngine` 负责「**游标 / 增量 / 批量落盘**」，`SyncManager` 保持「**按单个 uid 做一次双向同步**」的两层职责。③ 阅读器「**有 uid 且 `SettingsStore.toConfig() != null`**」才接线同步；无 uid 时完全离线（**不做任何网络调用**，也不构造 `RestClient`）。④ A 批**不接线** `SyncEngine`（书架 B 批再接入），因此 `ResourceIndex` / `SyncEngine` 目前是「**可测但无调用方**」的能力储备。
+
+**理由**：① 单文件 JSON **零新增依赖**（不引入 Room / SQLite），且索引是**派生状态**——可随时 `clear()` + `bootstrap()` 从 `/api/changes` 重建，不需要事务与数据迁移；② 两层职责切分让「跨多 uid 的增量编排（游标推进、崩溃幂等、批量落盘）」与「单文档双向同步（进度/批注字段映射、`location + text` 去重）」各自可独立单测，`SyncManager` 无需感知游标与墓碑的存在；③ 守卫 + A 批不接线共同保证「服务端未配置 / 无 uid 时零网络行为」，不破坏 M10.6「服务端可选」与 M9.1「令牌只经 `putSecret`」两条既有不变量。
+
+**代价**：① 单文件**全量重写**（`rename` / `markDeleted` / `setCursor` 仍序列化整份 JSON），条目上万后写放大与 GC 压力明显，需评估迁移 Room/SQLite；② `ResourceIndex` 假定**单线程串行调用**、内存缓存不加锁——B 批一旦跨线程接线必须先补锁或强制单 dispatcher；③ 能力储备期间 `SyncEngine` 无法端到端验证，只能靠 fake `SyncApi` 的单测覆盖。

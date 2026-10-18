@@ -37,6 +37,7 @@
 - 译文/解释面板**模板拆分与原文默认显示**（M11.12，2026-10-18）：`seshat-reader-translate-template` 默认值改为 `"%l\n\n%q\n\n---\n\n%t\n"`（去掉正文标题，header-line 继续显示「Seshat 译文/解释」）；新增 `seshat-reader-translate-explain-template`（默认 `"%q\n\n---\n\n%t\n"`，解释面板独立模板，`nil` 退回纯正文且不借用翻译模板）；`seshat-reader-translate-show-source` 默认值改为 `t`（默认显示原文引用块）。`--apply-template` / `--render-panel` / `--render-object` 以可选 `context` 参数选择模板。
 - 批注列表**去掉分页，改为单列连续流**（M11.13，2026-10-18）：删除 `seshat-reader-annotation-page-size`、当前页/buffer-local 页号、`--page-count`/`--clamp-page`/`--page-items`、4 个翻页命令与 `]`/`[` 键位、纯文本页脚，以及 ETAF 的 `--page`/`--page-count`/`--page-of-index`/`--sync-page-with-selection`；全量条目一次性单列渲染，徽章恒为「N 条」，`n`/`p` 只移动选中。ETAF 卡片列表去掉固定 12 行高度与内部滚动，改按条目数**显式计算 viewport 高度**（已挂载时 `etaf-runtime-refit`），面板窗口整体滚动。
 - 译文/解释面板启用 **visual-fill-column**（M11.14，2026-10-18）：新增 `seshat-reader-translate-visual-fill-column`（默认 `t`），面板正文按 `visual-fill-column-width`（nil → `fill-column`）缩窄/居中；`visual-fill-column` 为软依赖，未安装时静默跳过；批注列表不启用（ETAF 按窗口宽度布局）。关闭时显式 `-1` 清理窗口 margin。
+- Android 接入 M7 只读协议（M9.2 A 批，2026-10-18）：`sync/RestClient` 新增 `GET /api/roots`、`GET /api/resources`、`GET /api/resolve`、`GET /api/changes` 四个只读端点（int64 字段一律 `Long`，`next_cursor` / `has_more` / `old_path` 走 `@SerialName`）；新增本地资源索引 `sync/ResourceIndex`（`SharedPreferences("seshat_resource_index")` 单文件 JSON，`ResourceEntry` + 单一 `cursor`，属派生状态——可 `clear()` 后 `bootstrap()` 重建）与增量同步引擎 `sync/SyncEngine`（`bootstrap()` / `pull()`，每页先应用事件再存游标、崩溃最多重复一页、分段批量落盘消除 O(N²) 写放大）；阅读器支持可选 `EXTRA_UID`，**有 uid 且服务端已配置**时同步进度/批注，无 uid（SAF 直接打开）时完全离线（零网络调用）。**A 批不接线 `SyncEngine`**（书架 B 批接入），故二者当前是「可测但无调用方」的能力储备。单测总数 260 → 336（新增 `ResourceIndexTest` / `SyncEngineTest` / `ReaderSyncTest` / `LegacyKeysTest` / `Rfc3339Test` 等）。**零新增依赖。**
 
 ### 变更
 
@@ -53,6 +54,8 @@
 - `emacs/seshat-reader/` 包内新增 3 个自研扩展模块（`seshat-reader-reference.el` / `seshat-reader-sidebar.el` / `seshat-reader-etaf.el`），`VENDORED.md` 自研扩展表同步。
 - **阅读器面板渲染重构（M11.10，2026-10-18）**：译文/解释改为**面板内只读 Markdown 文本 buffer 完整渲染**——gt 只渲染到隐藏中转 buffer ` *Seshat gt*`（`:window-config` = `display-buffer-no-window` + `allow-no-window`），`:then` 回调取纯文本写入展示 buffer，以 `gfm-view-mode` → `markdown-view-mode` → `text-mode` 降级链显示（原生折行/滚动/复制/isearch）；`header-line` 显示「Seshat 译文」/「Seshat 解释」，面板内 `q`（关面板）/`C-c C-s`（存为批注）改由 minor mode `seshat-reader-translate-panel-mode` 承载。**删除**「来源：第 N 页」行与自绘「q 关闭」提示；`seshat-reader-translate-render` 的 `sidebar` 语义随之更新（面板内 Markdown 文本 buffer，非 ETAF 排版），`pop`/`pin` 仍为 posframe 回退。`seshat-reader-sidebar-translate-buffer-name` 改为**展示 buffer** 名（不再作 gt `:name` 与捕获守卫）。**ETAF 渲染层收敛为批注卡片**：译文排版组件树与 `seshat-reader-etaf-render-translate` 删除（`seshat-reader-etaf.el` 929 → 690 行），ETAF 只渲染批注列表 + 分页。
 - **破坏性**（M11.13）：删除 `seshat-reader-annotation-page-size` 与批注列表的 `]` / `[` 翻页键；用户配置中引用该变量不再生效。`seshat-reader-translate-show-source` 默认值由 `nil` 改为 `t`（面板默认显示原文，内容更高）。
+- 状态 API 由文档标识改为 uid（Android，M9.2 A 批，2026-10-18）：`GET|PUT /api/progress/{uid}`、`GET /api/annotations?uid=`、`POST /api/annotations` 请求体字段，以及 `RestClient` / `SyncManager` 的参数名与 DTO 字段统一改名（`@SerialName("uid")`，无残留旧字段）；本地进度/批注的 Store 键在「有 uid」时改用 uid。
+- 连通性探测探针改为 `GET /api/roots`（Android，M9.2 A 批，2026-10-18）：原探针打批注端点并带自造的文档标识，M7 起批注按 uid 查询且要求 uid 已登记，客户端没有可用的已登记 uid，导致对 M7 服务端**恒失败**；`/api/roots` 无入参、只读、不写数据，200 即证明地址可达 + 令牌有效。旧服务端（无该路由）返回 404 → `ServerError(404)`，设置页应提示版本可能过旧。
 
 ### 破坏性
 
@@ -73,6 +76,9 @@
 
 - **安全（S1/S2，M7 安全复审，2026-10-18）**：WebDAV 出口增加符号链接守卫——新增 `internal/webdav/symlink.go` 的 `symlinkGuardFS` 并接入 `/dav/` 与 `/public/` 两个出口（包装顺序 `webdav.Dir → extWhitelistFS → readOnlyFS → symlinkGuardFS → dotPathFS → versionedFS`），与 REST 同口径、实际更严：请求路径的父链或目标自身含软链一律拒绝（`os.ErrPermission`，PROPFIND 中该项被静默跳过）。`GET /api/files` 对危险扩展名（`.html`/`.htm`/`.xhtml`/`.svg`/`.xml`/`.xsl`/`.js`/`.mjs`）强制下载（`Content-Type: application/octet-stream` + `Content-Disposition: attachment`），并对**所有**下载加 `X-Content-Type-Options: nosniff`；Web UI 首页与 `/static/` 加 `nosniff` + `X-Frame-Options: DENY` + CSP（`default-src 'self'`）。**残余**：`/api/` 的其它响应（JSON 端点与错误响应）仍无安全头，HSTS 仍由反代负责（见 `docs/security.md` §8.7、§8.8）。
 - 修复：`If-Match` 与 `If-None-Match` 同时出现时**两者都校验**（此前只校验 `If-Match`，`If-None-Match` 被静默忽略）——任一前提不满足即 `412 etag_mismatch` 且内容不变；`If-Match` 已匹配与 `If-None-Match: *` 的组合因此恒为 412（两个前提不可同时成立），这是有意为之。
+- 修复进度推送因 `updated_at` 小数秒被服务端拒绝（Android，M9.2 A 批，2026-10-18）：服务端用 `time.RFC3339` 解析，不接受小数秒，客户端此前序列化带毫秒，导致 `PUT /api/progress` 一律 `400`；现统一**截断到秒**。
+- 阅读器进度推送由「每次翻页」改为「`onStop` 一次 + 同值跳过」（M9.2 A 批，2026-10-18）：每页推送会让请求数随翻页线性增长并可能把服务端写爆，改为离开阅读器时推送一次；`lastPushedPosition` 的同值跳过只是防抖，不是严格节流。
+- `SyncEngine` 改为分段批量落盘（M9.2 A 批，2026-10-18）：create/update 先累积到内存，遇到 rename/delete 或批次结束才一次 `upsertAll`，把「N 条事件 N 次全量重写」的 O(N²) 写放大压成「每段一次」；rename/delete 前强制 flush 以保证事件顺序语义。
 
 ## [0.2.0] - 2026-10-12
 

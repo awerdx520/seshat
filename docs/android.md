@@ -37,7 +37,7 @@
 | 4 | 主题（跟随系统 / 浅色 / 深色） | `app_theme` | **立即**（`SeshatApp` 里 `AppCompatDelegate.setDefaultNightMode`，Activity 自动重建） |
 | 5 | 正文字号（80–200%，**仅 EPUB 生效**） | `reader_text_zoom` | 下次打开阅读器 |
 | 6 | 翻页模式（横向翻页 / 竖向连续滚动） | `reader_page_mode` | 下次打开阅读器 |
-| 7 | 连通性测试 | 无存储 | 按下即测（`GET /api/annotations?document_id=__connectivity_probe__`——**旧写法**：M7 起服务端状态端点只认 `uid`，该探测会得到 `400`，见 §7） |
+| 7 | 连通性测试 | 无存储 | 按下即测（`GET /api/roots`——无入参、只读，200 即证明「地址可达 + 令牌有效」。M7 起批注端点按 uid 查询且要求 uid 已登记，客户端没有可用的已登记 uid，故不再用批注端点探测；未升级到 M7 的旧服务端没有该路由，返回 404 → `ServerError(404)`，设置页应提示「服务端版本可能过旧」，见 §8） |
 | 8 | 关于 | 无存储 | 静态（版本号 + 配置状态） |
 
 - 存储**分两层**：机密与同步配置走 `SecurePrefs`（EncryptedSharedPreferences，见 `docs/security.md` §7）；
@@ -107,3 +107,60 @@ M7 把服务端的文档身份从「客户端自定字符串」改成「服务�
 - **后续改造**：数据源接入与 M10 Reader 将改为「路径 → `GET /api/resolve?root=&path=` → uid」，把 `(root, path) → uid` 的映射缓存在 `seshat_app_prefs`（普通偏好，不加密、可重建），仅缓存服务端返回的 uid，不在客户端生成。
 - **无需迁移**：服务端与客户端均尚未部署，本地旧 `documentId` 名下的进度/批注可直接**清空**（删除对应 prefs 键即可），不需要做 id 迁移或双写过渡期。
 - 契约细节见 [`docs/api.md`](api.md) §6（路径解析）与 [`docs/sync-protocol.md`](sync-protocol.md) §2（身份模型）。
+
+## 8. 与 M7 服务端对接（M9.2 A 批）
+
+第 7 节描述的「已知不一致」是本批改造前的状态（保留作背景）；M9.2 A 批已解决 Android 侧：不再把内容哈希当 uid 发送，而是由服务端解析出 uid，无 uid 时完全离线。本批**只做只读协议 + 索引 + 增量 + 阅读器 uid 接入**，文件同步（书架）留 B 批。
+
+### 8.1 uid 的来源与解析
+
+- uid 由**服务端生成**（26 位 Crockford Base32），客户端**不生成、不解析**，只透传。
+- 路径 → uid 的唯一入口是 `GET /api/resolve?root=&path=`（`sync/RestClient.resolve`：200 返回 uid，404 → `null`，400 抛 `ApiException`）。
+- uid 与路径解耦：**rename 后 uid 不变**；删除后同一路径重建会**复用原 uid**（墓碑保留 uid 与 path 的意义），因此「按路径缓存 uid」在删除重建后仍然有效。
+- A 批按**单根**实现（服务端默认只有 `notes`，mode=mirror）；多根 / ondemand 根留 B 批。
+
+### 8.2 阅读器的两条路径
+
+| 打开方式 | Store 键 | 同步 |
+|---|---|---|
+| **有 uid**（书架 / 索引打开，Intent 带 `EXTRA_UID`） | uid | 启用（进度 + 批注） |
+| **无 uid**（SAF 或直接打开） | 内容哈希（EPUB：SHA-256 前 16 字节，32 位十六进制）或文件 `uri.toString()`（PDF） | **纯本地**，零网络调用 |
+
+- 键选择的唯一判定点在 Activity：`effectiveKey = uid ?: docId`，随后透传给五个 Store（`ReadingProgressStore`、epub `AnnotationStore`、`PdfProgressStore`、`PdfAnnotationStore`、`PdfInkStore`），Store 内部不做判断。
+- 同步装配有三条守卫（`sync/ReaderSync.createReaderSync`）：① uid 非空；② `SettingsStore.toConfig() != null`（地址与令牌齐备）；③ 装配成功。任一不满足即静默返回，**不构造 `RestClient`**——保持「服务端未配置时零网络行为」。
+
+### 8.3 本地资源索引
+
+- `sync/ResourceIndex.kt`：`SharedPreferences("seshat_resource_index")` 的**单文件 JSON**（键 `index`），内容为 `ResourceIndexDocument(cursor, entries)`；条目 `ResourceEntry(uid, root, path, blob, size, mtime, deleted, dirty)`。
+- **零新增依赖**（不引入 Room / SQLite）；读写函数注入，纯逻辑可 JVM 单测。
+- **索引是派生状态**：可随时 `clear()` 后 `bootstrap()` 从 `/api/changes` 重建，不是唯一真相；`cursor` 与条目一起原子落盘，是唯一需要持久化的同步位置。
+- 写 API：`upsertAll`（批量，消除 O(N²) 写放大）/ `rename` / `markDeleted` / `setCursor` / `clear`；查 API：`findByUid` / `findByPath` / `alive()` / `entriesInRoot`。
+- 容量按「数千条资源、单文件数百 KB」设计，且**假定单线程串行调用、不加锁**。
+- A 批只交付 `SyncEngine`（`bootstrap` / `pull`），**尚未接线**——当前没有任何调用方，书架 B 批接入。
+
+### 8.4 增量游标
+
+- `GET /api/changes?since=&limit=`（`limit` 上限 2000）：`op ∈ create/update/rename/delete`，响应含 `next_cursor`（int64）与 `has_more`。
+- `sync/SyncEngine` 每页**先应用事件、再存 `next_cursor`**：两者之间崩溃则重启后重复应用同一页——`apply` 幂等，所以最多多花一次网络，**绝不丢事件**（反之先存游标会永久跳过整页）。
+- `has_more == true` 而游标未前进 → 抛 `IllegalStateException`，拒绝死循环重试同一页；未知 `op` 忽略（服务端新增操作类型时旧客户端仍能同步其余事件）。
+- `rename` 只用 `path`（`oldPath` 仅作日志线索，uid 才是稳定键）；`delete` 只置墓碑位，保留 uid 与 path。
+- `create/update` 的 `size` / `mtime` 只能继承索引既有值（`/api/changes` **不含**这两个字段）；全新条目无从得知 → `size = 0`、`mtime = 0` 且 `dirty = true`，表示「待 `GET /api/resources` 回填」。
+
+### 8.5 同步触发与失败语义
+
+| 时机 | 动作 |
+|---|---|
+| 打开书籍（有 uid 且服务端已配置） | `pullAnnotations` 合并远端批注；**本地无进度时**才 `pullProgress`（避免覆盖本机正在读的位置）；随后 `pushProgress` |
+| 新增批注 | 即时 `pushAnnotations`（按 `location + text` 去重，幂等） |
+| 离开阅读器（`onStop`） | `pushProgress` 一次（每次翻页推送会让请求爆炸；同值跳过只是防抖） |
+
+- 全部网络调用在**单线程 executor** 上串行执行；异常由 `runCatching` 吞掉并记一条 warn 日志——阅读是本地优先功能，同步失败不得阻断或弹窗打扰。
+- 已知限制：拉取到的**远端进度不立即跳转 UI**（当前阅读位置已按本地进度恢复，中途跳转会让正在读的用户丢失位置），下次打开本书才生效；`onStop` 可能因进程被杀而不执行（见 `openspec/tech-debt.md`）。
+- 设置页「连通性测试」探针由「带旧参数的批注端点」改为 `GET /api/roots`（无入参、只读、不写数据）——旧写法在 M7 服务端上恒失败：批注按 uid 查询且要求 uid 已登记，客户端没有可用的已登记 uid；`/api/roots` 无此约束。旧服务端（无 M7 路由）返回 404，客户端映射为 `ServerError(404)`，设置页应提示「服务端版本可能过旧」。
+
+### 8.6 旧键清理（只删不迁移）
+
+- 首次打开阅读器时按「**32 位十六进制**（EPUB 内容哈希）」或「**含 `:`**（PDF uri）」判定旧键并删除；用各 prefs 文件各自的一次性标记 `legacy_cleared`（`LegacyKeys.CLEARED_FLAG`）保证只跑一次，`legacy_` 前缀的键不参与清理。
+- **不迁移**：服务端与客户端均未部署，旧键名下的进度/批注直接丢弃；uid 为 26 位 Base32（既非 32 位十六进制也不含 `:`），不会误删合法新键。
+- 缺口：无 uid 时的离线键形态与旧键相同，清理安全性完全依赖该标记（见 `openspec/tech-debt.md`）。
+
