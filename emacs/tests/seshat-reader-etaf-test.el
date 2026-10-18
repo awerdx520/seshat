@@ -103,7 +103,7 @@
 ;; runtime」编译告警。
 (declare-function seshat-reader-etaf-available-p "seshat-reader-etaf" ())
 (declare-function seshat-reader-etaf-render-annotations "seshat-reader-etaf"
-                  (buffer items doc-id &optional source page page-count))
+                  (buffer items doc-id &optional source))
 (declare-function seshat-reader-etaf-annotation-goto "seshat-reader-etaf" ())
 (declare-function seshat-reader-etaf-annotation-delete "seshat-reader-etaf" ())
 (declare-function etaf-ref "etaf-reactive" (initial-value &rest args))
@@ -152,18 +152,6 @@
   (cl-loop for i from 1 to n
            collect (list :id i :uuid nil :page nil :location nil
                          :text (format "批注条目-%02d" i) :dirty nil)))
-
-(defun seshat-reader-etaf-test--mount-annotations-view (items)
-  "Mount the annotations panel view for ITEMS into a fresh buffer, return it.
-调用方必须**自行** `let' 绑定 `seshat-reader-etaf--items' / `--page' /
-`--page-count' / `--selected' / `--doc-label' 等 ref 后再调用本函数（视图在
-`etaf-mount' 期间读这些 ref 取初值）。调用方负责 `kill-buffer'。"
-  (let ((buf (get-buffer-create " *seshat-etaf-test-view*")))
-    (etaf-mount buf (seshat-reader-etaf--annotations-view items)
-                (list :viewport-width 600
-                      :viewport-height
-                      seshat-reader-etaf--default-viewport-height))
-    buf))
 
 (defun seshat-reader-etaf-test--fetch-etaf-module ()
   "Load the ETAF rendering layer, returning t on success.
@@ -222,7 +210,7 @@
     ;; `require' 一律抛错，模拟「ETAF 文件存在但半损坏」（字节码与源码不匹配、
     ;; 依赖缺失等）。
     (cl-letf (((symbol-function 'require)
-               (lambda (&rest _args) (error "half-broken"))))
+               (lambda (&rest _args) (error "桩：require 加载期失败（half-broken）"))))
       ;; 关键：不要用 `condition-case' 包住断言本身——本用例要锁定的不变量
       ;; 正是「`available-p' 自己不冒泡」，包一层就把它测没了。
       (should-not (seshat-reader-etaf-available-p))
@@ -472,151 +460,75 @@
       (when (buffer-live-p buf)
         (kill-buffer buf)))))
 
-;;; ⑨ 分页渲染（页码 ref、徽章、当页卡片、翻页键、跨页选中）
+;;; ⑨ 全量渲染（徽章恒为 N 条、全部卡片出图、无翻页键）
 
-(ert-deftest seshat-reader-etaf-test--render-annotations-stores-page ()
-  "`render-annotations' 把页码与总页数写入 ref；缺省时按第 1 页与全量条目数."
+(ert-deftest seshat-reader-etaf-test--badge-text-always-count ()
+  "徽章恒为「N 条」：30 条 → \"30 条\"，1 条 → \"1 条\"."
+  (skip-unless (seshat-reader-etaf-test--fetch-etaf-module))
+  (let ((seshat-reader-etaf--items
+         (etaf-ref (seshat-reader-etaf-test--many-items 30))))
+    (should (equal "30 条" (seshat-reader-etaf--badge-text nil))))
+  (let ((seshat-reader-etaf--items
+         (etaf-ref (seshat-reader-etaf-test--many-items 1))))
+    (should (equal "1 条" (seshat-reader-etaf--badge-text nil)))))
+
+(ert-deftest seshat-reader-etaf-test--annotations-view-renders-all-items ()
+  "30 条条目全部渲染进面板：viewport 高度按内容放大，末条不被裁掉."
   (skip-unless (seshat-reader-etaf-test--fetch-etaf-module))
   (skip-unless (seshat-reader-etaf-available-p))
-  (let* ((items (seshat-reader-etaf-test--many-items 21))
+  (let* ((items (seshat-reader-etaf-test--many-items 30))
          (buf (get-buffer-create
                (seshat-reader-etaf-test--reset-list-buffer)))
          (seshat-reader-etaf--items (etaf-ref nil))
          (seshat-reader-etaf--selected (etaf-ref nil))
-         (seshat-reader-etaf--page (etaf-ref nil))
-         (seshat-reader-etaf--page-count (etaf-ref nil))
-         (seshat-reader-annotation-page-size 20))
+         (seshat-reader-etaf--doc-label (etaf-ref nil)))
     (unwind-protect
         (progn
-          ;; 显式页码：首次 mount 分支
-          (seshat-reader-etaf-render-annotations buf items "doc-page" nil 2 2)
-          (should (= 2 (etaf-value seshat-reader-etaf--page)))
-          (should (= 2 (etaf-value seshat-reader-etaf--page-count)))
-          ;; 缺省参数：幂等（flush）分支，页号回 1，页数由 items 算出
-          (seshat-reader-etaf-render-annotations buf items "doc-page-default")
-          (should (= 1 (etaf-value seshat-reader-etaf--page)))
-          (should (= 2 (etaf-value seshat-reader-etaf--page-count))))
+          (seshat-reader-etaf-render-annotations buf items "doc-all")
+          (let ((text (seshat-reader-etaf-test--buffer-text buf)))
+            (should (string-match-p "批注条目-01" text))
+            (should (string-match-p "批注条目-30" text))
+            ;; 30 张卡片全部出图（无切片、无内部滚动裁剪）
+            (should (= 30 (seshat-reader-etaf-test--count-matches
+                           "批注条目-" text)))
+            ;; 徽章恒为条目总数
+            (should (string-match-p "30 条" text))
+            (should-not (string-match-p "页" text))))
       (when (buffer-live-p buf)
         (kill-buffer buf)))))
 
-(ert-deftest seshat-reader-etaf-test--annotations-view-badge-multi-page ()
-  "多页时标题徽章显示「第 x/y 页」，单页时显示「N 条」且不出现「页」."
+(ert-deftest seshat-reader-etaf-test--render-annotations-refit-grows-viewport ()
+  "已挂载后条目增多时 refit 放大 viewport：新增条目不被裁掉."
   (skip-unless (seshat-reader-etaf-test--fetch-etaf-module))
   (skip-unless (seshat-reader-etaf-available-p))
-  (let* ((items (seshat-reader-etaf-test--many-items 21))
-         (seshat-reader-etaf--items (etaf-ref items))
+  (let* ((few (seshat-reader-etaf-test--many-items 3))
+         (many (seshat-reader-etaf-test--many-items 30))
+         (buf (get-buffer-create
+               (seshat-reader-etaf-test--reset-list-buffer)))
+         (seshat-reader-etaf--items (etaf-ref nil))
          (seshat-reader-etaf--selected (etaf-ref nil))
-         (seshat-reader-etaf--doc-label (etaf-ref "doc-badge"))
-         (seshat-reader-etaf--page (etaf-ref 2))
-         (seshat-reader-etaf--page-count (etaf-ref 2))
-         (multi (seshat-reader-etaf-test--mount-annotations-view items)))
+         (seshat-reader-etaf--doc-label (etaf-ref nil)))
     (unwind-protect
-        (let ((text (seshat-reader-etaf-test--buffer-text multi)))
-          (should (string-match-p "第 2/2 页" text))
-          ;; 多页时不显示条目总数
-          (should-not (string-match-p "21 条" text)))
-      (when (buffer-live-p multi)
-        (kill-buffer multi)))
-    ;; 单页：显示「N 条」且不出现「页」
-    (let* ((one-page (seshat-reader-etaf-test--many-items 3))
-           (seshat-reader-etaf--items (etaf-ref one-page))
-           (seshat-reader-etaf--selected (etaf-ref nil))
-           (seshat-reader-etaf--doc-label (etaf-ref "doc-badge-1"))
-           (seshat-reader-etaf--page (etaf-ref 1))
-           (seshat-reader-etaf--page-count (etaf-ref 1))
-           (single (seshat-reader-etaf-test--mount-annotations-view one-page)))
-      (unwind-protect
-          (let ((text (seshat-reader-etaf-test--buffer-text single)))
-            (should (string-match-p "3 条" text))
-            (should-not (string-match-p "页" text)))
-        (when (buffer-live-p single)
-          (kill-buffer single))))))
+        (progn
+          (seshat-reader-etaf-render-annotations buf few "doc-grow")
+          (should (= 3 (seshat-reader-etaf-test--count-matches
+                        "批注条目-" (seshat-reader-etaf-test--buffer-text buf))))
+          ;; 第二次渲染走幂等（runtime 已存在）分支：必须 refit 到新高度
+          (seshat-reader-etaf-render-annotations buf many "doc-grow")
+          (let ((text (seshat-reader-etaf-test--buffer-text buf)))
+            (should (= 30 (seshat-reader-etaf-test--count-matches
+                           "批注条目-" text)))
+            (should (string-match-p "批注条目-30" text))))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
 
-(ert-deftest seshat-reader-etaf-test--annotations-view-renders-current-page ()
-  "卡片列表只渲染当页条目：第 2 页只含末条目，第 1 页只含首条目."
+(ert-deftest seshat-reader-etaf-test--annotation-keys-no-paging ()
+  "面板 `:keys' 表不含 `]' / `['，其余动作键仍在."
   (skip-unless (seshat-reader-etaf-test--fetch-etaf-module))
-  (skip-unless (seshat-reader-etaf-available-p))
-  (let* ((items (seshat-reader-etaf-test--many-items 21))
-         (seshat-reader-etaf--items (etaf-ref items))
-         (seshat-reader-etaf--selected (etaf-ref nil))
-         (seshat-reader-etaf--doc-label (etaf-ref "doc-page-view"))
-         (seshat-reader-etaf--page (etaf-ref 2))
-         (seshat-reader-etaf--page-count (etaf-ref 2))
-         (seshat-reader-annotation-page-size 20)
-         (second (seshat-reader-etaf-test--mount-annotations-view items)))
-    (unwind-protect
-        (let ((text (seshat-reader-etaf-test--buffer-text second)))
-          (should (string-match-p "批注条目-21" text))
-          (should-not (string-match-p "批注条目-01" text))
-          (should-not (string-match-p "批注条目-20" text)))
-      (when (buffer-live-p second)
-        (kill-buffer second)))
-    (let* ((seshat-reader-etaf--items (etaf-ref items))
-           (seshat-reader-etaf--selected (etaf-ref nil))
-           (seshat-reader-etaf--doc-label (etaf-ref "doc-page-view-1"))
-           (seshat-reader-etaf--page (etaf-ref 1))
-           (seshat-reader-etaf--page-count (etaf-ref 2))
-           (seshat-reader-annotation-page-size 20)
-           (first (seshat-reader-etaf-test--mount-annotations-view items)))
-      (unwind-protect
-          (let ((text (seshat-reader-etaf-test--buffer-text first)))
-            (should (string-match-p "批注条目-01" text))
-            ;; 卡片列表容器固定 `(lh 12)' + `:overflow 'scroll'`，故第 1 页的
-            ;; 第 13–20 条被滚动窗口裁掉（页内仍可滚动），此处只断言分页边界：
-            ;; 第 21 条属第 2 页，绝不出现在第 1 页的面板文本里。
-            (should-not (string-match-p "批注条目-21" text)))
-        (when (buffer-live-p first)
-          (kill-buffer first))))))
-
-(ert-deftest seshat-reader-etaf-test--annotation-keys-bind-paging ()
-  "`--annotation-keys' 把 `]' / `[' 绑到下一页 / 上一页命令."
-  (skip-unless (seshat-reader-etaf-test--fetch-etaf-module))
-  (should (eq 'seshat-reader-annotation-list-next-page
-              (nth 1 (assoc "]" seshat-reader-etaf--annotation-keys))))
-  (should (eq 'seshat-reader-annotation-list-prev-page
-              (nth 1 (assoc "[" seshat-reader-etaf--annotation-keys)))))
-
-(ert-deftest seshat-reader-etaf-test--move-selection-crosses-page ()
-  "跨页 `n' 先切页再滚动：`--page' 跟随且选中项为第 21 条."
-  (skip-unless (seshat-reader-etaf-test--fetch-etaf-module))
-  (seshat-reader-etaf-test--reset-list-buffer)
-  (let* ((items (seshat-reader-etaf-test--many-items 21))
-         (seshat-reader-etaf--items (etaf-ref items))
-         (seshat-reader-etaf--selected (etaf-ref 20))
-         (seshat-reader-etaf--page (etaf-ref 1))
-         (seshat-reader-etaf--page-count (etaf-ref 2))
-         (seshat-reader-etaf--doc-id "doc-move")
-         (seshat-reader-annotation-page-size 20)
-         (calls nil)
-         (next nil))
-    ;; 桩替 `--set-list-page'：记录调用并手动回写 `--page' ref，避免真渲染
-    (cl-letf (((symbol-function 'seshat-reader-annotation--set-list-page)
-               (lambda (page)
-                 (push page calls)
-                 (setf (etaf-value seshat-reader-etaf--page) page))))
-      (setq next (seshat-reader-etaf--move-selection 1)))
-    (should (equal 21 next))
-    (should (equal 21 (etaf-value seshat-reader-etaf--selected)))
-    (should (equal '(2) calls))
-    (should (= 2 (etaf-value seshat-reader-etaf--page)))))
-
-(ert-deftest seshat-reader-etaf-test--move-selection-same-page-no-switch ()
-  "页内移动不触发翻页：`--set-list-page' 不被调用."
-  (skip-unless (seshat-reader-etaf-test--fetch-etaf-module))
-  (seshat-reader-etaf-test--reset-list-buffer)
-  (let* ((items (seshat-reader-etaf-test--many-items 21))
-         (seshat-reader-etaf--items (etaf-ref items))
-         (seshat-reader-etaf--selected (etaf-ref 1))
-         (seshat-reader-etaf--page (etaf-ref 1))
-         (seshat-reader-etaf--page-count (etaf-ref 2))
-         (seshat-reader-etaf--doc-id "doc-move-same")
-         (seshat-reader-annotation-page-size 20)
-         (calls nil))
-    (cl-letf (((symbol-function 'seshat-reader-annotation--set-list-page)
-               (lambda (page) (push page calls))))
-      (should (equal 2 (seshat-reader-etaf--move-selection 1))))
-    (should-not calls)
-    (should (= 1 (etaf-value seshat-reader-etaf--page)))))
+  (should-not (assoc "]" seshat-reader-etaf--annotation-keys))
+  (should-not (assoc "[" seshat-reader-etaf--annotation-keys))
+  (dolist (sequence '("RET" "d" "C-c C-r" "q" "n" "p"))
+    (should (assoc sequence seshat-reader-etaf--annotation-keys))))
 
 (ert-deftest seshat-reader-etaf-test--sidebar-render-object-uses-hidden-gt-buffer ()
   "`sidebar' 渲染对象指向隐藏中转 buffer，并带 `:then' 回调.

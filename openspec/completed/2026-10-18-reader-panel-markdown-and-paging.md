@@ -150,7 +150,7 @@
 | `openspec/tech-debt.md` | 收敛 3 条既有条目 + 新增 markdown-mode 软依赖条目 |
 | `openspec/decisions.md` | 新增 1 条表格行（渲染载体选型，2026-10-18） |
 | `openspec/active/roadmap.md` | 新增 M11.10 行（✅） |
-| `openspec/active/2026-10-18-reader-panel-markdown-and-paging.md` | 本计划（进度勾选与 L3 清单） |
+| `openspec/completed/2026-10-18-reader-panel-markdown-and-paging.md` | 本计划（进度勾选与 L3 清单） |
 | `emacs/tests/seshat-reader-{translate,etaf,sidebar,annotation}-test.el` | 新增/改写 ERT 用例共 29 条（Markdown 面板 6、高度自适应 7、分页 14、集成 2） |
 
 ## 验证标准

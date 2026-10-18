@@ -175,6 +175,8 @@ SM-2 易度因子下限 1.3、默认 2.5，判定「答对」的最低评分为 
 > `seshat-reader-translate-render` 取 `pop` / `pin`，或取 `sidebar` 但
 > `seshat-reader-sidebar-enabled` 为 nil 时才会弹出。
 
+**正文模板**：译文与解释使用**各自独立**的模板变量——翻译面板套 `seshat-reader-translate-template`（默认 `"%l\n\n%q\n\n---\n\n%t\n"`）、解释面板套 `seshat-reader-translate-explain-template`（默认 `"%q\n\n---\n\n%t\n"`）；两者均可用 defcustom 自定义，设 `nil` 退回纯正文（解释模板为 `nil` 时**不借用**翻译模板）。默认正文为「语言对 + 原文引用块 + 分隔线 + 译文」（解释面板省去语言对行），**不含正文标题**——标题由面板 `header-line` 显示（「Seshat 译文」/「Seshat 解释」）。原文引用块**默认显示**（`seshat-reader-translate-show-source` 默认 `t`），设 `nil` 可关闭。
+
 阅读器侧入口为 `emacs/seshat-reader/seshat-reader-translate.el`，提供三个命令：
 
 | 命令 | 快捷键 | 作用 |

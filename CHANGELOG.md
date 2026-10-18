@@ -9,6 +9,7 @@
 
 ### 新增
 
+- Android 三区 UI 骨架（M9.1）：`MainActivity` 由 5 个按钮的入口页改造为单 Activity Shell——顶部 `MaterialToolbar`（标题随 tab 变化 + 溢出菜单「设置」）、中部 `FragmentContainerView`、底部 `BottomNavigationView` 双 tab（笔记 / 阅读）。新增 `ui/NotesFragment`（GTD 入口，列表待 M9.3）与 `ui/ReaderFragment`（迁入示例 EPUB / 选择 EPUB / 选择 PDF / 导入书籍 4 个入口，行为不变）。新增设置页 `settings/SettingsActivity`：服务端地址与访问令牌（令牌经 `EncryptedSharedPreferences` 加密、不回填明文、留空即保留原值；地址校验与规范化见 `settings/SettingsValidator`），填补「App 内无处配置同步服务器」的缺口。新增 JVM 单测 29 例（`MainTabTest` 6 / `SettingsValidatorTest` 16 / `SettingsStoreTest` 7），单测总数 136 → 165。构建配置：显式声明 `androidx.fragment:fragment:1.5.4`、删除重复的 `viewpager2` 声明、修正 `gradle.properties` 过时注释。**无新增第三方依赖**；`gtd/`、`reader/`、`sync/`、`importer/` 零改动。**UI 观感需真机验收（本机无 AVD / 设备 / 系统镜像）。**
 - 引入 `emacs/seshat-reader/`：vendor 自 emacs-reader（上游 commit `df3766e`），作为自研 Emacs 阅读器包的基础；包含「整页文本提取」与「页面矩形取文」两个新增能力，以及页号索引修复与 NaN 矩形防护。
 - 新增阅读器鼠标选区取文模块 `emacs/seshat-reader/seshat-reader-select.el`：拖拽框选文本并取出内容（仅支持未旋转页面）。
 - 新增 Emacs 侧批注采集与侧车同步（M11.3）：新模块 `emacs/seshat-reader/seshat-reader-annotation.el`（选区 → `C-c C-a` 建批注；`C-c C-l` 列表、`RET` 跳页、`d` 删除），`document_id` = `<标签>:<相对路径>`、`location` = `page:<n>;rect:…`；`emacs/seshat-rest.el` 新增 `seshat-rest-update-annotation`；`emacs/seshat-reader/Makefile` 加 `-L ..`（编译期可见顶层 `seshat-rest`）；新增 ERT 测试 `emacs/tests/seshat-reader-annotation-test.el`（17 用例，全绿）。修复「非 2xx 被静默当成无批注」的缺口（批注模块自行判状态码，区分空结果与失败）。**L3 端到端待服务端可用时补验。**
@@ -21,6 +22,11 @@
 - 译文/解释面板的**高度自适应**（M11.10，2026-10-18）：新增 `seshat-reader-sidebar-max-height`（默认 `0.8`），仅对 `translate` 且未挂载 ETAF runtime 的面板按内容行数（`window-text-pixel-size` 换算，夹紧 5 行–`0.8×frame`）调整窗口高度，成功后写入 per-kind 高度记忆；批注列表仍用固定高度 `seshat-reader-sidebar-height`。同帧内面板增高会压缩上方阅读窗口（预期）。
 - 批注列表**分页**（M11.10，2026-10-18）：新增 `seshat-reader-annotation-page-size`（默认 `20`）与 buffer-local 当前页；`]` / `[` 翻页（ETAF `:keys` 与 `list-mode-map` 双路径），标题徽章多页显示「第 x/y 页」、单页显示「N 条」，`n` / `p` 跨页时自动切页，删除/刷新后页号收敛；纯文本回退路径页脚 `-- 第 x/y 页 --` 仅在多页时显示。
 - 译文/解释面板**可选显示原文**（M11.10，2026-10-18）：新增 `seshat-reader-translate-show-source`（默认 `nil`），非 nil 时在正文前插入选中原文的 Markdown 引用块（每行 `> ` 前缀、不截断）。
+- 译文/解释面板 **Markdown 模板**（M11.11，2026-10-18）：新增 `seshat-reader-translate-template`（默认 `"# %k\n\n%l\n\n%q\n\n---\n\n%t\n"`，`nil` 退回纯正文），正文按「标题 + 语言对（`*en → zh*`）+ 可选原文引用块（`> **原文**`）+ 分隔线 + 正文」渲染；占位符由 `--format-langs` / `--quote-block` 生成，模板非法时回退纯正文并警告。`--render-panel` / `--render-object` 新增可选 `langs` 参数（向后兼容）。
+- 译文/解释面板**高度下限可配置**（M11.11，2026-10-18）：新增 `seshat-reader-sidebar-min-height`（默认 `0.25`，至少 1 行），自适应高度区间改为 `min-height`–`max-height`；`--content-height` 单行像素高改取首行与 `frame-char-height` 的较小值（避免标题行导致行数低估），测量上限 40 → 120 行。批注列表高度不受影响。
+- 译文/解释面板**模板拆分与原文默认显示**（M11.12，2026-10-18）：`seshat-reader-translate-template` 默认值改为 `"%l\n\n%q\n\n---\n\n%t\n"`（去掉正文标题，header-line 继续显示「Seshat 译文/解释」）；新增 `seshat-reader-translate-explain-template`（默认 `"%q\n\n---\n\n%t\n"`，解释面板独立模板，`nil` 退回纯正文且不借用翻译模板）；`seshat-reader-translate-show-source` 默认值改为 `t`（默认显示原文引用块）。`--apply-template` / `--render-panel` / `--render-object` 以可选 `context` 参数选择模板。
+- 批注列表**去掉分页，改为单列连续流**（M11.13，2026-10-18）：删除 `seshat-reader-annotation-page-size`、当前页/buffer-local 页号、`--page-count`/`--clamp-page`/`--page-items`、4 个翻页命令与 `]`/`[` 键位、纯文本页脚，以及 ETAF 的 `--page`/`--page-count`/`--page-of-index`/`--sync-page-with-selection`；全量条目一次性单列渲染，徽章恒为「N 条」，`n`/`p` 只移动选中。ETAF 卡片列表去掉固定 12 行高度与内部滚动，改按条目数**显式计算 viewport 高度**（已挂载时 `etaf-runtime-refit`），面板窗口整体滚动。
+- 译文/解释面板启用 **visual-fill-column**（M11.14，2026-10-18）：新增 `seshat-reader-translate-visual-fill-column`（默认 `t`），面板正文按 `visual-fill-column-width`（nil → `fill-column`）缩窄/居中；`visual-fill-column` 为软依赖，未安装时静默跳过；批注列表不启用（ETAF 按窗口宽度布局）。关闭时显式 `-1` 清理窗口 margin。
 
 ### 变更
 
@@ -34,9 +40,11 @@
 - `emacs/seshat-reader/Makefile`：新增可选 ETAF 依赖探测（`ETAF_ROOT ?= $(HOME)/WorkSpace/emacs-taf`），存在时把四仓库根与各自 `lisp/` 加入 `-L`；不存在时从编译与 checkdoc 列表中剔除 `seshat-reader-etaf.el`（`etaf-view` 为宏，编译期必须有 etaf-ui）。
 - `emacs/seshat-reader/` 包内新增 3 个自研扩展模块（`seshat-reader-reference.el` / `seshat-reader-sidebar.el` / `seshat-reader-etaf.el`），`VENDORED.md` 自研扩展表同步。
 - **阅读器面板渲染重构（M11.10，2026-10-18）**：译文/解释改为**面板内只读 Markdown 文本 buffer 完整渲染**——gt 只渲染到隐藏中转 buffer ` *Seshat gt*`（`:window-config` = `display-buffer-no-window` + `allow-no-window`），`:then` 回调取纯文本写入展示 buffer，以 `gfm-view-mode` → `markdown-view-mode` → `text-mode` 降级链显示（原生折行/滚动/复制/isearch）；`header-line` 显示「Seshat 译文」/「Seshat 解释」，面板内 `q`（关面板）/`C-c C-s`（存为批注）改由 minor mode `seshat-reader-translate-panel-mode` 承载。**删除**「来源：第 N 页」行与自绘「q 关闭」提示；`seshat-reader-translate-render` 的 `sidebar` 语义随之更新（面板内 Markdown 文本 buffer，非 ETAF 排版），`pop`/`pin` 仍为 posframe 回退。`seshat-reader-sidebar-translate-buffer-name` 改为**展示 buffer** 名（不再作 gt `:name` 与捕获守卫）。**ETAF 渲染层收敛为批注卡片**：译文排版组件树与 `seshat-reader-etaf-render-translate` 删除（`seshat-reader-etaf.el` 929 → 690 行），ETAF 只渲染批注列表 + 分页。
+- **破坏性**（M11.13）：删除 `seshat-reader-annotation-page-size` 与批注列表的 `]` / `[` 翻页键；用户配置中引用该变量不再生效。`seshat-reader-translate-show-source` 默认值由 `nil` 改为 `t`（面板默认显示原文，内容更高）。
 
 ### 修复
 
+- Android 设置页安全加固（M9.1，安全审查发现 3 项 blocking）：① 令牌在加密存储不可用时**不再降级写入明文** `SharedPreferences`——`SecurePrefs` 新增 `putSecret()`（不可加密即拒绝写入并返回 false），设置页在 `isEncrypted=false` 或解密异常时禁用保存并显示常驻告警；② 新增 `res/xml/backup_rules.xml` 与 `data_extraction_rules.xml`，把 `seshat_sync_secure.xml` / `seshat_sync.xml` 排除出 Auto Backup 与设备迁移（避免明文令牌上云、密文换机后 KEK 失效）；③ 解密异常不再导致设置页崩溃，改为可读告警 + 「重置本地配置」自救入口；④ 服务端地址校验**仅接受 https**、拒绝 userinfo（`https://real.com@evil.com` 类钓鱼）、拒绝查询参数与锚点、限制长度 2048 与端口范围；⑤ 新增「清除访问令牌」入口；⑥ 令牌输入框禁用 Autofill 与实例状态保存、设置页启用 `FLAG_SECURE`、离开页面清空输入框。新增/调整 JVM 单测至 179 例。另在复审后进一步移除 `SettingsStore.writeSecret` 的默认值（消除「漏传即静默写明文」的 fail-open 分支）、让 `clearAuthToken()` 返回真实结果并由 UI 提示，并修正文档中「重置本地配置可修复加密存储」的错误承诺。
 - 批注列表在 ETAF 已挂载时不再 `erase-buffer`（改为交给渲染层增量刷新）：此前任何刷新路径（含 uuid 删除）都会触发 `etaf-runtime-flush` 报 `Args out of range: 20, 20`，并整块降级为纯文本渲染。
 - 译文面板「来源：第 x 页」重复：正文管线渲染前剔除所有以 `来源：` 开头的行（gt 提取失败时会回退整个 buffer-string，把头部行与正文一起带出）；原文展开区不过滤，保持忠实摘录。**M11.10（2026-10-18）起该过滤器与「来源」行一并从代码中删除**——面板 Markdown 路径不再生成「来源」行，也不再自绘「q 关闭」提示（键位由 minor mode `seshat-reader-translate-panel-mode` 承载）。
 

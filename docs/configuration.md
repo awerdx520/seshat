@@ -82,7 +82,10 @@ Emacs 端通过 `seshat-reader-annotation` 采集 PDF 页面选区并同步为�
 | `seshat-reader-translate-explain-preset` | `reader-explain` | 「解释」使用的 gt 预设名（通常指向 `gt-chatgpt-engine`） |
 | `seshat-reader-translate-fallback-langs` | `(en zh)` | 语言回退：源语言取本列表首项，目标语言由此推导（可由命令前缀参数覆盖） |
 | `seshat-reader-translate-render` | `sidebar` | 译文/解释呈现方式：`sidebar`（默认，写入**底部面板内的 Markdown 文本 buffer**——`gfm-view-mode` → `markdown-view-mode` → `text-mode` 降级链，原生折行/滚动/复制/isearch 可用，**不经 ETAF 排版**）、`pop`（posframe 弹出，超时自动消失）或 `pin`（posframe 固定停留）。取 `sidebar` 但 `seshat-reader-sidebar-enabled` 为 nil 时退回 `pop` 式 posframe |
-| `seshat-reader-translate-show-source` | `nil` | 是否在面板正文前插入**选中原文的引用块**（每行加 `> ` 前缀、不截断）；`nil` 只显示译文/解释正文 |
+| `seshat-reader-translate-show-source` | `t` | 是否在面板正文前插入**选中原文的引用块**（`> **原文**` + 每行 `> ` 前缀、不截断）。**默认开启**（便于对照原文与译文）；设 `nil` 关闭，面板更紧凑 |
+| `seshat-reader-translate-template` | `"%l\n\n%q\n\n---\n\n%t\n"` | **翻译**面板的 Markdown 模板；`nil` 表示不套模板、直接插入正文。默认**不含标题**（`header-line` 显示「Seshat 译文」/「Seshat 解释」）；`%k` 标题占位符保留供自定义模板使用。占位符：`%k` 标题、`%l` 语言对（斜体，如 `*en → zh*`；无 langs 时留空）、`%q` 原文引用块、`%t` 正文。模板非法（未知占位符等）时回退纯正文并 `message` 警告 |
+| `seshat-reader-translate-explain-template` | `"%q\n\n---\n\n%t\n"` | **解释**面板的独立 Markdown 模板；默认不含标题与语言对（解释场景前者由 `header-line` 承担、后者信息价值低），占位符与上一行相同。`nil` 退回纯正文，**不会借用** `seshat-reader-translate-template` |
+| `seshat-reader-translate-visual-fill-column` | `t` | 译文/解释面板启用 `visual-fill-column-mode`（**软依赖**，未安装时静默跳过），按 `visual-fill-column-width`（`nil` → `fill-column`）缩窄正文；设 `nil` 关闭并清理窗口 margin；批注列表不受影响（ETAF 按窗口宽度布局） |
 
 说明：
 
@@ -109,7 +112,7 @@ Emacs 端通过 `seshat-reader-annotation` 采集 PDF 页面选区并同步为�
 - 服务恢复后，同步由以下时机推进：**启动后 `initial-delay`（默认 10 秒）首次 + 每 `sync-interval`（默认 300 秒）周期 + 手动 `M-x seshat-reader-annotation-queue-sync` + `list`/`create` 成功后的机会性同步**。
 - 队列文件为 elisp 数据（`prin1` 写出的 plist 列表），采用**原子写**：先把内容写入同目录唯一临时文件，再 `rename-file` 原子覆盖目标文件，避免写入中途崩溃留下损坏内容；读取到损坏文件时保留原文件不覆盖并报错。
 
-### 阅读器面板（M11.7–M11.10）
+### 阅读器面板（M11.7–M11.14）
 
 > 与批注侧车同属**客户端侧**配置（由 `seshat-reader-sidebar` 承载层读取，该模块零依赖、不渲染内容），与服务端无关。批注列表与译文/解释统一显示在底部弹出面板中。
 
@@ -117,18 +120,18 @@ Emacs 端通过 `seshat-reader-annotation` 采集 PDF 页面选区并同步为�
 |---|---|---|
 | `seshat-reader-sidebar-enabled` | `t` | 是否用面板展示批注列表与译文/解释；`nil` 时批注列表退回 `pop-to-buffer`，译文按 `seshat-reader-translate-render` 处理（取 `sidebar` 时退回 `pop` 式 posframe） |
 | `seshat-reader-sidebar-position` | `below-selected` | 面板弹出位置：`below-selected`（当前窗口下方分割，形如 `*Help*`）或 `at-bottom`（frame 底部整宽） |
-| `seshat-reader-sidebar-height` | `0.35` | 面板**首次显示**时的初始高度，作为 `display-buffer` 的 `window-height`（按比例）；译文/解释面板随后按内容自适应（见 `seshat-reader-sidebar-max-height`），批注列表固定用本值。改动仅对**新建**面板窗口生效，对已显示窗口不自动重排 |
-| `seshat-reader-sidebar-max-height` | `0.8` | 译文/解释面板按内容自适应时的**高度上限**（占 frame 比例）；自适应范围夹紧在 5 行到本值之间。仅对 `translate` 且未挂载 ETAF runtime 的面板生效，批注列表固定高度不受影响 |
-| `seshat-reader-annotation-page-size` | `20` | 批注列表**每页条数**；`]` / `[` 翻页，标题徽章在多页时显示「第 x/y 页」、单页显示「N 条」，`n` / `p` 跨页时自动切页 |
+| `seshat-reader-sidebar-height` | `0.35` | 面板**首次显示**时的初始高度，作为 `display-buffer` 的 `window-height`（按比例）；译文/解释面板随后按内容自适应（见 `seshat-reader-sidebar-min-height` / `seshat-reader-sidebar-max-height`），批注列表固定用本值。改动仅对**新建**面板窗口生效，对已显示窗口不自动重排 |
+| `seshat-reader-sidebar-max-height` | `0.8` | 译文/解释面板按内容自适应时的**高度上限**（占 frame 比例）；自适应范围夹紧在 `seshat-reader-sidebar-min-height`（默认 0.25）与本值之间。仅对 `translate` 且未挂载 ETAF runtime 的面板生效，批注列表固定高度不受影响 |
+| `seshat-reader-sidebar-min-height` | `0.25` | 译文/解释面板按内容自适应的**下限**（占 frame 比例，至少 1 行）；与 `max-height` 共同夹紧。仅对 `translate` 且未挂载 ETAF runtime 的面板生效，批注列表不受影响；`min` 配得比 `max` 大时以 `max` 为准 |
 | `seshat-reader-sidebar-select-window` | `t` | 面板显示后是否在**命令结束时**把光标移入面板（`display-buffer` 的 `post-command-select-window`）；`nil` 时光标留在原窗口 |
 | `seshat-reader-sidebar-translate-buffer-name` | `"*Seshat Sidebar*"` | 译文/解释的**展示 buffer** 名（只读 Markdown 文本 buffer，也是 popper 判定的名字之一）；gt 中转改用隐藏 buffer ` *Seshat gt*`，本变量不再作 gt `:name`、也不再作结果捕获的守卫依据 |
 
 说明：
 
 - **底部弹出、单窗口**：批注列表与译文共用同一个底部窗口，**后显示者接管**（这是 pop 式面板的既有语义，非缺陷）；需要两者同屏需另立方案。译文/解释已改为同一面板内的 Markdown 文本 buffer，互斥语义不变。
-- **译文/解释为 Markdown 文本 buffer**：面板正文是普通只读 buffer，用 `gfm-view-mode`（缺失时降级 `markdown-view-mode` / `text-mode`）渲染，`truncate-lines` 为 nil 且显式开 `word-wrap`；`header-line` 显示「Seshat 译文」/「Seshat 解释」；`q`（关面板）与 `C-c C-s`（存为批注）由 minor mode `seshat-reader-translate-panel-mode` 承载。**markdown-mode 为软依赖**：未安装时降级 `text-mode`（不折行美化、不隐藏标记），功能仍可用。
-- **高度自适应**：译文/解释面板显示后按内容实际行数（`window-text-pixel-size` 换算）调整高度，夹紧 5 行到 `seshat-reader-sidebar-max-height`，并把实测比例写入该 kind 的高度记忆；同帧内面板增高会压缩上方阅读窗口（预期行为）。
-- **分页**：批注列表按 `seshat-reader-annotation-page-size` 分页（buffer-local 当前页），`]` / `[` 翻页（ETAF `:keys` 与 `list-mode-map` 双路径），删除/刷新后页号自动收敛，纯文本回退路径的页脚 `-- 第 x/y 页 --` 仅在多页时显示。
+- **译文/解释为 Markdown 文本 buffer**：面板正文是普通只读 buffer，用 `gfm-view-mode`（缺失时降级 `markdown-view-mode` / `text-mode`）渲染，`truncate-lines` 为 nil 且显式开 `word-wrap`；`header-line` 显示「Seshat 译文」/「Seshat 解释」；`q`（关面板）与 `C-c C-s`（存为批注）由 minor mode `seshat-reader-translate-panel-mode` 承载。**markdown-mode 为软依赖**：未安装时降级 `text-mode`（不折行美化、不隐藏标记），功能仍可用。正文按模板渲染——翻译面板用 `seshat-reader-translate-template`（默认「语言对 + 原文块 + 分隔线 + 正文」）、解释面板用 `seshat-reader-translate-explain-template`（默认「原文块 + 分隔线 + 正文」）；两者默认都**不含正文标题**，因为 `header-line` 已显示「Seshat 译文」/「Seshat 解释」，需要正文标题时自定义模板加 `%k`（或设模板为 `nil` 退回纯正文）。
+- **高度自适应**：译文/解释面板显示后按内容实际行数（`window-text-pixel-size` 换算）调整高度，夹紧 `seshat-reader-sidebar-min-height`（默认 0.25）到 `seshat-reader-sidebar-max-height`（默认 0.8），并把实测比例写入该 kind 的高度记忆；同帧内面板增高会压缩上方阅读窗口（预期行为）。单行像素高取首行 `line-pixel-height` 与 `frame-char-height` 的**较小值**（Markdown 标题行通常比正文行高，直接用首行会把内容行数低估），测量上限 120 行（超长内容按上限计，避免测量耗时）。
+- **连续流展示**：批注列表**不分页**，全量条目一次性单列渲染（无页脚、无 `]`/`[` 翻页键）；徽章始终显示「N 条」，`n`/`p` 只移动选中、不再切页。列表超出面板高度时由**面板窗口**滚动查看；ETAF 渲染层按条目数显式计算 viewport 高度（`--content-viewport-height`，已挂载时经 `etaf-runtime-refit` 放大），保证新增条目不被裁剪。
 - **per-kind 高度记忆（仅会话内）**：同一时刻只有一个面板窗口，但 `annotations` 与 `translate` **各自记住自己的高度**——切换内容前先把当前窗口的实际高度（比例）记给它的类型，再用目标类型记住的高度新建窗口；同一类型重复显示走 `display-buffer` 复用，不重建、也不重置用户手动调整过的窗口高度。某类型首次显示时使用 `seshat-reader-sidebar-height`。状态保存在内存 alist 中，**重启 Emacs 后回到默认值**。
 - **关闭**：面板是非固定窗口；面板内 `q` 由 minor mode 承载（批注列表与译文面板各有其 minor mode 键位），`seshat-reader-sidebar-toggle` 可开合（关闭本包面板窗口，打开时按最近一次的内容类型重开，含 `translate`）。toggle **不使用** `window-toggle-side-windows`——它是 frame 级全量开关，会连带删除/恢复 eca-chat、which-key 的侧窗。
 - **popper 集成**：`*Seshat Annotations*` 与 `*Seshat Sidebar*` 两个 buffer 名已在 `thomas-emacs/lisp/init-window.el` 登记为 popper popup，可用 `C-'` 或 `` M-` `` 开关；popper 重开时经 `seshat-reader-sidebar-display-buffer` 分流回本包的显示逻辑，因此**布局（`position` / `height` / per-kind 高度）仍由本包掌控**，不会被 popper 的默认 bottom side window 规则改写。该分流由用户配置侧（`init-window.el`）接入，本包只提供函数。
@@ -153,7 +156,7 @@ Emacs 端通过 `seshat-reader-annotation` 采集 PDF 页面选区并同步为�
 
 > 面板内容的可选渲染层（`seshat-reader-etaf`），依赖 `etaf-ui`。**ETAF 四仓库不入 notes 仓库**，仅通过 `load-path` 加载；未安装时功能完全不受影响。
 >
-> **职责边界（M11.10 起）**：ETAF **只渲染批注卡片列表**（页码徽章 / 摘要 / `[待同步]` 标记 / 选中高亮 / 键位提示 / 分页）。**译文与解释不再经过 ETAF**——它们由 `seshat-reader-translate--render-panel` 写成面板内的只读 Markdown 文本 buffer（`gfm-view-mode` 降级链），原生折行、滚动、复制与 isearch 全部可用，不受 ETAF 固定画布 viewport 裁剪。因此 ETAF 不可用只影响批注列表的观感，**译文/解释功能完全不受影响**。
+> **职责边界（M11.10 起）**：ETAF **只渲染批注卡片列表**（页码徽章 / 摘要 / `[待同步]` 标记 / 选中高亮 / 键位提示）。**译文与解释不再经过 ETAF**——它们由 `seshat-reader-translate--render-panel` 写成面板内的只读 Markdown 文本 buffer（`gfm-view-mode` 降级链），原生折行、滚动、复制与 isearch 全部可用，不受 ETAF 固定画布 viewport 裁剪。因此 ETAF 不可用只影响批注列表的观感，**译文/解释功能完全不受影响**。
 
 安装：
 

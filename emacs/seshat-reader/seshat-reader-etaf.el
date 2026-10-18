@@ -105,18 +105,6 @@
 `etaf-runtime-flush' 时增量更新，故两者并行存在；写入点统一在
 `seshat-reader-etaf-render-annotations'。")
 
-(defvar seshat-reader-etaf--page (etaf-ref 1)
-  "批注列表当前显示的页码（**1-based**）.
-由 `seshat-reader-etaf-render-annotations' 写入（页码的权威来源在批注层：
-buffer-local 的 `seshat-reader-annotation-list-page'），视图经 `(expr …)' 读取
-它决定「只渲染当页哪 20 条」，故翻页后只做增量刷新（`etaf-runtime-flush'）。")
-
-(defvar seshat-reader-etaf--page-count (etaf-ref 1)
-  "批注列表的总页数（至少 1）.
-由 `seshat-reader-etaf-render-annotations' 写入（权威来源是
-`seshat-reader-annotation--page-count'，按全量条目数现算）；视图据此决定
-标题徽章显示「第 x/y 页」还是「N 条」.")
-
 (defvar seshat-reader-etaf--doc-source nil
   "发起面板的 seshat-reader 文档缓冲区，供动作命令跳页时使用.")
 
@@ -126,13 +114,9 @@ buffer-local 的 `seshat-reader-annotation-list-page'），视图经 `(expr …)
     ("C-c C-r" seshat-reader-etaf-annotation-reference "引用")
     ("q" seshat-reader-etaf-quit "关闭")
     ("n" seshat-reader-etaf-annotation-next "下一条")
-    ("p" seshat-reader-etaf-annotation-prev "上一条")
-    ("]" seshat-reader-annotation-list-next-page "下一页")
-    ("[" seshat-reader-annotation-list-prev-page "上一页"))
+    ("p" seshat-reader-etaf-annotation-prev "上一条"))
   "批注面板的 ETAF `:keys' 绑定表，元素为 (KEY COMMAND LABEL).
-`]' / `[` 翻页（命令由批注层提供，翻页会重渲染并刷新
-`seshat-reader-etaf--page'）；`n' / `p' 移动选中，选中跨页时先切页再滚动。
-`q' 关闭面板。")
+`n' / `p' 移动选中并滚动到选中项；`q' 关闭面板。列表不分页，故无翻页键。")
 
 (defun seshat-reader-etaf-available-p ()
   "Return non-nil when the ETAF rendering layer may be used.
@@ -284,9 +268,8 @@ COLORS 为 `seshat-reader-etaf--colors' 返回的 alist。一行一卡，列结�
 - 卡片之间用 `:border' 色的细底线分隔（不用 `etaf-divider'，避免过密）。
 
 本函数只负责**一张**卡片；哪些条目出卡片由 `seshat-reader-etaf--annotations-view'
-按当页切片（`seshat-reader-annotation--page-items'）决定，渲染层存的是**全量**
-条目。选中态（`▌' 与底色）取全量 `seshat-reader-etaf--selected'，故选中项不在
-当页时本页无标记，翻回该页时选中仍在——跨页选中不丢。"
+决定——列表**全量**渲染（不分页、不切片）。选中态（`▌' 与底色）取
+`seshat-reader-etaf--selected'。"
   (let* ((page (seshat-reader-etaf--item-page it))
          (key (seshat-reader-etaf--item-key it))
          (selected (seshat-reader-etaf--item-selected-p it)))
@@ -333,39 +316,27 @@ KEY 为 nil 时清除选中；本函数只改 `seshat-reader-etaf--selected'，�
 
 ;;; 面板视图
 
-(defun seshat-reader-etaf--current-page ()
-  "Return the page number currently shown in the annotation panel (1-based).
-`seshat-reader-etaf--page' 尚未写入（nil）时按第 1 页处理——分页切片不允许
-nil 页号（见 `seshat-reader-annotation--page-items'）。"
-  (or (etaf-value seshat-reader-etaf--page) 1))
-
 (defun seshat-reader-etaf--badge-text (items)
   "Return the header badge text of the annotation panel.
-多页（`seshat-reader-etaf--page-count' > 1）时返回 \"第 x/y 页\"；单页时返回
-条目总数 \"N 条\"（此时「页」的概念对用户无意义）。ITEMS 为首次渲染时的已知
-条目列表，仅作 ref 尚无值时（首次 mount 早期）的兜底来源。"
-  (let ((page-count (or (etaf-value seshat-reader-etaf--page-count) 1)))
-    (if (> page-count 1)
-        (format "第 %d/%d 页"
-                (seshat-reader-etaf--current-page) page-count)
-      (format "%d 条" (length (or (etaf-value seshat-reader-etaf--items)
-                                  items))))))
+恒为条目总数 \"N 条\"（列表不分页，「页」的概念对用户无意义）。ITEMS 为首次
+渲染时的已知条目列表，仅作 ref 尚无值时（首次 mount 早期）的兜底来源。"
+  (format "%d 条" (length (or (etaf-value seshat-reader-etaf--items) items))))
 
 (defun seshat-reader-etaf--annotations-view (items)
   "Return the annotation panel view for ITEMS, a list of plists.
 版式自上而下：标题栏（标题 + 右对齐徽章 + 细底线）→ 弱化的文档名 →
-卡片列表（可滚动，固定 12 行高）→ 底部键位提示（细顶线）。
+卡片列表（全量单列连续流，不限高、无内部滚动）→ 底部键位提示（细顶线）。
 
-**分页**：卡片列表只渲染**当页**条目——`seshat-reader-etaf--items' 存全量
-（选中、页号收敛与跨页移动都需要全量），经
-`seshat-reader-annotation--page-items' 按 `seshat-reader-etaf--page' 切片后才
-出卡片；徽章多页时显示「第 x/y 页」、单页时显示条目总数（见
-`seshat-reader-etaf--badge-text'）。
+**全量渲染**：卡片列表把 `seshat-reader-etaf--items' 的**全部**条目铺开，
+不分页也不切片；条目超出面板窗口高度时由**窗口**整体滚动查看，画布本身
+不裁剪（根 viewport 高度由 `seshat-reader-etaf-render-annotations' 按条目数
+显式计算，见 `seshat-reader-etaf--content-viewport-height'）。徽章恒为条目
+总数（见 `seshat-reader-etaf--badge-text'）。
 
 条目的**动态部分**（列表、徽章、文档名）一律经 `(expr …)' 读
-`seshat-reader-etaf--items' / `--page' / `--page-count' / `--doc-label'，从而
-翻页与刷新只做增量更新（`etaf-runtime-flush'）。`:keys' 挂在根 `column' 上，
-覆盖 ebox 默认滚动键 `n'/`p'，并登记 `]'/`[' 翻页。"
+`seshat-reader-etaf--items' / `--doc-label'，从而刷新只做增量更新
+（`etaf-runtime-flush'）。`:keys' 挂在根 `column' 上，覆盖 ebox 默认滚动键
+`n'/`p'（改为移动选中）。"
   (let ((colors (seshat-reader-etaf--colors)))
     (etaf-view
      (column :class "seshat-etaf-annotations"
@@ -392,18 +363,14 @@ nil 页号（见 `seshat-reader-annotation--page-items'）。"
          (expr (seshat-reader-etaf--text-view
                 (or (etaf-value seshat-reader-etaf--doc-label) "")
                 (alist-get :muted colors))))
-       ;; 卡片列表：只渲染当页（全量条目留在 `--items'，供选中与页号收敛）
+       ;; 卡片列表：全量渲染，不限高、无内部滚动（面板窗口整体滚动）
        (column :class "seshat-etaf-list"
                :ref seshat-reader-etaf--list-ref
                :width 'stretch
                :item-gap '(lh 0)
-               :height '(lh 12)
-               :overflow 'scroll
          (expr (mapcar (lambda (it)
                          (seshat-reader-etaf--card it colors))
-                       (seshat-reader-annotation--page-items
-                        (etaf-value seshat-reader-etaf--items)
-                        (seshat-reader-etaf--current-page)))))
+                       (etaf-value seshat-reader-etaf--items))))
        ;; 底部键位提示
        (box :width 'stretch
             :padding '((lh 0) (ch 1))
@@ -413,6 +380,24 @@ nil 页号（见 `seshat-reader-annotation--page-items'）。"
          (expr (seshat-reader-etaf--text-view
                 "RET 打开 · d 删除 · C-c C-r 引用 · n/p 移动 · q 关闭"
                 (alist-get :muted colors))))))))
+
+(defconst seshat-reader-etaf--chrome-lines 6
+  "批注面板除卡片列表外的固定行数估算（标题栏 + 文档名 + 底部提示 + 余量）.
+取略大的值：估算偏大只会多申请 viewport 行数，ebox 按实际内容写入、
+不补空行，故无视觉副作用；估算偏低则会**裁剪**条目。")
+
+(defconst seshat-reader-etaf--card-lines 2
+  "单张批注卡片占用的大致行数估算（单行文本 + 细下边线 + 余量）.")
+
+(defun seshat-reader-etaf--content-viewport-height (items)
+  "Return the viewport height in lines that lays out ITEMS in full.
+`etaf-mount' 的 `:viewport-height' 决定 ebox 向 buffer 写入多少行：固定 20 行
+时超出的卡片会被**裁掉**（画布只排 20 行，不是可滚动内容）。故按条目数
+估算 `chrome 行数 + (卡片行数 × 条目数)'，并下限到
+`seshat-reader-etaf--default-viewport-height'（空列表也不塌陷）。估算宁大勿小。"
+  (max seshat-reader-etaf--default-viewport-height
+       (+ seshat-reader-etaf--chrome-lines
+          (* seshat-reader-etaf--card-lines (length items)))))
 
 (defun seshat-reader-etaf--viewport-width (buffer)
   "Return BUFFER's viewport width in pixels, or the default width.
@@ -429,54 +414,53 @@ BUFFER 已显示时取其窗口的像素宽度（不小于 40），否则用
 (defun seshat-reader-etaf--ensure-selection (items)
   "Keep `seshat-reader-etaf--selected' pointing at an item of ITEMS.
 原选中项已不在 ITEMS 中（或原本就没有选中）时改选首项；ITEMS 为空时清空
-选中。
-
-ITEMS 必须是**全量**条目（`seshat-reader-etaf--items'），而不是当页切片：
-选中是跨页状态，若用当页条目校正，翻页后选中会被误判为「已失效」并重置到
-首页首条。"
+选中。ITEMS 即面板的全部条目（列表不分页）。"
   (let* ((keys (mapcar #'seshat-reader-etaf--item-key items))
          (current (etaf-value seshat-reader-etaf--selected)))
     (unless (member current keys)
       (seshat-reader-etaf--select (car keys)))))
 
-(defun seshat-reader-etaf-render-annotations (buffer items doc-id
-                                                    &optional source
-                                                    page page-count)
+(defun seshat-reader-etaf-render-annotations (buffer items doc-id &optional source)
   "Render annotation ITEMS into BUFFER for DOC-ID, remembering SOURCE.
-ITEMS 为 plist 列表（**全量**条目，服务端项在前、本地待同步项在后），元素
-可含 `:id'、`:uuid'、`:page'、`:text'、`:dirty'、`:location'；视图按
-PAGE 只渲染当页切片，全量条目留给选中与页号收敛。DOC-ID 为文档标识，SOURCE
-为发起面板的文档缓冲区（供后续跳页使用）。PAGE 为 1-based 页码，缺省取 1；
-PAGE-COUNT 为总页数，缺省由 ITEMS 现算
-（`seshat-reader-annotation--page-count'）。
+ITEMS 为 plist 列表（**全部**条目，服务端项在前、本地待同步项在后），元素
+可含 `:id'、`:uuid'、`:page'、`:text'、`:dirty'、`:location'；列表全量渲染，
+不分页。DOC-ID 为文档标识，SOURCE 为发起面板的文档缓冲区（供后续跳页使用）。
 
-两者写入 `seshat-reader-etaf--page' / `--page-count' ref：首次 mount 前
-`setf'（视图 mount 时就从 ref 取初值），幂等分支同样写入后 flush，因此
-翻页/刷新只做增量刷新，不重建组件树。
+viewport 高度按**内容高度**计算
+（`seshat-reader-etaf--content-viewport-height'）：`etaf-mount' 的
+`:viewport-height' 决定 ebox 写入多少行，固定值会裁掉多余条目，故随条目数
+放大——全部卡片都进 buffer，超出面板窗口的部分靠**窗口滚动**查看。
 
-幂等：BUFFER 已有挂载的 runtime 时只改 ref 并触发增量刷新；否则首次
-`etaf-mount'，并必须传 viewport plist（`:viewport-width' 像素、
-`:viewport-height' 行），否则没有布局。
+幂等：BUFFER 已有挂载的 runtime 时先按新条目数 refit（视口高度需随条目数
+变化，否则新条目被裁），再触发增量刷新；否则首次 `etaf-mount'，并必须传
+viewport plist（`:viewport-width' 像素、`:viewport-height' 行），否则没有
+布局。refit 失败不中断刷新，但会 `message' 一条警告（便于排查「列表被裁剪」）。
 
 返回 BUFFER（buffer 对象）。"
   (setq seshat-reader-etaf--doc-id doc-id
         seshat-reader-etaf--doc-source source)
   (let* ((target (get-buffer-create buffer))
-         (runtime (etaf-runtime-for-buffer target)))
-    (setf (etaf-value seshat-reader-etaf--page) (or page 1))
-    (setf (etaf-value seshat-reader-etaf--page-count)
-          (or page-count (seshat-reader-annotation--page-count items)))
+         (runtime (etaf-runtime-for-buffer target))
+         (width (seshat-reader-etaf--viewport-width target))
+         (height (seshat-reader-etaf--content-viewport-height items)))
     (setf (etaf-value seshat-reader-etaf--items) items)
     (setf (etaf-value seshat-reader-etaf--doc-label) doc-id)
     (seshat-reader-etaf--ensure-selection items)
     (if runtime
-        (etaf-runtime-flush runtime)
+        (progn
+          ;; 条目数变化后视口高度必须跟着变：固定高度的视口会裁掉新增条目。
+          ;; refit 是体验层操作，失败（runtime 已卸载等）不得影响面板刷新，
+          ;; 但必须留一条可排查的警告——静默失败会表现为「列表莫名被裁剪」。
+          (condition-case err
+              (etaf-runtime-refit runtime width height)
+            (error
+             (message "Seshat Reader annotation: 刷新 viewport 高度失败（%s），列表可能被裁剪"
+                      (error-message-string err))))
+          (etaf-runtime-flush runtime))
       (etaf-mount target
                   (seshat-reader-etaf--annotations-view items)
-                  (list :viewport-width
-                        (seshat-reader-etaf--viewport-width target)
-                        :viewport-height
-                        seshat-reader-etaf--default-viewport-height)))
+                  (list :viewport-width width
+                        :viewport-height height)))
     target))
 
 ;;; 动作命令（从选中项解析底层能力）
@@ -500,32 +484,12 @@ KEY 省略时取当前选中项的 key。面板未挂载、无 runtime 或 key �
                        (equal key (seshat-reader-etaf--item-key it)))
                      (etaf-value seshat-reader-etaf--items)))))
 
-(defun seshat-reader-etaf--page-of-index (index)
-  "Return the 1-based page number that holds full-list INDEX.
-页大小取批注层的 `seshat-reader-annotation-page-size'（**防御 0**：取
-`max 1'，否则除零报错）。INDEX 为 nil 时按首项处理。"
-  (1+ (/ (max 0 (or index 0))
-         (max 1 seshat-reader-annotation-page-size))))
-
-(defun seshat-reader-etaf--sync-page-with-selection (index)
-  "Switch the panel to the page holding full-list INDEX, if needed.
-仅当该页与当前 `seshat-reader-etaf--page' 不同时才调
-`seshat-reader-annotation--set-list-page'——它重渲染当页并回写页号 ref（顺带
-把页号夹紧到合法范围），故随后 `--scroll-selected-into-view' 能在新页里找到
-卡片。同页移动只滚动，不重渲染。"
-  (let ((page (seshat-reader-etaf--page-of-index index)))
-    (unless (equal page (etaf-value seshat-reader-etaf--page))
-      (seshat-reader-annotation--set-list-page page))))
-
 (defun seshat-reader-etaf--move-selection (step)
   "Move the selection by STEP items and return the new key.
 到两端时夹紧，不循环；ITEMS 为空时返回 nil 且不清除选中。
 
-索引在**全量** `seshat-reader-etaf--items' 上计算（当页切片只影响渲染），
-因此选中可以跨页：新选中项所在页 `(1+ (/ index page-size))' 与当前页不同时，
-先 `seshat-reader-etaf--sync-page-with-selection' 切页（触发当页重渲染），再
-把新选中项滚入可视区域；同页则只滚动。滚动与切页都是体验增强，失败不得
-影响选中切换本身（面板未挂载时静默跳过）。"
+列表全量渲染、不分页，故移动只需把新选中项滚入可视区域（滚动是体验增强，
+失败不影响选中切换本身：面板未挂载时静默跳过）。"
   (let* ((items (etaf-value seshat-reader-etaf--items))
          (keys (mapcar #'seshat-reader-etaf--item-key items))
          (current (etaf-value seshat-reader-etaf--selected))
@@ -535,7 +499,6 @@ KEY 省略时取当前选中项的 key。面板未挂载、无 runtime 或 key �
          (next (and keys (nth index keys))))
     (when next
       (seshat-reader-etaf--select next)
-      (seshat-reader-etaf--sync-page-with-selection index)
       (seshat-reader-etaf--scroll-selected-into-view next))
     next))
 
@@ -667,14 +630,14 @@ KEY 省略时取当前选中项的 key。面板未挂载、无 runtime 或 key �
                   (error-message-string err))))))))
 
 (defun seshat-reader-etaf-annotation-next ()
-  "选中下一条批注；选中跨页时先切到新页，再把它滚入可视区域.
-选中移动到面板末尾时夹紧（不循环）；切页与滚动失败静默跳过。"
+  "选中下一条批注，并把它滚入可视区域.
+选中移动到面板末尾时夹紧（不循环）；滚动失败静默跳过。"
   (interactive)
   (seshat-reader-etaf--move-selection 1))
 
 (defun seshat-reader-etaf-annotation-prev ()
-  "选中上一条批注；选中跨页时先切到新页，再把它滚入可视区域.
-选中移动到面板开头时夹紧（不循环）；切页与滚动失败静默跳过。"
+  "选中上一条批注，并把它滚入可视区域.
+选中移动到面板开头时夹紧（不循环）；滚动失败静默跳过。"
   (interactive)
   (seshat-reader-etaf--move-selection -1))
 

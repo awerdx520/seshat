@@ -89,6 +89,14 @@
   :type 'number
   :group 'seshat-reader-sidebar)
 
+(defcustom seshat-reader-sidebar-min-height 0.25
+  "译文/解释面板按内容自适应时的**下限**，按 `frame-height' 的**比例**计.
+仅对 kind 为 `translate' 的面板生效：目标高度不低于本值 × `frame-height'
+（向下取整，至少 1 行），也不高于 `seshat-reader-sidebar-max-height' ×
+`frame-height'。批注列表固定高度不受影响。"
+  :type 'number
+  :group 'seshat-reader-sidebar)
+
 (defcustom seshat-reader-sidebar-max-height 0.8
   "面板自适应高度的上限，按 `frame-height' 的**比例**计.
 仅对译文/解释（kind 为 `translate'）面板生效：面板显示后按内容实际行数调整
@@ -196,20 +204,22 @@ WINDOWS 省略时取全部本包面板窗口（`seshat-reader-sidebar--windows'�
 
 (defun seshat-reader-sidebar--content-height (window)
   "返回 WINDOW 的内容高度，以**行数**（整数）表示.
-实现：在 WINDOW 的 buffer 内取 `line-pixel-height' 作单行像素高（非正数或
-取不到时退回 `frame-char-height'），再用 `window-text-pixel-size' 测量从
-`point-min' 到 `point-max' 的像素高——测量上限取 40 行，避免超长内容测量
-耗时——最后按单行像素高向上取整换算为行数。任一环节失败返回 nil（调用方按
-最小高度处理）。"
+实现：在 WINDOW 的 buffer 内取单行像素高——取 `line-pixel-height'（首行）与
+`frame-char-height' 的**较小值**，首行像素高非正数或取不到时退回
+`frame-char-height'（Markdown 标题行通常比正文行高，直接用首行高会把内容行数
+低估）——再用 `window-text-pixel-size' 测量从 `point-min' 到 `point-max' 的
+像素高，测量上限取 120 行（避免超长内容测量耗时），最后按单行像素高向上取整
+换算为行数。任一环节失败返回 nil（调用方按最小高度处理）。"
   (ignore-errors
     (with-current-buffer (window-buffer window)
       (let* ((raw (line-pixel-height))
+             (char-height (frame-char-height))
              (line-height (if (and (numberp raw) (> raw 0))
-                              raw
-                            (frame-char-height)))
+                              (min raw char-height)
+                            char-height))
              (pixel (cdr (window-text-pixel-size
                           window (point-min) (point-max)
-                          nil (* 40 line-height)))))
+                          nil (* 120 line-height)))))
         (ceiling pixel line-height)))))
 
 (defun seshat-reader-sidebar--fit-applicable-p (buffer &optional kind)
@@ -233,8 +243,10 @@ KIND 省略时读 BUFFER 所在窗口的 `seshat-reader-sidebar-kind' window par
 `translate'、且 buffer 未挂载 ETAF runtime；KIND 省略时取 WINDOW 的
 `seshat-reader-sidebar-kind' window parameter），再以
 `seshat-reader-sidebar--content-height' 的行数 + 2（header-line 与余量）为
-目标高度，下限 5 行、上限为 `seshat-reader-sidebar-max-height' 与
-`frame-height' 之积向下取整，用 `window-resize'（DELTA 按行、忽略固定尺寸
+目标高度，下限为 `seshat-reader-sidebar-min-height' × `frame-height'（至少 1
+行）、上限为 `seshat-reader-sidebar-max-height' × `frame-height' 向下取整
+（`max-h' 与 `target' 都做 `max' 1 保底，故 frame 极小时仍至少 1 行；下限高于
+上限时先按上限夹紧再保底），用 `window-resize'（DELTA 按行、忽略固定尺寸
 约束）调整。
 调整后把最终比例 `window-total-height'/`frame-height' 写入
 `seshat-reader-sidebar--state'（同 KIND 先 `assq-delete-all' 再 `cons'，与
@@ -249,9 +261,12 @@ KIND 省略时读 BUFFER 所在窗口的 `seshat-reader-sidebar-kind' window par
       (when (seshat-reader-sidebar--fit-applicable-p buffer kind)
         (let* ((content (or (seshat-reader-sidebar--content-height window) 0))
                (frame-h (frame-height))
-               (max-h (floor (* seshat-reader-sidebar-max-height
+               (min-h (floor (* seshat-reader-sidebar-min-height
                                 (float frame-h))))
-               (target (max 5 (min max-h (+ content 2))))
+               (max-h (max 1 (floor (* seshat-reader-sidebar-max-height
+                                     (float frame-h)))))
+               (target (max 1 (max (min min-h max-h)
+                                   (min max-h (+ content 2)))))
                (delta (- target (window-total-height window))))
           (unless (zerop delta)
             (window-resize window delta nil t))

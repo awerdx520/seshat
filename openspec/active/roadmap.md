@@ -91,7 +91,7 @@ M0–M6 已完成并归档，见 `openspec/completed/personal-notes-system.md`�
 
 | 子项 | 内容 |
 |---|---|
-| M9.1 | 三区 UI 骨架（工具栏 / 内容区 / 底部 Notes·Reader 双 tab）+ 设置页 |
+| M9.1 | 三区 UI 骨架（工具栏 / 内容区 / 底部 Notes·Reader 双 tab）+ 设置页 ✅ 完成（2026-10-18），见 openspec/completed/2026-10-18-m9.1-android-shell.md |
 | M9.2 | 数据源接入（uid + 增量 + 本地缓存 + 按需下载电子书） |
 | M9.3 | Notes：orgzly 风格列表 / 搜索 / 展开 / 编辑 |
 | M9.4 | GTD：agenda 视图增强（M4 基础上） |
@@ -104,6 +104,7 @@ M0–M6 已完成并归档，见 `openspec/completed/personal-notes-system.md`�
 | M10.2 | 阅读增强（目录/主题/字体/跳转） |
 | M10.3 | 批注侧车 + `location` 约定统一（PDF `page:<n>`+范围；EPUB 待定） |
 | M10.4 | 进度/批注 uid 化同步 |
+| M10.5 | **PDF 阅读增强**（用户 2026-10-18 提出，未开工，需另行走方案确认与计划确认）：手写批注（笔迹侧车，不写回 PDF）、点击翻页、横向翻页 / 竖向连续滚动双模式（滚动时页间首尾相接，保留上页最后一行）、横屏适配（fitWidth / fitHeight 选择）、后台渲染线程 + 位图 LRU 缓存（依赖 M10.1） |
 
 ### M11 批注与引用闭环
 
@@ -120,7 +121,11 @@ M0–M6 已完成并归档，见 `openspec/completed/personal-notes-system.md`�
 | M11.7 | 阅读器信息面板（底部弹出，批注 / 译文 / 解释统一承载） | ✅ 完成（2026-10-17，含承载方式返工：底部弹出 + per-kind 高度）；见 openspec/completed/2026-10-16-m11.7-reader-sidebar.md |
 | M11.8 | 底部面板交互优化（光标跟随 · popper 开关 · 便捷键位） | 部分完成（2026-10-17）：光标跟随、popper 分流、面板内键位（由 M11.9 的 `:keys` 承担）已完成；**T6 全局 `SPC o P` 入口待办**；见 openspec/completed/2026-10-17-m11.8-sidebar-ux.md |
 | M11.9 | 面板 ETAF 渲染层（批注卡片化 + 译文排版，可选软依赖） | ✅ 完成（2026-10-17）；ETAF PoC 判可行（加载 0.09s / 首渲染 0.002s / 零 warning / 无 native 依赖）；见 openspec/completed/2026-10-17-m11.9-etaf-render.md |
-| M11.10 | 阅读器面板渲染重构：译文/解释改 Markdown 文本 buffer + 批注分页 | ✅ 完成（2026-10-18）；见 openspec/active/2026-10-18-reader-panel-markdown-and-paging.md |
+| M11.10 | 阅读器面板渲染重构：译文/解释改 Markdown 文本 buffer + 批注分页 | ✅ 完成（2026-10-18）；见 openspec/completed/2026-10-18-reader-panel-markdown-and-paging.md |
+| M11.11 | 译文/解释面板 Markdown 模板与初始高度（模板可配置 + 高度下限可配置） | ✅ 完成（2026-10-18）；见 openspec/completed/2026-10-18-reader-panel-markdown-template-and-min-height.md |
+| M11.12 | 译文/解释面板模板拆分、去正文重复标题、原文默认显示 | ✅ 完成（2026-10-18）；见 openspec/completed/2026-10-18-reader-panel-template-split.md |
+| M11.13 | 批注列表去分页，改单列连续流（全量渲染 + 按内容设置 ETAF viewport 高度） | ✅ 完成（2026-10-18）；见 openspec/completed/2026-10-18-annotation-list-continuous-flow.md |
+| M11.14 | 译文/解释面板启用 visual-fill-column-mode（软依赖、可关） | ✅ 完成（2026-10-18）；见 openspec/completed/2026-10-18-reader-panel-visual-fill-column.md |
 
 ## 风险登记
 
@@ -139,6 +144,7 @@ M0–M6 已完成并归档，见 `openspec/completed/personal-notes-system.md`�
 3. Reader「基础功能」清单（排除 TTS/词典/统计？）—— M10 需要
 4. EPUB 的 location 约定（CFI vs `chapter:x`）—— M10.3 需要
 5. M11.8 T6（`SPC o P` 全局键位）未做，属 UX 待办（见 tech-debt）
+6. PDF 手写批注的 `location` 协议（现有约定仅支持 `page:<n>;rect:x0,y0,x1,y1`，多点笔迹需扩展，例如 `page:<n>;ink:...`；需与 Emacs 端 rect 约定共存）—— M10.5 需要
 
 ## 文档清单
 

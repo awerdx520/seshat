@@ -67,6 +67,9 @@
 ;; 信息面板承载体（零依赖模块）；本模块用它取面板 buffer 名、
 ;; `--display-params' 与统一显示入口。
 (require 'seshat-reader-sidebar)
+;; `cl-every' 用于校验语言列表（`--format-langs'）；cl-lib 是内置库，
+;; 加载成本可忽略。注意它**不是** `-Q' 批处理下默认已加载的库。
+(require 'cl-lib)
 
 (eval-when-compile
   ;; `oset'/`oref' 是内置 eieio 的宏，仅在**编译期**需要 eieio 才能正确
@@ -93,6 +96,9 @@
 (declare-function gt-posframe-pin-render "gt-render-posframe" (&rest args))
 (declare-function gt-buffer-render "gt-render-buffer" (&rest args))
 (declare-function gt-start "gt-core" (translator))
+;; visual-fill-column 同样是软依赖（只在 `--prepare-view' 内按需加载），
+;; 编译期不加载其库，故显式声明签名以消除「not known to be defined」告警。
+(declare-function visual-fill-column-mode "visual-fill-column" (&optional arg))
 
 (defvar gt-preset-translators)
 
@@ -176,12 +182,54 @@ Markdown 只读视图显示：gt 只负责把纯译文渲染到隐藏中转 buff
   :type '(choice (const sidebar) (const pop) (const pin))
   :group 'seshat-reader-translate)
 
-(defcustom seshat-reader-translate-show-source nil
+(defcustom seshat-reader-translate-show-source t
   "是否在译文/解释面板的正文前显示选中的原文.
-非 nil 且存在选区文本时，面板正文前插入原文**引用块**：原文按行拆分、每行
-加 ``> `` 前缀，引用块与正文之间空一行。原文**不截断**（保持完整行，避免长段
-被截半）。默认 nil 表示只显示译文/解释正文，面板更紧凑。"
+默认 t：显示原文引用块，便于对照原文与译文；设 nil 时关闭，面板更紧凑。
+非 nil 且存在选区文本时，面板模板 `seshat-reader-translate-template' 的
+`%q' 占位符位置插入原文**引用块**（见
+`seshat-reader-translate--quote-block'）：首行 `> **原文**'、紧跟一个空
+引用行，随后原文按行拆分、每行加 ``> `` 前缀。原文**不截断**（保持完整行，
+避免长段被截半）。"
   :type 'boolean
+  :group 'seshat-reader-translate)
+
+(defcustom seshat-reader-translate-template
+  "%l\n\n%q\n\n---\n\n%t\n"
+  "译文面板的 Markdown 模板；nil 表示不套模板、直接插入正文.
+默认模板**不含标题**（`%k'）：面板的 `header-line' 已显示
+\"Seshat 译文\"/\"Seshat 解释\"，正文再复述一次只是噪音。`%k' 占位符仍保留，
+供自定义模板使用。
+占位符：`%k' 标题（`seshat-reader-translate--render-panel' 的 TITLE）、
+`%l' 语言对元信息（斜体，如 `en → zh'）、`%q' 原文引用块（仅
+`seshat-reader-translate-show-source' 非 nil 且有选区时非空）、`%t' 译文
+正文。模板渲染失败（未知占位符等）时回退纯正文并 `message' 警告。
+模板里的字面 `%' 需写成 `%%'（`format-spec' 语义）；正文与标题值中的 `%'
+不会被解析。
+
+解释面板使用**独立**的 `seshat-reader-translate-explain-template'（其默认
+值更精简：无标题、无语言对行）；本变量只影响翻译面板。"
+  :type '(choice (const :tag "不使用模板" nil) string)
+  :group 'seshat-reader-translate)
+
+(defcustom seshat-reader-translate-explain-template
+  "%q\n\n---\n\n%t\n"
+  "解释面板的 Markdown 模板；nil 表示不套模板、直接插入正文.
+占位符与 `seshat-reader-translate-template' 相同（`%k' 标题、`%l' 语言对、
+`%q' 原文引用块、`%t' 正文），默认不含 `%k' 与 `%l'（header-line 已显示
+标题；解释场景语言对信息价值低）。与翻译模板**相互独立**：本变量为 nil
+时解释面板退回纯正文，**不会**借用 `seshat-reader-translate-template'。"
+  :type '(choice (const :tag "不使用模板" nil) string)
+  :group 'seshat-reader-translate)
+
+(defcustom seshat-reader-translate-visual-fill-column t
+  "译文/解释面板是否启用 `visual-fill-column-mode'.
+非 nil 时在 `seshat-reader-translate--prepare-view' 末尾启用该 minor mode，
+按 `visual-fill-column-width'（nil 时回退 `fill-column'）缩窄文本区；设为
+nil 关闭——仅当面板已显示时传 -1 清理窗口 margin（面板未显示时不触碰窗口，
+避免误清阅读器窗口的 margin/fringe）。`visual-fill-column' 是软依赖：未安装
+时静默跳过。批注列表面板不受本变量影响。"
+  :type 'boolean
+  :safe #'booleanp
   :group 'seshat-reader-translate)
 
 (defcustom seshat-reader-translate-capture-window 120
@@ -275,23 +323,99 @@ nil 与 `word-wrap' 为 t——`gfm-view-mode' 实测不设 `word-wrap'，不显
 就只能按字符边界硬折行，CJK 折行效果差——最后设 `buffer-read-only' 为 t。
 
 major mode 调用失败（如 autoload 指向的库缺失）时回退 `text-mode'，保证
-面板渲染不因软依赖缺失而报错。"
+面板渲染不因软依赖缺失而报错。
+
+末尾按 `seshat-reader-translate-visual-fill-column' 启停
+`visual-fill-column-mode'（软依赖 `visual-fill-column'，未安装时静默跳过），
+让面板正文按 `visual-fill-column-width'（nil 时回退 `fill-column'）缩窄/居中。"
   (let ((mode (seshat-reader-translate--view-mode-function)))
     (condition-case nil
         (funcall mode)
       (error (text-mode))))
   (setq-local truncate-lines nil)
   (setq-local word-wrap t)
-  (setq-local buffer-read-only t))
+  (setq-local buffer-read-only t)
+  (when (or (fboundp 'visual-fill-column-mode)
+            (require 'visual-fill-column nil t))
+    ;; 启用时立即设 margin；关闭时仅当面板已显示（窗口可能残留旧 margin）
+    ;; 才传 -1 清理——面板未显示时 selected-window 是阅读器窗口，传 -1 会
+    ;; 误清它的 margin/fringe。
+    (if seshat-reader-translate-visual-fill-column
+        (visual-fill-column-mode 1)
+      (when (get-buffer-window (current-buffer))
+        (visual-fill-column-mode -1)))))
 
-(defun seshat-reader-translate--render-panel (text title)
+(defun seshat-reader-translate--format-langs (langs)
+  "把 LANGS 列表格式化为 \"源 → 目标...\" 字符串；无法格式化时返回 nil.
+例如 (en zh) 返回 \"en → zh\"，(en zh ja) 返回 \"en → zh → ja\"。
+LANGS 为 nil、非列表、含非符号或 nil 元素时返回 nil。"
+  (when (and (listp langs) langs
+             (cl-every (lambda (x) (and (symbolp x) (not (null x)))) langs))
+    (mapconcat #'symbol-name langs " → ")))
+
+(defun seshat-reader-translate--quote-block ()
+  "返回原文引用块 Markdown，无原文或未开启 `show-source' 时返回 nil.
+格式为 `> **原文**' 后接一个空引用行，再逐行加 `> ' 前缀；原文不截断。"
+  (let ((source (seshat-reader-translate--selection-source-text)))
+    (when (and seshat-reader-translate-show-source source)
+      (concat "> **原文**\n>\n"
+              (mapconcat (lambda (line) (concat "> " line))
+                         (split-string source "\n")
+                         "\n")))))
+
+(defun seshat-reader-translate--apply-template (text title &optional langs context)
+  "把 TEXT 按对应模板套上 Markdown 模板.
+CONTEXT 取 `explain' 时用 `seshat-reader-translate-explain-template'，其余
+（含 nil、`translate'）用 `seshat-reader-translate-template'。两个模板都为
+nil 时各自退回纯正文，互不借用——这是用 CONTEXT 而非「模板参数」的原因：
+模板参数为 nil 时无法区分「未提供」与「显式要求纯正文」，会导致解释模板
+为 nil 时错误回退到翻译模板。
+
+TITLE 填 `%k'，LANGS 经 `--format-langs' 转成 \"en → zh\" 后包成斜体填 `%l'
+（如 `*en → zh*'；LANGS 为空时该占位符留空，不会留下空的 `**'），原文
+引用块填 `%q'，TEXT 填 `%t'。所选模板为 nil 时原样返回 TEXT。渲染后压缩
+占位符为空造成的连续空行（`\\n{3,}' → `\\n\\n'）并补一个尾换行。仅
+`format-spec' 调用包在 `condition-case' 内：模板非法时 `message' 警告并
+原样返回 TEXT。"
+  (let ((template (if (eq context 'explain)
+                      seshat-reader-translate-explain-template
+                    seshat-reader-translate-template)))
+    (if (null template)
+        text
+      (let* ((lang-str (seshat-reader-translate--format-langs langs))
+             (quote-block (or (seshat-reader-translate--quote-block) ""))
+             (lang-line (if lang-str (concat "*" lang-str "*") ""))
+             rendered)
+        (setq rendered
+              (condition-case err
+                  (format-spec template
+                               (list (cons ?k title)
+                                     (cons ?l lang-line)
+                                     (cons ?q quote-block)
+                                     (cons ?t text)))
+                (error
+                 (message "Seshat Reader translate: 模板渲染失败（%s），回退纯正文"
+                          (error-message-string err))
+                 nil)))
+        (if (null rendered)
+            text
+          (concat (string-trim
+                   (replace-regexp-in-string "\n\\{3,\\}" "\n\n" rendered))
+                  "\n"))))))
+
+(defun seshat-reader-translate--render-panel (text title &optional langs context)
   "把 TEXT 写入译文面板 buffer 并以只读 Markdown 视图显示，返回该 buffer.
-TEXT 为纯译文/解释文本；TITLE 写到 buffer 的 `header-line-format'（显示在
-窗口顶行，不占正文行）。
+TEXT 为纯译文/解释文本，先经 `seshat-reader-translate--apply-template' 按
+CONTEXT 选定模板（`explain' 用 `seshat-reader-translate-explain-template'，
+其余用 `seshat-reader-translate-template'）套上语言对元信息、原文引用块与
+分隔线后写入；LANGS 用于模板的 `%l'，为 nil 时该行留空。CONTEXT 为 nil 时
+按翻译模板处理，故既有三参调用无需改动。TITLE 写到 buffer 的
+`header-line-format'（显示在窗口顶行，不占正文行）；默认模板不再把标题写进
+正文。
 
-`seshat-reader-translate-show-source' 非 nil 且存在选区文本时，先在正文前插入
-原文引用块：按行拆分、每行加 ``> `` 前缀，引用块与正文之间空一行，原文不
-截断。
+`seshat-reader-translate-show-source' 非 nil（默认）且存在选区文本时，原文
+以引用块形式出现在模板的 `%q' 位置（由
+`seshat-reader-translate--quote-block' 生成，原文不截断）。
 
 写入时用 `inhibit-read-only' 包裹（buffer 复用后仍是只读 buffer），随后
 `seshat-reader-translate--prepare-view' 设视图与只读、`header-line-format' 写
@@ -300,16 +424,12 @@ TEXT 为纯译文/解释文本；TITLE 写到 buffer 的 `header-line-format'（
 就绪，可跟随光标）。"
   (let ((buffer (get-buffer-create
                  seshat-reader-sidebar-translate-buffer-name))
-        (source (seshat-reader-translate--selection-source-text)))
+        (content (seshat-reader-translate--apply-template
+                  text title langs context)))
     (with-current-buffer buffer
       (let ((inhibit-read-only t))
         (erase-buffer)
-        (when (and seshat-reader-translate-show-source source)
-          (insert (mapconcat (lambda (line) (concat "> " line))
-                             (split-string source "\n")
-                             "\n"))
-          (insert "\n\n"))
-        (insert text))
+        (insert content))
       (seshat-reader-translate--prepare-view)
       (setq-local header-line-format title)
       (seshat-reader-translate-panel-mode 1)
@@ -331,7 +451,7 @@ TEXT 为纯译文/解释文本；TITLE 写到 buffer 的 `header-line-format'（
         (seshat-reader-translate--record-result
          (seshat-reader-translate--extract-result))))))
 
-(defun seshat-reader-translate--render-object (mode &optional title)
+(defun seshat-reader-translate--render-object (mode &optional title langs context)
   "按 MODE 构造一个 gt 渲染对象，TITLE 为译文面板的 header-line 标题.
 MODE 为 `sidebar' 且 `seshat-reader-sidebar-enabled' 非 nil 时，返回 go-translate
 function `gt-buffer-render'，让 gt 渲染到**隐藏中转 buffer**：`:name' 取
@@ -351,7 +471,12 @@ posframe 渲染器（gt function `gt-posframe-pop-render'）。
 
 TITLE 由 `seshat-reader-translate--translator' 按 context 传入（译作
 \"Seshat 译文\"、解释作 \"Seshat 解释\"）；`&optional' 保证既有单参调用无需
-改动。"
+改动。LANGS 由 `seshat-reader-translate--translator' 传入，供面板模板 `%l'
+使用（仅 sidebar 分支使用，posframe 分支忽略）。
+
+CONTEXT 同样由 `seshat-reader-translate--translator' 传入（`translate' 或
+`explain'），经 `:then' 回调原样转交 `seshat-reader-translate--render-panel'，
+由后者据其选择翻译模板或解释模板；默认 nil 时按翻译模板处理。"
   (pcase mode
     ('pin (gt-posframe-pin-render))
     ('sidebar
@@ -365,7 +490,8 @@ TITLE 由 `seshat-reader-translate--translator' 按 context 传入（译作
             :then (lambda (&rest _args)
                     (let ((result (seshat-reader-translate--panel-result)))
                       (when result
-                        (seshat-reader-translate--render-panel result title))))))
+                        (seshat-reader-translate--render-panel
+                         result title langs context))))))
        (gt-posframe-pop-render)))
     (_ (gt-posframe-pop-render))))
 
@@ -382,9 +508,10 @@ TEXT 为待翻译的纯文本；LANGS 为目标语言列表（如 (en zh)）。�
 `seshat-reader-translate-render'。返回设置好 taker 与 render 的
 translator 对象；调用前会先确保 gt 已加载。
 
-CONTEXT 用于区分预设缺失时的提示文案，取 `translate'（默认，纯翻译）
-或 `explain'（解释）：前者提示回退到内置翻译器，后者提示回退为普通翻译
-并建议在配置侧定义解释预设。"
+CONTEXT 用于区分预设缺失时的提示文案，并决定面板模板，取 `translate'
+（默认，纯翻译）或 `explain'（解释）：前者提示回退到内置翻译器并用
+`seshat-reader-translate-template'，后者提示回退为普通翻译、建议在配置侧
+定义解释预设，并用 `seshat-reader-translate-explain-template'。"
   (seshat-reader-translate--ensure-gt)
   (let* ((preset-trans (alist-get preset (gt-ensure-plain gt-preset-translators)))
          (trans (if preset-trans
@@ -400,7 +527,8 @@ CONTEXT 用于区分预设缺失时的提示文案，取 `translate'（默认，
                         seshat-reader-translate-render
                         (if (eq context 'explain)
                             "Seshat 解释"
-                          "Seshat 译文")))
+                          "Seshat 译文")
+                        langs context))
     trans))
 
 (defun seshat-reader-translate--target-langs (target-lang)

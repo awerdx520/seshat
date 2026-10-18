@@ -82,31 +82,31 @@ Emacs 阅读器（`seshat-reader`）的批注同步在客户端侧叠加一层**
 
 **渲染层 `seshat-reader-etaf`（可选，依赖 `etaf-ui`；只负责批注卡片）**：
 
-- 职责（M11.10 起）：**仅渲染批注卡片列表**——标题栏（文档名 + 条数/页码徽章）、批注卡片（页码徽章 / 摘要 / `[待同步]` 标记 / 选中标记）、底部键位提示与分页。**译文/解释不经过本层**（原「译文排版」组件树已删除）。
-- 交互：`:keys`（`RET` / `d` / `C-c C-r` / `q` / `n` / `p` / `]` / `[`）+ `:on-press`。Host keys 位于 `emulation-mode-map-alists` 最前，evil 不会吃掉——**但依赖加载顺序**：evil 先启用、面板再 mount 才成立；运行期 toggle evil 需重新 mount 面板。
+- 职责（M11.10 起）：**仅渲染批注卡片列表**——标题栏（文档名 + 条数徽章）、批注卡片（页码徽章 / 摘要 / `[待同步]` 标记 / 选中标记）、底部键位提示。**译文/解释不经过本层**（原「译文排版」组件树已删除）。
+- 交互：`:keys`（`RET` / `d` / `C-c C-r` / `q` / `n` / `p`）+ `:on-press`。Host keys 位于 `emulation-mode-map-alists` 最前，evil 不会吃掉——**但依赖加载顺序**：evil 先启用、面板再 mount 才成立；运行期 toggle evil 需重新 mount 面板。
 - 双色板：按 `background-mode` 取内置明/暗配色，文字一律用普通 `text` + 父 Host 样式（`etaf-label` / `etaf-badge` 自带颜色会覆盖父 Host，故不用）；换主题后需重新渲染面板。
-- 增量更新：状态（items / 选中项 / 文档标签 / 当前页）放在 `etaf-ref` 中，改 ref 由 ETAF 做 keyed patch + 行级 diff，不整树重渲染。
+- 增量更新：状态（items / 选中项 / 文档标签）放在 `etaf-ref` 中，改 ref 由 ETAF 做 keyed patch + 行级 diff，不整树重渲染。
+- 视口高度（M11.13 起）：卡片列表**不设固定高度、不做内部滚动**，改按条目数**显式计算 viewport 高度**（`seshat-reader-etaf--content-viewport-height`：chrome 6 行 + 每卡 2 行，最小 20 行）；已挂载时经 `etaf-runtime-refit` 放大视口，条目增多不被裁剪，超出面板高度的部分由**面板窗口**滚动查看。
 - 降级：未安装 / `require` 抛错 / 渲染抛错三态均回退兜底渲染（细节见 [`docs/configuration.md`](configuration.md)「ETAF 渲染层」）；**降级只影响批注列表观感，译文/解释不受影响**。
 
 **译文/解释渲染（Markdown 文本 buffer，不经 ETAF）**：
 
 - `seshat-reader-translate--render-panel` 把 gt 在隐藏中转 buffer（` *Seshat gt*`，`:window-config` = `(display-buffer-no-window)` + `allow-no-window`）中渲染出的纯文本写入**展示 buffer**（`seshat-reader-sidebar-translate-buffer-name`），以 `gfm-view-mode` → `markdown-view-mode` → `text-mode` 降级链设视图，`truncate-lines`=nil + 显式 `word-wrap`=t，并写 `header-line`（「Seshat 译文」/「Seshat 解释」）。
+- **模板链路**：`--render-panel (TEXT TITLE &optional LANGS CONTEXT)` → `seshat-reader-translate--apply-template (TEXT TITLE &optional LANGS CONTEXT)`（`format-spec` 填 `%k` 标题 / `%l` 语言对 / `%q` 原文引用块 / `%t` 正文）→ 写入只读 Markdown buffer。**模板按 `CONTEXT` 选择**：`explain` → `seshat-reader-translate-explain-template`（默认 `"%q\n\n---\n\n%t\n"`），其余（含 nil）→ `seshat-reader-translate-template`（默认 `"%l\n\n%q\n\n---\n\n%t\n"`）；两个模板**相互独立**，explain 模板为 `nil` 时不借用翻译模板。默认模板都**不含正文标题**（`%k`），标题由 `header-line` 承担。`%l` 由 `--translator` 透传的 langs 经 `--format-langs` 转成 `*en → zh*`；`%q` 由 `--quote-block` 生成、**默认开启**（`seshat-reader-translate-show-source` 默认 `t`）。`--render-object (MODE &optional TITLE LANGS CONTEXT)` 同样带可选 `LANGS` / `CONTEXT`（向后兼容）。模板非法时 `--apply-template` 回退纯正文并 `message` 警告。
+- **宽度缩窄（M11.14 起）**：`--prepare-view` 末尾按 `seshat-reader-translate-visual-fill-column`（默认 `t`）启停 `visual-fill-column-mode`——软依赖、未安装时静默跳过，宽度沿用全局 `visual-fill-column-width`（`nil` → `fill-column`），关闭时显式传 `-1` 以清理窗口 margin（buffer 复用、major mode 重设后不残留缩窄）。**批注列表不启用**：ETAF 布局按 `window-body-width` 计算，`window-margins` 缩窄会导致错位。
 - 键位 `q`（关面板）/ `C-c C-s`（存为批注）由 minor mode `seshat-reader-translate-panel-mode` 承载，不污染 Markdown 视图共享键位表。理由见 [`openspec/decisions.md`](../openspec/decisions.md)（ETAF 画布固定 viewport 裁剪、内容不可选中复制、CJK 2 列测量风险）。
-
-**分页状态（annotation 层）**：
-
-- `seshat-reader-annotation-page-size`（默认 20）+ buffer-local 当前页；`]` / `[` 翻页走两条路径（ETAF `:keys` 与 `list-mode-map`），`n` / `p` 跨页自动切页，删除/刷新后页号收敛；标题徽章多页显示「第 x/y 页」、单页显示「N 条」；纯文本回退路径页脚 `-- 第 x/y 页 --` 仅多页时出现。
 
 **高度自适应（sidebar 层）**：
 
-- 仅对 kind=`translate` 且**未挂载 ETAF runtime** 的面板生效：`seshat-reader-sidebar--fit-height-for-content` 用 `window-text-pixel-size` 换算内容行数，夹紧 5 行到 `seshat-reader-sidebar-max-height`（默认 0.8），成功后把实测比例写入 per-kind 高度记忆；批注列表固定用 `seshat-reader-sidebar-height`。同帧内面板增高会压缩上方阅读窗口（预期）。
+- 仅对 kind=`translate` 且**未挂载 ETAF runtime** 的面板生效：`seshat-reader-sidebar--fit-height-for-content` 用 `window-text-pixel-size` 换算内容行数，夹紧 `seshat-reader-sidebar-min-height`（默认 0.25）到 `seshat-reader-sidebar-max-height`（默认 0.8），成功后把实测比例写入 per-kind 高度记忆；批注列表固定用 `seshat-reader-sidebar-height`。同帧内面板增高会压缩上方阅读窗口（预期）。
+- **测量口径**：`seshat-reader-sidebar--content-height` 的单行像素高取首行 `line-pixel-height` 与 `frame-char-height` 的**较小值**（Markdown 标题行通常比正文行高，直接用首行会把内容行数低估），`window-text-pixel-size` 测量上限 120 行（超长内容按上限计，避免测量耗时），再向上取整换算为行数。目标高度 = `max(1, max(min(min-h, max-h), min(max-h, content+2)))`，其中 `min-h` / `max-h` 分别是 `seshat-reader-sidebar-min-height` / `seshat-reader-sidebar-max-height` × `frame-height` 向下取整，`content` 为内容行数、`+2` 留给 header-line 与余量。
 
 **兜底渲染**：
 
 - 批注列表：`seshat-reader-annotation--render-list` 的纯文本 + 文本属性渲染，行携带 `id` / `page` / `queue-uuid` / `location` 属性。ETAF 已挂载时该函数**不再 `erase-buffer`**（交给渲染层增量刷新），否则随后的 `etaf-runtime-flush` 会因缓冲区被清空报 `Args out of range`。
 - 译文/解释：`seshat-reader-translate--render-panel` 的 Markdown 文本 buffer 路径（见上一小节）；只有 `seshat-reader-translate-render` 取 `pop` / `pin`（或禁用面板）时回退 posframe，由 gt 的 `gt-posframe-pop-render` / `gt-posframe-pin-render` 承载。
 
-**数据流**：`seshat-reader-annotation--refresh-list`（拉服务端批注 + 读本地队列）→ items（服务端项在前、本地待同步项在后；本地项以 `:uuid` 标识、无 `:id`）→ **分页切片**（`seshat-reader-annotation-page-size`）→ 渲染层（ETAF 批注卡片）或兜底文本渲染 → `seshat-reader-sidebar-show` → `display-buffer`（参数单一来源、幂等、可选光标跟随）；译文/解释的数据流为 gt → 隐藏中转 buffer → `:then` 回调 → `seshat-reader-translate--render-panel` → 同一 `sidebar-show`。
+**数据流**：`seshat-reader-annotation--refresh-list`（拉服务端批注 + 读本地队列）→ items（服务端项在前、本地待同步项在后；本地项以 `:uuid` 标识、无 `:id`）→ **全量条目**（不分页、不切片）→ 渲染层（ETAF 卡片或文本兜底；ETAF 按条目数显式计算 viewport 高度、条目增多时 `etaf-runtime-refit`）→ `seshat-reader-sidebar-show` → `display-buffer`（参数单一来源、幂等、可选光标跟随）；译文/解释的数据流为 gt → 隐藏中转 buffer → `:then` 回调 → `seshat-reader-translate--render-panel` → 同一 `sidebar-show`。
 
 ## 数据流
 

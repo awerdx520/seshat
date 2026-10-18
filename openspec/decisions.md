@@ -125,3 +125,81 @@
 **理由**：① ETAF 画布 viewport 固定，长译文被裁剪、无法原生滚动到全文；② 画布内容**不可选中复制**（阅读场景的核心诉求——摘录译文/搜索结果二次利用）；③ CJK 在 ETAF 中的 2 列宽度测量存在风险，长段落折行不可靠；④ Markdown 交给 `gfm-view-mode` 渲染可获得原生折行、滚动、复制、isearch，且无需在渲染层重复实现排版。**2026-10-18 用户确认。**
 
 **代价**：① markdown-mode 成为软依赖（缺失时降级 `text-mode`，不折行美化、不隐藏标记）；② 面板内无法用 ETAF 的 `:keys` 统一承载译文键位，改由 minor mode 承载；③ ETAF 的译文排版代码（约 240 行）删除，`seshat-reader-etaf.el` 由 929 行降至 690 行。
+
+## 2026-10-18 · 译文/解释面板 Markdown 模板与高度下限可配置
+
+**决策**：译文/解释面板的正文呈现改为可配置 Markdown 模板
+`seshat-reader-translate-template`（默认「`# 标题` + `*语言对*` + 可选
+`> **原文**` 引用块 + `---` + 正文」，`nil` 退回纯正文）；面板自适应高度的
+下限改为可配置 `seshat-reader-sidebar-min-height`（默认 0.25，至少 1 行），
+区间为 min–max。
+
+**理由**：
+1. 纯正文面板缺少视觉层级，长译文与标题、原文混在一起不易扫读；
+2. 硬编码 5 行下限在短译文场景下明显偏矮，用户每次都要手动拉伸窗口；
+3. 模板与高度都用 defcustom 暴露，避免把样式偏好写死在代码里；
+4. 模板错误有运行时回退（非法占位符 → 纯正文 + 警告），不阻断翻译流程。
+
+**代价**：
+1. header-line 与正文 `# 标题` 有意重复（窗口装饰 vs 文档层级），用户需通过自定义模板去掉 `%k` 才能消除；
+2. `--content-height` 改用 `min(首行像素高, frame-char-height)` 属启发式估算，face-remapping 让正文行高于 char height 时会高估行数（保守方向，面板偏高而非裁内容）；
+3. `--render-panel` / `--render-object` 新增可选 `langs` 参数，内部 API 面扩大（保持 `&optional` 向后兼容）。
+
+## 2026-10-18 · Android 采用单 Activity Shell + 保留独立阅读器 Activity（M9.1）
+
+**决策**：Android 端采用「单 Activity Shell + Fragment 内容区」——`MainActivity` 承载 `MaterialToolbar` + `FragmentContainerView` + `BottomNavigationView`（笔记 / 阅读双 tab），tab 切换用 `show/hide` 保留状态；epub/pdf 阅读器与 GTD 保持独立全屏 Activity，由 Fragment 内入口启动。UI 栈继续用 **View/XML + Material Components**，不引入 Compose / Navigation Component / 协程 / Room；零新增第三方依赖（仅显式固定 `androidx.fragment:fragment:1.5.4`，原由 appcompat 传递引入）。
+
+**理由**：① 现有 3274 行 UI 全部是 View/XML，M9.1 的定位是「可承载 Notes/Reader 的壳」而非重写；② `androidx.navigation`、`androidx.preference`、`fragment-ktx` 均不在本机 Gradle 缓存中，零新增依赖可离线构建；③ 阅读需要沉浸与全屏，嵌入 tab 会压缩阅读区并牵动既有阅读器实现（违背「零回归」目标）；④ 设置页必须复用 `SecurePrefs` 的加密创建与回退逻辑，而 `PreferenceFragmentCompat` 直接操作 `SharedPreferences` 会绕过加密。
+
+**代价**：① 无 Navigation Component，深层页面（M9.3 列表→详情、M10 书架→阅读）需手写事务或后续引入；② 无 Compose，声明式 UI 的长期收益延后；③ Fragment 生命周期与 tab 恢复由手写 `commitNow()` 管理，正确性依赖自身实现；④ 设置页只承载两项配置，`remoteDir` 仍为默认 `/`。
+
+## 2026-10-18 · Android 设置页安全加固（M9.1 安全审查后）
+
+**决策**：① 机密（访问令牌）**绝不降级写入明文**——加密存储不可用时 `putSecret()` 返回 false、设置页禁用保存并告警，功能不可用优于凭据泄露；② 备份策略采用「保留 `allowBackup=true` + 排除同步配置两份 prefs」，而不是关闭整个应用备份（阅读进度、批注、org 文件仍可备份）；③ 服务端地址**仅接受 https**，拒绝 userinfo / 查询参数 / 锚点；④ 解密异常视为「配置不可用」而非崩溃，并提供「重置本地配置」自救入口；⑤ 增加「清除访问令牌」撤销路径。
+
+**理由**：security-reviewer 安全审查发现 3 项 blocking（加密回退静默写明文、`allowBackup` 无排除规则、解密异常无兜底）与 3 项 major（URL 校验不拒 userinfo、放行 http、无凭据撤销路径）。这些均为「不需要攻击者具备特殊能力即可发生」的风险，超出既有威胁模型。
+
+**代价**：① `sync/SecurePrefs.kt` 被修改（突破 M9.1 原定「既有模块零改动」边界，属安全例外，用户已批准）；② `GtdActivity` 只经 `SecurePrefs.getString` **读取**配置、不写令牌；但它调用 `SecurePrefs.open(this)` 未传 `onUnreadable`，加密不可用时属**静默使用** legacy 明文值（无新增泄露面，但无提示），已在 tech-debt 记录；③ 禁用 http 后，纯内网 http 部署需用户改用 https 反代；④ 加密不可用设备上设置页功能受限（设计取向：安全优先）。
+
+## 2026-10-18 · 译文/解释模板拆分、去正文标题、原文默认显示
+
+**决策**：翻译与解释使用各自独立的模板变量——`seshat-reader-translate-template`（默认 `"%l\n\n%q\n\n---\n\n%t\n"`）与新增的 `seshat-reader-translate-explain-template`（默认 `"%q\n\n---\n\n%t\n"`）；默认模板不再含 `%k`（正文标题），标题由 header-line 承担；`seshat-reader-translate-show-source` 默认值改为 `t`。渲染链路以可选 `context` 参数选择模板（`explain` → explain 模板，其余 → translate 模板）。
+
+**理由**：
+1. 两种用途的版式需求不同（解释不需要语言对行，译文需要），单一变量无法分别塑形；
+2. 正文 `# Seshat 译文/解释` 与 header-line 完全重复，删除正文标题可减少冗余且不影响滚动时的定位；
+3. 原文是理解译文的参照，默认关闭导致「看不见原始句子」，改为默认显示更符合阅读场景。
+
+**代价**：
+1. `show-source` 默认翻转属用户可见行为变更（面板默认更高）；
+2. 模板由 1 个变 2 个，配置面扩大；
+3. `%k` 保留但默认不用，自定义模板仍需理解 4 个占位符。
+
+## 2026-10-18 · 批注列表去分页，改单列连续流
+
+**决策**：删除批注列表的全部分页机制（`seshat-reader-annotation-page-size`、当前页、页数/切片/夹紧函数、4 个翻页命令、`]`/`[` 键位、纯文本页脚，以及 ETAF 的 page refs 与跨页选中逻辑）；批注列表改为**全量单列连续渲染**，徽章恒为「N 条」，`n`/`p` 只移动选中；ETAF 卡片列表去掉固定 12 行高度与内部滚动，渲染入口按条目数**显式计算 viewport 高度**（已挂载时 `etaf-runtime-refit`），面板靠窗口滚动查看超出部分。
+
+**理由**：
+1. 分页 + 固定 12 行内部滚动把列表切碎，无法连续浏览，`isearch` 只能搜当前页；
+2. 「只删分页不删固定高度」会退化为 12 行内部滚动，问题依旧；
+3. ETAF 根 viewport 高度固定、决定写入 buffer 的行数，必须按内容显式计算才能显示全部条目。
+
+**代价**：
+1. **破坏性**：删除 `seshat-reader-annotation-page-size` 与 `]`/`[` 键位，用户配置与肌肉记忆失效；
+2. 全量渲染无虚拟化，条目极多时首次渲染成本线性增长（已记 tech-debt）；
+3. viewport 高度按「每卡 2 行」保守估算，估算偏大（实测每卡 1 行）；实测
+   `computed-viewport-height=66`、`buffer-lines=35`——ebox 只写实际内容行、
+   不补空行，故无视觉副作用。
+
+## 2026-10-18 · 译文/解释面板启用 visual-fill-column
+
+**决策**：译文/解释面板在 `--prepare-view` 末尾启用 `visual-fill-column-mode`（软依赖，`seshat-reader-translate-visual-fill-column` 默认 t，可关），宽度沿用全局 `visual-fill-column-width`（nil → `fill-column`）；批注列表不启用。
+
+**理由**：
+1. 面板正文在宽窗口下拉满整行，长行阅读舒适度差；
+2. 复用用户已有的 visual-fill-column 配置，不引入第二套宽度设置；
+3. 批注列表的 ETAF 布局按 `window-body-width` 计算，`window-margins` 缩窄会错位，故不启用。
+
+**代价**：
+1. `visual-fill-column--enable` 会对 `selected-window` 重置 margin；`--disable` 还会重置 fringe。实现已加「仅面板已显示时才传 -1」的窗口守卫，避免选项为 nil 时每次渲染误清阅读器窗口；但启用路径（面板未显示时）的 selected-window margin 重置仍无法规避（影响窄）；
+2. 新增一个软依赖（未安装时功能静默缺失，无提示）。

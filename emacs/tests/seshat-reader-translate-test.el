@@ -305,6 +305,8 @@
   (skip-unless (require 'gt nil t))
   (let* ((seshat-reader-sidebar-translate-buffer-name "*Seshat Test Panel*")
          (seshat-reader-translate-show-source nil)
+         ;; 本用例只验证「写入 + 视图」，把模板关掉以免与模板渲染耦合
+         (seshat-reader-translate-template nil)
          (seshat-reader-select-last nil)
          (shown nil)
          (text "**粗体**\n\n- 列表项一\n- 列表项二")
@@ -332,7 +334,7 @@
       (when (buffer-live-p buf) (kill-buffer buf)))))
 
 (ert-deftest seshat-reader-translate-test--render-panel-show-source ()
-  "`show-source' 为 t 时正文前插入完整（不截断）的 `> ' 引用块."
+  "默认模板 + `show-source' 为 t 时渲染完整（不截断）引用块、分隔线与正文."
   (skip-unless (require 'gt nil t))
   (let* ((seshat-reader-sidebar-translate-buffer-name "*Seshat Test Panel*")
          (seshat-reader-translate-show-source t)
@@ -345,16 +347,21 @@
           (setq buf (seshat-reader-translate--render-panel "译文正文" "Seshat 译文"))
           (with-current-buffer buf
             (let ((content (buffer-string)))
-              ;; 引用块在正文之前，每行带 `> ' 前缀，与正文之间空一行
-              (should (string-prefix-p (concat "> " long "\n> 第二行原文\n\n")
-                                       content))
+              ;; 引号块在语言对行之后（LANGS 为 nil 故无该行），内容以引用块开头
+              (should (string-match-p (regexp-quote "> **原文**\n>\n") content))
+              (should (string-prefix-p "> **原文**\n>\n" content))
+              ;; 引用块每行带 `> ' 前缀，随后是分隔线与正文
+              (should (string-match-p
+                       (regexp-quote (concat "> " long
+                                             "\n> 第二行原文\n\n---\n\n译文正文\n"))
+                       content))
               ;; 不截断
               (should (string-match-p (regexp-quote long) content))
-              (should (string-suffix-p "译文正文" content)))))
+              (should (string-suffix-p "译文正文\n" content)))))
       (when (buffer-live-p buf) (kill-buffer buf)))))
 
 (ert-deftest seshat-reader-translate-test--render-panel-show-source-off ()
-  "`show-source' 为 nil（默认）时不插入引用块."
+  "`show-source' 为 nil 时不插入引用块，正文位于分隔线之后."
   (skip-unless (require 'gt nil t))
   (let* ((seshat-reader-sidebar-translate-buffer-name "*Seshat Test Panel*")
          (seshat-reader-translate-show-source nil)
@@ -364,8 +371,186 @@
         (cl-letf (((symbol-function 'seshat-reader-sidebar-show)
                    (lambda (b &rest _args) b)))
           (setq buf (seshat-reader-translate--render-panel "译文正文" "Seshat 译文"))
-          (should (equal (with-current-buffer buf (buffer-string)) "译文正文")))
+          (let ((content (with-current-buffer buf (buffer-string))))
+            ;; 无原文引用块
+            (should-not (string-match-p "原文" content))
+            ;; 分隔线 + 正文（无标题、无语言对行）
+            (should (string-prefix-p "---\n\n译文正文\n" content))
+            (should (string-match-p "---\n\n译文正文\n\\'" content))))
       (when (buffer-live-p buf) (kill-buffer buf)))))
+
+(ert-deftest seshat-reader-translate-test--prepare-view-enables-visual-fill-column ()
+  "`--prepare-view' 在 `seshat-reader-translate-visual-fill-column' 为 t 时启用 vfc."
+  (skip-unless (require 'visual-fill-column nil t))
+  (with-temp-buffer
+    (let ((seshat-reader-translate-visual-fill-column t))
+      (seshat-reader-translate--prepare-view)
+      (should visual-fill-column-mode))))
+
+(ert-deftest seshat-reader-translate-test--prepare-view-honors-disable-option ()
+  "选项为 nil 时 `--prepare-view' 不启用 `visual-fill-column-mode'.
+测试 buffer 无窗口，故 `-1' 守卫分支也不会执行。"
+  (skip-unless (require 'visual-fill-column nil t))
+  (with-temp-buffer
+    (let ((seshat-reader-translate-visual-fill-column nil))
+      (seshat-reader-translate--prepare-view)
+      (should-not visual-fill-column-mode))))
+
+(ert-deftest seshat-reader-translate-test--prepare-view-tolerates-missing-visual-fill-column ()
+  "`visual-fill-column' 软依赖缺失时 `--prepare-view' 静默跳过、不报错.
+用 `cl-letf' 桩 `fboundp' 与 `require' 模拟包未安装：仅对
+`visual-fill-column-mode'/`visual-fill-column' 返回 nil，其它符号透传给原
+函数——`--prepare-view' 还用 `fboundp' 判定 `gfm-view-mode'/
+`markdown-view-mode'，不透传会破坏视图 mode 的降级链。"
+  (with-temp-buffer
+    (let ((seshat-reader-translate-visual-fill-column t)
+          ;; 先取出原函数对象，避免桩内部递归调用自身
+          (orig-fboundp (symbol-function 'fboundp))
+          (orig-require (symbol-function 'require)))
+      (cl-letf (((symbol-function 'fboundp)
+                 (lambda (sym)
+                   (if (eq sym 'visual-fill-column-mode)
+                       nil
+                     (funcall orig-fboundp sym))))
+                ((symbol-function 'require)
+                 (lambda (feature &optional filename noerror)
+                   (if (eq feature 'visual-fill-column)
+                       nil
+                     (funcall orig-require feature filename noerror)))))
+        ;; 不抛错即视为通过（vfc 缺失时静默跳过）
+        (seshat-reader-translate--prepare-view)
+        (should-not (bound-and-true-p visual-fill-column-mode))))))
+
+;;; 模板渲染
+
+(ert-deftest seshat-reader-translate-test--format-langs-joins ()
+  "`--format-langs' 把语言列表格式化为 \"源 → 目标\" 字符串，无法格式化时 nil."
+  (should (equal (seshat-reader-translate--format-langs '(en zh)) "en → zh"))
+  (should (equal (seshat-reader-translate--format-langs '(en zh ja))
+                 "en → zh → ja"))
+  (should-not (seshat-reader-translate--format-langs nil))
+  ;; 非列表（单个符号）与含非符号元素的列表都无法格式化
+  (should-not (seshat-reader-translate--format-langs 'en))
+  (should-not (seshat-reader-translate--format-langs '(en "zh"))))
+
+(ert-deftest seshat-reader-translate-test--format-langs-rejects-nil-element ()
+  "列表含 nil 元素时 `--format-langs' 返回 nil.
+`(symbolp nil)' 为 t，故不能只用 `cl-every #'symbolp' 校验：含 nil 的列表
+（如 `seshat-reader-translate-fallback-langs' 被误配成 (nil zh)）会退化成
+\"nil → zh\" 这类无意义元信息，必须整体判为不可格式化。"
+  (should-not (seshat-reader-translate--format-langs '(nil zh)))
+  (should-not (seshat-reader-translate--format-langs '(en nil))))
+
+(ert-deftest seshat-reader-translate-test--apply-template-default ()
+  "默认模板渲染出语言对元信息、分隔线与正文（默认不含标题）。"
+  (let ((seshat-reader-translate-show-source nil)
+        (seshat-reader-select-last nil))
+    (let ((rendered (seshat-reader-translate--apply-template
+                     "正文" "Seshat 译文" '(en zh))))
+      ;; header-line 已显示标题，默认模板不再重复 `%k'
+      (should-not (string-match-p "# Seshat 译文" rendered))
+      (should (string-match-p (regexp-quote "*en → zh*") rendered))
+      (should (string-match-p "\n---\n" rendered))
+      (should (string-match-p "正文" rendered))
+      (should (string-suffix-p "正文\n" rendered))
+      (should (equal rendered "*en → zh*\n\n---\n\n正文\n")))))
+
+(ert-deftest seshat-reader-translate-test--apply-template-langs-nil ()
+  "LANGS 为 nil 时不产生语言对元信息行，结果以分隔线开头。"
+  (let ((seshat-reader-translate-show-source nil)
+        (seshat-reader-select-last nil))
+    (let ((rendered (seshat-reader-translate--apply-template
+                     "正文" "Seshat 译文" nil)))
+      (should-not (string-match-p "\\*" rendered))
+      (should-not (string-match-p "\n\n\n" rendered))
+      (should (equal rendered "---\n\n正文\n")))))
+
+(ert-deftest seshat-reader-translate-test--apply-template-disabled ()
+  "模板为 nil 时 `--apply-template' 原样返回 TEXT."
+  (let ((seshat-reader-translate-template nil))
+    (should (equal (seshat-reader-translate--apply-template
+                    "原样正文" "Seshat 译文" '(en zh))
+                   "原样正文"))))
+
+(ert-deftest seshat-reader-translate-test--apply-template-custom ()
+  "自定义模板按占位符替换并补一个尾换行."
+  (let ((seshat-reader-translate-template "## %k\n\n%t"))
+    (should (equal (seshat-reader-translate--apply-template
+                    "正文" "Seshat 译文" '(en zh))
+                   "## Seshat 译文\n\n正文\n"))))
+
+(ert-deftest seshat-reader-translate-test--apply-template-invalid-placeholder ()
+  "非法占位符时回退纯正文、不报错，并 message 警告."
+  (let ((seshat-reader-translate-template "# %z\n\n%t")
+        (messages nil))
+    (cl-letf (((symbol-function 'message)
+               (lambda (fmt &rest args)
+                 (push (apply #'format fmt args) messages)
+                 nil)))
+      (should (equal (seshat-reader-translate--apply-template
+                      "正文" "Seshat 译文" '(en zh))
+                     "正文")))
+    (should messages)
+    (should (string-match-p "模板渲染失败" (car messages)))))
+
+(ert-deftest seshat-reader-translate-test--apply-template-percent-in-text ()
+  "正文里字面的 `%' 不被 `format-spec' 二次解析，原样出现在渲染结果中.
+`format-spec' 只解析**模板**里的占位符，替换值中的 `%' 不会再被解析；本测试
+把这条语义固定下来，避免以后改用其它替换实现时正文（如「完成度 100%」）被
+吞掉或报错。"
+  ;; 取 defcustom 的标准值作为默认模板，避免在此重复字面模板而漂移
+  (let ((seshat-reader-translate-template
+         (eval (car (get 'seshat-reader-translate-template 'standard-value)) t))
+        (seshat-reader-translate-show-source nil)
+        (seshat-reader-select-last nil))
+    (let ((rendered (seshat-reader-translate--apply-template
+                     "完成度 100%" "Seshat 译文" '(en zh))))
+      (should (string-match-p (regexp-quote "完成度 100%") rendered))
+      (should (string-suffix-p "完成度 100%\n" rendered)))))
+
+(ert-deftest seshat-reader-translate-test--apply-template-uses-explain-template ()
+  "context 为 `explain' 时用解释模板（默认不含语言对行），其余用翻译模板."
+  (let ((seshat-reader-translate-show-source nil)
+        (seshat-reader-select-last nil))
+    ;; 解释：默认解释模板无 `%l'，故即使有 LANGS 也不出现语言对元信息
+    (let ((explain (seshat-reader-translate--apply-template
+                    "正文" "Seshat 解释" '(en zh) 'explain)))
+      (should-not (string-match-p (regexp-quote "*en → zh*") explain))
+      (should (equal explain "---\n\n正文\n")))
+    ;; 翻译：显式 `translate' 与 nil 都走 `seshat-reader-translate-template'
+    (dolist (context (list 'translate nil))
+      (let ((translated (seshat-reader-translate--apply-template
+                         "正文" "Seshat 译文" '(en zh) context)))
+        (should (string-match-p (regexp-quote "*en → zh*") translated))
+        (should (equal translated "*en → zh*\n\n---\n\n正文\n"))))))
+
+(ert-deftest seshat-reader-translate-test--show-source-defaults-to-t ()
+  "`seshat-reader-translate-show-source' 的默认值为 t（默认显示原文引用块）."
+  (should (eq (default-value 'seshat-reader-translate-show-source) t)))
+
+(ert-deftest seshat-reader-translate-test--apply-template-explain-no-langs-line ()
+  "context 为 `explain' 时用解释模板默认值渲染，结果不含语言对行."
+  (let ((seshat-reader-translate-explain-template
+         (eval (car (get 'seshat-reader-translate-explain-template
+                         'standard-value))
+               t))
+        (seshat-reader-translate-show-source nil)
+        (seshat-reader-select-last nil))
+    (should seshat-reader-translate-explain-template)
+    (let ((rendered (seshat-reader-translate--apply-template
+                     "解释正文" "Seshat 解释" '(en zh) 'explain)))
+      (should-not (string-match-p "en → zh" rendered))
+      (should-not (string-match-p (regexp-quote "Seshat 解释") rendered))
+      (should (equal rendered "---\n\n解释正文\n")))))
+
+(ert-deftest seshat-reader-translate-test--apply-template-independent-nil ()
+  "两个模板都为 nil 时各自原样返回 TEXT，不互相回退."
+  (let ((seshat-reader-translate-template nil)
+        (seshat-reader-translate-explain-template nil))
+    (dolist (context (list 'translate 'explain nil))
+      (should (equal (seshat-reader-translate--apply-template
+                      "纯正文" "标题" '(en zh) context)
+                     "纯正文")))))
 
 (ert-deftest seshat-reader-translate-test--panel-result-uses-record-result ()
   "`--panel-result' 从中转 buffer 提取译文并写入 last-result；取不到时保留上次."
@@ -416,6 +601,22 @@
                    (seshat-reader-translate--render-object
                     'sidebar "Seshat 解释"))
                   'gt-posframe-pop-render)))))
+
+(ert-deftest seshat-reader-translate-test--render-object-then-passes-langs ()
+  "sidebar 渲染对象的 `:then' 回调把 LANGS 与 CONTEXT 透传给 `--render-panel'."
+  (skip-unless (require 'gt nil t))
+  (skip-unless (require 'gt-render-buffer nil t))
+  (let ((seshat-reader-sidebar-enabled t)
+        (calls nil)
+        (obj nil))
+    (cl-letf (((symbol-function 'seshat-reader-translate--panel-result)
+               (lambda () "结果"))
+              ((symbol-function 'seshat-reader-translate--render-panel)
+               (lambda (&rest args) (push args calls) 'fake-buffer)))
+      (setq obj (seshat-reader-translate--render-object
+                 'sidebar "Seshat 译文" '(en zh) 'translate))
+      (funcall (slot-value obj 'then)))
+    (should (equal calls (list (list "结果" "Seshat 译文" '(en zh) 'translate))))))
 
 (ert-deftest seshat-reader-translate-test--install-capture-hook-for-mode-sidebar-no-hook ()
   "sidebar + enabled 时不安装任何捕获 hook（捕获在 `:then' 内完成）."
@@ -618,10 +819,12 @@ M 为链路上 `message' 的文本。
             (should (equal (slot-value render 'name) " *Seshat T6 gt*"))
             (should (member '(allow-no-window . t)
                             (slot-value render 'window-config))))
-          ;; ② 面板 buffer 内容 = 译文全文（未开原文引用块）
+          ;; ② 面板 buffer 内容 = 默认模板渲染结果（语言对 + 分隔线 + 译文；默认无标题）
           (should (bufferp panel))
           (should (equal (with-current-buffer panel (buffer-string))
-                         seshat-reader-translate-test--translated-text))
+                         (concat "*en → zh*\n\n---\n\n"
+                                 seshat-reader-translate-test--translated-text
+                                 "\n")))
           ;; ③ 只读 Markdown 视图：major-mode / 折行 / 只读 / header-line / 键位
           (with-current-buffer panel
             (if (or (fboundp 'gfm-view-mode) (fboundp 'markdown-view-mode))
@@ -695,11 +898,17 @@ M 为链路上 `message' 的文本。
             (should (string-prefix-p "page:3;" (nth 1 call)))
             (should (equal (nth 1 call)
                            "page:3;rect:10.00,20.00,30.00,40.00"))
-            ;; 正文取面板 buffer 的内容（面板 → 批注的同一份文本）
+            ;; 存批注的正文是纯译文（不含模板结构）
             (should (equal (nth 2 call)
-                           (with-current-buffer panel (buffer-string))))
-            (should (equal (nth 2 call)
-                           seshat-reader-translate-test--translated-text)))
+                           seshat-reader-translate-test--translated-text))
+            ;; 面板 buffer 包含该纯译文（正文位于模板的 `---' 之后）
+            (should (string-match-p
+                     (regexp-quote seshat-reader-translate-test--translated-text)
+                     (with-current-buffer panel (buffer-string)))))
+          ;; 面板确实套了模板：内容以语言对元信息行（模板 `%l'）开头
+          (should (string-prefix-p
+                   "*en → zh*"
+                   (with-current-buffer panel (buffer-string))))
           ;; 成功提示报告批注 id，且不出现「失败」
           (should messages)
           (should (string-match-p "42" (car messages)))

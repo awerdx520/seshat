@@ -426,7 +426,7 @@ ANNOTATIONS 为将作为服务端 JSON 响应返回的 Lisp 数据。"
             (should (string-match-p "已不是 seshat-reader 视图" (car messages)))))
       (kill-buffer source))))
 
-;;; 分页：页大小 / 页数 / 切片 / 页号夹紧 / 翻页命令 / 文本渲染路径
+;;; 全量渲染（无分页）：合并入口与「全量条目 + 无页脚」
 
 (defun seshat-reader-annotation-test--make-annotations (n)
   "构造 N 条服务端批注，第 I 条页码为 I、正文为 \"批注-I\"（两位补零）."
@@ -438,44 +438,10 @@ ANNOTATIONS 为将作为服务端 JSON 响应返回的 Lisp 数据。"
 
 (defun seshat-reader-annotation-test--render-fresh (file annotations)
   "清掉既有列表缓冲区后渲染 FILE 的 ANNOTATIONS，返回列表 buffer.
-清缓冲区是为了重置 buffer-local 页号（页号在缓冲区存活期间持续存在）。"
+清缓冲区是为了让每次渲染都从干净状态开始（不复用上一次的缓冲区内容）。"
   (when (get-buffer seshat-reader-annotation-list-buffer-name)
     (kill-buffer seshat-reader-annotation-list-buffer-name))
   (seshat-reader-annotation-test--render file annotations))
-
-(ert-deftest seshat-reader-annotation-test--page-count-boundaries ()
-  "页数边界：0 条=1 页、19/20 条=1 页、21 条=2 页、41 条=3 页."
-  (let ((seshat-reader-annotation-page-size 20))
-    (should (= (seshat-reader-annotation--page-count nil) 1))
-    (should (= (seshat-reader-annotation--page-count (make-list 19 nil)) 1))
-    (should (= (seshat-reader-annotation--page-count (make-list 20 nil)) 1))
-    (should (= (seshat-reader-annotation--page-count (make-list 21 nil)) 2))
-    (should (= (seshat-reader-annotation--page-count (make-list 40 nil)) 2))
-    (should (= (seshat-reader-annotation--page-count (make-list 41 nil)) 3))))
-
-(ert-deftest seshat-reader-annotation-test--page-items-slices-and-clamps ()
-  "切片取当页条目；超界页号夹紧到合法范围；空列表返回 nil."
-  (let* ((seshat-reader-annotation-page-size 3)
-         (items (number-sequence 1 7)))
-    (should (equal (seshat-reader-annotation--page-items items 1) '(1 2 3)))
-    (should (equal (seshat-reader-annotation--page-items items 2) '(4 5 6)))
-    (should (equal (seshat-reader-annotation--page-items items 3) '(7)))
-    ;; 超界页号夹紧：99 → 末页、0 → 首页
-    (should (equal (seshat-reader-annotation--page-items items 99) '(7)))
-    (should (equal (seshat-reader-annotation--page-items items 0) '(1 2 3)))
-    (should-not (seshat-reader-annotation--page-items nil 1))))
-
-(ert-deftest seshat-reader-annotation-test--clamp-page-range ()
-  "页号夹紧到 [1, page-count]；空列表恒为 1."
-  (let ((seshat-reader-annotation-page-size 20))
-    (let ((items (make-list 41 nil)))
-      (should (= (seshat-reader-annotation--clamp-page items 1) 1))
-      (should (= (seshat-reader-annotation--clamp-page items 2) 2))
-      (should (= (seshat-reader-annotation--clamp-page items 3) 3))
-      (should (= (seshat-reader-annotation--clamp-page items 9) 3))
-      (should (= (seshat-reader-annotation--clamp-page items 0) 1))
-      (should (= (seshat-reader-annotation--clamp-page items -5) 1)))
-    (should (= (seshat-reader-annotation--clamp-page nil 5) 1))))
 
 (ert-deftest seshat-reader-annotation-test--all-items-matches-etaf-items ()
   "`--all-items' 与 `--etaf-items' 完全一致，且服务端项在前、本地项在后."
@@ -504,119 +470,37 @@ ANNOTATIONS 为将作为服务端 JSON 响应返回的 Lisp 数据。"
     (should (equal (mapcar (lambda (item) (plist-get item :page)) all)
                    '(2 5 9 1)))))
 
-(ert-deftest seshat-reader-annotation-test--list-mode-paging-keys ()
-  "列表 mode 的 `]' / `[' 分别绑定到下一页 / 上一页命令."
-  (should (eq (lookup-key seshat-reader-annotation-list-mode-map (kbd "]"))
-              #'seshat-reader-annotation-list-next-page))
-  (should (eq (lookup-key seshat-reader-annotation-list-mode-map (kbd "["))
-              #'seshat-reader-annotation-list-prev-page)))
-
-(ert-deftest seshat-reader-annotation-test--paging-commands-clamp ()
-  "翻页命令只改 buffer-local 页号并按合法范围夹紧，且不发任何 HTTP."
+(ert-deftest seshat-reader-annotation-test--render-list-all-items-no-footer ()
+  "21 条批注全量渲染：末条也在列表里，且末尾不再有页脚行."
   (seshat-reader-annotation-test--with-temp-dir dir
     (let* ((file (expand-file-name "book.pdf" dir))
            (seshat-reader-annotation-roots (list (cons "lib" dir)))
-           (seshat-reader-annotation-page-size 20)
-           (annotations (seshat-reader-annotation-test--make-annotations 21)))
-      (with-temp-file file)
-      (let ((buffer (seshat-reader-annotation-test--render-fresh file annotations)))
-        (cl-letf (((symbol-function 'seshat-reader-annotation-queue-entries)
-                   (lambda (&rest _) nil)))
-          (let ((calls (seshat-reader-annotation-test--with-stub
-                           500 "{\"error\":{}}"
-                         (with-current-buffer buffer
-                           (should (= seshat-reader-annotation-list-page 1))
-                           (seshat-reader-annotation-list-next-page)
-                           (should (= seshat-reader-annotation-list-page 2))
-                           ;; 末页再下一页不变
-                           (seshat-reader-annotation-list-next-page)
-                           (should (= seshat-reader-annotation-list-page 2))
-                           (seshat-reader-annotation-list-prev-page)
-                           (should (= seshat-reader-annotation-list-page 1))
-                           ;; 首页再上一页不变
-                           (seshat-reader-annotation-list-prev-page)
-                           (should (= seshat-reader-annotation-list-page 1))
-                           (seshat-reader-annotation-list-last-page)
-                           (should (= seshat-reader-annotation-list-page 2))
-                           (seshat-reader-annotation-list-first-page)
-                           (should (= seshat-reader-annotation-list-page 1))))))
-            (should-not calls)))))))
-
-(ert-deftest seshat-reader-annotation-test--plain-text-paging-renders-page ()
-  "纯文本路径只渲染当页条目，末尾插入页脚行；翻页后只渲染新当页."
-  (seshat-reader-annotation-test--with-temp-dir dir
-    (let* ((file (expand-file-name "book.pdf" dir))
-           (seshat-reader-annotation-roots (list (cons "lib" dir)))
-           (seshat-reader-annotation-page-size 20)
            (annotations (seshat-reader-annotation-test--make-annotations 21)))
       (with-temp-file file)
       (let ((buffer (seshat-reader-annotation-test--render-fresh file annotations)))
         (with-current-buffer buffer
-          ;; 20 条当页条目 + 1 行页脚
+          ;; 21 条各占一行，无页脚
           (should (= (count-lines (point-min) (point-max)) 21))
           (should (string-match-p "批注-01" (buffer-string)))
           (should (string-match-p "批注-20" (buffer-string)))
-          (should-not (string-match-p "批注-21" (buffer-string)))
-          (should (string-match-p "第 1/2 页" (buffer-string)))
-          ;; 页脚行不带批注文本属性
-          (goto-char (point-min))
-          (forward-line 20)
-          (should (string-match-p "-- 第 1/2 页 --"
-                                  (buffer-substring (line-beginning-position)
-                                                    (line-end-position))))
-          (should-not (get-text-property (line-beginning-position)
-                                         'seshat-reader-annotation-id)))
-        (cl-letf (((symbol-function 'seshat-reader-annotation-queue-entries)
-                   (lambda (&rest _) nil)))
-          (with-current-buffer buffer
-            (seshat-reader-annotation-list-next-page)))
-        (with-current-buffer buffer
-          (should (= (count-lines (point-min) (point-max)) 2))
           (should (string-match-p "批注-21" (buffer-string)))
-          (should-not (string-match-p "批注-01" (buffer-string)))
-          (goto-char (point-min))
-          (forward-line 1)
-          (should (string-match-p "-- 第 2/2 页 --"
-                                  (buffer-substring (line-beginning-position)
-                                                    (line-end-position)))))))))
+          (should-not (string-match-p "第 1/2 页" (buffer-string)))
+          (should-not (string-match-p "-- 第" (buffer-string))))))))
 
-(ert-deftest seshat-reader-annotation-test--delete-on-last-page-converges ()
-  "在第 2 页删掉唯一一条后页号自动收敛到 1，且不渲染空页."
-  (seshat-reader-annotation-test--with-temp-dir dir
-    (let* ((file (expand-file-name "book.pdf" dir))
-           (seshat-reader-annotation-roots (list (cons "lib" dir)))
-           (seshat-reader-annotation-page-size 20)
-           (annotations (seshat-reader-annotation-test--make-annotations 21))
-           (server annotations))
-      (with-temp-file file)
-      (cl-letf (((symbol-function 'seshat-reader-annotation--fetch)
-                 (lambda (_doc) server))
-                ((symbol-function 'seshat-reader-annotation-queue-entries)
-                 (lambda (&rest _) nil))
-                ((symbol-function 'seshat-reader-annotation-queue-sync) #'ignore)
-                ((symbol-function 'seshat-reader-annotation-delete)
-                 (lambda (_id) t)))
-        ;; 从干净的列表缓冲区开始（重置 buffer-local 页号）
-        (when (get-buffer seshat-reader-annotation-list-buffer-name)
-          (kill-buffer seshat-reader-annotation-list-buffer-name))
-        (with-temp-buffer
-          (setq buffer-file-name file)
-          (seshat-reader-annotation-list))
-        (let ((buffer (get-buffer seshat-reader-annotation-list-buffer-name)))
-          (with-current-buffer buffer
-            (should (= seshat-reader-annotation-list-page 1))
-            (seshat-reader-annotation-list-next-page)
-            (should (= seshat-reader-annotation-list-page 2))
-            (should (string-match-p "批注-21" (buffer-string)))
-            ;; 服务端已删掉最后一条
-            (setq server (butlast annotations 1))
-            (goto-char (point-min))
-            (seshat-reader-annotation-list-delete)
-            ;; 页号收敛到 1，且只剩下 20 条、无页脚（单页不显示页脚）
-            (should (= seshat-reader-annotation-list-page 1))
-            (should (= (count-lines (point-min) (point-max)) 20))
-            (should (string-match-p "批注-20" (buffer-string)))
-            (should-not (string-match-p "页 --" (buffer-string)))))))))
+(ert-deftest seshat-reader-annotation-test--list-mode-no-paging-keys ()
+  "列表 mode 不再把 `]' / `[' 绑到翻页命令，翻页命令本身也已删除."
+  (should-not (fboundp 'seshat-reader-annotation-list-next-page))
+  (should-not (fboundp 'seshat-reader-annotation-list-prev-page))
+  (should-not (fboundp 'seshat-reader-annotation-list-first-page))
+  (should-not (fboundp 'seshat-reader-annotation-list-last-page))
+  (with-temp-buffer
+    (seshat-reader-annotation-list-mode)
+    (dolist (sequence '("]" "["))
+      (should-not (memq (key-binding (kbd sequence))
+                        '(seshat-reader-annotation-list-next-page
+                          seshat-reader-annotation-list-prev-page
+                          seshat-reader-annotation-list-first-page
+                          seshat-reader-annotation-list-last-page))))))
 
 (provide 'seshat-reader-annotation-test)
 ;;; seshat-reader-annotation-test.el ends here

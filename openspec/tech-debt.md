@@ -223,3 +223,60 @@
 ## 面板测试的状态隔离与空列表表现（M11.10，2026-10-18）
 - 测试隔离：`seshat-reader-etaf-test` 的若干用例未对 `seshat-reader-etaf--doc-id` / `--doc-source`、`seshat-reader-sidebar--last-kind` / `--last-buffer` 做 `let` 绑定，退出后残留。当前不影响结果（后续用例均自行绑定/覆盖），但违反测试隔离原则，后续补 `let`。
 - 空列表表现不一致：批注为空时，纯文本路径显示「（该文档没有批注）」，ETAF 路径渲染空卡片列表 + 徽章「0 条」。行为可接受（M11.9 既有），属测试盲区，后续统一或补测。
+
+## Android L3 设备验证缺口（M9.1，2026-10-18）
+- 现象：本机 `adb devices` 为空、AVD 数量为 0、`$ANDROID_SDK/system-images/` 无镜像文件（仅空目录），无法用模拟器或真机做 UI 交互验证。
+- 影响：三区骨架、tab 切换状态保留、设置页保存/回填、4 个阅读入口与 GTD 入口的可达性只能人工真机验收；CI 也无法覆盖。
+- 缓解：L3 降级为静态校验（`aapt2 dump badging` / `apkanalyzer manifest print` 校验包名、launcher 与 5 个 Activity）+ 人工验收清单（见 `openspec/completed/2026-10-18-m9.1-android-shell.md`「验证标准」）。
+- 根治：安装系统镜像并创建 AVD（`sdkmanager "system-images;android-35;google_apis;x86_64"` + `avdmanager create avd`），或接入真机 / 云设备农场。
+
+## BottomNavigationView 无图标（M9.1，2026-10-18）
+- 现象：底部双 tab 只有文字标签（`nav_notes` / `nav_reader`），无矢量图标，`app:labelVisibilityMode="labeled"`。
+- 原因：本机无设备可验证图标渲染，为降低「自绘 vector path 出错却无法发现」的风险，M9.1 刻意不引入 drawable。
+- 影响：视觉弱于 Material 规范（NavigationBar 通常 icon + label），功能完整。
+- 建议：真机验证环境具备后补两枚 24dp 矢量图标，并在 `res/menu/menu_main_tabs.xml` 加 `android:icon`。
+
+## Notes / Reader tab 为占位（M9.1，2026-10-18）
+- 现状：`ui/NotesFragment` 只有占位文案与「打开 GTD」按钮；`ui/ReaderFragment` 只有 4 个既有阅读入口。
+- 影响：三区骨架已就位但内容区尚空；Notes 的 orgzly 风格列表（M9.3）与 Reader 的书架（M10.1）未接入；数据源接入（M9.2 的 uid + 增量 + 本地缓存）仍依赖 M7 服务端地基。
+- 约定：这两个 Fragment 是后续里程碑的唯一落点——M9.3 把 Notes 列表挂进 `NotesFragment`，M10.1 把书架挂进 `ReaderFragment`，不另建 Activity。
+
+## androidx.security 仍为 alpha 版（M9.1，2026-10-18）
+- 现状：`androidx.security:security-crypto:1.1.0-alpha06` 是预览版，`EncryptedSharedPreferences` 的解密时机（`create()` 内 vs 首次 `getString()`）与异常类型在版本间存在差异。
+- 缓解：M9.1 已在 `getString`/`putString`/`putSecret` 三层做异常兜底，且 `isEncrypted=false` 时拒绝写入机密。
+- 建议：等 1.1.0 稳定版发布后升级，并回归 `SecurePrefsTest` 与真机「恢复备份后打开设置页」场景。
+
+## Android 设置页输入健壮性（M9.1，2026-10-18）
+- 现状：`SettingsValidator` 用 `java.net.URI` 解析，IDN 域名（如 `https://例え.テスト`）与无方括号 IPv6（`fe80::1`）会被判为 `MALFORMED` 而拒绝；不支持用户填写带方括号的 IPv6 之外的等价写法。
+- 影响：属可用性限制，非安全问题；绝大多数自托管场景使用 ASCII 域名或 IPv4。
+- 建议：如需支持，用 `java.net.IDN.toASCII` 预处理 host 并显式处理方括号 IPv6。
+
+## 保存配置非原子且失败不可感知（N1，M9.1 安全复审，2026-10-18）
+- 现象：`SettingsStore.save()` 分两次写入令牌与地址，且 `putString` 内部吞异常返回 `Unit`，地址写入失败时仍返回 `SaveResult.Ok`，UI 提示「配置已保存」并退出。
+- 影响：失败后可能留下「新令牌 + 旧地址」组合（有效令牌被发往用户本想迁离的主机）；写入失败对用户不可见。
+- 建议（M9.2 前处理）：`SecurePrefs` 暴露 `saveConfig(url: String, token: String?): Boolean`，内部 `prefs.edit().putString(URL).putString(TOKEN).commit()` 一次落盘（`commit()` 有返回值），`SettingsStore` 据此返回真实结果。
+
+## 加密存储损坏后无法自愈（N3，M9.1 安全复审，2026-10-18）
+- 现象：`SecurePrefs.open()` 失败回退为 legacy 实例后，损坏的 `seshat_sync_secure.xml` 不被删除；`clear()` 只清 legacy，故「重置本地配置」无法恢复加密能力，而 UI 会隐藏告警并提示已重置（文案已在 T9 修正为「需在系统设置中清除应用数据」）。
+- 影响：设备可能永久处于「无法保存令牌」状态；此前版本会引导用户执行无效的破坏性操作（丢失已存服务器地址）。
+- 建议（M9.2 前处理）：`SecurePrefs` 持有 `applicationContext`，新增 `resetAll(): Boolean`（清 prefs + `deleteSharedPreferences(ENCRYPTED_PREFS)`），`SettingsActivity` 仅在成功时隐藏告警。
+
+## 校验通过值与保存值不一致（n4，M9.1 安全复审，2026-10-18）
+- 现象：`SettingsValidator.validateServerUrl` 返回 `withScheme.trimEnd('/')`（原始串）而非 URI 重组结果，故 `https:/a.com` 被接受并保存为 `https://https:/a.com`；空端口 `a.com:`、`:0`、含控制字符、`/../` 路径均被接受。
+- 影响：畸形地址进入 `SeshatConfig.serverUrl` 并拼进请求，可能导致请求失败或打到意外的 host/path（未构造出主机级绕过，userinfo/host 校验闭合）。
+- 建议：拒绝 `[\x00-\x1f\x7f]` 与控制字符、拒绝 `port == 0`、用 `scheme://host[:port]path` 重组后再返回。
+
+## 设置页输入与状态副作用（n2/n5/n6，M9.1 安全复审，2026-10-18）
+- n2：`onUnreadable` 不改变 `isEncrypted`，若解密异常发生在 `EncryptedSharedPreferences.create()` 之后，`putSecret` 仍返回 true，fail-closed 仅由 UI 承担。建议增加 `@Volatile usable` 标志并纳入 `putSecret` 判断。
+- n5：令牌无长度上限（建议 4096，超限返回独立错误原因）。
+- n6：`onPause` 清空令牌输入框且 `saveEnabled=false`，旋转屏幕/来电返回后已输入未保存的令牌静默丢失且无提示。建议清空时若输入非空则提示。
+
+## 备份与可用性取舍待文档化（n8/n9/n10，M9.1 安全复审，2026-10-18）
+- n8：`GtdActivity` 调 `SecurePrefs.open(this)` 未传 `onUnreadable`，加密不可用时静默使用 legacy 明文令牌（无新增泄露面，但无提示）。
+- n9：B2 的备份排除规则缺 lint 与真机证据（`com.android.tools.lint:lint-gradle:31.13.2` 未缓存 + 网络不可达）；`reader_annotations` / `reading_progress` / `pdf_reader` 会随云备份上传（不含凭据，属用户内容隐私），该取舍需在 `docs/security.md` §7 记录。
+- n10：设置页 `FLAG_SECURE` 为全窗口，用户无法截图求助；属刻意的安全/可用性权衡，需在 `docs/android.md` 记录以免后续被当作 bug 移除。
+
+## 批注列表全量渲染无虚拟化（M11.13，2026-10-18）
+- 现象：去分页后列表一次性渲染全部条目，条目数极大（数百条以上）时首次渲染成本线性增长，且 ETAF viewport 高度按条目数放大。
+- 可选优化：按可视区域渲染（虚拟滚动）或恢复「分批加载」但保留连续流语义。
+- 现状：当前不阻塞日常使用（批注通常几十条）。

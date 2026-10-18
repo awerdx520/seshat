@@ -504,14 +504,15 @@ T10 第 1 轮反馈的验收：用户要求译文面板也跟随光标。分两�
 ;;; 内容自适应高度（T2）
 
 (defun seshat-reader-sidebar-test--fit-run (kind content-lines init-height
-                                                 &optional etaf-runtime)
+                                                 &optional etaf-runtime frame-h)
   "在桩环境下跑一次 `seshat-reader-sidebar--fit-height-for-content'.
 KIND 为面板内容类型，CONTENT-LINES 为桩出的内容行数，INIT-HEIGHT 为桩出的
 初始窗口总行数；ETAF-RUNTIME 非 nil 时把 `etaf-runtime-for-buffer' 桩成返回它
 （模拟「buffer 已挂载 ETAF runtime」）。返回 plist：`:resizes' 为
 `window-resize' 调用列表（元素 `(WINDOW DELTA)'）、`:state' 为执行后的
 `seshat-reader-sidebar--state'、`:final-height' 为执行后的窗口总行数。
-单行像素高固定桩为 10，`frame-height' 固定桩为 50。"
+首行像素高（`line-pixel-height'）与 `frame-char-height' 均固定桩为 10，
+`frame-height' 固定桩为 FRAME-H（省略时 50）。"
   (let* ((buf (get-buffer-create "*seshat-sidebar-test-fit*"))
          (win (selected-window))
          (orig-buffer (window-buffer win))
@@ -530,11 +531,13 @@ KIND 为面板内容类型，CONTENT-LINES 为桩出的内容行数，INIT-HEIGH
           (let ((seshat-reader-sidebar--state nil))
             (cl-letf (((symbol-function 'line-pixel-height)
                        (lambda () line-height))
+                      ((symbol-function 'frame-char-height)
+                       (lambda (&rest _) line-height))
                       ((symbol-function 'window-text-pixel-size)
                        (lambda (&rest _)
                          (cons 100 (* content-lines line-height))))
                       ((symbol-function 'frame-height)
-                       (lambda (&rest _) 50))
+                       (lambda (&rest _) (or frame-h 50)))
                       ((symbol-function 'window-total-height)
                        (lambda (&rest _) h))
                       ((symbol-function 'window-resize)
@@ -582,12 +585,69 @@ KIND 为面板内容类型，CONTENT-LINES 为桩出的内容行数，INIT-HEIGH
                    (/ (float expect) 50.0)))))
 
 (ert-deftest seshat-reader-sidebar-test--fit-height-for-content-clamps-min ()
-  "内容极少时目标高度不低于 5 行."
-  (let* ((result (seshat-reader-sidebar-test--fit-run 'translate 1 20))
+  "内容极少时目标高度不低于 `seshat-reader-sidebar-min-height' × `frame-height'."
+  (let* ((seshat-reader-sidebar-min-height 0.25)
+         (result (seshat-reader-sidebar-test--fit-run 'translate 1 20))
+         (resizes (plist-get result :resizes))
+         (expect (floor (* 0.25 50))))
+    (should (= expect 12))
+    (should (= (length resizes) 1))
+    (should (= (+ 20 (cadar resizes)) expect))
+    (should (= (plist-get result :final-height) expect))))
+
+(ert-deftest seshat-reader-sidebar-test--fit-height-for-content-min-height-override ()
+  "下限随 `seshat-reader-sidebar-min-height' 变化：0.4 × 50 = 20 行即目标高度.
+初始 20 行与目标相等，故 DELTA 为 0、不调用 `window-resize'。"
+  (let* ((seshat-reader-sidebar-min-height 0.4)
+         (result (seshat-reader-sidebar-test--fit-run 'translate 1 20))
+         (resizes (plist-get result :resizes)))
+    (should-not resizes)
+    (should (= (plist-get result :final-height) 20))
+    (should (equal (cdr (assq 'translate (plist-get result :state)))
+                   0.4))))
+
+(ert-deftest seshat-reader-sidebar-test--fit-height-for-content-min-over-max ()
+  "下限高于上限时先夹到上限，再用至少 1 行保底（不因下限越界而超过上限）."
+  (let* ((seshat-reader-sidebar-min-height 0.9)
+         (seshat-reader-sidebar-max-height 0.8)
+         (result (seshat-reader-sidebar-test--fit-run 'translate 1 20))
+         (resizes (plist-get result :resizes))
+         (expect (floor (* 0.8 50))))
+    (should (= expect 40))
+    (should (= (length resizes) 1))
+    (should (= (plist-get result :final-height) expect))
+    (should (equal (cdr (assq 'translate (plist-get result :state)))
+                   (/ (float expect) 50.0)))))
+
+(ert-deftest seshat-reader-sidebar-test--fit-height-for-content-floor-one-line ()
+  "`frame-height' 极小时目标高度仍至少 1 行（`max-h' 与 `target' 双重保底）."
+  (let* ((seshat-reader-sidebar-min-height 0.25)
+         (seshat-reader-sidebar-max-height 0.8)
+         (result (seshat-reader-sidebar-test--fit-run 'translate 0 0 nil 1))
          (resizes (plist-get result :resizes)))
     (should (= (length resizes) 1))
-    (should (= (+ 20 (cadar resizes)) 5))
-    (should (= (plist-get result :final-height) 5))))
+    (should (= (plist-get result :final-height) 1))
+    (should (= (+ 0 (cadar resizes)) 1))))
+
+(ert-deftest seshat-reader-sidebar-test--content-height-uses-min-line-height ()
+  "单行像素高取「首行像素高与 `frame-char-height' 的较小值」.
+桩 `line-pixel-height' 为 20（模拟 Markdown 标题行更高）、`frame-char-height'
+为 10、内容像素高 6 × 20 = 120；按较小的 10 换算得 12 行——若直接用 20 则会
+低估为 6 行。"
+  (let* ((buf (get-buffer-create "*seshat-sidebar-test-content-height*"))
+         (win (selected-window))
+         (orig-buffer (window-buffer win)))
+    (unwind-protect
+        (progn
+          (set-window-buffer win buf)
+          (cl-letf (((symbol-function 'line-pixel-height) (lambda () 20))
+                    ((symbol-function 'frame-char-height) (lambda (&rest _) 10))
+                    ((symbol-function 'frame-height) (lambda (&rest _) 50))
+                    ((symbol-function 'window-text-pixel-size)
+                     (lambda (&rest _) (cons 100 (* 6 20)))))
+            (should (= (seshat-reader-sidebar--content-height win) 12))))
+      (set-window-buffer win orig-buffer)
+      (kill-buffer buf))))
 
 (ert-deftest seshat-reader-sidebar-test--fit-height-for-content-skips-annotations ()
   "kind 为 `annotations' 时面板高度不被调整、记忆不变."
@@ -638,6 +698,8 @@ KIND 为面板内容类型，CONTENT-LINES 为桩出的内容行数，INIT-HEIGH
                        (lambda (_buffer &optional _action) win))
                       ((symbol-function 'line-pixel-height)
                        (lambda () line-height))
+                      ((symbol-function 'frame-char-height)
+                       (lambda (&rest _) line-height))
                       ((symbol-function 'window-text-pixel-size)
                        (lambda (&rest _) (cons 100 (* 12 line-height))))
                       ((symbol-function 'frame-height) (lambda (&rest _) 50))
