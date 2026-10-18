@@ -241,6 +241,7 @@
 - 现状：`ui/NotesFragment` 只有占位文案与「打开 GTD」按钮；`ui/ReaderFragment` 只有 4 个既有阅读入口。
 - 影响：三区骨架已就位但内容区尚空；Notes 的 orgzly 风格列表（M9.3）与 Reader 的书架（M10.1）未接入；数据源接入（M9.2 的 uid + 增量 + 本地缓存）仍依赖 M7 服务端地基。
 - 约定：这两个 Fragment 是后续里程碑的唯一落点——M9.3 把 Notes 列表挂进 `NotesFragment`，M10.1 把书架挂进 `ReaderFragment`，不另建 Activity。
+- 解决（M10.6 B3/B4）：`ReaderFragment` 已接书架（B3），`NotesFragment` 已接 org 列表 / 搜索 / 编辑 / Agenda（B4）；本条的「占位」现状不再成立，仅留作历史记录。
 
 ## androidx.security 仍为 alpha 版（M9.1，2026-10-18）
 - 现状：`androidx.security:security-crypto:1.1.0-alpha06` 是预览版，`EncryptedSharedPreferences` 的解密时机（`create()` 内 vs 首次 `getString()`）与异常类型在版本间存在差异。
@@ -575,3 +576,43 @@
 - 现状：Shell 用 `FragmentTransaction.show/hide` 切换 tab，两个 Fragment 只创建一次；`show/hide` **不改变生命周期**，`onResume` 不会再次触发。书架只在 `onViewCreated`、`onResume`（从阅读器返回）与过滤/排序变更时 `refresh()`。
 - 影响：在「笔记」tab 期间书架内容可能已变化（例如导入流程/外部写入），切回「阅读」tab 仍显示旧列表（缺新书、进度徽标过期），用户需要退出重进或改一次过滤条件才能看到更新。
 - 建议：`ReaderFragment` 覆写 `onHiddenChanged(hidden: Boolean)`，`hidden == false` 时按需 `refresh()`（可加时间窗节流，例如距上次刷新 <3s 则跳过）；若将来改为 `ViewPager2`/Navigation 组件，则对应改为 `onResume` 或 `onStart` 语义。
+
+## `OrgEntry` 无稳定 id，折叠状态用解析下标（M10.6 B4，2026-10-18）
+- 现状：`OrgParser` 产出的 `OrgEntry` 没有身份字段；`OrgTreeBuilder` 的 `OrgNode.index`、`NotesFragment.collapsed` 的折叠键、`NotesEditActivity` 的编辑目标都取自「条目在本次解析结果中的下标」。
+- 影响：任何一次重新解析（保存、切文件、Agenda 段切状态返回）后下标可能变化，折叠状态按旧下标残留或错位——`pruneCollapsed` 只能清掉已失效的下标，无法让折叠状态跟随条目移动；跨会话持久化折叠状态更无从谈起。
+- 建议：给 `OrgEntry` 补稳定 id（内容指纹：`层级 + 标题 + 同标题出现序号`，或解析时记录 headline 行号并配内容哈希）；折叠键改用 id，`OrgEditor` 的写回继续用行号（两套坐标解耦）。
+
+## Notes 只读 `filesDir/notes/` 下的第一个 org 文件（M10.6 B4，2026-10-18）
+- 现状：`NotesFragment.loadNotes()` 取 `listFiles{...}.sortedBy { name }.firstOrNull()`，只解析一个文件；同步上传也是这个文件。
+- 影响：目录里放多个 org 文件时，除按文件名排序第一个之外全部不可见、不可编辑、不会同步，多文件用户实际不可用；界面也无任何提示说明「只显示了一个文件」。
+- 建议：加文件切换（工具栏下拉或抽屉），选中文件名存 `AppPreferences`；`loadNotes` / `NotesSync.upload` 统一按选中文件工作。
+
+## 搜索不含 tags 与 metadata，命中视图强制展开（M10.6 B4，2026-10-18）
+- 现状：`OrgSearchMatcher` 只匹配标题与正文；命中行由 `OrgTreeBuilder.flattenFiltered` 强制展开祖先链。
+- 影响：搜 `:work:` 这类标签必然无结果（用户会误判条目不存在）；命中视图里点折叠箭头会被下一次 `rebuild` 立刻展开回来，看起来像按钮失效。
+- 建议：匹配范围补 tags / priority / scheduled / deadline（复用 `OrgEntryDisplay` 的展示口径）；区分「搜索强制展开」与「用户手动覆盖」两套状态（命中行优先显示折叠箭头并允许覆盖），或命中时暂时隐藏折叠箭头。
+
+## 编辑页 metadata（优先级/计划/截止/标签/属性）只读（M10.6 B4，2026-10-18）
+- 现状：`NotesEditActivity` 仅允许改标题 / 正文 / TODO 状态；其余字段只展示。
+- 影响：调整优先级、计划、截止、标签必须离开 App 用外部编辑器，移动端「随手改」的场景缺失；且改标题会触发 headline 重建的字段顺序规范化（见下一条）。
+- 建议：先做高频且局部可改的三个——计划（`SCHEDULED:` 行）、截止（`DEADLINE:` 行）、标签（行尾 `:tag:`），都只需改写单行；优先级放在 headline 内、需与 TODO 关键字顺序协调，最后做。
+
+## `OrgEditor` 重建 headline 会规范化字段顺序（M10.6 B4，2026-10-18）
+- 现状：`OrgEditor.setTitle` / `setTodoState` 以 `stars + TODO + rest` 重组 headline，`* [#A] TODO x` 保存后变成 `* TODO [#A] x`。
+- 影响：与 org-mode / orgzly 的书写习惯不一致；只改一个标题就会产生用户没预期的行级 diff，容易被误认为编辑器改坏了别处。
+- 建议：解析时记录 TODO 关键字的位置与其余部分，重建时按原位置回填（仅「原本无 TODO、本次新增」时才前置）；同步补 CRLF 与多关键字算例的单测。
+
+## 编辑页与 GTD/Agenda 并发写同一文件无锁与版本校验（M10.6 B4，2026-10-18）
+- 现状：`NotesEditActivity` 保存、`NotesFragment` Agenda 段切状态、`GtdActivity` 切状态都是「`readText` → 内存改写 → `writeText` 全量覆盖」，无文件锁、无 mtime / 内容哈希校验。
+- 影响：两个写者先后写会互相覆盖（例如编辑页还在返回栈里、用户在 Agenda 段切了一条状态），后写者把前者改动整段丢弃且无人提示。
+- 建议：写前记录并校验 `lastModified` / 长度（或内容哈希），不匹配则提示「文件已被修改」并重载；长期把写操作收敛到单一写者（串行 executor + 内存当前文本）。
+
+## Notes 列表无 `DiffUtil`，整表重绑致滚动跳动（M10.6 B4，2026-10-18）
+- 现状：`NotesListAdapter.submit()` 直接 `notifyDataSetChanged()`；折叠 / 搜索输入 / 分段切换每次都整表重绑。
+- 影响：条目多时每次折叠都全表刷新并丢失滚动位置，RecyclerView 复用被打断，长列表出现肉眼可见的跳动与闪烁。
+- 建议：`VisibleRow` 已是不可变数据类，加 `DiffUtil.ItemCallback`（id = `node.index`，内容比较状态/标题/标签/摘要/缩进/折叠标记）成本低，改用 `ListAdapter` 承接。
+
+## 正文摘要取首行，常显示计划行（M10.6 B4，2026-10-18）
+- 现状：列表行的正文摘要取 `OrgEntry` body 的首个非空行。
+- 影响：org 文档里正文常以 `DEADLINE:` / `SCHEDULED:` 计划行开头，摘要就显示成「DEADLINE: <2026-10-20 周三>」，信息量低且误导（用户以为标题被换掉了）。
+- 建议：摘要跳过 `DEADLINE:` / `SCHEDULED:` / `CLOSED:` / `:PROPERTIES:` 等结构行，取首个纯文本行；无纯文本行时回退首个非空行。

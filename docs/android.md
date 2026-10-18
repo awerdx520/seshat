@@ -20,10 +20,10 @@
 
 | tab | Fragment | 承载内容 |
 |---|---|---|
-| 笔记 | `ui/NotesFragment` | M9.1 仅有「打开 GTD」入口（`gtd/GtdActivity`）；orgzly 风格列表 / 搜索 / 编辑由 M9.3 接入 |
+| 笔记 | `ui/NotesFragment` | org 树列表（层级/折叠/搜索）+ 笔记/Agenda 分段（M10.6 B4，见 §8）：搜索框、Agenda 段点击切 TODO、Agenda 段同步按钮；点条目进 `ui/NotesEditActivity` 编辑 |
 | 阅读 | `ui/ReaderFragment` | 书架网格（M10.6 B3：扫描 `filesDir/books/`、过滤/排序、点书进阅读器，见 §7）+ 底部 3 个入口：导入书籍、选择 EPUB、示例 EPUB（PDF 由书架点击打开） |
 
-阅读器（`reader/EpubReaderActivity`、`reader/PdfReaderActivity`）与 GTD（`gtd/GtdActivity`）仍是**独立全屏 Activity**，由 Fragment 内的入口启动——沉浸阅读不占内容区，且保证既有实现零改动。
+阅读器（`reader/EpubReaderActivity`、`reader/PdfReaderActivity`）仍是**独立全屏 Activity**，由 Fragment 内的入口启动——沉浸阅读不占内容区，且保证既有实现零改动。`gtd/GtdActivity`（三 Spinner 过滤的旧版 GTD 页）自 M10.6 B4d 起**不再有 Fragment 入口**（Notes 的 Agenda 段取代），保留为可独立启动的 Activity。
 
 ## 3. 设置页（M9.1 起，M9.2 扩展到 8 项）
 
@@ -37,7 +37,7 @@
 | 4 | 主题（跟随系统 / 浅色 / 深色） | `app_theme` | **立即**（`SeshatApp` 里 `AppCompatDelegate.setDefaultNightMode`，Activity 自动重建） |
 | 5 | 正文字号（80–200%，**仅 EPUB 生效**） | `reader_text_zoom` | 下次打开阅读器 |
 | 6 | 翻页模式（横向翻页 / 竖向连续滚动） | `reader_page_mode` | 下次打开阅读器 |
-| 7 | 连通性测试 | 无存储 | 按下即测（`GET /api/roots`——无入参、只读，200 即证明「地址可达 + 令牌有效」。M7 起批注端点按 uid 查询且要求 uid 已登记，客户端没有可用的已登记 uid，故不再用批注端点探测；未升级到 M7 的旧服务端没有该路由，返回 404 → `ServerError(404)`，设置页应提示「服务端版本可能过旧」，见 §10） |
+| 7 | 连通性测试 | 无存储 | 按下即测（`GET /api/roots`——无入参、只读，200 即证明「地址可达 + 令牌有效」。M7 起批注端点按 uid 查询且要求 uid 已登记，客户端没有可用的已登记 uid，故不再用批注端点探测；未升级到 M7 的旧服务端没有该路由，返回 404 → `ServerError(404)`，设置页应提示「服务端版本可能过旧」，见 §11） |
 | 8 | 关于 | 无存储 | 静态（版本号 + 配置状态） |
 
 - 存储**分两层**：机密与同步配置走 `SecurePrefs`（EncryptedSharedPreferences，见 `docs/security.md` §7）；
@@ -57,7 +57,7 @@
 | `settings/` | 配置校验与持久化 | 不做网络 |
 | `sync/` | 传输层（REST / WebDAV）与安全存储 | 被 `settings` 与阅读器复用 |
 | `reader/` | epub / pdf 阅读与本地进度、批注 | 由 `ReaderFragment` 启动 |
-| `gtd/` | org 解析、过滤、编辑与 GTD 视图 | 由 `NotesFragment` 启动 |
+| `gtd/` | org 解析、过滤、树构建/搜索、行区间改写、GTD 视图与 org 上传（`NotesSync`） | 由 `NotesFragment` 使用；`GtdActivity` 保留可独立启动 |
 | `importer/` | 书籍导入 | 由 `ReaderFragment` 调用 |
 
 ## 5. 阅读器渲染管线（M9.2）
@@ -121,7 +121,29 @@
 4. `covers/` 无自动清理：书籍删除后封面与元数据缓存滞留（无容量上限）。
 5. 切 tab 不刷新书架：`show/hide` 不改变生命周期、`onResume` 不触发；从阅读器返回会刷新（`onResume` 里按需重扫）。
 
-## 8. 构建与验证
+## 8. Notes（M10.6 B4）
+
+`ui/NotesFragment` 由 M9.1 的占位视图改为真实 org 列表。解析在 `gtd/OrgParser`、建树与扁平化在 `gtd/OrgTree`（`OrgTreeBuilder`）、搜索匹配在 `gtd/OrgSearchMatcher`、Agenda 排序在 `gtd/GtdSorter`、单条写回在 `gtd/OrgEditor`；页面本身只负责后台线程、渲染与 Toast。
+
+| 项 | 实现 |
+|---|---|
+| 数据源 | `filesDir/notes/*.org`（首次从 `assets/sample.org` 复制到 `filesDir/notes/sample.org`），**只读第一个文件**（按文件名排序）。M10.6 B4d 起 `GtdActivity` 读**同一路径**，双副本分叉消除；旧 `filesDir/sample.org` 保留但**不再读取** |
+| 列表 | 层级缩进（按标题星号深度）+ 折叠（有子节点的行可点箭头展开/收起）；每行「状态徽标 + 标题 + `:tag:` 同行 + 正文首行摘要」（`item_note_entry`） |
+| 搜索 | 标题 + 正文的**包含匹配**（大小写不敏感），命中保留祖先链并**强制展开**；输入 250ms 防抖后重建列表 |
+| 分段 | 笔记（树列表）/ Agenda（不套 `GtdFilter`，全量条目经 `GtdSorter.byEarliestDate` 扁平按最早日期升序，点击切 TODO 状态）。同步按钮仅在 Agenda 段可见 |
+| 同步 | `gtd/NotesSync.upload(context, file)` 上传到 `/dav` 下的 `<remoteDir>/seshat/<文件名>`（Content-Type `text/plain; charset=utf-8`）；结果 `Ok(code, path)` / `NotConfigured` / `Failed(msg)`，**阻塞**调用，线程与 Toast 由页面负责。与 `GtdActivity` 共用同一实现 |
+| 编辑页 | `ui/NotesEditActivity`：标题 / 正文 / TODO 状态可编辑并写回（`OrgEditor` 行区间改写）；优先级、计划、截止、标签、属性**只读展示** |
+
+**已知限制**：
+
+1. 只读 `filesDir/notes/` 下的**第一个** org 文件，多文件切换未做。
+2. 搜索不含标签（`:tag:`）与其它 metadata；命中视图强制展开，此时点折叠箭头无反馈。
+3. 折叠状态以「条目在**当前解析结果**中的下标」为键，重新解析后可能漂移（已按当前树裁剪失效下标）。
+4. 列表无 `DiffUtil`：折叠 / 搜索 / 分段切换都是整表重绑，滚动位置会跳。
+5. 编辑页填写的新标题若含 `TODO`、`:tag:`、`[#A]`，保存后会被重新解析成语义（不是纯文本标题）。
+6. 正文摘要取首行，示例文档首行常是 `DEADLINE:` 这类计划行，摘要信息量低。
+
+## 9. 构建与验证
 
 ```sh
 cd android
@@ -131,7 +153,7 @@ cd android
 
 L3（设备安装与交互验证）需要真机或 AVD；当前环境无可用设备与系统镜像，相关缺口见 `openspec/tech-debt.md`「Android L3 设备验证缺口」。
 
-## 9. 文档标识演进（M7 之后）
+## 10. 文档标识演进（M7 之后）
 
 M7 把服务端的文档身份从「客户端自定字符串」改成「服务端权威 uid」，Android 侧尚未跟进，形成了明确的**已知不一致**：
 
@@ -142,18 +164,18 @@ M7 把服务端的文档身份从「客户端自定字符串」改成「服务�
 - **无需迁移**：服务端与客户端均尚未部署，本地旧 `documentId` 名下的进度/批注可直接**清空**（删除对应 prefs 键即可），不需要做 id 迁移或双写过渡期。
 - 契约细节见 [`docs/api.md`](api.md) §6（路径解析）与 [`docs/sync-protocol.md`](sync-protocol.md) §2（身份模型）。
 
-## 10. 与 M7 服务端对接（M9.2 A 批）
+## 11. 与 M7 服务端对接（M9.2 A 批）
 
 第 9 节描述的「已知不一致」是本批改造前的状态（保留作背景）；M9.2 A 批已解决 Android 侧：不再把内容哈希当 uid 发送，而是由服务端解析出 uid，无 uid 时完全离线。本批**只做只读协议 + 索引 + 增量 + 阅读器 uid 接入**，文件同步（书架）留 B 批。
 
-### 10.1 uid 的来源与解析
+### 11.1 uid 的来源与解析
 
 - uid 由**服务端生成**（26 位 Crockford Base32），客户端**不生成、不解析**，只透传。
 - 路径 → uid 的唯一入口是 `GET /api/resolve?root=&path=`（`sync/RestClient.resolve`：200 返回 uid，404 → `null`，400 抛 `ApiException`）。
 - uid 与路径解耦：**rename 后 uid 不变**；删除后同一路径重建会**复用原 uid**（墓碑保留 uid 与 path 的意义），因此「按路径缓存 uid」在删除重建后仍然有效。
 - A 批按**单根**实现（服务端默认只有 `notes`，mode=mirror）；多根 / ondemand 根留 B 批。
 
-### 10.2 阅读器的两条路径
+### 11.2 阅读器的两条路径
 
 | 打开方式 | Store 键 | 同步 |
 |---|---|---|
@@ -163,7 +185,7 @@ M7 把服务端的文档身份从「客户端自定字符串」改成「服务�
 - 键选择的唯一判定点在 Activity：`effectiveKey = uid ?: docId`，随后透传给五个 Store（`ReadingProgressStore`、epub `AnnotationStore`、`PdfProgressStore`、`PdfAnnotationStore`、`PdfInkStore`），Store 内部不做判断。
 - 同步装配有三条守卫（`sync/ReaderSync.createReaderSync`）：① uid 非空；② `SettingsStore.toConfig() != null`（地址与令牌齐备）；③ 装配成功。任一不满足即静默返回，**不构造 `RestClient`**——保持「服务端未配置时零网络行为」。
 
-### 10.3 本地资源索引
+### 11.3 本地资源索引
 
 - `sync/ResourceIndex.kt`：`SharedPreferences("seshat_resource_index")` 的**单文件 JSON**（键 `index`），内容为 `ResourceIndexDocument(cursor, entries)`；条目 `ResourceEntry(uid, root, path, blob, size, mtime, deleted, dirty)`。
 - **零新增依赖**（不引入 Room / SQLite）；读写函数注入，纯逻辑可 JVM 单测。
@@ -172,7 +194,7 @@ M7 把服务端的文档身份从「客户端自定字符串」改成「服务�
 - 容量按「数千条资源、单文件数百 KB」设计，且**假定单线程串行调用、不加锁**。
 - A 批只交付 `SyncEngine`（`bootstrap` / `pull`），**尚未接线**——当前没有任何调用方，书架 B 批接入。
 
-### 10.4 增量游标
+### 11.4 增量游标
 
 - `GET /api/changes?since=&limit=`（`limit` 上限 2000）：`op ∈ create/update/rename/delete`，响应含 `next_cursor`（int64）与 `has_more`。
 - `sync/SyncEngine` 每页**先应用事件、再存 `next_cursor`**：两者之间崩溃则重启后重复应用同一页——`apply` 幂等，所以最多多花一次网络，**绝不丢事件**（反之先存游标会永久跳过整页）。
@@ -180,7 +202,7 @@ M7 把服务端的文档身份从「客户端自定字符串」改成「服务�
 - `rename` 只用 `path`（`oldPath` 仅作日志线索，uid 才是稳定键）；`delete` 只置墓碑位，保留 uid 与 path。
 - `create/update` 的 `size` / `mtime` 只能继承索引既有值（`/api/changes` **不含**这两个字段）；全新条目无从得知 → `size = 0`、`mtime = 0` 且 `dirty = true`，表示「待 `GET /api/resources` 回填」。
 
-### 10.5 同步触发与失败语义
+### 11.5 同步触发与失败语义
 
 | 时机 | 动作 |
 |---|---|
@@ -192,7 +214,7 @@ M7 把服务端的文档身份从「客户端自定字符串」改成「服务�
 - 已知限制：拉取到的**远端进度不立即跳转 UI**（当前阅读位置已按本地进度恢复，中途跳转会让正在读的用户丢失位置），下次打开本书才生效；`onStop` 可能因进程被杀而不执行（见 `openspec/tech-debt.md`）。
 - 设置页「连通性测试」探针由「带旧参数的批注端点」改为 `GET /api/roots`（无入参、只读、不写数据）——旧写法在 M7 服务端上恒失败：批注按 uid 查询且要求 uid 已登记，客户端没有可用的已登记 uid；`/api/roots` 无此约束。旧服务端（无 M7 路由）返回 404，客户端映射为 `ServerError(404)`，设置页应提示「服务端版本可能过旧」。
 
-### 10.6 旧键清理（只删不迁移）
+### 11.6 旧键清理（只删不迁移）
 
 - 首次打开阅读器时按「**32 位十六进制**（EPUB 内容哈希）」或「**含 `:`**（PDF uri）」判定旧键并删除；用各 prefs 文件各自的一次性标记 `legacy_cleared`（`LegacyKeys.CLEARED_FLAG`）保证只跑一次，`legacy_` 前缀的键不参与清理。
 - **不迁移**：服务端与客户端均未部署，旧键名下的进度/批注直接丢弃；uid 为 26 位 Base32（既非 32 位十六进制也不含 `:`），不会误删合法新键。

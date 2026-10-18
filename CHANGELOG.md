@@ -46,6 +46,9 @@
 - Android 封面缓存（M10.6 B3）：新增 `reader/CoverCache`——内存 `LruCache<String, Bitmap>`（按 `byteCount`，上限 `Runtime.maxMemory() / 8`）+ 磁盘 `filesDir/covers/<key>.jpg`，并把书籍元数据另存 `<key>.json` 以**避免重复解析 EPUB 与重算内容哈希**；缓存键为 `文件名 + length + lastModified` 的 SHA-256 前 16 位 hex（`reader/CoverKeys`），PDF 封面用首页 `PdfRenderer` 渲染并按 `inSampleSize` 降采样。
 - 书籍扫描与进度枚举（M10.6 B3）：新增 `reader/BookLibrary`（扫描 `filesDir/books/` → 元数据 → 合并进度 → 过滤 → 排序，阻塞调用、须在后台线程）与 `reader/BookMetaReaders`（生产用 EPUB/PDF 元数据读取，PDF 只取页数不渲染）；`ReadingProgressStore` 新增 `all()`、`PdfProgressStore` 新增 `loadAll()` 供书架一次性枚举进度。新增 JVM 单测 4 个测试类共 42 例（`BookLibraryTest` 13 / `BookShelfLogicTest` 14 / `CoverKeysTest` 10 / `CoverCacheMetaTest` 5），单测总数 407 全绿（B2+B3 合计 336 → 407）。
 - 示例书迁移到 `filesDir/books/`（M10.6 B3）：`assets/sample.epub` 首次复制到书籍目录后打开书架条目；旧路径 `filesDir/sample.epub` **保留不删**作为回滚点（进度键为内容哈希，迁移后同一本书的进度仍可见）。
+- Android 笔记列表（M10.6 B4）：`ui/NotesFragment` 由占位视图改为真实 org 列表——`filesDir/notes/*.org` 经 `OrgParser` 解析 + `OrgTreeBuilder` 建树，按层级缩进展示、可折叠；每行为「状态徽标 + 标题 + `:tag:` 同行 + 正文首行摘要」（`item_note_entry`）；顶部搜索框对标题 + 正文做大小写不敏感的包含匹配（`OrgSearchMatcher`），命中保留祖先链并强制展开，输入 250ms 防抖；分段「笔记 / Agenda」——Agenda 段用 `GtdSorter.byEarliestDate` 扁平按最早日期排序，点击切换 TODO 状态。
+- Android 笔记编辑页（M10.6 B4）：新增 `ui/NotesEditActivity`，标题 / 正文 / TODO 状态可编辑并写回 org（`OrgEditor` 行区间改写）；优先级、计划、截止、标签、属性**只读展示**。
+- 抽取 `gtd/NotesSync` 并统一 GTD 数据源（M10.6 B4）：新增 `NotesSync.upload(context, file): NotesSyncResult`（`Ok` / `NotConfigured` / `Failed`）——阻塞、无 Toast、不建线程，经 `SecurePrefs` 取地址与令牌后 `PUT` 到 `remoteDir/seshat/<文件名>`；`GtdActivity` 与 Notes 的 Agenda 段共用该实现，删除重复的 `readSyncConfig()` / `joinPath()`。`GtdActivity` 改读 `filesDir/notes/sample.org`，与 Notes 列表**同一份文件**，旧 `filesDir/sample.org` 保留但不再读取。
 
 ### 变更
 
@@ -108,6 +111,8 @@
 - **脚本产物名**：`notes-backup-*.tar.gz` / `notes-backup.log` → `seshat-backup-*`。
 - **Web 管理界面**：内嵌前端（`internal/api/web/`）的品牌文案已更新；浏览器 `localStorage` 令牌键由 `notes.token` 改为 `seshat.token`，升级后**需在 Web 管理界面重新输入 API 令牌**。
 - **客户端配置**：Elisp 变量前缀 `notes-*` → `seshat-*`，默认值更新（本地目录 `~/seshat`、远端目录 `"seshat"`、HEAD 文件 `~/.emacs.d/seshat-head`）；Android 加密配置文件名 `notes_sync_secure`/`notes_sync` → `seshat_sync_secure`/`seshat_sync`，**既有同步配置不会自动迁移，需重新配置**。
+- **Android GTD 数据源统一**（M10.6 B4）：`GtdActivity` 由 `filesDir/sample.org` 改为 `filesDir/notes/sample.org`（与 Notes 列表同源，消除双副本分叉）；旧文件保留不删。Notes tab 的 Agenda 段成为主入口，`fragment_notes.xml` 移除 `openGtdButton`，`GtdActivity` 保留为可独立启动的 Activity（字符串资源 `main_open_gtd` 保留）。
+- **Android 同步实现去重**（M10.6 B4）：GTD 与 Notes 的 org 上传合并为 `gtd/NotesSync`，Toast 文案与线程结构不变（Notes 侧成功文案为「已上传到 <路径>（HTTP <码>）」）。
 
 ## [0.1.0] - 2026-10-11
 

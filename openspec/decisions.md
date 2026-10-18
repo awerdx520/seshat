@@ -291,3 +291,11 @@
 **理由**：零新增依赖；书架只读本地，服务端同步留给 B 批（`SyncEngine` 接线）；内容哈希是唯一能仅凭文件复现的稳定键。
 
 **代价**：首次扫描需逐本解析（慢）；有 uid 的书查不到进度；PDF 两套进度不共享；EPUB 首次上架解析 2 次（`BookMeta` 无 `opfDir`）。
+
+## 2026-10-18 · M10.6 B4 Notes 与 GTD 并入
+
+**决策**：Notes 与 GTD 统一读 `filesDir/notes/*.org`（旧 `filesDir/sample.org` 保留但不读）；树构建用「解析下标」作节点 id；编辑页只允许改标题/正文/状态，其余 metadata 只读；同步逻辑抽成 `NotesSync`（阻塞、无 Toast）。
+
+**理由**：消除双副本分叉（Notes 写 `filesDir/notes/sample.org`、GTD 写 `filesDir/sample.org`，两边改动互不可见）；下标 id 零成本且与 `OrgEditor` 的行号约定同源（解析顺序 = headline 顺序，一一对应）；metadata 写回需重写 headline 与计划行，收益低风险高（见 `openspec/tech-debt.md` 的 headline 规范化条目）。
+
+**代价**：① 重新解析后折叠状态可能漂移（已用 `pruneCollapsed` 裁剪失效下标，仍无法跟随条目移动）；② 单文件限制（只读第一个 org，多文件切换未做）；③ metadata 编辑需用户在外部编辑器完成。
