@@ -4,15 +4,22 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.text.InputType
+import android.view.GestureDetector
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.view.doOnNextLayout
 import androidx.fragment.app.FragmentActivity
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
@@ -43,7 +50,10 @@ import java.util.concurrent.Executors
  *   - [ReaderPageMode.HORIZONTAL]：`ViewPager2` 左右滑动，每章一页（[ChapterPagerAdapter] + [ChapterFragment]）；
  *   - [ReaderPageMode.VERTICAL]：`RecyclerView` 竖向连续滚动，章与章首尾相接（[ChapterScrollAdapter]）；
  *   两种容器同时存在于布局中，按模式只显示其一，底部「上一章/下一章」按钮按模式分流。
- * - 顶部显示「第 n/N 章 · 标题」；
+ * - 顶部显示「第 n/N 章 · 标题」，点击标题可输入章号直接跳章；
+ * - 布局为「全屏阅读区 + 顶部标题浮层 + 底部控制浮层」，单击屏幕**中央区域**（横向 30%~70%）
+ *   同步切换两块浮层的显隐；浮层首次布局后把自身高度写为阅读区 padding，正文不被遮挡；
+ * - 底部浮层第一行是章节 [SeekBar]（拖动松手才跳章），下方是「上一章/批注/下一章」按钮；
  * - 退出/翻页时持久化进度，工具栏「批注」按钮把选中文本存为批注。
  *
  * epub 打开流程（后台线程）：读取字节 → 解析（[EpubParser]）→ 计算文档 id（[documentIdOf]）→ 装配容器。
@@ -72,6 +82,16 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
     private lateinit var chapterTitleView: TextView
     private lateinit var pager: ViewPager2
     private lateinit var scrollView: RecyclerView
+
+    /** 顶部浮层（章节标题容器）：与 [bottomChrome] 同步显隐。 */
+    private lateinit var topChrome: View
+
+    /** 底部浮层（翻页/批注按钮容器）：与 [topChrome] 同步显隐。 */
+    private lateinit var bottomChrome: View
+
+    /** 底部浮层第一行的章节进度条（0-based，`max = chapterCount() - 1`）。 */
+    private lateinit var chapterSeekBar: SeekBar
+
     private lateinit var progressStore: ReadingProgressStore
     private lateinit var annotationStore: AnnotationStore
 
@@ -95,6 +115,32 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
 
     /** 重锚进行中标记：避免测量回调互相触发形成抖动循环。 */
     private var pendingReanchor: Boolean = false
+
+    /** 浮层高度是否已写入阅读区 padding（一次性，见 [applyChromePaddingOnFirstLayout]）。 */
+    private var chromePaddingApplied: Boolean = false
+
+    /** 正在等待首次布局的浮层监听（写入 padding 后移除，避免每次布局重算）。 */
+    private var chromeLayoutListener: View.OnLayoutChangeListener? = null
+
+    /**
+     * 单击 → 切换浮层的延迟投递器（缺陷 A：双击缩放的第一击 UP 也会回调 `onSingleTapUp`）。
+     *
+     * 用主线程 [Handler] 而非 `View.postDelayed`：不依赖任何具体 View 的生命周期，
+     * 且能在 [onDestroy] 里一次清空全部挂起任务。
+     */
+    private val tapHandler = Handler(Looper.getMainLooper())
+
+    /** 已排入 [tapHandler]、尚未执行的浮层切换（收到双击时撤销它）。 */
+    private var pendingToggle: Runnable? = null
+
+    /** 最近一次触摸所在容器的宽度（判定「中央区域」用，见 [tapDetector]）。 */
+    private var tapViewWidth: Int = 0
+
+    /** 手指正在拖动章节进度条（拖动期间不让滚动上报反写进度，避免与手指抢位置）。 */
+    private var isTrackingSeekBar: Boolean = false
+
+    /** 程序化写 `SeekBar.progress` 期间为 `true`：拦截由此产生的回调，防跳章回环。 */
+    private var isSyncingSeekBar: Boolean = false
 
     /**
      * 阅读状态同步管理器。
@@ -132,6 +178,9 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
         chapterTitleView = findViewById(R.id.chapterTitleView)
         pager = findViewById(R.id.chapterPager)
         scrollView = findViewById(R.id.chapterScrollView)
+        topChrome = findViewById(R.id.epubTopChrome)
+        bottomChrome = findViewById(R.id.epubBottomChrome)
+        chapterSeekBar = findViewById(R.id.chapterSeekBar)
         progressStore = ReadingProgressStore(this)
         annotationStore = AnnotationStore(this)
         uid = intent.getStringExtra(EXTRA_UID)?.trim()?.takeIf { it.isNotEmpty() }
@@ -139,8 +188,19 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
         clearLegacyOnce()
 
         findViewById<Button>(R.id.prevChapterButton).setOnClickListener { moveBy(-1) }
+        // 目录（B2c）：与既有按钮并列绑定；浮层隐藏时按钮不可见，自然无法点击，无需额外处理
+        findViewById<Button>(R.id.tocButton).setOnClickListener { showToc() }
         findViewById<Button>(R.id.nextChapterButton).setOnClickListener { moveBy(1) }
         findViewById<Button>(R.id.annotateButton).setOnClickListener { addAnnotationFromSelection() }
+        setupSeekBar()
+        // 标题可点：输入章号直接跳章（章节数极大时比拖 SeekBar 更精确）
+        chapterTitleView.isClickable = true
+        chapterTitleView.setOnClickListener { showJumpToChapterDialog() }
+
+        // 点击手势（切换浮层显隐）：两种翻页模式的容器都挂一份监听。
+        installTapPaging()
+        // 浮层高度 → 阅读区 padding（首次布局后执行一次，正文不再被浮层遮挡）
+        applyChromePaddingOnFirstLayout()
 
         // 横向模式才需要 pager 的回调；竖向模式下 pager 不可见，回调不会触发。
         if (pageMode == ReaderPageMode.HORIZONTAL) {
@@ -177,6 +237,11 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
     }
 
     override fun onDestroy() {
+        // 先撤销挂起的浮层切换与布局监听（避免已销毁的 Activity 被 post 回调整活）
+        cancelPendingToggle()
+        tapHandler.removeCallbacksAndMessages(null)
+        chromeLayoutListener?.let { topChrome.removeOnLayoutChangeListener(it) }
+        chromeLayoutListener = null
         // 先停同步线程（在 super.onDestroy() 之前）。
         // 用 shutdown() 而非「立即中断」版本：后者会把队列里尚未执行的任务直接丢弃、并中断
         // 正在执行的请求；而 [onStop] 刚入队的那次进度推送是本 Activity 生命周期内
@@ -270,6 +335,8 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
             pager.setCurrentItem(startChapterIndex, false)
         }
         updateChapterTitle(startChapterIndex)
+        // 章节总数此刻才确定：显式同步一次进度条（max = count - 1，≤1 章禁用）
+        syncSeekBar(startChapterIndex)
     }
 
     /**
@@ -405,6 +472,18 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
      * **章内偏移**取中心项自身顶部已滚出视口的像素（`-centerView.top`），
      * 不得复用「首项锚点换算」（`ScrollProgressMath` 旧的 first 项路径）的 offset：
      * 那是相对 first 项的滚出量，中心项不是 first 时会错位。
+     *
+     * **中心点必须扣掉浮层 padding**：B2b 起 `scrollView` 带上下 padding（浮层高度），
+     * 子项的 `top/bottom` 以带 padding 的 View 坐标系表达，可见区是
+     * `[paddingTop, height - paddingBottom]`。直接用 `height / 2` 会比真实可见中心偏低
+     * `(paddingBottom - paddingTop) / 2`（顶部约 48dp、底部含 SeekBar 更高），
+     * 导致章切换提前发生，故改用 `paddingTop + (height - paddingTop - paddingBottom) / 2`。
+     *
+     * **章内偏移同样要扣掉 paddingTop**：`LinearLayoutManager.scrollToPositionWithOffset` 的
+     * offset 以 padding 之后的可视起点为基准（`AnchorInfo.assignCoordinateFromPadding`），
+     * 与恢复端对齐就必须让偏移表达「中心项顶部相对可视区顶部的滚出量」：
+     * `paddingTop - top`。直接用 `-top` 会把每章开头 `paddingTop` 像素（约一块浮层高）
+     * 的滚动记为 0，测量回调重锚时表现为「章加载完成后正文往上跳一小段」。
      */
     private fun reportVisibleChapter() {
         val layoutManager = scrollView.layoutManager as? LinearLayoutManager ?: return
@@ -416,11 +495,14 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
             val view = layoutManager.findViewByPosition(position) ?: return@mapNotNull null
             ItemBounds(position = position, top = view.top, bottom = view.bottom)
         }
+        // 可见区中心（相对 scrollView 顶部；padding 不改 height，故需人工扣除）
+        val viewportCenter = scrollView.paddingTop +
+            (scrollView.height - scrollView.paddingTop - scrollView.paddingBottom) / 2
         // 可视中心章；无可见项时保持原章不动
-        val chapterIndex = ScrollProgressMath.visibleCenterPosition(bounds, scrollView.height / 2)
+        val chapterIndex = ScrollProgressMath.visibleCenterPosition(bounds, viewportCenter)
             ?: return
         val centerView = layoutManager.findViewByPosition(chapterIndex) ?: return
-        val scrollY = (-centerView.top).coerceAtLeast(0)
+        val scrollY = (scrollView.paddingTop - centerView.top).coerceAtLeast(0)
 
         if (chapterIndex == visibleChapterIndex && scrollY == visibleChapterScrollY) return
         visibleChapterIndex = chapterIndex
@@ -448,12 +530,243 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
         }
     }
 
+    // ---- 点击手势与浮层显隐 ----
+
+    /**
+     * 点击手势检测器（单击中央区域 → 延迟切换浮层）。
+     *
+     * 只关心 `onSingleTapUp` / `onDoubleTap`：滑动、长按、多指都不在这里处理，交给容器自身
+     * （`ViewPager2` 的翻页滑动、`RecyclerView` 的竖向滚动、WebView 的文本选择）。
+     *
+     * **为什么要延迟 250ms**：两个 WebView（[ChapterFragment] / [ChapterScrollAdapter]）都开了
+     * `builtInZoomControls = true`，双击缩放时 `GestureDetector` 会先回调 `onSingleTapUp`
+     * （双指/双击的**第一击 UP** 也是一次完整单击）再回调 `onDoubleTap`。若在 `onSingleTapUp` 里
+     * 立即 `toggleChrome()`，每次双击缩放都会连带把浮层藏起来。故把切换投递到 250ms 之后
+     * （约等于系统 `ViewConfiguration.getDoubleTapTimeout()` 的常用窗口），并在 `onDoubleTap`
+     * 里撤销挂起的切换——只有「确实没有第二击」的单击才会真正切换。
+     *
+     * **为什么只在中央区域切换**：与 PDF 侧 `PdfReaderActivity.handleTap` 的 30%/70% 口径一致，
+     * 左右边缘留给「上一页/下一页」（EPUB 侧的按钮翻页将来可平移到边缘点击，届时无需再改手势层），
+     * 避免用户点边缘想翻页却把工具栏藏了。竖向模式同样按横向坐标判定（左右边缘不切换）。
+     *
+     * 返回值语义保持不变：中央区域返回 `true`（与延迟前一致）、边缘返回 `false`
+     * （不消费事件，交给容器/WebView 处理）。
+     */
+    private val tapDetector by lazy {
+        GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+            override fun onSingleTapUp(e: MotionEvent): Boolean {
+                val width = tapViewWidth
+                // 宽度未知（尚未布局）时不分区，一律按中央处理
+                if (width > 0 && (e.x <= width * TAP_EDGE_RATIO || e.x >= width * (1f - TAP_EDGE_RATIO))) {
+                    return false
+                }
+                scheduleToggle()
+                return true
+            }
+
+            override fun onDoubleTap(e: MotionEvent): Boolean {
+                // 双击：撤销第一击挂起的切换；返回 false 让 WebView 自己做缩放
+                cancelPendingToggle()
+                return false
+            }
+        })
+    }
+
+    /** 排入一次 250ms 后的浮层切换（重复单击只保留最后一次）。 */
+    private fun scheduleToggle() {
+        cancelPendingToggle()
+        val runnable = Runnable {
+            pendingToggle = null
+            toggleChrome()
+        }
+        pendingToggle = runnable
+        tapHandler.postDelayed(runnable, TAP_TOGGLE_DELAY_MS)
+    }
+
+    /** 撤销尚未执行的浮层切换（双击/销毁时调用）。 */
+    private fun cancelPendingToggle() {
+        pendingToggle?.let { tapHandler.removeCallbacks(it) }
+        pendingToggle = null
+    }
+
+    /**
+     * 把两块浮层的实时高度写入阅读区 padding（只执行一次）。
+     *
+     * **为什么要用运行时高度**：浮层高度不是固定值——标题单/双行、字号放大（`textZoom`）、
+     * 按钮文案换行、系统字体缩放、`WindowInsets`（状态栏/导航栏）都会改变它。硬编码 48dp/60dp
+     * 在字体放大时必然失准，仍会遮住末几行。
+     *
+     * **为什么监听在 [topChrome] 而不是两块都监听**：两块浮层同属一个 `FrameLayout`、同一次布局
+     * 遍历中被测量，监听一块即可触发；真正读高度前用 `post` 挪到遍历结束后，保证 [bottomChrome]
+     * 的 `height` 也已就绪（`onLayoutChange` 回调时序上底部浮层可能尚未测量）。
+     *
+     * **为什么用布尔标记而不是每次布局都重设**：阅读时滚动、键盘弹出都会反复触发布局，
+     * 反复写 padding 会打断滚动锚点（`RecyclerView` 会在 padding 变化后重新布局）。
+     */
+    private fun applyChromePaddingOnFirstLayout() {
+        if (chromePaddingApplied) return
+        val listener = object : View.OnLayoutChangeListener {
+            override fun onLayoutChange(
+                v: View,
+                left: Int,
+                top: Int,
+                right: Int,
+                bottom: Int,
+                oldLeft: Int,
+                oldTop: Int,
+                oldRight: Int,
+                oldBottom: Int,
+            ) {
+                // post：等本轮布局遍历结束（底部浮层高度可用）后再读
+                v.post { applyChromePadding() }
+            }
+        }
+        chromeLayoutListener = listener
+        topChrome.addOnLayoutChangeListener(listener)
+    }
+
+    /**
+     * 读两块浮层高度并写入阅读区 padding。
+     *
+     * 以下两种情况**不置位**直接 `return`，保留布局监听、等下一次布局回调重试：
+     * 1. 任一侧浮层高度为 0（尚未测量/被隐藏）；
+     * 2. 横向模式下取不到 `ViewPager2` 内部 `RecyclerView`（见 [horizontalContent]）——
+     *    一次性写入若在容器就绪前置位，会让横向正文**永久**缺 padding。
+     *
+     * 竖向模式下 [scrollView] 始终存在，故内部 `RecyclerView` 有无都不影响置位。
+     * 重试由 [chromePaddingApplied] 闸控，不会重复写入；重试路径不打日志（避免每帧刷屏）。
+     */
+    private fun applyChromePadding() {
+        if (chromePaddingApplied) return
+        val top = topChrome.height
+        val bottom = bottomChrome.height
+        // 浮层隐藏/尚未布局时高度为 0：不写 0 padding（否则「只设置一次」会永久锁死 0）
+        if (top <= 0 || bottom <= 0) return
+
+        val content = horizontalContent()
+        // 横向模式必须先拿到真实内容容器；竖向模式无此依赖（横向容器为空属正常）
+        if (pageMode == ReaderPageMode.HORIZONTAL && content == null) return
+        content?.let {
+            it.setPadding(0, top, 0, bottom)
+            // 必须开：否则正文被裁在 padding 内，而不是延伸到半透明浮层下方
+            it.clipToPadding = false
+        }
+        scrollView.setPadding(0, top, 0, bottom)
+        scrollView.clipToPadding = false
+
+        chromePaddingApplied = true
+        chromeLayoutListener?.let { topChrome.removeOnLayoutChangeListener(it) }
+        chromeLayoutListener = null
+    }
+
+    /**
+     * 横向模式的真实内容容器（`ViewPager2` 内部的 `RecyclerView`）。
+     *
+     * `ViewPager2`（1.1.0）既未重写 `setPadding` 也未转发 `clipToPadding`：直接给它设 padding
+     * 只会让内部 `RecyclerView` 变小（正文虽不被遮挡，但也不会延伸到浮层下方）。
+     * 故把 padding 下到内部 `RecyclerView`；取不到时返回 `null`（此时横向模式保持原样，
+     * 与 tap 监听取不到内部 `RecyclerView` 时的降级策略一致）。
+     */
+    private fun horizontalContent(): RecyclerView? = pager.getChildAt(0) as? RecyclerView
+
+    /** 横向模式 tap 监听是否已挂到 ViewPager2 内部 `RecyclerView` 上（只挂一次）。 */
+    private var pagerTapInstalled: Boolean = false
+
+    /** 「取不到内部 `RecyclerView`」的 warn 日志是否已打过（只在首次失败时打，避免每次布局刷屏）。 */
+    private var pagerTapWarned: Boolean = false
+
+    /**
+     * 安装 tap 手势（两种翻页模式都生效）。
+     *
+     * - 竖向模式：直接挂在 [scrollView]（外层 `RecyclerView`）上；
+     * - 横向模式：`ViewPager2` 内部就是一个 `RecyclerView`，取 `getChildAt(0)` 挂同一个监听。
+     *
+     * **不消费触摸事件**：[onInterceptTouchEvent] 恒返回 `false`，仅把事件喂给
+     * [tapDetector]——一旦返回 `true` 就会吞掉滑动，破坏 `ViewPager2` 的翻页与
+     * `RecyclerView` 的滚动。
+     *
+     * 时序说明：`ViewPager2` 在构造时就已把内部 `RecyclerView` 加为子 View，通常
+     * `onCreate` 里就能取到；为防不同版本/自定义封装带来的差异，取不到时再挂一个
+     * **一次性** `OnLayoutChangeListener`，在首次布局后重试。
+     *
+     * **已知限制**：横向 tap 依赖 `ViewPager2` 内部 `RecyclerView`，若始终取不到
+     * （内部实现变更/子 View 布局不同），则横向模式 tap 不可用——仅记 warn 日志，
+     * 不崩溃，翻页与竖向 tap 不受影响。
+     */
+    private fun installTapPaging() {
+        val listener = object : RecyclerView.SimpleOnItemTouchListener() {
+            override fun onInterceptTouchEvent(rv: RecyclerView, e: MotionEvent): Boolean {
+                // 记录容器宽度：onSingleTapUp 里的 e.x 是相对该容器的坐标
+                tapViewWidth = rv.width
+                tapDetector.onTouchEvent(e)
+                return false
+            }
+        }
+        // 竖向模式：外层 RecyclerView
+        scrollView.addOnItemTouchListener(listener)
+        // 横向模式：ViewPager2 内部 RecyclerView（取不到则等首次布局重试一次）
+        if (!installPagerTap(listener)) {
+            pager.addOnLayoutChangeListener(object : View.OnLayoutChangeListener {
+                override fun onLayoutChange(
+                    v: View,
+                    left: Int,
+                    top: Int,
+                    right: Int,
+                    bottom: Int,
+                    oldLeft: Int,
+                    oldTop: Int,
+                    oldRight: Int,
+                    oldBottom: Int,
+                ) {
+                    if (installPagerTap(listener)) pager.removeOnLayoutChangeListener(this)
+                }
+            })
+        }
+    }
+
+    /**
+     * 尝试把 tap 监听挂到 `ViewPager2` 内部 `RecyclerView` 上。
+     *
+     * @return 已挂载（含此前已挂过）返回 `true`；取不到内部 `RecyclerView` 返回 `false`。
+     */
+    private fun installPagerTap(listener: RecyclerView.OnItemTouchListener): Boolean {
+        if (pagerTapInstalled) return true
+        val inner = pager.getChildAt(0) as? RecyclerView
+        if (inner == null) {
+            // 只在首次失败时告警：该方法由每次布局回调重试，反复 Log.w 会刷屏
+            if (!pagerTapWarned) {
+                pagerTapWarned = true
+                Log.w(TAG, "未取到 ViewPager2 内部 RecyclerView，横向模式 tap 暂不可用")
+            }
+            return false
+        }
+        inner.addOnItemTouchListener(listener)
+        pagerTapInstalled = true
+        return true
+    }
+
+    /**
+     * 切换浮层工具栏显隐。
+     *
+     * **为什么顶部与底部同步显隐**：它们共同构成「工具栏」这一个整体语义——用户点中央是为了
+     * 要么「专心读书」（两者都藏）、要么「操作/查看章节信息」（两者都要用，如看标题再点下一章）。
+     * 分开显隐会产生「只剩标题没按钮」或「只剩按钮不知在第几章」的半残状态，因此必须同进同退。
+     *
+     * 显隐状态**不持久化**（与 PDF 阅读器一致）：每次进入阅读器都是默认可见。
+     */
+    private fun toggleChrome() {
+        // 两者始终同步，故任取其一判断当前状态即可。
+        val target = if (topChrome.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+        topChrome.visibility = target
+        bottomChrome.visibility = target
+    }
+
     // ---- 导航与标题 ----
 
     private fun moveBy(delta: Int) {
         val count = chapterCount()
         if (count == 0) return
-        val current = if (pageMode == ReaderPageMode.VERTICAL) visibleChapterIndex else pager.currentItem
+        val current = currentChapterIndex()
         val target = (current + delta).coerceIn(0, count - 1)
         if (target == current) return
         if (pageMode == ReaderPageMode.VERTICAL) {
@@ -462,6 +775,16 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
             pager.setCurrentItem(target, true)
         }
     }
+
+    /**
+     * 当前章序号（两种模式各取自己的事实来源）。
+     *
+     * 竖向连续滚动下 `pager` 不可见、`currentItem` 恒为恢复起点，只有 [visibleChapterIndex] 反映
+     * 读者真实所在；横向翻页反之（`visibleChapterIndex` 不更新）。[moveBy] 与 [showToc] 共用这一处
+     * 口径，避免两处各写一遍三元判断而走偏。
+     */
+    private fun currentChapterIndex(): Int =
+        if (pageMode == ReaderPageMode.VERTICAL) visibleChapterIndex else pager.currentItem
 
     private fun updateChapterTitle(index: Int) {
         val chapters = book?.chapters ?: return
@@ -472,6 +795,167 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
             chapters.size,
             chapter.title,
         )
+        // 标题更新即「当前章变化」的唯一汇聚点（pager 选中 / 竖向滚动上报 / 首次装配），
+        // 故进度条同步放在这里，三种模式共用一条路径。
+        syncSeekBar(index)
+    }
+
+    /**
+     * 装配章节进度条的监听。
+     *
+     * **只在松手时跳章**：拖动过程中 `onProgressChanged` 恒不动作（不预览标题、不跳转）——
+     * 拖过 300 章会连续触发上百次跳转，横向模式下即上百次 `setCurrentItem`，而
+     * `ViewPager2` 只认最后一次，前 99 次都是白做的布局与 Fragment 创建。
+     */
+    private fun setupSeekBar() {
+        chapterSeekBar.max = 0
+        chapterSeekBar.progress = 0
+        chapterSeekBar.isEnabled = false
+        chapterSeekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                // 拖动中什么都不做（保持简单）；程序化 setProgress 的 fromUser = false 也在此被忽略，
+                // 是防回环的第一道闸（第二道是 isSyncingSeekBar，见 onStopTrackingTouch）。
+            }
+
+            override fun onStartTrackingTouch(seekBar: SeekBar?) {
+                isTrackingSeekBar = true
+            }
+
+            override fun onStopTrackingTouch(seekBar: SeekBar?) {
+                isTrackingSeekBar = false
+                // 防回环：程序化 setProgress 不会走到这里（它不产生 tracking），
+                // 但仍用闸门兜住「同步期间被外部拖动」的极端时序。
+                if (isSyncingSeekBar) return
+                jumpToChapter(ChapterSeekMath.indexOf(seekBar?.progress ?: 0, chapterCount()))
+            }
+        })
+    }
+
+    /**
+     * 把当前章同步到进度条（程序化写入，**不得**触发跳章）。
+     *
+     * 回环防护用布尔闸门 [isSyncingSeekBar] 而非 `SeekBar.isPressed` / `isTracking`：
+     * - `setProgress` 触发的是 `onProgressChanged(fromUser = false)`，本身不进 `onStopTrackingTouch`；
+     * - 但 `jumpToChapter` → 容器滚动 → `reportVisibleChapter` → `updateChapterTitle` →
+     *   `syncSeekBar` 是**同一个调用栈内**的同步链，一旦将来有人在 `onProgressChanged` 里
+     *   加了动作就会立刻打环。布尔闸门把这个窗口显式圈出来，代价是两个赋值。
+     *
+     * 拖动期间（[isTrackingSeekBar]）不覆盖用户手指的位置，避免「手指还在拖，进度被滚动上报拉回」。
+     */
+    private fun syncSeekBar(chapterIndex: Int) {
+        if (!::chapterSeekBar.isInitialized) return
+        if (isTrackingSeekBar) return
+        val count = chapterCount()
+        isSyncingSeekBar = true
+        try {
+            chapterSeekBar.max = ChapterSeekMath.maxFor(count)
+            chapterSeekBar.progress = ChapterSeekMath.progressOf(chapterIndex, count)
+            // 0 章 / 1 章无处可跳，禁用后视觉上也不会诱导拖动
+            chapterSeekBar.isEnabled = count > 1
+        } finally {
+            isSyncingSeekBar = false
+        }
+    }
+
+    /**
+     * 跳章（绝对定位，复用两种模式各自的既有一次性定位 API）。
+     *
+     * - 横向：`pager.setCurrentItem(target, false)` 立即生效（无动画，与恢复进度一致）；
+     * - 竖向：`scrollToPositionWithOffset(target, 0)`，章内偏移归 0（跳章语义是「到该章开头」）。
+     *
+     * **为什么不手写 [visibleChapterIndex] / [scrollByChapter]**：竖向跳章后的状态更新走
+     * `onScrolled` → [reportVisibleChapter] 这条既有链路（并由 [onChapterMeasured] 的重锚保持位置）。
+     * 但 `scrollToPositionWithOffset` 是**布局型**跳转（RecyclerView 只在真实滚动时派发
+     * `onScrolled`），故用 `doOnNextLayout` 在跳转后的首次布局结束时补一次
+     * [reportVisibleChapter]——仍是既有链路，只是显式触发。手写两处状态会让「跳章」被误记为
+     * 「读过该章某偏移」，与既有不变量冲突。
+     */
+    private fun jumpToChapter(index: Int) {
+        val count = chapterCount()
+        if (count == 0) return
+        val target = index.coerceIn(0, count - 1)
+        if (pageMode == ReaderPageMode.VERTICAL) {
+            (scrollView.layoutManager as? LinearLayoutManager)?.scrollToPositionWithOffset(target, 0)
+            // 布局型跳转不派发 onScrolled → reportVisibleChapter 不会被自动调用；
+            // 下一次布局完成后主动走一次既有链路（不手写 visibleChapterIndex / scrollByChapter）
+            scrollView.doOnNextLayout { reportVisibleChapter() }
+        } else {
+            pager.setCurrentItem(target, false)
+        }
+    }
+
+    /**
+     * 点击标题 → 输入章号跳章。
+     *
+     * 用 `AlertDialog` + 数字键盘 `EditText`（与批注对话框同一套写法）；输入为 **1-based**，
+     * 换算与夹紧全部交给 [ChapterSeekMath.indexFromUserInput]（纯逻辑，已有单测覆盖）。
+     * 非法输入（空白/非数字/≤0）只提示不跳转，弹窗保持已关闭——重开一次比在对话框里
+     * 校验后再报错更简单，且输入法遮挡影响更小。
+     */
+    private fun showJumpToChapterDialog() {
+        val count = chapterCount()
+        if (count == 0) return
+        val input = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER
+            hint = getString(R.string.reader_jump_chapter_hint, count)
+        }
+        val container = FrameLayout(this).apply {
+            setPadding(48, 32, 48, 0)
+            addView(
+                input,
+                FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                ),
+            )
+        }
+        AlertDialog.Builder(this)
+            .setTitle(R.string.reader_jump_to_chapter)
+            .setView(container)
+            .setPositiveButton(android.R.string.ok) { _, _ ->
+                val target = ChapterSeekMath.indexFromUserInput(input.text.toString(), count)
+                if (target == null) {
+                    Toast.makeText(this, R.string.reader_jump_invalid, Toast.LENGTH_SHORT).show()
+                } else {
+                    jumpToChapter(target)
+                }
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    /**
+     * 点击「目录」→ 章节目录对话框（**当前章高亮**）。
+     *
+     * 用 `setSingleChoiceItems` 的 `checkedItem` 表达「当前在读」：默认单选样式自带选中态，
+     * 不自定义 Adapter、不改主题；数百章的滚动与行复用交给 `AlertDialog` 自带的 `ListView`。
+     * 当前章与 [moveBy] 同一口径（[currentChapterIndex]），再经 [ChapterSeekMath.progressOf]
+     * 夹紧到 `[0, size-1]`——`checkedItem` 越界会导致「高亮不到任何项」。
+     *
+     * 点击后**先** `dismiss` **再**跳章：对话框窗口会盖住跳转后的首帧，读者看不到落到了哪一章。
+     */
+    private fun showToc() {
+        val chapters = book?.chapters.orEmpty()
+        if (chapters.isEmpty()) {
+            Toast.makeText(this, R.string.reader_toc_empty, Toast.LENGTH_SHORT).show()
+            return
+        }
+        val items = TocItemText
+            .labels(chapters, getString(R.string.reader_chapter_untitled))
+            .toTypedArray()
+        val checked = ChapterSeekMath.progressOf(currentChapterIndex(), chapters.size)
+        val dialog = AlertDialog.Builder(this)
+            .setTitle(R.string.reader_toc)
+            .setSingleChoiceItems(items, checked) { dialogInterface, which ->
+                dialogInterface.dismiss()
+                jumpToChapter(which)
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .create()
+        // `setSingleChoiceItems` 只标记选中项、**不会**自动滚动到它：数百章时当前项常在屏幕外。
+        // `listView` 由 Builder 在 `create()` 时注入，故在 onShow 里定位（此时列表已可滚动）。
+        dialog.setOnShowListener { dialog.listView?.setSelection(checked) }
+        dialog.show()
     }
 
     // ---- 进度 ----
@@ -614,6 +1098,12 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
 
         /** Intent 中携带服务端 uid 的键（可选；为空则退回内容哈希键）。 */
         const val EXTRA_UID = "extra_reader_uid"
+
+        /** 单击「非切换区」的宽度比例：左侧 30% 与右侧 30% 不切换浮层（与 PDF 侧口径一致）。 */
+        private const val TAP_EDGE_RATIO = 0.3f
+
+        /** 单击 → 切换浮层的延迟（毫秒）：跨过双击判定窗口，避免双击缩放第一击触发切换。 */
+        private const val TAP_TOGGLE_DELAY_MS = 250L
 
         /** 以本地文件路径打开（示例 epub 用）。[uid] 非空时写入 [EXTRA_UID]。 */
         fun intentForFile(context: Context, file: File, uid: String? = null): Intent =

@@ -9,7 +9,7 @@
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
 
-    <!-- 底部浮层工具栏：叠加在内容之上，横屏也不挤占阅读区 -->
+    <!-- 底部浮层工具栏：叠加在内容之上，横屏也不挤占阅读区（B2d：纵向两行 = 进度条行 + 按钮行） -->
     <LinearLayout
         android:id="@+id/pdfChrome"
         android:layout_width="match_parent"
@@ -17,68 +17,98 @@
         android:layout_gravity="bottom"
         android:background="#CC000000"
         android:gravity="center_vertical"
-        android:orientation="horizontal"
+        android:orientation="vertical"
         android:padding="6dp">
 
-        <Button
-            android:id="@+id/pdfPrevPageButton"
-            style="?android:attr/borderlessButtonStyle"
-            android:layout_width="wrap_content"
+        <!-- 第一行（B2d）：页进度条 + 页码（页码可点，输入页号直接跳页） -->
+        <LinearLayout
+            android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:textColor="#FFFFFF"
-            android:visibility="gone"
-            android:text="@string/pdf_prev_page" />
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
 
-        <TextView
-            android:id="@+id/pdfPageIndicator"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:textColor="#FFFFFF"
-            android:text="@string/pdf_page_indicator_placeholder" />
+            <SeekBar
+                android:id="@+id/pdfPageSeekBar"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:max="0"
+                android:paddingHorizontal="8dp"
+                android:progress="0" />
 
-        <Button
-            android:id="@+id/pdfNextPageButton"
-            style="?android:attr/borderlessButtonStyle"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:textColor="#FFFFFF"
-            android:visibility="gone"
-            android:text="@string/pdf_next_page" />
+            <TextView
+                android:id="@+id/pdfPageIndicator"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:background="?attr/selectableItemBackground"
+                android:clickable="true"
+                android:focusable="true"
+                android:gravity="center"
+                android:minHeight="48dp"
+                android:paddingHorizontal="8dp"
+                android:textColor="#FFFFFF"
+                android:text="@string/pdf_page_indicator_placeholder" />
+        </LinearLayout>
 
-        <Button
-            android:id="@+id/pdfInkToggleButton"
-            style="?android:attr/borderlessButtonStyle"
-            android:layout_width="wrap_content"
+        <!-- 第二行：原有按钮，顺序与属性保持不变（页码已上移至第一行） -->
+        <LinearLayout
+            android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:textColor="#FFFFFF"
-            android:text="@string/pdf_ink_toggle" />
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
 
-        <Button
-            android:id="@+id/pdfInkUndoButton"
-            style="?android:attr/borderlessButtonStyle"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:textColor="#FFFFFF"
-            android:visibility="gone"
-            android:text="@string/pdf_ink_undo" />
+            <Button
+                android:id="@+id/pdfPrevPageButton"
+                style="?android:attr/borderlessButtonStyle"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textColor="#FFFFFF"
+                android:visibility="gone"
+                android:text="@string/pdf_prev_page" />
 
-        <Button
-            android:id="@+id/pdfInkClearButton"
-            style="?android:attr/borderlessButtonStyle"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:textColor="#FFFFFF"
-            android:visibility="gone"
-            android:text="@string/pdf_ink_clear" />
+            <Button
+                android:id="@+id/pdfNextPageButton"
+                style="?android:attr/borderlessButtonStyle"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textColor="#FFFFFF"
+                android:visibility="gone"
+                android:text="@string/pdf_next_page" />
 
-        <Button
-            android:id="@+id/pdfAddAnnotation"
-            style="?android:attr/borderlessButtonStyle"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:textColor="#FFFFFF"
-            android:text="@string/pdf_add_annotation" />
+            <Button
+                android:id="@+id/pdfInkToggleButton"
+                style="?android:attr/borderlessButtonStyle"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textColor="#FFFFFF"
+                android:text="@string/pdf_ink_toggle" />
+
+            <Button
+                android:id="@+id/pdfInkUndoButton"
+                style="?android:attr/borderlessButtonStyle"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textColor="#FFFFFF"
+                android:visibility="gone"
+                android:text="@string/pdf_ink_undo" />
+
+            <Button
+                android:id="@+id/pdfInkClearButton"
+                style="?android:attr/borderlessButtonStyle"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textColor="#FFFFFF"
+                android:visibility="gone"
+                android:text="@string/pdf_ink_clear" />
+
+            <Button
+                android:id="@+id/pdfAddAnnotation"
+                style="?android:attr/borderlessButtonStyle"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textColor="#FFFFFF"
+                android:text="@string/pdf_add_annotation" />
+        </LinearLayout>
     </LinearLayout>
 
 </FrameLayout>

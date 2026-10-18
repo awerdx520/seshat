@@ -6,19 +6,26 @@ import android.graphics.pdf.PdfRenderer
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelFileDescriptor
+import android.text.InputType
 import android.util.Log
 import android.view.GestureDetector
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewGroup
 import android.widget.Button
 import android.widget.EditText
+import android.widget.FrameLayout
+import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.doOnNextLayout
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.PagerSnapHelper
 import androidx.recyclerview.widget.RecyclerView
@@ -42,7 +49,9 @@ import java.util.concurrent.Executors
  *
  * 渲染方案：使用 Android 系统内置的 [PdfRenderer]（API 21+，无需第三方 JNI 库），
  * 逐页渲染为 Bitmap，交由 [PdfPageAdapter] 在 [RecyclerView] 中显示，
- * 底部 [TextView] 显示「当前页 / 总页数」。
+ * 底部 [SeekBar] + [TextView] 显示「当前页 / 总页数」（B2d：进度条拖动松手跳页，页码可点输入跳页）。
+ * 阅读区（[RecyclerView]）底部按浮层实时高度预留 padding 且 `clipToPadding = false`（B2e），
+ * 故页尾内容不会被叠加在下方的浮层遮挡。
  *
  * 翻页模式由 [AppPreferences.pageMode] 决定，**只在打开阅读器时生效**：
  * - [ReaderPageMode.HORIZONTAL]：线性横向 + [PagerSnapHelper]，整页吸附横滑；
@@ -62,6 +71,18 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
 
     private lateinit var recycler: RecyclerView
     private lateinit var pageIndicator: TextView
+
+    /**
+     * 主线程 `Handler`：仅用于 tap 回调的 `post` 与撤销。
+     *
+     * 不用 `recycler.post` 的原因：`View` 只有 `removeCallbacks(runnable)`，无法一次性撤销全部
+     * 挂起回调；这里与 EPUB 侧（`EpubReaderActivity.tapHandler`）保持同一策略，
+     * [onDestroy] 里 `removeCallbacksAndMessages(null)` 即可清空，避免已销毁的 Activity 被唤醒。
+     */
+    private val tapHandler = Handler(Looper.getMainLooper())
+
+    /** 页码进度条（B2d）：拖动松手才跳页，程序化同步由 [isSyncingSeekBar] 加闸。 */
+    private lateinit var pageSeekBar: SeekBar
 
     private lateinit var layoutManager: LinearLayoutManager
     private lateinit var pageMode: ReaderPageMode
@@ -106,6 +127,15 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
     /** 上次已上报的页（避免滚动过程中重复写进度、重复刷新指示器）。 */
     private var lastReportedPage: Int = -1
 
+    /**
+     * 程序化写 `pageSeekBar.progress` 期间为 `true`：拦截由此产生的回调，防「跳页 → 滚动上报 →
+     * 同步进度条 → 再跳页」的回环（第一道闸，见 [setupSeekBar] 的说明）。
+     */
+    private var isSyncingSeekBar: Boolean = false
+
+    /** 用户手指正按在进度条上：此期间不覆盖其位置（否则拖动被滚动上报拉回）。 */
+    private var isTrackingSeekBar: Boolean = false
+
     private lateinit var progressStore: PdfProgressStore
     private lateinit var annotationStore: PdfAnnotationStore
     private lateinit var inkStore: PdfInkStore
@@ -120,6 +150,12 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
     /** 手写模式开关（旋转经 savedInstanceState 恢复）。 */
     private var inkEnabled: Boolean = false
 
+    /** 已写入阅读区 padding 的浮层高度（像素）；0 表示尚未写入，见 [applyChromePadding]。 */
+    private var appliedChromeBottom: Int = 0
+
+    /** 浮层布局监听（只挂一次，见 [applyChromePaddingOnFirstLayout]）。 */
+    private var chromeLayoutListener: View.OnLayoutChangeListener? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_pdf_reader)
@@ -127,6 +163,7 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
         // 先绑定视图，保证后续任何提前 finish 时 onDestroy 访问安全。
         recycler = findViewById(R.id.pdfPager)
         pageIndicator = findViewById(R.id.pdfPageIndicator)
+        pageSeekBar = findViewById(R.id.pdfPageSeekBar)
         chrome = findViewById(R.id.pdfChrome)
         inkToggleButton = findViewById(R.id.pdfInkToggleButton)
         inkUndoButton = findViewById(R.id.pdfInkUndoButton)
@@ -143,8 +180,15 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
                 view.paddingRight,
                 bars.bottom + (INITIAL_CHROME_PADDING_DP * resources.displayMetrics.density).toInt(),
             )
+            // 系统栏变化会改浮层高度（见上方 insets 说明）：同步一次阅读区 padding，
+            // 否则页尾仍会按旧高度被遮挡（B2e）。
+            view.post { applyChromePadding() }
             insets
         }
+
+        // 阅读区底部 padding 自适应浮层高度（B2e）：浮层是叠在 RecyclerView 之上的，
+        // 不预留 padding 时页尾内容会被压住。
+        applyChromePaddingOnFirstLayout()
 
         // 手写开关跨旋转恢复：否则转屏后手写层会静默关闭。
         inkEnabled = savedInstanceState?.getBoolean(STATE_INK_ENABLED) ?: false
@@ -187,6 +231,9 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
         inkClearButton.setOnClickListener { clearInk() }
         prevPageButton.setOnClickListener { movePage(-1) }
         nextPageButton.setOnClickListener { movePage(1) }
+        // 页码可点：输入页号直接跳页（B2d），与 EPUB 侧「点标题跳章」同一套交互。
+        pageIndicator.setOnClickListener { showJumpToPageDialog() }
+        setupSeekBar()
 
         val pdf = openRenderer(uri)
         if (pdf == null) {
@@ -196,6 +243,9 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
         }
         renderer = pdf
         lastPage = (pdf.pageCount - 1).coerceAtLeast(0)
+        // 进度条上限 = 最大页索引；单页 PDF 无处可跳，禁用后视觉上不诱导拖动。
+        pageSeekBar.max = lastPage
+        pageSeekBar.isEnabled = lastPage > 0
 
         // 模式在打开阅读器时读取一次（设置页改动下次生效）。
         pageMode = AppPreferences.open(this).pageMode()
@@ -359,6 +409,9 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
 
         // 先解绑，避免销毁过程中仍有新的绑定提交渲染任务。
         if (::recycler.isInitialized) {
+            // 撤销挂起的 tap 回调（onSingleTapUp 经 tapHandler.post 排入），
+            // 避免已销毁的 Activity 被回调唤醒
+            tapHandler.removeCallbacksAndMessages(null)
             recycler.clearOnScrollListeners()
             recycler.adapter = null
         }
@@ -467,6 +520,64 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
     private fun updateIndicator(position: Int) {
         val total = renderer?.pageCount ?: 0
         pageIndicator.text = getString(R.string.pdf_page_indicator, position + 1, total)
+        // 页码文本是「当前页变化」的唯一汇聚点（滚动上报 / 恢复进度 / 跳页），
+        // 故进度条同步只挂在这一处，三种路径共用一条。
+        syncSeekBar(position)
+    }
+
+    /**
+     * 装配页码进度条的监听（B2d）。
+     *
+     * **只在松手时跳页**：`onProgressChanged` 恒不动作（不滚动、不改页码）——拖过 300 页会连续
+     * 触发上百次 `scrollToPosition`，每次都是一次整页布局，只有最后一次有意义；且若在其中回写
+     * 页码文本，会与「滚动上报 → [syncSeekBar]」形成回环。
+     */
+    private fun setupSeekBar() {
+        pageSeekBar.max = 0
+        pageSeekBar.progress = 0
+        pageSeekBar.isEnabled = false
+        pageSeekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                // 恒不动作：拖动中不跳页；程序化 setProgress（fromUser = false）也在此被忽略，
+                // 这是防回环的第一道闸（第二道是 [isSyncingSeekBar]，见 onStopTrackingTouch）。
+            }
+
+            override fun onStartTrackingTouch(seekBar: SeekBar?) {
+                isTrackingSeekBar = true
+            }
+
+            override fun onStopTrackingTouch(seekBar: SeekBar?) {
+                isTrackingSeekBar = false
+                // 防回环：程序化 setProgress 不产生 tracking，本不会走到这里；
+                // 仍用闸门兜住「同步期间被外部拖动」的极端时序。
+                if (isSyncingSeekBar) return
+                jumpToPage(ChapterSeekMath.indexOf(seekBar?.progress ?: 0, lastPage + 1))
+            }
+        })
+    }
+
+    /**
+     * 把当前页同步到进度条（程序化写入，**不得**触发跳页）。
+     *
+     * 回环防护用布尔闸门 [isSyncingSeekBar] 而非 `SeekBar.isPressed`：`setProgress` 只触发
+     * `onProgressChanged(fromUser = false)`，但「跳页 → 滚动 → [updateCurrentPage] →
+     * [updateIndicator] → [syncSeekBar]」是同一调用栈内的同步链，闸门把这个窗口显式圈出来。
+     * 拖动期间（[isTrackingSeekBar]）不覆盖用户手指的位置。
+     *
+     * 夹紧复用 [ChapterSeekMath.progressOf]（与章数同构，`count = lastPage + 1`），
+     * 等价于任务要求的手写 `position.coerceIn(0, max)`。
+     */
+    private fun syncSeekBar(position: Int) {
+        if (!::pageSeekBar.isInitialized) return
+        isSyncingSeekBar = true
+        try {
+            pageSeekBar.max = lastPage
+            if (!isTrackingSeekBar) {
+                pageSeekBar.progress = ChapterSeekMath.progressOf(position, lastPage + 1)
+            }
+        } finally {
+            isSyncingSeekBar = false
+        }
     }
 
     private fun saveProgress(position: Int) {
@@ -483,6 +594,45 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
             .setPositiveButton(android.R.string.ok) { _, _ ->
                 val text = input.text?.toString()?.trim().orEmpty()
                 if (text.isNotEmpty()) addAnnotation(text)
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    /**
+     * 点击页码 → 输入页号跳页（B2d，与 EPUB 侧「点标题跳章」同一套写法）。
+     *
+     * 输入为 **1-based** 页号；换算与夹紧全部交给 [ChapterSeekMath.indexFromUserInput]
+     * （纯逻辑、已有单测）：`count` 取 `lastPage + 1`（总页数，因 [lastPage] 是最大页索引），
+     * 与 EPUB 传「章数」语义一致——超出上限夹紧到最后一页。非法输入（空白/非数字/≤0）
+     * 只提示不跳转，弹窗保持已关闭。
+     */
+    private fun showJumpToPageDialog() {
+        val pageCount = lastPage + 1
+        val input = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER
+            hint = getString(R.string.pdf_jump_page_hint, pageCount)
+        }
+        val container = FrameLayout(this).apply {
+            setPadding(48, 32, 48, 0)
+            addView(
+                input,
+                FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                ),
+            )
+        }
+        AlertDialog.Builder(this)
+            .setTitle(R.string.pdf_jump_to_page)
+            .setView(container)
+            .setPositiveButton(android.R.string.ok) { _, _ ->
+                val target = ChapterSeekMath.indexFromUserInput(input.text.toString(), pageCount)
+                if (target == null) {
+                    toast(getString(R.string.pdf_jump_invalid))
+                } else {
+                    jumpToPage(target)
+                }
             }
             .setNegativeButton(android.R.string.cancel, null)
             .show()
@@ -573,7 +723,7 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
                 if (inkEnabled) return false // 落笔优先
                 // 坐标先取值：事件对象在 post 之后可能已被系统复用。
                 val tapX = e.x
-                recycler.post { handleTap(tapX) }
+                tapHandler.post { handleTap(tapX) }
                 return true
             }
         })
@@ -605,6 +755,77 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
         val target = (current + delta).coerceIn(0, lastPage)
         if (target == current) return
         recycler.scrollToPosition(target)
+    }
+
+    /**
+     * 跳转到指定页（0-based 绝对定位，供进度条松手与页码输入复用）。
+     *
+     * 滚动方式与 [movePage] 一致（`scrollToPosition`，立即跳转、不与 PagerSnapHelper 动画竞争）；
+     * 越界夹紧到 `[0, lastPage]`，已在该页时直接返回（页码文本与进度条本已就位）。
+     *
+     * **补一次 [updateCurrentPage]**：`scrollToPosition` 是**布局型**跳转，RecyclerView 只在
+     * 可见子项范围变化时补发 `onScrolled(0, 0)`；竖向连续滚动下跳页可能不改变可见范围，
+     * 指示器与进度条就会停在旧值。与 EPUB 侧跳章同样用「下一次布局后主动走既有链路」兜住。
+     */
+    private fun jumpToPage(index: Int) {
+        val target = index.coerceIn(0, lastPage)
+        if (target == firstVisiblePage()) return
+        recycler.scrollToPosition(target)
+        recycler.doOnNextLayout { updateCurrentPage() }
+    }
+
+    /**
+     * 把浮层实时高度写入阅读区（`pdfPager`）的底部 padding（B2e）。
+     *
+     * **为什么要用运行时高度**：浮层高度不是固定值——按钮文案换行、系统字体缩放、
+     * 系统栏（导航栏/刘海）通过 [WindowInsetsCompat] 追加的底部 padding 都会改变它。
+     * 硬编码常量在字号放大或三键导航下必然失准，仍会遮住页尾。
+     *
+     * **为什么监听浮层布局而不是只在 `onCreate` 里读一次**：`onCreate` 阶段视图尚未测量，
+     * `height` 恒为 0。监听首次布局后并用 `post` 挪到本轮布局遍历结束再读，才能拿到真实高度。
+     *
+     * **为什么不移除监听（与 EPUB 侧的一次性写入不同）**：本页的浮层高度还会被 insets
+     * 回调改动（切三键/手势导航、旋转屏）——若只写一次，系统栏变高后页尾会重新被遮挡。
+     * 故监听常驻，靠 [appliedChromeBottom] 做「高度未变则不写」的幂等闸：
+     * 只有高度真的变了才重设 padding，避免常规滚动/键盘等布局反复写 padding 打断滚动锚点。
+     *
+     * **已知副作用**（见 `docs/android.md`）：`toggleChrome()` 隐藏浮层时**不**回收 padding，
+     * 故沉浸阅读时底部会留一条与浮层等高的空白；回收会引发滚动重布局抖动，取舍见技术债。
+     */
+    private fun applyChromePaddingOnFirstLayout() {
+        if (chromeLayoutListener != null) return
+        val listener = object : View.OnLayoutChangeListener {
+            override fun onLayoutChange(
+                v: View,
+                left: Int,
+                top: Int,
+                right: Int,
+                bottom: Int,
+                oldLeft: Int,
+                oldTop: Int,
+                oldRight: Int,
+                oldBottom: Int,
+            ) {
+                // post：等本轮布局遍历结束（浮层高度稳定）后再读
+                v.post { applyChromePadding() }
+            }
+        }
+        chromeLayoutListener = listener
+        chrome.addOnLayoutChangeListener(listener)
+    }
+
+    /** 读浮层高度并写入阅读区底部 padding；高度为 0 或与上次相同则跳过。 */
+    private fun applyChromePadding() {
+        if (!::recycler.isInitialized) return
+        val bottom = chrome.height
+        // 浮层尚未布局/已隐藏时高度为 0：不写 0 padding，等下一次布局
+        if (bottom <= 0) return
+        // 高度未变（常规滚动、键盘弹出等重复布局）：不再写，避免 RecyclerView 重新布点
+        if (bottom == appliedChromeBottom) return
+        appliedChromeBottom = bottom
+        recycler.setPadding(0, 0, 0, bottom)
+        // 必须开：否则内容被裁在 padding 内，而不是延伸到半透明浮层下方
+        recycler.clipToPadding = false
     }
 
     /** 切换浮层工具栏显隐。 */

@@ -20,6 +20,15 @@
     <string name="reader_no_source">未指定 epub 文件</string>
     <string name="reader_empty_file">文件为空或无法读取</string>
     <string name="reader_no_chapters">未能解析出章节</string>
+    <string name="reader_jump_to_chapter">跳转到第几章</string>
+    <string name="reader_jump_invalid">章号无效</string>
+    <string name="reader_jump_chapter_hint">章号（1-%1$d）</string>
+
+    <!-- EPUB 章节目录对话框（M10.6 B2c） -->
+    <string name="reader_toc">目录</string>
+    <string name="reader_toc_empty">本书没有目录</string>
+    <!-- 目录项标题缺失占位（不复用 reader_chapter_missing：「本章内容缺失」指正文缺失，语义不同） -->
+    <string name="reader_chapter_untitled">（无标题）</string>
 
     <!-- PDF 阅读器（M3.3） -->
     <string name="main_open_pdf">打开 PDF 阅读</string>
@@ -132,4 +141,7 @@
     <string name="pdf_ink_nothing_to_undo">没有可撤销的笔迹</string>
     <string name="pdf_prev_page">上一页</string>
     <string name="pdf_next_page">下一页</string>
+    <string name="pdf_jump_to_page">跳转到第几页</string>
+    <string name="pdf_jump_invalid">页码无效</string>
+    <string name="pdf_jump_page_hint">页码（1-%1$d）</string>
 </resources>
