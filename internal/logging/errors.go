@@ -19,6 +19,24 @@ const (
 	ErrNotFound        Code = "not_found"
 	ErrConflict        Code = "conflict"
 	ErrInternal        Code = "internal"
+
+	// ErrInvalidUID 表示 uid 形态非法（非 26 位 Crockford Base32），对外映射为 400。
+	ErrInvalidUID Code = "invalid_uid"
+	// ErrUnknownUID 表示 uid 形态合法但未登记或已墓碑，对外映射为 404。
+	// 与 ErrNotFound 分开：客户端据此区分「参数写错」与「服务端确实没有该资源」，
+	// 从而判断该重建本地缓存还是修参数。
+	ErrUnknownUID Code = "unknown_uid"
+
+	// ErrETagMismatch 表示条件写的前提不成立（If-Match 的 ETag 与当前内容不符，
+	// 或 If-None-Match: * 命中已存在的资源），对外映射为 412。内容未被修改。
+	ErrETagMismatch Code = "etag_mismatch"
+	// ErrRootReadOnly 表示目标根不接受写操作（书库根按需读取、不进 git），
+	// 对外映射为 403。客户端据此回退为只读展示，而不是重试。
+	ErrRootReadOnly Code = "root_read_only"
+	// ErrRescanInProgress 表示已有一次全量重扫在进行中，本次请求被拒绝，
+	// 对外映射为 409。重扫是维护动作且写登记表，同一时刻只允许一次；
+	// 客户端据此稍后重试，而不是把它当成参数错误去修改请求。
+	ErrRescanInProgress Code = "rescan_in_progress"
 )
 
 // AppError 是应用统一错误类型：错误码 + 用户可读信息 + 底层错误。

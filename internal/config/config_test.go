@@ -200,3 +200,260 @@ webdav:
 		t.Errorf("webdav.public_allow_exts = %v, 期望 [\".org\" \".md\"]", got)
 	}
 }
+
+// TestLoadRootsDefaultSingleNoteRoot 验证未配置 webdav.roots 时归一为单根
+// （tag=notes、path=webdav.root、mode=mirror），保持向后兼容。
+func TestLoadRootsDefaultSingleNoteRoot(t *testing.T) {
+	cfg, err := Load(filepath.Join(t.TempDir(), "not-exist.yaml"))
+	if err != nil {
+		t.Fatalf("Load 返回错误: %v", err)
+	}
+
+	roots := cfg.WebDAV.Roots
+	if len(roots) != 1 {
+		t.Fatalf("未配置 roots 时应归一为单根，实际 %d 根: %v", len(roots), roots)
+	}
+	got := roots[0]
+	if got.Tag != "notes" || got.Path != "./data/seshat" || got.Mode != RootModeMirror {
+		t.Errorf("归一后的根 = %+v, 期望 {notes ./data/seshat mirror}", got)
+	}
+
+	// 自定义 webdav.root 时，内置单根跟随该值。
+	path := writeConfig(t, "webdav:\n  root: \"./srv/notes\"\n")
+	cfg, err = Load(path)
+	if err != nil {
+		t.Fatalf("Load 返回错误: %v", err)
+	}
+	if len(cfg.WebDAV.Roots) != 1 || cfg.WebDAV.Roots[0].Path != "./srv/notes" {
+		t.Errorf("roots = %+v, 期望单根 path 跟随 webdav.root", cfg.WebDAV.Roots)
+	}
+}
+
+// TestLoadRootsExplicitMulti 验证显式多根配置按声明顺序与 mode 保留。
+func TestLoadRootsExplicitMulti(t *testing.T) {
+	path := writeConfig(t, `
+webdav:
+  root: "./data/seshat"
+  roots:
+    - { tag: notes,  path: "./data/seshat", mode: mirror }
+    - { tag: ebooks, path: "./data/ebooks", mode: ondemand }
+    - { tag: papers, path: "./data/papers",  mode: ondemand }
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load 返回错误: %v", err)
+	}
+
+	roots := cfg.WebDAV.Roots
+	if len(roots) != 3 {
+		t.Fatalf("roots 数量 = %d, 期望 3: %v", len(roots), roots)
+	}
+	want := []RootConfig{
+		{Tag: "notes", Path: "./data/seshat", Mode: RootModeMirror},
+		{Tag: "ebooks", Path: "./data/ebooks", Mode: RootModeOnDemand},
+		{Tag: "papers", Path: "./data/papers", Mode: RootModeOnDemand},
+	}
+	for i := range want {
+		if roots[i] != want[i] {
+			t.Errorf("roots[%d] = %+v, 期望 %+v", i, roots[i], want[i])
+		}
+	}
+}
+
+// TestLoadRootsModeInferred 验证 mode 留空时按位置推导：首根 mirror、其余 ondemand。
+func TestLoadRootsModeInferred(t *testing.T) {
+	path := writeConfig(t, `
+webdav:
+  roots:
+    - { tag: notes,  path: "./data/seshat" }
+    - { tag: ebooks, path: "./data/ebooks" }
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load 返回错误: %v", err)
+	}
+
+	roots := cfg.WebDAV.Roots
+	if len(roots) != 2 {
+		t.Fatalf("roots 数量 = %d, 期望 2", len(roots))
+	}
+	if roots[0].Mode != RootModeMirror {
+		t.Errorf("roots[0].mode = %q, 期望 %q", roots[0].Mode, RootModeMirror)
+	}
+	if roots[1].Mode != RootModeOnDemand {
+		t.Errorf("roots[1].mode = %q, 期望 %q", roots[1].Mode, RootModeOnDemand)
+	}
+}
+
+// TestLoadRootsFirstPathFallsBackToWebDAVRoot 验证首根 path 留空时回落 webdav.root。
+func TestLoadRootsFirstPathFallsBackToWebDAVRoot(t *testing.T) {
+	path := writeConfig(t, `
+webdav:
+  root: "./data/seshat"
+  roots:
+    - { tag: notes }
+    - { tag: ebooks, path: "./data/ebooks" }
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load 返回错误: %v", err)
+	}
+	if got := cfg.WebDAV.Roots[0].Path; got != "./data/seshat" {
+		t.Errorf("roots[0].path = %q, 期望回落为 webdav.root 的 \"./data/seshat\"", got)
+	}
+}
+
+// TestLoadRootsSingleOnDemand 验证单根显式 mode=ondemand 被接受（不强加 mirror）：
+// 归一化只对「留空」的 mode 按位置推导，显式值原样保留。
+func TestLoadRootsSingleOnDemand(t *testing.T) {
+	path := writeConfig(t, `
+webdav:
+  roots:
+    - { tag: ebooks, path: "./data/ebooks", mode: ondemand }
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load 返回错误: %v", err)
+	}
+	roots := cfg.WebDAV.Roots
+	if len(roots) != 1 {
+		t.Fatalf("roots 数量 = %d, 期望 1", len(roots))
+	}
+	if roots[0].Tag != "ebooks" || roots[0].Mode != RootModeOnDemand {
+		t.Errorf("roots[0] = %+v, 期望 {ebooks ... ondemand}", roots[0])
+	}
+}
+
+// TestLoadRootsValidationErrors 验证非法 roots 配置在 Load 阶段即报错。
+func TestLoadRootsValidationErrors(t *testing.T) {
+	cases := []struct {
+		name    string
+		yaml    string
+		wantSub string
+	}{
+		{
+			name: "tag 重复",
+			yaml: `
+webdav:
+  roots:
+    - { tag: notes, path: "./a" }
+    - { tag: notes, path: "./b" }
+`,
+			wantSub: "重复",
+		},
+		{
+			name: "tag 含冒号",
+			yaml: `
+webdav:
+  roots:
+    - { tag: "no:tes", path: "./a" }
+`,
+			wantSub: "':'",
+		},
+		{
+			name: "tag 为空",
+			yaml: `
+webdav:
+  roots:
+    - { tag: "", path: "./a" }
+`,
+			wantSub: "tag 不能为空",
+		},
+		{
+			name: "非首根 path 为空",
+			yaml: `
+webdav:
+  roots:
+    - { tag: notes, path: "./a" }
+    - { tag: ebooks }
+`,
+			wantSub: "path 不能为空",
+		},
+		{
+			name: "webdav.root 与首根 path 均空",
+			yaml: `
+webdav:
+  root: ""
+  roots:
+    - { tag: notes }
+`,
+			wantSub: "path 不能为空",
+		},
+		{
+			name: "非法 mode",
+			yaml: `
+webdav:
+  roots:
+    - { tag: notes, path: "./a", mode: "sync" }
+`,
+			wantSub: "mode",
+		},
+		{
+			name: "两个 mirror",
+			yaml: `
+webdav:
+  roots:
+    - { tag: notes,  path: "./a", mode: mirror }
+    - { tag: ebooks, path: "./b", mode: mirror }
+`,
+			wantSub: "mirror",
+		},
+		{
+			name: "mirror 不是首根",
+			yaml: `
+webdav:
+  roots:
+    - { tag: ebooks, path: "./b", mode: ondemand }
+    - { tag: notes,  path: "./a", mode: mirror }
+`,
+			wantSub: "首根",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeConfig(t, tc.yaml)
+			_, err := Load(path)
+			if err == nil {
+				t.Fatalf("期望 Load 返回错误，实际为 nil")
+			}
+			if !strings.Contains(err.Error(), tc.wantSub) {
+				t.Errorf("错误信息 = %q, 期望包含 %q", err.Error(), tc.wantSub)
+			}
+		})
+	}
+}
+
+// TestValidateDirectly 验证 Validate 可独立调用（不经 Load），
+// 并把归一化结果写回 WebDAV.Roots。
+func TestValidateDirectly(t *testing.T) {
+	cfg := Default()
+	if len(cfg.WebDAV.Roots) != 0 {
+		t.Fatalf("Default() 不应预置 roots，实际 %v", cfg.WebDAV.Roots)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("默认配置 Validate 返回错误: %v", err)
+	}
+	if len(cfg.WebDAV.Roots) != 1 || cfg.WebDAV.Roots[0].Tag != "notes" || cfg.WebDAV.Roots[0].Mode != RootModeMirror {
+		t.Errorf("Validate 后 roots = %+v, 期望归一为单根 notes/mirror", cfg.WebDAV.Roots)
+	}
+
+	// 归一化幂等：再次 Validate 结果不变。
+	before := append([]RootConfig(nil), cfg.WebDAV.Roots...)
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("第二次 Validate 返回错误: %v", err)
+	}
+	if len(cfg.WebDAV.Roots) != len(before) || cfg.WebDAV.Roots[0] != before[0] {
+		t.Errorf("Validate 不幂等：before=%v after=%v", before, cfg.WebDAV.Roots)
+	}
+
+	// 无 webdav.root 且未配置 roots 时无法确定路径 → 报错（可识别为配置缺失）。
+	empty := &Config{}
+	if err := empty.Validate(); err == nil {
+		t.Error("webdav.root 与 roots 均缺失时 Validate 应报错")
+	}
+}

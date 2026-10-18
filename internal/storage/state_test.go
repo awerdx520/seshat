@@ -8,6 +8,14 @@ import (
 	"seshat/internal/logging"
 )
 
+// 状态层用例使用的固定 uid（26 位 Crockford Base32）。storage 层只校验非空，
+// 但用真实形态的 uid 使测试数据与 API 契约保持一致。
+const (
+	testUID1 = "01K8Q3M7D2X9V6T1B8N5C0RDEJ"
+	testUID2 = "01K8Q3M7D2X9V6T1B8N5C0RDEK"
+	testUID3 = "01K8Q3M7D2X9V6T1B8N5C0RDEM"
+)
+
 // assertCode 断言 err 是被 AppError 包装的指定错误码。
 func assertCode(t *testing.T, err error, want logging.Code) {
 	t.Helper()
@@ -27,21 +35,21 @@ func assertCode(t *testing.T, err error, want logging.Code) {
 func TestProgressRoundTrip(t *testing.T) {
 	db := openTestDB(t)
 
-	if err := db.SetProgress("doc-1", "p1", "2026-10-11T10:00:00Z"); err != nil {
+	if err := db.SetProgress(testUID1, "p1", "2026-10-11T10:00:00Z"); err != nil {
 		t.Fatalf("SetProgress() 返回错误: %v", err)
 	}
-	got, err := db.GetProgress("doc-1")
+	got, err := db.GetProgress(testUID1)
 	if err != nil {
 		t.Fatalf("GetProgress() 返回错误: %v", err)
 	}
-	if got.DocumentID != "doc-1" || got.Position != "p1" || got.UpdatedAt != "2026-10-11T10:00:00Z" {
+	if got.UID != testUID1 || got.Position != "p1" || got.UpdatedAt != "2026-10-11T10:00:00Z" {
 		t.Fatalf("读回记录不符: %+v", got)
 	}
 
-	if err := db.SetProgress("doc-1", "p2", "2026-10-11T11:00:00Z"); err != nil {
+	if err := db.SetProgress(testUID1, "p2", "2026-10-11T11:00:00Z"); err != nil {
 		t.Fatalf("二次 SetProgress() 返回错误: %v", err)
 	}
-	got, err = db.GetProgress("doc-1")
+	got, err = db.GetProgress(testUID1)
 	if err != nil {
 		t.Fatalf("二次 GetProgress() 返回错误: %v", err)
 	}
@@ -54,10 +62,10 @@ func TestProgressRoundTrip(t *testing.T) {
 func TestProgressTimestampBackfill(t *testing.T) {
 	db := openTestDB(t)
 
-	if err := db.SetProgress("doc-1", "p1", ""); err != nil {
+	if err := db.SetProgress(testUID1, "p1", ""); err != nil {
 		t.Fatalf("SetProgress() 返回错误: %v", err)
 	}
-	got, err := db.GetProgress("doc-1")
+	got, err := db.GetProgress(testUID1)
 	if err != nil {
 		t.Fatalf("GetProgress() 返回错误: %v", err)
 	}
@@ -74,13 +82,13 @@ func TestProgressTimestampBackfill(t *testing.T) {
 func TestProgressErrors(t *testing.T) {
 	db := openTestDB(t)
 
-	_, err := db.GetProgress("missing")
+	_, err := db.GetProgress(testUID3)
 	assertCode(t, err, logging.ErrNotFound)
 
-	err = db.SetProgress("doc-1", "", "2026-10-11T10:00:00Z")
+	err = db.SetProgress(testUID1, "", "2026-10-11T10:00:00Z")
 	assertCode(t, err, logging.ErrInvalidArgument)
 
-	err = db.SetProgress("doc-1", "p1", "not-a-timestamp")
+	err = db.SetProgress(testUID1, "p1", "not-a-timestamp")
 	assertCode(t, err, logging.ErrInvalidArgument)
 
 	err = db.SetProgress("   ", "p1", "")
@@ -91,10 +99,10 @@ func TestProgressErrors(t *testing.T) {
 func TestAnnotationCRUD(t *testing.T) {
 	db := openTestDB(t)
 
-	if _, err := db.CreateAnnotation("doc-2", "loc-1", "文本"); err != nil {
+	if _, err := db.CreateAnnotation(testUID2, "loc-1", "文本"); err != nil {
 		t.Fatalf("CreateAnnotation() 返回错误: %v", err)
 	}
-	created, err := db.CreateAnnotation("doc-1", "loc-2", "文本2")
+	created, err := db.CreateAnnotation(testUID1, "loc-2", "文本2")
 	if err != nil {
 		t.Fatalf("二次 CreateAnnotation() 返回错误: %v", err)
 	}
@@ -105,8 +113,8 @@ func TestAnnotationCRUD(t *testing.T) {
 		t.Fatalf("created_at 不是 RFC3339: %q", created.CreatedAt)
 	}
 
-	// 只返回目标文档的批注。
-	items, err := db.ListAnnotations("doc-2")
+	// 只返回目标 uid 的批注。
+	items, err := db.ListAnnotations(testUID2)
 	if err != nil {
 		t.Fatalf("ListAnnotations() 返回错误: %v", err)
 	}
@@ -114,8 +122,8 @@ func TestAnnotationCRUD(t *testing.T) {
 		t.Fatalf("列举结果不符: %+v", items)
 	}
 
-	// 无批注的文档返回空切片（非 nil），保证上层序列化为 JSON []。
-	empty, err := db.ListAnnotations("doc-none")
+	// 无批注的 uid 返回空切片（非 nil），保证上层序列化为 JSON []。
+	empty, err := db.ListAnnotations(testUID3)
 	if err != nil {
 		t.Fatalf("ListAnnotations() 空结果返回错误: %v", err)
 	}
@@ -133,14 +141,14 @@ func TestAnnotationCRUD(t *testing.T) {
 	if updated.CreatedAt != created.CreatedAt {
 		t.Fatalf("created_at 不应变化: %q → %q", created.CreatedAt, updated.CreatedAt)
 	}
-	if updated.DocumentID != "doc-1" {
-		t.Fatalf("document_id 不应变化: %q", updated.DocumentID)
+	if updated.UID != testUID1 {
+		t.Fatalf("uid 不应变化: %q", updated.UID)
 	}
 
 	if err := db.DeleteAnnotation(created.ID); err != nil {
 		t.Fatalf("DeleteAnnotation() 返回错误: %v", err)
 	}
-	items, err = db.ListAnnotations("doc-1")
+	items, err = db.ListAnnotations(testUID1)
 	if err != nil {
 		t.Fatalf("删除后 ListAnnotations() 返回错误: %v", err)
 	}
@@ -159,10 +167,10 @@ func TestAnnotationErrors(t *testing.T) {
 	err = db.DeleteAnnotation(404)
 	assertCode(t, err, logging.ErrNotFound)
 
-	_, err = db.CreateAnnotation("doc", "", "文本")
+	_, err = db.CreateAnnotation(testUID1, "", "文本")
 	assertCode(t, err, logging.ErrInvalidArgument)
 
-	_, err = db.CreateAnnotation("doc", "loc", "")
+	_, err = db.CreateAnnotation(testUID1, "loc", "")
 	assertCode(t, err, logging.ErrInvalidArgument)
 
 	_, err = db.ListAnnotations("")
@@ -180,10 +188,10 @@ func TestAnnotationsSurviveReopen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("首次 Open() 失败: %v", err)
 	}
-	if err := db.SetProgress("doc", "p1", "2026-10-11T10:00:00Z"); err != nil {
+	if err := db.SetProgress(testUID1, "p1", "2026-10-11T10:00:00Z"); err != nil {
 		t.Fatalf("SetProgress() 返回错误: %v", err)
 	}
-	if _, err := db.CreateAnnotation("doc", "loc", "文本"); err != nil {
+	if _, err := db.CreateAnnotation(testUID1, "loc", "文本"); err != nil {
 		t.Fatalf("CreateAnnotation() 返回错误: %v", err)
 	}
 	if err := db.Close(); err != nil {
@@ -196,10 +204,10 @@ func TestAnnotationsSurviveReopen(t *testing.T) {
 	}
 	defer func() { _ = reopened.Close() }()
 
-	if _, err := reopened.GetProgress("doc"); err != nil {
+	if _, err := reopened.GetProgress(testUID1); err != nil {
 		t.Fatalf("重开后读取进度失败: %v", err)
 	}
-	items, err := reopened.ListAnnotations("doc")
+	items, err := reopened.ListAnnotations(testUID1)
 	if err != nil || len(items) != 1 {
 		t.Fatalf("重开后批注 = %+v, err = %v", items, err)
 	}
@@ -216,15 +224,15 @@ func TestProgressConflictDetection(t *testing.T) {
 	const stale = "2026-10-11T09:00:00Z"
 
 	// 无已存记录：正常写入。
-	if err := db.SetProgress("doc", "p1", first); err != nil {
+	if err := db.SetProgress(testUID1, "p1", first); err != nil {
 		t.Fatalf("首次 SetProgress() 返回错误: %v", err)
 	}
 
 	// 新于已存：正常覆盖。
-	if err := db.SetProgress("doc", "p2", second); err != nil {
+	if err := db.SetProgress(testUID1, "p2", second); err != nil {
 		t.Fatalf("较新 SetProgress() 返回错误: %v", err)
 	}
-	got, err := db.GetProgress("doc")
+	got, err := db.GetProgress(testUID1)
 	if err != nil {
 		t.Fatalf("GetProgress() 返回错误: %v", err)
 	}
@@ -233,8 +241,8 @@ func TestProgressConflictDetection(t *testing.T) {
 	}
 
 	// 旧于已存：ErrConflict，且内容保持不被覆盖。
-	assertCode(t, db.SetProgress("doc", "p-stale", stale), logging.ErrConflict)
-	got, err = db.GetProgress("doc")
+	assertCode(t, db.SetProgress(testUID1, "p-stale", stale), logging.ErrConflict)
+	got, err = db.GetProgress(testUID1)
 	if err != nil {
 		t.Fatalf("冲突后 GetProgress() 返回错误: %v", err)
 	}
@@ -243,7 +251,7 @@ func TestProgressConflictDetection(t *testing.T) {
 	}
 
 	// 等于已存：视为幂等重放，不返回冲突。
-	if err := db.SetProgress("doc", "p2", second); err != nil {
+	if err := db.SetProgress(testUID1, "p2", second); err != nil {
 		t.Fatalf("相同时间戳 SetProgress() 返回错误: %v", err)
 	}
 }
@@ -253,13 +261,13 @@ func TestProgressConflictDetection(t *testing.T) {
 func TestProgressEmptyTimestampUnconditional(t *testing.T) {
 	db := openTestDB(t)
 
-	if err := db.SetProgress("doc", "p1", "2026-10-11T11:00:00Z"); err != nil {
+	if err := db.SetProgress(testUID1, "p1", "2026-10-11T11:00:00Z"); err != nil {
 		t.Fatalf("SetProgress() 返回错误: %v", err)
 	}
-	if err := db.SetProgress("doc", "p2", ""); err != nil {
+	if err := db.SetProgress(testUID1, "p2", ""); err != nil {
 		t.Fatalf("空时间戳 SetProgress() 应无条件成功，实际: %v", err)
 	}
-	got, err := db.GetProgress("doc")
+	got, err := db.GetProgress(testUID1)
 	if err != nil {
 		t.Fatalf("GetProgress() 返回错误: %v", err)
 	}
@@ -281,7 +289,7 @@ func TestProgressEmptyTimestampUnconditional(t *testing.T) {
 func TestAnnotationConflictDetection(t *testing.T) {
 	db := openTestDB(t)
 
-	created, err := db.CreateAnnotation("doc", "loc", "原始文本")
+	created, err := db.CreateAnnotation(testUID1, "loc", "原始文本")
 	if err != nil {
 		t.Fatalf("CreateAnnotation() 返回错误: %v", err)
 	}
@@ -295,7 +303,7 @@ func TestAnnotationConflictDetection(t *testing.T) {
 	// 旧于已存：ErrConflict，记录保持原样。
 	_, err = db.UpdateAnnotationAt(created.ID, "loc-stale", "陈旧文本", older)
 	assertCode(t, err, logging.ErrConflict)
-	items, err := db.ListAnnotations("doc")
+	items, err := db.ListAnnotations(testUID1)
 	if err != nil {
 		t.Fatalf("ListAnnotations() 返回错误: %v", err)
 	}

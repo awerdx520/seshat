@@ -18,6 +18,7 @@ import (
 	"seshat/internal/auth"
 	"seshat/internal/gitver"
 	"seshat/internal/index"
+	"seshat/internal/registry"
 )
 
 // writeMethods 是会产生工作区变更、因此需要在处理后自动提交的 HTTP 方法。
@@ -42,6 +43,9 @@ var writeMethods = map[string]bool{
 // root 为挂载根目录，authenticator 负责认证，source 标记端点来源，
 // repo 为目标 git 仓库（Open 自同一 root）。NewHandler 保持原签名不变，
 // 本函数是新增入口。
+//
+// 警告：本入口不含点路径与软链守卫，生产请使用 ...WithRegistry 变体
+// （同文件的 VersionedHandlerWithRegistry / NewPolicyVersionedHandlerWithRegistry）。
 func VersionedHandler(root string, authenticator *auth.Authenticator, source Source, repo *gitver.Repo) http.Handler {
 	handler := newDAVHandler(davPrefix, newVersionedFS(root, repo))
 	return authenticator.Middleware(commitAfterWrite(source, repo, handler))
@@ -87,6 +91,25 @@ const orgSuffix = ".org"
 // 或挂载根为仓库子目录时用 NewPolicyVersionedHandler。
 func VersionedHandlerWithIndex(root string, authenticator *auth.Authenticator, source Source, repo *gitver.Repo, indexer *index.Indexer) http.Handler {
 	return newPolicyVersionedHandler(root, authenticator, source, PolicyOptions{}, repo, indexer, davPrefix, "")
+}
+
+// VersionedHandlerWithRegistry 在 VersionedHandlerWithIndex 的基础上，额外把成功的
+// 写操作登记进 registry（resources + changes，见 registryAfterWrite）：
+//
+//   - 写方法返回 2xx 后，按方法推导事件（PUT → create/update、DELETE → delete、
+//     MOVE → rename、COPY → 目标 create），rev 取 commit 之后的 Repo.Head()；
+//   - 失败响应（4xx/5xx）不产生任何事件；登记失败只记日志，不影响响应。
+//
+// 处理链由外到内依次为：认证 → 全文索引 → 身份登记 → git commit → WebDAV。
+// reg 为 nil 时行为与 VersionedHandlerWithIndex 完全一致；注册前需先对其调用
+// SetRoots（首根 tag 即登记使用的逻辑根）。
+//
+// root、authenticator、source、repo、indexer 语义同 VersionedHandlerWithIndex；
+// 前缀固定为 davPrefix 且挂载根即仓库根。对外出口请用
+// NewPolicyVersionedHandlerWithRegistry。
+func VersionedHandlerWithRegistry(root string, authenticator *auth.Authenticator, source Source, repo *gitver.Repo, indexer *index.Indexer, reg *registry.Service) http.Handler {
+	return newPolicyVersionedHandlerWithRegistry(root, authenticator, source, PolicyOptions{},
+		repo, indexer, reg, davPrefix, "", firstRootTag(reg))
 }
 
 // indexAfterWrite 包装 next：请求处理完成后，若为成功响应（2xx）则按写方法

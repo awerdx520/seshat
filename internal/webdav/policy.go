@@ -1,9 +1,9 @@
-// 本文件实现对外公开出口的访问策略：只读与扩展名白名单。
+// 本文件实现对外公开出口的访问策略：只读、扩展名白名单与点路径拒绝。
 //
 // 策略以 webdav.FileSystem 包装的方式叠加在裸 webdav.Dir 之上：读操作
 // （只读 OpenFile、Stat）始终放行，写操作按策略拒绝。原有的 NewHandler /
 // VersionedHandler 签名与行为保持不变，本文件仅新增 ReadOnlyFS、
-// ExtWhitelistFS 与组合入口 NewPolicyHandler。
+// ExtWhitelistFS、dotPathFS 与组合入口 NewPolicyHandler。
 package webdav
 
 import (
@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 
@@ -19,6 +20,7 @@ import (
 	"seshat/internal/auth"
 	"seshat/internal/gitver"
 	"seshat/internal/index"
+	"seshat/internal/registry"
 )
 
 // isWriteFlag 判断 OpenFile 的 flag 是否含写意图。
@@ -155,6 +157,104 @@ func normalizeExts(allow []string) []string {
 	return out
 }
 
+// errDotPath 构造点路径（.git 段或隐藏段）访问被拒时的错误。
+// 包裹 os.ErrPermission：一是让调用方可用 errors.Is(err, os.ErrPermission) 判定，
+// 二是让 webdav 自身的 PROPFIND 遍历把它当成「无权限，静默跳过」（见
+// golang.org/x/net/webdav 的 handlePropfindError），从而不中断整个 Multi-Status。
+func errDotPath(name string) error {
+	return fmt.Errorf("对外出口拒绝访问点路径 %q（含 .git 段或以 '.' 开头的段）: %w", name, os.ErrPermission)
+}
+
+// hasDotSegment 判断 WebDAV 请求路径是否含「点段」。
+//
+// 判定口径与 internal/registry 的 normalizeResourcePath 一致：
+//   - 先折叠路径（去前导斜杠、合并重复斜杠、折叠 "."）：使 "/a.org"、"//a.org"、
+//     "/./a.org" 这类等价写法得到同一结论，避免「多写一个 './' 就绕过策略」；
+//   - 折叠后任一段为 .git（大小写不敏感，兼顾大小写不敏感的卷）或以 '.' 开头
+//     （隐藏文件/隐藏目录）即视为点路径。
+//
+// 挂载根本身（"" 或 "/"）折叠后为空串，不算点路径——否则 PROPFIND 根目录会被拒。
+func hasDotSegment(name string) bool {
+	slashed := filepath.ToSlash(name)
+	clean := strings.TrimPrefix(path.Clean("/"+slashed), "/")
+	if clean == "" {
+		return false
+	}
+	for _, seg := range strings.Split(clean, "/") {
+		if strings.EqualFold(seg, ".git") || strings.HasPrefix(seg, ".") {
+			return true
+		}
+	}
+	return false
+}
+
+// dotPathFS 包装一个 webdav.FileSystem，拒绝一切落在「点路径」上的访问：
+// .git 内部目录（可泄露 remote URL、可破坏版本库）与隐藏文件/隐藏目录（编辑器
+// 缓存、工具配置，不属于笔记内容）。规则与 registry 的 normalizeResourcePath
+// 同口径，使「登记可接受的路径集」与「出口可访问的路径集」保持一致。
+//
+// 读写一律拒绝：读 .git/config 会泄露 remote URL 与凭据配置，读隐藏文件会泄露
+// 服务端工具链细节，故 OpenFile 不做读写区分——只要路径命中点段就返回权限错误。
+//
+// Readdir（列目录）有意不过滤：包装返回的仍是底层 webdav.File，目录内容原样列出。
+// 取舍说明：过滤 Readdir 会让「列目录看到的条目」与「能 Stat 到的条目」更不一致，
+// 而拒绝访问的语义应该由 Stat/OpenFile 承担；实际观感上点条目也不会出现在
+// PROPFIND 响应里——webdav 的遍历对每个子项先 Stat，命中本包装的权限错误后调用
+// handlePropfindError，其行为正是「静默跳过该子项」，响应仍是 207 Multi-Status，
+// 不会因为目录里存在 .git 而报错。
+type dotPathFS struct {
+	fs webdav.FileSystem
+}
+
+// newDotPathFS 以底层 fs 构造点路径拒绝包装。
+func newDotPathFS(fs webdav.FileSystem) dotPathFS {
+	return dotPathFS{fs: fs}
+}
+
+// Mkdir 拒绝在点路径上创建目录（如 MKCOL /.git）。
+func (fs dotPathFS) Mkdir(ctx context.Context, name string, perm os.FileMode) error {
+	if hasDotSegment(name) {
+		return errDotPath(name)
+	}
+	return fs.fs.Mkdir(ctx, name, perm)
+}
+
+// OpenFile 对点路径一律拒绝——读写都不放行（读 .git/config 会泄露 remote URL）。
+func (fs dotPathFS) OpenFile(ctx context.Context, name string, flag int, perm os.FileMode) (webdav.File, error) {
+	if hasDotSegment(name) {
+		return nil, errDotPath(name)
+	}
+	return fs.fs.OpenFile(ctx, name, flag, perm)
+}
+
+// RemoveAll 拒绝删除点路径（含 DELETE /.git 这类整棵删除）。
+func (fs dotPathFS) RemoveAll(ctx context.Context, name string) error {
+	if hasDotSegment(name) {
+		return errDotPath(name)
+	}
+	return fs.fs.RemoveAll(ctx, name)
+}
+
+// Rename 对源与目标都做点路径检查：既禁止「写进点路径」（MOVE /a.org → /.git/x），
+// 也禁止「从点路径移出」（MOVE /.git/config → /leak.org）。
+func (fs dotPathFS) Rename(ctx context.Context, oldName, newName string) error {
+	if hasDotSegment(oldName) {
+		return errDotPath(oldName)
+	}
+	if hasDotSegment(newName) {
+		return errDotPath(newName)
+	}
+	return fs.fs.Rename(ctx, oldName, newName)
+}
+
+// Stat 拒绝点路径的元信息查询（PROPFIND/GET/HEAD 的入口都会先 Stat）。
+func (fs dotPathFS) Stat(ctx context.Context, name string) (os.FileInfo, error) {
+	if hasDotSegment(name) {
+		return nil, errDotPath(name)
+	}
+	return fs.fs.Stat(ctx, name)
+}
+
 // PolicyOptions 配置对外出口的访问策略。
 type PolicyOptions struct {
 	// ReadOnly 为 true 时整个出口只读（所有写操作被拒）。
@@ -168,6 +268,10 @@ type PolicyOptions struct {
 // 后只读，使只读位于最外层——只读时任何写操作都最先被拒，不依赖白名单是否命中。
 // 读操作始终放行。返回的 FileSystem 可再交给版本化包装（wrapVersionedFS）叠加
 // ETag 能力。
+//
+// 注意：本函数不含点路径拒绝，点路径包装（dotPathFS）由版本化链路在 wrapVersionedFS
+// 之前单独套一层（见 newPolicyVersionedHandlerWithRegistry）；NewPolicyHandler 不带
+// 版本化，其行为保持不变。
 func policyFS(root string, opts PolicyOptions) webdav.FileSystem {
 	var fs webdav.FileSystem = webdav.Dir(root)
 	if len(opts.AllowExts) > 0 {
@@ -185,6 +289,9 @@ func policyFS(root string, opts PolicyOptions) webdav.FileSystem {
 // 使只读位于最外层——只读时任何写操作都最先被拒，不依赖白名单是否命中。
 // 读操作始终放行。认证与来源注入链路与 NewHandler 完全一致（先认证，再注入
 // 来源标记，最后交给 WebDAV 处理器）。前缀固定为默认的 davPrefix。
+//
+// 警告：本入口不含点路径与软链守卫，生产请使用 ...WithRegistry 变体
+// （NewPolicyVersionedHandlerWithRegistry 会叠加 dotPathFS 与 symlinkGuardFS）。
 func NewPolicyHandler(root string, authenticator *auth.Authenticator, source Source, opts PolicyOptions) http.Handler {
 	handler := newDAVHandler(davPrefix, policyFS(root, opts))
 	return authenticator.Middleware(injectSource(source, handler))
@@ -210,15 +317,63 @@ func NewPolicyHandler(root string, authenticator *auth.Authenticator, source Sou
 // 无变更工作区为 no-op，不产生空提交，索引钩子对非 2xx 响应直接跳过。repo /
 // indexer 为 nil 时对应环节自动跳过；opts 为零值时等价于无访问策略
 // （与 VersionedHandlerWithIndex 行为一致）。
+//
+// 无论 opts 如何取值，本入口都会叠加点路径拒绝（dotPathFS）与软链守卫
+// （symlinkGuardFS）：.git 与隐藏文件/隐藏目录既不可读也不可写，请求路径的
+// 父链或目标自身含符号链接时也一律拒绝（详见 dotPathFS / symlinkGuardFS 的说明）。
 func NewPolicyVersionedHandler(root string, authenticator *auth.Authenticator, source Source, opts PolicyOptions, repo *gitver.Repo, indexer *index.Indexer, prefix, offset string) http.Handler {
 	return newPolicyVersionedHandler(root, authenticator, source, opts, repo, indexer, prefix, offset)
+}
+
+// NewPolicyVersionedHandlerWithRegistry 在 NewPolicyVersionedHandler 的基础上，额外
+// 把成功的写操作登记进 registry（resources + changes，详见 registryAfterWrite）。
+//
+// 处理链（外层 → 内层）：
+//
+//	认证 → 全文索引 → 身份登记 → git commit → WebDAV
+//
+// 身份登记位于 commit 之外层，故 rev 取 commit 之后的 HEAD；位于索引内层，故索引
+// 仍在登记之后更新。reg 为 nil 时行为与 NewPolicyVersionedHandler 完全一致；
+// 日志根标签取 reg 的首根（调用前需先 SetRoots）。
+//
+// 其余参数语义（root / opts / prefix / offset / repo / indexer）与
+// NewPolicyVersionedHandler 完全一致：对外出口挂在笔记根子目录时必须传 offset
+// （如 "public"），否则 ETag、索引 key 与登记路径都会错位。
+func NewPolicyVersionedHandlerWithRegistry(root string, authenticator *auth.Authenticator, source Source, opts PolicyOptions, repo *gitver.Repo, indexer *index.Indexer, reg *registry.Service, prefix, offset string) http.Handler {
+	return newPolicyVersionedHandlerWithRegistry(root, authenticator, source, opts,
+		repo, indexer, reg, prefix, offset, firstRootTag(reg))
 }
 
 // newPolicyVersionedHandler 是 NewPolicyVersionedHandler 与 VersionedHandlerWithIndex
 // 的共享实现：组装「认证 → 可选策略 → 版本化 FS → 写后 commit → 全文索引」处理链。
 // offset 为挂载根相对仓库根的偏移，透传给 versionedFS 与索引钩子。
 func newPolicyVersionedHandler(root string, authenticator *auth.Authenticator, source Source, opts PolicyOptions, repo *gitver.Repo, indexer *index.Indexer, prefix, offset string) http.Handler {
-	fs := wrapVersionedFS(policyFS(root, opts), repo, offset)
+	return newPolicyVersionedHandlerWithRegistry(root, authenticator, source, opts, repo, indexer, nil, prefix, offset, "")
+}
+
+// newPolicyVersionedHandlerWithRegistry 是带身份登记的共享实现：在 commit 钩子外层
+// 插入 registryAfterWrite（rootTag 为登记使用的逻辑根标签），索引钩子保持在最外层。
+// reg 为 nil 时不插入登记钩子，处理链与 newPolicyVersionedHandler 逐层一致。
+//
+// 文件系统包装顺序（内 → 外）：
+//
+//	webdav.Dir → 扩展名白名单 → 只读 → symlinkGuardFS → dotPathFS → versionedFS
+//
+// dotPathFS 位于 policyFS 之上、versionedFS 之下：点路径在最靠近盘面的策略层就被
+// 拒绝，且必须先于版本化包装——否则 versionedFS.Stat 会把 ETag 计算（blob hash）
+// 作用到 .git 内部路径上。只读与白名单语义不变：只读仍在最内层最先拒绝写操作。
+//
+// symlinkGuardFS 夹在策略层与 dotPathFS 之间（绑定同一个物理根 root）：点路径
+// 检查是纯字符串判断、成本更低，故放在更外层先拒；软链接检查才需要打盘（逐级
+// Lstat）。它同时位于 versionedFS 之内，避免 ETag 计算作用到软链路径上。裸
+// webdav.Dir 会跟随软链，若无这一层，根内一条 leak -> /etc/passwd 就能读写根外
+// 文件（详见 symlink.go 文件头）。
+func newPolicyVersionedHandlerWithRegistry(root string, authenticator *auth.Authenticator, source Source, opts PolicyOptions, repo *gitver.Repo, indexer *index.Indexer, reg *registry.Service, prefix, offset, rootTag string) http.Handler {
+	fs := wrapVersionedFS(newDotPathFS(newSymlinkGuardFS(policyFS(root, opts), root)), repo, offset)
 	inner := commitAfterWrite(source, repo, newDAVHandler(prefix, fs))
+	if reg != nil {
+		// 登记钩子包在 commit 外层（拿到 commit 后的 HEAD），索引钩子再包其外层。
+		inner = registryAfterWrite(rootTag, prefix, offset, reg, repo, inner)
+	}
 	return authenticator.Middleware(indexAfterWrite(root, prefix, offset, indexer, inner))
 }

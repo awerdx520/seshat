@@ -15,12 +15,14 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"seshat/internal/auth"
 	"seshat/internal/gitver"
 	"seshat/internal/index"
 	"seshat/internal/logging"
+	"seshat/internal/registry"
 	"seshat/internal/storage"
 )
 
@@ -36,30 +38,46 @@ type Server struct {
 	// （能力未启用），其余端点不受影响。
 	indexer *index.Indexer
 
+	// registry 提供服务端权威的文件身份与增量同步（M7）：资源清单、单资源元数据、
+	// 路径解析与变更日志四个只读端点。为 nil 时这些端点返回 503（登记能力未启用），
+	// 其余端点不受影响。
+	registry *registry.Service
+
 	// nodeAuth 为本地处理节点端点提供独立认证（节点令牌）。为 nil 时节点端点
 	// 回退使用主 Authenticator（此时若其未配置节点令牌，则回退接受主令牌，
 	// 即既有单令牌行为）。
 	nodeAuth *auth.Authenticator
+
+	// rescanRunning 标记「当前有全量重扫在跑」（M7 B6）。
+	//
+	// 用 atomic.Bool 而非 sync.Mutex：rescan 的语义是「抢不到就立刻 409」，
+	// 需要的是「试占位」而非「排队等锁」（sync.Mutex 无 TryLock 之外的试占位
+	// 手段，而排队等待会掩盖调用方定时任务重叠的误用）。CAS false→true 成功
+	// 者独占，defer 归还。
+	rescanRunning atomic.Bool
 }
 
 // progressResponse 是阅读进度的对外表示。
+//
+// uid 是服务端权威文档身份（26 位 Crockford Base32），取代 M7 之前的 document_id：
+// 状态 API 只接受 uid，不再接受路径或内容标识（破坏性变更，见 CHANGELOG）。
 type progressResponse struct {
-	DocumentID string `json:"document_id"`
-	Position   string `json:"position"`
-	UpdatedAt  string `json:"updated_at"`
+	UID       string `json:"uid"`
+	Position  string `json:"position"`
+	UpdatedAt string `json:"updated_at"`
 }
 
-// annotationResponse 是批注的对外表示。
+// annotationResponse 是批注的对外表示（uid 指向所属文档）。
 type annotationResponse struct {
-	ID         int64  `json:"id"`
-	DocumentID string `json:"document_id"`
-	Location   string `json:"location"`
-	Text       string `json:"text"`
-	CreatedAt  string `json:"created_at"`
-	UpdatedAt  string `json:"updated_at"`
+	ID        int64  `json:"id"`
+	UID       string `json:"uid"`
+	Location  string `json:"location"`
+	Text      string `json:"text"`
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
 }
 
-// progressRequest 是设置进度的请求体。
+// progressRequest 是设置进度的请求体（uid 取自路径参数 /api/progress/{uid}）。
 type progressRequest struct {
 	Position  string `json:"position"`
 	UpdatedAt string `json:"updated_at"`
@@ -67,9 +85,9 @@ type progressRequest struct {
 
 // annotationCreateRequest 是创建批注的请求体。
 type annotationCreateRequest struct {
-	DocumentID string `json:"document_id"`
-	Location   string `json:"location"`
-	Text       string `json:"text"`
+	UID      string `json:"uid"`
+	Location string `json:"location"`
+	Text     string `json:"text"`
 }
 
 // annotationUpdateRequest 是更新批注的请求体。
@@ -190,7 +208,7 @@ type nodeRegisterResponse struct {
 // 端点（文件历史、某版本内容、共同祖先）时改用 NewHandlerWithRepo，需要
 // 全文搜索端点时改用 NewHandlerFull。
 func NewHandler(db *storage.DB, a *auth.Authenticator) http.Handler {
-	return newServer(db, nil, nil, nil).handler(a)
+	return newServer(db, nil, nil, nil, nil).handler(a)
 }
 
 // NewHandlerWithRepo 在 NewHandler 的基础上追加版本查询端点，复用同一套 mux
@@ -199,7 +217,7 @@ func NewHandler(db *storage.DB, a *auth.Authenticator) http.Handler {
 // repo 提供文件历史/某版本内容/共同祖先能力；repo 为 nil 时不注册版本查询
 // 路由（请求落到 ServeMux 默认 404）。
 func NewHandlerWithRepo(db *storage.DB, repo *gitver.Repo, a *auth.Authenticator) http.Handler {
-	return newServer(db, repo, nil, nil).handler(a)
+	return newServer(db, repo, nil, nil, nil).handler(a)
 }
 
 // NewHandlerFull 构造包含全部能力的 REST 处理器：在 NewHandlerWithRepo 的基础上
@@ -212,7 +230,7 @@ func NewHandlerWithRepo(db *storage.DB, repo *gitver.Repo, a *auth.Authenticator
 // NewWithNodeToken 构造并配置了节点令牌时按节点令牌认证，否则回退主令牌。
 // 需要节点令牌与主令牌使用不同 Authenticator 实例时改用 NewHandlerFullWithNodeAuth。
 func NewHandlerFull(db *storage.DB, repo *gitver.Repo, indexer *index.Indexer, a *auth.Authenticator) http.Handler {
-	return newServer(db, repo, indexer, nil).handler(a)
+	return newServer(db, repo, indexer, nil, nil).handler(a)
 }
 
 // NewHandlerFullWithNodeAuth 在 NewHandlerFull 的基础上，为节点端点（任务轮询、
@@ -222,12 +240,23 @@ func NewHandlerFull(db *storage.DB, repo *gitver.Repo, indexer *index.Indexer, a
 // 主令牌不能访问节点端点（当 nodeAuth 配置了节点令牌时），节点令牌也不能访问
 // 普通端点。nodeAuth 为 nil 时回退使用 a（等价于 NewHandlerFull）。
 func NewHandlerFullWithNodeAuth(db *storage.DB, repo *gitver.Repo, indexer *index.Indexer, a, nodeAuth *auth.Authenticator) http.Handler {
-	return newServer(db, repo, indexer, nodeAuth).handler(a)
+	return newServer(db, repo, indexer, nil, nodeAuth).handler(a)
 }
 
-// newServer 组装处理器依赖。
-func newServer(db *storage.DB, repo *gitver.Repo, indexer *index.Indexer, nodeAuth *auth.Authenticator) *Server {
-	return &Server{db: db, repo: repo, indexer: indexer, nodeAuth: nodeAuth}
+// NewHandlerFullWithRegistry 在 NewHandlerFullWithNodeAuth 的基础上注入身份登记
+// 服务（M7），从而挂出四个只读端点：GET /api/resources、GET /api/resources/{uid}、
+// GET /api/resolve、GET /api/changes。
+//
+// reg 为 nil 时这四个端点返回 503（登记能力未启用），其余端点行为与
+// NewHandlerFullWithNodeAuth 完全一致——调用方可以用同一构造函数，由依赖是否
+// 就绪决定能力，而不必记得换构造函数。
+func NewHandlerFullWithRegistry(db *storage.DB, repo *gitver.Repo, indexer *index.Indexer, reg *registry.Service, a, nodeAuth *auth.Authenticator) http.Handler {
+	return newServer(db, repo, indexer, reg, nodeAuth).handler(a)
+}
+
+// newServer 组装处理器依赖（内部函数，签名可变）。
+func newServer(db *storage.DB, repo *gitver.Repo, indexer *index.Indexer, reg *registry.Service, nodeAuth *auth.Authenticator) *Server {
+	return &Server{db: db, repo: repo, indexer: indexer, registry: reg, nodeAuth: nodeAuth}
 }
 
 // handler 组装顶层处理器：普通 API 路由（/api/）整体套主 Bearer 认证中间件，
@@ -261,8 +290,9 @@ func (s *Server) handler(a *auth.Authenticator) http.Handler {
 // routes 构建全部 API 路由；版本查询路由仅在 repo 非 nil 时注册。
 func (s *Server) routes() *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /api/progress/{document_id}", s.handleGetProgress)
-	mux.HandleFunc("PUT /api/progress/{document_id}", s.handlePutProgress)
+	// 状态端点以 uid 为键（M7 破坏性变更）：路径参数名为 uid，不再接受 document_id。
+	mux.HandleFunc("GET /api/progress/{uid}", s.handleGetProgress)
+	mux.HandleFunc("PUT /api/progress/{uid}", s.handlePutProgress)
 	mux.HandleFunc("POST /api/annotations", s.handleCreateAnnotation)
 	mux.HandleFunc("GET /api/annotations", s.handleListAnnotations)
 	mux.HandleFunc("PUT /api/annotations/{id}", s.handleUpdateAnnotation)
@@ -270,6 +300,38 @@ func (s *Server) routes() *http.ServeMux {
 
 	// 全文搜索端点（M5.1）：命中返回 path 列表；indexer 为 nil 时返回 503。
 	mux.HandleFunc("GET /api/search", s.handleSearch)
+
+	// 身份登记与增量同步的只读端点（M7 A5）。无论 registry 是否注入都注册：
+	// 路由表稳定，服务未启用登记能力时客户端得到 503 而非 404，「能力未就绪」
+	// 与「端点不存在」在上层可区分（不依赖客户端是否知道服务端构造方式）。
+	// 未注入时由各 handler 首行判空返回 503（见 requireRegistry）。
+	mux.HandleFunc("GET /api/resources", s.handleListResources)
+	mux.HandleFunc("GET /api/resources/{uid}", s.handleGetResource)
+	mux.HandleFunc("GET /api/resolve", s.handleResolve)
+	mux.HandleFunc("GET /api/changes", s.handleListChanges)
+	// 根映射下发（M7 B2）：只回 tag/mode/default，不回物理路径。数据源与上面四个
+	// 端点同源（registry.Service.Roots()），未注入 registry 时同样返回 503。
+	mux.HandleFunc("GET /api/roots", s.handleListRoots)
+
+	// 文件内容端点（M7 B3）：GET 读内容（支持 Range，所有根）、PUT/DELETE 写与删
+	// （仅 mirror 根）、POST /api/resources/{uid}/move 按 uid 移动。移动端点不挂在
+	// /api/files/{path...}/ 下：Go 1.22 的 ServeMux 不允许 {path...} 之后再有字面量段
+	// （见下方版本路由的同类注释），故以 uid 定位、目标路径放 body。
+	mux.HandleFunc("GET /api/files/{path...}", s.handleGetFile)
+	mux.HandleFunc("PUT /api/files/{path...}", s.handlePutFile)
+	mux.HandleFunc("DELETE /api/files/{path...}", s.handleDeleteFile)
+	mux.HandleFunc("POST /api/resources/{uid}/move", s.handleMoveResource)
+
+	// 全量重扫（M7 B6）：维护端点，修复写钩子漏记。与 "GET /api/resources/{uid}"
+	// 不冲突（方法已区分），与 "POST /api/resources/{uid}/move" 也不冲突（段数不同，
+	// ServeMux 在注册时即校验，冲突会 panic）。字面量段 rescan 只在 POST 上注册，
+	// 故 "GET /api/resources/rescan" 会落到 {uid} 处理器并因 uid 形态非法返回 400。
+	// 未注入 registry 时同样返回 503（见 requireRegistry）。
+	mux.HandleFunc("POST /api/resources/rescan", s.handleRescan)
+
+	// 引用图双向查询（M7 C1）：?uid=&direction=in|out。与上面四个端点同源（registry），
+	// 未注入 registry 时返回 503（见 requireRegistry）；响应只含引用边，不含路径/内容。
+	mux.HandleFunc("GET /api/refs", s.handleListRefs)
 
 	// LLM 任务创建端点（M6.2）：客户端（主令牌）提交任务入队。本地处理节点
 	// 端点（任务轮询、结果回传、节点注册）不使用主认证中间件，改由 handler
@@ -295,11 +357,42 @@ func (s *Server) routes() *http.ServeMux {
 	return mux
 }
 
+// requireKnownUID 校验状态端点收到的 uid，通过返回 true；否则写出错误响应并返回 false。
+//
+// 两级校验（与 /api/resources/{uid} 的口径一致）：
+//   - 形态：必须匹配 registry.IsUID（26 位 Crockford Base32），否则 400 invalid_uid；
+//   - 登记：已注入 registry 时确认该 uid 在 resources 表中存活（墓碑视为不存在），
+//     未登记/已墓碑 → 404 unknown_uid（经 writeLookupError 改写）。
+//
+// registry 为 nil（NewHandler / NewHandlerWithRepo / NewHandlerFull 等旧构造函数）时
+// 跳过登记校验，只做形态校验：这些入口本就不装配身份登记能力，若要求「先登记才能
+// 读写状态」，状态端点会在未启用 registry 的部署里整体不可用——那是能力回退，不是
+// 我们想要的语义。登记能力就绪时（WithRegistry 入口）则强制 uid 必须已登记，
+// 避免为拼错的 uid 留下孤儿状态。
+func (s *Server) requireKnownUID(w http.ResponseWriter, uid string) bool {
+	if !registry.IsUID(uid) {
+		writeError(w, logging.NewAppError(logging.ErrInvalidUID,
+			"uid 格式非法（须为 26 位 Crockford Base32）"))
+		return false
+	}
+	if s.registry == nil {
+		return true
+	}
+	if _, err := s.registry.Entry(uid); err != nil {
+		writeLookupError(w, err)
+		return false
+	}
+	return true
+}
+
 // handleGetProgress 返回文档的最新阅读进度；携带 If-Modified-Since 且进度未更新时返回 304。
 func (s *Server) handleGetProgress(w http.ResponseWriter, r *http.Request) {
-	documentID := r.PathValue("document_id")
+	uid := r.PathValue("uid")
+	if !s.requireKnownUID(w, uid) {
+		return
+	}
 
-	progress, err := s.db.GetProgress(documentID)
+	progress, err := s.db.GetProgress(uid)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -328,14 +421,17 @@ func (s *Server) handlePutProgress(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	documentID := r.PathValue("document_id")
-	if err := s.db.SetProgress(documentID, req.Position, req.UpdatedAt); err != nil {
+	uid := r.PathValue("uid")
+	if !s.requireKnownUID(w, uid) {
+		return
+	}
+	if err := s.db.SetProgress(uid, req.Position, req.UpdatedAt); err != nil {
 		writeError(w, err)
 		return
 	}
 
 	// 回读以返回服务端实际保存的值（含回填/规范化后的 updated_at）。
-	progress, err := s.db.GetProgress(documentID)
+	progress, err := s.db.GetProgress(uid)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -344,14 +440,18 @@ func (s *Server) handlePutProgress(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleCreateAnnotation 创建批注并返回 201 + 完整记录（含服务端生成的 id 与时间戳）。
+// 目标文档由请求体的 uid 指定。
 func (s *Server) handleCreateAnnotation(w http.ResponseWriter, r *http.Request) {
 	var req annotationCreateRequest
 	if err := decodeBody(w, r, &req); err != nil {
 		writeError(w, err)
 		return
 	}
+	if !s.requireKnownUID(w, req.UID) {
+		return
+	}
 
-	annotation, err := s.db.CreateAnnotation(req.DocumentID, req.Location, req.Text)
+	annotation, err := s.db.CreateAnnotation(req.UID, req.Location, req.Text)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -359,11 +459,14 @@ func (s *Server) handleCreateAnnotation(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusCreated, toAnnotationResponse(annotation))
 }
 
-// handleListAnnotations 按 document_id 列出批注。
+// handleListAnnotations 按 uid 列出某个文档的批注（GET /api/annotations?uid=）。
 func (s *Server) handleListAnnotations(w http.ResponseWriter, r *http.Request) {
-	documentID := r.URL.Query().Get("document_id")
+	uid := r.URL.Query().Get("uid")
+	if !s.requireKnownUID(w, uid) {
+		return
+	}
 
-	items, err := s.db.ListAnnotations(documentID)
+	items, err := s.db.ListAnnotations(uid)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -582,8 +685,11 @@ func (s *Server) handleMergeBase(w http.ResponseWriter, r *http.Request) {
 			writeError(w, err)
 			return
 		}
+		// 非 AppError 分支：原始错误可能含 git 内部细节（revision 串、go-git 的
+		// 走查信息），只记服务端日志，响应体给固定文案，避免把内部错误文本外泄。
+		slog.Warn("api: 两个版本无共同祖先", "a", a, "b", b, "error", err)
 		writeJSON(w, http.StatusConflict, errorResponse{
-			Error: errorPayload{Code: string(logging.ErrConflict), Message: err.Error()},
+			Error: errorPayload{Code: string(logging.ErrConflict), Message: "两个版本无共同祖先"},
 		})
 		return
 	}
@@ -802,18 +908,18 @@ func decodeBody(w http.ResponseWriter, r *http.Request, dst any) error {
 
 // toProgressResponse 将存储层进度转换为对外表示。
 func toProgressResponse(p *storage.Progress) progressResponse {
-	return progressResponse{DocumentID: p.DocumentID, Position: p.Position, UpdatedAt: p.UpdatedAt}
+	return progressResponse{UID: p.UID, Position: p.Position, UpdatedAt: p.UpdatedAt}
 }
 
 // toAnnotationResponse 将存储层批注转换为对外表示。
 func toAnnotationResponse(a *storage.Annotation) annotationResponse {
 	return annotationResponse{
-		ID:         a.ID,
-		DocumentID: a.DocumentID,
-		Location:   a.Location,
-		Text:       a.Text,
-		CreatedAt:  a.CreatedAt,
-		UpdatedAt:  a.UpdatedAt,
+		ID:        a.ID,
+		UID:       a.UID,
+		Location:  a.Location,
+		Text:      a.Text,
+		CreatedAt: a.CreatedAt,
+		UpdatedAt: a.UpdatedAt,
 	}
 }
 
@@ -847,16 +953,24 @@ func writeError(w http.ResponseWriter, err error) {
 // statusForCode 将应用错误码映射为 HTTP 状态码。
 func statusForCode(code logging.Code) int {
 	switch code {
-	case logging.ErrInvalidArgument:
+	case logging.ErrInvalidArgument, logging.ErrInvalidUID:
 		return http.StatusBadRequest
 	case logging.ErrUnauthorized:
 		return http.StatusUnauthorized
-	case logging.ErrForbidden:
+	case logging.ErrForbidden, logging.ErrRootReadOnly:
 		return http.StatusForbidden
-	case logging.ErrNotFound:
+	case logging.ErrNotFound, logging.ErrUnknownUID:
 		return http.StatusNotFound
 	case logging.ErrConflict:
 		return http.StatusConflict
+	// 已有重扫在跑：不是参数错也不是业务乐观锁冲突，而是「服务端此刻忙」，
+	// 客户端的正确动作是稍后重试（不修改请求体），故用 409 而非 400/503。
+	case logging.ErrRescanInProgress:
+		return http.StatusConflict
+	// 条件写失败（If-Match 内容不符 / If-None-Match: * 命中已存在）是「前提不成立」，
+	// 用 412 而非 409：客户端的正确动作是重新拉取当前内容后再试。
+	case logging.ErrETagMismatch:
+		return http.StatusPreconditionFailed
 	default:
 		return http.StatusInternalServerError
 	}

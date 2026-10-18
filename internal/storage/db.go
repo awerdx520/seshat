@@ -29,7 +29,7 @@ import (
 // 语义：migrations 中第 i 条脚本将 user_version 从 i 迁移到 i+1，因此
 // schemaVersion 必须恒等于 len(migrations)（由 TestMigrationsLengthMatchesVersion 守卫）。
 // 新增迁移时：追加脚本到 migrations 末尾，并把 schemaVersion 加一。
-const schemaVersion = 5
+const schemaVersion = 7
 
 // migrations 按版本顺序保存 schema 迁移脚本。
 //
@@ -100,10 +100,151 @@ CREATE INDEX IF NOT EXISTS idx_annotations_document ON annotations(document_id);
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );`,
+	// v6：文件身份三表（M7 服务端地基：uid 身份 · 引用 · 增量同步）。
+	//
+	// 本版本只新增身份相关表，不改动任何既有表——「身份登记」（v6）与「状态表按 uid
+	// 重建」（v7，B4 落地）分开，使两者各自成为可独立验证的交付点。
+	//
+	// resources 是服务端权威的文件身份登记：uid 由服务端生成，跨改名稳定；path 为
+	// 当前路径，UNIQUE(root, path) 保证同一根下一条路径只对应一个 uid；删除写墓碑
+	// （deleted_at 置非空）而非物理删除，path 保留删除前值，使按 uid 仍可追溯。
+	// blob 建索引以支撑「按内容哈希找资源」的反查。
+	//
+	// changes 是全局单调游标日志：seq 由 SQLite AUTOINCREMENT 提供，保证严格递增且
+	// 不复用（客户端以最后消费的 seq 作游标拉增量）；op 取值 create/update/rename/delete；
+	// old_path 仅 rename 事件使用。日志不设 TTL。
+	//
+	// refs 是引用图：一条记录表示「source 在 source_location 处引用了 target」；
+	// 复合主键天然去重，target_uid 建索引以支撑「谁引用了我」的反向查询。
+	`-- 资源登记表：服务端权威文件身份
+CREATE TABLE IF NOT EXISTS resources (
+  uid        TEXT PRIMARY KEY,
+  root       TEXT NOT NULL,
+  path       TEXT NOT NULL,
+  kind       TEXT NOT NULL DEFAULT 'file',
+  blob       TEXT NOT NULL DEFAULT '',
+  size       INTEGER NOT NULL DEFAULT 0,
+  mtime      INTEGER NOT NULL DEFAULT 0,
+  rev        TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  deleted_at TEXT,
+  UNIQUE(root, path)
+);
+CREATE INDEX IF NOT EXISTS idx_resources_blob ON resources(blob);
+
+-- 变更日志：全局单调游标
+CREATE TABLE IF NOT EXISTS changes (
+  seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+  uid        TEXT NOT NULL,
+  op         TEXT NOT NULL,
+  root       TEXT NOT NULL,
+  path       TEXT NOT NULL,
+  old_path   TEXT NOT NULL DEFAULT '',
+  blob       TEXT NOT NULL DEFAULT '',
+  rev        TEXT NOT NULL DEFAULT '',
+  changed_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_changes_uid ON changes(uid);
+
+-- 引用图
+CREATE TABLE IF NOT EXISTS refs (
+  source_uid      TEXT NOT NULL,
+  source_location TEXT NOT NULL DEFAULT '',
+  target_uid      TEXT NOT NULL,
+  target_location TEXT NOT NULL DEFAULT '',
+  created_at      TEXT NOT NULL,
+  PRIMARY KEY (source_uid, source_location, target_uid, target_location)
+);
+CREATE INDEX IF NOT EXISTS idx_refs_target ON refs(target_uid);`,
+	// v7：状态表按 uid 重建（M7 B4：状态 API 破坏性切换）。
+	//
+	// 为什么 DROP 重建而非数据搬迁：M7 开工时服务端尚未部署，状态表无存量数据；
+	// 保留 document_id 需长期维护两套读写路径，收益为零。该假设不靠约定兜底——执行
+	// 本脚本前由 preMigrationChecks[7] 机械校验两表为空，非空即中止（见
+	// assertStateTablesEmptyBeforeRebuild）。
+	//
+	// 重建后的语义与 v2 一致，只把文档键从 document_id（路径/内容标识）换成 uid
+	// （服务端权威身份，跨改名稳定）：reading_progress 仍以文档键为主键（每文档一条、
+	// 后写覆盖），annotations 仍按文档键建索引以支撑「按文档列举」。
+	`DROP TABLE IF EXISTS reading_progress;
+CREATE TABLE IF NOT EXISTS reading_progress (
+  uid        TEXT PRIMARY KEY,
+  position   TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+DROP TABLE IF EXISTS annotations;
+CREATE TABLE IF NOT EXISTS annotations (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  uid        TEXT NOT NULL,
+  location   TEXT NOT NULL,
+  text       TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_annotations_uid ON annotations(uid);`,
 }
 
 // errEmptyPath 表示调用方传入了空的数据库路径。
 var errEmptyPath = errors.New("数据库路径为空")
+
+// preMigrationChecks 保存「脚本执行之前」必须通过的防御性检查（键为迁移版本号）。
+//
+// 存在理由：v7 会 DROP 并重建状态表，这是不可逆操作；计划假设 H7「状态表无存量
+// 数据」必须由机械校验兜住，而不是靠部署约定。检查必须在脚本执行前、同一事务内
+// 运行，失败即整体回滚（user_version 保持原值）。
+//
+// 为什么用独立 map 而不在 applyMigration 内写 version == 7 分支：applyMigration 是
+// 通用函数，若为一处需求塞入特定版本分支，后续每次不可逆迁移都要再加一条分支；
+// 用钩子表则「预防性检查」与「迁移逻辑」解耦，新增版本只需追加一条记录，其余版本
+// 语义完全不变（无钩子的版本走空检查，行为与改动前一致）。
+var preMigrationChecks = map[int]func(tx *sql.Tx) error{
+	7: assertStateTablesEmptyBeforeRebuild,
+}
+
+// assertStateTablesEmptyBeforeRebuild 是 v7 的前置检查：reading_progress 与
+// annotations 都必须为空，任一非空则拒绝重建（避免静默丢数据）。
+//
+// 表不存在时视为 0 行（全新库或从未写过状态）——存在性经 sqlite_master 判断，
+// 因为对缺表执行 SELECT COUNT(*) 会报错而非返回 0。错误信息同时给出两表行数，
+// 让运维一眼看出是哪张表有数据。
+func assertStateTablesEmptyBeforeRebuild(tx *sql.Tx) error {
+	progressRows, err := countRowsIfExists(tx, "reading_progress")
+	if err != nil {
+		return err
+	}
+	annotationRows, err := countRowsIfExists(tx, "annotations")
+	if err != nil {
+		return err
+	}
+	if progressRows == 0 && annotationRows == 0 {
+		return nil
+	}
+	return logging.Wrap(
+		fmt.Errorf("状态表非空，拒绝执行 v7 重建（reading_progress=%d, annotations=%d）",
+			progressRows, annotationRows),
+		logging.ErrInternal, "迁移中止")
+}
+
+// countRowsIfExists 返回表的行数；表不存在时返回 0。
+func countRowsIfExists(tx *sql.Tx, table string) (int64, error) {
+	var exists int
+	err := tx.QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?`, table).Scan(&exists)
+	if err != nil {
+		return 0, logging.Wrap(err, logging.ErrInternal, "检查表 "+table+" 是否存在失败")
+	}
+	if exists == 0 {
+		return 0, nil
+	}
+
+	// 表名来自包内常量列表，不经用户输入，直接拼接安全（PRAGMA/表名无法参数化）。
+	var rows int64
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM ` + table).Scan(&rows); err != nil {
+		return 0, logging.Wrap(err, logging.ErrInternal, "统计表 "+table+" 行数失败")
+	}
+	return rows, nil
+}
 
 // DB 封装底层 SQLite 连接，并暴露存储层的打开/关闭能力。
 type DB struct {
@@ -195,6 +336,14 @@ func applyMigration(db *sql.DB, version int) error {
 		return logging.Wrap(err, logging.ErrInternal, fmt.Sprintf("开始迁移 v%d 事务失败", version))
 	}
 	defer func() { _ = tx.Rollback() }()
+
+	// 不可逆迁移的前置防御（见 preMigrationChecks）：在脚本执行之前完成，失败即
+	// 回滚，user_version 保持原值——「迁移要么整体生效，要么库完全没变」。
+	if check := preMigrationChecks[version]; check != nil {
+		if err := check(tx); err != nil {
+			return err
+		}
+	}
 
 	if _, err := tx.Exec(migrations[version-1]); err != nil {
 		return logging.Wrap(err, logging.ErrInternal, fmt.Sprintf("应用迁移 v%d 失败", version))

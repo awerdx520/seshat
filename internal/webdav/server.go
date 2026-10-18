@@ -62,6 +62,9 @@ var sourceKey = contextKey{}
 //
 // 处理顺序：认证中间件 → 注入来源标记 → webdav.Handler，即先拒绝未认证
 // 请求，再为已认证请求附加来源标记，最后交给 WebDAV 处理器。
+//
+// 警告：本入口不含点路径与软链守卫，生产请使用 ...WithRegistry 变体
+// （VersionedHandlerWithRegistry / NewPolicyVersionedHandlerWithRegistry）。
 func NewHandler(root string, authenticator *auth.Authenticator, source Source) http.Handler {
 	handler := newDAVHandler(davPrefix, webdav.Dir(root))
 	return authenticator.Middleware(injectSource(source, handler))

@@ -18,8 +18,13 @@ db:
   # 数据库密钥：敏感，从环境变量 SESHAT_DB_KEY 读取，不在此处配置。
 
 webdav:
-  # 笔记根目录。
+  # 笔记根目录（等价 roots[0]；未配置 roots 时即为唯一根，tag 为 notes）。
   root: "./data/seshat"
+  # 多根映射：首个为笔记根（mirror，挂 WebDAV + FTS + git），其余为书库根
+  # （ondemand，只读 REST，不进 FTS）。mode 留空时按位置推导；留空/注释掉等价单根 notes。
+  # roots:
+  #   - { tag: notes,  path: "./data/seshat" }
+  #   - { tag: ebooks, path: "./data/ebooks" }
   # 对外公开的出口目录（WebDAV 公开范围）。
   public: "./data/seshat/public"
   # 对外出口是否只读：true 时对外出口拒绝一切写操作，默认 false（可读写）。

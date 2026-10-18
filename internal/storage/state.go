@@ -17,33 +17,33 @@ import (
 // timestampLayout 是进度/批注时间列的存储格式。
 const timestampLayout = time.RFC3339
 
-// Progress 是单个文档的最新阅读进度。
+// Progress 是单个文档的最新阅读进度；文档以 uid 标识（M7 起为服务端权威身份）。
 type Progress struct {
-	DocumentID string
-	Position   string
-	UpdatedAt  string
+	UID       string
+	Position  string
+	UpdatedAt string
 }
 
-// Annotation 是单条批注。
+// Annotation 是单条批注；uid 指向所属文档。
 type Annotation struct {
-	ID         int64
-	DocumentID string
-	Location   string
-	Text       string
-	CreatedAt  string
-	UpdatedAt  string
+	ID        int64
+	UID       string
+	Location  string
+	Text      string
+	CreatedAt string
+	UpdatedAt string
 }
 
-// SetProgress 写入或覆盖文档的阅读进度（同 document_id 后写覆盖）。
+// SetProgress 写入或覆盖文档的阅读进度（同 uid 后写覆盖）。
 //
 // 乐观冲突检测：当客户端显式提供 updatedAt（非空）且服务端已存记录的
 // updated_at 晚于该值（即客户端基于旧版本写入）时，返回 ErrConflict 且不覆盖；
 // 相等或更新则正常覆盖。updatedAt 为空时回填当前 UTC 时间并视为无条件写入，
-// 以保持向后兼容。非 RFC3339 格式、或 documentID/position 为空时返回
+// 以保持向后兼容。非 RFC3339 格式、或 uid/position 为空时返回
 // ErrInvalidArgument 包装的错误。
-func (d *DB) SetProgress(documentID, position, updatedAt string) error {
-	if strings.TrimSpace(documentID) == "" {
-		return logging.NewAppError(logging.ErrInvalidArgument, "document_id 不能为空")
+func (d *DB) SetProgress(uid, position, updatedAt string) error {
+	if strings.TrimSpace(uid) == "" {
+		return logging.NewAppError(logging.ErrInvalidArgument, "uid 不能为空")
 	}
 	if position == "" {
 		return logging.NewAppError(logging.ErrInvalidArgument, "position 不能为空")
@@ -56,16 +56,16 @@ func (d *DB) SetProgress(documentID, position, updatedAt string) error {
 	// 仅在客户端带了时间戳时做冲突检测；空时间戳表示无条件写入。
 	if strings.TrimSpace(updatedAt) != "" {
 		if err := d.assertNotStale(
-			`SELECT updated_at FROM reading_progress WHERE document_id = ?`, documentID, ts); err != nil {
+			`SELECT updated_at FROM reading_progress WHERE uid = ?`, uid, ts); err != nil {
 			return err
 		}
 	}
 
-	// UPSERT：document_id 为主键，冲突时覆盖 position 与 updated_at（后写覆盖语义）。
+	// UPSERT：uid 为主键，冲突时覆盖 position 与 updated_at（后写覆盖语义）。
 	_, err = d.db.Exec(
-		`INSERT INTO reading_progress(document_id, position, updated_at) VALUES(?, ?, ?)
-		 ON CONFLICT(document_id) DO UPDATE SET position = excluded.position, updated_at = excluded.updated_at`,
-		documentID, position, ts)
+		`INSERT INTO reading_progress(uid, position, updated_at) VALUES(?, ?, ?)
+		 ON CONFLICT(uid) DO UPDATE SET position = excluded.position, updated_at = excluded.updated_at`,
+		uid, position, ts)
 	if err != nil {
 		return logging.Wrap(err, logging.ErrInternal, "写入阅读进度失败")
 	}
@@ -73,15 +73,15 @@ func (d *DB) SetProgress(documentID, position, updatedAt string) error {
 }
 
 // GetProgress 读取文档的阅读进度；不存在时返回 ErrNotFound 包装的错误。
-func (d *DB) GetProgress(documentID string) (*Progress, error) {
-	if strings.TrimSpace(documentID) == "" {
-		return nil, logging.NewAppError(logging.ErrInvalidArgument, "document_id 不能为空")
+func (d *DB) GetProgress(uid string) (*Progress, error) {
+	if strings.TrimSpace(uid) == "" {
+		return nil, logging.NewAppError(logging.ErrInvalidArgument, "uid 不能为空")
 	}
 
 	var p Progress
 	err := d.db.QueryRow(
-		`SELECT document_id, position, updated_at FROM reading_progress WHERE document_id = ?`,
-		documentID).Scan(&p.DocumentID, &p.Position, &p.UpdatedAt)
+		`SELECT uid, position, updated_at FROM reading_progress WHERE uid = ?`,
+		uid).Scan(&p.UID, &p.Position, &p.UpdatedAt)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return nil, logging.Wrap(err, logging.ErrNotFound, "阅读进度不存在")
@@ -93,9 +93,9 @@ func (d *DB) GetProgress(documentID string) (*Progress, error) {
 
 // CreateAnnotation 新建一条批注，created_at/updated_at 由服务端以当前 UTC 时间填充，
 // 返回包含自增 id 与时间戳的完整记录。必填字段为空时返回 ErrInvalidArgument。
-func (d *DB) CreateAnnotation(documentID, location, text string) (*Annotation, error) {
-	if strings.TrimSpace(documentID) == "" {
-		return nil, logging.NewAppError(logging.ErrInvalidArgument, "document_id 不能为空")
+func (d *DB) CreateAnnotation(uid, location, text string) (*Annotation, error) {
+	if strings.TrimSpace(uid) == "" {
+		return nil, logging.NewAppError(logging.ErrInvalidArgument, "uid 不能为空")
 	}
 	if location == "" {
 		return nil, logging.NewAppError(logging.ErrInvalidArgument, "location 不能为空")
@@ -106,8 +106,8 @@ func (d *DB) CreateAnnotation(documentID, location, text string) (*Annotation, e
 
 	now := time.Now().UTC().Format(timestampLayout)
 	res, err := d.db.Exec(
-		`INSERT INTO annotations(document_id, location, text, created_at, updated_at) VALUES(?, ?, ?, ?, ?)`,
-		documentID, location, text, now, now)
+		`INSERT INTO annotations(uid, location, text, created_at, updated_at) VALUES(?, ?, ?, ?, ?)`,
+		uid, location, text, now, now)
 	if err != nil {
 		return nil, logging.Wrap(err, logging.ErrInternal, "创建批注失败")
 	}
@@ -117,24 +117,24 @@ func (d *DB) CreateAnnotation(documentID, location, text string) (*Annotation, e
 	}
 
 	return &Annotation{
-		ID:         id,
-		DocumentID: documentID,
-		Location:   location,
-		Text:       text,
-		CreatedAt:  now,
-		UpdatedAt:  now,
+		ID:        id,
+		UID:       uid,
+		Location:  location,
+		Text:      text,
+		CreatedAt: now,
+		UpdatedAt: now,
 	}, nil
 }
 
 // ListAnnotations 按 id 升序返回指定文档的全部批注；无结果时返回空切片（非 nil）。
-func (d *DB) ListAnnotations(documentID string) ([]Annotation, error) {
-	if strings.TrimSpace(documentID) == "" {
-		return nil, logging.NewAppError(logging.ErrInvalidArgument, "document_id 不能为空")
+func (d *DB) ListAnnotations(uid string) ([]Annotation, error) {
+	if strings.TrimSpace(uid) == "" {
+		return nil, logging.NewAppError(logging.ErrInvalidArgument, "uid 不能为空")
 	}
 
 	rows, err := d.db.Query(
-		`SELECT id, document_id, location, text, created_at, updated_at
-		 FROM annotations WHERE document_id = ? ORDER BY id`, documentID)
+		`SELECT id, uid, location, text, created_at, updated_at
+		 FROM annotations WHERE uid = ? ORDER BY id`, uid)
 	if err != nil {
 		return nil, logging.Wrap(err, logging.ErrInternal, "列举批注失败")
 	}
@@ -144,7 +144,7 @@ func (d *DB) ListAnnotations(documentID string) ([]Annotation, error) {
 	items := make([]Annotation, 0)
 	for rows.Next() {
 		var a Annotation
-		if err := rows.Scan(&a.ID, &a.DocumentID, &a.Location, &a.Text, &a.CreatedAt, &a.UpdatedAt); err != nil {
+		if err := rows.Scan(&a.ID, &a.UID, &a.Location, &a.Text, &a.CreatedAt, &a.UpdatedAt); err != nil {
 			return nil, logging.Wrap(err, logging.ErrInternal, "解析批注记录失败")
 		}
 		items = append(items, a)
@@ -236,8 +236,8 @@ func (d *DB) DeleteAnnotation(id int64) error {
 func (d *DB) getAnnotation(id int64) (*Annotation, error) {
 	var a Annotation
 	err := d.db.QueryRow(
-		`SELECT id, document_id, location, text, created_at, updated_at FROM annotations WHERE id = ?`,
-		id).Scan(&a.ID, &a.DocumentID, &a.Location, &a.Text, &a.CreatedAt, &a.UpdatedAt)
+		`SELECT id, uid, location, text, created_at, updated_at FROM annotations WHERE id = ?`,
+		id).Scan(&a.ID, &a.UID, &a.Location, &a.Text, &a.CreatedAt, &a.UpdatedAt)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return nil, logging.Wrap(err, logging.ErrNotFound, "批注不存在")

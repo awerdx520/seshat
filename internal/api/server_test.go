@@ -23,6 +23,14 @@ import (
 // testToken 是测试用访问令牌，与 New 构造的 Authenticator 保持一致。
 const testToken = "test-token"
 
+// uidDoc / uidOther / uidAbsent 是状态端点用例的固定 uid（26 位 Crockford Base32）；
+// uidAbsent 仅用于「合法但无记录」的 404 场景。
+const (
+	uidDoc    = "01K8Q3M7D2X9V6T1B8N5C0RDEJ"
+	uidOther  = "01K8Q3M7D2X9V6T1B8N5C0RDEK"
+	uidAbsent = "01K8Q3M7D2X9V6T1B8N5C0RDEM"
+)
+
 // newTestHandler 构造挂载了临时数据库与测试令牌的 REST 处理器。
 func newTestHandler(t *testing.T) http.Handler {
 	t.Helper()
@@ -104,7 +112,7 @@ func assertErrorCode(t *testing.T, rec *httptest.ResponseRecorder, status int, c
 func TestProgressPutThenGet(t *testing.T) {
 	h := newTestHandler(t)
 
-	put := do(t, h, http.MethodPut, "/api/progress/book-1", testToken, map[string]string{
+	put := do(t, h, http.MethodPut, "/api/progress/"+uidDoc, testToken, map[string]string{
 		"position":   "chapter-3:42",
 		"updated_at": "2026-10-11T10:00:00Z",
 	}, nil)
@@ -112,13 +120,13 @@ func TestProgressPutThenGet(t *testing.T) {
 		t.Fatalf("PUT 状态码 = %d, 期望 200 (body=%q)", put.Code, put.Body.String())
 	}
 
-	get := do(t, h, http.MethodGet, "/api/progress/book-1", testToken, nil, nil)
+	get := do(t, h, http.MethodGet, "/api/progress/"+uidDoc, testToken, nil, nil)
 	if get.Code != http.StatusOK {
 		t.Fatalf("GET 状态码 = %d, 期望 200 (body=%q)", get.Code, get.Body.String())
 	}
 	body := decodeJSON(t, get)
-	if body["document_id"] != "book-1" {
-		t.Fatalf("document_id = %v, 期望 book-1", body["document_id"])
+	if body["uid"] != uidDoc {
+		t.Fatalf("uid = %v, 期望 %s", body["uid"], uidDoc)
 	}
 	if body["position"] != "chapter-3:42" {
 		t.Fatalf("position = %v, 期望 chapter-3:42", body["position"])
@@ -133,7 +141,7 @@ func TestProgressPutOverwrites(t *testing.T) {
 	h := newTestHandler(t)
 
 	for _, pos := range []string{"p1", "p2"} {
-		rec := do(t, h, http.MethodPut, "/api/progress/doc", testToken, map[string]string{
+		rec := do(t, h, http.MethodPut, "/api/progress/"+uidDoc, testToken, map[string]string{
 			"position":   pos,
 			"updated_at": "2026-10-11T10:00:00Z",
 		}, nil)
@@ -142,7 +150,7 @@ func TestProgressPutOverwrites(t *testing.T) {
 		}
 	}
 
-	get := do(t, h, http.MethodGet, "/api/progress/doc", testToken, nil, nil)
+	get := do(t, h, http.MethodGet, "/api/progress/"+uidDoc, testToken, nil, nil)
 	if got := decodeJSON(t, get)["position"]; got != "p2" {
 		t.Fatalf("position = %v, 期望后写覆盖为 p2", got)
 	}
@@ -152,7 +160,7 @@ func TestProgressPutOverwrites(t *testing.T) {
 func TestProgressGetNotFound(t *testing.T) {
 	h := newTestHandler(t)
 
-	rec := do(t, h, http.MethodGet, "/api/progress/missing", testToken, nil, nil)
+	rec := do(t, h, http.MethodGet, "/api/progress/"+uidAbsent, testToken, nil, nil)
 	assertErrorCode(t, rec, http.StatusNotFound, "not_found")
 }
 
@@ -160,7 +168,7 @@ func TestProgressGetNotFound(t *testing.T) {
 func TestProgressPutMissingPosition(t *testing.T) {
 	h := newTestHandler(t)
 
-	rec := do(t, h, http.MethodPut, "/api/progress/doc", testToken, map[string]string{
+	rec := do(t, h, http.MethodPut, "/api/progress/"+uidDoc, testToken, map[string]string{
 		"position":   "",
 		"updated_at": "2026-10-11T10:00:00Z",
 	}, nil)
@@ -172,7 +180,7 @@ func TestProgressNotModified(t *testing.T) {
 	h := newTestHandler(t)
 
 	const stamp = "2026-10-11T10:00:00Z"
-	put := do(t, h, http.MethodPut, "/api/progress/doc", testToken, map[string]string{
+	put := do(t, h, http.MethodPut, "/api/progress/"+uidDoc, testToken, map[string]string{
 		"position":   "p1",
 		"updated_at": stamp,
 	}, nil)
@@ -185,7 +193,7 @@ func TestProgressNotModified(t *testing.T) {
 		t.Fatalf("解析时间戳失败: %v", err)
 	}
 
-	rec := do(t, h, http.MethodGet, "/api/progress/doc", testToken, nil, map[string]string{
+	rec := do(t, h, http.MethodGet, "/api/progress/"+uidDoc, testToken, nil, map[string]string{
 		"If-Modified-Since": ts.Format(http.TimeFormat),
 	})
 	if rec.Code != http.StatusNotModified {
@@ -196,7 +204,7 @@ func TestProgressNotModified(t *testing.T) {
 	}
 
 	// 早于更新时间的 If-Modified-Since 应返回完整内容。
-	older := do(t, h, http.MethodGet, "/api/progress/doc", testToken, nil, map[string]string{
+	older := do(t, h, http.MethodGet, "/api/progress/"+uidDoc, testToken, nil, map[string]string{
 		"If-Modified-Since": ts.Add(-time.Hour).Format(http.TimeFormat),
 	})
 	if older.Code != http.StatusOK {
@@ -209,9 +217,9 @@ func TestAnnotationsCRUD(t *testing.T) {
 	h := newTestHandler(t)
 
 	created := do(t, h, http.MethodPost, "/api/annotations", testToken, map[string]string{
-		"document_id": "book-1",
-		"location":    "chapter-1:10",
-		"text":        "第一条批注",
+		"uid":      uidDoc,
+		"location": "chapter-1:10",
+		"text":     "第一条批注",
 	}, nil)
 	if created.Code != http.StatusCreated {
 		t.Fatalf("POST 状态码 = %d, 期望 201 (body=%q)", created.Code, created.Body.String())
@@ -221,7 +229,7 @@ func TestAnnotationsCRUD(t *testing.T) {
 	if !ok || id <= 0 {
 		t.Fatalf("创建响应缺少有效 id: %q", created.Body.String())
 	}
-	if createdBody["document_id"] != "book-1" || createdBody["location"] != "chapter-1:10" {
+	if createdBody["uid"] != uidDoc || createdBody["location"] != "chapter-1:10" {
 		t.Fatalf("创建响应字段不符: %q", created.Body.String())
 	}
 	for _, field := range []string{"created_at", "updated_at"} {
@@ -230,7 +238,7 @@ func TestAnnotationsCRUD(t *testing.T) {
 		}
 	}
 
-	list := do(t, h, http.MethodGet, "/api/annotations?document_id=book-1", testToken, nil, nil)
+	list := do(t, h, http.MethodGet, "/api/annotations?uid="+uidDoc, testToken, nil, nil)
 	if list.Code != http.StatusOK {
 		t.Fatalf("GET 列表状态码 = %d, 期望 200", list.Code)
 	}
@@ -259,43 +267,44 @@ func TestAnnotationsCRUD(t *testing.T) {
 		t.Fatalf("DELETE 状态码 = %d, 期望 204 (body=%q)", deleteRec.Code, deleteRec.Body.String())
 	}
 
-	after := decodeList(t, do(t, h, http.MethodGet, "/api/annotations?document_id=book-1", testToken, nil, nil))
+	after := decodeList(t, do(t, h, http.MethodGet, "/api/annotations?uid="+uidDoc, testToken, nil, nil))
 	if len(after) != 0 {
 		t.Fatalf("删除后批注条数 = %d, 期望 0", len(after))
 	}
 }
 
-// TestAnnotationsListSeparatesDocuments 验证列表按 document_id 过滤。
-func TestAnnotationsListSeparatesDocuments(t *testing.T) {
+// TestAnnotationsListSeparatesUIDs 验证列表按 uid 隔离。
+func TestAnnotationsListSeparatesUIDs(t *testing.T) {
 	h := newTestHandler(t)
 
-	for _, doc := range []string{"a", "a", "b"} {
+	for _, doc := range []string{uidDoc, uidDoc, uidOther} {
 		rec := do(t, h, http.MethodPost, "/api/annotations", testToken, map[string]string{
-			"document_id": doc,
-			"location":    "loc",
-			"text":        "text",
+			"uid":      doc,
+			"location": "loc",
+			"text":     "text",
 		}, nil)
 		if rec.Code != http.StatusCreated {
 			t.Fatalf("POST 状态码 = %d, 期望 201", rec.Code)
 		}
 	}
 
-	items := decodeList(t, do(t, h, http.MethodGet, "/api/annotations?document_id=a", testToken, nil, nil))
+	items := decodeList(t, do(t, h, http.MethodGet, "/api/annotations?uid="+uidDoc, testToken, nil, nil))
 	if len(items) != 2 {
-		t.Fatalf("文档 a 的批注条数 = %d, 期望 2", len(items))
+		t.Fatalf("uidDoc 的批注条数 = %d, 期望 2", len(items))
 	}
-	items = decodeList(t, do(t, h, http.MethodGet, "/api/annotations?document_id=b", testToken, nil, nil))
+	items = decodeList(t, do(t, h, http.MethodGet, "/api/annotations?uid="+uidOther, testToken, nil, nil))
 	if len(items) != 1 {
-		t.Fatalf("文档 b 的批注条数 = %d, 期望 1", len(items))
+		t.Fatalf("uidOther 的批注条数 = %d, 期望 1", len(items))
 	}
 }
 
-// TestAnnotationsListRequiresDocumentID 验证缺少 document_id 查询参数返回 400。
-func TestAnnotationsListRequiresDocumentID(t *testing.T) {
+// TestAnnotationsListRequiresUID 验证缺少 uid 查询参数返回 400 invalid_uid。
+func TestAnnotationsListRequiresUID(t *testing.T) {
 	h := newTestHandler(t)
 
+	// 未带 uid 查询参数：uid 为空串 → 形态非法，按 invalid_uid 拒绝。
 	rec := do(t, h, http.MethodGet, "/api/annotations", testToken, nil, nil)
-	assertErrorCode(t, rec, http.StatusBadRequest, "invalid_argument")
+	assertErrorCode(t, rec, http.StatusBadRequest, "invalid_uid")
 }
 
 // TestAnnotationCreateRejectsEmptyFields 验证创建时必填字段为空返回 400。
@@ -303,9 +312,9 @@ func TestAnnotationCreateRejectsEmptyFields(t *testing.T) {
 	h := newTestHandler(t)
 
 	rec := do(t, h, http.MethodPost, "/api/annotations", testToken, map[string]string{
-		"document_id": "book-1",
-		"location":    "",
-		"text":        "text",
+		"uid":      uidDoc,
+		"location": "",
+		"text":     "text",
 	}, nil)
 	assertErrorCode(t, rec, http.StatusBadRequest, "invalid_argument")
 }
@@ -360,9 +369,9 @@ func TestRequestBodyTooLarge(t *testing.T) {
 	// text 字段承载超过 1 MiB 的填充数据，使整个 JSON 主体超出上限。
 	big := strings.Repeat("a", 1<<20+1024)
 	payload, err := json.Marshal(map[string]string{
-		"document_id": "book-1",
-		"location":    "loc",
-		"text":        big,
+		"uid":      uidDoc,
+		"location": "loc",
+		"text":     big,
 	})
 	if err != nil {
 		t.Fatalf("序列化请求体失败: %v", err)
@@ -389,7 +398,7 @@ func TestUnauthorized(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			rec := do(t, h, http.MethodGet, "/api/progress/doc", tc.token, nil, nil)
+			rec := do(t, h, http.MethodGet, "/api/progress/"+uidDoc, tc.token, nil, nil)
 			if rec.Code != http.StatusUnauthorized {
 				t.Fatalf("GET 状态码 = %d, 期望 401", rec.Code)
 			}
@@ -400,9 +409,9 @@ func TestUnauthorized(t *testing.T) {
 			assertErrorCode(t, rec, http.StatusUnauthorized, "unauthorized")
 
 			rec = do(t, h, http.MethodPost, "/api/annotations", tc.token, map[string]string{
-				"document_id": "book-1",
-				"location":    "loc",
-				"text":        "text",
+				"uid":      uidDoc,
+				"location": "loc",
+				"text":     "text",
 			}, nil)
 			if rec.Code != http.StatusUnauthorized {
 				t.Fatalf("POST 状态码 = %d, 期望 401", rec.Code)
@@ -452,14 +461,14 @@ func TestServerEndToEndOverRealHTTP(t *testing.T) {
 	}
 
 	// 未认证请求在真实栈下同样拒绝。
-	unauth := send(http.MethodGet, "/api/progress/doc", "", nil, nil)
+	unauth := send(http.MethodGet, "/api/progress/"+uidDoc, "", nil, nil)
 	_ = unauth.Body.Close()
 	if unauth.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("未认证状态码 = %d, 期望 401", unauth.StatusCode)
 	}
 
 	const stamp = "2026-10-11T10:00:00Z"
-	put := send(http.MethodPut, "/api/progress/doc", testToken, map[string]string{
+	put := send(http.MethodPut, "/api/progress/"+uidDoc, testToken, map[string]string{
 		"position":   "p1",
 		"updated_at": stamp,
 	}, nil)
@@ -476,7 +485,7 @@ func TestServerEndToEndOverRealHTTP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("解析时间戳失败: %v", err)
 	}
-	notModified := send(http.MethodGet, "/api/progress/doc", testToken, nil, map[string]string{
+	notModified := send(http.MethodGet, "/api/progress/"+uidDoc, testToken, nil, map[string]string{
 		"If-Modified-Since": ts.Format(http.TimeFormat),
 	})
 	buf, _ := io.ReadAll(notModified.Body)
@@ -489,9 +498,9 @@ func TestServerEndToEndOverRealHTTP(t *testing.T) {
 	}
 
 	created := send(http.MethodPost, "/api/annotations", testToken, map[string]string{
-		"document_id": "book-1",
-		"location":    "loc",
-		"text":        "text",
+		"uid":      uidDoc,
+		"location": "loc",
+		"text":     "text",
 	}, nil)
 	if created.StatusCode != http.StatusCreated {
 		t.Fatalf("POST 状态码 = %d, 期望 201", created.StatusCode)
@@ -513,7 +522,7 @@ func TestServerEndToEndOverRealHTTP(t *testing.T) {
 func TestUnauthorizedDoesNotWrite(t *testing.T) {
 	h := newTestHandler(t)
 
-	rec := do(t, h, http.MethodPut, "/api/progress/doc", "wrong-token", map[string]string{
+	rec := do(t, h, http.MethodPut, "/api/progress/"+uidDoc, "wrong-token", map[string]string{
 		"position":   "p1",
 		"updated_at": "2026-10-11T10:00:00Z",
 	}, nil)
@@ -522,7 +531,7 @@ func TestUnauthorizedDoesNotWrite(t *testing.T) {
 	}
 
 	// 认证通过后读取应仍为 404（未被未认证写入污染）。
-	got := do(t, h, http.MethodGet, "/api/progress/doc", testToken, nil, nil)
+	got := do(t, h, http.MethodGet, "/api/progress/"+uidDoc, testToken, nil, nil)
 	if got.Code != http.StatusNotFound {
 		t.Fatalf("读取状态码 = %d, 期望 404（未认证请求不应写入）", got.Code)
 	}
@@ -533,7 +542,7 @@ func TestUnauthorizedDoesNotWrite(t *testing.T) {
 func TestProgressConflictReturns409(t *testing.T) {
 	h := newTestHandler(t)
 
-	put := do(t, h, http.MethodPut, "/api/progress/doc", testToken, map[string]string{
+	put := do(t, h, http.MethodPut, "/api/progress/"+uidDoc, testToken, map[string]string{
 		"position":   "p-new",
 		"updated_at": "2026-10-11T11:00:00Z",
 	}, nil)
@@ -541,13 +550,13 @@ func TestProgressConflictReturns409(t *testing.T) {
 		t.Fatalf("首次 PUT 状态码 = %d, 期望 200 (body=%q)", put.Code, put.Body.String())
 	}
 
-	stale := do(t, h, http.MethodPut, "/api/progress/doc", testToken, map[string]string{
+	stale := do(t, h, http.MethodPut, "/api/progress/"+uidDoc, testToken, map[string]string{
 		"position":   "p-stale",
 		"updated_at": "2026-10-11T10:00:00Z",
 	}, nil)
 	assertErrorCode(t, stale, http.StatusConflict, "conflict")
 
-	get := do(t, h, http.MethodGet, "/api/progress/doc", testToken, nil, nil)
+	get := do(t, h, http.MethodGet, "/api/progress/"+uidDoc, testToken, nil, nil)
 	if got := decodeJSON(t, get)["position"]; got != "p-new" {
 		t.Fatalf("冲突后 position = %v, 期望保持 p-new（不被旧时间戳覆盖）", got)
 	}
@@ -558,9 +567,9 @@ func TestAnnotationConflictReturns409(t *testing.T) {
 	h := newTestHandler(t)
 
 	created := do(t, h, http.MethodPost, "/api/annotations", testToken, map[string]string{
-		"document_id": "doc",
-		"location":    "loc",
-		"text":        "原始",
+		"uid":      uidDoc,
+		"location": "loc",
+		"text":     "原始",
 	}, nil)
 	if _, ok := decodeJSON(t, created)["id"].(float64); !ok {
 		t.Fatalf("创建响应缺少 id: %q", created.Body.String())
@@ -572,4 +581,38 @@ func TestAnnotationConflictReturns409(t *testing.T) {
 		"updated_at": "2000-01-01T00:00:00Z",
 	}, nil)
 	assertErrorCode(t, update, http.StatusConflict, "conflict")
+}
+
+// TestMergeBaseConflictDoesNotLeakGitError 验证「无共同祖先」的 409 只返回固定文案：
+// 响应体不得携带 git 内部错误文本（revision 串、go-git 的走查细节），原始错误只进日志。
+func TestMergeBaseConflictDoesNotLeakGitError(t *testing.T) {
+	repo, root := openRepo(t)
+	h := newVersionHandler(t, repo)
+
+	writeRepoFile(t, root, "a.org", "第一版\n")
+	if err := repo.Commit("c1"); err != nil {
+		t.Fatalf("Commit 失败: %v", err)
+	}
+	c1 := repoHead(t, repo)
+
+	// 直接写入对象库的孤立提交：与 c1 分属互不相连的历史。
+	orphan := writeOrphanCommit(t, root, "orphan.org", "孤立内容\n", "孤立提交")
+
+	rec := do(t, h, http.MethodGet, "/api/merge-base?a="+orphan+"&b="+c1, testToken, nil, nil)
+	assertErrorCode(t, rec, http.StatusConflict, "conflict")
+
+	errObj, ok := decodeJSON(t, rec)["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("响应体缺少 error 对象: %q", rec.Body.String())
+	}
+	msg, _ := errObj["message"].(string)
+	if msg != "两个版本无共同祖先" {
+		t.Errorf("错误信息 = %q, 期望固定文案「两个版本无共同祖先」", msg)
+	}
+	// 任何内部细节都不该出现在响应体里：完整 hash、go-git 的措辞。
+	for _, leak := range []string{orphan, c1, "共同祖先失败", "merge-base"} {
+		if strings.Contains(rec.Body.String(), leak) {
+			t.Errorf("响应体泄漏内部错误文本 %q: %q", leak, rec.Body.String())
+		}
+	}
 }
