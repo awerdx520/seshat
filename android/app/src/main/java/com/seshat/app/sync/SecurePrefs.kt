@@ -28,6 +28,8 @@ class SecurePrefs internal constructor(
     private val prefs: SharedPreferences,
     private val legacy: SharedPreferences?,
     val isEncrypted: Boolean,
+    /** 读取/写入配置失败（密钥损坏、备份恢复后 KEK 失效等）时的回调，供 UI 提示。 */
+    private val onUnreadable: (() -> Unit)? = null,
 ) {
 
     /**
@@ -35,13 +37,21 @@ class SecurePrefs internal constructor(
      *
      * 若加密存储中不存在 [key] 而旧明文存储中存在同名键，则把值迁移到加密存储、
      * 删除明文旧值，并返回该值；两者都没有时返回 [defValue]。
+     *
+     * 解密失败（KEK 失效 / 文件损坏）时不抛出，返回 [defValue] 并回调 [onUnreadable]，
+     * 保证设置页仍可打开并执行「重置本地配置」。
      */
-    fun getString(key: String, defValue: String? = null): String? {
-        val current = prefs.getString(key, null)
-        if (current != null) return current
+    fun getString(key: String, defValue: String? = null): String? = try {
+        prefs.getString(key, null) ?: migrateLegacy(key) ?: defValue
+    } catch (e: Exception) {
+        Log.w(TAG, "读取加密配置失败，配置不可用", e)
+        onUnreadable?.invoke()
+        defValue
+    }
 
-        val legacyValue = legacy?.getString(key, null) ?: return defValue
-        // 迁移：写入加密存储后清除明文旧值，避免令牌以明文继续留存。
+    /** 加密存储缺该键时，从旧明文存储迁移过来并清除明文旧值。 */
+    private fun migrateLegacy(key: String): String? {
+        val legacyValue = legacy?.getString(key, null) ?: return null
         prefs.edit().putString(key, legacyValue).apply()
         legacy.edit().remove(key).apply()
         return legacyValue
@@ -49,7 +59,42 @@ class SecurePrefs internal constructor(
 
     /** 写入字符串值到加密存储。 */
     fun putString(key: String, value: String) {
-        prefs.edit().putString(key, value).apply()
+        try {
+            prefs.edit().putString(key, value).apply()
+        } catch (e: Exception) {
+            Log.w(TAG, "写入配置失败", e)
+            onUnreadable?.invoke()
+        }
+    }
+
+    /**
+     * 写入机密值（访问令牌）。
+     *
+     * 加密存储不可用时**拒绝写入并返回 `false`**——机密绝不降级写入明文 prefs。
+     *
+     * @return 是否成功写入。
+     */
+    fun putSecret(key: String, value: String): Boolean {
+        if (!isEncrypted) return false
+        return try {
+            prefs.edit().putString(key, value).apply()
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "写入加密配置失败，已拒绝保存", e)
+            onUnreadable?.invoke()
+            false
+        }
+    }
+
+    /** 清除本应用保存的全部同步配置（不动 Android Keystore）。 */
+    fun clear() {
+        try {
+            prefs.edit().clear().apply()
+            legacy?.edit()?.clear()?.apply()
+        } catch (e: Exception) {
+            Log.w(TAG, "清除配置失败", e)
+            onUnreadable?.invoke()
+        }
     }
 
     companion object {
@@ -72,8 +117,11 @@ class SecurePrefs internal constructor(
          *
          * 优先创建 [EncryptedSharedPreferences]；初始化失败时回退到普通
          * [SharedPreferences]（[LEGACY_PREFS]）并告警，保证同步功能仍可用、历史明文配置仍可读。
+         *
+         * @param onUnreadable 读取/写入失败（密钥损坏、备份恢复后 KEK 失效等）时的回调，
+         *   供设置页展示常驻告警，避免直接崩溃。
          */
-        fun open(context: Context): SecurePrefs {
+        fun open(context: Context, onUnreadable: (() -> Unit)? = null): SecurePrefs {
             val legacy = context.getSharedPreferences(LEGACY_PREFS, Context.MODE_PRIVATE)
             return try {
                 val masterKey = MasterKey.Builder(context)
@@ -86,11 +134,11 @@ class SecurePrefs internal constructor(
                     EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
                     EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
                 )
-                SecurePrefs(encrypted, legacy, isEncrypted = true)
+                SecurePrefs(encrypted, legacy, true, onUnreadable)
             } catch (e: Exception) {
                 // 设备不支持硬件密钥库 / 密钥库损坏 / 文件解密失败等。
                 Log.w(TAG, "加密存储初始化失败，回退到普通 SharedPreferences", e)
-                SecurePrefs(legacy, null, isEncrypted = false)
+                SecurePrefs(legacy, null, isEncrypted = false, onUnreadable = onUnreadable)
             }
         }
     }

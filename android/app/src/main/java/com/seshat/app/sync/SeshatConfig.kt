@@ -33,4 +33,8 @@ data class SeshatConfig(
         val p = path.trimStart('/')
         return if (p.isEmpty()) davBase else "$davBase/$p"
     }
+
+    /** 脱敏输出：避免 `toString()` 把访问令牌带进日志或异常消息。 */
+    override fun toString(): String =
+        "SeshatConfig(serverUrl=$serverUrl, token=***, remoteDir=$remoteDir)"
 }

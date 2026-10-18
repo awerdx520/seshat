@@ -71,6 +71,9 @@ dependencies {
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("com.google.android.material:material:1.12.0")
 
+    // Fragment：三区骨架的 Fragment 宿主（原由 appcompat 传递引入，此处显式固定版本）
+    implementation("androidx.fragment:fragment:1.5.4")
+
     // 阅读器 UI：ViewPager2 逐页翻页 + RecyclerView 适配器
     implementation("androidx.viewpager2:viewpager2:1.1.0")
     implementation("androidx.recyclerview:recyclerview:1.3.2")
@@ -84,8 +87,6 @@ dependencies {
     // 安全存储：同步令牌（auth_token）经 EncryptedSharedPreferences 加密保存
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
 
-    // 阅读：章节分页（左右滑动切换章节）
-    implementation("androidx.viewpager2:viewpager2:1.1.0")
     // 阅读：WebViewAssetLoader —— 以 https 虚拟域提供 epub 内资源，规避 file:// 访问限制
     implementation("androidx.webkit:webkit:1.12.1")
 

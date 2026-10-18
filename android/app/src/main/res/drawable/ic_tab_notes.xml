@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 笔记 tab 图标：竖版书页轮廓 + 三条横线（自绘几何，颜色由 BottomNavigationView 的 itemIconTint 着色） -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+
+    <path
+        android:fillColor="@android:color/transparent"
+        android:pathData="M6,3h9l3,3v15H6z"
+        android:strokeColor="#FF000000"
+        android:strokeLineJoin="round"
+        android:strokeWidth="1.6" />
+
+    <path
+        android:fillColor="@android:color/transparent"
+        android:pathData="M9,8h6M9,12h6M9,16h4"
+        android:strokeColor="#FF000000"
+        android:strokeLineCap="round"
+        android:strokeWidth="1.6" />
+</vector>

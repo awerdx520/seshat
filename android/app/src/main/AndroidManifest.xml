@@ -6,8 +6,11 @@
 
     <application
         android:allowBackup="true"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
         android:icon="@drawable/ic_launcher"
         android:label="@string/app_name"
+        android:name=".SeshatApp"
         android:supportsRtl="true"
         android:theme="@style/Theme.Seshat">
 
@@ -36,6 +39,12 @@
             android:name=".gtd.GtdActivity"
             android:exported="false"
             android:label="@string/title_gtd" />
+
+        <!-- 同步设置页（M9.1）：仅应用内启动，不对外导出 -->
+        <activity
+            android:name=".settings.SettingsActivity"
+            android:exported="false"
+            android:label="@string/settings_title" />
     </application>
 
 </manifest>

@@ -81,4 +81,37 @@ class SecurePrefsTest {
         prefs.putString(SecurePrefs.KEY_AUTH_TOKEN, "t")
         assertEquals("t", prefs.getString(SecurePrefs.KEY_AUTH_TOKEN))
     }
+
+    @Test
+    fun putSecretRejectedWhenNotEncrypted() {
+        // 加密不可用时拒绝写入机密，绝不降级明文
+        val fallback = FakeSharedPreferences()
+        val prefs = SecurePrefs(fallback, null, isEncrypted = false)
+
+        assertFalse(prefs.putSecret(SecurePrefs.KEY_AUTH_TOKEN, "secret"))
+        assertNull(fallback.getString(SecurePrefs.KEY_AUTH_TOKEN, null))
+    }
+
+    @Test
+    fun putSecretWritesWhenEncrypted() {
+        val prefs = SecurePrefs(encrypted, legacy, isEncrypted = true)
+
+        assertTrue(prefs.putSecret(SecurePrefs.KEY_AUTH_TOKEN, "v"))
+        assertEquals("v", encrypted.getString(SecurePrefs.KEY_AUTH_TOKEN, null))
+    }
+
+    @Test
+    fun clearRemovesAllKeys() {
+        val prefs = SecurePrefs(encrypted, legacy, isEncrypted = true)
+        prefs.putString(SecurePrefs.KEY_SERVER_URL, "https://a.com")
+        prefs.putString(SecurePrefs.KEY_AUTH_TOKEN, "t")
+        legacy.putRaw(SecurePrefs.KEY_AUTH_TOKEN, "plain")
+
+        prefs.clear()
+
+        assertNull(encrypted.getString(SecurePrefs.KEY_SERVER_URL, null))
+        assertNull(encrypted.getString(SecurePrefs.KEY_AUTH_TOKEN, null))
+        // 明文回退存储同样被清空
+        assertTrue(legacy.getAll().isEmpty())
+    }
 }

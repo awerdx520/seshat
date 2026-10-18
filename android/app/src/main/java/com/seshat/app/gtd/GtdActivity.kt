@@ -14,6 +14,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.seshat.app.R
+import com.seshat.app.settings.AppPreferences
 import com.seshat.app.sync.SeshatConfig
 import com.seshat.app.sync.SecurePrefs
 import com.seshat.app.sync.WebDavClient
@@ -29,8 +30,8 @@ import java.io.File
  * 交互（M4.3）：
  * - **点击条目**：按 `TODO→DONE、DONE→TODO、无状态→TODO` 切换 TODO 状态，经 [OrgEditor]
  *   改写 org 文本并写回本地文件，随后重新解析刷新列表与过滤栏。
- * - **同步按钮**：后台线程把本地 org 文件 `PUT` 到 WebDAV 服务端（远端相对路径
- *   [REMOTE_PATH]），主线程 Toast 结果；服务器配置见 [readSyncConfig]。
+ * - **同步按钮**：后台线程把本地 org 文件 `PUT` 到 WebDAV 服务端（远端路径为
+ *   「远程目录 + `seshat/sample.org`」，见 [readSyncConfig] 与 [joinPath]），主线程 Toast 结果。
  *
  * 入口：[intent] 静态工厂方法（应用内启动，exported=false）。
  */
@@ -176,10 +177,12 @@ class GtdActivity : AppCompatActivity() {
         }
 
         Toast.makeText(this, getString(R.string.gtd_syncing), Toast.LENGTH_SHORT).show()
+        // 远程目录取自应用偏好（非机密），下次同步自动生效；与固定文件名拼成远端路径。
+        val remotePath = joinPath(AppPreferences.open(this).remoteDir(), "seshat/sample.org")
         // 网络请求必须离开主线程，避免 NetworkOnMainThreadException / ANR。
         Thread {
             val message = try {
-                val code = WebDavClient(config).put(REMOTE_PATH, content, ORG_CONTENT_TYPE)
+                val code = WebDavClient(config).put(remotePath, content, ORG_CONTENT_TYPE)
                 getString(R.string.gtd_sync_success, code)
             } catch (e: Exception) {
                 getString(R.string.gtd_sync_failed, e.message ?: e.javaClass.simpleName)
@@ -201,7 +204,18 @@ class GtdActivity : AppCompatActivity() {
         val serverUrl = prefs.getString(SecurePrefs.KEY_SERVER_URL)?.trim().orEmpty()
         val token = prefs.getString(SecurePrefs.KEY_AUTH_TOKEN)?.trim().orEmpty()
         if (serverUrl.isEmpty() || token.isEmpty()) return null
-        return SeshatConfig(serverUrl = serverUrl, token = token, remoteDir = REMOTE_DIR)
+        return SeshatConfig(serverUrl = serverUrl, token = token, remoteDir = AppPreferences.open(this).remoteDir())
+    }
+
+    /** 拼接远程路径：目录去首尾斜杠，相对路径去首尾斜杠，空段自动跳过。 */
+    private fun joinPath(dir: String, relative: String): String {
+        val left = dir.trim().trim('/')
+        val right = relative.trim().trim('/')
+        return when {
+            left.isEmpty() -> right
+            right.isEmpty() -> left
+            else -> "$left/$right"
+        }
     }
 
     /** 依据文档内容动态构建三个过滤 Spinner（首项恒为「全部」）并挂载监听。 */
@@ -260,12 +274,6 @@ class GtdActivity : AppCompatActivity() {
     companion object {
         /** 本地 org 文件名（与 assets 同名，首次复制到 filesDir）。 */
         private const val SAMPLE_ASSET = "sample.org"
-
-        /** WebDAV 远端相对路径（拼接为 `<serverUrl>/dav/seshat/sample.org`）。 */
-        private const val REMOTE_PATH = "seshat/sample.org"
-
-        /** WebDAV 笔记目录（相对服务端 `/dav`）。 */
-        private const val REMOTE_DIR = "/"
 
         /** org 文件上传时的 Content-Type。 */
         private const val ORG_CONTENT_TYPE = "text/plain; charset=utf-8"

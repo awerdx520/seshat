@@ -8,6 +8,7 @@ import android.webkit.WebView
 import androidx.fragment.app.Fragment
 import androidx.webkit.WebViewAssetLoader
 import com.seshat.app.R
+import com.seshat.app.settings.AppPreferences
 
 /**
  * 单章阅读页：一个 WebView 承载一章 HTML。
@@ -48,6 +49,8 @@ class ChapterFragment : Fragment() {
             allowContentAccess = false
             builtInZoomControls = true
             displayZoomControls = false
+            // 正文字号（设置页配置，打开阅读器时生效）
+            textZoom = AppPreferences.open(requireContext()).textZoom()
         }
         web.isVerticalScrollBarEnabled = false
         web.setOnScrollChangeListener { _, _, scrollY, _, _ -> host.onChapterScrolled(chapterIndex, scrollY) }

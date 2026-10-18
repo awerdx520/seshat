@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<full-backup-content>
+    <!-- 同步配置含访问令牌：密文在换机恢复后因 KEK 不迁移而无法解密，明文回退则等于泄露，故一律排除 -->
+    <exclude domain="sharedpref" path="seshat_sync_secure.xml" />
+    <exclude domain="sharedpref" path="seshat_sync.xml" />
+</full-backup-content>
