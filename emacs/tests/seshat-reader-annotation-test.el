@@ -24,9 +24,13 @@
 
 ;; `seshat-reader-annotation' 的 ERT 测试套件。
 ;;
-;; 全部用例**绝不触网**：统一用 `cl-letf' 桩替 `seshat-rest--request'，
-;; 由桩记录实参（方法、路径、请求体）并返回构造好的 (STATUS . BODY)
-;; 假响应；任何真实 HTTP 调用都不会发生。
+;; 全部用例**绝不触网**：统一用 `cl-letf' 桩替 `seshat-rest--request'
+;; （记录方法、路径、请求体并返回构造好的假响应）与 `seshat-rest-resolve-uid'
+;; （返回固定 uid，供 `seshat-reader-annotation--uid' 的路径 → uid 解析），
+;; 任何真实 HTTP 调用都不会发生。
+;;
+;; 双值契约：`doc-id'（\"<标签>:<相对路径>\"）只用于显示与 `seshat:' 链接
+;; 文本；`uid'（服务端权威身份）只用于 API。断言时严格区分二者。
 ;;
 ;; 临时文件与目录一律建在 `temporary-file-directory'（通常 /tmp）下，
 ;; 并在用例结束时递归删除，因此测试可重复运行、不污染仓库。
@@ -48,6 +52,13 @@
 (defvar seshat-reader-annotation-test--calls nil
   "最近一批桩替调用记录，元素形如 (METHOD PATH REQUEST-BODY).")
 
+(defconst seshat-reader-annotation-test--uid "01K8Q3M7D2X9V6T1B8N5C0RDEF"
+  "测试用的固定 uid（服务端权威文件身份）。
+动态绑定为 nil 即表达「服务端未登记该文档」。")
+
+(defvar seshat-reader-annotation-test--resolve-calls nil
+  "最近一批桩替 `seshat-rest-resolve-uid' 的调用记录，元素形如 (ROOT PATH).")
+
 (defun seshat-reader-annotation-test--stub (status response-body)
   "返回一个桩替 `seshat-rest--request' 的闭包.
 闭包把每次调用的 (METHOD PATH REQUEST-BODY) 压入
@@ -56,14 +67,30 @@
     (push (list method path request-body) seshat-reader-annotation-test--calls)
     (cons status response-body)))
 
+(defun seshat-reader-annotation-test--stub-resolve ()
+  "返回一个桩替 `seshat-rest-resolve-uid' 的闭包.
+闭包把 (ROOT PATH) 压入 `seshat-reader-annotation-test--resolve-calls'，并
+返回 `seshat-reader-annotation-test--uid' 的**当前（动态）值**——把它绑定
+为 nil 即可模拟「服务端未登记」。"
+  (lambda (root path)
+    (push (list root path) seshat-reader-annotation-test--resolve-calls)
+    seshat-reader-annotation-test--uid))
+
 (defmacro seshat-reader-annotation-test--with-stub (status body &rest forms)
-  "桩替 `seshat-rest--request' 后求值 FORMS，并返回调用记录.
-STATUS 与 BODY 是桩恒定返回的假响应；返回值是本次记录的调用列表
-（元素形如 (METHOD PATH REQUEST-BODY)）。"
+  "桩替 `seshat-rest--request' 与 `seshat-rest-resolve-uid' 后求值 FORMS.
+STATUS 与 BODY 是 `--request' 桩恒定返回的假响应；`--resolve' 桩按
+`seshat-reader-annotation-test--uid' 返回 uid 并记录调用。每次求值前把
+`seshat-reader-annotation--uid-cache' 绑定为 nil，避免用例间缓存串味。
+返回值是本次记录的 `--request' 调用列表（元素形如
+\(METHOD PATH REQUEST-BODY)）。"
   (declare (indent 2) (debug t))
-  `(let ((seshat-reader-annotation-test--calls nil))
+  `(let ((seshat-reader-annotation-test--calls nil)
+         (seshat-reader-annotation-test--resolve-calls nil)
+         (seshat-reader-annotation--uid-cache nil))
      (cl-letf (((symbol-function 'seshat-rest--request)
-                (seshat-reader-annotation-test--stub ,status ,body)))
+                (seshat-reader-annotation-test--stub ,status ,body))
+               ((symbol-function 'seshat-rest-resolve-uid)
+                (seshat-reader-annotation-test--stub-resolve)))
        ,@forms)
      seshat-reader-annotation-test--calls))
 
@@ -86,7 +113,7 @@ ANNOTATIONS 为将作为服务端 JSON 响应返回的 Lisp 数据。"
       (seshat-reader-annotation-list)))
   (get-buffer seshat-reader-annotation-list-buffer-name))
 
-;;; document_id 派生
+;;; doc-id 派生（展示与 `seshat:' 链接文本专用，不参与 API）
 
 (ert-deftest seshat-reader-annotation-test--doc-id-hit-root ()
   "命中已配置文档根时返回 \"<标签>:<相对路径>\"."
@@ -121,6 +148,74 @@ ANNOTATIONS 为将作为服务端 JSON 响应返回的 Lisp 数据。"
       (with-temp-file file)
       (should (equal (seshat-reader-annotation--doc-id file) "inner:doc.pdf")))))
 
+;;; uid 解析（服务端权威身份，与显示用 doc-id 双值并存）
+
+(ert-deftest seshat-reader-annotation-test--uid-resolves-through-roots ()
+  "`--uid' 按最长匹配根拆出（根标签, 相对路径）后经 `seshat-rest-resolve-uid' 解析."
+  (seshat-reader-annotation-test--with-temp-dir dir
+    (let* ((outer (file-name-as-directory (expand-file-name "A" dir)))
+           (inner (file-name-as-directory (expand-file-name "A/sub" outer)))
+           (file (expand-file-name "doc.pdf" inner))
+           (seshat-reader-annotation-roots (list (cons "outer" outer)
+                                                 (cons "inner" inner))))
+      (make-directory inner t)
+      (with-temp-file file)
+      (seshat-reader-annotation-test--with-stub 204 ""
+        (should (equal (seshat-reader-annotation--uid file)
+                       seshat-reader-annotation-test--uid))
+        (should (equal seshat-reader-annotation-test--resolve-calls
+                       '(("inner" "doc.pdf"))))))))
+
+(ert-deftest seshat-reader-annotation-test--uid-cache-hit-skips-request ()
+  "同一文件第二次取 uid 命中缓存：`seshat-rest-resolve-uid' 只被调用一次."
+  (seshat-reader-annotation-test--with-temp-dir dir
+    (let* ((file (expand-file-name "doc.pdf" dir))
+           (seshat-reader-annotation-roots (list (cons "lib" dir))))
+      (with-temp-file file)
+      (seshat-reader-annotation-test--with-stub 204 ""
+        (should (equal (seshat-reader-annotation--uid file)
+                       seshat-reader-annotation-test--uid))
+        (should (equal (seshat-reader-annotation--uid file)
+                       seshat-reader-annotation-test--uid))
+        (should (= 1 (length seshat-reader-annotation-test--resolve-calls)))
+        (should (equal (assoc (file-truename (expand-file-name file))
+                              seshat-reader-annotation--uid-cache)
+                       (cons (file-truename (expand-file-name file))
+                             seshat-reader-annotation-test--uid)))))))
+
+(ert-deftest seshat-reader-annotation-test--uid-unregistered-errors ()
+  "服务端未登记（resolve 返回 nil）时 `--uid' 抛 `user-error'，且不写缓存."
+  (seshat-reader-annotation-test--with-temp-dir dir
+    (let* ((file (expand-file-name "doc.pdf" dir))
+           (seshat-reader-annotation-roots (list (cons "lib" dir)))
+           (seshat-reader-annotation-test--uid nil)
+           (caught nil))
+      (with-temp-file file)
+      (seshat-reader-annotation-test--with-stub 404 "{\"error\":{\"code\":\"not_found\"}}"
+        (condition-case err
+            (seshat-reader-annotation--uid file)
+          (user-error (setq caught err))))
+      (should caught)
+      (should (string-match-p "文档未在服务端登记"
+                              (error-message-string caught)))
+      (should-not seshat-reader-annotation--uid-cache))))
+
+(ert-deftest seshat-reader-annotation-test--uid-outside-roots-errors ()
+  "文件不在任何已配置根内时 `--uid' 抛 `user-error'，且不发起解析请求."
+  (seshat-reader-annotation-test--with-temp-dir dir
+    (let* ((file (expand-file-name "doc.pdf" dir))
+           (seshat-reader-annotation-roots nil))
+      (with-temp-file file)
+      (seshat-reader-annotation-test--with-stub 204 ""
+        (let ((caught nil))
+          (condition-case err
+              (seshat-reader-annotation--uid file)
+            (user-error (setq caught err)))
+          (should caught)
+          (should (string-match-p "文档未在服务端登记"
+                                  (error-message-string caught)))
+          (should-not seshat-reader-annotation-test--resolve-calls))))))
+
 ;;; location 组装
 
 (ert-deftest seshat-reader-annotation-test--location-format ()
@@ -140,7 +235,7 @@ ANNOTATIONS 为将作为服务端 JSON 响应返回的 Lisp 数据。"
 ;;; 创建批注
 
 (ert-deftest seshat-reader-annotation-test--create-assembles-request ()
-  "创建批注时请求体含正确的 document_id、location 与 text."
+  "创建批注时请求体含正确的 uid、location 与 text（不发 doc-id）."
   (seshat-reader-annotation-test--with-temp-dir dir
     (let* ((file (expand-file-name "book.pdf" dir))
            (seshat-reader-annotation-roots (list (cons "lib" dir)))
@@ -148,14 +243,16 @@ ANNOTATIONS 为将作为服务端 JSON 响应返回的 Lisp 数据。"
             (list :file file :page 3 :rect '(1 2 3 4) :text "选区文本")))
       (with-temp-file file)
       (let ((calls (seshat-reader-annotation-test--with-stub
-                      201 "{\"id\":7,\"document_id\":\"lib:book.pdf\"}"
+                      201 "{\"id\":7,\"uid\":\"01K8Q3M7D2X9V6T1B8N5C0RDEF\"}"
                     (seshat-reader-annotation-create))))
         (should calls)
         (let* ((call (car calls))
                (body (json-parse-string (nth 2 call) :object-type 'alist)))
           (should (equal (nth 0 call) "POST"))
           (should (equal (nth 1 call) "/api/annotations"))
-          (should (equal (alist-get 'document_id body) "lib:book.pdf"))
+          (should (equal (alist-get 'uid body)
+                         seshat-reader-annotation-test--uid))
+          (should-not (alist-get 'document-id body))
           (should (equal (alist-get 'location body)
                          "page:3;rect:1.00,2.00,3.00,4.00"))
           (should (equal (alist-get 'text body) "选区文本")))))))
@@ -242,6 +339,28 @@ ANNOTATIONS 为将作为服务端 JSON 响应返回的 Lisp 数据。"
         (should-not (get-text-property (point) 'seshat-reader-annotation-page))
         (should (string-match-p "\\?" (buffer-string)))
         (should (string-match-p "无法从 location 解析页码" (buffer-string)))))))
+
+;;; 双值不变量：列表缓冲区同时持有 uid（供 API）与 doc-id（供显示/链接）
+
+(ert-deftest seshat-reader-annotation-test--list-keeps-uid-and-doc-id ()
+  "列表刷新用 uid 拉取，展示/链接用的 doc-id 仍写入 `-list-document-id'."
+  (seshat-reader-annotation-test--with-temp-dir dir
+    (let* ((file (expand-file-name "book.pdf" dir))
+           (seshat-reader-annotation-roots (list (cons "lib" dir))))
+      (with-temp-file file)
+      (let ((calls (seshat-reader-annotation-test--with-stub 200 "[]"
+                      (with-temp-buffer
+                        (setq buffer-file-name file)
+                        (seshat-reader-annotation-list)))))
+        (should (= (length calls) 1))
+        (should (equal (nth 1 (car calls))
+                       (format "/api/annotations?uid=%s"
+                               seshat-reader-annotation-test--uid)))
+        (with-current-buffer (get-buffer seshat-reader-annotation-list-buffer-name)
+          (should (equal seshat-reader-annotation-list-uid
+                         seshat-reader-annotation-test--uid))
+          (should (equal seshat-reader-annotation-list-document-id
+                         "lib:book.pdf")))))))
 
 ;;; 列表拉取的 HTTP 错误（T7：非 2xx 不得伪装成「无批注」）
 
@@ -451,10 +570,14 @@ ANNOTATIONS 为将作为服务端 JSON 响应返回的 Lisp 数据。"
                             (list (cons 'id 2)
                                   (cons 'location "page:5;rect:0.00,0.00,1.00,1.00")
                                   (cons 'text "服务端二"))))
-         (queued (list (list :uuid "u1" :action 'create :document-id "lib:book.pdf"
+         (queued (list (list :uuid "u1" :action 'create
+                             :uid "01K8Q3M7D2X9V6T1B8N5C0RDEF"
+                             :document-id "lib:book.pdf"
                              :location "page:9;rect:0.00,0.00,1.00,1.00"
                              :text "本地一")
-                       (list :uuid "u2" :action 'create :document-id "lib:book.pdf"
+                       (list :uuid "u2" :action 'create
+                             :uid "01K8Q3M7D2X9V6T1B8N5C0RDEF"
+                             :document-id "lib:book.pdf"
                              :location "page:1;rect:0.00,0.00,1.00,1.00"
                              :text "本地二")))
          (all (seshat-reader-annotation--all-items annotations queued)))

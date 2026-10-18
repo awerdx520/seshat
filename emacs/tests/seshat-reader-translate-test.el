@@ -52,6 +52,9 @@
   "/tmp/seshat-translate-test.pdf"
   "测试用选区的文档文件路径（无需真实存在）.")
 
+(defconst seshat-reader-translate-test--uid "01K8Q3M7D2X9V6T1B8N5C0RDEF"
+  "测试用的固定 uid（服务端权威文件身份，存批注时发送）.")
+
 (defun seshat-reader-translate-test--selection ()
   "返回一个典型的鼠标选区 plist（含 :text、:page、:rect、:file）."
   (list :text "Hello world"
@@ -644,12 +647,13 @@
 ;;; 存为批注
 
 (ert-deftest seshat-reader-translate-test--save-as-annotation-posts ()
-  "存批注发 POST /api/annotations，body 的 document_id/location/text 正确."
+  "存批注发 POST /api/annotations，body 的 uid/location/text 正确（不发 doc-id）."
   (let ((dir (file-name-as-directory
               (make-temp-file "seshat-translate-test" t))))
     (unwind-protect
         (let* ((file (expand-file-name "book.pdf" dir))
                (seshat-reader-annotation-roots (list (cons "lib" dir)))
+               (seshat-reader-annotation--uid-cache nil)
                (seshat-reader-translate-last-result "译文正文")
                (seshat-reader-select-last
                 (list :file file :page 3 :rect '(10.0 20.0 30.0 40.0)
@@ -659,17 +663,55 @@
           (cl-letf (((symbol-function 'seshat-rest--request)
                      (lambda (method path &optional body)
                        (push (list method path body) calls)
-                       (cons 201 "{\"id\":7}"))))
+                       (cons 201 "{\"id\":7}")))
+                    ((symbol-function 'seshat-rest-resolve-uid)
+                     (lambda (_root _path)
+                       seshat-reader-translate-test--uid)))
             (seshat-reader-translate-save-as-annotation))
           (should calls)
           (let* ((call (car calls))
                  (body (json-parse-string (nth 2 call) :object-type 'alist)))
             (should (equal (nth 0 call) "POST"))
             (should (equal (nth 1 call) "/api/annotations"))
-            (should (equal (alist-get 'document_id body) "lib:book.pdf"))
+            ;; 存批注发给服务端的是服务端权威 uid，不是显示用的 doc-id
+            (should (equal (alist-get 'uid body)
+                           seshat-reader-translate-test--uid))
+            (should-not (alist-get 'document-id body))
+            (should-not (equal (alist-get 'uid body) "lib:book.pdf"))
             (should (equal (alist-get 'location body)
                            "page:3;rect:10.00,20.00,30.00,40.00"))
             (should (equal (alist-get 'text body) "译文正文"))))
+      (delete-directory dir t))))
+
+(ert-deftest seshat-reader-translate-test--save-as-annotation-unregistered-errors ()
+  "文档未在服务端登记（resolve 返回 nil）时存批注抛 `user-error'、不发 POST."
+  (let ((dir (file-name-as-directory
+              (make-temp-file "seshat-translate-test" t))))
+    (unwind-protect
+        (let* ((file (expand-file-name "book.pdf" dir))
+               (seshat-reader-annotation-roots (list (cons "lib" dir)))
+               (seshat-reader-annotation--uid-cache nil)
+               (seshat-reader-translate-last-result "译文正文")
+               (seshat-reader-select-last
+                (list :file file :page 3 :rect '(10.0 20.0 30.0 40.0)
+                      :text "选区"))
+               (calls nil)
+               (caught nil))
+          (with-temp-file file)
+          (cl-letf (((symbol-function 'seshat-rest--request)
+                     (lambda (method path &optional body)
+                       (push (list method path body) calls)
+                       (cons 201 "{\"id\":7}")))
+                    ((symbol-function 'seshat-rest-resolve-uid)
+                     (lambda (_root _path) nil))
+                    ((symbol-function 'message) (lambda (&rest _) nil)))
+            (condition-case err
+                (seshat-reader-translate-save-as-annotation)
+              (user-error (setq caught err))))
+          (should caught)
+          (should (string-match-p "文档未在服务端登记"
+                                  (error-message-string caught)))
+          (should-not calls))
       (delete-directory dir t))))
 
 (ert-deftest seshat-reader-translate-test--save-as-annotation-without-result-errors ()
@@ -849,10 +891,11 @@ M 为链路上 `message' 的文本。
       (when (buffer-live-p panel) (kill-buffer panel)))))
 
 (ert-deftest seshat-reader-translate-test--integration-panel-to-annotation ()
-  "端到端：面板里的译文存为服务端批注，document-id/location/text 正确.
+  "端到端：面板里的译文存为服务端批注，uid/location/text 正确.
 承接 `--integration-selection-to-panel' 的链路（同一份选区与译文），再走
 `seshat-reader-translate-save-as-annotation'，断言提交给
-`seshat-rest-create-annotation' 的三个实参由选区派生且正文取面板内容。"
+`seshat-rest-create-annotation' 的三个实参由选区派生且正文取面板内容
+（首个实参是服务端权威 uid，显示用 doc-id 不参与提交）。"
   (skip-unless (require 'gt nil t))
   (skip-unless (require 'gt-render-buffer nil t))
   (let* ((seshat-reader-select-last
@@ -882,9 +925,11 @@ M 为链路上 `message' 的文本。
           (should (equal seshat-reader-translate-last-result
                          seshat-reader-translate-test--translated-text))
           (cl-letf (((symbol-function 'seshat-rest-create-annotation)
-                     (lambda (document-id location text)
-                       (push (list document-id location text) created)
+                     (lambda (uid location text)
+                       (push (list uid location text) created)
                        '((id . 42))))
+                    ((symbol-function 'seshat-rest-resolve-uid)
+                     (lambda (_root _path) seshat-reader-translate-test--uid))
                     ((symbol-function 'message)
                      (lambda (fmt &rest args)
                        (push (apply #'format fmt args) messages)
@@ -892,8 +937,9 @@ M 为链路上 `message' 的文本。
             (seshat-reader-translate-save-as-annotation))
           (should (= 1 (length created)))
           (let ((call (car created)))
-            ;; document-id 由选区文件经文档根派生（不写真实文件）
-            (should (equal (nth 0 call) "t6:seshat-translate-test.pdf"))
+            ;; 第一个实参是服务端权威 uid（不是显示用的 doc-id）
+            (should (equal (nth 0 call) seshat-reader-translate-test--uid))
+            (should-not (equal (nth 0 call) "t6:seshat-translate-test.pdf"))
             ;; location 带 page: 前缀，且 rect 按两位小数格式化
             (should (string-prefix-p "page:3;" (nth 1 call)))
             (should (equal (nth 1 call)

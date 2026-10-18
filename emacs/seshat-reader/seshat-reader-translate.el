@@ -53,8 +53,9 @@
 ;; `gt-posframe-pin-render-output-hook'（固定），并在
 ;; `--capture-result' 中用启动时间戳的时间窗口守卫过滤其它 gt 用法。
 ;;
-;; 文档标识（`document_id'）与位置（`location'）的约定见
-;; `seshat-reader-annotation'。
+;; 文档身份与位置（`location'）的约定见 `seshat-reader-annotation'：存批注
+;; 时发送的是服务端权威 uid（`seshat-reader-annotation--uid'），显示用
+;; doc-id（`seshat-reader-annotation--doc-id'）只用于提示文案。
 ;;
 ;; 本模块**不做 OCR**：扫描件（页面无文本层）无法取词，需等 M11.6 的
 ;; OCR 支持。
@@ -754,14 +755,17 @@ buffer（不再弹 posframe），面板可用 `q' 或 `seshat-reader-sidebar-tog
 (defun seshat-reader-translate-save-as-annotation ()
   "把最近一次译文存为服务端批注（**侧车**，不写回文档）.
 批注存储在服务端（经 `seshat-rest-create-annotation'），**不会**写回用户
-正在阅读的原文档，因此不会改动文件内容。文档标识与位置分别由
-`seshat-reader-annotation--doc-id' 与
+正在阅读的原文档，因此不会改动文件内容。位置由
 `seshat-reader-annotation--location' 从最近一次选区
-（`seshat-reader-select-last' 的 :file/:page/:rect）派生。
+（`seshat-reader-select-last' 的 :page/:rect）派生；服务端身份由
+`seshat-reader-annotation--uid' 从选区的 :file 解析（uid 是发给服务端的
+唯一身份；显示用 doc-id 仍由 `seshat-reader-annotation--doc-id' 派生，
+只用于提示文案）。
 
 正文取 `seshat-reader-translate-last-result'（最近一次翻译或解释的纯
 译文）；尚无译文、或译文去掉空白后为空时以 `user-error' 提示先翻译或
-解释选区。无选区、或选区未记录文档文件时同样以 `user-error' 提示。
+解释选区。无选区、选区未记录文档文件、或文档未在服务端登记时同样以
+`user-error' 提示。
 
 创建成功（服务端返回含 `id' 的 alist）时 `message' 报告批注 id；服务端
 不可用、返回非 2xx 或响应无法解析时 `message' 明确警告，绝不静默。异常
@@ -779,10 +783,11 @@ buffer（不再弹 posframe），面板可用 `q' 或 `seshat-reader-sidebar-tog
         (let* ((page (plist-get selection :page))
                (rect (plist-get selection :rect))
                (document-id (seshat-reader-annotation--doc-id file))
+               (uid (seshat-reader-annotation--uid file))
                (location (seshat-reader-annotation--location page rect)))
           (condition-case err
               (let ((response (seshat-rest-create-annotation
-                               document-id location text)))
+                               uid location text)))
                 (if (and (listp response) (alist-get 'id response))
                     (message "Seshat Reader translate: 已把译文存为批注 %s（%s，%s）"
                              (format "%s" (alist-get 'id response))

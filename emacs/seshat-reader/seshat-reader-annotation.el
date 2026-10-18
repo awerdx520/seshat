@@ -27,10 +27,18 @@
 ;; 批注是**侧车（sidecar）**数据：保存在服务端（`POST /api/annotations'），
 ;; 不写回文档文件；阅读器只负责采集与展示，从不修改用户文档。
 ;;
-;; 文档标识（`document_id'）由本模块单点派生，约定为
-;; \"<根标签>:<相对路径>\"，其中根标签到根目录的映射由
-;; `seshat-reader-annotation-roots' 配置；未命中任何已配置根的文档降级为
-;; \"local:<绝对路径>\"（只在本地可见，不跨端共享）。
+;; 本模块区分**两个文档身份**（双值不变量）：
+;;
+;; - **显示标识（doc-id）**：由 `seshat-reader-annotation--doc-id' 从文件
+;;   路径单点派生，约定为 \"<根标签>:<相对路径>\"，根标签到根目录的映射由
+;;   `seshat-reader-annotation-roots' 配置；未命中任何已配置根的文档降级为
+;;   \"local:<绝对路径>\"。它**只用于**列表/面板显示与 `seshat:' 链接文本。
+;; - **服务端身份（uid）**：由 `seshat-reader-annotation--uid' 经
+;;   `GET /api/resolve' 从同一路径解析得到（按真实路径内存缓存），**只用于**
+;;   所有发给服务端的实参（批注的创建/拉取、离线队列同步）。
+;;
+;; 判据：凡「发给服务端」的实参一律 uid，凡「写进 buffer / 链接 / 文案」的
+;; 一律 doc-id。二者不可互换——服务端只认 uid，链接文本只认 doc-id。
 ;;
 ;; 位置（`location'）约定为 \"page:<n>;rect:<x0>,<y0>,<x1>,<y1>\"：页码
 ;; `<n>' 为 **1-based** 十进制整数，矩形为**页面坐标**（PDF point 空间、
@@ -110,36 +118,76 @@
                 :value-type (directory :tag "根目录"))
   :group 'seshat-reader-annotation)
 
+(defvar seshat-reader-annotation--uid-cache nil
+  "文件真实路径到服务端 uid 的内存缓存（alist，key 为 `file-truename'）.
+只在当前 Emacs 进程内有效。uid 由服务端分配、跨改名稳定，故不做失效：
+极端情形（服务端重建登记后 uid 变化）可手动
+`(setq seshat-reader-annotation--uid-cache nil)' 清空。")
+
+(defun seshat-reader-annotation--root-match (truename)
+  "在 `seshat-reader-annotation-roots' 中为 TRUENAME 找最长匹配根.
+TRUENAME 须为已归一的绝对真实路径（`file-truename'）。命中时返回
+`(标签 . 根目录)'，根目录带末尾斜杠；多个根同时命中时取**最长（最具体）
+的根**；未命中任何根时返回 nil。"
+  (let ((best nil)
+        (best-length -1))
+    (dolist (entry seshat-reader-annotation-roots)
+      (let* ((root (file-name-as-directory
+                    (file-truename (expand-file-name (cdr entry)))))
+             (length (length root)))
+        (when (and (file-in-directory-p truename root)
+                   (> length best-length))
+          (setq best (cons (car entry) root)
+                best-length length))))
+    best))
+
 (defun seshat-reader-annotation--doc-id (file)
-  "由文件路径 FILE 派生批注用的文档标识.
+  "由文件路径 FILE 派生**显示用**的文档标识（doc-id）.
 先把 FILE 归一化为绝对真实路径（`file-truename' 展开 `~'、相对路径与
 符号链接），再依次与 `seshat-reader-annotation-roots' 中的每个根比较：
 命中时返回 \"<标签>:<相对路径>\"，多个根命中时取**最长（最具体）的根**。
 未命中任何根时把结果降级为 \"local:<绝对路径>\"，并 `message' 一条警告
 提示该标识不跨端共享。
 
-FILE 为文档文件路径，可以是相对路径。返回的字符串可直接作为服务端
-`document_id' 使用。"
+FILE 为文档文件路径，可以是相对路径。返回值**只用于**列表/面板显示与
+`seshat:' 链接文本；发给服务端的身份必须是 uid（见
+`seshat-reader-annotation--uid'）。"
   (let* ((truename (file-truename (expand-file-name file)))
-         (best-tag nil)
-         (best-root nil)
-         (best-length -1))
-    (dolist (entry seshat-reader-annotation-roots)
-      (let* ((tag (car entry))
-             (root (file-name-as-directory
-                    (file-truename (expand-file-name (cdr entry)))))
-             (length (length root)))
-        (when (and (file-in-directory-p truename root)
-                   (> length best-length))
-          (setq best-tag tag
-                best-root root
-                best-length length))))
-    (if best-tag
-        (concat best-tag ":" (file-relative-name truename best-root))
+         (match (seshat-reader-annotation--root-match truename)))
+    (if match
+        (concat (car match) ":" (file-relative-name truename (cdr match)))
       (let ((fallback (concat "local:" truename)))
         (message "Seshat Reader annotation: %s 不在任何已配置的文档根内，降级为 %s（不跨端共享）"
                  truename fallback)
         fallback))))
+
+(defun seshat-reader-annotation--uid (file)
+  "由文件路径 FILE 解析服务端权威的文件 uid（**只用于** API 身份）.
+先把 FILE 归一化为绝对真实路径（`file-truename'），命中
+`seshat-reader-annotation--uid-cache' 时直接返回缓存值；未命中时按
+`seshat-reader-annotation-roots' 找最长匹配根，拆出 (根标签 . 相对路径)，
+再经 `seshat-rest-resolve-uid' 向服务端解析，成功则写入缓存并返回。
+
+文件不在任何已配置根内，或服务端未登记该文档（resolve 返回 nil）时抛
+`user-error' \"文档未在服务端登记：%s\"。失败结果**不写缓存**，下次调用
+会重试。
+
+显示与 `seshat:' 链接文本请用 `seshat-reader-annotation--doc-id'，不要把
+本函数的返回值写进 buffer。"
+  (let* ((truename (file-truename (expand-file-name file)))
+         (cached (assoc truename seshat-reader-annotation--uid-cache)))
+    (or (cdr cached)
+        (let* ((match (seshat-reader-annotation--root-match truename))
+               (uid (and match
+                         (seshat-rest-resolve-uid
+                          (car match)
+                          (file-relative-name truename (cdr match))))))
+          (unless (and (stringp uid) (not (string-empty-p uid)))
+            (user-error "文档未在服务端登记：%s" file))
+          (setq seshat-reader-annotation--uid-cache
+                (cons (cons truename uid)
+                      seshat-reader-annotation--uid-cache))
+          uid))))
 
 (defun seshat-reader-annotation--location (page rect)
   "由 PAGE 与 RECT 构造批注位置字符串.
@@ -190,17 +238,19 @@ WHAT 是描述该操作的短语（如 \"批注\"、\"删除操作\"），用于
              (> (seshat-reader-annotation-queue-count) 0))
     (ignore-errors (seshat-reader-annotation-queue-sync))))
 
-(defun seshat-reader-annotation--queued-create-entries (document-id)
-  "返回 DOCUMENT-ID 在本地离线队列中待同步的 create 条目列表.
-按需加载队列模块后取 `seshat-reader-annotation-queue-entries' 中 `:action'
-为 `create' 的条目（`delete' 条目没有可展示的位置与正文），保持入队顺序；
-没有匹配条目时返回 nil。"
+(defun seshat-reader-annotation--queued-create-entries (uid)
+  "返回 UID 对应的文档在本地离线队列中待同步的 create 条目列表.
+UID 为服务端权威身份（**不是**显示用 doc-id）。按需加载队列模块后取
+`seshat-reader-annotation-queue-entries' 中 `:action' 为 `create' 的条目
+（`delete' 条目没有可展示的位置与正文），保持入队顺序；没有匹配条目或
+UID 为 nil 时返回 nil。"
   (seshat-reader-annotation--require-queue)
-  (let (result)
-    (dolist (entry (seshat-reader-annotation-queue-entries document-id))
-      (when (eq (plist-get entry :action) 'create)
-        (push entry result)))
-    (nreverse result)))
+  (when uid
+    (let (result)
+      (dolist (entry (seshat-reader-annotation-queue-entries uid))
+        (when (eq (plist-get entry :action) 'create)
+          (push entry result)))
+      (nreverse result))))
 
 ;;; 交互式采集
 
@@ -238,30 +288,35 @@ BODY 为批注正文；为 nil 或去掉空白后为空串时退回使用最近�
              (location (seshat-reader-annotation--location page rect)))
         (when (or (null text) (string-empty-p (string-trim text)))
           (user-error "Seshat Reader annotation: 选区没有文本，可先用 C-u 输入批注正文"))
-        (condition-case nil
-            (let ((response (seshat-rest-create-annotation document-id location text)))
-              (if (and (listp response) (alist-get 'id response))
-                  (progn
-                    (message "Seshat Reader annotation: 已创建批注 %s（%s，%s）"
-                             (format "%s" (alist-get 'id response))
-                             document-id location)
-                    ;; 机会性同步：服务端此刻可达，顺手把积压的本地队列推进一次。
-                    (seshat-reader-annotation--require-queue)
-                    (when (> (seshat-reader-annotation-queue-count) 0)
-                      (ignore-errors (seshat-reader-annotation-queue-sync))))
-                (seshat-reader-annotation--enqueue
-                 (list :action 'create
-                       :document-id document-id
-                       :location location
-                       :text text)
-                 "批注")))
-          (error
-           (seshat-reader-annotation--enqueue
-            (list :action 'create
-                  :document-id document-id
-                  :location location
-                  :text text)
-            "批注")))))))
+        ;; 服务端身份在正文校验之后再解析：未登记时 `user-error' 直接冒泡给
+        ;; 用户（服务端权威 uid 无法离线生成）。
+        (let ((uid (seshat-reader-annotation--uid file)))
+          (condition-case nil
+              (let ((response (seshat-rest-create-annotation uid location text)))
+                (if (and (listp response) (alist-get 'id response))
+                    (progn
+                      (message "Seshat Reader annotation: 已创建批注 %s（%s，%s）"
+                               (format "%s" (alist-get 'id response))
+                               document-id location)
+                      ;; 机会性同步：服务端此刻可达，顺手把积压的本地队列推进一次。
+                      (seshat-reader-annotation--require-queue)
+                      (when (> (seshat-reader-annotation-queue-count) 0)
+                        (ignore-errors (seshat-reader-annotation-queue-sync))))
+                  (seshat-reader-annotation--enqueue
+                   (list :action 'create
+                         :uid uid
+                         :document-id document-id
+                         :location location
+                         :text text)
+                   "批注")))
+            (error
+             (seshat-reader-annotation--enqueue
+              (list :action 'create
+                    :uid uid
+                    :document-id document-id
+                    :location location
+                    :text text)
+              "批注"))))))))
 
 
 ;;; 列表与删除
@@ -276,7 +331,15 @@ BODY 为批注正文；为 nil 或去掉空白后为空串时退回使用最近�
   "`seshat-reader-annotation--fetch' 在拉取失败时返回的哨兵值.")
 
 (defvar-local seshat-reader-annotation-list-document-id nil
-  "列表缓冲区所展示批注的文档标识，供刷新时重新拉取.")
+  "列表缓冲区所展示批注的**显示标识（doc-id）**.
+形如 \"<标签>:<相对路径>\"，只用于列表显示与 `seshat:' 链接文本（
+`seshat-reader-reference' 只读本变量）。刷新/删除等 API 操作不得使用它，
+而应用 `seshat-reader-annotation-list-uid'。")
+
+(defvar-local seshat-reader-annotation-list-uid nil
+  "列表缓冲区所展示批注的**服务端身份（uid）**.
+供列表刷新（`g'）与删除路径发请求使用；显示与 `seshat:' 链接文本仍用
+`seshat-reader-annotation-list-document-id'（doc-id）。")
 
 (defvar-local seshat-reader-annotation-list-source nil
   "发起列表的 seshat-reader 文档缓冲区，供 `RET' 跳页使用.")
@@ -335,20 +398,21 @@ QUEUED-UUID 非 nil 时表示该条来自本地离线队列、尚未同步到服
                                'seshat-reader-annotation-queue-uuid queued-uuid
                                'seshat-reader-annotation-location location))))
 
-(defun seshat-reader-annotation--fetch (document-id)
-  "拉取 DOCUMENT-ID 的批注列表，失败时提示并返回失败哨兵.
-本函数直接查 HTTP 状态码，因此非 2xx 与「真正无批注」不会混为一谈：
-2xx 时用 `seshat-rest--json' 解析响应并返回批注列表（无批注为 nil，
-属合法结果，由调用方渲染为提示行）；HTTP 非 2xx（如 401 鉴权失败、
-500 服务端错误）时 `message' 一条**含状态码**的提示，并返回
+(defun seshat-reader-annotation--fetch (uid)
+  "拉取 UID 的批注列表，失败时提示并返回失败哨兵.
+UID 为服务端权威身份（**不是** doc-id）。本函数直接查 HTTP 状态码，因此
+非 2xx 与「真正无批注」不会混为一谈：2xx 时用 `seshat-rest--json' 解析
+响应并返回批注列表（无批注为 nil，属合法结果，由调用方渲染为提示行）；
+HTTP 非 2xx（如 401 鉴权失败、400 uid 非法、500 服务端错误）时 `message'
+一条**含状态码**的提示，并返回
 `seshat-reader-annotation--fetch-error'。服务端不可用、网络失败或响应
 无法解析等异常情形同样 `message' 提示并返回该哨兵。哨兵只用于让调用
 方跳过渲染、保留既有列表，绝不把异常冒泡成 backtrace。"
   (condition-case err
       (let* ((response (seshat-rest--request
                         "GET"
-                        (format "/api/annotations?document_id=%s"
-                                (url-hexify-string document-id))))
+                        (format "/api/annotations?uid=%s"
+                                (url-hexify-string uid))))
              (status (car response)))
         (if (and (integerp status) (>= status 200) (< status 300))
             (seshat-rest--json response)
@@ -444,12 +508,18 @@ ETAF 渲染层未加载（或尚未挂载）时返回 nil，调用方按文本�
        (and (etaf-runtime-for-buffer (current-buffer)) t)))
 
 (defun seshat-reader-annotation--render-list (document-id source annotations
-                                                         &optional queued)
+                                                         &optional queued uid)
   "在 `*Seshat Annotations*' 中渲染批注列表.
-DOCUMENT-ID 为文档标识，SOURCE 为发起列表的 seshat-reader 文档缓冲区；
-二者都以 buffer-local 形式记入列表缓冲区，供 `d' 刷新与 `RET' 跳页
-复用，ANNOTATIONS 也一并缓存到
+DOCUMENT-ID 为**显示标识（doc-id）**，SOURCE 为发起列表的 seshat-reader
+文档缓冲区；二者都以 buffer-local 形式记入列表缓冲区，供 `d' 刷新与 `RET'
+跳页复用，ANNOTATIONS 也一并缓存到
 `seshat-reader-annotation-list-entries' 供免 HTTP 重渲染。
+
+UID 为服务端权威身份，非 nil 时写入 buffer-local
+`seshat-reader-annotation-list-uid'（供列表刷新与删除发请求）。为 nil 时
+**保留**列表缓冲区里已有的值——ETAF 渲染层的 `--rerender-cached' 走的就是
+这条「无新 uid」的路径，它复用上一次完整渲染写入的值。显示与 `seshat:'
+链接文本一律用 DOCUMENT-ID，绝不写 uid。
 
 ANNOTATIONS 为服务端返回的批注列表，QUEUED 为本地离线队列中待同步的
 create 条目列表（plist 列表，见
@@ -482,6 +552,8 @@ create 条目列表（plist 列表，见
       (unless (derived-mode-p 'seshat-reader-annotation-list-mode)
         (seshat-reader-annotation-list-mode))
       (setq-local seshat-reader-annotation-list-document-id document-id)
+      (when uid
+        (setq-local seshat-reader-annotation-list-uid uid))
       (setq-local seshat-reader-annotation-list-source source)
       (setq-local seshat-reader-annotation-list-entries annotations)
       (unless (and (seshat-reader-annotation--etaf-p)
@@ -503,9 +575,14 @@ create 条目列表（plist 列表，见
     ;; `pop-to-buffer'）。此处 `(current-buffer)' 即列表缓冲区本身。
     (seshat-reader-sidebar-show (current-buffer) 'annotations t)))
 
-(defun seshat-reader-annotation--refresh-list (document-id &optional source)
-  "按 DOCUMENT-ID 重新拉取批注并刷新列表缓冲区.
-SOURCE 为发起列表的 seshat-reader 文档缓冲区（可为 nil）。
+(defun seshat-reader-annotation--refresh-list (document-id &optional source uid)
+  "按文档标识 DOCUMENT-ID 重新拉取批注并刷新列表缓冲区.
+DOCUMENT-ID 为**显示标识（doc-id）**；SOURCE 为发起列表的 seshat-reader
+文档缓冲区（可为 nil）；UID 为服务端权威身份（拉取、删除等 API 操作用
+它）。UID 为 nil 时取列表缓冲区的 buffer-local
+`seshat-reader-annotation-list-uid'——ETAF 渲染层的刷新路径
+（`seshat-reader-etaf--refresh-list'）只传前两个参数，它复用上一次完整
+渲染写入的值；两者都取不到时不猜身份：只展示本地待同步条目并提示。
 
 服务端批注渲染在前，本地离线队列中尚未同步的 create 条目以 \"[待同步]\"
 追加在后（见 `seshat-reader-annotation--render-list'）——本地项只读队列
@@ -519,16 +596,27 @@ SOURCE 为发起列表的 seshat-reader 文档缓冲区（可为 nil）。
 拉取失败（返回 `seshat-reader-annotation--fetch-error' 哨兵）时**不**
 清空列表：仍渲染本地待同步条目并提示当前只显示本地批注；队列也为空时只
 提示当前没有可显示的批注。两种情形都不会抛出 backtrace。"
-  (let* ((queued (seshat-reader-annotation--queued-create-entries document-id))
-         (result (seshat-reader-annotation--fetch document-id)))
+  (let* ((uid (or uid
+                  (and (get-buffer seshat-reader-annotation-list-buffer-name)
+                       (buffer-local-value
+                        'seshat-reader-annotation-list-uid
+                        (get-buffer seshat-reader-annotation-list-buffer-name)))))
+         (queued (seshat-reader-annotation--queued-create-entries uid))
+         (result (if uid
+                     (seshat-reader-annotation--fetch uid)
+                   seshat-reader-annotation--fetch-error)))
     (if (eq result seshat-reader-annotation--fetch-error)
         (progn
-          (seshat-reader-annotation--render-list document-id source nil queued)
-          (if queued
-              (message "Seshat Reader annotation: 批注列表（离线）仅显示本地待同步批注 %d 条"
-                       (length queued))
-            (message "Seshat Reader annotation: 当前没有可显示的批注（本地也没有待同步条目）。")))
-      (seshat-reader-annotation--render-list document-id source result queued)
+          (seshat-reader-annotation--render-list document-id source nil queued uid)
+          (cond
+           ((null uid)
+            (message "Seshat Reader annotation: 未知服务端文档身份，本轮不拉取服务端批注。"))
+           (queued
+            (message "Seshat Reader annotation: 批注列表（离线）仅显示本地待同步批注 %d 条"
+                     (length queued)))
+           (t
+            (message "Seshat Reader annotation: 当前没有可显示的批注（本地也没有待同步条目）。"))))
+      (seshat-reader-annotation--render-list document-id source result queued uid)
       (seshat-reader-annotation--maybe-sync-queue))))
 
 ;;; 跳页与删除
@@ -582,6 +670,8 @@ backtrace。"
                                'seshat-reader-annotation-id))
         (document-id (buffer-local-value 'seshat-reader-annotation-list-document-id
                                          (current-buffer)))
+        (uid (buffer-local-value 'seshat-reader-annotation-list-uid
+                                 (current-buffer)))
         (source (buffer-local-value 'seshat-reader-annotation-list-source
                                     (current-buffer))))
     (cond
@@ -594,18 +684,23 @@ backtrace。"
        document-id source
        (buffer-local-value 'seshat-reader-annotation-list-entries
                            (current-buffer))
-       (seshat-reader-annotation--queued-create-entries document-id)))
+       (seshat-reader-annotation--queued-create-entries uid)
+       uid))
      ((null id)
       (message "Seshat Reader annotation: 当前行没有关联批注，无法删除。"))
      (t
-      (when (seshat-reader-annotation-delete id)
-        (seshat-reader-annotation--refresh-list document-id source))))))
+      (when (seshat-reader-annotation-delete id uid)
+        (seshat-reader-annotation--refresh-list document-id source uid))))))
 
-(defun seshat-reader-annotation-delete (id)
+(defun seshat-reader-annotation-delete (id &optional uid)
   "删除编号为 ID 的批注并报告结果.
 ID 可为整数或字符串（服务端列表返回的 `id' 可能是整数），发送前一律用
 `(format \"%s\" id)' 字符串化，以统一整数/字符串入参。成功时 `message'
 报告已删除并返回 t。
+
+UID 为可选的文档服务端身份：删除请求按批注 `id' 定位，并不需要它；它只
+随离线队列条目的 `:uid' 一并保存，使队列条目保留文档归属（列表路径会传
+`seshat-reader-annotation-list-uid'，交互调用可为 nil）。
 
 失败（非 2xx 或请求异常）时**不**报错：把 `(:action delete :id ID)' 条目
 存入本地离线队列（ID 保留入参的原始类型，序列化与同步侧用
@@ -620,12 +715,12 @@ ID 可为整数或字符串（服务端列表返回的 `id' 可能是整数）�
               (message "Seshat Reader annotation: 已删除批注 %s。" id-string)
               t)
           (seshat-reader-annotation--enqueue
-           (list :action 'delete :id id)
+           (list :action 'delete :id id :uid uid)
            "删除操作")
           nil)
       (error
        (seshat-reader-annotation--enqueue
-        (list :action 'delete :id id)
+        (list :action 'delete :id id :uid uid)
         "删除操作")
        nil))))
 
@@ -646,7 +741,10 @@ Keybindings:
 
 (defun seshat-reader-annotation-list ()
   "列出当前文档的全部批注.
-从当前缓冲区的 variable `buffer-file-name' 派生文档标识，向服务端拉取批注并
+从当前缓冲区的 variable `buffer-file-name' 派生两个身份：显示标识
+（doc-id，供列表与 `seshat:' 链接）与服务端权威身份（uid，供拉取/刷新/
+删除）；uid 由 `GET /api/resolve' 解析并缓存，文档未在服务端登记时
+`user-error' 提示。随后向服务端拉取批注并
 渲染到 `*Seshat Annotations*'；每行显示 **1-based** 页码与正文摘要
 （摘要按 `seshat-reader-annotation-list-summary-width' 截断并以 \"…\"
 结尾）。服务端批注在前，本地离线队列中待同步的 create 条目以
@@ -668,9 +766,11 @@ evil；在 evil 环境下它们可能被 evil 接管（evil 会覆盖 `special-m
   (interactive)
   (let ((file (buffer-file-name)))
     (if file
+        ;; 双值：doc-id 供显示与 `seshat:' 链接，uid 供 API（拉取/删除/刷新）
         (seshat-reader-annotation--refresh-list
          (seshat-reader-annotation--doc-id file)
-         (current-buffer))
+         (current-buffer)
+         (seshat-reader-annotation--uid file))
       (message "Seshat Reader annotation: 当前缓冲区没有关联文件，无法确定文档标识。"))))
 
 (with-eval-after-load 'seshat-reader

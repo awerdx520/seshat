@@ -16,20 +16,25 @@
 ;;   (setq seshat-rest-base-url "https://example.com"
 ;;         seshat-rest-token "your-token")
 ;;
-;; 同步阅读进度：
+;; 同步阅读进度（参数均为服务端权威的文件 uid）：
 ;;
-;;   (seshat-rest-set-progress "book-1" "chapter-3:42")
-;;   (seshat-rest-get-progress "book-1")
+;;   (seshat-rest-set-progress "01K8Q3M7D2X9V6T1B8N5C0RDEF" "chapter-3:42")
+;;   (seshat-rest-get-progress "01K8Q3M7D2X9V6T1B8N5C0RDEF")
 ;;
 ;; 管理批注：
 ;;
-;;   (seshat-rest-create-annotation "book-1" "chapter-1:10" "第一条批注")
-;;   (seshat-rest-list-annotations "book-1")
+;;   (seshat-rest-create-annotation "01K8Q3M7D2X9V6T1B8N5C0RDEF" "chapter-1:10" "第一条批注")
+;;   (seshat-rest-list-annotations "01K8Q3M7D2X9V6T1B8N5C0RDEF")
 ;;   (seshat-rest-delete-annotation 1)
 ;;
-;; 端点、字段与错误码约定见项目 `docs/api.md'。注意服务端把 `{document_id}'
-;; 当作 URL 路径中的单个路径段，不能包含斜杠；本模块统一用 `url-hexify-string'
-;; 对标识做 URL 编码后再拼接路径。
+;; 由根标签与相对路径解析 uid（客户端取 uid 的唯一入口）：
+;;
+;;   (seshat-rest-resolve-uid "notes" "book/chapter-1.org")
+;;
+;; 端点、字段与错误码约定见项目 `docs/api.md'。注意文件身份是服务端权威的
+;; uid（26 位 Crockford Base32），进度/批注端点一律以 uid 为键；旧的路径式
+;; 文档标识已被废弃。服务端把 uid 当作 URL 路径中的单个路径段，不含斜杠；
+;; 本模块统一用 `url-hexify-string' 对标识做 URL 编码后再拼接路径。
 ;;
 ;; 认证失败（401）由服务端公共认证中间件产生，响应体是 JSON 错误体
 ;; {"error":{"code":"unauthorized","message":"Unauthorized"}}（并保留
@@ -66,7 +71,7 @@
   "向服务端同步发送一次 HTTP 请求并等待响应。
 METHOD 为请求方法字符串（\"GET\"、\"PUT\"、\"POST\"、\"DELETE\" 等）。
 PATH 为以 \"/\" 开头的请求路径，可含查询串，例如
-\"/api/annotations?document_id=book-1\"。
+\"/api/annotations?uid=01K8Q3M7D2X9V6T1B8N5C0RDEF\"。
 BODY 为可选的请求体字符串（通常由 `json-encode' 生成）。
 
 请求会携带 Bearer 令牌（`seshat-rest-token'）与 Accept 头；当 BODY 非空时
@@ -119,43 +124,67 @@ JSON 对象解析为 alist（键为符号），数组解析为 list。"
       (json-parse-string body :object-type 'alist :array-type 'list))))
 
 
+;;; uid 解析
+
+(defun seshat-rest-resolve-uid (root path)
+  "把根标签 ROOT 与相对路径 PATH 解析为服务端权威的文件 uid。
+ROOT 为根标签（如 \"notes\"），PATH 为相对该根的文件路径（不含根目录，
+例如 \"book/chapter-1.org\"）；二者都会被 URL 编码后作为查询参数发送。
+
+请求 `GET /api/resolve?root=&path='，成功（2xx 且响应体含非空字符串
+`uid'）时返回该 uid 字符串。**非 2xx、响应体缺少 uid、响应无法解析或
+请求异常时一律返回 nil**，不抛错——「未登记」是预期路径，提示语由调用方
+决定（例如 `seshat-reader-annotation--uid' 会转成 `user-error'）。"
+  (condition-case nil
+      (let* ((response (seshat-rest--request
+                        "GET"
+                        (format "/api/resolve?root=%s&path=%s"
+                                (url-hexify-string root)
+                                (url-hexify-string path))))
+             (json (seshat-rest--json response))
+             (uid (and (listp json) (alist-get 'uid json))))
+        (and (stringp uid) (not (string-empty-p uid)) uid))
+    (error nil)))
+
+
 ;;; 阅读进度
 
-(defun seshat-rest-set-progress (document-id position)
-  "设置文档 DOCUMENT-ID 的阅读进度为 POSITION。
+(defun seshat-rest-set-progress (uid position)
+  "设置文档 UID 的阅读进度为 POSITION。
 POSITION 为不透明的进度位置字符串（页码、CFI、行号等，由客户端定义）。
-DOCUMENT-ID 为不含斜杠的稳定标识，会先做 URL 编码。
+UID 为服务端权威的文件身份（26 位 Crockford Base32），会先做 URL 编码。
 成功时返回服务端实际保存的记录（alist，含 position、updated_at）；
 非 2xx 响应返回 nil。"
   (seshat-rest--json
    (seshat-rest--request
     "PUT"
-    (format "/api/progress/%s" (url-hexify-string document-id))
+    (format "/api/progress/%s" (url-hexify-string uid))
     (json-encode `((position . ,position))))))
 
-(defun seshat-rest-get-progress (document-id)
-  "获取文档 DOCUMENT-ID 的阅读进度。
-DOCUMENT-ID 为不含斜杠的稳定标识，会先做 URL 编码。
+(defun seshat-rest-get-progress (uid)
+  "获取文档 UID 的阅读进度。
+UID 为服务端权威的文件身份（26 位 Crockford Base32），会先做 URL 编码。
 成功（200）返回解析后的 alist（含 position、updated_at 等字段）；
-尚无进度（404）或其他非 2xx 响应返回 nil。"
+尚无进度（404）、uid 非法（400）或其他非 2xx 响应返回 nil。"
   (seshat-rest--json
    (seshat-rest--request
     "GET"
-    (format "/api/progress/%s" (url-hexify-string document-id)))))
+    (format "/api/progress/%s" (url-hexify-string uid)))))
 
 
 ;;; 批注
 
-(defun seshat-rest-create-annotation (document-id location text)
-  "为文档 DOCUMENT-ID 在位置 LOCATION 创建内容为 TEXT 的批注。
-LOCATION 与 TEXT 均不可为空。DOCUMENT-ID 原样放入 JSON 请求体（JSON 请求体无需 URL 编码）。
+(defun seshat-rest-create-annotation (uid location text)
+  "为文档 UID 在位置 LOCATION 创建内容为 TEXT 的批注。
+LOCATION 与 TEXT 均不可为空。UID 作为 JSON 请求体的 `uid' 字段原样发送
+（JSON 请求体无需 URL 编码）。
 成功（201）返回服务端创建的完整批注对象（alist，含 id 与时间戳）；
 非 2xx 响应返回 nil。"
   (seshat-rest--json
    (seshat-rest--request
     "POST"
     "/api/annotations"
-    (json-encode `((document_id . ,document-id)
+    (json-encode `((uid . ,uid)
                    (location . ,location)
                    (text . ,text))))))
 
@@ -172,16 +201,16 @@ LOCATION 与 TEXT 均不可为空。
     (json-encode `((location . ,location)
                    (text . ,text))))))
 
-(defun seshat-rest-list-annotations (document-id)
-  "列出文档 DOCUMENT-ID 的全部批注。
-DOCUMENT-ID 会先做 URL 编码后作为查询参数 `document_id' 发送。
+(defun seshat-rest-list-annotations (uid)
+  "列出文档 UID 的全部批注。
+UID 会先做 URL 编码后作为查询参数 `uid' 发送。
 成功（200）返回批注对象列表（每个对象为 alist，按 id 升序）；
 无批注时为 nil，非 2xx 响应亦返回 nil。"
   (seshat-rest--json
    (seshat-rest--request
     "GET"
-    (format "/api/annotations?document_id=%s"
-            (url-hexify-string document-id)))))
+    (format "/api/annotations?uid=%s"
+            (url-hexify-string uid)))))
 
 (defun seshat-rest-delete-annotation (id)
   "删除编号为 ID 的批注。

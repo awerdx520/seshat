@@ -45,9 +45,15 @@
 ;; 本地唯一标识（由 `seshat-reader-annotation-queue--new-uuid' 生成），用于
 ;; 去重与按 UUID 移除；`:queued-at' 是入队时刻的 ISO8601 本地时间。
 ;;
+;; **身份双值**：`:uid' 是服务端权威的文件身份，**同步时发送的就是它**；
+;; `:document-id' 只是显示用的 doc-id（\"<标签>:<相对路径>\"），同步不使
+;; 用它（保留它是为了队列条目自解释、便于人工排查）。缺 `:uid' 的旧条目
+;; （M7 之前的队列文件）在同步时**跳过并提示一次**，不会被静默丢弃。
+;;
 ;; create 条目标识 \"创建\"，形如
 ;;
 ;;   (:uuid \"20260101T120000-042917\" :action create
+;;    :uid \"01K8Q3M7D2X9V6T1B8N5C0RDEF\"
 ;;    :document-id \"ebook:x.pdf\"
 ;;    :location \"page:3;rect:10.00,20.00,110.00,40.00\"
 ;;    :text \"批注正文\"
@@ -57,12 +63,13 @@
 ;;
 ;;   (:uuid \"20260101T120500-123456\" :action delete
 ;;    :id 7
+;;    :uid \"01K8Q3M7D2X9V6T1B8N5C0RDEF\"
 ;;    :queued-at \"2026-01-01T12:05:00+0800\")
 ;;
 ;; 公开接口：
 ;;
 ;;   `seshat-reader-annotation-queue-enqueue'  入队一条批注操作
-;;   `seshat-reader-annotation-queue-entries'  查询条目（可按文档过滤）
+;;   `seshat-reader-annotation-queue-entries'  查询条目（可按 uid 过滤）
 ;;   `seshat-reader-annotation-queue-remove'   按 UUID 移除一条条目
 ;;   `seshat-reader-annotation-queue-count'    统计队列条数
 ;;   `seshat-reader-annotation-queue-sync'     逐条同步队列并移除已成功条目
@@ -211,17 +218,20 @@ Commentary）。本函数为其补齐 `:uuid'（若尚无）与 `:queued-at'（I
         (seshat-reader-annotation-queue--write (append queue (list new)))
         new))))
 
-(defun seshat-reader-annotation-queue-entries (&optional document-id)
+(defun seshat-reader-annotation-queue-entries (&optional uid)
   "返回队列中的条目列表.
 
-无 DOCUMENT-ID 时返回全部条目（保持入队顺序）。给定 DOCUMENT-ID 时只返回
-`:document-id' 与之 `string=' 相等的条目。队列文件不存在时返回 nil。"
+无 UID 时返回全部条目（保持入队顺序）。给定 UID（服务端权威文件身份，
+**不是**显示用 doc-id）时只返回文档归属与之 `string=' 相等的条目；例外
+是 delete 条目——它按批注 `id' 定位、不依赖文档身份，故一律包含（其
+`:uid' 缺失也不影响同步）。队列文件不存在时返回 nil。"
   (let ((all (seshat-reader-annotation-queue--read)))
-    (if document-id
+    (if uid
         (cl-remove-if-not
          (lambda (entry)
-           (let ((id (plist-get entry :document-id)))
-             (and (stringp id) (string= document-id id))))
+           (or (eq (plist-get entry :action) 'delete)
+               (let ((id (plist-get entry :uid)))
+                 (and (stringp id) (string= uid id)))))
          all)
       all)))
 
@@ -249,41 +259,50 @@ UUID 与条目的 `:uuid' 用 `string=' 精确比较。找到并移除（含写�
 ;;; 同步到服务端
 
 (defun seshat-reader-annotation-queue--sync-create (entry)
-  "同步一条 create 条目 ENTRY，返回 `ok' 或 `stop'.
+  "同步一条 create 条目 ENTRY，返回 `ok'、`skip' 或 `stop'.
 
-ENTRY 为队列中的 create 操作 plist（含 `:document-id'、`:location'、`:text'）。
-先经 `seshat-reader-annotation--fetch' 拉取该文档的服务端批注：
+ENTRY 为队列中的 create 操作 plist（含 `:uid'、`:location'、`:text'）。
+`:uid' 是服务端权威身份，所有服务端调用都用它（`:document-id' 仅供显示）。
 
-- 返回失败哨兵 `seshat-reader-annotation--fetch-error' 时视为服务暂不可达，
-  返回 `stop'（保留本条，稍后重试）；
-- 返回批注列表时，若其中某条批注的 `location' 与 `text' 已与本条完全一致，
-  视为已同步，返回 `ok' 且**不**发起 POST（去重）；
-- 否则调用 `seshat-rest-create-annotation' 创建：成功（返回含 `id' 的 alist）
-  返回 `ok'，失败（返回 nil 或抛 error）返回 `stop'。"
-  (let* ((document-id (plist-get entry :document-id))
+- 缺 `:uid'（M7 之前入队的旧条目）时**不发起任何请求**，返回 `skip'，由
+  `seshat-reader-annotation-queue-sync' 统一提示一次并保留该条；
+- 否则先经 `seshat-reader-annotation--fetch' 按 uid 拉取该文档的服务端批注：
+  - 返回失败哨兵 `seshat-reader-annotation--fetch-error' 时视为服务暂不可达，
+    返回 `stop'（保留本条，稍后重试）；
+  - 返回批注列表时，若其中某条批注的 `location' 与 `text' 已与本条完全一致，
+    视为已同步，返回 `ok' 且**不**发起 POST（去重）；
+  - 否则调用 `seshat-rest-create-annotation'（首个实参为 uid）创建：成功
+    （返回含 `id' 的 alist）返回 `ok'，失败（返回 nil 或抛 error）返回 `stop'。"
+  (let* ((uid (plist-get entry :uid))
          (location (plist-get entry :location))
-         (text (plist-get entry :text))
-         (existing (seshat-reader-annotation--fetch document-id)))
+         (text (plist-get entry :text)))
     (cond
-     ((eq existing seshat-reader-annotation--fetch-error)
-      'stop)
-     ((cl-some (lambda (item)
-                 (and (equal (alist-get 'location item) location)
-                      (equal (alist-get 'text item) text)))
-               existing)
-      'ok)
+     ((not (and (stringp uid) (not (string-empty-p uid))))
+      'skip)
      (t
-      (condition-case nil
-          (let ((response (seshat-rest-create-annotation document-id location text)))
-            (if (and (listp response) (alist-get 'id response))
-                'ok
-              'stop))
-        (error 'stop))))))
+      (let ((existing (seshat-reader-annotation--fetch uid)))
+        (cond
+         ((eq existing seshat-reader-annotation--fetch-error)
+          'stop)
+         ((cl-some (lambda (item)
+                     (and (equal (alist-get 'location item) location)
+                          (equal (alist-get 'text item) text)))
+                   existing)
+          'ok)
+         (t
+          (condition-case nil
+              (let ((response (seshat-rest-create-annotation uid location text)))
+                (if (and (listp response) (alist-get 'id response))
+                    'ok
+                  'stop))
+            (error 'stop)))))))))
 
 (defun seshat-reader-annotation-queue--sync-delete (entry)
   "同步一条 delete 条目 ENTRY，返回 `ok' 或 `stop'.
 
-ENTRY 为队列中的 delete 操作 plist（含 `:id'）。本函数**直接调用
+ENTRY 为队列中的 delete 操作 plist（含 `:id'）。删除按服务端批注 `id'
+定位，`:uid'（服务端文档身份）只是随条目记录、缺失也不影响同步。本函数
+**直接调用
 `seshat-rest--request'** 以便按 HTTP 状态码区分结果（因为封装层
 `seshat-rest-delete-annotation' 对 404 等非 2xx 统一返回 nil，无法区分
 「原本已不存在」与「真正失败」）：状态码为 2xx，或为 **404**（批注已不存在，
@@ -309,20 +328,23 @@ ENTRY 为队列中的 delete 操作 plist（含 `:id'）。本函数**直接调�
          (t 'stop)))
     (error 'stop)))
 
-(defun seshat-reader-annotation-queue-sync (&optional document-id)
+(defun seshat-reader-annotation-queue-sync (&optional uid)
   "把离线队列中的批注操作同步到服务端并返回 (成功数 . 剩余数).
 
-DOCUMENT-ID 非 nil 时只同步该文档的条目（经
-`seshat-reader-annotation-queue-entries' 过滤，保持入队顺序），否则同步全部。
+UID 非 nil 时只同步该文档（服务端权威身份，**不是** doc-id）的条目（经
+`seshat-reader-annotation-queue-entries' 过滤，保持入队顺序；delete 条目
+不依赖文档身份，故始终参与），否则同步全部。
 
 逐条处理并**在每条成功后立即**用 `seshat-reader-annotation-queue-remove'
 按 UUID 重读队列、原子写回；因此与用户并发入队不冲突——本轮只会移除自己
 处理过（并按 UUID 命中）的条目，新入队的条目不会被误删。各 action 的语义：
 
-- create：先经 `seshat-reader-annotation--fetch' 拉取该文档的服务端批注；
-  返回失败哨兵视为服务暂不可达，停止本轮；返回列表时若已有 `location' 与
-  `text' 均与队列条目完全一致的批注，视为已同步、不重复创建；否则经
-  `seshat-rest-create-annotation' 创建，失败即停止本轮。
+- create：先按 `:uid' 经 `seshat-reader-annotation--fetch' 拉取该文档的
+  服务端批注；返回失败哨兵视为服务暂不可达，停止本轮；返回列表时若已有
+  `location' 与 `text' 均与队列条目完全一致的批注，视为已同步、不重复
+  创建；否则经 `seshat-rest-create-annotation'（实参为 uid）创建，失败即
+  停止本轮。**缺 `:uid' 的旧条目在本轮被跳过**（不发送、不移除），并只
+  提示一次「旧队列条目缺少 uid，已跳过」。
 - delete：直接查 `seshat-rest--request' 的 HTTP 状态码，2xx 或 404 视为
   成功并移除，其它非 2xx 或异常时停止本轮。
 
@@ -332,8 +354,9 @@ DOCUMENT-ID 非 nil 时只同步该文档的条目（经
 并发新入队的条目）。
 
 队列文件损坏等需要用户干预的问题不在此吞掉，会照常 `error' 抛出。"
-  (let ((entries (seshat-reader-annotation-queue-entries document-id))
+  (let ((entries (seshat-reader-annotation-queue-entries uid))
         (synced 0)
+        (skipped-legacy nil)
         (stopped nil))
     (while (and entries (not stopped))
       (let* ((entry (car entries))
@@ -342,11 +365,17 @@ DOCUMENT-ID 非 nil 时只同步该文档的条目（经
                        ('delete (seshat-reader-annotation-queue--sync-delete entry))
                        (_ 'stop))))
         (setq entries (cdr entries))
-        (if (eq result 'ok)
-            (progn
-              (seshat-reader-annotation-queue-remove (plist-get entry :uuid))
-              (setq synced (1+ synced)))
-          (setq stopped t))))
+        (cond
+         ((eq result 'ok)
+          (seshat-reader-annotation-queue-remove (plist-get entry :uuid))
+          (setq synced (1+ synced)))
+         ((eq result 'skip)
+          ;; 旧条目：保留在队列里，本轮不再重试；提示只发一次。
+          (unless skipped-legacy
+            (setq skipped-legacy t)
+            (message "Seshat Reader annotation queue: 旧队列条目缺少 uid，已跳过。")))
+         (t
+          (setq stopped t)))))
     (let ((remaining (seshat-reader-annotation-queue-count)))
       (cond
        ((and (zerop synced) (zerop remaining))

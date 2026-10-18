@@ -130,9 +130,19 @@ FN 接收一个 document-id 参数并作为拉取结果返回。"
        (when (file-directory-p ,var)
          (delete-directory ,var t)))))
 
-(defun seshat-reader-annotation-queue-test--create-entry (document-id location text)
-  "返回一条 create 队列条目 plist（DOCUMENT-ID、LOCATION、TEXT）."
-  (list :action 'create :document-id document-id :location location :text text))
+(defconst seshat-reader-annotation-queue-test--uid
+  "01K8Q3M7D2X9V6T1B8N5C0RDEF"
+  "测试用的固定 uid（服务端权威文件身份，同步用）。")
+
+(defun seshat-reader-annotation-queue-test--create-entry (uid location text)
+  "返回一条 create 队列条目 plist（UID、LOCATION、TEXT）.
+`:uid' 为服务端权威身份（同步时发送）；`:document-id' 为显示用文档标识，
+本套件固定为 \"notes:display.pdf\"，不参与同步、也不参与按 uid 过滤。"
+  (list :action 'create
+        :uid uid
+        :document-id "notes:display.pdf"
+        :location location
+        :text text))
 
 (defconst seshat-reader-annotation-queue-test--loc1
   "page:1;rect:0.00,0.00,1.00,1.00"
@@ -166,21 +176,23 @@ FN 接收一个 document-id 参数并作为拉取结果返回。"
         (should (stringp (plist-get item :queued-at)))
         (should (equal (plist-get item :action) 'create))))))
 
-(ert-deftest seshat-reader-annotation-queue-test--entries-filters-by-document-id ()
-  "`-entries' 按 document-id 过滤；不存在的文档返回 nil."
+(ert-deftest seshat-reader-annotation-queue-test--entries-filters-by-uid ()
+  "`-entries' 按 uid 过滤（不再按 doc-id）；不存在的 uid 返回 nil."
   (seshat-reader-annotation-queue-test--with-temp-queue queue-file
     (seshat-reader-annotation-queue-enqueue
-     (seshat-reader-annotation-queue-test--create-entry "lib:a.pdf"
+     (seshat-reader-annotation-queue-test--create-entry "uid-a"
                                                         seshat-reader-annotation-queue-test--loc1 "a1"))
     (seshat-reader-annotation-queue-enqueue
-     (seshat-reader-annotation-queue-test--create-entry "lib:a.pdf"
+     (seshat-reader-annotation-queue-test--create-entry "uid-a"
                                                         seshat-reader-annotation-queue-test--loc2 "a2"))
     (seshat-reader-annotation-queue-enqueue
-     (seshat-reader-annotation-queue-test--create-entry "lib:b.pdf"
+     (seshat-reader-annotation-queue-test--create-entry "uid-b"
                                                         seshat-reader-annotation-queue-test--loc1 "b1"))
-    (should (= (length (seshat-reader-annotation-queue-entries "lib:a.pdf")) 2))
+    (should (= (length (seshat-reader-annotation-queue-entries "uid-a")) 2))
     (should (= (length (seshat-reader-annotation-queue-entries)) 3))
-    (should-not (seshat-reader-annotation-queue-entries "lib:missing.pdf"))))
+    (should-not (seshat-reader-annotation-queue-entries "uid-missing"))
+    ;; 过滤按 uid，不按 doc-id（所有条目 doc-id 相同，仍按 uid 分组）
+    (should-not (seshat-reader-annotation-queue-entries "notes:display.pdf"))))
 
 (ert-deftest seshat-reader-annotation-queue-test--remove-existing-and-missing ()
   "`-remove'：存在返回 t 且后续读取不含；不存在返回 nil."
@@ -356,10 +368,48 @@ FN 接收一个 document-id 参数并作为拉取结果返回。"
       (should (= (length paths) 2))
       (should (= (seshat-reader-annotation-queue-count) 0)))))
 
+;;; B2. 旧队列条目（无 `:uid'）
+
+(ert-deftest seshat-reader-annotation-queue-test--sync-skips-legacy-entry-without-uid ()
+  "缺 `:uid' 的旧 create 条目被跳过（不移除）且只提示一次，后续条目照常同步."
+  (seshat-reader-annotation-queue-test--with-temp-queue queue-file
+    (seshat-reader-annotation-queue-enqueue
+     (list :action 'create :document-id "notes:legacy.pdf"
+           :location seshat-reader-annotation-queue-test--loc1 :text "旧一"))
+    (seshat-reader-annotation-queue-enqueue
+     (list :action 'create :document-id "notes:legacy.pdf"
+           :location seshat-reader-annotation-queue-test--loc2 :text "旧二"))
+    (seshat-reader-annotation-queue-enqueue
+     (seshat-reader-annotation-queue-test--create-entry
+      seshat-reader-annotation-queue-test--uid
+      "page:3;rect:0.00,0.00,1.00,1.00" "新条目"))
+    (let ((result nil)
+          (messages nil)
+          (requests nil))
+      (setq messages
+            (seshat-reader-annotation-queue-test--capture-messages
+              (seshat-reader-annotation-queue-test--with-fetch (lambda (_uid) nil)
+                (setq requests
+                      (seshat-reader-annotation-queue-test--with-stub
+                          201 "{\"id\":1}"
+                        (setq result
+                              (seshat-reader-annotation-queue-sync)))))))
+      ;; 只有带 uid 的那条同步成功，两条旧条目仍留在队列
+      (should (equal result '(1 . 2)))
+      (should (= (length requests) 1))
+      (should (string-match-p
+               (regexp-quote seshat-reader-annotation-queue-test--uid)
+               (nth 2 (car requests))))
+      ;; 提示只发一次（而不是每条旧条目各一次）
+      (should (= 1 (length (cl-remove-if-not
+                            (lambda (msg)
+                              (string-match-p "旧队列条目缺少 uid" msg))
+                            messages)))))))
+
 ;;; C. 接入点（`seshat-reader-annotation'）
 
 (ert-deftest seshat-reader-annotation-queue-test--create-offline-enqueues-both-paths ()
-  "离线创建（桩抛 error / 桩返回 500）均入队，且提示不含「不可用」."
+  "离线创建（桩抛 error / 桩返回 500）均入队且条目带 uid，提示不含「不可用」."
   (dolist (mode '(error http-500))
     (seshat-reader-annotation-queue-test--with-temp-queue queue-file
       (seshat-reader-annotation-queue-test--with-temp-dir dir
@@ -368,22 +418,31 @@ FN 接收一个 document-id 参数并作为拉取结果返回。"
                (seshat-reader-select-last
                 (list :file file :page 1 :rect '(0 0 1 1) :text "离线正文")))
           (with-temp-file file)
-          (let ((messages
-                 (seshat-reader-annotation-queue-test--capture-messages
-                   (pcase mode
-                     ('error
-                      (cl-letf (((symbol-function 'seshat-rest--request)
-                                 (lambda (&rest _) (error "Network down"))))
-                        (seshat-reader-annotation-create)))
-                     ('http-500
-                      (ignore
-                       (seshat-reader-annotation-queue-test--with-stub
-                           500 "{\"error\":{}}"
-                         (seshat-reader-annotation-create))))))))
-            (should (= (seshat-reader-annotation-queue-count) 1))
-            (should messages)
-            (should-not (cl-some (lambda (m) (string-match-p "不可用" m))
-                                 messages))))))))
+          (cl-letf (((symbol-function 'seshat-reader-annotation--uid)
+                     (lambda (&rest _)
+                       seshat-reader-annotation-queue-test--uid)))
+            (let ((messages
+                   (seshat-reader-annotation-queue-test--capture-messages
+                     (pcase mode
+                       ('error
+                        (cl-letf (((symbol-function 'seshat-rest--request)
+                                   (lambda (&rest _) (error "Network down"))))
+                          (seshat-reader-annotation-create)))
+                       ('http-500
+                        (ignore
+                         (seshat-reader-annotation-queue-test--with-stub
+                             500 "{\"error\":{}}"
+                           (seshat-reader-annotation-create))))))))
+              (should (= (seshat-reader-annotation-queue-count) 1))
+              (should messages)
+              (should-not (cl-some (lambda (m) (string-match-p "不可用" m))
+                                   messages))
+              ;; 入队条目同时带 uid（供同步）与 doc-id（供显示）
+              (let ((entry (car (seshat-reader-annotation-queue--read))))
+                (should (equal (plist-get entry :uid)
+                               seshat-reader-annotation-queue-test--uid))
+                (should (equal (plist-get entry :document-id)
+                               "lib:book.pdf"))))))))))
 
 (ert-deftest seshat-reader-annotation-queue-test--create-online-empty-queue-no-sync ()
   "在线创建成功 + 队列为空：队列仍空、未触发 sync."
@@ -396,11 +455,14 @@ FN 接收一个 document-id 参数并作为拉取结果返回。"
              (sync-calls nil)
              (requests nil))
         (with-temp-file file)
-        (setq requests
-              (seshat-reader-annotation-queue-test--with-stub 201 "{\"id\":9}"
-                (setq sync-calls
-                      (seshat-reader-annotation-queue-test--with-sync-spy
-                        (seshat-reader-annotation-create)))))
+        (cl-letf (((symbol-function 'seshat-reader-annotation--uid)
+                   (lambda (&rest _)
+                     seshat-reader-annotation-queue-test--uid)))
+          (setq requests
+                (seshat-reader-annotation-queue-test--with-stub 201 "{\"id\":9}"
+                  (setq sync-calls
+                        (seshat-reader-annotation-queue-test--with-sync-spy
+                          (seshat-reader-annotation-create))))))
         (should (= (length requests) 1))
         (should-not sync-calls)
         (should (= (seshat-reader-annotation-queue-count) 0))))))
@@ -410,7 +472,7 @@ FN 接收一个 document-id 参数并作为拉取结果返回。"
   (seshat-reader-annotation-queue-test--with-temp-queue queue-file
     (seshat-reader-annotation-queue-enqueue
      (seshat-reader-annotation-queue-test--create-entry
-      "lib:other.pdf" seshat-reader-annotation-queue-test--loc1 "旧项"))
+      "01K8Q3M7D2X9V6T1B8N5C0RDEZ" seshat-reader-annotation-queue-test--loc1 "旧项"))
     (seshat-reader-annotation-queue-test--with-temp-dir dir
       (let* ((file (expand-file-name "book.pdf" dir))
              (seshat-reader-annotation-roots (list (cons "lib" dir)))
@@ -418,11 +480,14 @@ FN 接收一个 document-id 参数并作为拉取结果返回。"
               (list :file file :page 2 :rect '(0 0 1 1) :text "在线正文"))
              (sync-calls nil))
         (with-temp-file file)
-        (ignore
-         (seshat-reader-annotation-queue-test--with-stub 201 "{\"id\":9}"
-           (setq sync-calls
-                 (seshat-reader-annotation-queue-test--with-sync-spy
-                   (seshat-reader-annotation-create)))))
+        (cl-letf (((symbol-function 'seshat-reader-annotation--uid)
+                   (lambda (&rest _)
+                     seshat-reader-annotation-queue-test--uid)))
+          (ignore
+           (seshat-reader-annotation-queue-test--with-stub 201 "{\"id\":9}"
+             (setq sync-calls
+                   (seshat-reader-annotation-queue-test--with-sync-spy
+                     (seshat-reader-annotation-create))))))
         (should (= (length sync-calls) 1))))))
 
 (ert-deftest seshat-reader-annotation-queue-test--list-offline-renders-queued ()
@@ -430,23 +495,29 @@ FN 接收一个 document-id 参数并作为拉取结果返回。"
   (seshat-reader-annotation-queue-test--with-temp-queue queue-file
     (seshat-reader-annotation-queue-test--with-temp-dir dir
       (let* ((file (expand-file-name "book.pdf" dir))
-             (seshat-reader-annotation-roots (list (cons "lib" dir))))
+             (seshat-reader-annotation-roots (list (cons "lib" dir)))
+             (uid seshat-reader-annotation-queue-test--uid))
         (with-temp-file file)
-        (let* ((doc-id (seshat-reader-annotation--doc-id file))
-               (messages nil))
+        (let ((messages nil))
           (seshat-reader-annotation-queue-enqueue
            (seshat-reader-annotation-queue-test--create-entry
-            doc-id "page:4;rect:0.00,0.00,1.00,1.00" "本地待同步"))
+            uid "page:4;rect:0.00,0.00,1.00,1.00" "本地待同步"))
           (setq messages
                 (seshat-reader-annotation-queue-test--capture-messages
                   (seshat-reader-annotation-queue-test--with-fetch
-                      (lambda (_doc) seshat-reader-annotation--fetch-error)
-                    (with-temp-buffer
-                      (setq buffer-file-name file)
-                      (seshat-reader-annotation-list)))))
+                      (lambda (_uid) seshat-reader-annotation--fetch-error)
+                    (cl-letf (((symbol-function 'seshat-reader-annotation--uid)
+                               (lambda (&rest _) uid)))
+                      (with-temp-buffer
+                        (setq buffer-file-name file)
+                        (seshat-reader-annotation-list))))))
           (with-current-buffer (get-buffer seshat-reader-annotation-list-buffer-name)
             (should (string-match-p "本地待同步" (buffer-string)))
-            (should (string-match-p "\\[待同步\\]" (buffer-string))))
+            (should (string-match-p "\\[待同步\\]" (buffer-string)))
+            ;; 双值：uid 供刷新，doc-id 供显示
+            (should (equal seshat-reader-annotation-list-uid uid))
+            (should (equal seshat-reader-annotation-list-document-id
+                           "lib:book.pdf")))
           (should messages)
           (should-not (cl-some (lambda (m) (string-match-p "不可用" m))
                                messages)))))))
@@ -456,37 +527,40 @@ FN 接收一个 document-id 参数并作为拉取结果返回。"
   (seshat-reader-annotation-queue-test--with-temp-queue queue-file
     (seshat-reader-annotation-queue-test--with-temp-dir dir
       (let* ((file (expand-file-name "book.pdf" dir))
-             (seshat-reader-annotation-roots (list (cons "lib" dir))))
+             (seshat-reader-annotation-roots (list (cons "lib" dir)))
+             (uid seshat-reader-annotation-queue-test--uid))
         (with-temp-file file)
-        (let ((doc-id (seshat-reader-annotation--doc-id file)))
-          (seshat-reader-annotation-queue-enqueue
-           (seshat-reader-annotation-queue-test--create-entry
-            doc-id "page:9;rect:0.00,0.00,1.00,1.00" "本地项"))
-          (let ((server (list (list (cons 'id 5)
-                                    (cons 'location "page:2;rect:0.00,0.00,1.00,1.00")
-                                    (cons 'text "服务端项")))))
-            (cl-letf (((symbol-function 'seshat-reader-annotation--fetch)
-                       (lambda (_doc) server))
-                      ((symbol-function 'seshat-reader-annotation-queue-sync) #'ignore))
-              (with-temp-buffer
-                (setq buffer-file-name file)
-                (seshat-reader-annotation-list))))
-          (with-current-buffer (get-buffer seshat-reader-annotation-list-buffer-name)
-            (should (= (count-lines (point-min) (point-max)) 2))
-            (goto-char (point-min))
-            (should (equal (get-text-property (point) 'seshat-reader-annotation-id) 5))
-            (should-not (get-text-property (point) 'seshat-reader-annotation-queue-uuid))
-            (forward-line 1)
-            (should (stringp (get-text-property (point)
-                                                'seshat-reader-annotation-queue-uuid)))
-            (should-not (get-text-property (point) 'seshat-reader-annotation-id))))))))
+        (seshat-reader-annotation-queue-enqueue
+         (seshat-reader-annotation-queue-test--create-entry
+          uid "page:9;rect:0.00,0.00,1.00,1.00" "本地项"))
+        (let ((server (list (list (cons 'id 5)
+                                  (cons 'location "page:2;rect:0.00,0.00,1.00,1.00")
+                                  (cons 'text "服务端项")))))
+          (cl-letf (((symbol-function 'seshat-reader-annotation--fetch)
+                     (lambda (_uid) server))
+                    ((symbol-function 'seshat-reader-annotation--uid)
+                     (lambda (&rest _) uid))
+                    ((symbol-function 'seshat-reader-annotation-queue-sync) #'ignore))
+            (with-temp-buffer
+              (setq buffer-file-name file)
+              (seshat-reader-annotation-list))))
+        (with-current-buffer (get-buffer seshat-reader-annotation-list-buffer-name)
+          (should (= (count-lines (point-min) (point-max)) 2))
+          (goto-char (point-min))
+          (should (equal (get-text-property (point) 'seshat-reader-annotation-id) 5))
+          (should-not (get-text-property (point) 'seshat-reader-annotation-queue-uuid))
+          (forward-line 1)
+          (should (stringp (get-text-property (point)
+                                              'seshat-reader-annotation-queue-uuid)))
+          (should-not (get-text-property (point) 'seshat-reader-annotation-id)))))))
 
 (ert-deftest seshat-reader-annotation-queue-test--list-delete-local-item-no-http ()
   "删除本地待同步项：不发起 HTTP（桩 `--request' 0 次），队列项被移除."
   (seshat-reader-annotation-queue-test--with-temp-queue queue-file
     (let* ((entry (seshat-reader-annotation-queue-enqueue
                    (seshat-reader-annotation-queue-test--create-entry
-                    "lib:book.pdf" seshat-reader-annotation-queue-test--loc1 "本地项")))
+                    seshat-reader-annotation-queue-test--uid
+                    seshat-reader-annotation-queue-test--loc1 "本地项")))
            (uuid (plist-get entry :uuid)))
       (with-temp-buffer
         (seshat-reader-annotation-list-mode)
@@ -494,6 +568,8 @@ FN 接收一个 document-id 参数并作为拉取结果返回。"
           (insert (propertize "  1  本地项  [待同步]\n"
                               'seshat-reader-annotation-queue-uuid uuid)))
         (goto-char (point-min))
+        (setq-local seshat-reader-annotation-list-uid
+                    seshat-reader-annotation-queue-test--uid)
         (setq-local seshat-reader-annotation-list-document-id "lib:book.pdf")
         (setq-local seshat-reader-annotation-list-source nil)
         (setq-local seshat-reader-annotation-list-entries nil)
