@@ -540,3 +540,38 @@
 - 现状：B2b 起阅读区改为全屏 + 底部 padding = 浮层高度（约 40–56dp）。旧进度 `scrollY` 语义（相对章内 `WebView` 滚动量）不变，但「中心章」判定基准变为可见区中心，中心点相对旧实现下移约 40dp。
 - 影响：章边界附近（末尾约 40dp 的内容）可能被判定为「已进入下一章」，与旧版本记录的章节号出现 ±1 偏差；跨版本续读时表现为「打开后标题显示的章比上次记录的多一章」。
 - 建议：短期可接受（只在章尾窄带内出现）；若要严格一致，可在 `ScrollProgressMath` 的中心章判定里把 padding 计入并写单测固定语义；或在进度里显式记录「计算基准版本」，迁移时按版本换算。
+
+## 书架 EPUB 进度键 = 内容哈希，有 uid 的书查不到进度（M10.6 B3，2026-10-18）
+- 现状：`BookMeta.progressKey` 对 EPUB 恒为内容哈希（`EpubParser.documentIdOf`，SHA-256 前 16 字节），PDF 恒为 `file://` uri；书架据此查 `ReadingProgressStore.all()` / `PdfProgressStore.loadAll()`。阅读器端则是 `effectiveKey = uid ?: docId`——同一本书若有服务端 uid，进度存在 **uid** 键下。
+- 影响：凡通过服务端登记（有 uid）读过的书，书架按内容哈希查不到进度，徽标恒显示 0%（或按「未读」过滤掉），与用户在阅读器里看到的位置不一致；用户会误以为书架丢失了阅读记录。
+- 建议：B 批接线 `SyncEngine` / `ResourceIndex` 时改为**两键查找**——先用文件路径经 `ResourceIndex.findByPath`（或 `GET /api/resolve`）拿 uid，命中则按 uid 读进度，未命中再退回内容哈希；`BookMeta` 需携带可选 uid 或由书架层补一次索引查询。
+
+## PDF `file://`（书架）与 `content://`（SAF）两套进度不共享（M10.6 B3，2026-10-18）
+- 现状：书架打开的 PDF 用 `Uri.fromFile(file)`（`file://...`）作 `docId`，SAF 选择器打开的是 `content://...`；`PdfProgressStore` / `PdfAnnotationStore` / `PdfInkStore` 全部以 `docId` 字符串为键，两者是不同的键。
+- 影响：同一份 PDF 从书架读到的位置、批注、手写笔迹，从 SAF 再次打开时**全部看不到**（反之亦然），用户会认为数据丢失；且两套数据各自累积，无合并路径。
+- 建议：统一为按**内容或规范化路径**派生的稳定键（例如书架与 SAF 都取 `DocumentsContract` 的真实文件路径，或用内容哈希），并对既有两套键做一次惰性迁移；至少在 UI 上提示「来源不同，进度独立」。
+
+## EPUB2 封面不支持（M10.6 B3，2026-10-18）
+- 现状：`BookMeta` 的封面只认 EPUB3 manifest 里带 `properties="cover-image"` 的项；EPUB2 惯用的 `<meta name="cover" content="<id>"/>`（OPF2 元数据指向 cover 图 item）不识别。
+- 影响：存量 EPUB2 书籍（大量旧书）书架格子里没有封面，只有标题/作者占位，视觉上比静读天下等成熟阅读器差一截；且这是解析期判定，UI 无法补救。
+- 建议：`EpubParser` 补 EPUB2 回退——`properties="cover-image"` 未命中时读 `<meta name="cover">` 的 `content` 值，到 manifest 里按 `id` 找 href；再加一条「文件名形如 `cover.*` 的图片」兜底，并补 EPUB2 算例单测。
+
+## `covers/` 无自动清理（M10.6 B3，2026-10-18）
+- 现状：`filesDir/covers/` 只写不删——`CoverCache` 提供 `clearAll()` 但无任何调用方；书籍从 `filesDir/books/` 删除后，其 `<key>.jpg` 与 `<key>.json` 永久滞留；缓存键含文件 `length` + `lastModified`，同名文件被替换会产生**新键**，旧键文件成为孤儿。
+- 影响：缓存目录随「删除次数 + 文件替换次数」单调增长，长期可占数十至数百 MB；手机存储紧张时表现为「应用体积不明原因变大」，且用户无入口自助清理。
+- 建议：加扫描后的 sweep——遍历 `covers/` 与当前书库的有效键集合求差集并删除孤儿（可在书架扫描的同一后台线程末尾执行），再叠加容量上限（如 64 MB）或「最多保留 N 张」的 LRU 磁盘淘汰。
+
+## 书架首次扫描需逐本 readBytes + 解压 + SHA-256（M10.6 B3，2026-10-18）
+- 现状：`EpubBookMetaReader.read()` 对每本 EPUB 执行 `file.readBytes()` → `EpubParser.parse`（解压 OPF 等条目）→ `documentIdOf(bytes)`（整包 SHA-256）；`BookMeta` 只有 `coverHref`（相对 opfDir 的路径）而**没有 `opfDir`**，`CoverCache.epubCover()` 生成封面时必须重新解析一遍 EPUB 才能定位条目。
+- 影响：首次进入书架（或缓存失效后）耗时与峰值内存随书库规模线性增长——每本书都整包进堆再算哈希，大 EPUB（数百 MB）可触发 OOM；每本 EPUB 解析 **2 次**（元数据 1 次 + 封面 1 次），是首次加载慢的主因。
+- 建议：① `BookMeta` 增加 `opfDir`（或直接给 `coverEntry` 完整路径），消除封面二次解析；② 把「整包读入」改为流式摘要（`DigestInputStream` 边读边哈希），只对需要解析 OPF 的条目做局部解压；③ 首次扫描结果写入磁盘缓存（已有 `<key>.json`）后期次扫描只读缓存，需保证缓存失效判据（`length` + `lastModified`）可靠。
+
+## 封面与扫描共用同一单线程 executor，刷新被解码拖后（M10.6 B3，2026-10-18）
+- 现状：`ReaderFragment` 只有 `scanExecutor = Executors.newSingleThreadExecutor()` 一个后台线程，书库扫描与 `CoverCache.load()` 的封面解码/落盘都投在它上面（`PdfRenderer` 非线程安全是需要串行的原因，但封面解码并不需要与扫描串行）。
+- 影响：书库较大时（实测约 240 本）「扫描完成 → 网格可见」之后，新封面仍排队等在 executor 上，滚动过程中格子陆续变色，用户感知为「书架一卡一卡地加载」；而且扫描刷新（切回 Fragment / 从阅读器返回）必须排在已入队的封面解码之后，刷新延迟被放大。
+- 建议：拆两个后台线程——扫描（含 `PdfRenderer` 取页数、元数据解析）仍单线程，封面解码另用独立 executor（2 线程即可，解码本身是 CPU 密集且互相独立）；或在同一 executor 上给扫描任务加**优先级**（用 `ThreadPoolExecutor` + 优先队列），保证刷新永远先于历史封面任务。
+
+## 切 tab 不刷新书架（M10.6 B3，2026-10-18）
+- 现状：Shell 用 `FragmentTransaction.show/hide` 切换 tab，两个 Fragment 只创建一次；`show/hide` **不改变生命周期**，`onResume` 不会再次触发。书架只在 `onViewCreated`、`onResume`（从阅读器返回）与过滤/排序变更时 `refresh()`。
+- 影响：在「笔记」tab 期间书架内容可能已变化（例如导入流程/外部写入），切回「阅读」tab 仍显示旧列表（缺新书、进度徽标过期），用户需要退出重进或改一次过滤条件才能看到更新。
+- 建议：`ReaderFragment` 覆写 `onHiddenChanged(hidden: Boolean)`，`hidden == false` 时按需 `refresh()`（可加时间窗节流，例如距上次刷新 <3s 则跳过）；若将来改为 `ViewPager2`/Navigation 组件，则对应改为 `onResume` 或 `onStart` 语义。

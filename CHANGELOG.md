@@ -41,6 +41,11 @@
 - EPUB 章节目录（M10.6 B2）：新增底部 `SeekBar`（拖动中不跳、松手跳章）、点击标题栏章号输入章号跳转（非法输入提示「章号无效」）与「目录」对话框（当前章高亮、点击跳章并关闭，nav/NCX 已扁平化为无层级列表）。
 - PDF 页导航（M10.6 B2）：底部 `SeekBar` 拖动松手跳页、点击页码输入页号跳转；页码/进度指示在布局型跳转后用 `doOnNextLayout` 补齐同步。
 - EPUB/PDF 阅读区底部 padding 自适应浮层高度（M10.6 B2）：阅读区 `clipToPadding = false` + padding = 浮层运行时高度（首次布局后写入、高度变化时跟随），页尾/章尾内容不再被叠加的浮层遮挡。
+- Android 本地书架（M10.6 B3）：`ReaderFragment` 改为「过滤/排序条 + 封面网格」，数据源仅本地 `filesDir/books/`。网格列数按屏宽 2/3/4 列（<400dp / ≥400dp / ≥600dp），每格封面 + 标题 + 作者 + **进度徽标**（0% 不显示）；过滤「全部 / 未读 / 在读 / 已读」与排序「最近阅读 / 书名 / 导入时间」均为纯函数 `BookShelfLogic`；点击 EPUB 进 `EpubReaderActivity`（内容哈希作键）、PDF 进 `PdfReaderActivity`（`file://` 作键）。**零新增依赖。**
+- EPUB 元数据扩展（M10.6 B3）：`EpubParser` / `EpubBook` 新增作者（OPF `dc:creator`，缺失为 `null`）与封面（manifest 中 `properties="cover-image"` 的项，暴露 `coverHref`）。
+- Android 封面缓存（M10.6 B3）：新增 `reader/CoverCache`——内存 `LruCache<String, Bitmap>`（按 `byteCount`，上限 `Runtime.maxMemory() / 8`）+ 磁盘 `filesDir/covers/<key>.jpg`，并把书籍元数据另存 `<key>.json` 以**避免重复解析 EPUB 与重算内容哈希**；缓存键为 `文件名 + length + lastModified` 的 SHA-256 前 16 位 hex（`reader/CoverKeys`），PDF 封面用首页 `PdfRenderer` 渲染并按 `inSampleSize` 降采样。
+- 书籍扫描与进度枚举（M10.6 B3）：新增 `reader/BookLibrary`（扫描 `filesDir/books/` → 元数据 → 合并进度 → 过滤 → 排序，阻塞调用、须在后台线程）与 `reader/BookMetaReaders`（生产用 EPUB/PDF 元数据读取，PDF 只取页数不渲染）；`ReadingProgressStore` 新增 `all()`、`PdfProgressStore` 新增 `loadAll()` 供书架一次性枚举进度。新增 JVM 单测 4 个测试类共 42 例（`BookLibraryTest` 13 / `BookShelfLogicTest` 14 / `CoverKeysTest` 10 / `CoverCacheMetaTest` 5），单测总数 407 全绿（B2+B3 合计 336 → 407）。
+- 示例书迁移到 `filesDir/books/`（M10.6 B3）：`assets/sample.epub` 首次复制到书籍目录后打开书架条目；旧路径 `filesDir/sample.epub` **保留不删**作为回滚点（进度键为内容哈希，迁移后同一本书的进度仍可见）。
 
 ### 变更
 

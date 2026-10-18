@@ -283,3 +283,11 @@
 **理由**：① 单文件 JSON **零新增依赖**（不引入 Room / SQLite），且索引是**派生状态**——可随时 `clear()` + `bootstrap()` 从 `/api/changes` 重建，不需要事务与数据迁移；② 两层职责切分让「跨多 uid 的增量编排（游标推进、崩溃幂等、批量落盘）」与「单文档双向同步（进度/批注字段映射、`location + text` 去重）」各自可独立单测，`SyncManager` 无需感知游标与墓碑的存在；③ 守卫 + A 批不接线共同保证「服务端未配置 / 无 uid 时零网络行为」，不破坏 M10.6「服务端可选」与 M9.1「令牌只经 `putSecret`」两条既有不变量。
 
 **代价**：① 单文件**全量重写**（`rename` / `markDeleted` / `setCursor` 仍序列化整份 JSON），条目上万后写放大与 GC 压力明显，需评估迁移 Room/SQLite；② `ResourceIndex` 假定**单线程串行调用**、内存缓存不加锁——B 批一旦跨线程接线必须先补锁或强制单 dispatcher；③ 能力储备期间 `SyncEngine` 无法端到端验证，只能靠 fake `SyncApi` 的单测覆盖。
+
+## 2026-10-18 · M10.6 B3 书架
+
+**决策**：书架数据源仅本地 `filesDir/books/`；元数据与封面走「磁盘缓存 + 内存 LruCache」而非新增数据库；EPUB 的进度键用内容哈希（与阅读器 `uid ?: docId` 的无 uid 分支一致），PDF 接受 `file://`（书架）与 `content://`（SAF）两套进度分离。
+
+**理由**：零新增依赖；书架只读本地，服务端同步留给 B 批（`SyncEngine` 接线）；内容哈希是唯一能仅凭文件复现的稳定键。
+
+**代价**：首次扫描需逐本解析（慢）；有 uid 的书查不到进度；PDF 两套进度不共享；EPUB 首次上架解析 2 次（`BookMeta` 无 `opfDir`）。
