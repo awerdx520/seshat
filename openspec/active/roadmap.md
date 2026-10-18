@@ -2,10 +2,11 @@
 
 ## 当前状态
 
-- 阶段：Phase 2（Plan）· 路线图已落盘
-- 已确认：整体方案 ✅（用户 2026-10-12 确认）、路线图 ✅（用户 2026-10-12 确认）
+- 阶段：Phase 4（Review & Document）· M7 已完成并归档
+- 已确认：整体方案 ✅（用户 2026-10-12 确认）、路线图 ✅（用户 2026-10-12 确认）；M7 方案 ✅ 与计划 ✅（用户 2026-10-18 确认）
 - 加密：维持现有 TLS（反向代理终止）；**不做应用层加密**（用户已取消该需求）
-- 下一步：等待用户指示是否开工 M7（M7 需另行走方案确认与计划确认两道门禁）
+- 下一步：M8（Emacs 端接入）需另行方案确认与计划确认
+- 2026-10-18 进展：M9.1 / M9.2（设置项·连续滚动）/ M10.5（手写·点击翻页·横屏）/ M10.6-B1（服务端可选）已完成并归档；M7 服务端已完成（待提交）；下一步为 M9.2 的 T1–T6 或 M10.6 的 B2–B4
 - 未决问题（阻塞后续里程碑，不阻塞本文件）：收录目录清单、GTD 深度、Reader 功能清单、EPUB location 约定
 
 ## 背景与起点
@@ -67,14 +68,16 @@ M0–M6 已完成并归档，见 `openspec/completed/personal-notes-system.md`�
 
 ### M7 服务端地基（uid + 引用 + 增量）
 
+计划与执行记录：[openspec/completed/2026-10-18-m7-uid-identity-and-incremental-sync.md](../completed/2026-10-18-m7-uid-identity-and-incremental-sync.md)（已完成并归档，2026-10-18）。**M7.1 的验收要点据实调整**：因服务端尚未部署、无存量数据，迁移拆为 v6（只建身份三表）与 v7（`DROP` 重建状态表，`preMigrationChecks[7]` 以 `COUNT(*)` 非空即中止为防御），不做 `document_id` → uid 的存量映射（见 `openspec/decisions.md` 2026-10-18）。
+
 | 子项 | 内容 | 验收要点 |
 |---|---|---|
-| M7.1 | `resources` / `changes` / `refs` 三表 + 迁移（`document_id` → `uid`） | 迁移可重跑；存量 progress/annotations 成功映射 uid |
-| M7.2 | 根映射配置（多根 + 逻辑前缀），服务端权威、可下发 | 多根同名文件不冲突 |
-| M7.3 | REST：`files` CRUD/move、`changes`（since 游标）、`resolve`、`refs` | curl 走通「增→改→重命名→删→增量拉取」，uid 全程稳定 |
-| M7.4 | WebDAV 写路径登记钩子（第三方写入同样进 registry） | 第三方 PUT/MOVE 后能在 `resources` 查到 |
-| M7.5 | 协议文档重写（`docs/sync-protocol.md`、`docs/api.md`） | 新人可据文档实现一个客户端 |
-| M7.6 | `seshat:` 引用语法 + 解析 | 链接可解析为 uid（跨端一致） |
+| M7.1 | `resources` / `changes` / `refs` 三表 + 迁移（`document_id` → `uid`） | 迁移可重跑；存量 progress/annotations 成功映射 uid —— ✅ 完成（2026-10-18；迁移可重跑已验证，存量映射改为 v6/v7 拆分 + 非空即中止） |
+| M7.2 | 根映射配置（多根 + 逻辑前缀），服务端权威、可下发 | 多根同名文件不冲突 —— ✅ 完成（2026-10-18） |
+| M7.3 | REST：`files` CRUD/move、`changes`（since 游标）、`resolve`、`refs` | curl 走通「增→改→重命名→删→增量拉取」，uid 全程稳定 —— ✅ 完成（2026-10-18） |
+| M7.4 | WebDAV 写路径登记钩子（第三方写入同样进 registry） | 第三方 PUT/MOVE 后能在 `resources` 查到 —— ✅ 完成（2026-10-18；含启动全量登记 `Bootstrap`） |
+| M7.5 | 协议文档重写（`docs/sync-protocol.md`、`docs/api.md`） | 新人可据文档实现一个客户端 —— ✅ 完成（2026-10-18） |
+| M7.6 | `seshat:` 引用语法 + 解析 | 链接可解析为 uid（跨端一致） —— ✅ 完成（2026-10-18；服务端 `refs` 支持 `tag:path` 与 uid 双形态） |
 
 ### M8 Emacs 端接入
 
@@ -92,19 +95,20 @@ M0–M6 已完成并归档，见 `openspec/completed/personal-notes-system.md`�
 | 子项 | 内容 |
 |---|---|
 | M9.1 | 三区 UI 骨架（工具栏 / 内容区 / 底部 Notes·Reader 双 tab）+ 设置页 ✅ 完成（2026-10-18），见 openspec/completed/2026-10-18-m9.1-android-shell.md |
-| M9.2 | 数据源接入（uid + 增量 + 本地缓存 + 按需下载电子书） |
-| M9.3 | Notes：orgzly 风格列表 / 搜索 / 展开 / 编辑 |
-| M9.4 | GTD：agenda 视图增强（M4 基础上） |
+| M9.2 | 数据源接入（uid + 增量 + 本地缓存 + 按需下载电子书）——A 批（Android 接 M7：uid 化 + 只读协议 + 索引 + 增量拉取）T0 前置验证已通过（2026-10-18），T1–T6 待实施，见 openspec/active/2026-10-18-m9.2-android-m7-client.md；B 批（文件同步）未开工 |
+| M9.3 | Notes：orgzly 风格列表 / 搜索 / 展开 / 编辑——计划已就绪（与书架、阅读器对齐合并为 M10.6），B4 待实施 |
+| M9.4 | GTD：agenda 视图增强（M4 基础上）——计划已就绪（与书架、阅读器对齐合并为 M10.6），B4 待实施 |
+| M9.1b | 设置项扩展（8 项）+ tab 图标 + 阅读器连续滚动（PDF/EPUB 竖向零间隙）✅ 完成（2026-10-18），见 openspec/completed/2026-10-18-m9.2-settings-and-reader-scroll.md（编号用 M9.1b 以免与上表已有的 M9.2「数据源接入」冲突） |
 
 ### M10 Android Reader
 
 | 子项 | 内容 |
 |---|---|
-| M10.1 | 书架（元数据来自服务端，封面/进度/按需下载） |
-| M10.2 | 阅读增强（目录/主题/字体/跳转） |
+| M10.1 | 书架（元数据来自服务端，封面/进度/按需下载）——计划已就绪（M10.6 B3），待实施 |
+| M10.2 | 阅读增强（目录/主题/字体/跳转）——字号/翻页模式已随 M9.2 落地；工具栏显隐/SeekBar/目录待 M10.6 B2 |
 | M10.3 | 批注侧车 + `location` 约定统一（PDF `page:<n>`+范围；EPUB 待定） |
 | M10.4 | 进度/批注 uid 化同步 |
-| M10.5 | **PDF 阅读增强**（用户 2026-10-18 提出，未开工，需另行走方案确认与计划确认）：手写批注（笔迹侧车，不写回 PDF）、点击翻页、横向翻页 / 竖向连续滚动双模式（滚动时页间首尾相接，保留上页最后一行）、横屏适配（fitWidth / fitHeight 选择）、后台渲染线程 + 位图 LRU 缓存（依赖 M10.1） |
+| M10.5 | **PDF 阅读增强**（用户 2026-10-18 提出，未开工，需另行走方案确认与计划确认）：手写批注（笔迹侧车，不写回 PDF）、点击翻页、横向翻页 / 竖向连续滚动双模式（滚动时页间首尾相接，保留上页最后一行）、横屏适配（fitWidth / fitHeight 选择）、后台渲染线程 + 位图 LRU 缓存（依赖 M10.1）✅ 完成（2026-10-18，手写批注 + 点击翻页 + 横屏），见 openspec/completed/2026-10-18-m10.5-pdf-ink-and-paging.md |
 
 ### M11 批注与引用闭环
 
@@ -139,12 +143,13 @@ M0–M6 已完成并归档，见 `openspec/completed/personal-notes-system.md`�
 
 ## 未决问题
 
-1. 收录目录清单（哪些根、什么前缀）—— M7.2 需要
+1. 收录目录清单（哪些根、什么前缀）—— M7.2 需要 —— ✅ 已解决（M7.2 落地 `webdav.roots`：`tag`/`path`/`mode`，未配置时归一为单根 `notes`，2026-10-18）
 2. GTD 深度（只读 / 可编辑 / repeater·DEADLINE·状态流转）—— M9.4 需要
 3. Reader「基础功能」清单（排除 TTS/词典/统计？）—— M10 需要
-4. EPUB 的 location 约定（CFI vs `chapter:x`）—— M10.3 需要
+4. EPUB 的 location 约定（CFI vs `chapter:x`）—— M10.3 需要 —— **仍未定**（M7 不解决；M7 只把「身份」从路径换成 uid，location 语义未变）
 5. M11.8 T6（`SPC o P` 全局键位）未做，属 UX 待办（见 tech-debt）
-6. PDF 手写批注的 `location` 协议（现有约定仅支持 `page:<n>;rect:x0,y0,x1,y1`，多点笔迹需扩展，例如 `page:<n>;ink:...`；需与 Emacs 端 rect 约定共存）—— M10.5 需要
+6. PDF 手写批注的 `location` 协议（现有约定仅支持 `page:<n>;rect:x0,y0,x1,y1`，多点笔迹需扩展，例如 `page:<n>;ink:...`；需与 Emacs 端 rect 约定共存）—— M10.5 需要（已定稿：`page:<n>;ink:<color>,<widthPt>,<x0>,<y0>,...`，页面坐标，见 docs/api.md 4.5.1；2026-10-18）
+7. 含 `#`/`%` 的文档名引用 —— ✅ 已缓解（M7 引入 uid 形态承载身份：服务端 `refs` 支持 uid 形态，解析不再受文件名字符限制；Emacs 侧 `seshat:` 链接文本仍为 doc-id 形态，故为「缓解」而非「解决」，见 tech-debt「含 `#`/`%` 的文档名不支持引用」）
 
 ## 文档清单
 

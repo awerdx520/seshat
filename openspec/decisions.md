@@ -203,3 +203,75 @@
 **代价**：
 1. `visual-fill-column--enable` 会对 `selected-window` 重置 margin；`--disable` 还会重置 fringe。实现已加「仅面板已显示时才传 -1」的窗口守卫，避免选项为 nil 时每次渲染误清阅读器窗口；但启用路径（面板未显示时）的 selected-window margin 重置仍无法规避（影响窄）；
 2. 新增一个软依赖（未安装时功能静默缺失，无提示）。
+
+## 2026-10-18 · Android 设置存储分层与阅读器连续滚动容器（M9.2）
+
+**决策**：① 配置分两层存储——机密（令牌）与服务端地址走 `SecurePrefs`（EncryptedSharedPreferences）；远程目录/主题/字号/翻页模式走新增的 `settings/AppPreferences`（普通 `seshat_app_prefs.xml`，不加密、参与系统备份）。② 阅读器连续滚动统一用 `RecyclerView`：PDF 单一容器 + 横向 `PagerSnapHelper`；EPUB 双容器（横向 `ViewPager2` / 竖向 `RecyclerView` of 高度自适应 `WebView`）。③ 阅读偏好（字号/翻页模式）**下次打开阅读器生效**，不做运行中热切换；主题**立即生效**（`AppCompatDelegate` + 新增 `SeshatApp`）。
+
+**理由**：① 加密层初始化可能失败（Keystore 损坏/定制 ROM），若把主题与阅读偏好也放加密 prefs，会在加密不可用时一并失效；分层后非机密偏好始终可用，且无需为它们承担加密开销。② `ViewPager2` 竖向只支持整页吸附、无法零间隙连续滚动，而 `RecyclerView` 同时满足「横向吸附（`PagerSnapHelper`）」与「竖向连续」两种模式，避免同一页面维护两套容器。③ 热切换翻页模式需要迁移滚动位置、重建 WebView/位图，风险与收益不匹配；主题切换只影响资源重解析，可即时生效。④ `ScrollProgressMath` 抽成纯函数，让「可见位置 ↔ 进度锚点」的换算可 JVM 单测（`onScroll` 回调本身无法单测）。
+
+**代价**：① 两套 prefs 文件增加理解成本（已在 `docs/android.md` 与 `docs/security.md` §7 说明）；② EPUB 竖向禁复用导致滚动时反复创建 `WebView`，章节多时有性能开销；③ WebView 高度测量依赖 `onPageFinished` 与随后的一次 JS 往返，测量完成前 item 高度为占位值，需要重锚兜底；④ PDF 竖向模式仍按「整页 item」连续堆叠（页内不连续），不是单页视口内的流式排版。
+
+## 2026-10-18 · M7 文件身份采用服务端 uid（直接切换，无兼容层）
+
+**决策**：文件身份采用服务端生成的 26 字符 Crockford Base32 uid（`crypto/rand` 16 字节，零新增依赖），`resources` 表为权威登记，路径降级为可变属性。状态表（`reading_progress` / `annotations`）在 v6 迁移中直接 `DROP` 重建为以 uid 为键；状态 API 不再接受 `document_id`，`/api/resolve?root=&path=` 是客户端获取 uid 的唯一入口。Emacs 端两处派生/调用点同步改造。
+
+**理由**：① 服务端尚未部署、无存量生产数据，兼容期的维护成本（双列读写 + legacy 映射 + 兼容层分支）没有任何实际收益；② 改名/移动不再失锚，三端身份（Emacs `tag:path`、Android SHA-256）收敛到同一 uid；③ 一次切换比长期两套路径更不容易出错。
+
+**代价**：① 破坏性变更——状态 API 与客户端不兼容，Emacs 必须同步升级（已纳入 M7 任务 B5），Android 留给后续里程碑；② 若将来有第三方客户端接入，需按 uid 契约实现。详见 `docs/adr/0003-uid-identity-model.md`。
+
+## 2026-10-18 · M7 增量同步采用全局 changes.seq 游标
+
+**决策**：增量同步采用「全局 `changes.seq` 单调游标 + 客户端 cursor」；删除写墓碑并保留 `delete` 事件；registry 是**派生状态**，可由文件系统 `rescan` 重建。
+
+**理由**：单写者 SQLite 下最简单可靠，跨根统一；墓碑使客户端能感知删除；派生状态使钩子失败可修复。
+
+**代价**：`changes` 无 TTL 会增长（单用户量级可忽略）；钩子失败窗口内事件缺失，需 rescan 兜底。详见 docs/adr/0004-incremental-change-log.md。
+
+## 2026-10-18 · M7 多根映射：仅笔记根挂 WebDAV 与 FTS
+
+**决策**：多根映射中仅 `roots[0]`（笔记根）挂 WebDAV 全量镜像与 FTS 索引，其余根（书库）只经 REST 按需读取；REST 写复用 `gitver.WriteAndCommit` + `If-Match`，不引入第二套冲突语义。
+
+**理由**：契合路线图决策 5（笔记全量、电子书按需）；多根挂 WebDAV 会破坏路径命名空间；冲突检测应单点实现。
+
+**代价**：书库上传/管理暂无 WebDAV 入口（可后续按需补挂载点）；REST 写需复刻 ETag 语义。
+
+## 2026-10-18 · M7 迁移拆分为 v6（身份三表）与 v7（状态表重建）
+
+**决策**：M7 的 schema 变更拆成两条迁移——v6 只创建身份三表（`resources` / `changes` / `refs`，含索引），**不动任何既有表**；v7 才 `DROP` 重建 `reading_progress` / `annotations` 为以 uid 为键。v7 配 `preMigrationChecks[7]` 防御：脚本执行前对两表做 `COUNT(*)`，任一非空即中止，整条迁移回滚、`user_version` 保持 6。
+
+**理由**：① 批次自洽——批次 A（身份三表 + registry）可独立交付与验证，不必把「不可逆的状态表重建」绑进同一次交付；② 把「不可逆」隔离到单次且有防御的迁移：将来若真有存量数据，失败形态是「中止」而不是「悄悄删数据」；③ 迁移语义保持「要么整体生效，要么库完全没变」（`applyMigration` 单事务 + 前置检查）。
+
+**代价**：① 两个迁移版本号而非一个，读 `db.go` 需理解拆分原因；② 防御只保证「空表才重建」，若将来需要真正的 `document_id` → uid 数据映射，仍须另写数据迁移；③ 本仓库现状是「服务端未部署、无存量数据」，故直接 `DROP` 而非映射。
+
+## 2026-10-18 · Emacs 客户端 uid 适配采用「双值」而非全面替换
+
+**决策**：Emacs 侧不做 `document_id` → `uid` 的全面替换，而是**双值并存**——`doc-id`（`<标签>:<相对路径>`）只用于 buffer 显示与 `seshat:` 链接文本，`uid` 只用于调 REST API。批注列表 buffer 同时持 `seshat-reader-annotation-list-document-id`（doc-id，供显示与 `reference.el` 取用）与 `seshat-reader-annotation-list-uid`（uid，供列表刷新与删除发请求）；uid 经新增的 `seshat-rest-resolve-uid`（`root` + `path` → uid）解析并缓存。
+
+**理由**：① 让 `seshat-reader-reference.el` **零改动**——`seshat:` 链接的生成与反向解析仍以 doc-id 文本工作，既有笔记中的链接保持可读、可跳转；② 用户看到的是可读路径而非 26 位随机串；③ 身份权威留在服务端，客户端只在发请求处切换，改动面与回归风险最小。
+
+**代价**：① 多一个 buffer-local（`list-uid`）与一次 resolve 缓存，两值需各自维护（doc-id 变了 uid 通常不变，但 uid 可能因资源重建而变）；② uid 需联网解析，离线时首次使用退化（已记 tech-debt）；③ 「doc-id 已随文件改名而变、链接文本未同步」这类不一致在 UI 上不可见。
+
+## 2026-10-18 · WebDAV 与 REST 写共用 `registry.Apply`，事件顺序固定；rescan 用 CAS 不排队
+
+**决策**：① WebDAV 写钩子与 REST 文件端点**共用同一个** `registry.Apply`（不各写一套登记逻辑），事件顺序固定为「落盘 → commit → registry → refs 刷新」；② `POST /api/resources/rescan` 用 `Server.rescanRunning`（`atomic.Bool`）CAS 抢占，抢不到立即 `409 rescan_in_progress`，不排队等待。
+
+**理由**：① 事件顺序决定 `rev` 与 `seq` 的正确性——先落盘才有内容、先 commit 才有可写进 `rev` 的 commit id、登记完成后 `changes.seq` 才与磁盘状态一致；两条写入路径若顺序不同会产生不同含义的 `rev`；② 单点实现保证第三方 PUT/MOVE 与自有 REST 写产生同构事件（含墓碑与复活语义）；③ rescan 的语义是「抢不到即报错」——它是维护端点，排队等待会掩盖调用方误用，也会让等待者拿着过期结果返回。
+
+**代价**：① 钩子失败窗口内事件缺失（登记失败只记日志），需 rescan 兜底；② rescan 是全局互斥，多客户端同时触发时后者报 409，客户端需自行重试或忽略；③ 「落盘成功但 commit/登记失败」的中间态只能靠 rescan 收敛，无自动补偿。
+
+## 2026-10-18 · PDF 手写批注用归一化坐标 + 仅本地存储（M10.5）
+
+**决策**：① 手写笔迹以**归一化坐标（0..1，相对页面 FIT_CENTER 显示矩形）**存储与传输，线宽同样归一化；像素坐标只在绘制/触摸瞬间由纯函数 `InkGeometry` 换算。② 手写批注**只存本地**（`PdfInkStore`，键 `pdf_ink_<docId>`），不接入服务端；`location` 的 ink 协议（`page:<n>;ink:<color>,<widthPt>,<x0>,<y0>,...`，页面坐标）写入 `docs/api.md` 4.5.1 作为预留。③ 交互采用「阅读 / 手写」双模式，不做笔/手指区分；手写时浮层显示「上一页 / 下一页」。
+
+**理由**：① 归一化坐标使横竖屏切换、不同 `renderWidth`、不同缩放比下笔迹位置都正确，且无需数据迁移；若用 PDF point 空间则要在每次渲染宽度变化时重算（且依赖页面原始尺寸）。② 服务端 `location` 是单字段不透明字符串，一笔一 annotation 的 ink 串可直接复用批注表；但当 Android 侧批注同步 UI 尚未建立、Emacs 端只渲染 `rect` 时，上传只会产生「看不见的批注」，故本次仅本地 + 协议预留。③ 双模式比 `MotionEvent.getToolType` 更可靠（多数用户无触控笔，且无设备无法验证笔/手指行为）；手写时点击与滑动都被落笔占用，因此必须提供浮层翻页按钮，否则用户会以为卡死。
+
+**代价**：① 笔迹无法跨端查看（Emacs 端只显示 `rect`），也暂不进服务端备份；② 归一化坐标依赖「图片以 FIT_CENTER 显示」这一前提，若将来 item 改用其他 `scaleType` 必须同步改 `InkGeometry`；③ 手写模式与翻页互斥（需切换模式或点浮层按钮），不如「笔写、手指翻」自然；④ 横屏 + 横向模式下 `renderWidth` 用**首页**宽高比代表全书，混合横竖页面的 PDF 非首页分辨率为近似值。
+
+## 2026-10-18 · Android 服务端改为可选配置（M10.6 B1）
+
+**决策**：服务端（地址 + 令牌）是**可选**配置。`SettingsValidator` 引入 `UrlValidation.Empty` 作为合法状态（替代原 `UrlError.EMPTY` 错误）；`SettingsActivity.save()` 分三路——地址合法 → 写服务端配置；地址留空 → **只写本地偏好**（远程目录/字号/翻页模式），令牌若填写则经新增的 `SettingsStore.saveTokenOnly()` 单独写入（仍走 `writeSecret` 加密通道）；地址非法 → 内联报错。清空地址**不删除**已存服务端配置。
+
+**理由**：用户明确「服务器是可选项」。原实现把空地址当错误并在 `save()` 最前 early-return，导致未配置服务端时**任何设置都存不进去**——真机实测：点「竖向连续滚动」+「保存」→ 提示「服务端地址不能为空」、Activity 不退出、prefs 无 `reader_page_mode`，属可用性阻断。
+
+**代价**：① 「地址留空 + 令牌有值」是半配置状态（同步不可用但不报错），需在文档提示；② `SettingsStore` 的写入路径从 1 条变 2 条（`save` / `saveTokenOnly`），测试面扩大；③ 删除 `UrlError.EMPTY` 后需同步清理 `urlErrorText` 分支与 `settings_err_url_empty` 文案（已做）。

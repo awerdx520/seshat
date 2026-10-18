@@ -235,3 +235,169 @@ gitleaks dir . --redact --no-banner
 - 已知正则宽化：`no-secret-files` 的 `.env(\..*)?$` 按「路径以 `.env.<后缀>` 结尾」
   判定，比 `.gitignore` 的 `.env.*` 更宽，会连带拦下 `config.env.js` 一类命名。本项目为
   Go / Elisp / Android，无此类命名；未来若引入，需评估调整正则或为其加 `exclude`。
+
+## 7. Android 端令牌存储策略（M9.1）
+
+Android 客户端的访问令牌（等同服务端 `SESHAT_AUTH_TOKEN`）按以下策略处理：
+
+| 项 | 策略 | 理由 |
+|---|---|---|
+| 落盘 | 只经 `EncryptedSharedPreferences`（MasterKey AES256_GCM，键 AES256_SIV、值 AES256_GCM） | 令牌等同账号口令，不能明文落盘 |
+| 加密不可用时 | `SecurePrefs.putSecret()` **拒绝写入并返回 false**；设置页禁用保存、显示常驻告警、提供「重置本地配置」 | 宁可功能不可用，也不能把令牌写成明文 |
+| 读取异常（KEK 失效 / 备份恢复 / 密钥损坏） | `getString()` 捕获异常、返回默认值、回调 UI 提示，不崩溃 | 用户必须还能进设置页重置配置 |
+| 备份 | `res/xml/backup_rules.xml` 与 `data_extraction_rules.xml` 排除 `seshat_sync_secure.xml` 与 `seshat_sync.xml` | 避免明文令牌随 Auto Backup 上云；避免密文换机后无法解密 |
+| 服务端地址 | 仅接受 `https`；拒绝 userinfo、查询参数、锚点；长度上限 2048 | 防止凭据被发往伪装主机或明文传输 |
+| UI 暴露 | 令牌**不回填明文**，只显示「已配置 / 未配置」；输入框 `importantForAutofill="no"` + `saveEnabled="false"`；设置页 `FLAG_SECURE`；离开页面清空输入框 | 缩小截屏、Autofill、saved state、View 驻留等旁路 |
+| 撤销 | 设置页提供「清除访问令牌」（`SettingsStore.clearAuthToken()`） | 设备外借/丢失时需能回到无凭据状态 |
+| 连通性测试（M9.2） | 令牌**只**经 `Authorization` 头发往经 `SettingsValidator` 校验的 https origin（仅 https、拒 userinfo/查询参数/锚点）；结果只回传状态码或固定文案（`令牌包含非法字符` / `仅支持 https 地址`），不把令牌写入日志、Toast 或界面；OkHttp 对敏感头打码，跨 origin 重定向时剥离 `Authorization` | 让用户在保存前自证「地址 + 令牌」可用，同时不扩大令牌的信任边界 |
+
+### 7.1 非机密偏好与备份范围（M9.2）
+
+- 远程目录、主题、正文字号、翻页模式存于独立的 `seshat_app_prefs.xml`（**普通** SharedPreferences）：不含凭据，**不加密**，**参与**系统备份与设备迁移。
+- 与之相对，`seshat_sync_secure.xml` / `seshat_sync.xml` 被 `res/xml/backup_rules.xml` 与 `data_extraction_rules.xml` 排除出备份（见上一节）。
+- 其余本地数据（`reader_annotations` / `reading_progress` / `pdf_reader`）会随云备份上传：它们**不含凭据**，但包含批注文本、阅读书目与进度，属用户内容隐私。该取舍为「用户自己的 Google 账号内可接受」，若未来需要更严格隔离，应把这些 prefs 一并加入备份排除规则。
+
+## 8. M7 引入的安全边界（2026-10-18）
+
+本节把 M7 修复轮固化的边界集中记录，便于审计与回归时对照（判据以代码为准，此处只做归纳）。
+原有章节的编号未变动，本节追加在末尾。
+
+### 8.1 路径边界
+
+**规范化规则**（顺序即实现顺序，任一不通过即拒绝）：
+
+1. 拒绝含 NUL 字节的路径（REST 侧单独检查，避免 `open(2)` 层才报错）；
+2. 按 `/` 切段，任一段恰为 `..` → 拒绝（先拒 `..` 再做 `path.Clean`，避免折叠把越界
+   段吃掉）；
+3. `path.Clean` 折叠（去前导斜杠、合并重复斜杠、消 `.`）；折叠后为空或 `.` → 拒绝
+   （文件端点不允许指向根本身）；
+4. 逐段拒绝 `.git`（大小写不敏感，兼顾大小写不敏感卷）与任何以 `.` 开头的段
+   （隐藏文件/目录）。
+
+**四处入口同口径**：REST（`internal/api/files.go` 的 `cleanRelPath`）、WebDAV 出口
+（`internal/webdav/policy.go` 的 `hasDotSegment`，`/dav/` 与 `/public/` 共用同一策略
+包装）、登记层（`internal/registry/service.go` 的 `normalizeResourcePath`）、扫描层
+（`internal/registry/bootstrap.go` 的 `isDotName` + `SkipDir`）。登记可接受集与出口
+可访问集因此一致——不会出现「磁盘有、登记表没有」或「API 能写、登记拒绝」的死角。
+
+**根选择**：`?root=` 只能在 `SetRoots` 登记的 tag 中精确匹配（大小写敏感，缺省首根），
+未知 tag → `400 invalid_argument`；客户端无法用 tag 或路径拼出配置之外的物理目录。
+
+**写路径双重校验**：`mirrorRepo` 除取根外，还校验 `filepath.Abs(root.Path)` 与
+`repo.Root()` 一致——配置漂移时拒绝写入（`500`），避免「写入落到别的根」。错误信息只
+带根 tag，不回绝对路径（物理路径属部署细节）。
+
+**`SetRoots` 拒绝空 `Path`**：空 Path 会让 `filepath.Join("", rel)` 退化为进程 CWD，
+使「登记根」静默变成「当前工作目录」并越界扫描部署目录。
+
+### 8.2 符号链接策略
+
+| 环节 | 策略 |
+|---|---|
+| 登记 / 重扫 | 只登记普通文件（`d.Type().IsRegular()`），符号链接、设备、管道一律跳过；`filepath.WalkDir` 本身不跟随目录软链 |
+| REST 读（`GET`） | 目标自身是符号链接 → `404 not_found`（读侧不区分「不存在」与「是链接」，避免用状态码差异探测根外文件是否存在） |
+| REST 写（`PUT`/`DELETE`） | 目标自身是符号链接 → `400 invalid_argument`（明示非法请求，不写穿链接） |
+| 父目录逃逸 | 父目录链解析真实路径后必须仍在根的真实路径内（前缀 + 分隔符校验）→ 否则 `400 invalid_argument` |
+| 比较基准 | 根自身先 `EvalSymlinks`（部署侧挂载根常是软链），否则合法路径会被误判为逃逸 |
+| 父目录尚不存在 | `realPathLoosely` 逐级向上找最深存在祖先做 `EvalSymlinks`，再拼回未存在的尾段（尾段不含 `..`，不会引入新逃逸） |
+
+### 8.3 条件写
+
+- **原子性**：`gitver.WriteAndCommitIf` 把「读当前 ETag → 比较 → 写文件 → git commit」
+  收进同一持锁临界区。条件不成立返回 `ErrBlobMismatch` → `412 etag_mismatch`，且
+  **不落盘、不产生提交**；并发两个相同 `If-Match` 的写恰好一个成功。
+- **`If-None-Match: *`** 的「已存在」判据是「登记表有存活行 **或** 磁盘文件存在」——两种
+  不一致状态（登记有行/磁盘无文件、磁盘有文件/登记无行）都不会被当成可创建。
+- **空 ETag 永不匹配**：`If-Match: ""` 不会被当成「当前内容为空」或「无条件写」，而是
+  直接 `412`；这堵住了「空 ETag → 下层按空期望值比较 → 退化为无条件覆盖」的降级路径。
+- **两个条件头都校验**：`If-Match` 与 `If-None-Match` 同时出现时**不是二选一**——任一前提
+  不成立即 `412`。`If-Match` 匹配必然意味着资源存在，故与 `If-None-Match: *` 的组合恒为
+  `412`，这正是「两个前提不可同时成立」的正确表达。
+
+### 8.4 资源上限
+
+| 边界 | 取值 | 目的 / 位置 |
+|---|---|---|
+| PUT 请求体 | 32 MiB（`maxFileBytes`） | 防止单请求把整库内存打满 |
+| GET 响应体 | 流式（`http.ServeContent`），ETag 逐块 sha1 | 内存 O(1)，大书文件不整体读入 |
+| 单文档引用条数 | 2000（`maxRefsPerDocument`） | 超出按首次出现顺序截断并记日志（写操作仍成功），避免单请求阻塞 DB |
+| 目录删除列举上限 | 100000（`deleteListLimit`） | 一次尽量取全登记行，否则会漏写墓碑 |
+| 清单 / 变更流 `limit` | 夹紧到 `[1, 2000]` | 防止一次拉取无界 |
+| 启动登记 `bootstrapTimeout` | 2 分钟 | 超大目录树不至于让进程无限卡在启动 |
+| `rescan` 执行时长 | 请求上下文（客户端断开即取消） | 断开的长扫描不会继续跑完 |
+
+### 8.5 错误信息边界
+
+- 响应只含稳定错误码 + 固定中文文案，**不含**底层错误串、SQL、绝对路径与文件内容；
+  底层细节只进服务端日志。
+- `merge-base` 的 `409` 文案固定为「两个版本无共同祖先」，原始 git 错误仅以 `slog.Warn`
+  记录（修复前会把 git 的错误文本透出）。
+- `416` 由标准内容服务产生，响应体是 Go 标准库的纯文本（不是本服务的错误 JSON）；它同样
+  不携带任何服务端内部信息。
+- 根 tag 是唯一允许出现在错误信息里的「配置相关」字段，物理路径始终不出现。
+
+### 8.6 维护端点与令牌模型
+
+- `POST /api/resources/rescan` 挂在 `/api/` 之下，与其它端点共用**主令牌**认证；节点令牌
+  不覆盖 `/api/`。除「同一时刻只允许一次」（`rescanRunning` CAS，抢不到立即 `409`）外
+  **没有任何频率限制或配额**。
+- 这意味着**令牌即全权限**：持有主令牌者可以反复触发全量扫描（成本随文件数 × 内容哈希
+  增长），也可以读写任何 `mirror` 根、删除目录、发起 revert。主令牌应按「管理员口令」
+  对待（仅存于服务端与受信客户端、只经 TLS 传输、泄露即轮换，见 §3.4、§4.3），不要下发给
+  多用户客户端。
+
+### 8.7 已知残余（明确未解决）
+
+1. **安全响应头只覆盖两个入口**：Web UI（首页与 `/static/`）已有 `nosniff` +
+   `X-Frame-Options: DENY` + CSP（`internal/api/embed.go` 的 `setWebUISecurityHeaders`），
+   `GET /api/files` 的**所有下载**已有 `nosniff`、对主动内容强制 `attachment`
+   （`internal/api/files.go`）；但 `/api/` 的**其它**响应（JSON 端点与错误响应）仍不带任何
+   安全头，`Strict-Transport-Security` 一概留给反代（§5）。这些入口直连服务端端口时仍无
+   浏览器侧防护。
+2. **Emacs 端 uid 缓存不随服务端重建失效**：服务端重建登记表（DB 重来、切 base-url）后
+   uid 变化，客户端缓存的旧 uid 会持续 `404 unknown_uid`，需手动清缓存或等同步失败后重解析。
+3. **`registry.Apply` 的读-改-写非原子**：`GetResourceByUID` 在事务之外执行，「查现状 → 写
+   登记」之间存在 TOCTOU 窗口（并发写同一路径时可能重复处理或漏写事件）。
+4. **`rescan` 可反复触发**：见 §8.6，只有并发互斥，没有频率限制与审计记录。
+5. ~~**WebDAV 出口未做独立的软链拒绝**~~ —— **已解决（S1，2026-10-18）**：新增
+   `internal/webdav/symlink.go` 的 `symlinkGuardFS`，接入 `/dav/` 与 `/public/` 两个出口
+   （包装顺序 `webdav.Dir → extWhitelistFS → readOnlyFS → symlinkGuardFS → dotPathFS →
+   versionedFS`）。请求路径的父链或目标自身含软链一律拒绝（错误包裹 `os.ErrPermission`，
+   故 PROPFIND 遍历时该项被静默跳过，响应仍是 207）。口径比 REST 更严：**不看软链指向根内
+   还是根外**，任何软链中间段都拒。裸 `webdav.NewHandler` 入口仍不含守卫，但装配链路
+   （`cmd/server/main.go`）不使用它。
+6. **符号链接策略的覆盖面**：`DELETE` 目录的子树收敛作用于登记表（不含软链），但「目录内
+   存在软链」与「软链指向根外」的组合未被专门测试覆盖。
+
+### 8.8 WebDAV 出口的差异（M7 安全复审，2026-10-18）
+
+两个 WebDAV 出口（`/dav/`、`/public/`）与 REST 文件端点**并非等价**。下表逐项如实记录
+（判据为 2026-10-18 的代码事实，不以计划代替实现）：
+
+| 能力 | REST `GET/PUT/DELETE /api/files/{path...}` | WebDAV `/dav/`、`/public/` |
+|---|---|---|
+| 点路径（`.git`、任一 `.` 开头的段） | 拒绝 → `400 invalid_argument` | 拒绝 → `403 Forbidden`（`dotPathFS`）——**已落地** |
+| 符号链接（目标自身或中间段） | 目标自身：读 `404` / 写 `400`；中间段：`400`（`physicalPathChecked` + `rejectSymlinkAncestors`，见 §8.2） | 拒绝 → `403 Forbidden`（`symlinkGuardFS`）；**口径更严**：不看软链指向根内还是根外，任何软链中间段都拒；PROPFIND 中该项被静默跳过 ——**已落地** |
+| 条件写 `If-Match` / `If-None-Match` | 支持，两者同时出现时**都校验**，且比较与写入在同一临界区（§8.3） | **不支持**：`x/net/webdav` v0.61.0 的 `handlePut` 不解析这两个头，客户端条件写被**静默忽略**（退化为无条件覆盖） |
+| 危险扩展名（`.html`/`.svg` 等主动内容） | 强制 `application/octet-stream` + `Content-Disposition: attachment`，所有下载加 `nosniff` | 不适用（WebDAV 客户端自行解释 `Content-Type`；本出口不做强制下载）。WebDAV 出口**不**强制下载；浏览器在 Basic 认证后可能按扩展名内联渲染（残余风险，需客户端自行约束） |
+| 写与提交的临界区 | 落盘 + commit + 登记全在 `repo` 锁内 | 库自行落盘，钩子只保护「暂存 + 提交」——锁不对称 |
+
+对应技术债见 `openspec/tech-debt.md`：`WebDAV 出口不支持条件写`、
+`WebDAV 写与 REST 写的锁不对称`、`根内软链的部署假设`。
+
+**给客户端实现的结论**：点路径与符号链接守卫在**两个出口都生效**（软链口径 WebDAV 更严），
+这部分无需按出口做差异处理。但**需要乐观锁的写入必须走 REST** `PUT /api/files/{path...}`，
+或改用 `ETag` + `GET /api/merge-base` 自行检测冲突；WebDAV 出口只适合「最后写入即算数」的
+场景（例如把整棵目录当普通网盘挂载）。
+
+**危险扩展名强制下载：已实现（S2，2026-10-18）**。`GET /api/files` 对主动内容扩展名
+（`.html` / `.htm` / `.xhtml` / `.shtml` / `.ehtml` / `.xht` / `.svg` / `.svgz` / `.xml` /
+`.xsl` / `.js` / `.mjs` / `.mht` / `.rdf`，大小写不敏感）强制
+`Content-Type: application/octet-stream` + `Content-Disposition: attachment`，并且**所有**
+文件下载响应都带 `X-Content-Type-Options: nosniff`（`internal/api/files.go`）。黑名单为**枚举式**
+（`.html/.htm/.xhtml/.shtml/.ehtml/.xht/.svg/.svgz/.xml/.xsl/.js/.mjs/.mht/.rdf`），新出现的
+可执行类型需显式加入；更稳的做法是反转为「安全类型白名单才内联」，已记 tech-debt。Web UI 的首页
+与 `/static/` 另由 `setWebUISecurityHeaders` 加 `nosniff` + `X-Frame-Options: DENY` + CSP
+（`default-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'`，
+`internal/api/embed.go`）。**残余**：`/api/` 的其它响应（JSON 端点与错误响应）仍无安全头，
+`Strict-Transport-Security` 仍由反代负责（§5）。

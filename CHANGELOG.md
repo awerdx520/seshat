@@ -9,6 +9,16 @@
 
 ### 新增
 
+- 服务端文件身份（M7）：新增 `resources` 表与 26 位 Crockford Base32 `uid`（`crypto/rand` 16 字节，零新增依赖），路径降级为可变属性——改名/移动后 `uid` 不变，三端身份收敛到同一个 uid。详见 `docs/adr/0003-uid-identity-model.md`。
+- 服务端变更流（M7）：新增 `changes` 表与全局单调 `seq`，`GET /api/changes?since=<seq>` 增量拉取；删除写墓碑并保留 `delete` 事件，客户端可感知删除。详见 `docs/adr/0004-incremental-change-log.md`。
+- 服务端引用图（M7）：新增 `refs` 表记录 `seshat:` 引用（`tag:path` 与 uid 双形态），`GET /api/refs?uid=&direction=in|out` 双向查询引用关系。
+- 服务端资源端点（M7）：`GET /api/resources`（按 `?root=` / `?prefix=` 过滤，`limit` / `has_more` 分页）、`GET /api/resources/{uid}`、`GET /api/resolve`（`?root=&path=` → uid，客户端获取 uid 的唯一入口）、`GET /api/roots`（下发多根映射）、`POST /api/resources/rescan`（按文件系统重建登记）。
+- 服务端文件端点（M7）：`GET|PUT|DELETE /api/files/{path...}`（ETag / `If-Match` 乐观锁 / 单区间 Range）与 `POST /api/resources/{uid}/move`（改名/移动保持 uid）。
+- 多根映射（M7.2）：配置 `webdav.roots`（`tag` / `path` / `mode`），`mirror` 根（笔记根，挂 WebDAV 全量镜像 + FTS）与 `ondemand` 根（书库根，按需读取）并存；未配置时归一为单根 `notes`（向后兼容），`GET /api/roots` 下发。
+- 启动全量登记（M7.4）：服务启动时调用 `registry.Bootstrap` 幂等登记全部根下的文件，用 size / mtime / blob hash 快跳未变更文件。
+- Emacs 客户端 uid 适配（M7，B5）：`seshat-rest.el` 新增 `seshat-rest-resolve-uid`（`root` + `path` → uid）；批注模块改为**双值**——`doc-id` 只用于显示与 `seshat:` 链接文本、`uid` 只用于调 API（列表 buffer 同时持 `seshat-reader-annotation-list-document-id` 与 `seshat-reader-annotation-list-uid`）。
+- Android PDF 手写批注、点击翻页与横屏适配（M10.5）：① **手写批注**——在页面位上自由绘制（`InkOverlayView`），支持撤销上一笔与清除本页；笔迹以归一化坐标（相对页面显示矩形 0..1）存于本地 `PdfInkStore`（`pdf_ink_<docId>`），跨横竖屏与不同渲染分辨率天然对齐（坐标换算由纯函数 `InkGeometry` 承担，11+ 例单测覆盖 FIT_CENTER 留白算例）；「阅读 / 手写」双模式切换，手写时拦截手势并显示「上一页 / 下一页」。② **点击翻页**——横向模式点击左右各 30% 翻页、中间 40% 切换工具栏；`onInterceptTouchEvent` 恒返回 false，不吞滑动与吸附。③ **横屏适配**——横向模式按可用高度 × 首页宽高比计算渲染宽度（减少留白），底部工具栏改为贴底半透明浮层并按 `WindowInsetsCompat` 避让系统栏。新增 JVM 单测 24 例（`InkGeometryTest` 12 / `PdfInkStoreTest` 12），单测总数 225 → 249。**手写批注仅本地保存，尚未接入服务端同步**（`location` 的 ink 协议已写入 `docs/api.md` 4.5.1）；**UI 与笔迹对齐需真机验收**（本机无 AVD / 设备）。
+- Android 设置项扩展与阅读器连续滚动（M9.2）：① 设置页从 2 项扩展到 **8 项**——新增 WebDAV 远程目录、主题（跟随系统/浅色/深色，切换即时生效）、EPUB 正文字号（80–200%）、翻页模式、连通性测试（`GET /api/annotations?document_id=__connectivity_probe__`）与「关于」（版本号 + 配置状态）；② 底部 tab 补上自绘矢量图标；③ **PDF 与 EPUB 均支持竖向连续滚动**（页/章间零间隙），PDF 换成 `RecyclerView` + 单线程后台渲染 + `LruCache(maxMemory/8)` 位图缓存 + 横向 `PagerSnapHelper` 吸附，EPUB 竖向用 `RecyclerView` + 每章一个高度自适应 `WebView`（禁复用 + 测量后重锚）；④ 新增非机密偏好层 `settings/AppPreferences`（`seshat_app_prefs.xml`，与加密层分离，加密不可用时主题/阅读偏好仍可用）与 `SeshatApp`（启动时应用主题）；⑤ 新增 `ScrollProgressMath` 纯函数统一两种模式的进度换算。新增 JVM 单测 36 例（`AppPreferencesTest` 18 / `ConnectivityTesterTest` 8 / `ScrollProgressMathTest` 10），单测总数 179 → 215。**零新增依赖。**
 - Android 三区 UI 骨架（M9.1）：`MainActivity` 由 5 个按钮的入口页改造为单 Activity Shell——顶部 `MaterialToolbar`（标题随 tab 变化 + 溢出菜单「设置」）、中部 `FragmentContainerView`、底部 `BottomNavigationView` 双 tab（笔记 / 阅读）。新增 `ui/NotesFragment`（GTD 入口，列表待 M9.3）与 `ui/ReaderFragment`（迁入示例 EPUB / 选择 EPUB / 选择 PDF / 导入书籍 4 个入口，行为不变）。新增设置页 `settings/SettingsActivity`：服务端地址与访问令牌（令牌经 `EncryptedSharedPreferences` 加密、不回填明文、留空即保留原值；地址校验与规范化见 `settings/SettingsValidator`），填补「App 内无处配置同步服务器」的缺口。新增 JVM 单测 29 例（`MainTabTest` 6 / `SettingsValidatorTest` 16 / `SettingsStoreTest` 7），单测总数 136 → 165。构建配置：显式声明 `androidx.fragment:fragment:1.5.4`、删除重复的 `viewpager2` 声明、修正 `gradle.properties` 过时注释。**无新增第三方依赖**；`gtd/`、`reader/`、`sync/`、`importer/` 零改动。**UI 观感需真机验收（本机无 AVD / 设备 / 系统镜像）。**
 - 引入 `emacs/seshat-reader/`：vendor 自 emacs-reader（上游 commit `df3766e`），作为自研 Emacs 阅读器包的基础；包含「整页文本提取」与「页面矩形取文」两个新增能力，以及页号索引修复与 NaN 矩形防护。
 - 新增阅读器鼠标选区取文模块 `emacs/seshat-reader/seshat-reader-select.el`：拖拽框选文本并取出内容（仅支持未旋转页面）。
@@ -30,6 +40,8 @@
 
 ### 变更
 
+- 状态端点改以 uid 为键（M7，B4）：`GET|PUT /api/progress/{uid}`、`GET /api/annotations?uid=`，批注写入按 uid 关联；`reading_progress` / `annotations` 在 v7 迁移中重建（`DROP` + 按 uid 新建，见「破坏性」）。
+- WebDAV 写路径接入登记钩子（M7.4）：写钩子链新增 registry 登记调用，第三方 PUT/MOVE 后同样进 `resources`；FTS 索引**仍只覆盖笔记根**（`roots[0]`），书库根不进全文索引。
 - `emacs/seshat-reader`：完成自研化改名（`reader` → `seshat-reader`），feature / 符号 / 文件名 / C 模块可见名统一为 `seshat-reader-*` 与 `seshat-render-core`；构建产物改为 `seshat-render-core.so` + `seshat-reader-autoloads.el`。
 - `emacs/seshat-reader/seshat-reader-select.el`：引用随之更新（鼠标选区取文功能不变）。
 - 验证：`make clean && make all` 通过；独立 Emacs 进程文本提取与 `pdftotext` 归一化后逐字一致；断言 7/7。
@@ -42,11 +54,25 @@
 - **阅读器面板渲染重构（M11.10，2026-10-18）**：译文/解释改为**面板内只读 Markdown 文本 buffer 完整渲染**——gt 只渲染到隐藏中转 buffer ` *Seshat gt*`（`:window-config` = `display-buffer-no-window` + `allow-no-window`），`:then` 回调取纯文本写入展示 buffer，以 `gfm-view-mode` → `markdown-view-mode` → `text-mode` 降级链显示（原生折行/滚动/复制/isearch）；`header-line` 显示「Seshat 译文」/「Seshat 解释」，面板内 `q`（关面板）/`C-c C-s`（存为批注）改由 minor mode `seshat-reader-translate-panel-mode` 承载。**删除**「来源：第 N 页」行与自绘「q 关闭」提示；`seshat-reader-translate-render` 的 `sidebar` 语义随之更新（面板内 Markdown 文本 buffer，非 ETAF 排版），`pop`/`pin` 仍为 posframe 回退。`seshat-reader-sidebar-translate-buffer-name` 改为**展示 buffer** 名（不再作 gt `:name` 与捕获守卫）。**ETAF 渲染层收敛为批注卡片**：译文排版组件树与 `seshat-reader-etaf-render-translate` 删除（`seshat-reader-etaf.el` 929 → 690 行），ETAF 只渲染批注列表 + 分页。
 - **破坏性**（M11.13）：删除 `seshat-reader-annotation-page-size` 与批注列表的 `]` / `[` 翻页键；用户配置中引用该变量不再生效。`seshat-reader-translate-show-source` 默认值由 `nil` 改为 `t`（面板默认显示原文，内容更高）。
 
+### 破坏性
+
+- **状态 API 不再接受 `document_id`**（M7）：改用 uid——形态非法返回 `400 invalid_uid`，uid 未登记或已墓碑返回 `404 unknown_uid`。服务端尚未部署、无存量数据，故 v7 迁移直接 `DROP` 重建 `reading_progress` / `annotations`；迁移前 `preMigrationChecks[7]` 对两表做 `COUNT(*)` 防御，任一非空即中止（整条迁移回滚、`user_version` 保持 v6）。
+- **Emacs 客户端必须同步升级**（M7）：旧客户端仍发 `document_id`，批注/阅读进度不再可用；升级后 `uid` 经 `GET /api/resolve` 首次解析并缓存。Android 端的 uid 适配留待后续里程碑。
+
 ### 修复
 
+- **安全边界收紧（M7 修复轮）**：`.git` 与点路径（任一以 `.` 开头的段）在 **REST 与 WebDAV 两侧**一律拒绝（REST `400 invalid_argument`，WebDAV `403 Forbidden`，两侧判定同口径），堵住 `.git/config` 泄露 remote URL 与「写穿版本库」的路径；**符号链接不跟随**——登记/重扫只收普通文件，REST 读端点对软链返回 `404`、写端点返回 `400`，父目录经软链越出根同样 `400`；`PUT` 的 `If-Match` 改为**原子条件写**（读 ETag/比较/落盘/commit 在同一临界区，并发同 ETag 只有一个成功）；**空 ETag 永不匹配**（不再退化为无条件写）；`If-None-Match: *` 的「已存在」判据改为「登记表存活 ∨ 磁盘存在」，覆盖登记与磁盘不一致的两种状态。
+- 修复 rescan 把「处理失败」误判为「已删除」（M7 修复轮）：`registry.scanRoot` 的 `seen` 集合改为「磁盘上确认存在即计入」，与后续读元数据/登记是否成功解耦——修复前一次读取失败会让 Rescan 为该文件写墓碑并产生 `delete` 事件，把可重试的失败放大成客户端可见的「文件被删除」；失败只计入 `failed` 计数，由下一轮幂等补齐。
+- 修复目录删除误伤同前缀资源（M7 修复轮）：子树收敛从 LIKE 前缀改为**路径段边界**判定（`path` 等于目标，或其前缀恰为「目标 + `/`」），删除 `a/b` 不再命中 `a/bc`、`a/b-备份`。同时 `GET /api/resources?prefix=` 的 `ListResources` 一并改为大小写敏感的精确段边界匹配，`%`/`_` 不再作为通配符生效（客户端无需再二次过滤）。
+- 修复 `GET /api/files` 大文件全量读入内存（M7 修复轮）：改用 `http.ServeContent` **流式**输出，ETag 逐块哈希计算（内存 O(1)）；`Range`/`If-None-Match`/`If-Modified-Since`/`If-Range` 全部交给标准语义处理。**行为变化**：不可满足的 `Range` 仍返回 `416` + `Content-Range: bytes */<size>`，但响应体不再是 JSON 错误结构（由标准内容服务产生纯文本），代码不再产生 `range_not_satisfiable` 错误码（文档已同步）。
+- 修复单份文档引用刷新可阻塞数据库（M7 修复轮）：新增 `maxRefsPerDocument = 2000` 上限，超出部分按首次出现顺序**截断并记日志**（写操作仍然成功，不影响文档落盘与 commit），避免超大引用集在一次请求内锁住 DB。
+- Android 设置页「保存」不再被服务端校验阻断（M10.6 B1）：服务端改为**可选配置**——`SettingsValidator` 新增 `UrlValidation.Empty` 作为合法状态（替代原 `UrlError.EMPTY` 错误），地址留空时仍可保存远程目录/字号/翻页模式等本地偏好；令牌可单独保存（新增 `SettingsStore.saveTokenOnly()`，仍走加密通道）。同时修复两处连带问题：① 地址留空时点「测试连接」会抛 `ClassCastException` 崩溃（`as UrlValidation.Ok` 强转），现改为三态分支并提示「请先填写服务端地址」；② 测试 helper 对 sealed 类型 `when` 非穷尽。EPUB 竖向连续滚动模式的**章节标题滞后**修复：当前章改取「覆盖视口中心的那一项」（`ScrollProgressMath.visibleCenterPosition`），章内偏移改取中心项自身顶部滚出量（`-centerView.top`），不再复用首项锚点。单测 249 → 260（`SettingsValidatorTest` +2、`SettingsStoreTest` +3、`ScrollProgressMathTest` +6）。另：真机验证暴露并修复「令牌校验把空值当硬错误」——`save()` 现只拦截 `ILLEGAL_CHARS`（会让请求头构造崩溃的非法字符），`EMPTY` 不再阻断保存；实测地址留空 + 无令牌时可成功保存翻页模式，令牌含空格仍被拦。
 - Android 设置页安全加固（M9.1，安全审查发现 3 项 blocking）：① 令牌在加密存储不可用时**不再降级写入明文** `SharedPreferences`——`SecurePrefs` 新增 `putSecret()`（不可加密即拒绝写入并返回 false），设置页在 `isEncrypted=false` 或解密异常时禁用保存并显示常驻告警；② 新增 `res/xml/backup_rules.xml` 与 `data_extraction_rules.xml`，把 `seshat_sync_secure.xml` / `seshat_sync.xml` 排除出 Auto Backup 与设备迁移（避免明文令牌上云、密文换机后 KEK 失效）；③ 解密异常不再导致设置页崩溃，改为可读告警 + 「重置本地配置」自救入口；④ 服务端地址校验**仅接受 https**、拒绝 userinfo（`https://real.com@evil.com` 类钓鱼）、拒绝查询参数与锚点、限制长度 2048 与端口范围；⑤ 新增「清除访问令牌」入口；⑥ 令牌输入框禁用 Autofill 与实例状态保存、设置页启用 `FLAG_SECURE`、离开页面清空输入框。新增/调整 JVM 单测至 179 例。另在复审后进一步移除 `SettingsStore.writeSecret` 的默认值（消除「漏传即静默写明文」的 fail-open 分支）、让 `clearAuthToken()` 返回真实结果并由 UI 提示，并修正文档中「重置本地配置可修复加密存储」的错误承诺。
 - 批注列表在 ETAF 已挂载时不再 `erase-buffer`（改为交给渲染层增量刷新）：此前任何刷新路径（含 uuid 删除）都会触发 `etaf-runtime-flush` 报 `Args out of range: 20, 20`，并整块降级为纯文本渲染。
 - 译文面板「来源：第 x 页」重复：正文管线渲染前剔除所有以 `来源：` 开头的行（gt 提取失败时会回退整个 buffer-string，把头部行与正文一起带出）；原文展开区不过滤，保持忠实摘录。**M11.10（2026-10-18）起该过滤器与「来源」行一并从代码中删除**——面板 Markdown 路径不再生成「来源」行，也不再自绘「q 关闭」提示（键位由 minor mode `seshat-reader-translate-panel-mode` 承载）。
+
+- **安全（S1/S2，M7 安全复审，2026-10-18）**：WebDAV 出口增加符号链接守卫——新增 `internal/webdav/symlink.go` 的 `symlinkGuardFS` 并接入 `/dav/` 与 `/public/` 两个出口（包装顺序 `webdav.Dir → extWhitelistFS → readOnlyFS → symlinkGuardFS → dotPathFS → versionedFS`），与 REST 同口径、实际更严：请求路径的父链或目标自身含软链一律拒绝（`os.ErrPermission`，PROPFIND 中该项被静默跳过）。`GET /api/files` 对危险扩展名（`.html`/`.htm`/`.xhtml`/`.svg`/`.xml`/`.xsl`/`.js`/`.mjs`）强制下载（`Content-Type: application/octet-stream` + `Content-Disposition: attachment`），并对**所有**下载加 `X-Content-Type-Options: nosniff`；Web UI 首页与 `/static/` 加 `nosniff` + `X-Frame-Options: DENY` + CSP（`default-src 'self'`）。**残余**：`/api/` 的其它响应（JSON 端点与错误响应）仍无安全头，HSTS 仍由反代负责（见 `docs/security.md` §8.7、§8.8）。
+- 修复：`If-Match` 与 `If-None-Match` 同时出现时**两者都校验**（此前只校验 `If-Match`，`If-None-Match` 被静默忽略）——任一前提不满足即 `412 etag_mismatch` 且内容不变；`If-Match` 已匹配与 `If-None-Match: *` 的组合因此恒为 412（两个前提不可同时成立），这是有意为之。
 
 ## [0.2.0] - 2026-10-12
 

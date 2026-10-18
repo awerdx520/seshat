@@ -230,11 +230,12 @@
 - 缓解：L3 降级为静态校验（`aapt2 dump badging` / `apkanalyzer manifest print` 校验包名、launcher 与 5 个 Activity）+ 人工验收清单（见 `openspec/completed/2026-10-18-m9.1-android-shell.md`「验证标准」）。
 - 根治：安装系统镜像并创建 AVD（`sdkmanager "system-images;android-35;google_apis;x86_64"` + `avdmanager create avd`），或接入真机 / 云设备农场。
 
-## BottomNavigationView 无图标（M9.1，2026-10-18）
+## BottomNavigationView 无图标（M9.1，2026-10-18）——已解决（M9.2，2026-10-18 补自绘矢量图标）
 - 现象：底部双 tab 只有文字标签（`nav_notes` / `nav_reader`），无矢量图标，`app:labelVisibilityMode="labeled"`。
 - 原因：本机无设备可验证图标渲染，为降低「自绘 vector path 出错却无法发现」的风险，M9.1 刻意不引入 drawable。
 - 影响：视觉弱于 Material 规范（NavigationBar 通常 icon + label），功能完整。
 - 建议：真机验证环境具备后补两枚 24dp 矢量图标，并在 `res/menu/menu_main_tabs.xml` 加 `android:icon`。
+- 解决（M9.2）：新增 res/drawable/ic_tab_notes.xml / ic_tab_reader.xml（自绘几何），menu_main_tabs.xml 两个 item 加 android:icon。
 
 ## Notes / Reader tab 为占位（M9.1，2026-10-18）
 - 现状：`ui/NotesFragment` 只有占位文案与「打开 GTD」按钮；`ui/ReaderFragment` 只有 4 个既有阅读入口。
@@ -280,3 +281,182 @@
 - 现象：去分页后列表一次性渲染全部条目，条目数极大（数百条以上）时首次渲染成本线性增长，且 ETAF viewport 高度按条目数放大。
 - 可选优化：按可视区域渲染（虚拟滚动）或恢复「分批加载」但保留连续流语义。
 - 现状：当前不阻塞日常使用（批注通常几十条）。
+
+## EPUB 竖向模式的 WebView 高度测量（M9.2，2026-10-18）
+- 现状：每章 item 高度依赖 `onPageFinished` 后一次 JS 往返（取 `scrollHeight` 与 `window.innerHeight`，按「视口物理高/视口 CSS 高」换算），测量完成前用屏高占位。
+- 未验证：真机上字体/图片晚于 `onPageFinished` 到位时，高度可能偏小导致章末内容被裁；当前只在测量后对**当前可见章**重锚，其余章高度修正可能引起轻微滚动跳动。
+- 根治方向：在 `loadDataWithBaseURL` 前注入 `viewport` meta 并等待 `document.fonts.ready` 再测量；或改用单 `WebView` 加载全书以避免逐章测量。
+
+## 连续滚动的设备级验证缺口（M9.2，2026-10-18）
+- 现状：本机无 AVD / 无连接设备 / system-images 为空，滚动流畅度、吸附手感、EPUB 高度测量与重锚、tab 图标渲染、主题切换观感均未在真机验证。
+- 影响：M9.2 的核心体验（连续滚动）只有编译与单测保证，属已知风险。
+- 建议：安装 `system-images;android-35;google_apis;x86_64` 建 AVD，或接入真机，按 `openspec/completed/` 里的人工验收清单逐项核对。
+
+## codegraph 无法索引 Kotlin 符号（M9.2，2026-10-18）
+- 现象：`codegraph index` 对 `android/` 的 Kotlin 源码提取不出符号节点（实测 0 nodes / 28–64 edges，仅解析文件与少量引用），索引对本 Android 模块无检索价值。
+- 影响：Android 侧的代码探索只能靠 `grep`/逐文件阅读，效率低于 Go 侧。
+- 建议：Android 侧改用 LSP（`eca__editor_definition`/`editor_references`）或后续评估支持 Kotlin 的索引工具。
+
+## PDF 竖向模式的进度无页内偏移（M9.2，2026-10-18）
+- 现状：`PdfProgress` 只有 `page` 字段，竖向连续滚动恢复时固定 `scrollToPositionWithOffset(page, 0)`，只能恢复到页首；EPUB 则能恢复到章内精确偏移。
+- 影响：长页 PDF（如扫描件）竖向滚动退出再进入会回到页顶，体验略差于 EPUB。
+- 建议：给 `PdfProgress` 增加 `offset` 字段并迁移（按 `openspec/decisions.md` 的 C 数据契约域纪律：复制 + 观察期）。
+
+## PDF 渲染线程的销毁竞态依赖 catch 兜底（M9.2，2026-10-18）
+- 现状：`PdfPageAdapter.shutdown()` 用 `shutdownNow()`，但 `interrupt` 对 `PdfRenderer.openPage/render` 无效；真正兜底是 `renderer.close()` 后抛异常被 `renderPage` 的 `catch (Exception)` 吞掉。`renderPage` 里的 `synchronized(renderer)` 无法保护不在锁内的 `close()`，属无效防御。
+- 影响：极端时序下可能出现 native 层崩溃（Kotlin catch 兜不住），无设备无法验证。
+- 建议：`onDestroy` 改为 `shutdown()` + `awaitTermination(500ms)` 后再 `renderer.close()`，并去掉无效的 `synchronized`。
+
+## 连通性测试的并发与取消（M9.2，2026-10-18）
+- 现状：探测在裸 `Thread` 执行，按钮未在探测期间禁用，`onDestroy` 也没有取消标志；连点会并发多个带令牌请求，旧结果可能覆盖新结果。
+- 影响：仅影响 UI 正确性与资源浪费，无凭据泄露。
+- 建议：探测期间禁用按钮 + 用请求序号丢弃过期回调；或改用 `Future`/`ExecutorService` 并在 `onDestroy` 取消。
+
+## GtdActivity 的 remoteDir 有两个来源（M9.2，2026-10-18）
+- 现状：`readSyncConfig()` 把 `remoteDir` 放进 `SeshatConfig`，`syncToServer()` 又用 `joinPath(remoteDir, "seshat/sample.org")` 手动拼接路径。当前 `WebDavClient` 的 `davUrl` 不使用 `config.remoteDir`，行为正确。
+- 影响：若将来 `WebDavClient` 改为用 `config.remoteDir` 参与拼接，会出现重复拼接。
+- 建议：统一为一处（要么只传 `config.remoteDir` 由传输层拼，要么只在调用层拼并把 `remoteDir` 从 `SeshatConfig` 移除）。
+
+## 手写笔迹无跨端显示（M10.5，2026-10-18）
+- 现状：手写批注只存 Android 本地（`PdfInkStore`），未上传服务端；Emacs 端（M11.3）只支持 `page:<n>;rect:...`，无法渲染笔迹。
+- 影响：同一 PDF 在 Emacs 与 Android 上看到的批注不一致；换设备后手写笔迹丢失。
+- 建议：M10.3 统一批注同步时，按 `docs/api.md` 4.5.1 的 ink 协议上传（一笔一 annotation）；若要跨端可见，需 Emacs 端补笔迹渲染或降级显示为「第 n 页有一处手写批注」。
+
+## `updateInkChrome()` 每次切页解析整份笔迹 JSON（M10.5，2026-10-18）
+- 现状：`PdfReaderActivity.updateInkChrome()` 在每次页面切换时调用 `inkStore.hasInk(...)`，其内部会读取并 JSON 解析整份 `PdfInkDocument`。
+- 影响：笔迹数量多（数百笔）时可能有毫秒级主线程开销，滚动中反复触发。
+- 建议：Activity 内缓存一份 `PdfInkDocument` 快照（写入时更新），或让 `PdfInkStore` 提供按页索引的轻量查询。
+
+## 横屏 renderWidth 用首页宽高比代表全书（M10.5，2026-10-18）
+- 现象：横屏 + 横向翻页模式下，`renderWidth` 由首页宽高比估算；含混合横竖页面的 PDF，非首页的渲染分辨率可能偏大或偏小。
+- 影响：仅影响清晰度/内存，不影响布局（`FIT_CENTER` 负责显示）。
+- 建议：如需精确，可按每页宽高比分别渲染（`PdfPageAdapter` 已按页存 `pageHeights`，扩展为按页存 `pageWidths` 即可），代价是 LRU 缓存键需改为 `(page, width)`。
+
+## MOVE 到墓碑路径返回 409（M7，2026-10-18）
+- 现象：目标路径上存在墓碑（已删除资源的登记行仍占用 `UNIQUE(root, path)`），`POST /api/resources/{uid}/move` 的登记步骤撞唯一约束返回 409，而物理移动此时**已经发生**。
+- 影响：调用方看到「移动失败」，但磁盘上的文件已在新路径——登记与磁盘不一致，只能靠 `POST /api/resources/rescan` 收敛。
+- 建议：在 storage 层实现「复活目标墓碑」（把目标行的 uid 改为被移动资源的 uid），或 Move 前先查目标墓碑并走复活路径（create 路径已有 `tombstoneAt` 复用逻辑，可直接对齐）。
+
+## `--refresh-list` 兼容路径零 ERT 覆盖（M7，2026-10-18）
+- 现象：`grep refresh emacs/tests/*.el` 命中 0——批注列表的 `--refresh-list` 兼容路径（ETAF 未挂载时走的重渲染分支）没有任何 ERT 用例。
+- 影响：该分支无回归保护，只能靠人工观察；此前「ETAF 已挂载时不再 `erase-buffer`」的缺陷正出在相邻路径。
+- 建议：补 2 例——① 未启用 ETAF 时 `--refresh-list` 重渲染后条目数与内容正确；② 启用 ETAF 时走渲染层分支（用 `seshat-reader-etaf-enabled` 绑定区分两条路径）。
+
+## `seshat-reader-annotation.el` docstring 仍写 `document_id`（M7，2026-10-18）
+- 现象：`seshat-reader-annotation.el:109,111` 的 docstring 仍以 `document_id` 描述取值；wire 字段已零命中（代码不再发 `document_id`）。
+- 影响：纯术语残留，不影响行为；但会让后来者误以为服务端仍接受 `document_id`。
+- 建议：统一为「显示用 doc-id、请求用 uid」的措辞，与 `seshat:` 链接文档保持一致。
+
+## `make all` 不保证刷新 `.elc`（M7，2026-10-18）
+- 现象：`emacs/seshat-reader/Makefile` 的 `all` 按 mtime 判定是否重编；跨文件依赖变更或时钟异常时可能保留旧 `.elc`。
+- 影响：改源码后仍加载旧字节码，表现为「改了没效果」或测试假失败（本次已踩坑，属假失败）。
+- 建议：改源码后固定执行 `rm -f *.elc && make all`；若要根治，把 `.elc` 目标改为 `.PHONY` 或按源码哈希判定重编。
+
+## ERT 假绿判据（M7，2026-10-18）
+- 现象：跑 ERT 时若缺少 `-L` 加载路径，测试里的 `skip-unless` 会静默跳过整批用例，ERT 仍报 `0 unexpected`，看起来全绿。
+- 影响：会误判「测试通过」并掩盖真实回归。
+- 建议：把 `skipped=0` 作为通过判据（不能只看 unexpected 计数），并把完整 `-L` 集合固化进脚本或 Makefile 目标，避免手敲遗漏。
+
+## Codegraph 对 Go 与 Elisp 均无效（M7，2026-10-18）
+- 现象：`codegraph index` 在本仓库输出 `0 nodes`（Go 与 Emacs Lisp 均不产出符号节点）。
+- 影响：Codegraph 工具在本项目无检索价值；「查无结果」不等于代码里没有。
+- 建议：Go 侧依赖 `go vet` / LSP（`eca__editor_definition` / `editor_references`），Elisp 侧用 elisp-dev-mcp（`elisp-get-function-definition` / `elisp-describe-function`）；索引更新步骤可跳过。
+
+## 离线创建批注退化（M7，2026-10-18）
+- 现象：批注请求需先 `GET /api/resolve` 解析 uid；首次打开某文档且离线时无法新建批注（已缓存 uid 的文档不受影响）。
+- 影响：推翻路线图假设 H1——M11.6 的离线队列只覆盖「服务端可用但请求失败」，不覆盖「从未解析过 uid」；M11.6 的离线能力因此受限。
+- 建议：本地持久化 `doc-id → uid` 缓存，或离线入队时延后解析（同步阶段补 uid），使首次离线也能入队；短期在文档中说明该边界。
+
+## `roots[1..]` 不代建目录（M7，2026-10-18）
+- 现象：`webdav.roots` 中除首根外的根目录不存在时启动 fail-fast，不自动 `MkdirAll`。
+- 影响：部署时多根配置易因漏建目录导致服务起不来，且失败点在启动期。
+- 建议：在运维文档（`docs/configuration.md` / `docs/deploy.md`）明确「每个根目录需预先创建」，或改为启动时 `MkdirAll`（`ondemand` 根仍可保留 fail-fast）。
+
+## `ListResources` 的 `prefix` 是未转义 LIKE（M7，2026-10-18）—— 已解决（M7 修复轮，2026-10-18）
+- 现象：`GET /api/resources?prefix=` 原先拼成 `path = ? OR path LIKE ? || '/%'`，prefix 里的 `%` / `_` 作为 LIKE 通配符生效。
+- 影响：含 `%` 或 `_` 的路径前缀会多命中（返回不属于该前缀的资源），客户端需自行过滤。
+- 解决：`internal/storage/resource.go` 的 `ListResources` 已改用定长比较 `path = ? OR substr(path, 1, length(?) + 1) = ? || '/'`（先去掉 prefix 尾斜杠），语义是「精确字节前缀 + `/`」——**大小写敏感**且 `%`/`_` 不再有通配符含义；`GET /api/resources?prefix=` 的返回不再是超集，客户端无需二次按 `path` 过滤（`docs/api.md` §15 与 `docs/sync-protocol.md` §10 已同步）。
+
+## MOVE 到已存在目标时静默丢事件（M7，2026-10-18）
+- 现象：目标路径已有存活资源时，`registry.Apply` 撞 `UNIQUE(root, path)` 只记日志，`changes` 事件未写入。
+- 影响：登记与磁盘不一致且客户端收不到该变更（游标推进后无法靠增量补齐），需 rescan 兜底。
+- 建议：Move 前先检查目标是否存活，存在即返回 409 并拒绝移动；同时把 Apply 失败上抛给调用方，而不是仅记日志。
+
+## 端到端盲区（M7，2026-10-18）
+- 现象：三处只有单测、未进 E2E——① FTS 只索引首根；② B4 的错误码与 v7 `COUNT(*)` 防御；③ B6 并发 rescan 的 409。
+- 影响：单测覆盖的是函数/处理器级行为，跨服务链路（SQLite 迁移 + WebDAV 钩子 + 启动 Bootstrap）未被真实验证。
+- 建议：服务端可部署后补 3 个 E2E 场景（书库根不进索引、非空状态表的 v7 迁移中止、并发 rescan 一 200 一 409）。
+
+## `seshat:` 裸文本尾部标点未剥离（M7，2026-10-18）
+- 现象：服务端从裸文本提取 `seshat:` 引用时未剥离尾部标点，`seshat:a.org.` 会把句末的 `.` 计入 target。
+- 影响：解析出的路径/uid 多一个字符，`refs` 中出现无效引用；org 链接形态（`[[seshat:...]]`）不受影响。
+- 建议：裸文本提取时剥离尾部标点（`.,;:!?)` 等），并补对应单测。
+
+## 目录级写非原子批量（M7，2026-10-18）
+- 现象：目录级写（删除/移动目录时处理其下资源）逐条调用 `registry.Apply`，不是单事务批量。
+- 影响：中途失败会留下「部分登记」中间态（部分资源已墓碑、部分未），客户端看到不完整的变更流。
+- 建议：短期以 rescan 兜底；根治需 storage 层提供批量 Apply，把目录级变更收进一个事务，保证「全成功或全不生效」。
+
+## Android 连通性探测使用旧 document_id 参数（M7，2026-10-18）
+- 现象：`android/app/src/main/java/com/seshat/app/settings/ConnectivityTester.kt` 的 `PROBE_DOCUMENT_ID = "__connectivity_probe__"` 仍请求 `GET /api/annotations?document_id=...`；M7 起状态端点只接受 `uid`，该请求必然 400，设置页「连通性测试」会误报失败。
+- 影响：Android 现版本的连通性测试不可用（其它功能不受影响，因尚未部署且状态 API 本就要在后续里程碑适配）。
+- 建议：改用 `GET /api/roots` 或 `GET /api/changes?since=0&limit=1` 作为探测端点（只验证认证与连通性，不依赖具体文档），并与 Android 端 uid 适配（M9.2 数据源/M10）一并落地。
+
+## 安全响应头覆盖不全（M7 安全复审，2026-10-18，部分解决）
+- 现象（原）：服务端自身不设 `X-Content-Type-Options: nosniff`、`X-Frame-Options`、`X-XSS-Protection`、CSP，也没有 `Strict-Transport-Security`；这些头全部依赖反向代理添加（`docs/security.md` §5）。
+- 现状（2026-10-18 复核，S2 落地后）：**已覆盖**的两处——Web UI（首页与 `/static/`）由 `internal/api/embed.go` 的 `setWebUISecurityHeaders` 设 `nosniff` + `X-Frame-Options: DENY` + CSP（`default-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'`）；`GET /api/files` 的所有下载设 `nosniff`，主动内容（`.html`/`.svg`/`.js` 等）强制 `application/octet-stream` + `Content-Disposition: attachment`。**仍缺**：`/api/` 的其它响应（全部 JSON 端点与统一错误响应）不带任何安全头，`Strict-Transport-Security` 一概留给反代。
+- 影响：直连服务端端口（或反代配置遗漏）时，JSON 端点与错误响应仍无浏览器侧防护（错误响应可被 MIME 嗅探、API 可被跨站嵌入）；HSTS 缺失让首次明文请求可被降级。与 Web UI 把访问令牌存在同源 `localStorage`（`internal/api/web/static/app.js` 的 `seshat.token`）叠加时，尚未覆盖的入口构成残余 XSS 面。
+- 建议：把安全头做成包住**全部**路由的统一中间件（而非分散在 Web UI 与文件端点两处），HSTS 按域名/TLS 就绪度决定是否由服务端下发；或在启动时检测「非环回监听且无反代标记」并告警。
+
+## Emacs 端 uid 缓存不随服务端重建失效（M7 安全复审，2026-10-18 复核，仍未解决）
+- 现象：`seshat-rest.el` 的 `seshat-rest-resolve-uid` 结果按文档键缓存；缓存既不设 TTL，也不随服务端登记表重建（DB 从零重建、uid 重新生成）或切换 base-url 而失效。
+- 复核（2026-10-18）：批注模块另有一层 `seshat-reader-annotation--uid-cache`，以 `file-truename` 为键、**永不失效**，且不绑定 `base-url`——两层缓存都缺失效机制。
+- 影响：服务端重建后，客户端持续用旧 uid 请求，得到 `404 unknown_uid`，表现为「批注/进度全部消失」；用户需手动清缓存或等某条路径触发重新解析。切换服务器时更隐蔽：旧 uid 会被发到**另一台**服务器，可能命中无关资源。
+- 建议：① 缓存键包含 base-url；② 缓存值改为 `(base-url uid . 时间戳)`，遇到 `unknown_uid` 时失效该键并重解析一次（幂等，代价一次 `GET /api/resolve`）；③ 提供显式的清缓存命令。
+
+## 路径规范化逻辑在四处重复（M7 安全复审，2026-10-18 复核，仍未解决；复核后实为五处）
+- 现象：同一套「拒 `..`/NUL/`.` 段/`.git` 段」的规则在 `internal/api/files.go`（`cleanRelPath`）、`internal/webdav/policy.go`（`hasDotSegment`）、`internal/registry/service.go`（`normalizeResourcePath`）、`internal/registry/bootstrap.go`（`isDotName` + `SkipDir`）各写一遍。前三处已加「两处必须同步修改」注释。
+- 复核（2026-10-18）：`internal/gitver/version.go` 的 `resolve` / `resolveAny` 另有第五份「拒绝点段 / 越出根」判定，注释同样只写「两处必须同步」。五份实现的集合口径并不完全一致（WebDAV 侧允许挂载根本身，`gitver` 侧按名字解析版本表达式）。
+- 影响：规则演进时容易只改一处，产生「API 能写、登记层拒绝」或「出口可读、登记不可见」的死角；新增入口（如后续的 COPY/版本恢复入口）极易漏掉规则；注释只能提醒，不能阻止。
+- 建议：抽出一个共享包（`internal/pathguard`，或文中的 `internal/pathspec`）提供 `Clean(rel) (string, error)` 与 `IsDotName(name) bool`，五处改为调用；并让 REST / WebDAV 两个出口共用**同一套不变量测试**（表驱动，作为唯一真源）。WebDAV 侧的 `hasDotSegment` 还需保留「挂载根不算点路径」的差异，用选项参数表达。
+
+## `registry.Apply` 的读-改-写非原子（M7 安全复审，2026-10-18 复核，仍未解决）
+- 现象：`Apply` 先用 `db.GetResourceByUID`（**事务外**）读现状判定新 uid / 事件类型，再在同一事务里 upsert 登记 + append 事件；读取点与写入点不在同一事务。
+- 复核（2026-10-18）：`ApplyResourceChange` 事务之外另有 `GetResourceByUID` 读取，并发 create/delete 同一 uid 存在竞态。当前 SQLite 为单连接串行执行、且 uid 随机（16 字节 `crypto/rand`），碰撞概率极低，故实践中几乎不可复现——属「理论上成立、现实中罕见」的一类。
+- 影响：并发写同一路径时两次 Apply 可能基于同一旧快照判定，导致事件类型（create/update）重复或丢失、uid 复用判断错位；与「文件已落盘」的顺序叠加后只能靠 rescan 收敛。
+- 建议：把读取与写入收进同一事务（`GetResourceByUID` 增加 tx 变体），或在 storage 层提供 `ApplyIf` 形式的原子条件写；同时用并发用例（两个 goroutine 写同一路径）锁定「恰好一条 create 事件」。
+
+## bootstrap 跳过点文件后旧登记行会被写墓碑（M7 修复轮新增记录，2026-10-18）
+- 现象：`scanRoot` 把点路径（`.git` 与任何以 `.` 开头的名字）排除在 `seen` 之外；登记表里若残留修复前的点文件行，Rescan 会按「就登记而言磁盘上已不存在」为它**写墓碑**，从而产生一条 `delete` 事件。
+- 影响：这是**预期的历史清理**，不是数据丢失；但客户端会看到「从未感知过的资源的 delete 事件」，若客户端把 delete 当异常告警会误报。同理，rescan 的 `deleted` 计数会 +N（N = 遗留点文件行数）。
+- 建议：客户端应把「delete 一个本地不存在的 uid」视为无操作（幂等忽略）；服务端可在首次清理时记一条带计数的日志，便于运维解释 `deleted` 突增。
+
+## WebDAV 出口不支持条件写（M7 安全复审，2026-10-18）
+- 现象：`x/net/webdav` v0.61.0 的 `handlePut` 未实现 `If-Match` / `If-None-Match`，标准 WebDAV 客户端用它们做乐观锁时会被**静默忽略**（退化为无条件覆盖）。服务端自己的 `bufferedFS` / 版本化包装层也没有补上这两个头的判定；条件写只在 REST `PUT /api/files/{path...}` 上生效（见 `docs/api.md` §8.2）。
+- 影响：客户端以为锁生效、实际是无条件覆盖，冲突检测完全失效且**没有任何错误信号**——比直接报错更危险（用户会信任「已加锁」假象）。经 `/dav/` 或 `/public/` 写笔记的第三方编辑器（Obsidian、calibre、文件管理器挂载等）都落在这个盲区里。
+- 建议：客户端侧冲突检测改走 REST，或用 `ETag` + `GET /api/merge-base` 自行检测；根治需自定义 `bufferedFS`——写缓冲到内存/临时文件，在 `Close` 时于 `repo` 锁内调用 `WriteAndCommitIf(rel, content, msg, wantBlob, wantAbsent)`，把 WebDAV 的条件头映射成 `wantBlob` / `wantAbsent`。
+
+## `rescan` 无频率限制（M7 安全复审，2026-10-18）
+- 现象：`POST /api/resources/rescan` 只有 `Server.rescanRunning`（`atomic.Bool` CAS）做并发互斥，抢不到返回 `409 rescan_in_progress`；这只防「同时两次」，不防「串行地反复触发」——令牌持有者可以循环触发全库重扫。
+- 影响：成本随「文件数 × 内容哈希」增长，单个客户端即可把机器占满（重扫期间 DB 与磁盘都在忙）；且没有审计记录可追溯谁触发了多少次。
+- 建议：加最小间隔（如 60s，窗口内返回 `429` 或带 `retry_after` 的 `409`），或改为后台任务队列 + 任务 id 查询；同时记审计日志（时间、耗时、`scanned`/`deleted`/`failed` 计数）。
+
+## `deleteListLimit = 100000` 截断（M7 安全复审，2026-10-18）
+- 现象：`internal/api/files.go` 的目录删除用 `deleteListLimit = 100000` 一次列举登记行（`Limit: deleteListLimit`），超出部分不再列举。
+- 影响：超大目录（>10 万条登记行）删除时，超出部分**不写墓碑**，登记表留下孤儿行；`GET /api/changes` 因而缺 `delete` 事件，客户端保留已不存在的资源，直到下一次 rescan 才收敛。
+- 建议：改为分批删除（按 uid 游标循环，直到取空），或提高上限并**在截断时记警告日志**（当前是静默截断）；`docs/security.md` §8.4 的「目录删除列举上限」条目应同步说明截断后果。
+
+## 根内软链的部署假设（M7 安全复审，2026-10-18）
+- 现象：整条防护链（REST 的 `physicalPathChecked` / `rejectSymlinkAncestors`、WebDAV 的 `symlinkGuardFS`、登记层 `IsRegular` 过滤）都建立在「软链可被识别并拒绝」之上。两个出口现已各自落实守卫（WebDAV 侧见 `internal/webdav/symlink.go`，接入 `/dav/` 与 `/public/`），但**启动期仍不检查根内是否存在软链**，`docs/configuration.md` 也没有「根内不得放置软链」的前置条件。
+- 影响：防护已不依赖「根内没有软链」这一假设（有软链时两侧都拒），但拒绝是**静默的**——根内一条合法用途的软链会让 WebDAV 列目录少一项（PROPFIND 对权限错误静默跳过）、REST 读到 `404`/`400`，运维难以定位原因。另：`newSymlinkGuardFS` 在根不存在或无权限时退化为 `filepath.Abs`，此时「根自身是软链」仍依赖构造期 `EvalSymlinks` 成功。
+- 建议：启动时扫描每个根，发现根内软链即告警（`mirror` 根建议 fail-fast，`ondemand` 根 warn），并在 `docs/configuration.md` 写明「根内不放置软链」；同时给 `symlinkGuardFS` 的 `EvalSymlinks` 失败路径补一条启动日志。
+
+## WebDAV 写与 REST 写的锁不对称（M7 安全复审，2026-10-18）
+- 现象：REST 走 `WriteAndCommit` / `WriteAndCommitIf`——「写文件 → commit → 登记」全在 `repo` 锁内完成；WebDAV 由 `webdav.Dir` 自行把内容落盘，之后才由钩子调 `repo.Commit`，`repo` 锁只保护「暂存 + 提交」，**不覆盖落盘**。
+- 影响：同一文件被 REST 与 WebDAV 并发写时存在时间窗——REST 侧在锁内读到的内容可能正被 WebDAV 侧改写，或反之；结果是一个写入被另一个静默覆盖，且事件流的 `blob` 可能与磁盘最终内容不一致（需 rescan 收敛）。
+- 建议：与「WebDAV 出口不支持条件写」同根因，用同一个 `bufferedFS` 统一写路径（缓冲 → `Close` 时在锁内 `WriteAndCommitIf`），让两个出口共用同一临界区。
+
+## 主动内容内联黑名单为枚举式（M7 安全终审，2026-10-18）
+- 现象：`internal/api/files.go` 的 `activeContentExts` 是一张**枚举式**黑名单（`.html`/`.htm`/`.xhtml`/`.shtml`/`.ehtml`/`.xht`/`.svg`/`.svgz`/`.xml`/`.xsl`/`.js`/`.mjs`/`.mht`/`.rdf`）。判定只按 `path.Ext` 精确匹配，名单之外的扩展名一律按「被动内容」内联返回（带按扩展名推断的 `Content-Type`）。
+- 影响：**漏项即形成 XSS 缝隙**。Go 内建 MIME 表会把 `.shtml`/`.ehtml` 映射为 `text/html`、`.xht` 映射为 `application/xhtml+xml`——这类扩展名一旦漏在名单外，服务端就会**显式声明**主动类型，`nosniff` 不阻止显式声明的类型被当作 HTML 执行，于是 `PUT` 一个 `evil.shtml` 再接 `GET /api/files/evil.shtml` 即可在服务端源下执行脚本（可读 `localStorage` 里的令牌）。本轮已补齐 6 项，但「下次 Go 新增映射」「其它厂商扩展名（如 `.xhtmlz`、`.htc`）」仍会重复此问题；WebDAV 出口连这层强制下载都没有。
+- 建议：反转为「安全类型**白名单**才内联」——只有明确的被动类型（文本笔记、图片、PDF 等）按其推断类型返回，其余一律 `application/octet-stream` + `attachment`；同时 WebDAV 侧对同一份名单同样强制 `attachment`（当前 `Content-Type` 由客户端自行解释，浏览器在 Basic 认证后可能按扩展名内联渲染），并把名单抽成单一真源供 REST / WebDAV 共用。
