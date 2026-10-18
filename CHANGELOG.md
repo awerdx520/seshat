@@ -38,6 +38,9 @@
 - 批注列表**去掉分页，改为单列连续流**（M11.13，2026-10-18）：删除 `seshat-reader-annotation-page-size`、当前页/buffer-local 页号、`--page-count`/`--clamp-page`/`--page-items`、4 个翻页命令与 `]`/`[` 键位、纯文本页脚，以及 ETAF 的 `--page`/`--page-count`/`--page-of-index`/`--sync-page-with-selection`；全量条目一次性单列渲染，徽章恒为「N 条」，`n`/`p` 只移动选中。ETAF 卡片列表去掉固定 12 行高度与内部滚动，改按条目数**显式计算 viewport 高度**（已挂载时 `etaf-runtime-refit`），面板窗口整体滚动。
 - 译文/解释面板启用 **visual-fill-column**（M11.14，2026-10-18）：新增 `seshat-reader-translate-visual-fill-column`（默认 `t`），面板正文按 `visual-fill-column-width`（nil → `fill-column`）缩窄/居中；`visual-fill-column` 为软依赖，未安装时静默跳过；批注列表不启用（ETAF 按窗口宽度布局）。关闭时显式 `-1` 清理窗口 margin。
 - Android 接入 M7 只读协议（M9.2 A 批，2026-10-18）：`sync/RestClient` 新增 `GET /api/roots`、`GET /api/resources`、`GET /api/resolve`、`GET /api/changes` 四个只读端点（int64 字段一律 `Long`，`next_cursor` / `has_more` / `old_path` 走 `@SerialName`）；新增本地资源索引 `sync/ResourceIndex`（`SharedPreferences("seshat_resource_index")` 单文件 JSON，`ResourceEntry` + 单一 `cursor`，属派生状态——可 `clear()` 后 `bootstrap()` 重建）与增量同步引擎 `sync/SyncEngine`（`bootstrap()` / `pull()`，每页先应用事件再存游标、崩溃最多重复一页、分段批量落盘消除 O(N²) 写放大）；阅读器支持可选 `EXTRA_UID`，**有 uid 且服务端已配置**时同步进度/批注，无 uid（SAF 直接打开）时完全离线（零网络调用）。**A 批不接线 `SyncEngine`**（书架 B 批接入），故二者当前是「可测但无调用方」的能力储备。单测总数 260 → 336（新增 `ResourceIndexTest` / `SyncEngineTest` / `ReaderSyncTest` / `LegacyKeysTest` / `Rfc3339Test` 等）。**零新增依赖。**
+- EPUB 章节目录（M10.6 B2）：新增底部 `SeekBar`（拖动中不跳、松手跳章）、点击标题栏章号输入章号跳转（非法输入提示「章号无效」）与「目录」对话框（当前章高亮、点击跳章并关闭，nav/NCX 已扁平化为无层级列表）。
+- PDF 页导航（M10.6 B2）：底部 `SeekBar` 拖动松手跳页、点击页码输入页号跳转；页码/进度指示在布局型跳转后用 `doOnNextLayout` 补齐同步。
+- EPUB/PDF 阅读区底部 padding 自适应浮层高度（M10.6 B2）：阅读区 `clipToPadding = false` + padding = 浮层运行时高度（首次布局后写入、高度变化时跟随），页尾/章尾内容不再被叠加的浮层遮挡。
 
 ### 变更
 
@@ -79,6 +82,9 @@
 - 修复进度推送因 `updated_at` 小数秒被服务端拒绝（Android，M9.2 A 批，2026-10-18）：服务端用 `time.RFC3339` 解析，不接受小数秒，客户端此前序列化带毫秒，导致 `PUT /api/progress` 一律 `400`；现统一**截断到秒**。
 - 阅读器进度推送由「每次翻页」改为「`onStop` 一次 + 同值跳过」（M9.2 A 批，2026-10-18）：每页推送会让请求数随翻页线性增长并可能把服务端写爆，改为离开阅读器时推送一次；`lastPushedPosition` 的同值跳过只是防抖，不是严格节流。
 - `SyncEngine` 改为分段批量落盘（M9.2 A 批，2026-10-18）：create/update 先累积到内存，遇到 rename/delete 或批次结束才一次 `upsertAll`，把「N 条事件 N 次全量重写」的 O(N²) 写放大压成「每段一次」；rename/delete 前强制 flush 以保证事件顺序语义。
+- 修复 EPUB 双击缩放误切换工具栏（M10.6 B2）：单击改为 250ms 延迟切换，双击第二击取消待执行切换，左右各 30% 边缘不响应，双击只缩放不切换浮层。
+- 修复 EPUB 浮层化后中心章判定偏移（M10.6 B2）：竖向模式中心章改取可见区中心，原 `height/2` 在新增 padding 下偏移约 26dp。
+- 修复 PDF 页码/进度指示在布局型跳转后不同步（M10.6 B2）：`jumpToPage` 后的 `scrollToPosition` 可能不触发滚动回调，改用 `doOnNextLayout` 走既有更新链路。
 
 ## [0.2.0] - 2026-10-12
 
