@@ -1,7 +1,6 @@
 package com.seshat.app.gtd
 
 import android.content.res.ColorStateList
-import android.graphics.Color
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
@@ -69,7 +68,7 @@ class GtdEntryAdapter : RecyclerView.Adapter<GtdEntryAdapter.EntryViewHolder>() 
         if (state != null) {
             holder.badge.visibility = View.VISIBLE
             holder.badge.text = state
-            holder.badge.backgroundTintList = ColorStateList.valueOf(badgeColor(state))
+            holder.badge.backgroundTintList = ColorStateList.valueOf(OrgEntryDisplay.badgeColor(state))
         } else {
             holder.badge.visibility = View.GONE
         }
@@ -110,30 +109,11 @@ class GtdEntryAdapter : RecyclerView.Adapter<GtdEntryAdapter.EntryViewHolder>() 
 
     override fun getItemCount(): Int = items.size
 
-    /** 按 TODO 状态返回徽标底色。 */
-    private fun badgeColor(state: String): Int = when (state) {
-        STATE_DONE -> COLOR_DONE
-        STATE_CANCELLED -> COLOR_CANCELLED
-        else -> COLOR_ACTIVE
-    }
-
     private companion object {
         /** 条目根布局基础内边距（与 item_gtd_entry.xml 的 start padding 对齐）。 */
         const val BASE_PADDING_DP = 12
 
         /** 每深一级标题的缩进步长。 */
         const val INDENT_PER_LEVEL_DP = 16
-
-        const val STATE_DONE = "DONE"
-        const val STATE_CANCELLED = "CANCELLED"
-
-        /** 进行中状态（TODO/NEXT/STARTED/WAITING/HOLD）徽标底色。 */
-        val COLOR_ACTIVE = Color.parseColor("#1565C0")
-
-        /** 已完成状态徽标底色。 */
-        val COLOR_DONE = Color.parseColor("#2E7D32")
-
-        /** 已取消状态徽标底色。 */
-        val COLOR_CANCELLED = Color.parseColor("#757575")
     }
 }

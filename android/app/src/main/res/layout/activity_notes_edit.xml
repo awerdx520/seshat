@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 笔记编辑页（M10.6 B4c）：标题 / 正文 / TODO 状态可编辑，其余元信息只读展示 -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical">
+
+    <!-- 面包屑：文件名 • 上级标题链 -->
+    <TextView
+        android:id="@+id/breadcrumb"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:padding="12dp"
+        android:textColor="?android:attr/textColorSecondary"
+        android:textSize="12sp" />
+
+    <!-- 只读：原标题（便于与编辑框内容对照） -->
+    <TextView
+        android:id="@+id/entryTitleView"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:padding="12dp"
+        android:textSize="18sp" />
+
+    <!-- TODO 状态切换 + 只读元信息（优先级 / 计划 / 截止 / 标签） -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:padding="8dp">
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/todoStateButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content" />
+
+        <TextView
+            android:id="@+id/metaSummary"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:layout_weight="1"
+            android:textSize="12sp" />
+    </LinearLayout>
+
+    <!-- 标题编辑（单行标题，最多两行显示） -->
+    <EditText
+        android:id="@+id/titleEdit"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:hint="@string/notes_edit_title_hint"
+        android:inputType="text"
+        android:maxLines="2"
+        android:padding="12dp" />
+
+    <!-- 正文编辑：占满剩余高度，多行可滚动 -->
+    <EditText
+        android:id="@+id/bodyEdit"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:gravity="top|start"
+        android:inputType="textMultiLine"
+        android:minLines="8"
+        android:padding="12dp" />
+
+    <!-- 底部操作按钮 -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:padding="8dp">
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/saveButton"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="@string/notes_edit_save" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/cancelButton"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:layout_weight="1"
+            android:text="@string/notes_edit_cancel" />
+    </LinearLayout>
+
+</LinearLayout>

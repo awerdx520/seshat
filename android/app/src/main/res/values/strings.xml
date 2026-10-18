@@ -75,6 +75,35 @@
     <string name="notes_placeholder">笔记列表（M9.3 接入）</string>
     <string name="reader_placeholder">阅读器（M10 书架接入）</string>
 
+    <!-- 笔记列表（M10.6 B4b） -->
+    <string name="notes_search_hint">搜索笔记</string>
+    <string name="notes_tab_notes">笔记</string>
+    <string name="notes_tab_agenda">Agenda</string>
+    <string name="notes_empty">还没有笔记</string>
+    <string name="notes_search_empty">没有匹配的条目</string>
+    <string name="notes_sync">同步</string>
+    <string name="notes_parse_failed">解析失败：%1$s</string>
+    <string name="notes_load_failed">加载笔记失败</string>
+    <string name="notes_no_title">（无标题）</string>
+    <string name="notes_agenda_empty">Agenda 为空</string>
+    <string name="notes_sync_success">已上传到 %1$s（HTTP %2$d）</string>
+    <string name="notes_sync_failed">同步失败：%1$s</string>
+
+    <!-- 笔记编辑页（M10.6 B4c） -->
+    <string name="notes_edit_title">编辑笔记</string>
+    <string name="notes_edit_title_hint">标题</string>
+    <string name="notes_edit_breadcrumb">%1$s • %2$s</string>
+    <string name="notes_edit_save">保存</string>
+    <string name="notes_edit_cancel">取消</string>
+    <string name="notes_edit_saved">已保存</string>
+    <string name="notes_edit_save_failed">保存失败：%1$s</string>
+    <string name="notes_edit_load_failed">加载失败：%1$s</string>
+    <string name="notes_meta_empty">无附加信息</string>
+    <string name="notes_meta_priority">优先级 %1$s</string>
+    <string name="notes_meta_scheduled">计划 %1$s</string>
+    <string name="notes_meta_deadline">截止 %1$s</string>
+    <string name="notes_todo_set">设为 TODO</string>
+
     <!-- 设置页（M9.1） -->
     <string name="settings_title">设置</string>
     <string name="settings_server_url_hint">服务端地址</string>

@@ -45,6 +45,12 @@
             android:name=".settings.SettingsActivity"
             android:exported="false"
             android:label="@string/settings_title" />
+
+        <!-- 笔记条目编辑页（M10.6 B4c）：仅应用内启动，不对外导出 -->
+        <activity
+            android:name=".ui.NotesEditActivity"
+            android:exported="false"
+            android:label="@string/notes_edit_title" />
     </application>
 
 </manifest>

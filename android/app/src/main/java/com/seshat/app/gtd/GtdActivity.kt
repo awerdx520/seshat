@@ -14,26 +14,25 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.seshat.app.R
-import com.seshat.app.settings.AppPreferences
-import com.seshat.app.sync.SeshatConfig
-import com.seshat.app.sync.SecurePrefs
-import com.seshat.app.sync.WebDavClient
 import java.io.File
 
 /**
  * GTD agenda / TODO 视图（M4.2 展示 + 过滤，M4.3 读写 org + WebDAV 同步）。
  *
- * 数据来源：应用私有目录 `filesDir/sample.org`（首次启动从 assets 复制样例）。
- * 用 [OrgParser] 解析为 [OrgDocument]，在 [RecyclerView] 中展示全部条目；
- * 顶部提供三个 [Spinner] 过滤栏：TODO 状态、优先级、标签，三者组合过滤（见 [GtdFilter]）。
+ * 数据来源（M10.6 B4d 起统一）：应用私有目录 `filesDir/notes/sample.org`，与 Notes 列表
+ * 读写**同一份文件**（首次启动从 assets 复制样例）。旧路径 `filesDir/sample.org` 保留但
+ * **不再读取**，仅作迁移回滚点。用 [OrgParser] 解析为 [OrgDocument]，在 [RecyclerView]
+ * 中展示全部条目；顶部提供三个 [Spinner] 过滤栏：TODO 状态、优先级、标签，三者组合过滤
+ * （见 [GtdFilter]）。
  *
  * 交互（M4.3）：
  * - **点击条目**：按 `TODO→DONE、DONE→TODO、无状态→TODO` 切换 TODO 状态，经 [OrgEditor]
  *   改写 org 文本并写回本地文件，随后重新解析刷新列表与过滤栏。
- * - **同步按钮**：后台线程把本地 org 文件 `PUT` 到 WebDAV 服务端（远端路径为
- *   「远程目录 + `seshat/sample.org`」，见 [readSyncConfig] 与 [joinPath]），主线程 Toast 结果。
+ * - **同步按钮**：后台线程经 [NotesSync.upload] 把本地 org 文件 `PUT` 到 WebDAV 服务端的
+ *   「远程目录 + `seshat/<文件名>`」，主线程 Toast 结果。
  *
- * 入口：[intent] 静态工厂方法（应用内启动，exported=false）。
+ * 入口：[intent] 静态工厂方法（应用内启动，exported=false）。Notes tab 的 Agenda 段已成为
+ * 主入口，本 Activity 保留为可独立启动的页面（便于真机对照验证）。
  */
 class GtdActivity : AppCompatActivity() {
 
@@ -45,7 +44,7 @@ class GtdActivity : AppCompatActivity() {
     private lateinit var prioritySpinner: Spinner
     private lateinit var tagSpinner: Spinner
 
-    /** 本地可读写 org 文件（`filesDir/sample.org`）。 */
+    /** 本地可读写 org 文件（`filesDir/notes/sample.org`，与 Notes 列表同源）。 */
     private lateinit var localOrgFile: File
 
     /** 当前本地 org 文本（改写时以它为输入基准）。 */
@@ -89,12 +88,17 @@ class GtdActivity : AppCompatActivity() {
     }
 
     /**
-     * 保证 `filesDir/sample.org` 存在且非空：首次启动从 assets 复制。
+     * 保证 `filesDir/notes/sample.org` 存在且非空：目录缺失时创建，文件缺失或为空时从 assets 复制。
      *
-     * @return 本地 org 文件；复制失败返回 `null`（并 Toast 提示）。
+     * 与 [com.seshat.app.ui.NotesFragment] 使用同一路径（M10.6 B4d 消除数据分叉）；
+     * 旧 `filesDir/sample.org` **保留但不再读取**。
+     *
+     * @return 本地 org 文件；创建/复制失败返回 `null`（并 Toast 提示）。
      */
     private fun ensureLocalOrg(): File? = try {
-        val target = File(filesDir, SAMPLE_ASSET)
+        val dir = File(filesDir, NOTES_DIR_NAME)
+        if (!dir.exists()) dir.mkdirs()
+        val target = File(dir, SAMPLE_ASSET)
         if (!target.exists() || target.length() == 0L) {
             assets.open(SAMPLE_ASSET).use { input ->
                 target.outputStream().use { output -> input.copyTo(output) }
@@ -157,65 +161,25 @@ class GtdActivity : AppCompatActivity() {
         reloadDocument()
     }
 
-    /** 后台线程把本地 org 文件 PUT 到 WebDAV 服务端；主线程 Toast 结果。 */
+    /**
+     * 后台线程把本地 org 文件 PUT 到 WebDAV 服务端；主线程 Toast 结果。
+     *
+     * 配置读取、路径拼接与网络请求都委托给 [NotesSync.upload]（与 Notes 的 Agenda 段共用），
+     * 这里只保留线程与 Toast 的 UI 责任。
+     */
     private fun syncToServer() {
         if (!::localOrgFile.isInitialized) return
-        val config = readSyncConfig()
-        if (config == null) {
-            Toast.makeText(this, getString(R.string.gtd_sync_not_configured), Toast.LENGTH_LONG).show()
-            return
-        }
-        val content: ByteArray = try {
-            localOrgFile.readBytes()
-        } catch (e: Exception) {
-            Toast.makeText(
-                this,
-                getString(R.string.gtd_sync_failed, e.message ?: ""),
-                Toast.LENGTH_LONG,
-            ).show()
-            return
-        }
-
         Toast.makeText(this, getString(R.string.gtd_syncing), Toast.LENGTH_SHORT).show()
-        // 远程目录取自应用偏好（非机密），下次同步自动生效；与固定文件名拼成远端路径。
-        val remotePath = joinPath(AppPreferences.open(this).remoteDir(), "seshat/sample.org")
+        val file = localOrgFile
         // 网络请求必须离开主线程，避免 NetworkOnMainThreadException / ANR。
         Thread {
-            val message = try {
-                val code = WebDavClient(config).put(remotePath, content, ORG_CONTENT_TYPE)
-                getString(R.string.gtd_sync_success, code)
-            } catch (e: Exception) {
-                getString(R.string.gtd_sync_failed, e.message ?: e.javaClass.simpleName)
+            val message = when (val result = NotesSync.upload(this, file)) {
+                is NotesSyncResult.Ok -> getString(R.string.gtd_sync_success, result.httpCode)
+                NotesSyncResult.NotConfigured -> getString(R.string.gtd_sync_not_configured)
+                is NotesSyncResult.Failed -> getString(R.string.gtd_sync_failed, result.message)
             }
             runOnUiThread { Toast.makeText(this, message, Toast.LENGTH_LONG).show() }
         }.start()
-    }
-
-    /**
-     * 读取同步服务器配置。
-     *
-     * 经 [SecurePrefs] 读取 `server_url`（服务端根地址）与 `auth_token`（即服务端
-     * `SESHAT_AUTH_TOKEN`，WebDAV 用作 Basic 密码）：令牌以 EncryptedSharedPreferences
-     * 加密保存，首次读取时自动把旧的明文配置迁移到加密存储。
-     * 任一项缺失或为空时返回 `null`，由调用方提示用户「未配置同步服务器」。
-     */
-    private fun readSyncConfig(): SeshatConfig? {
-        val prefs = SecurePrefs.open(this)
-        val serverUrl = prefs.getString(SecurePrefs.KEY_SERVER_URL)?.trim().orEmpty()
-        val token = prefs.getString(SecurePrefs.KEY_AUTH_TOKEN)?.trim().orEmpty()
-        if (serverUrl.isEmpty() || token.isEmpty()) return null
-        return SeshatConfig(serverUrl = serverUrl, token = token, remoteDir = AppPreferences.open(this).remoteDir())
-    }
-
-    /** 拼接远程路径：目录去首尾斜杠，相对路径去首尾斜杠，空段自动跳过。 */
-    private fun joinPath(dir: String, relative: String): String {
-        val left = dir.trim().trim('/')
-        val right = relative.trim().trim('/')
-        return when {
-            left.isEmpty() -> right
-            right.isEmpty() -> left
-            else -> "$left/$right"
-        }
     }
 
     /** 依据文档内容动态构建三个过滤 Spinner（首项恒为「全部」）并挂载监听。 */
@@ -272,11 +236,11 @@ class GtdActivity : AppCompatActivity() {
     }
 
     companion object {
-        /** 本地 org 文件名（与 assets 同名，首次复制到 filesDir）。 */
-        private const val SAMPLE_ASSET = "sample.org"
+        /** 笔记目录名（`filesDir/notes`，与 Notes 列表同源）。 */
+        private const val NOTES_DIR_NAME = "notes"
 
-        /** org 文件上传时的 Content-Type。 */
-        private const val ORG_CONTENT_TYPE = "text/plain; charset=utf-8"
+        /** 本地 org 文件名（与 assets 同名，首次复制到 `filesDir/notes`）。 */
+        private const val SAMPLE_ASSET = "sample.org"
 
         private const val STATE_TODO = "TODO"
         private const val STATE_DONE = "DONE"

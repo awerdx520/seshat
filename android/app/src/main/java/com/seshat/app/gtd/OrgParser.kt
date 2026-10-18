@@ -13,6 +13,10 @@ package com.seshat.app.gtd
  * @property scheduled `SCHEDULED: <...>` 中尖括号内的原文；无则为 `null`。
  * @property deadline `DEADLINE: <...>` 中尖括号内的原文；无则为 `null`。
  * @property body 归属于本条目、紧随其后的非标题行（保留原始内容，去掉首尾空行）。
+ * @property startLine headline 所在行（0-based，与 `text.split("\n")` 的下标一致）；
+ *   `-1` 表示未提供（手工构造的测试数据，无法用于行区间改写）。
+ * @property endLine 本条目结束后的一行（exclusive，即「下一条 headline 的行号」或文件行数）；
+ *   `-1` 表示未提供。
  */
 data class OrgEntry(
     val level: Int,
@@ -23,6 +27,10 @@ data class OrgEntry(
     val scheduled: String?,
     val deadline: String?,
     val body: String,
+    /** headline 所在行（0-based）；-1 表示未提供（手工构造的测试数据）。 */
+    val startLine: Int = -1,
+    /** 本条目结束后的一行（exclusive，即「下一条 headline 的行号」或文件行数）；-1 表示未提供。 */
+    val endLine: Int = -1,
 )
 
 /**
@@ -79,33 +87,45 @@ class OrgParser(val todoKeywords: Set<String> = DEFAULT_TODO_KEYWORDS) {
         val entries = mutableListOf<OrgEntry>()
         var currentLevel: Int? = null
         var currentHeadline: String = ""
+        var currentStartLine = -1
         var currentBody = mutableListOf<String>()
 
-        // 把当前累积的条目落盘到结果列表。
-        fun flush() {
+        // 把当前累积的条目落盘到结果列表；[endLine] 为下一条 headline 的行号（末条为文件行数）。
+        fun flush(endLine: Int) {
             val level = currentLevel ?: return
-            entries.add(buildEntry(level, currentHeadline, currentBody))
+            entries.add(buildEntry(level, currentHeadline, currentBody, currentStartLine, endLine))
         }
 
-        for (rawLine in text.lines()) {
-            val match = HEADLINE_REGEX.matchEntire(rawLine)
+        // 行号坐标系统一为 `split("\n")` 的下标（与 OrgEditor 一致）；行尾 `\r` 先剥离，
+        // 因此 CRLF 文本的行号与 `\n` 文本完全相同（`\r` 不算换行）。
+        val lines = text.split("\n")
+        for ((lineIndex, rawLine) in lines.withIndex()) {
+            val line = rawLine.removeSuffix("\r")
+            val match = HEADLINE_REGEX.matchEntire(line)
             if (match != null) {
-                flush()
+                flush(lineIndex)
                 currentLevel = match.groupValues[1].length
                 // 组 1 = 星号；组 2 = 标题内容（正则中的 (?:...) 不占组号）。
                 currentHeadline = match.groupValues.getOrElse(2) { "" }
+                currentStartLine = lineIndex
                 currentBody = mutableListOf()
             } else if (currentLevel != null) {
-                currentBody.add(rawLine)
+                currentBody.add(line)
             }
             // 首个标题前的散落文本：currentLevel 仍为 null，直接忽略。
         }
-        flush()
+        flush(lines.size)
         return OrgDocument(entries)
     }
 
     /** 把一个标题行 + 其正文组装为 [OrgEntry]。 */
-    private fun buildEntry(level: Int, headline: String, bodyLines: List<String>): OrgEntry {
+    private fun buildEntry(
+        level: Int,
+        headline: String,
+        bodyLines: List<String>,
+        startLine: Int,
+        endLine: Int,
+    ): OrgEntry {
         var work = headline.trim()
 
         // 1) 优先级 [#X]（标题内）
@@ -153,6 +173,8 @@ class OrgParser(val todoKeywords: Set<String> = DEFAULT_TODO_KEYWORDS) {
             scheduled = scheduled,
             deadline = deadline,
             body = bodyText,
+            startLine = startLine,
+            endLine = endLine,
         )
     }
 
@@ -164,11 +186,11 @@ class OrgParser(val todoKeywords: Set<String> = DEFAULT_TODO_KEYWORDS) {
         /** 标题行：若干星号 + 可选（空白 + 内容）。 */
         private val HEADLINE_REGEX = Regex("""^(\*+)(?:\s+(.*))?$""")
 
-        /** 标题内优先级 `[#A]`（含小写）。 */
-        private val PRIORITY_REGEX = Regex("""\[#([A-Za-z0-9])\]""")
+        /** 标题内优先级 `[#A]`（含小写）；[OrgEditor] 重建 headline 时复用。 */
+        internal val PRIORITY_REGEX = Regex("""\[#([A-Za-z0-9])\]""")
 
-        /** 标题末尾连续标签块 `:a:b:`（前面需为空白或行首）。 */
-        private val TAGS_REGEX =
+        /** 标题末尾连续标签块 `:a:b:`（前面需为空白或行首）；[OrgEditor] 重建 headline 时复用。 */
+        internal val TAGS_REGEX =
             Regex("""(?:^|\s)(:[A-Za-z0-9_@#%]+(?::[A-Za-z0-9_@#%]+)*:)\s*$""")
 
         /** `SCHEDULED: <...>`，捕获尖括号内原文。 */

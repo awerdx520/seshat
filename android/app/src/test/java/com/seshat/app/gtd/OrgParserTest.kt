@@ -263,4 +263,47 @@ class OrgParserTest {
         assertNotNull(todos[0].todoState)
         assertEquals("事情", todos[0].title)
     }
+
+    // ---------- 行区间（M10.6 B4c） ----------
+
+    @Test
+    fun parse_singleEntry_fillsLineRange() {
+        val text = "* 唯一\n正文一\n正文二"
+        val entry = parser.parse(text).entries.single()
+
+        assertEquals(0, entry.startLine)
+        assertEquals(3, entry.endLine) // 文件共 3 行
+    }
+
+    @Test
+    fun parse_multipleEntries_endLineIsNextHeadlineLine() {
+        val text = "* A\nA 正文\n** B\nB 正文\n* C"
+        val entries = parser.parse(text).entries
+
+        assertEquals(listOf(0, 2, 4), entries.map { it.startLine })
+        assertEquals(listOf(2, 4, 5), entries.map { it.endLine })
+    }
+
+    @Test
+    fun parse_lastEntry_endLineIsLineCount() {
+        val text = "* A\n** B\nB 正文\nB 正文二"
+        val entries = parser.parse(text).entries
+
+        assertEquals(4, entries.last().endLine)
+        assertEquals(text.split("\n").size, entries.last().endLine)
+    }
+
+    @Test
+    fun parse_crlfText_lineNumbersIgnoreCarriageReturn() {
+        // `\r` 不算换行：行号与 split("\n") 的下标一致
+        val text = "* A\r\nA 正文\r\n* B\r\nB 正文"
+        val entries = parser.parse(text).entries
+
+        assertEquals(2, entries.size)
+        assertEquals(listOf("A", "B"), entries.map { it.title })
+        assertEquals(0, entries[0].startLine)
+        assertEquals(2, entries[0].endLine)
+        assertEquals(2, entries[1].startLine)
+        assertEquals(4, entries[1].endLine)
+    }
 }

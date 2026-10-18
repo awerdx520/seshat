@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 笔记列表单行（M10.6 B4b）：状态徽标 + 标题 + 标签 + 折叠箭头，下行为正文摘要 -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:paddingStart="8dp"
+    android:paddingTop="6dp"
+    android:paddingEnd="8dp"
+    android:paddingBottom="6dp">
+
+    <!-- 标题行：层级缩进由适配器修改 itemView 的 paddingStart 实现 -->
+    <LinearLayout
+        android:id="@+id/noteTitleRow"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <!-- TODO 状态徽标：底色由适配器按状态着色（复用 GtdEntryAdapter 的配色） -->
+        <TextView
+            android:id="@+id/noteTodoBadge"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:background="@drawable/bg_todo_badge"
+            android:paddingStart="6dp"
+            android:paddingTop="2dp"
+            android:paddingEnd="6dp"
+            android:paddingBottom="2dp"
+            android:textColor="#FFFFFF"
+            android:textSize="10sp"
+            android:textStyle="bold"
+            android:visibility="gone"
+            tools:text="TODO" />
+
+        <!-- 标题（空标题兜底占位） -->
+        <TextView
+            android:id="@+id/noteTitle"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="6dp"
+            android:layout_weight="1"
+            android:ellipsize="end"
+            android:maxLines="1"
+            android:textSize="15sp"
+            tools:text="实现 GTD agenda 视图" />
+
+        <!-- 标签 :a:b:（与标题同行） -->
+        <TextView
+            android:id="@+id/noteTags"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="6dp"
+            android:maxLines="1"
+            android:textColor="?android:attr/textColorSecondary"
+            android:textSize="11sp"
+            android:visibility="gone"
+            tools:text=":android:feature:" />
+
+        <!-- 折叠箭头：▾ 展开 / ▸ 折叠；无子节点时隐藏 -->
+        <TextView
+            android:id="@+id/noteCollapse"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:paddingStart="8dp"
+            android:paddingEnd="8dp"
+            android:textSize="16sp"
+            android:visibility="gone"
+            tools:text="▾" />
+    </LinearLayout>
+
+    <!-- 正文摘要（正文首个非空行） -->
+    <TextView
+        android:id="@+id/noteSummary"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:ellipsize="end"
+        android:maxLines="1"
+        android:textColor="?android:attr/textColorSecondary"
+        android:textSize="12sp"
+        android:visibility="gone"
+        tools:text="展示 org 条目的 TODO 列表，支持按状态过滤。" />
+</LinearLayout>
