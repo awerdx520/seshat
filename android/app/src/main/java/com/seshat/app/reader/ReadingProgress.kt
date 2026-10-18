@@ -55,6 +55,26 @@ class ReadingProgressStore(
     }
 
     /**
+     * 枚举全部已存进度（键 = 有效键，即写入时用的 uid 或内容哈希）。
+     *
+     * 书架用来把「进度」映射到「每本书」，因此键必须原样返回、不做剥离；
+     * 非 `String` 值（如 [LegacyKeys.CLEARED_FLAG] 布尔标记）与 JSON 损坏条目一律跳过。
+     */
+    fun all(): Map<String, ReadingProgress> {
+        val result = LinkedHashMap<String, ReadingProgress>()
+        for ((key, value) in prefs.all) {
+            val raw = value as? String ?: continue
+            val progress = try {
+                json.decodeFromString(ReadingProgress.serializer(), raw)
+            } catch (_: Exception) {
+                continue
+            }
+            result[key] = progress
+        }
+        return result
+    }
+
+    /**
      * 一次性清理旧键（M7 之前以 documentId 作键的记录）：32 位十六进制内容哈希或含 `:` 的 uri。
      *
      * 幂等纯清理：多次调用结果一致；是否只跑一次由调用方用 [LegacyKeys.CLEARED_FLAG] 标记控制。

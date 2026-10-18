@@ -1,45 +1,85 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- 阅读 tab：顶部过滤/排序 + 书架网格 + 底部三个入口（M10.6 B3d） -->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:gravity="center_horizontal"
-    android:orientation="vertical"
-    android:padding="24dp">
+    android:orientation="vertical">
 
-    <TextView
-        android:id="@+id/readerPlaceholder"
+    <!-- 过滤 / 排序：各占一半宽度 -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:padding="12dp">
+
+        <Spinner
+            android:id="@+id/filterSpinner"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1" />
+
+        <Spinner
+            android:id="@+id/sortSpinner"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1" />
+    </LinearLayout>
+
+    <!-- 扫描中的进度指示 -->
+    <ProgressBar
+        android:id="@+id/shelfLoading"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:layout_marginTop="24dp"
-        android:text="@string/reader_placeholder"
-        android:textSize="16sp" />
+        android:layout_gravity="center_horizontal"
+        android:contentDescription="@string/shelf_loading"
+        android:visibility="gone" />
 
-    <com.google.android.material.button.MaterialButton
-        android:id="@+id/openSampleButton"
+    <!-- 空书架提示 -->
+    <TextView
+        android:id="@+id/shelfEmpty"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="24dp"
-        android:text="@string/reader_open_sample" />
+        android:gravity="center"
+        android:padding="24dp"
+        android:text="@string/shelf_empty"
+        android:visibility="gone" />
 
-    <com.google.android.material.button.MaterialButton
-        android:id="@+id/pickEpubButton"
+    <androidx.recyclerview.widget.RecyclerView
+        android:id="@+id/bookGrid"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:clipToPadding="false"
+        android:padding="8dp" />
+
+    <!-- 底部入口：导入 / 打开任意本地 epub / 示例书 -->
+    <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="8dp"
-        android:text="@string/reader_pick_file" />
+        android:orientation="horizontal"
+        android:padding="8dp">
 
-    <com.google.android.material.button.MaterialButton
-        android:id="@+id/openPdfButton"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="8dp"
-        android:text="@string/main_open_pdf" />
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/importButton"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="@string/main_import_file" />
 
-    <com.google.android.material.button.MaterialButton
-        android:id="@+id/importButton"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="8dp"
-        android:text="@string/main_import_file" />
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/pickEpubButton"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="@string/reader_pick_file" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/openSampleButton"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="@string/reader_open_sample" />
+    </LinearLayout>
 
 </LinearLayout>

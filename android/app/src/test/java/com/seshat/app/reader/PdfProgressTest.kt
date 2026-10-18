@@ -105,4 +105,49 @@ class PdfProgressTest {
         val (store, _) = newStore()
         assertEquals(0, store.clearLegacy())
     }
+
+    // ---- loadAll：枚举全部 PDF 进度（书架用） ----
+
+    @Test
+    fun loadAllReturnsEveryPrefixedEntryKeyedByDocId() {
+        val map = mutableMapOf<String, String>()
+        val store = PdfProgressStore(
+            read = { map[it] },
+            write = { k, v -> map[k] = v },
+            keys = { map.keys },
+        )
+        store.save("doc1", PdfProgress(page = 2, updatedAt = 111L))
+        store.save("uid-2", PdfProgress(page = 7, updatedAt = 222L))
+
+        val all = store.loadAll()
+
+        assertEquals(setOf("doc1", "uid-2"), all.keys)
+        assertEquals(PdfProgress(page = 7, updatedAt = 222L), all["uid-2"])
+    }
+
+    @Test
+    fun loadAllSkipsCorruptedAndForeignKeys() {
+        val map = mutableMapOf<String, String>(
+            PdfProgressStore.key("good") to "3:50",
+            PdfProgressStore.key("bad") to "not-a-progress",
+            "annotation_some-doc" to "x:1",
+            "legacy_cleared" to "true",
+        )
+        val store = PdfProgressStore(
+            read = { map[it] },
+            write = { k, v -> map[k] = v },
+            keys = { map.keys },
+        )
+
+        val all = store.loadAll()
+
+        assertEquals(setOf("good"), all.keys)
+    }
+
+    @Test
+    fun loadAllWithoutInjectedKeysReturnsEmpty() {
+        // 未注入 keys：无法枚举，返回空表（不抛异常）
+        val (store, _) = newStore()
+        assertTrue(store.loadAll().isEmpty())
+    }
 }

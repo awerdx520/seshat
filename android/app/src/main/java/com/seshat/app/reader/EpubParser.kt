@@ -84,6 +84,10 @@ data class EpubBook(
     val opfPath: String,
     val opfDir: String,
     val manifest: List<ManifestItem>,
+    /** 作者（`dc:creator` 首个非空值）；缺失为 null。 */
+    val author: String? = null,
+    /** 封面图片相对 [opfDir] 的路径；EPUB2 的 `<meta name="cover">` 不识别，缺失为 null。 */
+    val coverHref: String? = null,
 )
 
 /** OPF 解析结果（中间结构，便于单测）。 */
@@ -93,6 +97,10 @@ data class OpfDocument(
     val spine: List<String>,
     val navItemId: String?,
     val ncxItemId: String?,
+    /** `dc:creator` 首个非空值；缺失为 null。 */
+    val creator: String? = null,
+    /** manifest 中 `properties` 分词含 `cover-image` 的 item 的 href；缺失为 null。 */
+    val coverHref: String? = null,
 )
 
 /** 目录项（来自 EPUB3 nav 或 EPUB2 NCX），href 为相对该文档所在目录的原始引用。 */
@@ -130,6 +138,8 @@ object EpubParser {
             opfPath = opfPath,
             opfDir = opfDir,
             manifest = opf.manifest,
+            author = opf.creator,
+            coverHref = opf.coverHref,
         )
     }
 
@@ -175,12 +185,25 @@ object EpubParser {
             it.mediaType.equals("application/x-dtbncx+xml", ignoreCase = true)
         }?.id
 
+        // dc:creator：取首个非空值（多作者时仅保留第一位，见 tech-debt）。
+        val creator = descendants(root, "creator")
+            .firstOrNull { it.textContent?.isNotBlank() == true }
+            ?.textContent
+            ?.trim()
+
+        // 封面：EPUB3 用 manifest 的 `properties="cover-image"`；properties 可能是多词串。
+        val coverHref = manifest.firstOrNull { item ->
+            item.properties.split(Regex("\\s+")).any { it == "cover-image" }
+        }?.href?.ifBlank { null }
+
         return OpfDocument(
             title = title,
             manifest = manifest,
             spine = spine,
             navItemId = navItemId,
             ncxItemId = ncxFromSpine ?: ncxFromManifest,
+            creator = creator,
+            coverHref = coverHref,
         )
     }
 

@@ -144,4 +144,17 @@
     <string name="pdf_jump_to_page">跳转到第几页</string>
     <string name="pdf_jump_invalid">页码无效</string>
     <string name="pdf_jump_page_hint">页码（1-%1$d）</string>
+
+    <!-- 书架网格（M10.6 B3d） -->
+    <string name="shelf_filter_all">全部</string>
+    <string name="shelf_filter_unread">未读</string>
+    <string name="shelf_filter_reading">在读</string>
+    <string name="shelf_filter_finished">已读</string>
+    <string name="shelf_sort_recent">最近阅读</string>
+    <string name="shelf_sort_title">书名</string>
+    <string name="shelf_sort_import">导入时间</string>
+    <string name="shelf_empty">书库为空，点下方「导入书籍」添加</string>
+    <string name="shelf_loading">正在扫描书库…</string>
+    <string name="shelf_progress">%1$d%%</string>
+    <string name="shelf_no_cover">无封面</string>
 </resources>

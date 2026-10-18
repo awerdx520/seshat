@@ -98,4 +98,34 @@ class ReadingProgressStoreTest {
         // 幂等：再跑一次删除 0 条
         assertEquals(0, store.clearLegacy())
     }
+
+    // ---- all()：枚举全部已存进度（书架用） ----
+
+    @Test
+    fun allReturnsEachStoredProgressKeyedByPrefsKey() {
+        store.save(ReadingProgress(documentId = "doc-1", chapterIndex = 3, updatedAt = 100L))
+        store.save(ReadingProgress(documentId = "uid-2", chapterIndex = 9, updatedAt = 200L))
+
+        val all = store.all()
+
+        assertEquals(setOf("doc-1", "uid-2"), all.keys)
+        assertEquals(9, all["uid-2"]!!.chapterIndex)
+        assertEquals(200L, all["uid-2"]!!.updatedAt)
+    }
+
+    @Test
+    fun allSkipsCorruptedAndNonStringEntries() {
+        store.save(ReadingProgress(documentId = "good", chapterIndex = 1))
+        prefs.putRaw("broken", "{not-json")
+        prefs.edit().putBoolean("legacy_cleared", true).apply()
+
+        val all = store.all()
+
+        assertEquals(setOf("good"), all.keys)
+    }
+
+    @Test
+    fun allOnEmptyPrefsReturnsEmpty() {
+        assertTrue(store.all().isEmpty())
+    }
 }

@@ -206,6 +206,126 @@ class EpubParserTest {
         assertNull(source.read("OEBPS/missing.xhtml"))
     }
 
+    // ---- author / cover 元数据（M10.6 B3a） ----
+
+    @Test
+    fun parseOpfReadsCreatorFromDcCreator() {
+        val opf = EpubParser.parseOpf(
+            opfXml(
+                title = "有作者",
+                manifest = """<item id="c1" href="c1.xhtml" media-type="application/xhtml+xml"/>""",
+                spine = """<itemref idref="c1"/>""",
+                metadata = "<dc:creator>张三</dc:creator>",
+            ),
+        )
+
+        assertEquals("张三", opf.creator)
+    }
+
+    @Test
+    fun parseOpfWithoutCreatorLeavesItNull() {
+        val opf = EpubParser.parseOpf(
+            opfXml(
+                title = "无作者",
+                manifest = """<item id="c1" href="c1.xhtml" media-type="application/xhtml+xml"/>""",
+                spine = """<itemref idref="c1"/>""",
+            ),
+        )
+
+        assertNull(opf.creator)
+        // 顺带确认 metadata 块本身解析正常（排除「整份 OPF 没解析出来」的假阳性）
+        assertEquals("无作者", opf.title)
+    }
+
+    @Test
+    fun parseFillsAuthorEndToEnd() {
+        val book = EpubParser.parse(
+            ByteArrayEpubSource(
+                epubBytes(
+                    "META-INF/container.xml" to containerXml("OEBPS/content.opf"),
+                    "OEBPS/content.opf" to opfXml(
+                        title = "端到端作者",
+                        manifest = """<item id="c1" href="c1.xhtml" media-type="application/xhtml+xml"/>""",
+                        spine = """<itemref idref="c1"/>""",
+                        metadata = "<dc:creator>李四</dc:creator>",
+                    ),
+                ),
+            ),
+        )
+
+        assertEquals("李四", book.author)
+    }
+
+    @Test
+    fun parseOpfReadsCoverHrefFromCoverImageProperty() {
+        val opf = EpubParser.parseOpf(
+            opfXml(
+                title = "有封面",
+                manifest = """
+                    <item id="cover" href="images/cover.jpg" media-type="image/jpeg" properties="cover-image"/>
+                    <item id="c1" href="c1.xhtml" media-type="application/xhtml+xml"/>
+                """.trimIndent(),
+                spine = """<itemref idref="c1"/>""",
+            ),
+        )
+
+        assertEquals("images/cover.jpg", opf.coverHref)
+    }
+
+    @Test
+    fun parseOpfRecognisesCoverImageAmongMultipleProperties() {
+        val opf = EpubParser.parseOpf(
+            opfXml(
+                title = "多属性封面",
+                manifest = """
+                    <item id="cover" href="images/cover.png" media-type="image/png" properties="nav cover-image"/>
+                    <item id="c1" href="c1.xhtml" media-type="application/xhtml+xml"/>
+                """.trimIndent(),
+                spine = """<itemref idref="c1"/>""",
+            ),
+        )
+
+        assertEquals("images/cover.png", opf.coverHref)
+    }
+
+    @Test
+    fun parseOpfWithoutCoverItemLeavesCoverHrefNull() {
+        val opf = EpubParser.parseOpf(
+            opfXml(
+                title = "无封面",
+                manifest = """
+                    <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
+                    <item id="c1" href="c1.xhtml" media-type="application/xhtml+xml"/>
+                """.trimIndent(),
+                spine = """<itemref idref="c1"/>""",
+            ),
+        )
+
+        assertNull(opf.coverHref)
+    }
+
+    @Test
+    fun parseFillsCoverHrefEndToEnd() {
+        val book = EpubParser.parse(
+            ByteArrayEpubSource(
+                epubBytes(
+                    "META-INF/container.xml" to containerXml("OEBPS/content.opf"),
+                    "OEBPS/content.opf" to opfXml(
+                        title = "端到端封面",
+                        manifest = """
+                            <item id="cover" href="images/cover.jpg" media-type="image/jpeg" properties="cover-image"/>
+                            <item id="c1" href="c1.xhtml" media-type="application/xhtml+xml"/>
+                        """.trimIndent(),
+                        spine = """<itemref idref="c1"/>""",
+                    ),
+                ),
+            ),
+        )
+
+        assertEquals("images/cover.jpg", book.coverHref)
+        assertNull(book.author)
+    }
+
     // ---- 测试数据构造 ----
 
     private fun epubBytes(vararg entries: Pair<String, String>): ByteArray {
@@ -228,17 +348,20 @@ class EpubParserTest {
         </container>
     """.trimIndent()
 
+    /** [metadata] 用于追加额外 metadata 元素（如 `dc:creator`），默认空以保持既有用例不变。 */
     private fun opfXml(
         title: String,
         manifest: String,
         spine: String,
         spineAttrs: String = "",
+        metadata: String = "",
     ): String = """<?xml version="1.0" encoding="UTF-8"?>
         <package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">
           <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
             <dc:identifier id="id">urn:uuid:test</dc:identifier>
             <dc:title>$title</dc:title>
             <dc:language>zh</dc:language>
+            $metadata
           </metadata>
           <manifest>
             $manifest

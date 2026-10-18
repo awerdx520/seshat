@@ -51,6 +51,23 @@ class PdfProgressStore(
     /** 读取指定文档的进度，无记录或记录损坏时返回 `null`。 */
     fun load(docId: String): PdfProgress? = PdfProgress.decode(read(key(docId)))
 
+    /**
+     * 枚举全部已存 PDF 进度（键 = 剥掉 `pdf_progress_` 前缀后的 docId）。
+     *
+     * 只认本 store 命名空间下的键（同一 prefs 文件还存批注/手写），
+     * 值损坏的条目由 [load] 返回 `null` 后被跳过。未注入 [keys] 时无法枚举 → 返回空表。
+     */
+    fun loadAll(): Map<String, PdfProgress> {
+        val result = LinkedHashMap<String, PdfProgress>()
+        for (prefKey in keys()) {
+            if (!prefKey.startsWith(PREFIX)) continue
+            val docId = prefKey.removePrefix(PREFIX)
+            val progress = load(docId) ?: continue
+            result[docId] = progress
+        }
+        return result
+    }
+
     /** 覆盖写入指定文档的进度。 */
     fun save(docId: String, progress: PdfProgress) {
         write(key(docId), progress.encode())
