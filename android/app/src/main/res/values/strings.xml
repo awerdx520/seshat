@@ -236,6 +236,7 @@
     <string name="pdf_menu_highlight">高亮标注</string>
     <string name="pdf_menu_handwrite">进入手写</string>
     <string name="pdf_copy_done">已复制本页文字</string>
+    <string name="pdf_copy_truncated">本页文字过长，已复制前 10 万字符</string>
     <string name="pdf_copy_no_text">本页没有可复制的文字</string>
     <string name="pdf_copy_label">PDF 文字</string>
 </resources>

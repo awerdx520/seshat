@@ -23,6 +23,10 @@ internal object PdfTextExtractor {
      * @param pageIndex 0-based 页索引；越界返回空串
      * @param sizeHint 文档字节数预估；`> [MAX_BYTES]` 直接返回空串（**不读流**）；未知传 -1
      * @return 页面文本；扫描版（无文本层）/加密/损坏/越界 → 空串，**不抛异常**
+     *
+     * 注意：[sizeHint] 来自 `openAssetFileDescriptor().length`（provider 自报值，可谎报 0/-1 绕过
+     * 上面的早退）；真正的上限由调用方用 [BoundedInputStream] 包住流传入来保证——[sizeHint]
+     * 只是「不读流就早退」的优化，**不是唯一防线**。
      */
     fun extractPage(input: InputStream, pageIndex: Int, sizeHint: Long = -1L): String {
         // 早退必须放在最前面：不触达 PdfBox（也不读流），便于纯 JVM 单测覆盖与防 OOM

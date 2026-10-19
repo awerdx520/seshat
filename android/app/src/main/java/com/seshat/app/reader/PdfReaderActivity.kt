@@ -996,10 +996,13 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
             val sizeHint = runCatching {
                 contentResolver.openAssetFileDescriptor(uri, "r")?.use { it.length }
             }.getOrNull() ?: -1L
-            // 解析是阻塞 + 高内存操作，必须离开主线程（与目录解析同样的理由）
+            // 解析是阻塞 + 高内存操作，必须离开主线程（与目录解析同样的理由）。
+            // sizeHint 同样不可信（provider 自报），流本身再套一层硬上限。
             val text = runCatching {
-                contentResolver.openInputStream(uri)?.use {
-                    PdfTextExtractor.extractPage(it, page, sizeHint)
+                contentResolver.openInputStream(uri)?.use { raw ->
+                    PdfTextExtractor.extractPage(
+                        BoundedInputStream(raw, PdfTextExtractor.MAX_BYTES), page, sizeHint,
+                    )
                 }
             }.getOrNull().orEmpty()
             runOnUiThread {
@@ -1008,11 +1011,25 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
                     toast(getString(R.string.pdf_copy_no_text))
                     return@runOnUiThread
                 }
+                // 整页文本可能数 MB，超 binder 事务上限会抛 TransactionTooLargeException → 截断
+                val clipped = if (text.length > MAX_CLIP_CHARS) {
+                    text.substring(0, MAX_CLIP_CHARS)
+                } else {
+                    text
+                }
                 val clipboard = getSystemService(ClipboardManager::class.java)
                 clipboard?.setPrimaryClip(
-                    ClipData.newPlainText(getString(R.string.pdf_copy_label), text),
+                    ClipData.newPlainText(getString(R.string.pdf_copy_label), clipped),
                 )
-                toast(getString(R.string.pdf_copy_done))
+                toast(
+                    getString(
+                        if (clipped.length < text.length) {
+                            R.string.pdf_copy_truncated
+                        } else {
+                            R.string.pdf_copy_done
+                        },
+                    ),
+                )
             }
         }
     }
@@ -1196,8 +1213,9 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
         val sizeHint = runCatching {
             contentResolver.openAssetFileDescriptor(uri, "r")?.use { it.length }
         }.getOrNull() ?: -1L
-        return contentResolver.openInputStream(uri)?.use { input ->
-            PdfOutlineReader.read(input, sizeHint)
+        // sizeHint 是 provider 自报值（可谎报 0/-1 绕过预检），故流本身再套一层硬上限
+        return contentResolver.openInputStream(uri)?.use { raw ->
+            PdfOutlineReader.read(BoundedInputStream(raw, PdfOutlineReader.MAX_OUTLINE_BYTES), sizeHint)
         } ?: emptyList()
     }
 
@@ -1263,6 +1281,14 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
          * insets 回调里在系统栏 inset 之上叠加这一份，避免内容紧贴系统栏。
          */
         private const val INITIAL_CHROME_PADDING_DP = 6
+
+        /**
+         * 「复制本页文字」写入剪贴板的字符上限（10 万）。
+         *
+         * 恶意/异常 PDF 单页可含数 MB 文本，直接塞进 `ClipData` 会超过 binder 事务上限
+         * （约 1 MB）抛 `TransactionTooLargeException` 而崩溃；截断远优于崩溃。
+         */
+        private const val MAX_CLIP_CHARS = 100_000
 
         /** `savedInstanceState` 中手写开关的键。 */
         private const val STATE_INK_ENABLED = "state_ink_enabled"

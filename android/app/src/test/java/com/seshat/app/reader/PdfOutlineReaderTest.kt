@@ -148,6 +148,40 @@ class PdfOutlineReaderTest {
         assertEquals(listOf(3, 4), PdfOutlineReader.flatten(tree, depth = 3).map { it.depth })
     }
 
+    @Test
+    fun flattenRespectsLimit() {
+        // 守：广度预算 —— 海量兄弟书签（深度 0，深度上限管不到）只产出 limit 项，超出即停。
+        val tree = (0 until 10).map { PdfOutlineReader.PdfOutlineItem("N$it", it) }
+
+        val flat = PdfOutlineReader.flatten(tree, limit = 3)
+
+        assertEquals(3, flat.size)
+        assertEquals(listOf("N0", "N1", "N2"), flat.map { it.title })
+    }
+
+    @Test
+    fun flattenDefaultLimitAllowsNormalOutline() {
+        // 守：默认上限不误伤正常目录 —— 3 层小树必须全量返回（截断只针对异常文档）
+        val tree = listOf(
+            PdfOutlineReader.PdfOutlineItem(
+                "A", 0,
+                listOf(
+                    PdfOutlineReader.PdfOutlineItem(
+                        "A-1", 1,
+                        listOf(PdfOutlineReader.PdfOutlineItem("A-1-a", 2)),
+                    ),
+                ),
+            ),
+            PdfOutlineReader.PdfOutlineItem("B", 3),
+        )
+
+        val flat = PdfOutlineReader.flatten(tree)
+
+        assertEquals(listOf("A", "A-1", "A-1-a", "B"), flat.map { it.title })
+        assertEquals(listOf(0, 1, 2, 0), flat.map { it.depth })
+        assertTrue("默认上限应远大于正常目录规模", PdfOutlineReader.MAX_NODES >= flat.size)
+    }
+
     // ------------------------------------------------------------- pageDirectory（纯函数）
 
     @Test
