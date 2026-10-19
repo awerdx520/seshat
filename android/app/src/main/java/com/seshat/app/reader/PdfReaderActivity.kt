@@ -991,11 +991,12 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
             return
         }
         val page = firstVisiblePage()
-        val sizeHint = runCatching {
-            contentResolver.openAssetFileDescriptor(uri, "r")?.use { it.length }
-        }.getOrNull() ?: -1L
-        // 解析是阻塞 + 高内存操作，必须离开主线程（与目录解析同样的理由）
         ioExecutor.execute {
+            // sizeHint 也要在后台读：openAssetFileDescriptor 是 binder 调用，主线程做不合适
+            val sizeHint = runCatching {
+                contentResolver.openAssetFileDescriptor(uri, "r")?.use { it.length }
+            }.getOrNull() ?: -1L
+            // 解析是阻塞 + 高内存操作，必须离开主线程（与目录解析同样的理由）
             val text = runCatching {
                 contentResolver.openInputStream(uri)?.use {
                     PdfTextExtractor.extractPage(it, page, sizeHint)

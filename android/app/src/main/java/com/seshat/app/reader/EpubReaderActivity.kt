@@ -18,6 +18,8 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.doOnNextLayout
 import androidx.fragment.app.FragmentActivity
 import androidx.recyclerview.widget.LinearLayoutManager
@@ -41,6 +43,7 @@ import com.seshat.app.sync.createReaderSync
 import java.io.File
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import kotlin.math.roundToInt
 
 /**
  * epub 阅读界面（MVP）。
@@ -131,6 +134,18 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
     private var chromeLayoutListener: View.OnLayoutChangeListener? = null
 
     /**
+     * 顶部浮层自身的垂直基础 padding（像素），与布局 XML 的 `paddingVertical` 保持一致。
+     *
+     * 用常量而不是读 `view.paddingTop`：insets 回调会反复执行，读当前 padding 会累加系统栏高度。
+     */
+    private val chromeBasePaddingPx: Int
+        get() = (CHROME_BASE_PADDING_DP * resources.displayMetrics.density).roundToInt()
+
+    /** 底部浮层自身的垂直基础 padding（像素），见 [chromeBasePaddingPx]。 */
+    private val bottomChromeBasePaddingPx: Int
+        get() = (BOTTOM_CHROME_BASE_PADDING_DP * resources.displayMetrics.density).roundToInt()
+
+    /**
      * 单击 → 切换浮层的延迟投递器（缺陷 A：双击缩放的第一击 UP 也会回调 `onSingleTapUp`）。
      *
      * 用主线程 [Handler] 而非 `View.postDelayed`：不依赖任何具体 View 的生命周期，
@@ -210,6 +225,30 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
 
         // 点击手势（切换浮层显隐）：两种翻页模式的容器都挂一份监听。
         installTapPaging()
+        // 系统栏 insets：浮层是 overlay，不补 padding 会被状态栏/导航栏遮挡（targetSdk 35 起
+        // edge-to-edge 强制，Android 15+ 必然发生）。高度变化会让浮层变高 → 同步重算阅读区 padding。
+        ViewCompat.setOnApplyWindowInsetsListener(topChrome) { view, insets ->
+            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            view.setPadding(
+                view.paddingLeft,
+                bars.top + chromeBasePaddingPx,
+                view.paddingRight,
+                view.paddingBottom,
+            )
+            view.post { applyContentPadding() }
+            insets
+        }
+        ViewCompat.setOnApplyWindowInsetsListener(bottomChrome) { view, insets ->
+            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            view.setPadding(
+                view.paddingLeft,
+                view.paddingTop,
+                view.paddingRight,
+                bars.bottom + bottomChromeBasePaddingPx,
+            )
+            view.post { applyContentPadding() }
+            insets
+        }
         // 浮层高度 → 阅读区 padding（常驻监听：高度/可见性变化时实时跟随）
         applyChromePaddingOnFirstLayout()
 
@@ -1150,6 +1189,18 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
 
         /** 单击 → 切换浮层的延迟（毫秒）：跨过双击判定窗口，避免双击缩放第一击触发切换。 */
         private const val TAP_TOGGLE_DELAY_MS = 250L
+
+        /**
+         * 顶部浮层的垂直基础 padding（dp）：与 `activity_epub_reader.xml` 的
+         * `epubTopChrome` `paddingVertical` 对齐。
+         */
+        private const val CHROME_BASE_PADDING_DP = 2f
+
+        /**
+         * 底部浮层的垂直基础 padding（dp）：与 `activity_epub_reader.xml` 的
+         * `epubBottomChrome` `paddingVertical` 对齐（该浮层是 4dp，与顶部不同）。
+         */
+        private const val BOTTOM_CHROME_BASE_PADDING_DP = 4f
 
         /** 以本地文件路径打开（示例 epub 用）。[uid] 非空时写入 [EXTRA_UID]。 */
         fun intentForFile(context: Context, file: File, uid: String? = null): Intent =

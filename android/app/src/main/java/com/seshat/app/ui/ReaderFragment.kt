@@ -142,8 +142,7 @@ class ReaderFragment : Fragment() {
             pickImport.launch(arrayOf("*/*"))
         }
 
-        seedSampleIfEmpty()
-        refresh()
+        seedSampleIfEmptyThenRefresh()
         // 首次进入强制同步一次（客户端无下拉刷新，进入即拉最新清单）
         syncNow(force = true)
     }
@@ -482,20 +481,35 @@ class ReaderFragment : Fragment() {
     }
 
     /**
-     * 书架为空时静默把 `assets/sample.epub` 复制到书籍目录（M10.8）。
+     * 书架为空时静默播种 `assets/sample.epub`（M10.8）。
      *
      * 新用户首次进入即可看到一本书，但不再占用底部按钮。只在书籍目录**为空**时执行：
-     * 已有任何文件就跳过，绝不覆盖用户的书。复制失败静默忽略（书架显示空态提示即可）。
+     * 已有任何文件就跳过，绝不覆盖用户的书；复制失败静默忽略（书架显示空态即可）。
      *
-     * 同步执行：sample.epub 只有几十 KB，且必须在首次 [refresh] 扫描前完成，否则书架会先扫到空目录。
+     * 在 [scanExecutor] 上执行（磁盘 IO 不上主线程），完成后回主线程触发 [refresh]，
+     * 保证扫描时 sample 已就位。
      */
-    private fun seedSampleIfEmpty() {
-        val context = context ?: return
+    private fun seedSampleIfEmptyThenRefresh() {
+        val context = context?.applicationContext
+        val executor = scanExecutor
+        // 视图已销毁（context/executor 均被清理）时无事可做
+        if (context == null || executor == null) return
         val dir = BookImporter(context).booksDir()
-        if (dir.listFiles()?.isNotEmpty() == true) return
+        // executor 可能已在 onDestroyView 里被 shutdownNow（视图销毁竞态）
         runCatching {
-            context.assets.open(SAMPLE_ASSET).use { input ->
-                File(dir, SAMPLE_ASSET).outputStream().use { output -> input.copyTo(output) }
+            executor.execute {
+                if (dir.listFiles()?.isEmpty() != false) {
+                    runCatching {
+                        context.assets.open(SAMPLE_ASSET).use { input ->
+                            File(dir, SAMPLE_ASSET).outputStream().use { output ->
+                                input.copyTo(output)
+                            }
+                        }
+                    }
+                }
+                activity?.runOnUiThread {
+                    if (isAdded) refresh()
+                }
             }
         }
     }
