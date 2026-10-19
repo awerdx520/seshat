@@ -178,6 +178,7 @@ A 批交付但**无调用方**的 `sync/ResourceIndex` 与 `sync/SyncEngine` 在
 4. **`ResourceEntry` 无 `rev`**：无法 `If-Match` 条件更新，上传是无条件覆盖。
 5. **书架不区分内部/外部来源**：远端条目与本地条目同形，只有「未下载」徽标可辨。
 6. **封面旧键残留**：下载后文件 `length` / `lastModified` 变化 → `CoverKeys` 换键，旧 `<key>.jpg` / `<key>.json` 不清理。
+- 书架卡片标题取自 EPUB 的 OPF `<dc:title>`（PDF 用文件名）；同一 OPF 标题的多本书在书架上会显示为同名卡片，仅封面/进度可区分
 
 ## 10. 构建与验证
 
