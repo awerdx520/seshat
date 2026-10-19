@@ -6,6 +6,9 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 /**
  * [ResourceIndex] 单测（纯 JVM，用内存 fake 代替 SharedPreferences）。
@@ -367,5 +370,193 @@ class ResourceIndexTest {
         assertEquals("a-new.md", batchIndex.findByUid("a")!!.path)
         assertEquals(22L, batchIndex.findByUid("b")!!.size)
         assertTrue(batchIndex.findByUid("b")!!.dirty)
+    }
+
+    // ---- 19~20. dirtyEntries：回填候选（目标根 + dirty + 非墓碑） ----
+
+    @Test
+    fun dirtyEntriesReturnsOnlyTargetRootDirtyAliveEntries() {
+        val prefs = FakePrefs()
+        val index = prefs.index()
+        index.upsertAll(
+            listOf(
+                entry("a", root = "main", dirty = true),
+                entry("b", root = "main", dirty = false),
+                entry("c", root = "main", dirty = true, deleted = true), // 墓碑不回填
+                entry("d", root = "other", dirty = true),
+            ),
+        )
+
+        val dirty = index.dirtyEntries("main")
+        assertEquals(listOf("a"), dirty.map { it.uid })
+
+        // 返回快照：改动返回的列表不影响索引
+        @Suppress("UNCHECKED_CAST")
+        (dirty as MutableList<ResourceEntry>).clear()
+        assertEquals(listOf("a"), index.dirtyEntries("main").map { it.uid })
+        assertEquals(4, index.all().size)
+    }
+
+    @Test
+    fun dirtyEntriesExcludesOtherRoots() {
+        val prefs = FakePrefs()
+        val index = prefs.index()
+        index.upsertAll(
+            listOf(
+                entry("a", root = "main", dirty = true),
+                entry("d", root = "other", dirty = true),
+                entry("e", root = "ebooks", dirty = true),
+            ),
+        )
+
+        assertEquals(listOf("d"), index.dirtyEntries("other").map { it.uid })
+        assertEquals(listOf("e"), index.dirtyEntries("ebooks").map { it.uid })
+        assertTrue(index.dirtyEntries("absent").isEmpty())
+    }
+
+    // ---- 21~24. applyMetadata：批量回填 + 清 dirty ----
+
+    @Test
+    fun applyMetadataBackfillsFieldsAndClearsDirty() {
+        val prefs = FakePrefs()
+        val index = prefs.index()
+        index.upsert(entry("a", blob = "", size = 0, mtime = 0, dirty = true))
+
+        index.applyMetadata(listOf(ResourceMetadataUpdate(uid = "a", blob = "b1", size = 111, mtime = 222)))
+
+        val got = index.findByUid("a")!!
+        assertEquals("b1", got.blob)
+        assertEquals(111L, got.size)
+        assertEquals(222L, got.mtime)
+        assertFalse(got.dirty)
+        assertFalse(got.deleted)
+        // 真的落盘：新实例看到同样的结果
+        val reread = prefs.index().findByUid("a")!!
+        assertEquals("b1", reread.blob)
+        assertEquals(111L, reread.size)
+        assertFalse(reread.dirty)
+    }
+
+    @Test
+    fun applyMetadataIgnoresUnknownUidSilently() {
+        val prefs = FakePrefs()
+        val index = prefs.index()
+        index.upsert(entry("a", size = 7, mtime = 8, dirty = true))
+        index.upsert(entry("b", size = 9, mtime = 10))
+        val storedBefore = prefs.stored
+
+        // 全是未知 uid：不抛、不改、不写盘
+        index.applyMetadata(
+            listOf(
+                ResourceMetadataUpdate("ghost", "bg", 1, 2),
+                ResourceMetadataUpdate("phantom", "bp", 3, 4),
+            ),
+        )
+
+        assertEquals(2, index.all().size)
+        val a = index.findByUid("a")!!
+        assertEquals(7L, a.size)
+        assertTrue(a.dirty) // 未被误清
+        assertEquals(9L, index.findByUid("b")!!.size)
+        assertNull(index.findByUid("ghost"))
+        assertEquals(storedBefore, prefs.stored)
+    }
+
+    @Test
+    fun applyMetadataUpdatesTombstoneKeepingDeletedFlag() {
+        val prefs = FakePrefs()
+        val index = prefs.index()
+        index.upsert(entry("a", size = 1, mtime = 2, dirty = true))
+        index.markDeleted("a")
+
+        index.applyMetadata(listOf(ResourceMetadataUpdate("a", "b2", 33, 44)))
+
+        val got = index.findByUid("a")!!
+        assertTrue(got.deleted) // 墓碑保留
+        assertFalse(got.dirty) // dirty 清掉
+        assertEquals("b2", got.blob)
+        assertEquals(33L, got.size)
+        assertEquals(44L, got.mtime)
+    }
+
+    @Test
+    fun applyMetadataWithEmptyListDoesNotWrite() {
+        val prefs = FakePrefs()
+        val index = prefs.index()
+        index.upsert(entry("a", size = 0, mtime = 0, dirty = true))
+        val writesBefore = prefs.writes
+
+        index.applyMetadata(emptyList())
+
+        assertEquals(writesBefore, prefs.writes) // 不写盘
+        val a = index.findByUid("a")!!
+        assertTrue(a.dirty) // dirty 未被清
+        assertEquals(0L, a.size)
+    }
+
+    @Test
+    fun applyMetadataWritesOnceForWholeBatch() {
+        val prefs = FakePrefs()
+        val index = prefs.index()
+        index.upsertAll((1..50).map { entry("u$it", size = 0, mtime = 0, dirty = true) })
+        val writesBefore = prefs.writes
+
+        index.applyMetadata((1..50).map { ResourceMetadataUpdate("u$it", "blob-$it", it.toLong(), it * 2L) })
+
+        assertEquals(writesBefore + 1, prefs.writes) // 批量只写一次
+        assertEquals(0, index.dirtyEntries("main").size)
+        assertEquals(50L, index.findByUid("u50")!!.size)
+    }
+
+    // ---- 25. 读方法返回快照副本 ----
+
+    @Test
+    fun readMethodsReturnSnapshotCopies() {
+        val prefs = FakePrefs()
+        val index = prefs.index()
+        index.upsert(entry("a", root = "main"))
+        index.upsert(entry("b", root = "main"))
+
+        @Suppress("UNCHECKED_CAST")
+        (index.all() as MutableList<ResourceEntry>).clear()
+        @Suppress("UNCHECKED_CAST")
+        (index.alive() as MutableList<ResourceEntry>).clear()
+        @Suppress("UNCHECKED_CAST")
+        (index.entriesInRoot("main") as MutableList<ResourceEntry>).clear()
+        @Suppress("UNCHECKED_CAST")
+        (index.dirtyEntries("main") as MutableList<ResourceEntry>).add(entry("ghost"))
+
+        // 索引内部未被外部改动污染
+        assertEquals(listOf("a", "b"), index.all().map { it.uid })
+        assertEquals(listOf("a", "b"), index.alive().map { it.uid })
+        assertEquals(listOf("a", "b"), index.entriesInRoot("main").map { it.uid })
+        assertTrue(index.dirtyEntries("main").isEmpty())
+    }
+
+    // ---- 26. 并发 upsert 不丢条目（验证 @Synchronized 有效） ----
+
+    @Test(timeout = 10_000)
+    fun concurrentUpsertsLoseNoEntries() {
+        val prefs = FakePrefs()
+        val index = prefs.index()
+        val pool = Executors.newFixedThreadPool(2)
+        val start = CountDownLatch(1)
+        val done = CountDownLatch(2)
+        try {
+            repeat(2) { thread ->
+                pool.execute {
+                    start.await() // 尽量让两个线程同时进入
+                    for (i in 1..100) index.upsert(entry("t$thread-u$i"))
+                    done.countDown()
+                }
+            }
+            start.countDown()
+            assertTrue("并发任务未在 8s 内完成", done.await(8, TimeUnit.SECONDS))
+        } finally {
+            pool.shutdown()
+        }
+
+        assertEquals(200, index.all().size)
+        assertEquals(200, prefs.index().all().size) // 落盘结果也完整
     }
 }

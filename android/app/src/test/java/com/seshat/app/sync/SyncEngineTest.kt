@@ -457,4 +457,115 @@ class SyncEngineTest {
         assertEquals(3, batched.writes)
         assertEquals(5, sequential.writes)
     }
+
+    // ---- 17. rename 事件被收集进 SyncResult（供本地文件跟随） ----
+
+    @Test
+    fun renameEventIsCollectedInSyncResult() {
+        val (idx, _) = index()
+        val api = FakeApi(
+            listOf(
+                page(
+                    listOf(change("u1", "rename", path = "b/y.epub", oldPath = "a/x.epub")),
+                    nextCursor = 5,
+                    hasMore = false,
+                ),
+            ),
+        )
+        val engine = SyncEngine(api, idx)
+
+        val result = engine.bootstrap()
+
+        assertEquals(
+            listOf(RenameEvent("u1", "a/x.epub", "b/y.epub")),
+            result.renames,
+        )
+    }
+
+    // ---- 18. oldPath 为空的 rename 不产生 RenameEvent ----
+
+    @Test
+    fun renameWithoutOldPathProducesNoRenameEvent() {
+        val (idx, _) = index()
+        val api = FakeApi(
+            listOf(
+                page(
+                    listOf(change("u1", "rename", path = "b/y.epub", oldPath = null)),
+                    nextCursor = 5,
+                    hasMore = false,
+                ),
+            ),
+        )
+        val engine = SyncEngine(api, idx)
+
+        val result = engine.bootstrap()
+
+        assertTrue("oldPath 为 null 时无法定位本地旧文件", result.renames.isEmpty())
+        // 索引侧的 rename 仍照常生效（与 renames 收集互不影响）
+        assertEquals(1, result.applied)
+    }
+
+    // ---- 19. 多页的 rename 按出现顺序累计 ----
+
+    @Test
+    fun renamesAccumulateAcrossPagesInOrder() {
+        val (idx, _) = index()
+        val api = FakeApi(
+            listOf(
+                page(
+                    listOf(
+                        change("u1", "rename", path = "b/one.epub", oldPath = "a/one.epub"),
+                        change("u2", "create", path = "a/two.epub"),
+                    ),
+                    nextCursor = 10,
+                    hasMore = true,
+                ),
+                page(
+                    listOf(change("u2", "rename", path = "b/two.epub", oldPath = "a/two.epub")),
+                    nextCursor = 20,
+                    hasMore = false,
+                ),
+            ),
+        )
+        val engine = SyncEngine(api, idx)
+
+        val result = engine.pull()
+
+        assertEquals(2, result.pages)
+        assertEquals(
+            listOf(
+                RenameEvent("u1", "a/one.epub", "b/one.epub"),
+                RenameEvent("u2", "a/two.epub", "b/two.epub"),
+            ),
+            result.renames,
+        )
+    }
+
+    // ---- 20. 非 rename 事件不产生 RenameEvent ----
+
+    @Test
+    fun nonRenameEventsProduceNoRenameEvent() {
+        val (idx, _) = index()
+        idx.upsert(entry("u2", path = "b.md", blob = "b2"))
+        val api = FakeApi(
+            listOf(
+                page(
+                    listOf(
+                        change("u1", "create", path = "a.md"),
+                        change("u2", "update", path = "b.md"),
+                        change("u2", "delete", path = "b.md"),
+                        change("u3", "chmod", path = "c.md"),
+                    ),
+                    nextCursor = 7,
+                    hasMore = false,
+                ),
+            ),
+        )
+        val engine = SyncEngine(api, idx)
+
+        val result = engine.pull()
+
+        assertTrue("create/update/delete/未知 op 都不应产生 RenameEvent", result.renames.isEmpty())
+        assertEquals(3, result.applied)
+    }
 }

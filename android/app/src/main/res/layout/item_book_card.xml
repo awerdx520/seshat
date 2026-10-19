@@ -33,6 +33,21 @@
             android:paddingBottom="2dp"
             android:textColor="#FFFFFF"
             android:textSize="11sp" />
+
+        <!-- 状态徽标：未下载 / 下载中…（本地可用时隐藏，M9.2 B 批） -->
+        <TextView
+            android:id="@+id/bookStatus"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="top|start"
+            android:background="#CC000000"
+            android:paddingStart="4dp"
+            android:paddingTop="2dp"
+            android:paddingEnd="4dp"
+            android:paddingBottom="2dp"
+            android:textColor="#FFFFFF"
+            android:textSize="10sp"
+            android:visibility="gone" />
     </FrameLayout>
 
     <TextView

@@ -13,12 +13,21 @@ fun interface SyncApi {
     fun changes(since: Long, limit: Int): ChangesPageDto
 }
 
+/** 一次同步中发生的重命名（用于本地文件跟随）。 */
+data class RenameEvent(val uid: String, val oldPath: String, val newPath: String)
+
 /**
  * 一次同步的结果：应用事件总数、结束游标、拉取页数。
  *
  * 计划中的 `BootstrapResult` / `PullResult` 结构完全相同，已合并为本类型。
  */
-data class SyncResult(val applied: Int, val cursor: Long, val pages: Int)
+data class SyncResult(
+    val applied: Int,
+    val cursor: Long,
+    val pages: Int,
+    /** 本次同步中 op=rename 且 oldPath 非空的事件（按出现顺序）。 */
+    val renames: List<RenameEvent> = emptyList(),
+)
 
 /**
  * 增量同步引擎：把服务端 `/api/changes` 的变更事件折叠进本地 [ResourceIndex]。
@@ -35,7 +44,8 @@ data class SyncResult(val applied: Int, val cursor: Long, val pages: Int)
  *    「待后续用 `GET /api/resources` 回填」；要拿到真实 size/mtime 需另外查询 `/api/resources`，记入 tech-debt。
  * 4. **`rev` 被丢弃**：本地的 [ResourceEntry] 没有 `rev` 字段（`uid + cursor` 已足够表达同步位置），
  *    需要服务端版本号的场景（如条件更新）须另行扩展索引，记入 tech-debt。
- * 5. **rename 只用 `path`**：`oldPath` 仅作日志/调试线索，不用于二次匹配（uid 才是稳定键）。
+ * 5. **rename 的 `oldPath` 只用于本地跟随**：索引侧仍只用 `path`（uid 才是稳定键），
+ *    `oldPath` 仅被收集进 [SyncResult.renames]，供 `SyncCoordinator` 重命名本地文件。
  * 6. **未知 `op` 忽略**：不抛异常、不改索引、不计入 [SyncResult.applied]，以便服务端新增操作类型时
  *    旧客户端仍能同步其余事件。
  * 7. **A 批不接线**：本类当前**没有任何调用点**（`SeshatApp` / Activity / [SyncManager] 均未使用），
@@ -50,6 +60,16 @@ class SyncEngine(
     private val api: SyncApi,
     private val index: ResourceIndex,
 ) {
+
+    /**
+     * 本次同步中收集到的重命名事件（`op = rename` 且 `oldPath` 非空）。
+     *
+     * ## 生命周期
+     * [sync] 开头 [MutableList.clear]、结尾做快照塞进 [SyncResult.renames]；[apply] 只追加。
+     * [apply] 是 public 且被测试直接调用，因此**单次 [apply] 之间不清空**——直接调用方不读这个字段，
+     * 下一次 [sync] 会先清空，所以不会有副作用。
+     */
+    private val pendingRenames = mutableListOf<RenameEvent>()
 
     /** 全量重建：从 `since = 0` 循环到 `hasMore == false`；每页先应用事件、再存下一页游标。 */
     fun bootstrap(): SyncResult = sync(startSince = 0L)
@@ -92,6 +112,10 @@ class SyncEngine(
                 OP_RENAME -> {
                     flush()
                     index.rename(change.uid, change.path)
+                    // oldPath 非空才能定位本地旧文件；仅收集、不影响索引侧语义
+                    change.oldPath?.takeIf { it.isNotBlank() }?.let {
+                        pendingRenames += RenameEvent(change.uid, it, change.path)
+                    }
                     applied++
                 }
                 OP_DELETE -> {
@@ -134,6 +158,7 @@ class SyncEngine(
 
     /** 拉取循环：`startSince` → `hasMore == false`。异常向上抛，已提交页的数据与游标保留。 */
     private fun sync(startSince: Long): SyncResult {
+        pendingRenames.clear() // 每次同步独立收集：上一次（含异常中断）的残留不得泄漏进本次结果
         var since = startSince
         var applied = 0
         var pages = 0
@@ -152,7 +177,12 @@ class SyncEngine(
             pages++
             if (!page.hasMore) break
         }
-        return SyncResult(applied = applied, cursor = index.cursor(), pages = pages)
+        return SyncResult(
+            applied = applied,
+            cursor = index.cursor(),
+            pages = pages,
+            renames = pendingRenames.toList(),
+        )
     }
 
     companion object {

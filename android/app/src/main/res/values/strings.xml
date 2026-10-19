@@ -207,4 +207,12 @@
     <string name="shelf_loading">正在扫描书库…</string>
     <string name="shelf_progress">%1$d%%</string>
     <string name="shelf_no_cover">无封面</string>
+
+    <!-- 远端书架与按需下载（M9.2 B 批 T7） -->
+    <string name="book_not_downloaded">未下载</string>
+    <string name="book_downloading">下载中…</string>
+    <string name="book_download_failed">下载失败：%1$s</string>
+    <string name="book_download_not_configured">未配置服务端，无法下载</string>
+    <string name="book_upload_too_large">文件超过 32 MiB，暂不支持上传</string>
+    <string name="book_upload_failed">上传失败：%1$s</string>
 </resources>

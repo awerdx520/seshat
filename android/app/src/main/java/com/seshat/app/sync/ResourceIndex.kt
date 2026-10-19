@@ -35,6 +35,19 @@ data class ResourceIndexDocument(
 )
 
 /**
+ * 元数据回填用的一次更新（来自 `/api/resources` 的 size/mtime/blob）。
+ *
+ * `/api/changes` 响应不含 `size`/`mtime`，因此增量同步产生的新条目 `dirty = true`，
+ * 需由 [ResourceIndex.applyMetadata] 用这些字段回填并清脏。
+ */
+data class ResourceMetadataUpdate(
+    val uid: String,
+    val blob: String,
+    val size: Long,
+    val mtime: Long,
+)
+
+/**
  * 本地资源索引：缓存远端资源清单，供增量同步与阅读器 uid 解析使用。
  *
  * ## 定位
@@ -42,8 +55,12 @@ data class ResourceIndexDocument(
  * 因此这里不做事务、不做迁移，读写失败也只影响下次全量同步的成本。
  *
  * ## 并发
- * A 批假定**单线程调用**（同步流程在单一协程/线程内串行）：内部用一个惰性 [cached] 文档做读写
- * 缓存，未加锁。跨线程使用前必须先补锁或改为事件串行。
+ * **所有 public 方法均为 `@Synchronized`**（对象级锁）：同步流程与书架扫描即便落在不同线程也安全。
+ * 索引操作是 O(n) 的内存遍历 + 一次全量序列化，锁粒度可接受；读方法（[all]/[alive]/
+ * [entriesInRoot]/[dirtyEntries]）返回**快照副本**，调用方可在锁外自由遍历。
+ *
+ * 仍假定**单进程**：底层 `SharedPreferences` 不支持跨进程并发（多进程需换成 ContentProvider/Room
+ * 或把索引下沉到单一进程服务）。
  *
  * ## 容量边界
  * 单条 JSON 全量重写的设计面向**数千条资源 / 数百 KB 级**的索引；条目数量级明显超过此范围
@@ -63,35 +80,54 @@ class ResourceIndex(
     // ---- 游标 ----
 
     /** 当前增量游标（空文档时为 0）。 */
+    @Synchronized
     fun cursor(): Long = document().cursor
 
     /** 设置增量游标（只改 cursor，条目不变；接受任意 `Long`）。 */
+    @Synchronized
     fun setCursor(value: Long) {
         persist(document().copy(cursor = value))
     }
 
-    // ---- 查询 ----
+    // ---- 查询（均返回快照副本） ----
 
-    /** 全部条目（含墓碑），保持写入顺序。 */
-    fun all(): List<ResourceEntry> = document().entries
+    /** 全部条目（含墓碑），保持写入顺序。**返回快照**：修改返回列表不影响索引。 */
+    @Synchronized
+    fun all(): List<ResourceEntry> = ArrayList(document().entries)
 
-    /** 存活条目（过滤 `deleted = true`），保持原顺序。 */
-    fun alive(): List<ResourceEntry> = document().entries.filterNot { it.deleted }
+    /** 存活条目（过滤 `deleted = true`），保持原顺序。**返回快照**。 */
+    @Synchronized
+    fun alive(): List<ResourceEntry> =
+        ArrayList(document().entries.filterNot { it.deleted })
 
     /** 按 uid 精确查找；未命中返回 null。 */
-    fun findByUid(uid: String): ResourceEntry? = document().entries.firstOrNull { it.uid == uid }
+    @Synchronized
+    fun findByUid(uid: String): ResourceEntry? =
+        document().entries.firstOrNull { it.uid == uid }
 
     /** 按 root + path 精确查找（**不过滤墓碑**，由调用方检查 [ResourceEntry.deleted]）。 */
+    @Synchronized
     fun findByPath(root: String, path: String): ResourceEntry? =
         document().entries.firstOrNull { it.root == root && it.path == path }
 
-    /** 某根下的全部条目（**含墓碑**），保持原顺序。 */
+    /** 某根下的全部条目（**含墓碑**），保持原顺序。**返回快照**。 */
+    @Synchronized
     fun entriesInRoot(root: String): List<ResourceEntry> =
-        document().entries.filter { it.root == root }
+        ArrayList(document().entries.filter { it.root == root })
+
+    /**
+     * 某根下 `dirty = true` 且**非墓碑**的条目（元数据回填候选），保持原顺序。
+     *
+     * **返回快照**：修改返回列表不影响索引。
+     */
+    @Synchronized
+    fun dirtyEntries(root: String): List<ResourceEntry> =
+        ArrayList(document().entries.filter { it.root == root && it.dirty && !it.deleted })
 
     // ---- 写入 ----
 
     /** 插入或更新：同 uid 已存在则**原位替换**（顺序不变、不产生重复），否则追加到末尾。 */
+    @Synchronized
     fun upsert(entry: ResourceEntry) {
         val current = document()
         val position = current.entries.indexOfFirst { it.uid == entry.uid }
@@ -110,6 +146,7 @@ class ResourceIndex(
      * [entries] 为空时直接返回——不构造文档、不写盘（保持「从未落盘」的原状）。
      * 列表内同 uid 出现多次时，后者覆盖前者且位置以首次出现为准（与逐条 [upsert] 一致）。
      */
+    @Synchronized
     fun upsertAll(entries: List<ResourceEntry>) {
         if (entries.isEmpty()) return
         val current = document()
@@ -126,6 +163,7 @@ class ResourceIndex(
     }
 
     /** 改路径：只替换该 uid 的 [ResourceEntry.path]，其它字段不变；uid 不存在时静默无操作。 */
+    @Synchronized
     fun rename(uid: String, newPath: String) {
         val current = document()
         if (current.entries.none { it.uid == uid }) return
@@ -137,6 +175,7 @@ class ResourceIndex(
     }
 
     /** 标记墓碑：置 `deleted = true` 并**保留 uid/root/path 原值**；uid 不存在时静默无操作。 */
+    @Synchronized
     fun markDeleted(uid: String) {
         val current = document()
         if (current.entries.none { it.uid == uid }) return
@@ -148,8 +187,35 @@ class ResourceIndex(
     }
 
     /** 清空索引：写回空文档（cursor = 0、entries 空），保留 prefs 键本身非空值。 */
+    @Synchronized
     fun clear() {
         persist(ResourceIndexDocument())
+    }
+
+    /**
+     * 批量回填元数据（`blob`/`size`/`mtime`）并**清 dirty**，整批只落盘一次。
+     *
+     * - 只更新**仍存在**的 uid；未知 uid 静默忽略；
+     * - 已墓碑的条目也回填（保留 `deleted = true`，只更新元数据并清 dirty）；
+     * - [updates] 为空、或没有任何条目被命中时**不写盘**。
+     */
+    @Synchronized
+    fun applyMetadata(updates: List<ResourceMetadataUpdate>) {
+        if (updates.isEmpty()) return
+        val current = document()
+        if (current.entries.isEmpty()) return
+        val byUid = updates.associateBy { it.uid }
+        val updated = current.entries.map { existing ->
+            val update = byUid[existing.uid] ?: return@map existing
+            existing.copy(
+                blob = update.blob,
+                size = update.size,
+                mtime = update.mtime,
+                dirty = false,
+            )
+        }
+        if (updated == current.entries) return // 全未命中：不做无意义写盘
+        persist(current.copy(entries = updated))
     }
 
     // ---- 内部 ----

@@ -75,8 +75,15 @@ class DefaultBookMetaReader(
  * 两个进度 Store 的构造方式照抄各阅读器 Activity，保证读写同一份 prefs：
  * - epub：[ReadingProgressStore] + `reading_progress`
  * - pdf：[PdfProgressStore] + `pdf_reader`（与批注/手写共用文件，靠 `pdf_progress_` 前缀隔离）
+ *
+ * @param remote 远端清单来源（M9.2 B 批）：`null` 表示纯本地书架。传入的 lambda 在
+ *               [BookLibrary.load] 内部（后台线程）才被调用，可安全读 [com.seshat.app.sync.ResourceIndex]
+ *               或触发一次根清单拉取。
  */
-fun openBookLibrary(context: Context): BookLibrary {
+fun openBookLibrary(
+    context: Context,
+    remote: (() -> List<RemoteBook>)? = null,
+): BookLibrary {
     val epubStore = ReadingProgressStore(context)
     val pdfPrefs = context.getSharedPreferences(PdfReaderActivity.PREFS_NAME, Context.MODE_PRIVATE)
     val pdfStore = PdfProgressStore(
@@ -90,5 +97,6 @@ fun openBookLibrary(context: Context): BookLibrary {
         metaReader = DefaultBookMetaReader(),
         epubProgress = { epubStore.all() },
         pdfProgress = { pdfStore.loadAll() },
+        remoteBooks = remote,
     )
 }

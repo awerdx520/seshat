@@ -31,18 +31,29 @@ class BookGridAdapter(
 
     private val items = mutableListOf<BookItem>()
 
+    /** 正在下载的文件名集合（`BookItem.file.name`）；由 Fragment 维护，用于显示「下载中…」。 */
+    private val downloading = HashSet<String>()
+
     /** 单本书视图持有者。 */
     class BookHolder(view: View) : RecyclerView.ViewHolder(view) {
         val cover: ImageView = view.findViewById(R.id.bookCover)
         val progress: TextView = view.findViewById(R.id.bookProgress)
+        val status: TextView = view.findViewById(R.id.bookStatus)
         val title: TextView = view.findViewById(R.id.bookTitle)
         val author: TextView = view.findViewById(R.id.bookAuthor)
     }
 
-    /** 用 [newItems] 整体替换当前列表并刷新。 */
-    fun submit(newItems: List<BookItem>) {
+    /**
+     * 用 [newItems] 整体替换当前列表并刷新。
+     *
+     * @param newItems    书架条目（本地 + 远端未下载占位）
+     * @param downloading 正在下载的文件名集合（按 `file.name` 匹配，与下载落点一致）
+     */
+    fun submit(newItems: List<BookItem>, downloading: Set<String> = emptySet()) {
         items.clear()
         items.addAll(newItems)
+        this.downloading.clear()
+        this.downloading.addAll(downloading)
         notifyDataSetChanged()
     }
 
@@ -60,19 +71,37 @@ class BookGridAdapter(
         // 作者未知（PDF 恒为 null）时留空，而不是占位文案：卡片空间有限
         holder.author.text = item.author.orEmpty()
 
-        // 进度徽标：0% 视为未读，隐藏以避免干扰
-        if (item.percent > 0) {
+        // 进度徽标：0% 视为未读，隐藏以避免干扰；远端未下载条目 percent 恒 0，一并隐藏
+        if (item.percent > 0 && item.isDownloaded) {
             holder.progress.visibility = View.VISIBLE
             holder.progress.text = context.getString(R.string.shelf_progress, item.percent)
         } else {
             holder.progress.visibility = View.GONE
         }
 
+        // 状态徽标：下载中 优先于 未下载（下载中的条目同样 isDownloaded = false）
+        when {
+            item.file.name in downloading -> {
+                holder.status.visibility = View.VISIBLE
+                holder.status.text = context.getString(R.string.book_downloading)
+            }
+
+            !item.isDownloaded -> {
+                holder.status.visibility = View.VISIBLE
+                holder.status.text = context.getString(R.string.book_not_downloaded)
+            }
+
+            else -> holder.status.visibility = View.GONE
+        }
+
         // 复用校验键：本视图即将展示哪本书
         holder.cover.tag = item.progressKey
         // 先清掉上一本书的位图，避免复用瞬间闪出别人的封面
         holder.cover.setImageDrawable(null)
-        coverLoader(item, holder.cover)
+        // 未下载的条目没有本地文件：只露出 xml 里的占位底色，不触发封面解码
+        if (item.isDownloaded) {
+            coverLoader(item, holder.cover)
+        }
 
         // 点击整张卡片回调（每次 bind 重设，避免视图复用串号）
         holder.itemView.setOnClickListener { onClick(item) }

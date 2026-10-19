@@ -5,6 +5,7 @@ import java.io.File
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -51,12 +52,23 @@ class BookLibraryTest {
         metaReader: BookMetaReader = fakeMeta,
         epubProgress: Map<String, ReadingProgress> = emptyMap(),
         pdfProgress: Map<String, PdfProgress> = emptyMap(),
+        remoteBooks: (() -> List<RemoteBook>)? = null,
     ): BookLibrary = BookLibrary(
         booksDir = books,
         metaReader = metaReader,
         epubProgress = { epubProgress },
         pdfProgress = { pdfProgress },
+        remoteBooks = remoteBooks,
     )
+
+    /** 造远端清单条目（name 一般与 path 末段一致）。 */
+    private fun remote(
+        name: String,
+        uid: String = "uid-$name",
+        path: String = "lib/$name",
+        size: Long = 100,
+        mtime: Long = 5_000,
+    ) = RemoteBook(uid = uid, root = "main", path = path, name = name, size = size, mtime = mtime)
 
     @Test
     fun emptyDirReturnsEmptyList() {
@@ -194,6 +206,80 @@ class BookLibraryTest {
         val item = library().load().single()
 
         assertEquals(1_234_567_890_000L, item.importedAt)
+    }
+
+    // ---- 远端清单合并（M9.2 B） ----
+
+    @Test
+    fun remoteOnlyBooksAppearAsPlaceholdersNotDownloaded() {
+        books = tmp.newFolder("books-remote-only")
+        val a = remote("a.epub", uid = "u-a", mtime = 9_000)
+        val b = remote("b.pdf", uid = "u-b", mtime = 8_000)
+
+        val result = library(remoteBooks = { listOf(a, b) }).load()
+
+        assertEquals(listOf("u-a", "u-b"), result.map { it.uid })
+        val epub = result.first { it.uid == "u-a" }
+        assertFalse(epub.isDownloaded)
+        assertEquals(a, epub.remote)
+        assertEquals(File(books, "a.epub"), epub.file)
+        assertEquals(BookType.EPUB, epub.type)
+        assertEquals("a", epub.title)
+        assertNull(epub.author)
+        assertEquals(0, epub.totalCount)
+        assertEquals("lib/a.epub", epub.progressKey)
+        assertEquals(0, epub.percent)
+        assertEquals(0L, epub.lastReadAt)
+        assertEquals(9_000L, epub.importedAt)
+        assertEquals(BookType.PDF, result.first { it.uid == "u-b" }.type)
+        // 未下载条目 percent=0 → 出现在「未读」过滤里
+        assertEquals(2, library(remoteBooks = { listOf(a, b) }).load(filter = BookFilter.UNREAD).size)
+    }
+
+    @Test
+    fun downloadedRemoteBookKeepsLocalMetaAndGetsUid() {
+        books = tmp.newFolder("books-remote-downloaded")
+        File(books, "a.epub").writeBytes(ByteArray(100)) // 长度与远端 size 一致 → 判定已落盘
+        val a = remote("a.epub", uid = "u-a", size = 100, mtime = 9_000)
+
+        val item = library(remoteBooks = { listOf(a) }).load().single()
+
+        assertTrue(item.isDownloaded)
+        assertEquals("u-a", item.uid)
+        assertEquals(a, item.remote)
+        // 已落盘时用本地真实元数据（作者/章节数/进度键），不用占位值
+        assertEquals("作者", item.author)
+        assertEquals(10, item.totalCount)
+        assertEquals("key-a", item.progressKey)
+    }
+
+    @Test
+    fun nullRemoteBooksBehavesLikePureLocal() {
+        books = tmp.newFolder("books-no-remote")
+        File(books, "a.epub").writeText("x")
+
+        val item = library().load().single()
+
+        assertNull(item.remote)
+        assertNull(item.uid)
+        assertTrue(item.isDownloaded)
+    }
+
+    @Test
+    fun sameNameButDifferentLengthKeepsLocalEntryOnly() {
+        books = tmp.newFolder("books-same-name-diff-size")
+        File(books, "a.epub").writeBytes(ByteArray(100)) // 本地 100 字节
+        val a = remote("a.epub", uid = "u-a", size = 200, mtime = 9_000) // 远端 200 字节
+
+        val result = library(remoteBooks = { listOf(a) }).load()
+
+        // 设计 §4：只有「本地无同名文件」的远端条目才追加占位——同名但长度不同意味着远端版本
+        // 有新内容，仍只显示本地那一本（避免书架出现两本同名书），差异由下载流程覆盖。
+        val item = result.single()
+        assertTrue(item.isDownloaded)
+        assertEquals("u-a", item.uid)
+        assertEquals(a, item.remote)
+        assertEquals(100L, item.file.length())
     }
 
     // ---- 生产实现 EpubBookMetaReader（纯 JDK 解析，可真跑） ----

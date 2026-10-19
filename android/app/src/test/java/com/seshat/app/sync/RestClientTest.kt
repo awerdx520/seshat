@@ -1,5 +1,6 @@
 package com.seshat.app.sync
 
+import java.io.File
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -7,15 +8,23 @@ import okhttp3.OkHttpClient
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.After
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Before
+import org.junit.Rule
 import org.junit.Test
+import org.junit.rules.TemporaryFolder
 
 /** RestClient 请求构造与执行（MockWebServer）单测。 */
 class RestClientTest {
+
+    /** 下载落盘用例需要真实目录（[TemporaryFolder]）。 */
+    @get:Rule
+    val tmp = TemporaryFolder()
 
     private lateinit var server: MockWebServer
     private lateinit var config: SeshatConfig
@@ -325,5 +334,191 @@ class RestClientTest {
         assertEquals("1234", req.url.queryParameter("since"))
         assertEquals("100", req.url.queryParameter("limit"))
         assertEquals("Bearer secret-token", req.header("Authorization"))
+    }
+
+    // ---- M9.2 B 批：文件通道（/api/files + move） ----
+
+    /** 路径按 `/` 逐段编码，`root` 走 query。 */
+    @Test
+    fun buildGetFileEncodesPathSegmentsAndRoot() {
+        val req = client.buildGetFile("notes", "/a/b.org")
+        assertEquals("GET", req.method)
+        assertEquals("/api/files/a/b.org", req.url.encodedPath)
+        assertEquals("notes", req.url.queryParameter("root"))
+        assertEquals(listOf("api", "files", "a", "b.org"), req.url.pathSegments)
+        assertEquals("Bearer secret-token", req.header("Authorization"))
+    }
+
+    /** 中文与空格必须百分号编码，且解码回来后仍等于原始路径段（不得出现裸空格）。 */
+    @Test
+    fun buildGetFileEncodesChineseAndSpace() {
+        val req = client.buildGetFile("notes", "中文 书/第一章 a.org")
+        assertTrue(req.url.encodedPath.contains("%E4%B8%AD%E6%96%87%20%E4%B9%A6"))
+        assertFalse(req.url.encodedPath.contains(" "))
+        assertEquals(listOf("api", "files", "中文 书", "第一章 a.org"), req.url.pathSegments)
+    }
+
+    @Test
+    fun buildGetFileAddsIfNoneMatchHeader() {
+        val req = client.buildGetFile("notes", "a.org", ifNoneMatch = "\"etag-1\"")
+        assertEquals("\"etag-1\"", req.header("If-None-Match"))
+        assertNull(req.header("Range"))
+    }
+
+    /** `rangeStart` → `Range: bytes=<start>-`（服务端按 `http.ServeContent` 语法解析）。 */
+    @Test
+    fun buildGetFileAddsRangeHeader() {
+        val req = client.buildGetFile("notes", "a.org", rangeStart = 100L)
+        assertEquals("bytes=100-", req.header("Range"))
+        assertNull(req.header("If-None-Match"))
+    }
+
+    @Test
+    fun buildPutFileUsesOctetStreamAndBody() {
+        val bytes = byteArrayOf(0, 1, 2, 65, 66)
+        val req = client.buildPutFile("notes", "a/b.org", bytes)
+        assertEquals("PUT", req.method)
+        assertEquals("/api/files/a/b.org", req.url.encodedPath)
+        assertEquals("notes", req.url.queryParameter("root"))
+        assertTrue(req.body!!.contentType().toString().startsWith("application/octet-stream"))
+        val buffer = okio.Buffer()
+        req.body!!.writeTo(buffer)
+        assertArrayEquals(bytes, buffer.readByteArray())
+    }
+
+    @Test
+    fun buildPutFileAddsConditionalHeaders() {
+        val req = client.buildPutFile("notes", "a.org", byteArrayOf(1), ifMatch = "\"e1\"", ifNoneMatch = "*")
+        assertEquals("\"e1\"", req.header("If-Match"))
+        assertEquals("*", req.header("If-None-Match"))
+    }
+
+    @Test
+    fun buildDeleteFileUsesDeleteMethod() {
+        val req = client.buildDeleteFile("notes", "dir/a.org")
+        assertEquals("DELETE", req.method)
+        assertEquals("/api/files/dir/a.org", req.url.encodedPath)
+        assertEquals("notes", req.url.queryParameter("root"))
+    }
+
+    @Test
+    fun buildMoveResourcePostsToBody() {
+        val req = client.buildMoveResource("u-1", "x/y.org")
+        assertEquals("POST", req.method)
+        assertEquals("/api/resources/u-1/move", req.url.encodedPath)
+        val body = okio.Buffer().also { req.body!!.writeTo(it) }.readUtf8()
+        assertEquals("x/y.org", Json.parseToJsonElement(body).jsonObject["to"]?.jsonPrimitive?.content)
+    }
+
+    /** 200 → 内容落盘；`.part` 临时文件必须已被 rename 掉。 */
+    @Test
+    fun downloadFileWritesTargetAndLeavesNoPart() {
+        server.enqueue(MockResponse().setResponseCode(200).setBody("hello-file-bytes"))
+        val dir = tmp.newFolder()
+        val target = File(dir, "b.org")
+        val result = client.downloadFile("notes", "a/b.org", target)
+        val request = server.takeRequest()
+        assertEquals("/api/files/a/b.org?root=notes", request.path)
+        assertEquals(target, result)
+        assertEquals("hello-file-bytes", target.readText())
+        assertFalse(File(dir, "b.org.part").exists())
+    }
+
+    /** 304 → 返回 null，且不得创建（或截断）本地文件。 */
+    @Test
+    fun downloadFileReturnsNullOn304() {
+        server.enqueue(MockResponse().setResponseCode(304))
+        val dir = tmp.newFolder()
+        val target = File(dir, "b.org")
+        assertNull(client.downloadFile("notes", "b.org", target, ifNoneMatch = "\"etag-1\""))
+        assertEquals("\"etag-1\"", server.takeRequest().getHeader("If-None-Match"))
+        assertFalse(target.exists())
+        assertFalse(File(dir, "b.org.part").exists())
+    }
+
+    /** 非 2xx → 抛 ApiException，且残留的 `.part` 必须被清理。 */
+    @Test
+    fun downloadFileCleansPartOnError() {
+        server.enqueue(
+            MockResponse().setResponseCode(500)
+                .setBody("""{"error":{"code":"internal","message":"读取失败"}}"""),
+        )
+        val dir = tmp.newFolder()
+        val target = File(dir, "b.org")
+        try {
+            client.downloadFile("notes", "b.org", target)
+            fail("应抛出 ApiException")
+        } catch (e: ApiException) {
+            assertEquals(500, e.statusCode)
+            assertEquals("internal", e.code)
+        }
+        assertFalse(File(dir, "b.org.part").exists())
+        assertFalse(target.exists())
+    }
+
+    /** 超 32 MiB 前置拦截：不得发出任何请求。 */
+    @Test
+    fun uploadFileRejectsOversizeBeforeRequest() {
+        val tooBig = ByteArray((RestClient.MAX_UPLOAD_BYTES + 1).toInt())
+        try {
+            client.uploadFile("notes", "big.epub", tooBig)
+            fail("应抛出 IllegalArgumentException")
+        } catch (e: IllegalArgumentException) {
+            assertTrue(e.message.orEmpty().contains("32 MiB"))
+        }
+        assertEquals(0, server.requestCount)
+    }
+
+    @Test
+    fun uploadFileParsesWriteResponse() {
+        server.enqueue(
+            MockResponse().setResponseCode(201)
+                .setBody(
+                    """{"uid":"u-1","root":"notes","path":"books/a.epub","blob":"blob-1","etag":"\"e-1\"","rev":"r-1","seq":9007199254740993,"created":true}""",
+                ),
+        )
+        val resp = client.uploadFile("notes", "books/a.epub", byteArrayOf(1, 2, 3), ifNoneMatch = "*")
+        val request = server.takeRequest()
+        assertEquals("PUT", request.method)
+        assertEquals("/api/files/books/a.epub?root=notes", request.path)
+        assertEquals("*", request.getHeader("If-None-Match"))
+        assertEquals("u-1", resp.uid)
+        assertEquals("books/a.epub", resp.path)
+        assertEquals("blob-1", resp.blob)
+        assertEquals("\"e-1\"", resp.etag)
+        assertEquals("r-1", resp.rev)
+        assertEquals(9007199254740993L, resp.seq)
+        assertTrue(resp.created)
+    }
+
+    @Test
+    fun deleteFileParsesUids() {
+        server.enqueue(
+            MockResponse().setResponseCode(200)
+                .setBody("""{"uid":"u-1","uids":["u-1","u-2"],"root":"notes","path":"dir/a.org","seq":7}"""),
+        )
+        val resp = client.deleteFile("notes", "dir/a.org")
+        val request = server.takeRequest()
+        assertEquals("DELETE", request.method)
+        assertEquals("/api/files/dir/a.org?root=notes", request.path)
+        assertEquals(listOf("u-1", "u-2"), resp.uids)
+        assertEquals("dir/a.org", resp.path)
+        assertEquals(7L, resp.seq)
+    }
+
+    @Test
+    fun moveResourceParsesFromAndTo() {
+        server.enqueue(
+            MockResponse().setResponseCode(200)
+                .setBody("""{"uid":"u-1","root":"notes","from":"a.org","to":"x/y.org","seq":9}"""),
+        )
+        val resp = client.moveResource("u-1", "x/y.org")
+        val request = server.takeRequest()
+        assertEquals("/api/resources/u-1/move", request.requestUrl?.encodedPath)
+        assertEquals("x/y.org", Json.parseToJsonElement(request.body.readUtf8()).jsonObject["to"]?.jsonPrimitive?.content)
+        assertEquals("u-1", resp.uid)
+        assertEquals("a.org", resp.from)
+        assertEquals("x/y.org", resp.to)
+        assertEquals(9L, resp.seq)
     }
 }
