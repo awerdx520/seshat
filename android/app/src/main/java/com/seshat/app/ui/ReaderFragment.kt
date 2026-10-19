@@ -86,7 +86,7 @@ class ReaderFragment : Fragment() {
     /** 按需下载器（[onViewCreated] 装配）。 */
     private lateinit var bookDownloader: BookDownloader
 
-    /** 上次触发同步的时刻（`elapsedRealtime`），用于 [onResume] 的 30s 限流。 */
+    /** 上次触发同步的时刻（`elapsedRealtime`），用于 [syncNow] 的非强制路径（[onResume]）限流。 */
     private var lastSyncAt = 0L
 
     private lateinit var adapter: BookGridAdapter
@@ -168,6 +168,17 @@ class ReaderFragment : Fragment() {
         if (::grid.isInitialized && !loading) refresh()
         // 同步按 30s 限流：切回书架不每次都打网络
         syncNow(force = false)
+    }
+
+    /**
+     * tab 显隐切换回调（`MainActivity` 用 `show`/`hide` 切 tab，**不会**触发 [onResume]）。
+     *
+     * 切回本 tab 时强制同步一次（绕过 [SYNC_MIN_INTERVAL_MS] 限流），使服务端 move/改名后
+     * 本地索引与 `files/books/` 能跟随；`SyncOutcome.Ok` 分支内部已 `refresh()`，故不重复扫描。
+     */
+    override fun onHiddenChanged(hidden: Boolean) {
+        super.onHiddenChanged(hidden)
+        if (!hidden) syncNow(force = true)
     }
 
     override fun onDestroyView() {
@@ -451,6 +462,7 @@ class ReaderFragment : Fragment() {
      * 触发一次同步（异步，不阻塞 UI）。
      *
      * `force = false` 时按 [SYNC_MIN_INTERVAL_MS] 限流：`onResume` 频繁切回书架不每次都打网络。
+     * `force = true` 跳过限流（首次进入、切回本 tab 见 [onHiddenChanged]）。
      * `NotConfigured` 静默（服务端是可选能力）；失败只记日志，不打扰用户（书架已有本地数据）。
      */
     private fun syncNow(force: Boolean) {

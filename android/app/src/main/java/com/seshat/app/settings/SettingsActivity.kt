@@ -20,6 +20,7 @@ import com.seshat.app.R
 import com.seshat.app.SeshatApp
 import com.seshat.app.sync.SecurePrefs
 import com.seshat.app.sync.SeshatConfig
+import com.seshat.app.sync.SyncHolder
 import kotlin.math.roundToInt
 
 /**
@@ -304,7 +305,13 @@ class SettingsActivity : AppCompatActivity() {
         }
         val newToken = (tokenResult as? TokenValidation.Replace)?.token
 
-        when (val urlResult = SettingsValidator.validateServerUrl(serverUrlInput.text?.toString())) {
+        when (
+            val urlResult = SettingsValidator.validateServerUrl(
+                serverUrlInput.text?.toString(),
+                // 仅 debug 构建为 true（本机 adb reverse 联调）；release 恒为 false → https-only
+                allowHttp = resources.getBoolean(R.bool.allow_cleartext_http),
+            )
+        ) {
             is UrlValidation.Error -> {
                 serverUrlLayout.error = getString(urlErrorText(urlResult.reason))
             }
@@ -315,12 +322,16 @@ class SettingsActivity : AppCompatActivity() {
                     showStorageUnavailable()
                 }
                 applyLocalPreferences()
+                // 地址被清空也可能意味着「换了服务器/不再使用服务端」：同步装配必须失效
+                SyncHolder.invalidate(this)
                 finishWithToast()
             }
 
             is UrlValidation.Ok -> when (store.save(urlResult.normalized, newToken)) {
                 SaveResult.Ok -> {
                     applyLocalPreferences()
+                    // 保存成功：丢弃缓存的 RestClient 与「未配置」结论，并让编排器重拉根清单
+                    SyncHolder.invalidate(this)
                     finishWithToast()
                 }
 
@@ -349,7 +360,12 @@ class SettingsActivity : AppCompatActivity() {
      */
     private fun testConnection() {
         // 服务端可选：地址留空时没有探测目标，直接给出提示（不能再按 Ok 强转）
-        val normalizedUrl = when (val urlResult = SettingsValidator.validateServerUrl(serverUrlInput.text?.toString())) {
+        val normalizedUrl = when (
+            val urlResult = SettingsValidator.validateServerUrl(
+                serverUrlInput.text?.toString(),
+                allowHttp = resources.getBoolean(R.bool.allow_cleartext_http),
+            )
+        ) {
             is UrlValidation.Error -> {
                 serverUrlLayout.error = getString(urlErrorText(urlResult.reason))
                 return
@@ -367,7 +383,12 @@ class SettingsActivity : AppCompatActivity() {
             return
         }
 
-        val tester = ConnectivityTester(SeshatConfig(serverUrl = normalizedUrl, token = token))
+        // requireHttps 跟随构建变体：debug 允许明文 http（本机 adb reverse 联调），release 恒为 true。
+        // 不传则用构造函数默认值 true，导致 debug 下 http 地址恒定报「仅支持 https 地址」。
+        val tester = ConnectivityTester(
+            SeshatConfig(serverUrl = normalizedUrl, token = token),
+            requireHttps = !resources.getBoolean(R.bool.allow_cleartext_http),
+        )
         connectionResultText.setText(R.string.settings_testing)
         Thread({
             val result = tester.test()

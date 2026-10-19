@@ -12,7 +12,8 @@
         android:label="@string/app_name"
         android:name=".SeshatApp"
         android:supportsRtl="true"
-        android:theme="@style/Theme.Seshat">
+        android:theme="@style/Theme.Seshat"
+        android:usesCleartextTraffic="${usesCleartextTraffic}">
 
         <activity
             android:name=".MainActivity"

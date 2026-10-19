@@ -43,8 +43,17 @@ android {
     }
 
     buildTypes {
+        debug {
+            // debug 变体：允许明文 http（仅用于本机 adb reverse 真机验证），
+            // 实际放行的域由 src/debug/res/xml/network_security_config.xml 限定为本机回环
+            manifestPlaceholders["usesCleartextTraffic"] = "true"
+            resValue("bool", "allow_cleartext_http", "true")
+        }
         release {
             isMinifyEnabled = false
+            // release 恒为 https-only：禁止明文 http，校验器也不放宽
+            manifestPlaceholders["usesCleartextTraffic"] = "false"
+            resValue("bool", "allow_cleartext_http", "false")
             if (keystorePropertiesFile.exists()) {
                 signingConfig = signingConfigs.getByName("release")
             }

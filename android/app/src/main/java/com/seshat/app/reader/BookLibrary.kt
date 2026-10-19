@@ -19,7 +19,8 @@ enum class BookType {
  * @property author      作者；未知为 `null`（PDF 恒为 `null`）。
  * @property totalCount  总量：epub 为章节数，pdf 为页数。用于换算进度百分比。
  * @property progressKey 进度存储键：epub 为内容哈希（[documentIdOf]），pdf 为 `file://` uri 字符串。
- *                       必须与阅读器端「无 uid」时的键保持一致，否则书架查不到进度。
+ *                       属于**本地身份**，仅在条目无 uid（纯本地书 / 远端清单不可用）时用于查进度；
+ *                       有 uid 时以 uid 为准（见 [BookLibrary.load]）。
  * @property coverHref   封面相对 opfDir 的路径（epub）；pdf 为 `null`。
  *
  * 标 [Serializable] 是为了能被 [CoverCache] 以 JSON 形式缓存到磁盘（见 [CachedBookMeta]）。
@@ -102,6 +103,10 @@ class BookLibrary(
      *
      * 只收 `epub` / `pdf`（扩展名忽略大小写）的普通文件；解析失败的文件静默跳过。
      *
+     * 进度查找是**双键**的：优先 uid（服务端身份，阅读器在有 uid 时就用它作进度键），
+     * uid 为 `null` 或该键无进度时回退到本地键 [BookMeta.progressKey]（内容哈希 / `file://` uri）。
+     * 单查本地键会让有 uid 的书 percent 恒为 0（徽标被隐藏）。
+     *
      * 配置了 [remoteBooks] 时，本地扫描结果会与远端清单合并（按**文件名**对齐）：
      * - 本地已有同名文件 → 只保留本地条目（带真实元数据），并把 `uid` / `remote` 填上
      *   （阅读器据此按 uid 同步进度）；即使长度与远端不同也如此——远端版本更新时由下载流程
@@ -130,19 +135,22 @@ class BookLibrary(
             localNames += file.name
             val type = typeOf(file) ?: continue
             val meta = metaReader.read(file) ?: continue
+            // 远端同名声明的 uid：必须在查进度之前算出（进度键可能是 uid）
+            val remote = remoteByName[file.name]
+            val uid = remote?.uid
+            // 优先 uid：阅读器在有 uid 时用 uid 作进度键，无 uid 才回退本地键（内容哈希/uri）
             val item = when (type) {
                 BookType.EPUB -> {
-                    val progress = epub[meta.progressKey]
+                    val progress = (uid?.let { epub[it] }) ?: epub[meta.progressKey]
                     buildItem(file, type, meta, progress?.chapterIndex ?: 0, progress?.updatedAt ?: 0L)
                 }
 
                 BookType.PDF -> {
-                    val progress = pdf[meta.progressKey]
+                    val progress = (uid?.let { pdf[it] }) ?: pdf[meta.progressKey]
                     buildItem(file, type, meta, progress?.page ?: 0, progress?.updatedAt ?: 0L)
                 }
             }
-            // 已落盘的本地书：反查同名远端条目，补上 uid / remote
-            val remote = remoteByName[file.name]
+            // 已落盘的本地书：补上 remote / uid（本地解析优先，远端只提供身份）
             val merged = if (remote == null) item else item.copy(remote = remote, uid = remote.uid)
             if (BookShelfLogic.matches(filter, merged.percent)) items += merged
         }

@@ -83,6 +83,50 @@ class SettingsValidatorTest {
         assertUrlError(UrlError.UNSUPPORTED_SCHEME, "ftp://a.com")
     }
 
+    // ---- allowHttp 开关（仅 debug 构建允许明文 http，用于本机 adb reverse 联调） ----
+
+    /** 断言地址校验通过（显式指定 allowHttp）且规范化结果等于 [expected]。 */
+    private fun assertUrlOk(expected: String, raw: String, allowHttp: Boolean) {
+        when (val result = SettingsValidator.validateServerUrl(raw, allowHttp)) {
+            is UrlValidation.Ok -> assertEquals("输入：$raw", expected, result.normalized)
+            is UrlValidation.Error -> fail("输入：$raw 期望通过，实际失败：${result.reason}")
+            UrlValidation.Empty -> fail("输入：$raw 期望通过，实际为留空（Empty）")
+        }
+    }
+
+    /** 断言地址校验失败（显式指定 allowHttp）且原因等于 [reason]。 */
+    private fun assertUrlError(reason: UrlError, raw: String?, allowHttp: Boolean) {
+        when (val result = SettingsValidator.validateServerUrl(raw, allowHttp)) {
+            is UrlValidation.Ok -> fail("输入：$raw 期望失败，实际通过：${result.normalized}")
+            is UrlValidation.Error -> assertEquals("输入：$raw", reason, result.reason)
+            UrlValidation.Empty -> fail("输入：$raw 期望失败，实际为留空（Empty）")
+        }
+    }
+
+    @Test
+    fun httpAllowedWhenAllowHttpEnabled() {
+        // debug 变体：allowHttp=true 时接受 http（本机回环地址，真机联调用）
+        assertUrlOk("http://127.0.0.1:18081", "http://127.0.0.1:18081", allowHttp = true)
+    }
+
+    @Test
+    fun httpStillRejectedByDefault() {
+        // 默认参数必须保持 https-only：release 语义不得被放宽
+        assertUrlError(UrlError.UNSUPPORTED_SCHEME, "http://example.com", allowHttp = false)
+    }
+
+    @Test
+    fun ftpStillRejectedWhenAllowHttpEnabled() {
+        // allowHttp 只放宽 http，不放宽其它 scheme
+        assertUrlError(UrlError.UNSUPPORTED_SCHEME, "ftp://example.com", allowHttp = true)
+    }
+
+    @Test
+    fun httpsStillOkWhenAllowHttpDisabled() {
+        // 回归：allowHttp=false 时 https 行为不变
+        assertUrlOk("https://example.com", "https://example.com", allowHttp = false)
+    }
+
     @Test
     fun portKept() {
         assertUrlOk("https://a.com:8443", "https://a.com:8443")

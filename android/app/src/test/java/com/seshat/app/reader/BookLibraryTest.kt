@@ -282,6 +282,76 @@ class BookLibraryTest {
         assertEquals(100L, item.file.length())
     }
 
+    // ---- 进度双键查找：优先 uid，回退 progressKey（回归：EPUB 卡片无进度徽标） ----
+
+    @Test
+    fun epubProgressFoundByUidWhenStoreKeyedByUid() {
+        books = tmp.newFolder("books-uid-epub")
+        File(books, "book.epub").writeText("x")
+
+        val item = library(
+            epubProgress = mapOf(
+                "U1" to ReadingProgress(documentId = "U1", chapterIndex = 5, updatedAt = 700L),
+            ),
+            remoteBooks = { listOf(remote("book.epub", uid = "U1", size = 1)) },
+        ).load().single()
+
+        // 阅读器在有 uid 时按 uid 写进度 → 书架必须能用 uid 查到
+        assertEquals("U1", item.uid)
+        assertEquals(50, item.percent) // 5/10 章
+        assertEquals(700L, item.lastReadAt)
+    }
+
+    @Test
+    fun epubProgressFallsBackToProgressKeyWhenUidHasNoProgress() {
+        books = tmp.newFolder("books-uid-fallback")
+        File(books, "book.epub").writeText("x")
+
+        val item = library(
+            epubProgress = mapOf(
+                // 只有内容哈希键有进度（旧版阅读器 / 无 uid 时写入的键）
+                "key-book" to ReadingProgress(documentId = "key-book", chapterIndex = 5, updatedAt = 700L),
+            ),
+            remoteBooks = { listOf(remote("book.epub", uid = "U1", size = 1)) },
+        ).load().single()
+
+        assertEquals(50, item.percent) // 回退生效：仍能读到 5/10 章
+        assertEquals(700L, item.lastReadAt)
+    }
+
+    @Test
+    fun epubUidProgressWinsOverProgressKeyProgress() {
+        books = tmp.newFolder("books-uid-wins")
+        File(books, "book.epub").writeText("x")
+
+        val item = library(
+            epubProgress = mapOf(
+                "U1" to ReadingProgress(documentId = "U1", chapterIndex = 5, updatedAt = 700L),
+                "key-book" to ReadingProgress(documentId = "key-book", chapterIndex = 2, updatedAt = 200L),
+            ),
+            remoteBooks = { listOf(remote("book.epub", uid = "U1", size = 1)) },
+        ).load().single()
+
+        // 两键都有进度时以 uid 为准（服务端身份是权威来源）
+        assertEquals(50, item.percent) // 取 uid 的 5/10，而非 key-book 的 2/10
+        assertEquals(700L, item.lastReadAt)
+    }
+
+    @Test
+    fun pdfProgressFoundByUidWhenStoreKeyedByUid() {
+        books = tmp.newFolder("books-uid-pdf")
+        File(books, "doc.pdf").writeText("x")
+
+        val item = library(
+            pdfProgress = mapOf("P1" to PdfProgress(page = 6, updatedAt = 555L)),
+            remoteBooks = { listOf(remote("doc.pdf", uid = "P1", size = 1)) },
+        ).load().single()
+
+        assertEquals("P1", item.uid)
+        assertEquals(50, item.percent) // 6/12 页
+        assertEquals(555L, item.lastReadAt)
+    }
+
     // ---- 生产实现 EpubBookMetaReader（纯 JDK 解析，可真跑） ----
 
     @Test

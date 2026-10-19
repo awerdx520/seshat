@@ -49,8 +49,9 @@ sealed interface TokenValidation {
  * 设置页的输入校验（纯逻辑，无 Android 依赖，可在 JVM 单测中验证）。
  *
  * 安全约束（M9.1 安全加固）：
- * - **仅接受 https**——明文 http 会把 Bearer / Basic 凭据暴露在网络中，与本项目
- *   「传输层由反向代理终止 TLS」的威胁模型冲突。
+ * - **默认仅接受 https**——明文 http 会把 Bearer / Basic 凭据暴露在网络中，与本项目
+ *   「传输层由反向代理终止 TLS」的威胁模型冲突。仅 debug 构建传 `allowHttp = true`
+ *   放行 http（本机 adb reverse 真机联调），release 恒为 https-only。
  * - **拒绝 userinfo**（`https://real.com@evil.com` 会让用户误判目标主机）。
  * - **拒绝查询参数与锚点**——配置项是服务端根地址，携带参数会污染后续 API 路径拼接。
  * - 只做最小规范化（补 scheme、去末尾斜杠），**不重组 URL**。
@@ -66,16 +67,25 @@ object SettingsValidator {
     /** 访问令牌允许的字符集（RFC 6750 b64token 的近似：可见 ASCII，不含空格）。 */
     private val TOKEN_CHARS = Regex("^[\\u0021-\\u007E]+$")
 
-    /** 校验服务端地址。 */
-    fun validateServerUrl(raw: String?): UrlValidation {
+    /**
+     * 校验服务端地址。
+     *
+     * @param raw 用户输入（可为 `null`）。
+     * @param allowHttp 是否允许明文 http（**仅 debug 构建**为 true，用于本机 adb reverse 联调）；
+     *   默认 false → https-only（与既有语义、单测一致）。
+     *   注意：本开关只放宽 scheme，主机名白名单由 debug 的 `network_security_config.xml` 负责。
+     */
+    fun validateServerUrl(raw: String?, allowHttp: Boolean = false): UrlValidation {
         val trimmed = raw?.trim().orEmpty()
         // 地址留空是合法状态（服务端可选，表示仅本地使用），与「格式非法」区分开
         if (trimmed.isEmpty()) return UrlValidation.Empty
         if (trimmed.length > MAX_URL_LENGTH) return UrlValidation.Error(UrlError.TOO_LONG)
 
         val withScheme = if (trimmed.contains("://")) trimmed else "https://$trimmed"
-        // 先判 scheme：明文 http 会把访问令牌暴露在网络中，与「传输层由反代终止 TLS」冲突
-        if (withScheme.substringBefore("://").lowercase() != "https") {
+        // 先判 scheme：明文 http 会把访问令牌暴露在网络中，与「传输层由反代终止 TLS」冲突；
+        // 仅 debug 构建传 allowHttp=true 放行 http，其它 scheme 一律拒绝
+        val scheme = withScheme.substringBefore("://").lowercase()
+        if (scheme != "https" && !(allowHttp && scheme == "http")) {
             return UrlValidation.Error(UrlError.UNSUPPORTED_SCHEME)
         }
 
