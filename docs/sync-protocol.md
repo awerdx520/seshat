@@ -388,6 +388,13 @@ GET /api/refs?uid=<uid>&direction=in    # 谁引用了我
 - **`403 root_read_only` 不重试**：它是架构约束（书库只读），不是暂时故障；
 - **`503 unavailable` 可重试**：服务端能力未就绪（未装配 registry/indexer），属部署问题。
 
+### 9.1 Android 客户端实现要点（M9.2 B 批）
+
+- **按需下载用整份 `GET`，未用 `Range`**：`GET /api/files/{path...}?root=` 一次拿全文，先写 `<name>.part`，`close()` 后原子 `renameTo`、异常路径删 `.part`。服务端支持的单区间 `Range`（206/416）与 `If-None-Match`（304）客户端**均未接入**，因此无断点续传，重试即从头开始。
+- **上传前本地校验 32 MiB**：服务端 `PUT /api/files` 单次请求体上限 32 MiB，超限返回 `400 invalid_argument`。客户端把上限写成常量（`RestClient.MAX_UPLOAD_BYTES`）并在**发请求前**拦截提示，避免「大文件神秘失败」；新建用 `If-None-Match: *`。
+- **`since` 是秒级 mtime，不是游标**：回填 `size`/`mtime` 用 `GET /api/resources?root=&since=&limit=`，语义 `mtime >= since` 且响应体**无 `next_cursor`**。分页只能取本页 `max(mtime)` 前进；若该页没有任何时间前进（同秒条目已在上一页返回完）必须 `since += 1`，否则原地死循环。故回填**不保证单次全量**，只保证「下次再跑会补齐」（尽力而为 + 幂等）。
+- **`move` 只限 mirror 根**：`POST /api/resources/{uid}/move` 对 `ondemand` 根返回 `403 root_read_only`，客户端不应为它准备重命名逻辑——`ondemand` 根也不会有 `rename` 事件。mirror 根内的 rename 事件可用来跟随本地文件名，但**仅当目标不存在时**才能移动（同名不同目录会冲突，跳过不覆盖）。
+
 ## 10. 已知限制
 
 以下均从当前实现的事实提取（不是规划），客户端需据此设计降级路径。

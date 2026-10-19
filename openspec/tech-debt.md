@@ -686,3 +686,43 @@
 - 现状：`item_note_file.xml` 为竖排两行（标题 15sp + 元信息/标签 12sp）且根布局 `padding="12dp"`，未按屏幕尺寸/密度分档；横屏（3200px 宽级别）实测一屏只容纳 6–7 项。
 - 影响：宽屏下信息密度过低，笔记库稍多就需要大量滚动；横屏本来就为「一次看更多行」存在，当前实现把这块收益抵消掉了。
 - 建议：把行内边距与行间距改为 `values` / `values-w600dp` 分档（横屏或宽屏降到 6–8dp、单位置两行合一），或改用 `?attr/listPreferredItemHeightSmall` 之类的高度约束；同时评估「标题 + 元信息」同行右对齐的紧凑版布局（宽屏一行即可容纳）。
+
+## 上传 >32 MiB 不支持（M9.2 B 批，2026-10-19）
+- 现状：`RestClient.MAX_UPLOAD_BYTES = 32 MiB` 与服务端 `PUT /api/files` 的单次请求体上限一致；`ReaderFragment` 在导入回调里前置判断，**超限只 Toast 提示「不上传」**，本地文件保留。原 M9.2 A 批条目（「`PUT /api/files` 单次上限 32 MiB，`GET` 的 `Range`/`If-None-Match` 未接入」）的「客户端尚未实现上传/下载」口径已不成立，此处记录 B 批交付后的**残余**缺口。
+- 影响：大体积 PDF（扫描版画册、教材）只能留在本机，换设备或多端阅读取不到；用户看不到「为什么这本书没上云」以外的补救路径。
+- 建议：两条路选一——① 客户端分片上传（服务端需新增「分片会话」端点，`PUT` 单块仍受 32 MiB 限制，最后合并）；② 超限时改走 WebDAV 通道（`WebDavClient.put` 已有，`mirror` 根同时挂 `PUT`，但书库根是 `ondemand` 只读，只能落到 mirror 根）。在实现之前保持「显式提示不上传」的现状，不要静默丢弃错误。
+
+## 无后台定时同步（关闭 App 后不拉取）（M9.2 B 批，2026-10-19）
+- 现状：同步只在书架**前台可见**时触发（首次进书架、`onResume` 30s 限流、刷新按钮）；刻意不引 WorkManager（零新增依赖）。进程被杀后既不拉取变更，也不重试失败的同步。
+- 影响：服务端在其他设备上改动的书，要等用户下次主动打开书架才发现；「另一台设备刚导入的书」在书架上看不到，容易误判为同步坏了。
+- 建议：若最终接受引入 WorkManager，用 `PeriodicWorkRequest`（最小 15 分钟）+ 网络可用约束做后台增量拉取，`SyncCoordinator` 已把「游标 / 幂等 / 单实例」三件事处理好，接成本主要在 WorkManager 的依赖与 `Constraints` 配置；不引依赖时的替代方案是 `JobScheduler` + 前台可见时补偿同步。
+
+## 下载无断点续传、无进度回调（M9.2 B 批，2026-10-19）
+- 现状：`RestClient.downloadFile` 用整份 `GET`，未发送 `Range`、也未用 `If-None-Match`；`BookDownloader.ensureLocal` 只有 `Ready` / `NotConfigured` / `Failed` 三态，**没有 `onProgress` 参数**，UI 只能显示「下载中…」。
+- 影响：几十 MiB 的书在弱网下一次失败就要从头重来；用户无从判断是卡住还是在下（大文件 + 慢网络时尤其明显）；已下载的部分 `.part` 在失败路径被删，完全没有复用价值。
+- 建议：① 断点续传——服务端已支持单区间 `Range`（206/416）与 `ETag`，客户端记录已落盘长度并发 `Range: bytes=<len>-` 续写同一个 `.part`，完成后再 rename；② 进度回调——`downloadFile` 从 `ResponseBody.contentLength()` 与逐块读取累计，回调节流到 100–200ms，`BookGridAdapter` 用 `ProgressBar` 或条目内百分比渲染（`downloading` 集合目前只有布尔语义，需扩展成 `Map<String, Int>`）。
+
+## 封面旧键残留（下载/替换文件后旧 `<key>.jpg` 与 `<key>.json` 不清理）（M9.2 B 批，2026-10-19）
+- 现状：`CoverKeys.keyFor(file)` = `文件名 + length + lastModified` 的 SHA-256 前 16 位 hex。远端书下载落盘后 `length` / `lastModified` 变化 → 新键，`CoverCache` 会生成新的 `<key>.jpg` + `<key>.json`，而旧键的两个文件没有任何删除路径（`covers/` 既无引用计数也无容量上限）。
+- 影响：每下载一次同一本书就多留一份封面与元数据；书库反复下载/服务端改名后 `covers/` 单调增长且无法判断哪些是孤儿，只能整目录手删（删了会退化成下次重新解析）。
+- 建议：短期在 `BookLibrary.load()` 结尾做一次「按当前书架上所有书的 key 集合求差，删掉不在集合里的 `<key>.jpg/.json`」（全量扫描时顺手做，O(n) 目录列举）；长期给 `covers/` 加 LRU 上限（按总字节数），与内存 `LruCache` 的策略对齐。
+
+## `BookDownloader` 并发下载同一本书无保护（依赖调用方去重）（M9.2 B 批，2026-10-19）
+- 现状：`ensureLocal` 自身**没有互斥**——两个线程对同一 `RemoteBook` 并发调用会同时写同一个 `<name>.part` 并竞争 `renameTo`。当前唯一保护是 `ReaderFragment` 的 `downloading: MutableSet<String>`（重复点击直接 return）与 `SyncHolder` 的单线程 executor，属**调用方约定**而非类内不变量。
+- 影响：一旦将来有第二个调用点（例如后台预下载、批量「全部下载」按钮）或把下载挪到多线程 executor，就会出现 `.part` 交错写入产出损坏文件、或 `renameTo` 失败后一本好书被判为 `Failed`。
+- 建议：把「同路径下载互斥」下沉到 `BookDownloader`（`ConcurrentHashMap<String, Future<DownloadResult>>` 按 `book.name` 合并同键请求，或在类内对 target 文件加锁），并让 `ReaderFragment` 的 `downloading` 集合退化为纯 UI 状态；顺带在单测里覆盖「两次并发调用只发一次请求」。
+
+## 上传目标根用「mirror + default」启发式（M9.2 B 批，2026-10-19）
+- 现状：`ReaderFragment` 选上传目标根的逻辑是 `roots.firstOrNull { mode == "mirror" && isDefault } ?: roots.firstOrNull { mode == "mirror" }`，都没有则静默跳过上传。默认根由服务端下发，客户端无法让用户指定。
+- 影响：服务端一旦配置多个 `mirror` 根（例如「笔记」与「私人书库」都设为 mirror，默认根是笔记根），导入的书会落到笔记根而不是用户期望的书库根，且**没有任何提示**；排查时只能靠服务端日志看出路径不对。
+- 建议：① 设置页加「上传目标目录（根）」下拉，选项来自 `GET /api/roots` 中 `mode == "mirror"` 的根（默认值仍取服务端默认根），存进 `AppPreferences`（非机密层）；② 上传成功的 Toast 里带上「已上传到 <root>」让目标可见；③ 在确定选择前保留当前启发式作为兜底，但要补一条 `Log.w` 记录实际选中的根。
+
+## `size <= 0` 时无法判断本地文件是否需重下（M9.2 B 批，2026-10-19）
+- 现状：`RemoteBookSource.localFileOf` 的判定是「文件存在 且（`book.size > 0` 时）长度相等」，`size <= 0` 时**只判存在、不校验长度**——这是为了避免元数据尚未回填（`/api/changes` 不返回 `size`）时把已下载的书误判成「未下载」。
+- 影响：反过来的风险是——若本地文件被截断（下载中断后残留、外部工具改坏、磁盘满）而服务端 `size` 又恰好未回填，书架会把它当作「已下载」并直接打开，表现为解析失败或内容缺尾，且不会再触发下载修复。
+- 建议：`ResourceEntry` 已有 `dirty` 位，可据此区分「`size` 未知是因为未回填」与「服务端真的没有 `size`（`ondemand` 根）」。优先方案：让 `BookDownloader.ensureLocal` 在 `size <= 0` 但条目 `dirty` 时**先触发一次回填/`GET /api/resources/{uid}`** 拿到真实 `size` 再判定；退而求其次提供「重新下载」长按菜单，让用户手动修复。
+
+## 书架不区分内部/外部来源（`BookItem.remote` 已存在但 UI 未用）（M9.2 B 批，2026-10-19）
+- 现状：`BookItem` 已有 `remote: RemoteBook?`（null = 纯本地书）与 `isDownloaded`，但 `BookGridAdapter` 只渲染「未下载 / 下载中」两个状态徽标，不提示条目的来源根（`remote.root`）与远端路径（`remote.path`）。
+- 影响：多根场景下用户看不出某本书来自哪个根；排查「这本书为什么上传失败 / 为什么服务端改名后没跟随」时缺少可见线索（`ondemand` 根只读、`move` 只对 mirror 根生效，这些约束全靠文档）。
+- 建议：封面占位或标题行下方追加来源徽标（如 `notes` / `ebooks` 的根 tag），长按条目弹出「来源 / 远端路径 / 重新下载 / 从书架移除」；`remote` 一并纳入书架过滤维度（按来源筛选）。同类问题见上文「笔记列表不区分内部/外部来源」（M10.7）——两处建议同一套 UI 方案，避免出现两种来源标注风格。

@@ -307,3 +307,11 @@
 **理由**：用户笔记是整份 org/md 文档（部分无 TODO），需要阅读而非任务管理；WebView 的 CSS 能力可同时服务两种语法且排版可控；自研渲染器避免引入 markdown 库并保证「先转义再解析」的安全顺序。
 
 **代价**：渲染只覆盖语法子集（无表格/图片/大纲）；SAF 只遍历一层；Agenda 降级为只读；多文件逐个解析无缓存。
+
+## 2026-10-19 · M9.2 B 批文件同步
+
+**决策**：不引 WorkManager / SwipeRefreshLayout（前台可见时触发同步，`onResume` 30s 限流）；`ResourceIndex` 用 `@Synchronized` + 全进程单实例（`SyncHolder`）；上传限 32 MiB 不分片；`SyncResult` 扩展 `renames` 并由 `SyncCoordinator` best-effort 跟随本地文件名。
+
+**理由**：零新增依赖；`ResourceIndex` 的锁是实例锁，必须单实例才能保护同一 prefs 键；分片上传需服务端配合，超出本批。
+
+**代价**：无后台同步；>32 MiB 无法上传；同名不同目录的 move 跟随会跳过；`ondemand` 根的书无法重命名。
