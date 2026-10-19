@@ -102,7 +102,7 @@
 
 ### 变更（Breaking Change）
 
-项目品牌由 `notes` 更名为 `Seshat`。本次为**破坏性变更**，升级前务必按 [`docs/migration-seshat.md`](docs/migration-seshat.md) 执行迁移；改名的方案、命名映射与用户裁决见 [`openspec/active/seshat-rename.md`](openspec/active/seshat-rename.md)。
+项目品牌由 `notes` 更名为 `Seshat`。本次为**破坏性变更**，升级前务必按 [`docs/migration-seshat.md`](docs/migration-seshat.md) 执行迁移；改名的方案、命名映射与用户裁决见 [`openspec/completed/seshat-rename.md`](openspec/completed/seshat-rename.md)。
 
 影响面：
 

@@ -42,7 +42,7 @@
 - org 文件头 `Keywords`（语义头，非品牌）；
 - `:notes:` tag（数据语义，可能已被真实笔记引用）。
 
-理由：一次性彻底改名以避免长期两名并存的心智负担；C 域改名按数据迁移单独处理，以复制 + 观察期降低风险。完整方案与实施清单见 [openspec/active/seshat-rename.md](active/seshat-rename.md)。
+理由：一次性彻底改名以避免长期两名并存的心智负担；C 域改名按数据迁移单独处理，以复制 + 观察期降低风险。完整方案与实施清单见 [openspec/completed/seshat-rename.md](completed/seshat-rename.md)。
 
 ## 2026-10-12 · seshat-reader 包彻底自研化改名
 

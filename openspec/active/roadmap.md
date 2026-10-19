@@ -109,7 +109,7 @@ M0–M6 已完成并归档，见 `openspec/completed/personal-notes-system.md`�
 | M10.3 | 批注侧车 + `location` 约定统一（PDF `page:<n>`+范围；EPUB 待定） |
 | M10.4 | 进度/批注 uid 化同步 |
 | M10.5 | **PDF 阅读增强**（用户 2026-10-18 提出，未开工，需另行走方案确认与计划确认）：手写批注（笔迹侧车，不写回 PDF）、点击翻页、横向翻页 / 竖向连续滚动双模式（滚动时页间首尾相接，保留上页最后一行）、横屏适配（fitWidth / fitHeight 选择）、后台渲染线程 + 位图 LRU 缓存（依赖 M10.1）✅ 完成（2026-10-18，手写批注 + 点击翻页 + 横屏），见 openspec/completed/2026-10-18-m10.5-pdf-ink-and-paging.md |
-| M10.7 | **笔记库与渲染阅读**（用户 2026-10-18 确认）：多文件笔记库（私有目录 + 可选 SAF 外部目录，framework `DocumentsContract` 零新增依赖）、org / markdown 渲染阅读页（WebView + 自研渲染器）、文件级源码编辑（`NoteEditActivity`）、设置页「笔记外部目录」（SAF 持久授权）✅ **完成并归档**（2026-10-18 开发，单测 468 → 562 例；2026-10-19 真机验收通过并修 2 处缺陷，单测 562 → 566 例）——见 openspec/active/2026-10-18-m10.7-notes-reader.md |
+| M10.7 | **笔记库与渲染阅读**（用户 2026-10-18 确认）：多文件笔记库（私有目录 + 可选 SAF 外部目录，framework `DocumentsContract` 零新增依赖）、org / markdown 渲染阅读页（WebView + 自研渲染器）、文件级源码编辑（`NoteEditActivity`）、设置页「笔记外部目录」（SAF 持久授权）✅ **完成并归档**（2026-10-18 开发，单测 468 → 562 例；2026-10-19 真机验收通过并修 2 处缺陷，单测 562 → 566 例）——见 openspec/completed/2026-10-18-m10.7-notes-reader.md |
 
 ### M11 批注与引用闭环
 
