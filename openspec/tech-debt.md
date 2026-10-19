@@ -661,3 +661,28 @@
 - 现状：① `NoteFileAdapter.submit()` 用 `notifyDataSetChanged()` 整表重绑（与 `NotesListAdapter` 一致，搜索输入、刷新、扫描回调都全表刷）；② `NoteViewActivity` 用 `loadDataWithBaseURL(null, …)` 载入 HTML，页面内相对路径链接与图片没有可解析的基点。
 - 影响：① 列表刷新时滚动位置与动画丢失，长列表有可见跳动；② 笔记里的相对链接（`./other.org`）与本地图片（`images/x.png`）点击/加载都失效（白屏或 `ERR_UNKNOWN_URL_SCHEME`）。
 - 建议：① 两个 adapter 统一改用 `ListAdapter` + `DiffUtil.ItemCallback`（`NoteItem` 不可变，id 可用 `ref.toString() + modifiedAt`）；② 若要支持本地图片，用 `loadDataWithBaseURL(file://<父目录>/)` 提供基点并保留 `allowFileAccess=false` + `allowContentAccess=false` 的收紧策略（WebView 对 baseUrl 的 `file://` 读取需实测），或改为在渲染阶段把相对图片路径重写成 `content://` 并单独校验。
+
+## Agenda 段条目不显示日期/时间，且混入无状态的父标题与 DONE 条目（M10.7 真机验收，2026-10-19）
+- 现状：`NotesFragment` 的 Agenda 段把各 org 文件的条目交给 `GtdSorter.byEarliestDate` 升序排列，但复用的 `NotesListAdapter` 行只展示标题与标签，**不显示日期/时间**；同一份条目流里既有带 `DEADLINE`/`SCHEDULED` 的条目，也有无任何计划时间的父标题（如「项目：Seshat 应用」）与 `DONE` 条目，二者都按同一规则参与排序。
+- 影响：用户看不出「为什么这条排在这条前面」（升序依据不可见），且无时间的父标题与已完成的 `DONE` 条目挤占了列表前部，真正待办的事项被推到滚动区之外；真机（2026-10-19）上表现为列表前几行全是无时间信息的分组标题。
+- 建议：① 行内补日期/时间（`DEADLINE` 优先、其次 `SCHEDULED`，无时间显示占位），让排序依据可见；② 提供「只看有时间的待办」过滤（默认开启），把无计划时间的父标题降级为不可点击的分组行、`DONE` 条目默认折叠或加删除线标注；过滤逻辑放在纯 JVM 侧（`GtdSorter` / 新增 `AgendaFilter`）以便单测覆盖。
+
+## 笔记列表不区分内部/外部来源（`NoteSourceKind` 已存在但 UI 未用）（M10.7 真机验收，2026-10-19）
+- 现状：`NoteScanner` 为每条 `NoteItem` 填了 `source`（`PRIVATE` / `EXTERNAL`），但 `NoteFileAdapter` 的行只渲染「格式 + 修改时间 + 标签」，`source` 在 UI 层零消费（也无任何代码读它）。
+- 影响：私有目录与 SAF 外部目录的笔记在同一列表里完全同形，用户无法判断某条笔记存在本机还是外部目录；排查「为什么这条只读」「为什么删除后还在」时缺少可见线索（`NotesSync` 只上传私有目录首个 org 文件，也与来源相关）。
+- 建议：行内元信息追加来源徽标（如「本机」/「外部」两个短标签，或外部项用不同前景色），并对 `EXTERNAL` 项保持无编辑入口的既有事实在 UI 上显式化（例如灰显「编辑源码」菜单项并提示「外部目录只读」）；`source` 一并纳入搜索过滤维度（按来源筛选）。
+
+## 列表页「选择目录」按钮直接跳设置页，与设置页内同名按钮行为不一致（M10.7 真机验收，2026-10-19）
+- 现状：`NotesFragment` 顶部「选择目录」按钮的实现是 `startActivity(SettingsActivity.intent(...))`——先跳设置页，再由用户在设置页里点「笔记外部目录」才真正起 SAF 选目录；设置页内那个同名动作直接起 `OpenDocumentTree`。两处文案相同、行为差一层。
+- 影响：用户点「选择目录」后看到的是一个设置页面（不在预期位置），容易以为按钮坏了或已进入错误页面；两个入口名字一样行为不一样，后续维护也容易只改一处。
+- 建议：二选一收口——① 列表页按钮文案改为「笔记设置」（跳设置页的语义自洽），并在设置页内保留唯一的 SAF 起入口；② 列表页直接起 `OpenDocumentTree`（复用设置页的持久授权 + 写偏好逻辑，抽成共享 helper），设置页的同类按钮改为调用同一 helper。倾向 ①（SAF 授权 + 清除需要一个稳定的设置位置来承载）。
+
+## WebView 疑似 text autosizing：同为 H1 的标题字号不一致（M10.7 真机验收，待复核）（2026-10-19）
+- 现状：`NoteViewActivity` 用 `loadDataWithBaseURL(null, html, "text/html", "utf-8", null)` 载入渲染结果，未设置 `settings.textZoom`、也未在 `HtmlDocument` 的 CSS 里声明 `-webkit-text-size-adjust`；真机上观察同一篇笔记里两处同为 `<h1>` 的标题字号不一致。
+- 影响：标题层级在视觉上失去可靠性（读者按字号判断层级会误判），长文档尤其明显；由于未复现到最小样例，目前不能排除是 CSS 选择器命中差异（例如段落内标题 vs 顶层标题）而非 autosizing。
+- 建议：先复核——用固定 HTML（两个纯 `<h1>`，内容等长）在真机与模拟器各看一次，确认是否随视口宽度/内容长度变化（autosizing 的特征）；若确认，则在 `HtmlDocument` 的 CSS 里给 `html { -webkit-text-size-adjust: 100%; }` 并为 `h1..h6` 显式声明 `font-size`（rem 单位），必要时同时设 `settings.textZoom = 100`。
+
+## 笔记列表行高偏大（横屏 3200 宽仅容纳 6–7 项）（M10.7 真机验收，2026-10-19）
+- 现状：`item_note_file.xml` 为竖排两行（标题 15sp + 元信息/标签 12sp）且根布局 `padding="12dp"`，未按屏幕尺寸/密度分档；横屏（3200px 宽级别）实测一屏只容纳 6–7 项。
+- 影响：宽屏下信息密度过低，笔记库稍多就需要大量滚动；横屏本来就为「一次看更多行」存在，当前实现把这块收益抵消掉了。
+- 建议：把行内边距与行间距改为 `values` / `values-w600dp` 分档（横屏或宽屏降到 6–8dp、单位置两行合一），或改用 `?attr/listPreferredItemHeightSmall` 之类的高度约束；同时评估「标题 + 元信息」同行右对齐的紧凑版布局（宽屏一行即可容纳）。

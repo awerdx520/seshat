@@ -49,7 +49,7 @@
 - Android 笔记列表（M10.6 B4）：`ui/NotesFragment` 由占位视图改为真实 org 列表——`filesDir/notes/*.org` 经 `OrgParser` 解析 + `OrgTreeBuilder` 建树，按层级缩进展示、可折叠；每行为「状态徽标 + 标题 + `:tag:` 同行 + 正文首行摘要」（`item_note_entry`）；顶部搜索框对标题 + 正文做大小写不敏感的包含匹配（`OrgSearchMatcher`），命中保留祖先链并强制展开，输入 250ms 防抖；分段「笔记 / Agenda」——Agenda 段用 `GtdSorter.byEarliestDate` 扁平按最早日期排序，点击切换 TODO 状态。
 - Android 笔记编辑页（M10.6 B4）：新增 `ui/NotesEditActivity`，标题 / 正文 / TODO 状态可编辑并写回 org（`OrgEditor` 行区间改写）；优先级、计划、截止、标签、属性**只读展示**。
 - 抽取 `gtd/NotesSync` 并统一 GTD 数据源（M10.6 B4）：新增 `NotesSync.upload(context, file): NotesSyncResult`（`Ok` / `NotConfigured` / `Failed`）——阻塞、无 Toast、不建线程，经 `SecurePrefs` 取地址与令牌后 `PUT` 到 `remoteDir/seshat/<文件名>`；`GtdActivity` 与 Notes 的 Agenda 段共用该实现，删除重复的 `readSyncConfig()` / `joinPath()`。`GtdActivity` 改读 `filesDir/notes/sample.org`，与 Notes 列表**同一份文件**，旧 `filesDir/sample.org` 保留但不再读取。
-- Android 笔记库与渲染阅读（M10.7，2026-10-18）：① **多文件笔记库列表**——`notes/NoteScanner` 扫私有目录 `filesDir/notes/` 与设置页可选的外部目录（SAF tree URI + 持久读权限），一个 `.org`/`.md` 文件一行（标题 + 格式/修改时间 + denote 标签），标题回退链「denote 文件名 > 首个 heading > 文件名」；② **渲染阅读页**——新增 `ui/NoteViewActivity`，`notes/render/OrgHtmlRenderer` 与 `MarkdownHtmlRenderer` 自研把文本转 HTML（先转义再匹配行内标记、代码块只转义不解析、链接走 `http`/`https`/`mailto` 白名单），`HtmlDocument` 提供统一内联 CSS（`prefers-color-scheme` 亮/暗），WebView 关闭 JS 与 file/content access；③ **文件级源码编辑器**——新增 `ui/NoteEditActivity`，整份源码纯文本编辑、后台读写、保留原行尾风格，仅对可写本地文件显示入口；④ 设置页新增「笔记外部目录」（SAF 选择 + 持久授权 + 清除）。单测 468 → 562 例，**零新增依赖**（不引 `androidx.documentfile`、markdown 库）。**渲染效果需真机验收（本机无 AVD / 设备）。**
+- Android 笔记库与渲染阅读（M10.7，2026-10-18）：① **多文件笔记库列表**——`notes/NoteScanner` 扫私有目录 `filesDir/notes/` 与设置页可选的外部目录（SAF tree URI + 持久读权限），一个 `.org`/`.md` 文件一行（标题 + 格式/修改时间 + 标签：denote 文件名优先，回退 org `#+FILETAGS:`），标题回退链「denote 文件名 > 首个 heading > 文件名」；② **渲染阅读页**——新增 `ui/NoteViewActivity`，`notes/render/OrgHtmlRenderer` 与 `MarkdownHtmlRenderer` 自研把文本转 HTML（先转义再匹配行内标记、代码块只转义不解析、链接走 `http`/`https`/`mailto` 白名单），`HtmlDocument` 提供统一内联 CSS（`prefers-color-scheme` 亮/暗），WebView 关闭 JS 与 file/content access；③ **文件级源码编辑器**——新增 `ui/NoteEditActivity`，整份源码纯文本编辑、后台读写、保留原行尾风格，仅对可写本地文件显示入口；④ 设置页新增「笔记外部目录」（SAF 选择 + 持久授权 + 清除）。单测 468 → 562 例，**零新增依赖**（不引 `androidx.documentfile`、markdown 库）。**渲染效果需真机验收（本机无 AVD / 设备）。**
 
 ### 变更
 
@@ -95,6 +95,8 @@
 - 修复 EPUB 双击缩放误切换工具栏（M10.6 B2）：单击改为 250ms 延迟切换，双击第二击取消待执行切换，左右各 30% 边缘不响应，双击只缩放不切换浮层。
 - 修复 EPUB 浮层化后中心章判定偏移（M10.6 B2）：竖向模式中心章改取可见区中心，原 `height/2` 在新增 padding 下偏移约 26dp。
 - 修复 PDF 页码/进度指示在布局型跳转后不同步（M10.6 B2）：`jumpToPage` 后的 `scrollToPosition` 可能不触发滚动回调，改用 `doOnNextLayout` 走既有更新链路。
+- 修复笔记渲染页「编辑源码」保存后 toolbar 标题仍是旧值（M10.7 真机验收，2026-10-19）：`NoteViewActivity.reload()` 重渲染后只换了正文、标题栏沿用打开时的 `EXTRA_TITLE`。现改为在同一个后台任务里用**新文本**算出首个 heading（`NoteScanner.firstHeading`），渲染成功后同步字段 `currentTitle` 与 toolbar 标题；取不到 heading（文件被清空/无 heading）时保留原标题不置空，`EXTRA_TITLE` 本身不回写（`intentForFile`/`intentForUri` 的调用约定不变）。
+- 修复笔记列表只显示 denote 文件名里的标签、忽略 org `#+FILETAGS:`（M10.7 真机验收，2026-10-19）：`sample.org` 带 `#+FILETAGS: :notes:` 但列表行 meta 只有 `ORG · 时间`。`NoteScanner` 新增 `fileTags(text)`（行首匹配 `#+FILETAGS:`，允许前导空白与大小写差异，去首尾 `:` 后按 `:` 分割并过滤空串），标签合并改为「denote 文件名标签优先，denote 缺失或为空时回退 FILETAGS」。**IO 影响**：只在「denote 未命中」（原本就要读内容找 heading）或「denote 命中但无标签」（新增的一次读取）时读文件，有标签的 denote 文件仍然零读取；SAF 外部目录同理。新增 4 例单测（`fileTags` 三例 + 「denote 无标签回退 FILETAGS」一例），单测 562 → 566。
 
 ## [0.2.0] - 2026-10-12
 
