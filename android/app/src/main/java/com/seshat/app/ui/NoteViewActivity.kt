@@ -21,6 +21,7 @@ import com.seshat.app.R
 import com.seshat.app.notes.NoteFormat
 import com.seshat.app.notes.NoteReader
 import com.seshat.app.notes.NoteRef
+import com.seshat.app.notes.NoteScanner
 import com.seshat.app.notes.render.HtmlDocument
 import com.seshat.app.notes.render.MarkdownHtmlRenderer
 import com.seshat.app.notes.render.OrgHtmlRenderer
@@ -56,6 +57,9 @@ class NoteViewActivity : AppCompatActivity() {
 
     /** 当前笔记格式（重渲染时沿用，避免重复推导扩展名）。 */
     private var format: NoteFormat? = null
+
+    /** toolbar 当前标题（初值来自 `EXTRA_TITLE`；重渲染后随新内容的首个 heading 更新）。 */
+    private var currentTitle: String = ""
 
     /** 文件读取线程（所有 IO 都在后台执行）。 */
     private var executor: ExecutorService? = null
@@ -144,7 +148,9 @@ class NoteViewActivity : AppCompatActivity() {
         }
         ref = target
         format = resolved
-        title = intent.getStringExtra(EXTRA_TITLE)?.takeIf { it.isNotBlank() } ?: fallbackTitle(target)
+        currentTitle = intent.getStringExtra(EXTRA_TITLE)?.takeIf { it.isNotBlank() }
+            ?: fallbackTitle(target)
+        title = currentTitle
         return true
     }
 
@@ -216,6 +222,8 @@ class NoteViewActivity : AppCompatActivity() {
      * 重新读取并渲染当前笔记（首次加载与「编辑源码」保存返回共用）。
      *
      * 不重建 Activity：保留滚动位置、缩放比例与菜单状态。
+     * 渲染成功后按**新内容**的首个 heading 同步 toolbar 标题（改标题后不再显示旧值；
+     * 取不到 heading 时保留原标题，不置空）。
      */
     private fun reload() {
         val target = ref ?: return
@@ -226,6 +234,8 @@ class NoteViewActivity : AppCompatActivity() {
         work.execute {
             val text = NoteReader.read(target, contentResolver)
             val html = text?.let { HtmlDocument.wrap(render(it, noteFormat)) }
+            // 新内容的首个 heading 作为新标题；取不到（文件被清空/无 heading）时保持原值不置空
+            val derived = text?.let { NoteScanner.firstHeading(it, noteFormat) }
             runOnUiThread {
                 if (isFinishing || isDestroyed) return@runOnUiThread
                 if (html == null) {
@@ -235,6 +245,11 @@ class NoteViewActivity : AppCompatActivity() {
                     return@runOnUiThread
                 }
                 webView.loadDataWithBaseURL(null, html, "text/html", "utf-8", null)
+                // 「编辑源码」保存后正文已重渲染，标题也必须跟着新内容走（否则停在打开时的旧标题）
+                if (derived != null && derived != currentTitle) {
+                    currentTitle = derived
+                    title = derived
+                }
                 noteLoading.visibility = View.GONE
             }
         }

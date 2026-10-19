@@ -26,7 +26,7 @@ sealed interface NoteRef {
  * @property title 展示标题（来源见 [NoteScanner] 的回退链）。
  * @property format 笔记格式。
  * @property modifiedAt 最后修改时间（毫秒时间戳）。
- * @property tags 标签（denote 文件名中的标签；无则空表）。
+ * @property tags 标签（denote 文件名中的标签优先；denote 无标签时取 org 的 `#+FILETAGS:`；都没有为空表）。
  * @property source 来源，决定是否可写。
  */
 data class NoteItem(

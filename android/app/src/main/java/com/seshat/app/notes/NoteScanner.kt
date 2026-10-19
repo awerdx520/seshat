@@ -31,6 +31,9 @@ internal object NoteScanner {
     /** markdown 标题末尾的可选闭合 `#`。 */
     private val MARKDOWN_TRAILING_HASHES = Regex("""#+$""")
 
+    /** org `#+FILETAGS:` 关键字行：允许前导空白，关键字大小写不敏感。 */
+    private val ORG_FILETAGS = Regex("""^\s*#\+filetags:\s*(.*)$""", RegexOption.IGNORE_CASE)
+
     /**
      * 扫描本地目录（不递归子目录）：
      * - 只收扩展名为 org/md 的普通文件；
@@ -54,20 +57,34 @@ internal object NoteScanner {
     /** 单文件 → [NoteItem]；扩展名不支持时返回 `null`。 */
     private fun toItem(file: File, source: NoteSourceKind): NoteItem? {
         val format = formatOf(file.extension) ?: return null
-        // denote 命中时无需读文件内容（省一次 IO）
         val denote = DenoteName.parse(file.name)
+        // 只有在「需要文件内容」时才读一次（denote 有标签且能给出标题时完全不读）：
+        // ① denote 未命中 → 要找标题回退链里的首个 heading；② denote 命中但无标签 → 要找 #+FILETAGS:
+        val text = if (needsText(denote)) readTextOrEmpty(file) else null
         val title = denote?.title
-            ?: firstHeading(readTextOrEmpty(file), format)
+            ?: firstHeading(text.orEmpty(), format)
             ?: file.nameWithoutExtension
         return NoteItem(
             ref = NoteRef.LocalFile(file),
             title = title,
             format = format,
             modifiedAt = file.lastModified(),
-            tags = denote?.tags.orEmpty(),
+            tags = tagsOf(denote, text),
             source = source,
         )
     }
+
+    /** 是否需要读文件内容（详见 [toItem] 的两条读文件理由）。 */
+    private fun needsText(denote: DenoteName.ParsedName?): Boolean =
+        denote == null || denote.tags.isEmpty()
+
+    /**
+     * 标签合并：denote 文件名标签优先；denote 缺失或为空时回退到 org 的 `#+FILETAGS:`。
+     *
+     * @param text 文件内容；denote 有标签时为 `null`（此时无需读文件）。
+     */
+    private fun tagsOf(denote: DenoteName.ParsedName?, text: String?): List<String> =
+        denote?.tags?.takeIf { it.isNotEmpty() } ?: fileTags(text.orEmpty())
 
     /**
      * 扫描 SAF 目录（只遍历一层，不递归）：
@@ -133,17 +150,18 @@ internal object NoteScanner {
         modifiedAt: Long,
     ): NoteItem {
         val ref = NoteRef.SafDocument(DocumentsContract.buildDocumentUriUsingTree(treeUri, documentId))
-        // denote 命中时无需读内容（SAF 读流比本地 IO 贵得多）
+        // SAF 读流很贵：仅「需要内容」时才读一次（denote 有标签且给出标题时不读）
         val denote = DenoteName.parse(displayName)
+        val text = if (needsText(denote)) NoteReader.read(ref, resolver) else null
         val title = denote?.title
-            ?: firstHeading(NoteReader.read(ref, resolver).orEmpty(), format)
+            ?: firstHeading(text.orEmpty(), format)
             ?: displayName.substringBeforeLast('.', displayName)
         return NoteItem(
             ref = ref,
             title = title,
             format = format,
             modifiedAt = modifiedAt,
-            tags = denote?.tags.orEmpty(),
+            tags = tagsOf(denote, text),
             source = NoteSourceKind.EXTERNAL,
         )
     }
@@ -180,5 +198,20 @@ internal object NoteScanner {
             if (cleaned.isNotEmpty()) return cleaned
         }
         return null
+    }
+
+    /**
+     * 从 org 文本提取 `#+FILETAGS: :a:b:` 的标签列表；不存在返回空表。
+     *
+     * 规则：行首匹配 `#+FILETAGS:`（允许前导空白、忽略大小写）→ 取其后内容 →
+     * 去首尾空白与 `:` → 按 `:` 分割 → 过滤空串。只取第一处命中（每文件一个关键字的常态）。
+     */
+    fun fileTags(text: String): List<String> {
+        text.lineSequence().forEach { rawLine ->
+            val match = ORG_FILETAGS.matchEntire(rawLine.trimEnd()) ?: return@forEach
+            val body = match.groupValues[1].trim().trim(':')
+            return body.split(':').filter { it.isNotEmpty() }
+        }
+        return emptyList()
     }
 }

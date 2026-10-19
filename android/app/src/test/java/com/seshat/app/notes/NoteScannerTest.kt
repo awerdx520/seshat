@@ -161,4 +161,35 @@ class NoteScannerTest {
         assertNull(NoteScanner.firstHeading("普通段落\n", NoteFormat.MARKDOWN))
         assertNull(NoteScanner.firstHeading("#+TITLE: 只有关键字\n", NoteFormat.ORG))
     }
+
+    // ---------- fileTags（缺陷修复：列表标签来自 #+FILETAGS:） ----------
+
+    @Test
+    fun fileTags_parsesMultipleTags() {
+        assertEquals(listOf("a", "b"), NoteScanner.fileTags("#+FILETAGS: :a:b:"))
+    }
+
+    @Test
+    fun fileTags_ignoresCaseAndSurroundingSpaces() {
+        assertEquals(listOf("single"), NoteScanner.fileTags("#+filetags:  :single:  "))
+    }
+
+    @Test
+    fun fileTags_absentReturnsEmpty() {
+        assertTrue(NoteScanner.fileTags("无标签行\n* 标题\n").isEmpty())
+    }
+
+    @Test
+    fun scanLocal_denoteWithoutTagsFallsBackToFileTags() {
+        // denote 命名但文件名无标签 → 读一次文件内容取 #+FILETAGS:
+        write(
+            "20240101T120000--笔记标题.org",
+            "#+TITLE: 示例\n#+FILETAGS: :notes:\n\n* 笔记标题\n",
+        )
+
+        val items = NoteScanner.scanLocal(tmp.root)
+
+        assertEquals(1, items.size)
+        assertEquals(listOf("notes"), items[0].tags)
+    }
 }
