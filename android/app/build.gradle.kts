@@ -99,6 +99,9 @@ dependencies {
     // 阅读：WebViewAssetLoader —— 以 https 虚拟域提供 epub 内资源，规避 file:// 访问限制
     implementation("androidx.webkit:webkit:1.12.1")
 
+    // PDF 目录（outline）解析：Android 版 Apache PDFBox（用户 2026-10-20 明确授权的唯一新增依赖）
+    implementation("com.tom-roush:pdfbox-android:2.0.27.0")
+
     // 单元测试（JVM）
     testImplementation("junit:junit:4.13.2")
     testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")

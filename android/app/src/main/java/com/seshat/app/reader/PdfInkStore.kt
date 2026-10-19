@@ -105,10 +105,16 @@ class PdfInkStore(
         /** 存储键：`pdf_ink_<docId>`。 */
         fun key(docId: String): String = "$PREFIX$docId"
 
-        /** 默认 JSON 配置：忽略未知字段、序列化默认值。 */
+        /**
+         * 默认 JSON 配置：
+         * - `ignoreUnknownKeys`：容忍未来字段扩展；
+         * - `encodeDefaults`：默认值（含 `style = PEN`）也写入，便于其它端读取；
+         * - `coerceInputValues`：未知枚举值（如未来新增笔型被旧版读到）回退到字段默认值，不抛异常。
+         */
         fun defaultJson(): Json = Json {
             ignoreUnknownKeys = true
             encodeDefaults = true
+            coerceInputValues = true
         }
     }
 }

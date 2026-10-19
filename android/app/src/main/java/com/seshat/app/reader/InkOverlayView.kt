@@ -45,6 +45,9 @@ class InkOverlayView @JvmOverloads constructor(
     private var currentColor: Int = DEFAULT_COLOR
     private var currentWidth: Float = DEFAULT_WIDTH_NORMALIZED
 
+    /** 当前笔型（新笔沿用；既有笔迹各自带自己的 style）。 */
+    private var currentStyle: InkStyle = InkStyle.PEN
+
     /** 一笔完成的回调（宿主负责持久化）。 */
     var onStrokeFinished: ((InkStroke) -> Unit)? = null
 
@@ -73,12 +76,31 @@ class InkOverlayView @JvmOverloads constructor(
         invalidate()
     }
 
+    /** 设置后续新笔的颜色（面板选色）。 */
+    fun setInkColor(color: Int) {
+        if (currentColor == color) return
+        currentColor = color
+    }
+
+    /** 设置后续新笔的归一化线宽（面板选粗细）。 */
+    fun setInkWidth(width: Float) {
+        if (currentWidth == width) return
+        currentWidth = width
+    }
+
+    /** 设置后续新笔的笔型（面板选笔型）。 */
+    fun setInkStyle(style: InkStyle) {
+        if (currentStyle == style) return
+        currentStyle = style
+        invalidate()
+    }
+
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         val rect = currentRect() ?: return
         strokes.forEach { drawStroke(canvas, it, rect) }
         if (currentPoints.isNotEmpty()) {
-            drawStroke(canvas, InkStroke(currentColor, currentWidth, currentPoints), rect)
+            drawStroke(canvas, InkStroke(currentColor, currentWidth, currentPoints, currentStyle), rect)
         }
     }
 
@@ -88,7 +110,7 @@ class InkOverlayView @JvmOverloads constructor(
         return if (rect.width <= 0f || rect.height <= 0f) null else rect
     }
 
-    /** 把一画笔迹按显示矩形换算成像素路径并绘制。 */
+    /** 把一画笔迹按显示矩形换算成像素路径并绘制（笔型决定透明度与线宽倍率）。 */
     private fun drawStroke(canvas: Canvas, stroke: InkStroke, rect: DisplayRect) {
         if (stroke.points.size < 2) return
         val path = Path()
@@ -99,8 +121,25 @@ class InkOverlayView @JvmOverloads constructor(
             path.lineTo(point.first, point.second)
         }
         strokePaint.color = stroke.color
-        strokePaint.strokeWidth = InkGeometry.strokeWidthToPx(stroke.width, rect)
+        strokePaint.strokeWidth =
+            InkGeometry.strokeWidthToPx(stroke.width, rect) * styleWidthScale(stroke.style)
+        // 必须在 setColor 之后设 alpha：setColor 会把 alpha 覆盖成颜色自带的分量
+        strokePaint.alpha = styleAlpha(stroke.style)
         canvas.drawPath(path, strokePaint)
+    }
+
+    /** 笔型 → 线宽倍率：钢笔 1×、马克笔 2.2×、荧光笔 3.5×。 */
+    private fun styleWidthScale(style: InkStyle): Float = when (style) {
+        InkStyle.PEN -> 1f
+        InkStyle.MARKER -> 2.2f
+        InkStyle.HIGHLIGHTER -> 3.5f
+    }
+
+    /** 笔型 → 不透明度：钢笔不透明、马克笔半透明、荧光笔更淡。 */
+    private fun styleAlpha(style: InkStyle): Int = when (style) {
+        InkStyle.PEN -> 255
+        InkStyle.MARKER -> 170
+        InkStyle.HIGHLIGHTER -> 90
     }
 
     /** 无障碍语义：本 View 消费点击手势（实际落笔逻辑在 onTouchEvent）。 */
@@ -145,7 +184,7 @@ class InkOverlayView @JvmOverloads constructor(
                 parent?.requestDisallowInterceptTouchEvent(false)
                 if (currentPoints.size >= 2) {
                     onStrokeFinished?.invoke(
-                        InkStroke(currentColor, currentWidth, currentPoints.toList()),
+                        InkStroke(currentColor, currentWidth, currentPoints.toList(), currentStyle),
                     )
                 }
                 currentPoints = mutableListOf()

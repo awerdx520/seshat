@@ -53,8 +53,8 @@ import java.util.concurrent.Executors
  * 远端有、本地无的书显示为「未下载」占位；点击时按需下载（[BookDownloader]）后再打开。
  *
  * 交互：点书 → epub 进 [EpubReaderActivity]、pdf 进 [PdfReaderActivity]（**带 uid**，服务端配置存在时
- * 阅读进度按资源 uid 同步）；底部保留「导入文件 / 选择 EPUB 文件 / 打开示例 EPUB」三个入口，
- * 导入成功且 ≤32 MiB 时后台上传到 mirror 根。
+ * 阅读进度按资源 uid 同步）；底部只留单一「导入」入口（M10.8，epub/pdf 由 [BookImporter] 按扩展名识别），
+ * 导入成功且 ≤32 MiB 时后台上传到 mirror 根；书架为空时静默播种 `assets/sample.epub`。
  *
  * 线程约定：扫描、封面解码、下载、上传都在 [scanExecutor]（单线程）上串行执行，结果回主线程更新 UI；
  * 同步则跑在 [SyncHolder] 持有的进程级单线程 executor 上（见 [SyncCoordinator]），两者互不阻塞。
@@ -97,14 +97,6 @@ class ReaderFragment : Fragment() {
 
     private lateinit var shelfLoading: ProgressBar
 
-    /** 系统文档选择器：选择本地 epub 后直接打开（不进书库）。 */
-    private val pickEpub =
-        registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
-            if (uri != null) {
-                startActivity(EpubReaderActivity.intentForUri(requireContext(), uri))
-            }
-        }
-
     /**
      * 系统文档选择器：经 [BookImporter] 导入书籍到应用私有阅读库，成功后刷新书架并尝试上传。
      *
@@ -145,17 +137,12 @@ class ReaderFragment : Fragment() {
         setupGrid()
         setupSpinners(view)
 
-        view.findViewById<MaterialButton>(R.id.openSampleButton).setOnClickListener {
-            openSampleEpub()
-        }
-        view.findViewById<MaterialButton>(R.id.pickEpubButton).setOnClickListener {
-            // 部分文档提供方不返回 epub 专用 MIME，放开为任意类型以免选不到文件。
-            pickEpub.launch(arrayOf("*/*"))
-        }
+        // 唯一入口：epub / pdf 由 BookImporter 按扩展名自动识别，mobi 会提示需转换
         view.findViewById<MaterialButton>(R.id.importButton).setOnClickListener {
             pickImport.launch(arrayOf("*/*"))
         }
 
+        seedSampleIfEmpty()
         refresh()
         // 首次进入强制同步一次（客户端无下拉刷新，进入即拉最新清单）
         syncNow(force = true)
@@ -336,6 +323,12 @@ class ReaderFragment : Fragment() {
                     // 视图可能已被复用给另一本书：只在该视图仍代表同一本书时 set
                     if (isAdded && imageView.tag == item.progressKey) {
                         imageView.setImageBitmap(bitmap)
+                        // 解码成功才隐藏书名首字占位；失败（损坏/加密/无图）时保留占位（M10.8）
+                        if (bitmap != null) {
+                            (imageView.parent as? View)
+                                ?.findViewById<TextView>(R.id.coverInitial)
+                                ?.visibility = View.GONE
+                        }
                     }
                 }
             }
@@ -489,31 +482,22 @@ class ReaderFragment : Fragment() {
     }
 
     /**
-     * 把 assets/sample.epub 复制到书籍目录（`filesDir/books/`）后打开。
+     * 书架为空时静默把 `assets/sample.epub` 复制到书籍目录（M10.8）。
      *
-     * 旧版曾复制到 `filesDir/sample.epub`（根目录），该文件刻意不删除作为回滚点；
-     * 由于 epub 进度键是内容哈希，迁移后同一本书的阅读进度仍然可见。
+     * 新用户首次进入即可看到一本书，但不再占用底部按钮。只在书籍目录**为空**时执行：
+     * 已有任何文件就跳过，绝不覆盖用户的书。复制失败静默忽略（书架显示空态提示即可）。
+     *
+     * 同步执行：sample.epub 只有几十 KB，且必须在首次 [refresh] 扫描前完成，否则书架会先扫到空目录。
      */
-    private fun openSampleEpub() {
-        val context = requireContext()
-        val target = File(BookImporter(context).booksDir(), SAMPLE_ASSET)
-        if (!target.exists() || target.length() == 0L) {
-            try {
-                context.assets.open(SAMPLE_ASSET).use { input ->
-                    target.outputStream().use { output -> input.copyTo(output) }
-                }
-            } catch (e: Exception) {
-                Toast.makeText(
-                    context,
-                    getString(R.string.reader_open_failed, e.message ?: SAMPLE_ASSET),
-                    Toast.LENGTH_LONG,
-                ).show()
-                return
+    private fun seedSampleIfEmpty() {
+        val context = context ?: return
+        val dir = BookImporter(context).booksDir()
+        if (dir.listFiles()?.isNotEmpty() == true) return
+        runCatching {
+            context.assets.open(SAMPLE_ASSET).use { input ->
+                File(dir, SAMPLE_ASSET).outputStream().use { output -> input.copyTo(output) }
             }
-            // 新书入库：刷新书架后用户可从网格再次打开
-            refresh()
         }
-        startActivity(EpubReaderActivity.intentForFile(context, target))
     }
 
     /** 过滤条件 → 文案。 */

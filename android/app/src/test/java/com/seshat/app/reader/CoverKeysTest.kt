@@ -93,4 +93,23 @@ class CoverKeysTest {
         assertEquals(1, CoverKeys.sampleSize(1000, 200, 100, 300))
         assertFalse(CoverKeys.sampleSize(1000, 200, 100, 300) > 1)
     }
+
+    // ---- 封面首字占位（M10.8） ----
+
+    @Test
+    fun `initialOf 取书名首字符`() {
+        assertEquals("三", CoverKeys.initialOf("三体"))
+    }
+
+    @Test
+    fun `initialOf 跳过前导空白并转大写`() {
+        assertEquals("A", CoverKeys.initialOf("  abc"))
+        assertEquals("三", CoverKeys.initialOf("\n\t 三体"))
+    }
+
+    @Test
+    fun `initialOf 空白书名返回问号`() {
+        assertEquals("?", CoverKeys.initialOf("   "))
+        assertEquals("?", CoverKeys.initialOf(""))
+    }
 }

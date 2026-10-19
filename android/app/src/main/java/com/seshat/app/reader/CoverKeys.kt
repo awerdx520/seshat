@@ -28,6 +28,16 @@ internal object CoverKeys {
     }
 
     /**
+     * 封面占位显示的首字：取书名第一个非空白字符（转大写），空书名返回 `"?"`。
+     *
+     * 封面解码失败（损坏/加密/无图）时书架卡片用它代替图片。
+     */
+    fun initialOf(title: String): String {
+        val first = title.firstOrNull { !it.isWhitespace() } ?: return "?"
+        return first.uppercaseChar().toString()
+    }
+
+    /**
      * BitmapFactory 降采样系数（2 的幂，最小值 1）：
      * 取满足 `src/sample >= req`（两维同时成立）的最大 sample，即「降采样后仍不小于请求尺寸」。
      *

@@ -106,6 +106,11 @@ class PdfPageAdapter(
     /** 手写模式开关的本地副本：绑定新出现的 item 时作为 [PdfInkHost] 的兜底。 */
     private var inkEnabled: Boolean = false
 
+    /** 当前笔参数（新绑定 item 时用作初值，保证滚动到新页也是同一支笔）。 */
+    private var inkColor: Int = InkOverlayView.DEFAULT_COLOR
+    private var inkWidth: Float = InkOverlayView.DEFAULT_WIDTH_NORMALIZED
+    private var inkStyle: InkStyle = InkStyle.PEN
+
     /** 竖向模式的占位高度解析结果（懒计算，onCreateViewHolder 首次绑定时确定）。 */
     private var resolvedDefaultHeight: Int = 0
 
@@ -176,6 +181,9 @@ class PdfPageAdapter(
         holder.overlay.setStrokes(inkHost.inkStrokes(position))
         // 宿主状态优先；本地开关用于适配「宿主尚未回调」的过渡窗口。
         holder.overlay.setInkEnabled(inkHost.isInkEnabled() || inkEnabled)
+        holder.overlay.setInkColor(inkColor)
+        holder.overlay.setInkWidth(inkWidth)
+        holder.overlay.setInkStyle(inkStyle)
         holder.overlay.onStrokeFinished = { stroke -> inkHost.onInkStrokeFinished(position, stroke) }
 
         if (holder.bindingAdapterPosition == RecyclerView.NO_POSITION) {
@@ -252,6 +260,24 @@ class PdfPageAdapter(
         visibleHolders().forEach { it.overlay.setInkEnabled(enabled) }
     }
 
+    /** 更新当前笔颜色并广播到可见页。 */
+    fun setInkColor(color: Int) {
+        inkColor = color
+        visibleHolders().forEach { it.overlay.setInkColor(color) }
+    }
+
+    /** 更新当前笔粗细并广播到可见页。 */
+    fun setInkWidth(width: Float) {
+        inkWidth = width
+        visibleHolders().forEach { it.overlay.setInkWidth(width) }
+    }
+
+    /** 更新当前笔型并广播到可见页。 */
+    fun setInkStyle(style: InkStyle) {
+        inkStyle = style
+        visibleHolders().forEach { it.overlay.setInkStyle(style) }
+    }
+
     /** 重新读取某页笔迹并刷新可见 holder（撤销/清除后调用）。 */
     fun refreshInk(page: Int) {
         visibleHolders()
@@ -294,6 +320,9 @@ class PdfPageAdapter(
         cache.evictAll()
         recyclerViewRef = null
         inkEnabled = false
+        inkColor = InkOverlayView.DEFAULT_COLOR
+        inkWidth = InkOverlayView.DEFAULT_WIDTH_NORMALIZED
+        inkStyle = InkStyle.PEN
     }
 
     /** 缓存容量：堆内存 1/8。 */

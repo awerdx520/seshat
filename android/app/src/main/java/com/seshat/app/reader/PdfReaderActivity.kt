@@ -1,5 +1,7 @@
 package com.seshat.app.reader
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.graphics.pdf.PdfRenderer
@@ -14,8 +16,8 @@ import android.util.Log
 import android.view.GestureDetector
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.ViewGroup
-import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.SeekBar
@@ -32,6 +34,7 @@ import androidx.recyclerview.widget.RecyclerView
 import com.seshat.app.R
 import com.seshat.app.settings.AppPreferences
 import com.seshat.app.settings.ReaderPageMode
+import com.seshat.app.settings.SettingsActivity
 import com.seshat.app.settings.SettingsStore
 import com.seshat.app.sync.PdfLocalSyncStore
 import com.seshat.app.sync.PdfSyncMapper
@@ -40,6 +43,7 @@ import com.seshat.app.sync.RestClientSyncAdapter
 import com.seshat.app.sync.SecurePrefs
 import com.seshat.app.sync.SyncManager
 import com.seshat.app.sync.createReaderSync
+import java.io.File
 import java.io.IOException
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -48,10 +52,13 @@ import java.util.concurrent.Executors
  * PDF 阅读器（M3.3 MVP / M9.2 支持竖向连续滚动）。
  *
  * 渲染方案：使用 Android 系统内置的 [PdfRenderer]（API 21+，无需第三方 JNI 库），
- * 逐页渲染为 Bitmap，交由 [PdfPageAdapter] 在 [RecyclerView] 中显示，
- * 底部 [SeekBar] + [TextView] 显示「当前页 / 总页数」（B2d：进度条拖动松手跳页，页码可点输入跳页）。
- * 阅读区（[RecyclerView]）底部按浮层实时高度预留 padding 且 `clipToPadding = false`（B2e），
- * 故页尾内容不会被叠加在下方的浮层遮挡。
+ * 逐页渲染为 Bitmap，交由 [PdfPageAdapter] 在 [RecyclerView] 中显示。
+ * 界面与 EPUB 侧同构（M10.8）：**顶部工具栏浮层**（返回 / 文件名 / 手写 / 批注 / 目录 / 设置）
+ * + **底部进度浮层**（[SeekBar] + [TextView] 显示「当前页 / 总页数」，B2d：进度条拖动松手跳页、
+ * 页码可点输入跳页），两块都是 overlay，不占布局。
+ * 阅读区（[RecyclerView]）的**上下** padding 都随对应浮层的**可见性**与实时高度联动
+ * （可见时预留浮层高度、隐藏时归零）且 `clipToPadding = false`（B2e），故页尾/页首内容
+ * 不会被叠加的浮层遮挡，沉浸阅读时也不会在两端留下空白。
  *
  * 翻页模式由 [AppPreferences.pageMode] 决定，**只在打开阅读器时生效**：
  * - [ReaderPageMode.HORIZONTAL]：线性横向 + [PagerSnapHelper]，整页吸附横滑；
@@ -80,6 +87,15 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
      * [onDestroy] 里 `removeCallbacksAndMessages(null)` 即可清空，避免已销毁的 Activity 被唤醒。
      */
     private val tapHandler = Handler(Looper.getMainLooper())
+
+    /**
+     * 已排入 [tapHandler]、尚未执行的单击（收到双击 / 长按时撤销）。
+     *
+     * 单击必须延迟派发：`GestureDetector` 对双击的**第一击**同样会回调 `onSingleTapUp`，
+     * 立即执行会「先翻页再进入手写模式」。延迟窗口取系统双击超时
+     * （`ViewConfiguration.getDoubleTapTimeout()`）。
+     */
+    private var pendingTap: Runnable? = null
 
     /** 页码进度条（B2d）：拖动松手才跳页，程序化同步由 [isSyncingSeekBar] 加闸。 */
     private lateinit var pageSeekBar: SeekBar
@@ -115,6 +131,24 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
     private var syncExecutor: ExecutorService? = null
 
     /**
+     * 目录解析专用单线程（`file://` 与 `content://` 两条路径共用）。
+     *
+     * 与 [syncExecutor] 隔离：outline 解析是阻塞 + 高内存操作，挤占同步线程会让一次目录解析
+     * 阻塞进度推送；也不复用渲染线程，避免大 PDF 解析期间翻页卡顿。故独立成一个单线程池。
+     */
+    private val ioExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+
+    /** 目录加载中标记：避免连点目录按钮并发起多次解析。 */
+    private var tocLoading: Boolean = false
+
+    /**
+     * 本次打开的 PDF Uri（[onCreate] 里从 Intent 解出后留存）。
+     *
+     * `onCreate` 中的 `uri` 是局部变量，而目录解析发生在它的后台回调里，故必须提升为字段。
+     */
+    private var pdfUri: Uri? = null
+
+    /**
      * 上次「已成功推送」的页码字符串（`page.toString()`，与 [PdfSyncMapper.encodePosition] 一致）。
      *
      * 只在同步线程（[syncExecutor] 的单线程）内读写，故无需额外同步。用途见下方推送方法的说明。
@@ -140,20 +174,46 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
     private lateinit var annotationStore: PdfAnnotationStore
     private lateinit var inkStore: PdfInkStore
 
-    private lateinit var inkToggleButton: Button
-    private lateinit var inkUndoButton: Button
-    private lateinit var inkClearButton: Button
-    private lateinit var prevPageButton: Button
-    private lateinit var nextPageButton: Button
-    private lateinit var chrome: View
+    /** 顶部工具栏浮层（返回/文件名/手写/批注/目录/设置）：与 [bottomChrome] 同步显隐。 */
+    private lateinit var topChrome: View
+
+    /** 底部进度浮层（页 SeekBar + 页码）：与 [topChrome] 同步显隐。 */
+    private lateinit var bottomChrome: View
+
+    /** 顶部浮层的文件名（PDF 没有书名元数据时显示文件名）。 */
+    private lateinit var topTitleView: TextView
+
+    // 浮层上的按钮都是 TextView（本项目无 ViewBinding，按钮外观由布局的 background/文字属性承担）。
+    private lateinit var inkToggleButton: TextView
+    private lateinit var inkUndoButton: TextView
+    private lateinit var inkClearButton: TextView
 
     /** 手写模式开关（旋转经 savedInstanceState 恢复）。 */
     private var inkEnabled: Boolean = false
 
-    /** 已写入阅读区 padding 的浮层高度（像素）；0 表示尚未写入，见 [applyChromePadding]。 */
-    private var appliedChromeBottom: Int = 0
+    /** 当前笔颜色（面板选色，不跨文档记忆——见 tech-debt）。 */
+    private var inkColor: Int = InkOverlayView.DEFAULT_COLOR
 
-    /** 浮层布局监听（只挂一次，见 [applyChromePaddingOnFirstLayout]）。 */
+    /** 当前笔归一化线宽。 */
+    private var inkWidth: Float = InkOverlayView.DEFAULT_WIDTH_NORMALIZED
+
+    /** 当前笔型。 */
+    private var inkStyle: InkStyle = InkStyle.PEN
+
+    /** 手写参数面板（仅手写模式显示）。 */
+    private lateinit var inkPanel: View
+
+    /**
+     * 已写入阅读区的**顶部** padding（像素）；-1 表示尚未写入，见 [applyContentPadding]。
+     *
+     * 与 [appliedBottomPadding] 一起充当幂等闸：两者都没变就不重设 padding。
+     */
+    private var appliedTopPadding: Int = -1
+
+    /** 已写入阅读区的**底部** padding（像素）；-1 表示尚未写入，见 [applyContentPadding]。 */
+    private var appliedBottomPadding: Int = -1
+
+    /** 浮层布局监听（同一实例挂到两块浮层上，只创建一次，见 [applyChromePaddingOnFirstLayout]）。 */
     private var chromeLayoutListener: View.OnLayoutChangeListener? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -164,15 +224,18 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
         recycler = findViewById(R.id.pdfPager)
         pageIndicator = findViewById(R.id.pdfPageIndicator)
         pageSeekBar = findViewById(R.id.pdfPageSeekBar)
-        chrome = findViewById(R.id.pdfChrome)
+        topChrome = findViewById(R.id.pdfTopChrome)
+        bottomChrome = findViewById(R.id.pdfBottomChrome)
+        topTitleView = findViewById(R.id.pdfTopTitle)
         inkToggleButton = findViewById(R.id.pdfInkToggleButton)
         inkUndoButton = findViewById(R.id.pdfInkUndoButton)
         inkClearButton = findViewById(R.id.pdfInkClearButton)
-        prevPageButton = findViewById(R.id.pdfPrevPageButton)
-        nextPageButton = findViewById(R.id.pdfNextPageButton)
+        // 手写参数面板：必须先于 updateInkChrome() 初始化（该方法会按手写模式切它的显隐）。
+        inkPanel = findViewById(R.id.inkPanel)
+        setupInkPanel()
 
-        // 浮层贴底：按系统导航栏/刘海补底部 padding，避免按钮被遮挡
-        ViewCompat.setOnApplyWindowInsetsListener(chrome) { view, insets ->
+        // 底部浮层贴底：按系统导航栏补底部 padding，避免控件被遮挡
+        ViewCompat.setOnApplyWindowInsetsListener(bottomChrome) { view, insets ->
             val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
             view.setPadding(
                 view.paddingLeft,
@@ -182,12 +245,24 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
             )
             // 系统栏变化会改浮层高度（见上方 insets 说明）：同步一次阅读区 padding，
             // 否则页尾仍会按旧高度被遮挡（B2e）。
-            view.post { applyChromePadding() }
+            view.post { applyContentPadding() }
+            insets
+        }
+        // 顶部浮层同理：状态栏/刘海变化会改它的高度
+        ViewCompat.setOnApplyWindowInsetsListener(topChrome) { view, insets ->
+            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            view.setPadding(
+                view.paddingLeft,
+                bars.top + (INITIAL_CHROME_PADDING_DP * resources.displayMetrics.density).toInt(),
+                view.paddingRight,
+                view.paddingBottom,
+            )
+            view.post { applyContentPadding() }
             insets
         }
 
-        // 阅读区底部 padding 自适应浮层高度（B2e）：浮层是叠在 RecyclerView 之上的，
-        // 不预留 padding 时页尾内容会被压住。
+        // 阅读区上下 padding 自适应两块浮层的可见性与高度（B2e）：浮层叠在 RecyclerView 之上，
+        // 不预留 padding 时页首/页尾内容会被压住。
         applyChromePaddingOnFirstLayout()
 
         // 手写开关跨旋转恢复：否则转屏后手写层会静默关闭。
@@ -199,9 +274,13 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
             finish()
             return
         }
+        // 目录解析在后台线程的回调里还要读它，局部变量出不了 onCreate，故留存为字段。
+        pdfUri = uri
         // 键选择的唯一落点：有服务端 uid 用 uid，否则用 uri 字符串（M7 之前的行为）
         uid = intent.getStringExtra(EXTRA_UID)?.trim()?.takeIf { it.isNotEmpty() }
         docId = uid ?: uri.toString()
+        // 顶部工具栏显示文件名（PDF 无书名元数据，取 URI 末段；取不到就留空）
+        topTitleView.text = uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.isNotBlank() } ?: ""
 
         val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         progressStore = PdfProgressStore(
@@ -225,15 +304,22 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
         // 旧键一次性清理（三个 store 共用 pdf_reader prefs，故共用一个标记）
         clearLegacyOnce()
 
-        findViewById<Button>(R.id.pdfAddAnnotation).setOnClickListener { promptAnnotation() }
+        findViewById<TextView>(R.id.annotateButton).setOnClickListener { promptAnnotation() }
+        findViewById<TextView>(R.id.backButton).setOnClickListener { finish() }
+        findViewById<TextView>(R.id.tocButton).setOnClickListener { showPdfToc() }
+        findViewById<TextView>(R.id.settingsButton).setOnClickListener {
+            startActivity(Intent(this, SettingsActivity::class.java))
+        }
         inkToggleButton.setOnClickListener { toggleInk() }
         inkUndoButton.setOnClickListener { undoInk() }
         inkClearButton.setOnClickListener { clearInk() }
-        prevPageButton.setOnClickListener { movePage(-1) }
-        nextPageButton.setOnClickListener { movePage(1) }
         // 页码可点：输入页号直接跳页（B2d），与 EPUB 侧「点标题跳章」同一套交互。
         pageIndicator.setOnClickListener { showJumpToPageDialog() }
         setupSeekBar()
+
+        // PdfBox-Android 需要一次性初始化资源加载器（字体/资源），只调一次即可；
+        // 必须早于任何 PDDocument 使用（目录解析在第一次点「目录」时才发生）。
+        com.tom_roush.pdfbox.android.PDFBoxResourceLoader.init(applicationContext)
 
         val pdf = openRenderer(uri)
         if (pdf == null) {
@@ -405,6 +491,11 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
         syncExecutor?.shutdown()
         syncExecutor = null
         syncManager = null
+        // 目录解析线程：只 shutdown（已入队的解析任务跑完即退出）。不中断，避免解析中途
+        // 抛出难以处理的异常；其结果回调会因 isFinishing/isDestroyed 被丢弃。
+        ioExecutor.shutdown()
+        // 撤销尚未执行的延迟单击（下面若 recycler 未初始化，tapHandler 那条清理路径跑不到）
+        cancelPendingTap()
         super.onDestroy()
 
         // 先解绑，避免销毁过程中仍有新的绑定提交渲染任务。
@@ -668,10 +759,21 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
 
     // ---- 手写按钮 ----
 
-    /** 切换手写模式；开启时显示翻页按钮（落笔占用点击与滑动，需按钮兜底翻页）。 */
+    /**
+     * 切换手写模式。
+     *
+     * 进入/退出有两条路径（M10.8）：顶栏「手写」按钮（本方法）、阅读区**双击**（见 [installTapPaging]）；
+     * 手写模式下长按不弹菜单（落笔优先）。
+     *
+     * 开启后落笔优先占用点击与滑动（见 [installTapPaging]），故此时翻页改由底部进度条
+     * 与「点页码输入页号」承担——原「手写时显示翻页按钮」的做法随工具栏改版取消（M10.8）。
+     */
     private fun toggleInk() {
         inkEnabled = !inkEnabled
         adapter?.setInkEnabled(inkEnabled)
+        adapter?.setInkColor(inkColor)
+        adapter?.setInkWidth(inkWidth)
+        adapter?.setInkStyle(inkStyle)
         updateInkChrome()
         toast(getString(if (inkEnabled) R.string.pdf_ink_toggle_on else R.string.pdf_ink_toggle))
     }
@@ -704,9 +806,93 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
         val hasInk = inkStore.hasInk(docId, firstVisiblePage())
         inkUndoButton.visibility = if (inkEnabled && hasInk) View.VISIBLE else View.GONE
         inkClearButton.visibility = if (inkEnabled && hasInk) View.VISIBLE else View.GONE
-        // 手写时点击与滑动都被落笔占用，必须保留按钮翻页
-        prevPageButton.visibility = if (inkEnabled) View.VISIBLE else View.GONE
-        nextPageButton.visibility = if (inkEnabled) View.VISIBLE else View.GONE
+        inkPanel.visibility = if (inkEnabled) View.VISIBLE else View.GONE
+        // 面板显隐会改变顶部浮层高度 → 重新算阅读区 padding（否则顶部正文被面板压住）
+        applyContentPadding()
+    }
+
+    /** 手写参数面板的点击接线（颜色 / 粗细 / 笔型），选中的控件用 alpha 区分。 */
+    private fun setupInkPanel() {
+        val colors = mapOf(
+            R.id.inkColorRed to 0xFFE53935.toInt(),
+            R.id.inkColorBlue to 0xFF1E88E5.toInt(),
+            R.id.inkColorGreen to 0xFF43A047.toInt(),
+            R.id.inkColorBlack to 0xFF212121.toInt(),
+            R.id.inkColorOrange to 0xFFFB8C00.toInt(),
+            R.id.inkColorPurple to 0xFF8E24AA.toInt(),
+        )
+        colors.forEach { (id, color) ->
+            findViewById<View>(id).setOnClickListener {
+                inkColor = color
+                adapter?.setInkColor(color)
+                refreshInkPanelSelection()
+            }
+        }
+        val widths = mapOf(
+            R.id.inkWidthThin to 0.0025f,
+            R.id.inkWidthMedium to 0.004f,
+            R.id.inkWidthThick to 0.007f,
+        )
+        widths.forEach { (id, width) ->
+            findViewById<View>(id).setOnClickListener {
+                inkWidth = width
+                adapter?.setInkWidth(width)
+                refreshInkPanelSelection()
+            }
+        }
+        val styles = mapOf(
+            R.id.inkStylePen to InkStyle.PEN,
+            R.id.inkStyleMarker to InkStyle.MARKER,
+            R.id.inkStyleHighlighter to InkStyle.HIGHLIGHTER,
+        )
+        styles.forEach { (id, style) ->
+            findViewById<View>(id).setOnClickListener {
+                inkStyle = style
+                adapter?.setInkStyle(style)
+                refreshInkPanelSelection()
+            }
+        }
+        refreshInkPanelSelection()
+    }
+
+    /** 刷新面板选中态：选中的不透明、未选中的半透明（比自绘边框省事且不依赖 drawable）。 */
+    private fun refreshInkPanelSelection() {
+        if (!::inkPanel.isInitialized) return
+        val selected = buildSet {
+            add(
+                when (inkColor) {
+                    0xFF1E88E5.toInt() -> R.id.inkColorBlue
+                    0xFF43A047.toInt() -> R.id.inkColorGreen
+                    0xFF212121.toInt() -> R.id.inkColorBlack
+                    0xFFFB8C00.toInt() -> R.id.inkColorOrange
+                    0xFF8E24AA.toInt() -> R.id.inkColorPurple
+                    else -> R.id.inkColorRed
+                },
+            )
+            add(
+                when {
+                    inkWidth <= 0.003f -> R.id.inkWidthThin
+                    inkWidth >= 0.006f -> R.id.inkWidthThick
+                    else -> R.id.inkWidthMedium
+                },
+            )
+            add(
+                when (inkStyle) {
+                    InkStyle.PEN -> R.id.inkStylePen
+                    InkStyle.MARKER -> R.id.inkStyleMarker
+                    InkStyle.HIGHLIGHTER -> R.id.inkStyleHighlighter
+                },
+            )
+        }
+        val all = listOf(
+            R.id.inkColorRed, R.id.inkColorBlue, R.id.inkColorGreen, R.id.inkColorBlack,
+            R.id.inkColorOrange, R.id.inkColorPurple,
+            R.id.inkWidthThin, R.id.inkWidthMedium, R.id.inkWidthThick,
+            R.id.inkStylePen, R.id.inkStyleMarker, R.id.inkStyleHighlighter,
+        )
+        all.forEach { id ->
+            findViewById<View>(id).alpha = if (id in selected) 1f else 0.35f
+        }
     }
 
     // ---- 点击翻页 ----
@@ -716,15 +902,35 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
      *
      * 关键：onInterceptTouchEvent **恒返回 false**，只把事件喂给 GestureDetector，
      * 绝不拦截——否则会吞掉滑动与 PagerSnapHelper 的吸附。
+     *
+     * 三手势分工（M10.8）：
+     * - 单击 → [scheduleTap] 延迟派发 [handleTap]（延迟是为了让双击的第一击可被撤销）；
+     * - 双击 → [toggleInk] 进入/退出手写模式；
+     * - 长按 → [showLongPressMenu]（复制本页文字 / 高亮标注 / 进入手写）；
+     * 手写模式下三者都让位给落笔。
      */
     private fun installTapPaging() {
         val detector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
             override fun onSingleTapUp(e: MotionEvent): Boolean {
-                if (inkEnabled) return false // 落笔优先
+                if (inkEnabled) return false // 落笔优先：手写模式下单击不翻页、不切工具栏
                 // 坐标先取值：事件对象在 post 之后可能已被系统复用。
                 val tapX = e.x
-                tapHandler.post { handleTap(tapX) }
+                // 延迟派发：双击的第一击也会回调 onSingleTapUp，立即执行会「先翻页再进手写」
+                scheduleTap(tapX)
                 return true
+            }
+
+            override fun onDoubleTap(e: MotionEvent): Boolean {
+                // 双击进入/退出手写模式（手写模式下双击退出）——先撤销第一击排下的翻页
+                cancelPendingTap()
+                toggleInk()
+                return true
+            }
+
+            override fun onLongPress(e: MotionEvent) {
+                if (inkEnabled) return // 手写模式下长按是落笔的一部分，不弹菜单
+                cancelPendingTap()
+                showLongPressMenu()
             }
         })
         recycler.addOnItemTouchListener(object : RecyclerView.SimpleOnItemTouchListener() {
@@ -735,18 +941,108 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
         })
     }
 
-    /** 处理单击：横向模式左 30% 上一页、右 30% 下一页，其余区域切换工具栏显隐。 */
-    private fun handleTap(tapX: Float) {
-        if (pageMode == ReaderPageMode.HORIZONTAL) {
-            val width = recycler.width
-            when {
-                tapX < width * 0.3f -> movePage(-1)
-                tapX > width * 0.7f -> movePage(1)
-                else -> toggleChrome()
-            }
-        } else {
-            toggleChrome()
+    /** 排入一次延迟单击（窗口 = 系统双击超时；期间收到双击/长按即撤销）。 */
+    private fun scheduleTap(tapX: Float) {
+        cancelPendingTap()
+        val runnable = Runnable {
+            pendingTap = null
+            handleTap(tapX)
         }
+        pendingTap = runnable
+        // 必须 ≥ 系统双击超时：否则 250–300ms 的「慢双击」会先触发翻页再进手写。
+        // 用系统值而不是硬编码常量，跨设备（不同 ViewConfiguration）都安全。
+        tapHandler.postDelayed(runnable, ViewConfiguration.getDoubleTapTimeout().toLong())
+    }
+
+    /** 撤销尚未执行的单击（双击 / 长按 / 销毁时调用）。 */
+    private fun cancelPendingTap() {
+        pendingTap?.let { tapHandler.removeCallbacks(it) }
+        pendingTap = null
+    }
+
+    /**
+     * 长按菜单（M10.8）：复制本页文字 / 高亮标注 / 进入手写。
+     *
+     * PDF 用 `PdfRenderer` 逐页渲染成位图，**没有文本选择层**，所以「复制」不能像 EPUB 那样
+     * 复制选中文本，改为用 PdfBox 提取当前页文本（扫描版 PDF 没有文本层 → 提示无文字）。
+     */
+    private fun showLongPressMenu() {
+        val items = arrayOf(
+            getString(R.string.pdf_menu_copy_text),
+            getString(R.string.pdf_menu_highlight),
+            getString(R.string.pdf_menu_handwrite),
+        )
+        AlertDialog.Builder(this)
+            .setItems(items) { _, which ->
+                when (which) {
+                    0 -> copyCurrentPageText()
+                    1 -> promptAnnotation()
+                    2 -> toggleInk()
+                }
+            }
+            .show()
+    }
+
+    /** 后台提取当前页文本并写入剪贴板；无文本层 / 失败时提示。 */
+    private fun copyCurrentPageText() {
+        val uri = pdfUri
+        if (uri == null) {
+            toast(getString(R.string.pdf_copy_no_text))
+            return
+        }
+        val page = firstVisiblePage()
+        val sizeHint = runCatching {
+            contentResolver.openAssetFileDescriptor(uri, "r")?.use { it.length }
+        }.getOrNull() ?: -1L
+        // 解析是阻塞 + 高内存操作，必须离开主线程（与目录解析同样的理由）
+        ioExecutor.execute {
+            val text = runCatching {
+                contentResolver.openInputStream(uri)?.use {
+                    PdfTextExtractor.extractPage(it, page, sizeHint)
+                }
+            }.getOrNull().orEmpty()
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                if (text.isBlank()) {
+                    toast(getString(R.string.pdf_copy_no_text))
+                    return@runOnUiThread
+                }
+                val clipboard = getSystemService(ClipboardManager::class.java)
+                clipboard?.setPrimaryClip(
+                    ClipData.newPlainText(getString(R.string.pdf_copy_label), text),
+                )
+                toast(getString(R.string.pdf_copy_done))
+            }
+        }
+    }
+
+    /**
+     * 处理单击：按 [TapZone] 三段分区翻屏或切换工具栏。
+     *
+     * 横向翻一页（复用 [movePage]），竖向滚动一屏（滚动量取可视高度，浮层 padding 已排除）。
+     */
+    private fun handleTap(tapX: Float) {
+        val width = recycler.width
+        if (width <= 0) {
+            toggleChrome()
+            return
+        }
+        when (TapZone.zone(tapX / width)) {
+            TapZone.Zone.PREV -> moveOneScreen(-1)
+            TapZone.Zone.NEXT -> moveOneScreen(1)
+            TapZone.Zone.TOGGLE -> toggleChrome()
+        }
+    }
+
+    /** 翻一屏：横向翻一页，竖向滚动一屏（滚动量为扣除浮层 padding 后的可视高度）。 */
+    private fun moveOneScreen(delta: Int) {
+        if (pageMode == ReaderPageMode.HORIZONTAL) {
+            movePage(delta)
+            return
+        }
+        val viewport = (recycler.height - recycler.paddingTop - recycler.paddingBottom)
+            .coerceAtLeast(1)
+        recycler.smoothScrollBy(0, delta * viewport)
     }
 
     /** 翻页：横向用 scrollToPosition（立即跳转，避免与 PagerSnapHelper 的动画竞争）。 */
@@ -775,22 +1071,24 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
     }
 
     /**
-     * 把浮层实时高度写入阅读区（`pdfPager`）的底部 padding（B2e）。
+     * 把浮层实时高度写入阅读区（`pdfPager`）的上下 padding（B2e / M10.8）。
      *
      * **为什么要用运行时高度**：浮层高度不是固定值——按钮文案换行、系统字体缩放、
-     * 系统栏（导航栏/刘海）通过 [WindowInsetsCompat] 追加的底部 padding 都会改变它。
-     * 硬编码常量在字号放大或三键导航下必然失准，仍会遮住页尾。
+     * 系统栏（状态栏/导航栏/刘海）通过 [WindowInsetsCompat] 追加的 padding 都会改变它。
+     * 硬编码常量在字号放大或三键导航下必然失准，仍会遮住页首/页尾。
      *
      * **为什么监听浮层布局而不是只在 `onCreate` 里读一次**：`onCreate` 阶段视图尚未测量，
      * `height` 恒为 0。监听首次布局后并用 `post` 挪到本轮布局遍历结束再读，才能拿到真实高度。
      *
-     * **为什么不移除监听（与 EPUB 侧的一次性写入不同）**：本页的浮层高度还会被 insets
-     * 回调改动（切三键/手势导航、旋转屏）——若只写一次，系统栏变高后页尾会重新被遮挡。
-     * 故监听常驻，靠 [appliedChromeBottom] 做「高度未变则不写」的幂等闸：
-     * 只有高度真的变了才重设 padding，避免常规滚动/键盘等布局反复写 padding 打断滚动锚点。
+     * **为什么两块浮层都挂监听**：两块各自可能因内容（文件名行、insets）单独改变高度，
+     * 挂在同一块上会漏掉另一块的独立变化。同一个 listener 实例挂两次，[chromeLayoutListener]
+     * 记录该实例是否已挂过，重复调用不会重复注册。
      *
-     * **已知副作用**（见 `docs/android.md`）：`toggleChrome()` 隐藏浮层时**不**回收 padding，
-     * 故沉浸阅读时底部会留一条与浮层等高的空白；回收会引发滚动重布局抖动，取舍见技术债。
+     * **为什么监听常驻而不移除**：本页的浮层高度还会被 insets 回调改动（切三键/手势导航、旋转屏），
+     * 且 [toggleChrome] 要求 padding 随可见性联动回收（浮层是 overlay，隐藏后阅读区应铺满）——
+     * 若只写一次，系统栏变高后页首/页尾会重新被遮挡、隐藏浮层后又会在两端留白。
+     * 监听常驻，靠 [appliedTopPadding]/[appliedBottomPadding] 做「值未变则不写」的幂等闸：
+     * 只有真的变了才重设 padding，避免常规滚动/键盘等布局反复写 padding 打断滚动锚点。
      */
     private fun applyChromePaddingOnFirstLayout() {
         if (chromeLayoutListener != null) return
@@ -807,30 +1105,123 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
                 oldBottom: Int,
             ) {
                 // post：等本轮布局遍历结束（浮层高度稳定）后再读
-                v.post { applyChromePadding() }
+                v.post { applyContentPadding() }
             }
         }
         chromeLayoutListener = listener
-        chrome.addOnLayoutChangeListener(listener)
+        topChrome.addOnLayoutChangeListener(listener)
+        bottomChrome.addOnLayoutChangeListener(listener)
     }
 
-    /** 读浮层高度并写入阅读区底部 padding；高度为 0 或与上次相同则跳过。 */
-    private fun applyChromePadding() {
+    /**
+     * 按两块浮层当前**可见性**与**高度**写入阅读区上下 padding。
+     *
+     * 某块浮层隐藏时对应方向 padding 必须归零（浮层是 overlay，不占布局，否则会留一条等高空白）；
+     * 可见但高度仍为 0（尚未测量）时直接 `return`，等下一次布局回调；上下都算出的值与上次相同
+     * 则跳过（幂等闸），避免常规滚动反复写 padding 打断滚动锚点。
+     */
+    private fun applyContentPadding() {
         if (!::recycler.isInitialized) return
-        val bottom = chrome.height
-        // 浮层尚未布局/已隐藏时高度为 0：不写 0 padding，等下一次布局
-        if (bottom <= 0) return
-        // 高度未变（常规滚动、键盘弹出等重复布局）：不再写，避免 RecyclerView 重新布点
-        if (bottom == appliedChromeBottom) return
-        appliedChromeBottom = bottom
-        recycler.setPadding(0, 0, 0, bottom)
+        if (!::topChrome.isInitialized || !::bottomChrome.isInitialized) return
+        val topVisible = topChrome.visibility == View.VISIBLE
+        val bottomVisible = bottomChrome.visibility == View.VISIBLE
+        val topHeight = topChrome.height
+        val bottomHeight = bottomChrome.height
+        // 浮层可见但尚未测量：等下一次布局回调
+        if (topVisible && topHeight <= 0) return
+        if (bottomVisible && bottomHeight <= 0) return
+        val padding = ReaderChrome.padding(topVisible, bottomVisible, topHeight, bottomHeight)
+        if (padding.top == appliedTopPadding && padding.bottom == appliedBottomPadding) return
+        appliedTopPadding = padding.top
+        appliedBottomPadding = padding.bottom
+        recycler.setPadding(0, padding.top, 0, padding.bottom)
         // 必须开：否则内容被裁在 padding 内，而不是延伸到半透明浮层下方
         recycler.clipToPadding = false
     }
 
-    /** 切换浮层工具栏显隐。 */
+    /** 切换两块浮层工具栏的显隐（沉浸阅读 / 恢复）。 */
     private fun toggleChrome() {
-        chrome.visibility = if (chrome.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+        val target = if (topChrome.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+        topChrome.visibility = target
+        bottomChrome.visibility = target
+        // 关键：padding 必须随可见性联动（浮层是 overlay，隐藏后阅读区应铺满）
+        applyContentPadding()
+    }
+
+    /**
+     * 显示 PDF 目录对话框（M10.8 / A-T6）。
+     *
+     * PDF 没有 EPUB 那种现成章节表，目录来自书签树（[PdfOutlineReader]，PdfBox 解析）。
+     * 解析是阻塞 + 高内存操作，必须放在 [ioExecutor] 后台线程；失败/无 outline 时由
+     * [PdfTocEntries.build] 回退「第 N 页」页码目录（此时对话框永不空手）。
+     * 点击条目用 [jumpToPage] 跳转（与进度条拖动、页码输入同一条路径）。
+     *
+     * 并发防抖：解析期间 [tocLoading] 为 `true`，连点按钮不会叠加多份解析。
+     */
+    private fun showPdfToc() {
+        if (tocLoading) return
+        val uri = pdfUri
+        if (uri == null) {
+            toast(getString(R.string.reader_toc_empty))
+            return
+        }
+        tocLoading = true
+        // 总页数取 lastPage + 1（lastPage 是最大页索引，至少为 0，故单页文档也是 1 页）
+        val pageCount = lastPage + 1
+        ioExecutor.execute {
+            val outline = runCatching { readOutline(uri) }.getOrDefault(emptyList())
+            val entries = PdfTocEntries.build(outline, pageCount)
+            runOnUiThread {
+                tocLoading = false
+                // 解析期间可能已退出：回调必须自我作废，否则会对已销毁的 Activity 弹框
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                showTocDialog(entries)
+            }
+        }
+    }
+
+    /**
+     * 按 URI scheme 读 outline：`file` 直接给 [File]，其余走 `contentResolver` 流（带大小预检）。
+     *
+     * 只在 [ioExecutor] 线程调用（阻塞 + 高内存）。异常由调用方 `runCatching` 收敛：
+     * 目录不是阅读必需功能，任何失败都退化为页码目录，不打扰用户。
+     */
+    private fun readOutline(uri: Uri): List<PdfOutlineReader.PdfOutlineItem> {
+        if (uri.scheme == "file") {
+            val path = uri.path ?: return emptyList()
+            return PdfOutlineReader.read(File(path))
+        }
+        // content:// 拿不到 File：先用 AssetFileDescriptor 的 length 做大小预检（未知时 -1）
+        val sizeHint = runCatching {
+            contentResolver.openAssetFileDescriptor(uri, "r")?.use { it.length }
+        }.getOrNull() ?: -1L
+        return contentResolver.openInputStream(uri)?.use { input ->
+            PdfOutlineReader.read(input, sizeHint)
+        } ?: emptyList()
+    }
+
+    /** 弹出目录单选对话框；空表提示「本书没有目录」（正常路径不会为空，仅兜底）。 */
+    private fun showTocDialog(entries: List<PdfTocEntries.Entry>) {
+        if (entries.isEmpty()) {
+            toast(getString(R.string.reader_toc_empty))
+            return
+        }
+        val labels = entries.map { entry ->
+            // 用全角空格做缩进（TextView 单行无层级样式，缩进最直观）
+            "　".repeat(entry.depth) + entry.title
+        }.toTypedArray()
+        // 高亮当前页对应项（-1 表示空表，此处已提前返回，故必为合法索引）
+        val checked = PdfTocEntries.indexForPage(entries, firstVisiblePage())
+        AlertDialog.Builder(this)
+            .setTitle(R.string.reader_toc)
+            .setSingleChoiceItems(labels, checked) { dialog, which ->
+                val target = entries[which].pageIndex
+                // pageIndex < 0：该书签没有页目标（纯 URI 链接），只关闭对话框，不跳页
+                if (target >= 0) jumpToPage(target)
+                dialog.dismiss()
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
     }
 
     /**
@@ -866,7 +1257,10 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
 
         private const val DEFAULT_RENDER_WIDTH = 1080
 
-        /** 浮层工具栏的初始内边距（dp），与布局 `activity_pdf_reader.xml` 中 `padding="6dp"` 对应。 */
+        /**
+         * 浮层垂直内边距基线（dp）：与布局 `activity_pdf_reader.xml` 的 `paddingVertical` 对应，
+         * insets 回调里在系统栏 inset 之上叠加这一份，避免内容紧贴系统栏。
+         */
         private const val INITIAL_CHROME_PADDING_DP = 6
 
         /** `savedInstanceState` 中手写开关的键。 */

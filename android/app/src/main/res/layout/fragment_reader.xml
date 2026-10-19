@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- 阅读 tab：顶部过滤/排序 + 书架网格 + 底部三个入口（M10.6 B3d） -->
+<!-- 阅读 tab：顶部过滤/排序 + 书架网格 + 底部单一导入入口（M10.8） -->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
@@ -53,33 +53,18 @@
         android:clipToPadding="false"
         android:padding="8dp" />
 
-    <!-- 底部入口：导入 / 打开任意本地 epub / 示例书 -->
+    <!-- 底部入口（M10.8）：只留「导入」；epub/pdf 由 BookImporter 按扩展名自动识别 -->
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:orientation="horizontal"
-        android:padding="8dp">
+        android:orientation="vertical"
+        android:padding="12dp">
 
         <com.google.android.material.button.MaterialButton
             android:id="@+id/importButton"
-            android:layout_width="0dp"
+            android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:text="@string/main_import_file" />
-
-        <com.google.android.material.button.MaterialButton
-            android:id="@+id/pickEpubButton"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:text="@string/reader_pick_file" />
-
-        <com.google.android.material.button.MaterialButton
-            android:id="@+id/openSampleButton"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:text="@string/reader_open_sample" />
+            android:text="@string/shelf_import" />
     </LinearLayout>
 
 </LinearLayout>

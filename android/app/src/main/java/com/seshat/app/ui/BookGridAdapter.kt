@@ -8,11 +8,13 @@ import android.widget.TextView
 import androidx.recyclerview.widget.RecyclerView
 import com.seshat.app.R
 import com.seshat.app.reader.BookItem
+import com.seshat.app.reader.CoverKeys
 
 /**
  * 书架网格适配器：把 [BookItem] 绑定到 [R.layout.item_book_card]。
  *
- * 单本书展示要素：封面（由外部 [coverLoader] 异步加载）+ 进度徽标（未读时隐藏）+ 标题 + 作者。
+ * 单本书展示要素：封面（由外部 [coverLoader] 异步加载）+ 书名首字占位（封面缺失/解码失败时显示）
+ * + 进度徽标（未读时隐藏）+ 标题 + 作者。
  *
  * 封面加载刻意交给调用方（Fragment）注入：本类不持有线程、缓存与 Context，
  * 便于后续替换为别的加载策略；也避免适配器与 [com.seshat.app.reader.CoverCache] 耦合。
@@ -37,6 +39,8 @@ class BookGridAdapter(
     /** 单本书视图持有者。 */
     class BookHolder(view: View) : RecyclerView.ViewHolder(view) {
         val cover: ImageView = view.findViewById(R.id.bookCover)
+        /** 封面缺失/解码失败时叠在封面上方的书名首字占位（M10.8）。 */
+        val coverInitial: TextView = view.findViewById(R.id.coverInitial)
         val progress: TextView = view.findViewById(R.id.bookProgress)
         val status: TextView = view.findViewById(R.id.bookStatus)
         val title: TextView = view.findViewById(R.id.bookTitle)
@@ -98,7 +102,10 @@ class BookGridAdapter(
         holder.cover.tag = item.progressKey
         // 先清掉上一本书的位图，避免复用瞬间闪出别人的封面
         holder.cover.setImageDrawable(null)
-        // 未下载的条目没有本地文件：只露出 xml 里的占位底色，不触发封面解码
+        // 封面占位：先显示书名首字；解码成功时由 loadCover 隐藏（失败/无封面则继续显示，M10.8）
+        holder.coverInitial.text = CoverKeys.initialOf(item.title)
+        holder.coverInitial.visibility = View.VISIBLE
+        // 未下载的条目没有本地文件：只露出占位底色 + 首字，不触发封面解码
         if (item.isDownloaded) {
             coverLoader(item, holder.cover)
         }

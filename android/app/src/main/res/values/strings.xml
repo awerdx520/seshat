@@ -29,6 +29,11 @@
     <string name="reader_toc_empty">本书没有目录</string>
     <!-- 目录项标题缺失占位（不复用 reader_chapter_missing：「本章内容缺失」指正文缺失，语义不同） -->
     <string name="reader_chapter_untitled">（无标题）</string>
+    <!-- 阅读器工具栏浮层（M10.8）：返回/设置/批注按钮文案与底部章号指示 -->
+    <string name="reader_back">←</string>
+    <string name="reader_settings">设置</string>
+    <string name="reader_annotate_short">批注</string>
+    <string name="reader_page_indicator">第 %1$d/%2$d 章</string>
 
     <!-- PDF 阅读器（M3.3） -->
     <string name="main_open_pdf">打开 PDF 阅读</string>
@@ -195,7 +200,17 @@
     <string name="pdf_jump_invalid">页码无效</string>
     <string name="pdf_jump_page_hint">页码（1-%1$d）</string>
 
+    <!-- 手写参数面板（M10.8 B-T2）：粗细 3 档 + 笔型 3 种 -->
+    <string name="pdf_ink_width_thin">细</string>
+    <string name="pdf_ink_width_medium">中</string>
+    <string name="pdf_ink_width_thick">粗</string>
+    <string name="pdf_ink_style_pen">钢笔</string>
+    <string name="pdf_ink_style_marker">马克笔</string>
+    <string name="pdf_ink_style_highlighter">荧光笔</string>
+
     <!-- 书架网格（M10.6 B3d） -->
+    <!-- M10.8：底部单一导入入口（epub/pdf 自动识别） -->
+    <string name="shelf_import">导入书籍</string>
     <string name="shelf_filter_all">全部</string>
     <string name="shelf_filter_unread">未读</string>
     <string name="shelf_filter_reading">在读</string>
@@ -215,4 +230,12 @@
     <string name="book_download_not_configured">未配置服务端，无法下载</string>
     <string name="book_upload_too_large">文件超过 32 MiB，暂不支持上传</string>
     <string name="book_upload_failed">上传失败：%1$s</string>
+
+    <!-- 长按菜单与复制本页文字（M10.8） -->
+    <string name="pdf_menu_copy_text">复制本页文字</string>
+    <string name="pdf_menu_highlight">高亮标注</string>
+    <string name="pdf_menu_handwrite">进入手写</string>
+    <string name="pdf_copy_done">已复制本页文字</string>
+    <string name="pdf_copy_no_text">本页没有可复制的文字</string>
+    <string name="pdf_copy_label">PDF 文字</string>
 </resources>

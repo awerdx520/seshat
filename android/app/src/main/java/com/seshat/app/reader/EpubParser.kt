@@ -86,7 +86,10 @@ data class EpubBook(
     val manifest: List<ManifestItem>,
     /** 作者（`dc:creator` 首个非空值）；缺失为 null。 */
     val author: String? = null,
-    /** 封面图片相对 [opfDir] 的路径；EPUB2 的 `<meta name="cover">` 不识别，缺失为 null。 */
+    /**
+     * 封面图片相对 [opfDir] 的路径；三级回退（EPUB3 properties → EPUB2 `<meta name="cover">` → 首张图片，
+     * 见 [EpubParser.pickCoverHref]），缺失为 null。
+     */
     val coverHref: String? = null,
 )
 
@@ -99,7 +102,7 @@ data class OpfDocument(
     val ncxItemId: String?,
     /** `dc:creator` 首个非空值；缺失为 null。 */
     val creator: String? = null,
-    /** manifest 中 `properties` 分词含 `cover-image` 的 item 的 href；缺失为 null。 */
+    /** 封面 href（三级回退，见 [EpubParser.pickCoverHref]）；缺失为 null。 */
     val coverHref: String? = null,
 )
 
@@ -191,10 +194,12 @@ object EpubParser {
             ?.textContent
             ?.trim()
 
-        // 封面：EPUB3 用 manifest 的 `properties="cover-image"`；properties 可能是多词串。
-        val coverHref = manifest.firstOrNull { item ->
-            item.properties.split(Regex("\\s+")).any { it == "cover-image" }
-        }?.href?.ifBlank { null }
+        // 封面：EPUB3 properties → EPUB2 <meta name="cover"> → 首张图片（见 pickCoverHref）
+        val epub2CoverId = descendants(root, "meta")
+            .firstOrNull { it.getAttribute("name").equals("cover", ignoreCase = true) }
+            ?.getAttribute("content")
+            ?.ifBlank { null }
+        val coverHref = pickCoverHref(manifest, epub2CoverId)
 
         return OpfDocument(
             title = title,
@@ -205,6 +210,36 @@ object EpubParser {
             creator = creator,
             coverHref = coverHref,
         )
+    }
+
+    /**
+     * 选封面 href（三级回退）。
+     *
+     * 1. EPUB3：manifest 里 `properties` 分词含 `cover-image` 的 item；
+     * 2. EPUB2：`<meta name="cover" content="<manifest id>"/>` 指向的 item；
+     * 3. 兜底：manifest 中第一个 `media-type` 以 `image/` 开头的 item。
+     *
+     * 第 3 级是启发式：若书里第一张图不是封面（如出版社 logo），会显示错图——已知局限，
+     * 记在 `openspec/tech-debt.md`。返回 null 表示连一张图都没有（UI 显示首字占位）。
+     *
+     * @param manifest OPF manifest 条目（顺序即文档顺序）
+     * @param epub2CoverId `<meta name="cover">` 的 content 值；无则为 null
+     */
+    internal fun pickCoverHref(manifest: List<ManifestItem>, epub2CoverId: String?): String? {
+        val epub3 = manifest.firstOrNull { item ->
+            item.properties.split(Regex("\\s+")).any { it == "cover-image" }
+        }?.href?.ifBlank { null }
+        if (epub3 != null) return epub3
+
+        val epub2 = epub2CoverId
+            ?.let { id -> manifest.firstOrNull { it.id == id } }
+            ?.href
+            ?.ifBlank { null }
+        if (epub2 != null) return epub2
+
+        return manifest.firstOrNull {
+            it.mediaType.startsWith("image/", ignoreCase = true)
+        }?.href?.ifBlank { null }
     }
 
     /** 解析 EPUB3 nav 文档：取 `epub:type="toc"` 的 nav（缺失则第一个 nav）下的全部链接。 */

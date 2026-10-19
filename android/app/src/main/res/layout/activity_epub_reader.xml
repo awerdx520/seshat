@@ -1,45 +1,109 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- 阅读区全屏 + 顶部/底部两块半透明浮层（M10.6）：阅读区不再被标题与按钮行挤压。 -->
+<!-- 阅读区全屏 + 顶部/底部两块浮层（M10.8）：浮层是 overlay，不占布局；
+     阅读区 padding 由 EpubReaderActivity.applyContentPadding() 按浮层可见性与实时高度设置。 -->
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent">
 
-    <!-- 横向分页容器（HORIZONTAL 模式）；与下方竖向容器并存，按偏好显示其一 -->
+    <!-- 横向分页容器（HORIZONTAL 模式） -->
     <androidx.viewpager2.widget.ViewPager2
         android:id="@+id/chapterPager"
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
 
-    <!-- 竖向连续滚动容器（M9.2）：与 ViewPager2 并存，按偏好显示其一 -->
+    <!-- 竖向连续滚动容器（VERTICAL 模式）；两者并存，按偏好显示其一 -->
     <androidx.recyclerview.widget.RecyclerView
         android:id="@+id/chapterScrollView"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
         android:visibility="gone" />
 
-    <!-- 顶部浮层：章节标题 -->
+    <!-- 顶部浮层：返回 | 章节标题 | 批注 | 目录 | 设置 -->
     <LinearLayout
         android:id="@+id/epubTopChrome"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_gravity="top"
         android:background="#CC000000"
-        android:orientation="vertical"
-        android:padding="6dp">
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingHorizontal="4dp"
+        android:paddingVertical="2dp">
+
+        <TextView
+            android:id="@+id/backButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:background="?android:attr/selectableItemBackground"
+            android:clickable="true"
+            android:focusable="true"
+            android:gravity="center"
+            android:minWidth="48dp"
+            android:paddingHorizontal="10dp"
+            android:paddingVertical="12dp"
+            android:text="@string/reader_back"
+            android:textColor="#FFFFFF"
+            android:textSize="16sp" />
 
         <TextView
             android:id="@+id/chapterTitleView"
-            android:layout_width="match_parent"
+            android:layout_width="0dp"
             android:layout_height="wrap_content"
+            android:layout_weight="1"
             android:ellipsize="end"
             android:maxLines="1"
-            android:paddingHorizontal="16dp"
-            android:paddingVertical="12dp"
+            android:paddingHorizontal="8dp"
+            android:textColor="#FFFFFF"
             android:textSize="15sp"
             android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/annotateButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:background="?android:attr/selectableItemBackground"
+            android:clickable="true"
+            android:focusable="true"
+            android:gravity="center"
+            android:minWidth="48dp"
+            android:paddingHorizontal="10dp"
+            android:paddingVertical="12dp"
+            android:text="@string/reader_annotate_short"
+            android:textColor="#FFFFFF"
+            android:textSize="14sp" />
+
+        <TextView
+            android:id="@+id/tocButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:background="?android:attr/selectableItemBackground"
+            android:clickable="true"
+            android:focusable="true"
+            android:gravity="center"
+            android:minWidth="48dp"
+            android:paddingHorizontal="10dp"
+            android:paddingVertical="12dp"
+            android:text="@string/reader_toc"
+            android:textColor="#FFFFFF"
+            android:textSize="14sp" />
+
+        <TextView
+            android:id="@+id/settingsButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:background="?android:attr/selectableItemBackground"
+            android:clickable="true"
+            android:focusable="true"
+            android:gravity="center"
+            android:minWidth="48dp"
+            android:paddingHorizontal="10dp"
+            android:paddingVertical="12dp"
+            android:text="@string/reader_settings"
+            android:textColor="#FFFFFF"
+            android:textSize="14sp" />
     </LinearLayout>
 
-    <!-- 底部浮层：章节进度条 + 上一章/批注/下一章 -->
+    <!-- 底部浮层：章节进度条 + 章号指示（点击可输入章号跳章） -->
     <LinearLayout
         android:id="@+id/epubBottomChrome"
         android:layout_width="match_parent"
@@ -47,7 +111,8 @@
         android:layout_gravity="bottom"
         android:background="#CC000000"
         android:orientation="vertical"
-        android:padding="6dp">
+        android:paddingHorizontal="6dp"
+        android:paddingVertical="4dp">
 
         <!-- 章节进度条（B2b）：0-based 章序号；max 运行时设为 chapterCount()-1 -->
         <SeekBar
@@ -58,40 +123,17 @@
             android:paddingHorizontal="12dp"
             android:progress="0" />
 
-        <LinearLayout
+        <TextView
+            android:id="@+id/pageIndicator"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:orientation="horizontal">
-
-            <Button
-                android:id="@+id/prevChapterButton"
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:text="@string/reader_prev_chapter" />
-
-            <!-- 章节目录（B2c）：四个按钮平分宽度，目录固定在第 2 位（常见阅读器布局） -->
-            <Button
-                android:id="@+id/tocButton"
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:text="@string/reader_toc" />
-
-            <Button
-                android:id="@+id/annotateButton"
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:text="@string/reader_add_annotation" />
-
-            <Button
-                android:id="@+id/nextChapterButton"
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:text="@string/reader_next_chapter" />
-        </LinearLayout>
+            android:background="?android:attr/selectableItemBackground"
+            android:clickable="true"
+            android:focusable="true"
+            android:gravity="center"
+            android:paddingVertical="6dp"
+            android:textColor="#FFFFFF"
+            android:textSize="12sp" />
     </LinearLayout>
 
 </FrameLayout>

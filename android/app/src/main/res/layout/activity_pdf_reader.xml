@@ -1,4 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- 阅读区全屏 + 顶部工具栏浮层 + 底部进度浮层（M10.8）：浮层是 overlay，不占布局；
+     阅读区 padding 由 PdfReaderActivity.applyContentPadding() 按浮层可见性与实时高度设置。 -->
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent">
@@ -9,106 +11,366 @@
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
 
-    <!-- 底部浮层工具栏：叠加在内容之上，横屏也不挤占阅读区（B2d：纵向两行 = 进度条行 + 按钮行） -->
+    <!-- 顶部浮层：竖向容器 = 工具栏行 + 手写参数面板（面板仅手写模式下显示） -->
     <LinearLayout
-        android:id="@+id/pdfChrome"
+        android:id="@+id/pdfTopChrome"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top"
+        android:background="#CC000000"
+        android:orientation="vertical"
+        android:paddingHorizontal="4dp"
+        android:paddingVertical="2dp">
+
+        <!-- 工具栏行：返回 | 文件名 | 手写 | 批注 | 目录 | 设置（撤销/清空暂隐藏） -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                android:id="@+id/backButton"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:background="?android:attr/selectableItemBackground"
+                android:clickable="true"
+                android:focusable="true"
+                android:gravity="center"
+                android:minWidth="48dp"
+                android:paddingHorizontal="10dp"
+                android:paddingVertical="12dp"
+                android:text="@string/reader_back"
+                android:textColor="#FFFFFF"
+                android:textSize="16sp" />
+
+            <TextView
+                android:id="@+id/pdfTopTitle"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:ellipsize="middle"
+                android:maxLines="1"
+                android:paddingHorizontal="8dp"
+                android:textColor="#FFFFFF"
+                android:textSize="15sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/pdfInkToggleButton"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:background="?android:attr/selectableItemBackground"
+                android:clickable="true"
+                android:focusable="true"
+                android:gravity="center"
+                android:minWidth="48dp"
+                android:paddingHorizontal="10dp"
+                android:paddingVertical="12dp"
+                android:text="@string/pdf_ink_toggle"
+                android:textColor="#FFFFFF"
+                android:textSize="14sp" />
+
+            <TextView
+                android:id="@+id/annotateButton"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:background="?android:attr/selectableItemBackground"
+                android:clickable="true"
+                android:focusable="true"
+                android:gravity="center"
+                android:minWidth="48dp"
+                android:paddingHorizontal="10dp"
+                android:paddingVertical="12dp"
+                android:text="@string/pdf_add_annotation"
+                android:textColor="#FFFFFF"
+                android:textSize="14sp" />
+
+            <TextView
+                android:id="@+id/tocButton"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:background="?android:attr/selectableItemBackground"
+                android:clickable="true"
+                android:focusable="true"
+                android:gravity="center"
+                android:minWidth="48dp"
+                android:paddingHorizontal="10dp"
+                android:paddingVertical="12dp"
+                android:text="@string/reader_toc"
+                android:textColor="#FFFFFF"
+                android:textSize="14sp" />
+
+            <TextView
+                android:id="@+id/settingsButton"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:background="?android:attr/selectableItemBackground"
+                android:clickable="true"
+                android:focusable="true"
+                android:gravity="center"
+                android:minWidth="48dp"
+                android:paddingHorizontal="10dp"
+                android:paddingVertical="12dp"
+                android:text="@string/reader_settings"
+                android:textColor="#FFFFFF"
+                android:textSize="14sp" />
+
+            <TextView
+                android:id="@+id/pdfInkUndoButton"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:background="?android:attr/selectableItemBackground"
+                android:clickable="true"
+                android:focusable="true"
+                android:gravity="center"
+                android:minWidth="48dp"
+                android:paddingHorizontal="10dp"
+                android:paddingVertical="12dp"
+                android:text="@string/pdf_ink_undo"
+                android:textColor="#FFFFFF"
+                android:textSize="14sp"
+                android:visibility="gone" />
+
+            <TextView
+                android:id="@+id/pdfInkClearButton"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:background="?android:attr/selectableItemBackground"
+                android:clickable="true"
+                android:focusable="true"
+                android:gravity="center"
+                android:minWidth="48dp"
+                android:paddingHorizontal="10dp"
+                android:paddingVertical="12dp"
+                android:text="@string/pdf_ink_clear"
+                android:textColor="#FFFFFF"
+                android:textSize="14sp"
+                android:visibility="gone" />
+        </LinearLayout>
+
+        <!-- 手写参数面板（M10.8）：仅在手写模式下显示 -->
+        <LinearLayout
+            android:id="@+id/inkPanel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:paddingTop="6dp"
+            android:visibility="gone">
+
+            <!-- 颜色行：6 色（选中态用 alpha 区分，不依赖额外 drawable） -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:paddingHorizontal="6dp">
+
+                <View
+                    android:id="@+id/inkColorRed"
+                    android:layout_width="36dp"
+                    android:layout_height="36dp"
+                    android:layout_marginEnd="8dp"
+                    android:background="#E53935"
+                    android:clickable="true"
+                    android:focusable="true" />
+
+                <View
+                    android:id="@+id/inkColorBlue"
+                    android:layout_width="36dp"
+                    android:layout_height="36dp"
+                    android:layout_marginEnd="8dp"
+                    android:background="#1E88E5"
+                    android:clickable="true"
+                    android:focusable="true" />
+
+                <View
+                    android:id="@+id/inkColorGreen"
+                    android:layout_width="36dp"
+                    android:layout_height="36dp"
+                    android:layout_marginEnd="8dp"
+                    android:background="#43A047"
+                    android:clickable="true"
+                    android:focusable="true" />
+
+                <View
+                    android:id="@+id/inkColorBlack"
+                    android:layout_width="36dp"
+                    android:layout_height="36dp"
+                    android:layout_marginEnd="8dp"
+                    android:background="#212121"
+                    android:clickable="true"
+                    android:focusable="true" />
+
+                <View
+                    android:id="@+id/inkColorOrange"
+                    android:layout_width="36dp"
+                    android:layout_height="36dp"
+                    android:layout_marginEnd="8dp"
+                    android:background="#FB8C00"
+                    android:clickable="true"
+                    android:focusable="true" />
+
+                <View
+                    android:id="@+id/inkColorPurple"
+                    android:layout_width="36dp"
+                    android:layout_height="36dp"
+                    android:background="#8E24AA"
+                    android:clickable="true"
+                    android:focusable="true" />
+            </LinearLayout>
+
+            <!-- 粗细行（3 chip 均分宽度：360dp 窄屏不再裁掉最右一个；公共属性内联，项目无 styles.xml） -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:paddingTop="6dp">
+
+                <TextView
+                    android:id="@+id/inkWidthThin"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="6dp"
+                    android:layout_marginEnd="3dp"
+                    android:layout_weight="1"
+                    android:background="?android:attr/selectableItemBackground"
+                    android:clickable="true"
+                    android:focusable="true"
+                    android:gravity="center"
+                    android:paddingHorizontal="6dp"
+                    android:paddingVertical="10dp"
+                    android:text="@string/pdf_ink_width_thin"
+                    android:textColor="#FFFFFF"
+                    android:textSize="13sp" />
+
+                <TextView
+                    android:id="@+id/inkWidthMedium"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginHorizontal="3dp"
+                    android:layout_weight="1"
+                    android:background="?android:attr/selectableItemBackground"
+                    android:clickable="true"
+                    android:focusable="true"
+                    android:gravity="center"
+                    android:paddingHorizontal="6dp"
+                    android:paddingVertical="10dp"
+                    android:text="@string/pdf_ink_width_medium"
+                    android:textColor="#FFFFFF"
+                    android:textSize="13sp" />
+
+                <TextView
+                    android:id="@+id/inkWidthThick"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="3dp"
+                    android:layout_marginEnd="6dp"
+                    android:layout_weight="1"
+                    android:background="?android:attr/selectableItemBackground"
+                    android:clickable="true"
+                    android:focusable="true"
+                    android:gravity="center"
+                    android:paddingHorizontal="6dp"
+                    android:paddingVertical="10dp"
+                    android:text="@string/pdf_ink_width_thick"
+                    android:textColor="#FFFFFF"
+                    android:textSize="13sp" />
+            </LinearLayout>
+
+            <!-- 笔型行（同上，3 chip 均分） -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:paddingTop="4dp">
+
+                <TextView
+                    android:id="@+id/inkStylePen"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="6dp"
+                    android:layout_marginEnd="3dp"
+                    android:layout_weight="1"
+                    android:background="?android:attr/selectableItemBackground"
+                    android:clickable="true"
+                    android:focusable="true"
+                    android:gravity="center"
+                    android:paddingHorizontal="6dp"
+                    android:paddingVertical="10dp"
+                    android:text="@string/pdf_ink_style_pen"
+                    android:textColor="#FFFFFF"
+                    android:textSize="13sp" />
+
+                <TextView
+                    android:id="@+id/inkStyleMarker"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginHorizontal="3dp"
+                    android:layout_weight="1"
+                    android:background="?android:attr/selectableItemBackground"
+                    android:clickable="true"
+                    android:focusable="true"
+                    android:gravity="center"
+                    android:paddingHorizontal="6dp"
+                    android:paddingVertical="10dp"
+                    android:text="@string/pdf_ink_style_marker"
+                    android:textColor="#FFFFFF"
+                    android:textSize="13sp" />
+
+                <TextView
+                    android:id="@+id/inkStyleHighlighter"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="3dp"
+                    android:layout_marginEnd="6dp"
+                    android:layout_weight="1"
+                    android:background="?android:attr/selectableItemBackground"
+                    android:clickable="true"
+                    android:focusable="true"
+                    android:gravity="center"
+                    android:paddingHorizontal="6dp"
+                    android:paddingVertical="10dp"
+                    android:text="@string/pdf_ink_style_highlighter"
+                    android:textColor="#FFFFFF"
+                    android:textSize="13sp" />
+            </LinearLayout>
+        </LinearLayout>
+    </LinearLayout>
+
+    <!-- 底部浮层：页进度条 + 页码（页码可点，输入页号直接跳页） -->
+    <LinearLayout
+        android:id="@+id/pdfBottomChrome"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_gravity="bottom"
         android:background="#CC000000"
         android:gravity="center_vertical"
         android:orientation="vertical"
-        android:padding="6dp">
+        android:paddingHorizontal="6dp"
+        android:paddingVertical="4dp">
 
-        <!-- 第一行（B2d）：页进度条 + 页码（页码可点，输入页号直接跳页） -->
-        <LinearLayout
+        <SeekBar
+            android:id="@+id/pdfPageSeekBar"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:gravity="center_vertical"
-            android:orientation="horizontal">
+            android:max="0"
+            android:paddingHorizontal="12dp"
+            android:progress="0" />
 
-            <SeekBar
-                android:id="@+id/pdfPageSeekBar"
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:max="0"
-                android:paddingHorizontal="8dp"
-                android:progress="0" />
-
-            <TextView
-                android:id="@+id/pdfPageIndicator"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:background="?attr/selectableItemBackground"
-                android:clickable="true"
-                android:focusable="true"
-                android:gravity="center"
-                android:minHeight="48dp"
-                android:paddingHorizontal="8dp"
-                android:textColor="#FFFFFF"
-                android:text="@string/pdf_page_indicator_placeholder" />
-        </LinearLayout>
-
-        <!-- 第二行：原有按钮，顺序与属性保持不变（页码已上移至第一行） -->
-        <LinearLayout
+        <TextView
+            android:id="@+id/pdfPageIndicator"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:gravity="center_vertical"
-            android:orientation="horizontal">
-
-            <Button
-                android:id="@+id/pdfPrevPageButton"
-                style="?android:attr/borderlessButtonStyle"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:textColor="#FFFFFF"
-                android:visibility="gone"
-                android:text="@string/pdf_prev_page" />
-
-            <Button
-                android:id="@+id/pdfNextPageButton"
-                style="?android:attr/borderlessButtonStyle"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:textColor="#FFFFFF"
-                android:visibility="gone"
-                android:text="@string/pdf_next_page" />
-
-            <Button
-                android:id="@+id/pdfInkToggleButton"
-                style="?android:attr/borderlessButtonStyle"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:textColor="#FFFFFF"
-                android:text="@string/pdf_ink_toggle" />
-
-            <Button
-                android:id="@+id/pdfInkUndoButton"
-                style="?android:attr/borderlessButtonStyle"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:textColor="#FFFFFF"
-                android:visibility="gone"
-                android:text="@string/pdf_ink_undo" />
-
-            <Button
-                android:id="@+id/pdfInkClearButton"
-                style="?android:attr/borderlessButtonStyle"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:textColor="#FFFFFF"
-                android:visibility="gone"
-                android:text="@string/pdf_ink_clear" />
-
-            <Button
-                android:id="@+id/pdfAddAnnotation"
-                style="?android:attr/borderlessButtonStyle"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:textColor="#FFFFFF"
-                android:text="@string/pdf_add_annotation" />
-        </LinearLayout>
+            android:background="?android:attr/selectableItemBackground"
+            android:clickable="true"
+            android:focusable="true"
+            android:gravity="center"
+            android:paddingVertical="6dp"
+            android:textColor="#FFFFFF"
+            android:text="@string/pdf_page_indicator_placeholder" />
     </LinearLayout>
 
 </FrameLayout>

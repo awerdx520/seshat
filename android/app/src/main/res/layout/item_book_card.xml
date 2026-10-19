@@ -20,6 +20,18 @@
             android:contentDescription="@string/shelf_no_cover"
             android:scaleType="centerCrop" />
 
+        <!-- 封面占位：封面缺失/解码失败时显示书名首字（M10.8） -->
+        <TextView
+            android:id="@+id/coverInitial"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:background="#FFE0E0E0"
+            android:gravity="center"
+            android:textColor="#FF757575"
+            android:textSize="36sp"
+            android:textStyle="bold"
+            android:visibility="gone" />
+
         <!-- 进度徽标：percent 为 0 时隐藏 -->
         <TextView
             android:id="@+id/bookProgress"

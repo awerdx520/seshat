@@ -326,6 +326,110 @@ class EpubParserTest {
         assertNull(book.author)
     }
 
+    // ---- 封面三级回退（M10.8） ----
+
+    @Test
+    fun coverFromEpub3Properties() {
+        val opf = EpubParser.parseOpf(
+            opfXml(
+                title = "EPUB3 封面",
+                manifest = """
+                    <item id="cover" href="images/epub3.jpg" media-type="image/jpeg" properties="cover-image"/>
+                    <item id="c1" href="c1.xhtml" media-type="application/xhtml+xml"/>
+                """.trimIndent(),
+                spine = """<itemref idref="c1"/>""",
+            ),
+        )
+
+        assertEquals("images/epub3.jpg", opf.coverHref)
+    }
+
+    @Test
+    fun coverFromEpub2MetaWhenNoEpub3Property() {
+        val opf = EpubParser.parseOpf(
+            opfXml(
+                title = "EPUB2 封面",
+                manifest = """
+                    <item id="img-first" href="images/logo.png" media-type="image/png"/>
+                    <item id="cover-img" href="images/epub2.jpg" media-type="image/jpeg"/>
+                    <item id="c1" href="c1.xhtml" media-type="application/xhtml+xml"/>
+                """.trimIndent(),
+                spine = """<itemref idref="c1"/>""",
+                metadata = """<meta name="cover" content="cover-img"/>""",
+            ),
+        )
+
+        assertEquals("images/epub2.jpg", opf.coverHref)
+    }
+
+    @Test
+    fun coverFallsBackToFirstImage() {
+        val opf = EpubParser.parseOpf(
+            opfXml(
+                title = "无声明封面",
+                manifest = """
+                    <item id="css" href="style.css" media-type="text/css"/>
+                    <item id="img" href="img/a.png" media-type="image/png"/>
+                    <item id="c1" href="c1.xhtml" media-type="application/xhtml+xml"/>
+                """.trimIndent(),
+                spine = """<itemref idref="c1"/>""",
+            ),
+        )
+
+        assertEquals("img/a.png", opf.coverHref)
+    }
+
+    @Test
+    fun coverSkipsNonImageItems() {
+        val opf = EpubParser.parseOpf(
+            opfXml(
+                title = "非图片在前",
+                manifest = """
+                    <item id="c1" href="c1.xhtml" media-type="application/xhtml+xml"/>
+                    <item id="img" href="img/b.jpg" media-type="image/jpeg"/>
+                """.trimIndent(),
+                spine = """<itemref idref="c1"/>""",
+            ),
+        )
+
+        assertEquals("img/b.jpg", opf.coverHref)
+    }
+
+    @Test
+    fun coverNullWhenNoImageAtAll() {
+        val opf = EpubParser.parseOpf(
+            opfXml(
+                title = "只有文本",
+                manifest = """
+                    <item id="css" href="style.css" media-type="text/css"/>
+                    <item id="c1" href="c1.xhtml" media-type="application/xhtml+xml"/>
+                """.trimIndent(),
+                spine = """<itemref idref="c1"/>""",
+            ),
+        )
+
+        assertNull(opf.coverHref)
+    }
+
+    @Test
+    fun coverPrefersEpub3OverEpub2AndFirstImage() {
+        val opf = EpubParser.parseOpf(
+            opfXml(
+                title = "三者并存",
+                manifest = """
+                    <item id="img-first" href="images/first.png" media-type="image/png"/>
+                    <item id="epub2" href="images/epub2.jpg" media-type="image/jpeg"/>
+                    <item id="epub3" href="images/epub3.jpg" media-type="image/jpeg" properties="cover-image"/>
+                    <item id="c1" href="c1.xhtml" media-type="application/xhtml+xml"/>
+                """.trimIndent(),
+                spine = """<itemref idref="c1"/>""",
+                metadata = """<meta name="cover" content="epub2"/>""",
+            ),
+        )
+
+        assertEquals("images/epub3.jpg", opf.coverHref)
+    }
+
     // ---- 测试数据构造 ----
 
     private fun epubBytes(vararg entries: Pair<String, String>): ByteArray {

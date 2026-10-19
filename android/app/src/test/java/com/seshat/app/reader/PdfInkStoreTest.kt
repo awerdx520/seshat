@@ -157,4 +157,63 @@ class PdfInkStoreTest {
         assertTrue(map.containsKey(PdfInkStore.key("d")))
         assertTrue(map.containsKey(PdfProgressStore.key(hex)))
     }
+
+    // ---- M10.8 笔型字段与向后兼容 ----
+
+    /** 旧版（M10.5）写入的 JSON：没有 `style` 字段。 */
+    private fun legacyJson(docId: String): String =
+        """{"documentId":"$docId","pages":[{"page":0,"strokes":[{"color":-1744387,"width":0.004,"points":[{"x":0.1,"y":0.2},{"x":0.2,"y":0.3}]}]}],"updatedAt":0}"""
+
+    @Test
+    fun legacyJsonWithoutStyleDecodesAsPen() {
+        // 老用户数据无 style 字段，反序列化必须落为默认 PEN（无需迁移）
+        prefs[PdfInkStore.key("doc1")] = legacyJson("doc1")
+
+        val strokes = store.strokes("doc1", 0)
+        assertEquals(1, strokes.size)
+        assertEquals(InkStyle.PEN, strokes.single().style)
+        // 旧字段本身仍按原样读出
+        assertEquals(-1744387, strokes.single().color)
+        assertEquals(0.004f, strokes.single().width, 0f)
+        assertEquals(2, strokes.single().points.size)
+    }
+
+    @Test
+    fun newStrokeKeepsItsStyle() {
+        store.appendStroke("d", 0, stroke().copy(style = InkStyle.MARKER))
+
+        // 重新从 prefs 解码（document() 每次都重新读），确认 style 真的落盘
+        assertEquals(InkStyle.MARKER, store.document("d").pages.single().strokes.single().style)
+        assertEquals(InkStyle.MARKER, store.strokes("d", 0).single().style)
+    }
+
+    @Test
+    fun unknownStyleInJsonFallsBackToPen() {
+        // 未知笔型（如未来新增）不得抛异常，coerceInputValues 回退到字段默认值
+        prefs[PdfInkStore.key("d")] = """{"documentId":"d","pages":[{"page":0,"strokes":[
+            {"color":-1,"width":0.01,"points":[{"x":0.1,"y":0.2},{"x":0.3,"y":0.4}],"style":"FOUNTAIN"}
+        ]}],"updatedAt":0}"""
+
+        val strokes = store.strokes("d", 0)
+        assertEquals(1, strokes.size)
+        assertEquals(InkStyle.PEN, strokes.single().style)
+    }
+
+    @Test
+    fun encodedJsonContainsStyle() {
+        store.appendStroke("d", 0, stroke().copy(style = InkStyle.MARKER))
+
+        val raw = prefs[PdfInkStore.key("d")]
+        assertTrue("原始 JSON 应含笔型：$raw", raw!!.contains("\"style\":\"MARKER\""))
+    }
+
+    @Test
+    fun defaultStyleIsPen() {
+        val plain = InkStroke(
+            color = 0xFF000000.toInt(),
+            width = 0.002f,
+            points = listOf(InkPoint(0f, 0f), InkPoint(1f, 1f)),
+        )
+        assertEquals(InkStyle.PEN, plain.style)
+    }
 }
