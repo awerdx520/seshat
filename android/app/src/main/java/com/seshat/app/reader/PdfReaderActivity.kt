@@ -1164,6 +1164,10 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
         bottomChrome.visibility = target
         // 关键：padding 必须随可见性联动（浮层是 overlay，隐藏后阅读区应铺满）
         applyContentPadding()
+        // GONE → VISIBLE 的那一刻 height 仍是 0，applyContentPadding 会提前返回（等测量），
+        // 故再投递一次，在本轮布局结束后按真实高度补写（否则显示浮层后 padding 停在 0，
+        // 正文前几行被顶栏压住）。
+        bottomChrome.post { applyContentPadding() }
     }
 
     /**

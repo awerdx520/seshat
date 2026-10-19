@@ -105,6 +105,8 @@ class BookGridAdapter(
         // 封面占位：先显示书名首字；解码成功时由 loadCover 隐藏（失败/无封面则继续显示，M10.8）
         holder.coverInitial.text = CoverKeys.initialOf(item.title)
         holder.coverInitial.visibility = View.VISIBLE
+        // 有封面时不能朗读「无封面」：描述交给占位文本，封面本身不重复播报
+        holder.cover.contentDescription = null
         // 未下载的条目没有本地文件：只露出占位底色 + 首字，不触发封面解码
         if (item.isDownloaded) {
             coverLoader(item, holder.cover)

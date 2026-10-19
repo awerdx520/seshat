@@ -722,9 +722,13 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
         appliedTopPadding = top
         appliedBottomPadding = bottom
         appliedContent = content
-        // padding 变化会重排内容但不派发 onScrolled（dy == 0），章内偏移需主动重算一次，
-        // 否则持久化的 scrollY 语义随 padding 漂移（破坏竖向进度的不变量）。
-        reportVisibleChapter()
+        // padding 变化会重排内容，但**不派发 onScrolled**（dy == 0），章内偏移需重算一次。
+        // 关键是必须等**下一轮布局完成**再算：setPadding 只是 requestLayout，此刻
+        // findViewByPosition(...).top 还是旧 padding 下的几何，同步算会把「旧几何 + 新 padding」
+        // 的混合值记成 scrollY，再经 onChapterMeasured 重锚，正文会被拉到错误位置
+        // （真机表现为：隐藏浮层后正文反而下移一整条顶栏高度）。用 doOnNextLayout 而非 post，
+        // 与 jumpToChapter 的既有写法一致。
+        scrollView.doOnNextLayout { reportVisibleChapter() }
     }
 
     /**
@@ -829,6 +833,10 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
         bottomChrome.visibility = target
         // 关键：padding 必须随可见性联动（浮层是 overlay，隐藏后阅读区应铺满）
         applyContentPadding()
+        // GONE → VISIBLE 的那一刻 height 仍是 0，applyContentPadding 会提前返回（等测量），
+        // 故再投递一次，在本轮布局结束后按真实高度补写（否则显示浮层后 padding 停在 0，
+        // 正文前几行被顶栏压住）。
+        topChrome.post { applyContentPadding() }
     }
 
     // ---- 导航与标题 ----
