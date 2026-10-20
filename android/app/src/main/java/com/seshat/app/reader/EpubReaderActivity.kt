@@ -535,6 +535,13 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
         layoutManager.scrollToPositionWithOffset(startChapterIndex, -startScrollY)
         visibleChapterIndex = startChapterIndex
         visibleChapterScrollY = startScrollY
+
+        // 首次进入时浮层高度可能尚未测量，applyContentPadding 会提前返回；
+        // 书装配完成后强制重算一次，保证正文一开始就让出顶栏空间（真机曾出现恒 padding=0）。
+        appliedTopPadding = -1
+        appliedBottomPadding = -1
+        appliedContent = null
+        scrollView.post { applyContentPadding() }
     }
 
     /**
@@ -719,6 +726,12 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
      *
      * 幂等闸由 [appliedTopPadding]/[appliedBottomPadding]/[appliedContent] 承担，重复调用不会
      * 反复写 padding；重试路径不打日志（避免每帧刷屏）。
+     *
+     * **padding 变化必须显式重锚**：`LinearLayoutManager.onLayoutChildren` 以子项的**绝对 `top`**
+     * 为锚（`updateAnchorFromChildren`），`setPadding` 之后内容不会跟着 padding 移动——padding
+     * 从 241 归零只是把「可滚动区域起点」上移，子项仍停在 y=241（真机实测：隐藏浮层后正文视觉
+     * 不动、顶部留 241px 白）。故写入前后记录「首个可见项相对**内容起点**的偏移」并用
+     * `scrollToPositionWithOffset` 放回：该偏移才是「读者正在读的位置」，padding 变化时必须守恒。
      */
     private fun applyContentPadding() {
         if (!::scrollView.isInitialized) return
@@ -736,6 +749,19 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
         if (top == appliedTopPadding && bottom == appliedBottomPadding && content === appliedContent) {
             return
         }
+        // 记录锚点：首个可见项相对**内容起点**（padding 起点）的偏移。
+        // 这个量代表「读者正在读的位置」，padding 变化时必须保持不变——
+        // 否则 LinearLayoutManager 会以子项绝对 top 为锚，内容不跟着 padding 移动，
+        // 隐藏浮层后正文就停在原处、顶部留一条与顶栏等高的白（真机实测 241px）。
+        val layoutManager = scrollView.layoutManager as? LinearLayoutManager
+        val oldTop = scrollView.paddingTop
+        val anchorPosition = layoutManager
+            ?.findFirstVisibleItemPosition()
+            ?.takeIf { it != RecyclerView.NO_POSITION }
+        val anchorOffset = anchorPosition
+            ?.let { layoutManager.findViewByPosition(it)?.top }
+            ?.minus(oldTop)
+
         content?.let {
             it.setPadding(0, top, 0, bottom)
             // 必须开：否则正文被裁在 padding 内，而不是延伸到半透明浮层下方
@@ -746,6 +772,12 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
         appliedTopPadding = top
         appliedBottomPadding = bottom
         appliedContent = content
+
+        // 显式把锚点放回同样的内容偏移：padding 变大 → 内容整体下移，变小 → 上移铺满
+        if (layoutManager != null && anchorPosition != null && anchorOffset != null) {
+            layoutManager.scrollToPositionWithOffset(anchorPosition, anchorOffset)
+        }
+
         // padding 变化会重排内容，但**不派发 onScrolled**（dy == 0），章内偏移需重算一次。
         // 关键是必须等**下一轮布局完成**再算：setPadding 只是 requestLayout，此刻
         // findViewByPosition(...).top 还是旧 padding 下的几何，同步算会把「旧几何 + 新 padding」
