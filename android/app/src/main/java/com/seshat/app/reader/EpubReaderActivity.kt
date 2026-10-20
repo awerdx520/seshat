@@ -16,6 +16,7 @@ import android.widget.FrameLayout
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.ViewCompat
@@ -96,6 +97,9 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
 
     /** 底部浮层的章号指示（点击可输入章号跳章，替代原底栏的按钮行）。 */
     private lateinit var pageIndicator: TextView
+
+    /** 目录抽屉（M10.9）：挂在 Activity 内容容器上，覆盖在阅读区之上。 */
+    private lateinit var tocDrawer: TocDrawer
 
     private lateinit var progressStore: ReadingProgressStore
     private lateinit var annotationStore: AnnotationStore
@@ -193,6 +197,11 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_epub_reader)
 
+        // 目录抽屉（M10.9）：挂在内容容器最上层；点击可跳转行 → 跳章
+        tocDrawer = TocDrawer(findViewById(android.R.id.content)) { index ->
+            jumpToChapter(index)
+        }
+
         // 模式与字号只在打开阅读器时读取一次（设置页改动下次进来生效）。
         val prefs = AppPreferences.open(this)
         pageMode = prefs.pageMode()
@@ -266,6 +275,21 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
 
         chapterTitleView.text = getString(R.string.reader_loading)
         openBook()
+
+        // 返回键：抽屉开着时先关抽屉，不退出阅读器
+        onBackPressedDispatcher.addCallback(
+            this,
+            object : OnBackPressedCallback(true) {
+                override fun handleOnBackPressed() {
+                    if (::tocDrawer.isInitialized && tocDrawer.isShowing) {
+                        tocDrawer.hide()
+                    } else {
+                        isEnabled = false
+                        onBackPressedDispatcher.onBackPressed()
+                    }
+                }
+            },
+        )
     }
 
     override fun onPause() {
@@ -837,6 +861,8 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
         // 故再投递一次，在本轮布局结束后按真实高度补写（否则显示浮层后 padding 停在 0，
         // 正文前几行被顶栏压住）。
         topChrome.post { applyContentPadding() }
+        // 浮层收起时抽屉若开着也一并收起，避免「没有工具栏却浮着目录」的悬空态
+        if (::tocDrawer.isInitialized && tocDrawer.isShowing) tocDrawer.hide()
     }
 
     // ---- 导航与标题 ----
@@ -1021,37 +1047,24 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
     }
 
     /**
-     * 点击「目录」→ 章节目录对话框（**当前章高亮**）。
+     * 打开目录抽屉（M10.9）。
      *
-     * 用 `setSingleChoiceItems` 的 `checkedItem` 表达「当前在读」：默认单选样式自带选中态，
-     * 不自定义 Adapter、不改主题；数百章的滚动与行复用交给 `AlertDialog` 自带的 `ListView`。
-     * 当前章与 [moveBy] 同一口径（[currentChapterIndex]），再经 [ChapterSeekMath.progressOf]
-     * 夹紧到 `[0, size-1]`——`checkedItem` 越界会导致「高亮不到任何项」。
-     *
-     * 点击后**先** `dismiss` **再**跳章：对话框窗口会盖住跳转后的首帧，读者看不到落到了哪一章。
+     * 优先用保留层级的 [EpubBook.tocTree]；为空（nav / NCX 都没解析出层级）时回退扁平章节列表。
+     * 抽屉自带折叠/展开与滚动定位，当前章节会被自动展开到可见。
      */
     private fun showToc() {
-        val chapters = book?.chapters.orEmpty()
-        if (chapters.isEmpty()) {
+        val book = book ?: return
+        val missing = getString(R.string.reader_chapter_untitled)
+        val rows = if (book.tocTree.isEmpty()) {
+            TocRows.forEpubFlat(book.chapters, missing)
+        } else {
+            TocRows.forEpub(book.tocTree, book.chapters, missing)
+        }
+        if (rows.isEmpty()) {
             Toast.makeText(this, R.string.reader_toc_empty, Toast.LENGTH_SHORT).show()
             return
         }
-        val items = TocItemText
-            .labels(chapters, getString(R.string.reader_chapter_untitled))
-            .toTypedArray()
-        val checked = ChapterSeekMath.progressOf(currentChapterIndex(), chapters.size)
-        val dialog = AlertDialog.Builder(this)
-            .setTitle(R.string.reader_toc)
-            .setSingleChoiceItems(items, checked) { dialogInterface, which ->
-                dialogInterface.dismiss()
-                jumpToChapter(which)
-            }
-            .setNegativeButton(android.R.string.cancel, null)
-            .create()
-        // `setSingleChoiceItems` 只标记选中项、**不会**自动滚动到它：数百章时当前项常在屏幕外。
-        // `listView` 由 Builder 在 `create()` 时注入，故在 onShow 里定位（此时列表已可滚动）。
-        dialog.setOnShowListener { dialog.listView?.setSelection(checked) }
-        dialog.show()
+        tocDrawer.show(rows, currentChapterIndex())
     }
 
     // ---- 进度 ----

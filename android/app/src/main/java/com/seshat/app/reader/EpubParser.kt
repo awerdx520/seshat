@@ -91,6 +91,8 @@ data class EpubBook(
      * 见 [EpubParser.pickCoverHref]），缺失为 null。
      */
     val coverHref: String? = null,
+    /** 保留层级的目录树（M10.9）；nav / NCX 都缺失时为空表，展示层回退扁平 [chapters]。 */
+    val tocTree: List<TocNode> = emptyList(),
 )
 
 /** OPF 解析结果（中间结构，便于单测）。 */
@@ -135,6 +137,31 @@ object EpubParser {
 
         val opfDir = opfPath.substringBeforeLast('/', "")
         val toc = parseToc(opf, source, opfDir)
+        // 目录树（M10.9）：nav / NCX 的 href 相对**文档自身目录**，故先算出该目录再解析。
+        // 注意与 buildChapters 的 titleByHref 不做对齐——那里用 opfDir 作 nav href 的 base 是
+        // 既有缺陷（nav 在子目录时章节标题会失配、回退文件名），本计划不改它以免扩大回归面。
+        val navPath = opf.manifest.firstOrNull { it.id == opf.navItemId }
+            ?.href
+            ?.takeIf { it.isNotBlank() }
+            ?.let { resolvePathFrom(opfDir, it) }
+        val ncxPath = opf.manifest.firstOrNull { it.id == opf.ncxItemId }
+            ?.href
+            ?.takeIf { it.isNotBlank() }
+            ?.let { resolvePathFrom(opfDir, it) }
+        val tocTree = runCatching {
+            val fromNav = navPath?.let { path ->
+                // navDir 取「nav 文档路径的父目录」：href 相对它才有意义
+                source.read(path)?.let { parseNavTree(String(it, Charsets.UTF_8), path.substringBeforeLast('/', "")) }
+            }.orEmpty()
+            // 与既有 parseToc 口径一致：nav 缺失**或解析为空**都回退 NCX
+            if (fromNav.isNotEmpty()) {
+                fromNav
+            } else {
+                ncxPath?.let { path ->
+                    source.read(path)?.let { parseNcxTree(String(it, Charsets.UTF_8), path.substringBeforeLast('/', "")) }
+                }.orEmpty()
+            }
+        }.getOrNull().orEmpty()
         return EpubBook(
             title = opf.title.ifBlank { "未命名" },
             chapters = buildChapters(opf, opfDir, toc),
@@ -143,6 +170,7 @@ object EpubParser {
             manifest = opf.manifest,
             author = opf.creator,
             coverHref = opf.coverHref,
+            tocTree = tocTree,
         )
     }
 
@@ -266,6 +294,108 @@ object EpubParser {
             val src = point.child("content")?.getAttribute("src").orEmpty()
             if (src.isBlank()) null else TocEntry(src, label)
         }
+    }
+
+    /**
+     * 解析 EPUB3 nav 文档为**目录树**（保留 `<nav><ol><li>` 嵌套，M10.9）。
+     *
+     * **与既有 [parseNav] 的关系：两条独立支路，互不影响。** [parseNav] 用
+     * `descendants(nav, "a")` 取全部后代并按文档顺序输出（服务 `chapters` 的标题匹配与分页），
+     * 本函数按树层级递归（服务目录抽屉）。**不要**把 [parseNav] 改成「先调本函数再拍平」——
+     * 两者在「`<li>` 内多个 `<a>`」「`<li><span><a>`」等写法下产出不同，改写会破坏既有行为。
+     *
+     * @param baseDir nav 文档**自身所在目录**（如 `OEBPS/nav`）；`<a href>` 相对它，
+     *   故用 `resolvePathFrom(baseDir, href)` 归一化为 epub 根相对路径后再存。
+     * @return 目录树；无 nav / 无 `<ol>` / XML 畸形 → 空表（**不抛异常**，与 [parseNav] 同等容错）
+     */
+    fun parseNavTree(navXml: String, baseDir: String): List<TocNode> = runCatching {
+        val root = parseXml(navXml)
+        val navs = descendants(root, "nav")
+        val tocNav = navs.firstOrNull { nav ->
+            val type = nav.getAttribute("epub:type").orEmpty().ifBlank { nav.getAttribute("type").orEmpty() }
+            type.split(' ', '\t').any { it == "toc" }
+        } ?: navs.firstOrNull()
+        val ol = tocNav?.let { descendants(it, "ol").firstOrNull() }
+        ol?.let { parseOl(it, baseDir) }.orEmpty()
+    }.getOrDefault(emptyList())
+
+    /**
+     * 解析 EPUB2 NCX 为**目录树**（保留 `<navPoint>` 嵌套，M10.9）。
+     *
+     * 与 [parseNcx] 同样是两条独立支路（见 [parseNavTree] 的说明）。
+     *
+     * @param baseDir ncx 文档自身所在目录；`<content src>` 相对它
+     * @return 目录树；无 navMap / XML 畸形 → 空表（不抛异常）
+     */
+    fun parseNcxTree(ncxXml: String, baseDir: String): List<TocNode> = runCatching {
+        val root = parseXml(ncxXml)
+        descendants(root, "navMap").firstOrNull()?.let { parseNavPoints(it, baseDir) }.orEmpty()
+    }.getOrDefault(emptyList())
+
+    /** 递归解析 `<ol>` 的**直接子** `<li>`（nav 树的一层）。 */
+    private fun parseOl(ol: Element, baseDir: String): List<TocNode> =
+        directChildren(ol, "li").mapNotNull { parseLi(it, baseDir) }
+
+    /**
+     * 解析单个 `<li>` 为一个树节点。
+     *
+     * 「本节点自己的 `<a>`」判定：优先 `li` 的直接子 `<a>`；否则取后代 `<a>` 中**第一个不在嵌套 `<ol>`
+     * 子树内**的（向上回溯父链判断），避免把子项的 `<a>` 误当成本节点标题。
+     * 既无标题锚点又无子项的空 `<li>` 返回 null（丢弃）。
+     */
+    private fun parseLi(li: Element, baseDir: String): TocNode? {
+        val childOl = li.child("ol") ?: descendants(li, "ol").firstOrNull()
+        val anchor = li.child("a") ?: firstAnchorOutsideNestedOls(li)
+        val children = childOl?.let { parseOl(it, baseDir) }.orEmpty()
+        if (anchor == null && children.isEmpty()) return null
+
+        val href = anchor?.getAttribute("href")
+            ?.takeIf { it.isNotBlank() }
+            ?.let { resolvePathFrom(baseDir, it) }
+        return TocNode(
+            title = anchor?.textContent?.trim().orEmpty(),
+            href = href,
+            children = children,
+        )
+    }
+
+    /** 取后代中第一个不属于 `li` 内嵌套 `<ol>` 子树的 `<a>`（即 li 自身的标题锚点）。 */
+    private fun firstAnchorOutsideNestedOls(li: Element): Element? =
+        descendants(li, "a").firstOrNull { anchor ->
+            var parent = anchor.parentNode
+            var insideNestedOl = false
+            while (parent != null && parent !== li) {
+                if (parent is Element && localName(parent) == "ol") {
+                    insideNestedOl = true
+                    break
+                }
+                parent = parent.parentNode
+            }
+            !insideNestedOl
+        }
+
+    /** 递归解析 `navPoint` 的**直接子** `navPoint`（NCX 树的一层）。 */
+    private fun parseNavPoints(parent: Element, baseDir: String): List<TocNode> =
+        directChildren(parent, "navPoint").map { point ->
+            val title = descendants(point, "navLabel").firstOrNull()
+                ?.let { label -> descendants(label, "text").firstOrNull()?.textContent?.trim() }
+                .orEmpty()
+            val href = descendants(point, "content").firstOrNull()
+                ?.getAttribute("src")
+                ?.takeIf { it.isNotBlank() }
+                ?.let { resolvePathFrom(baseDir, it) }
+            TocNode(title = title, href = href, children = parseNavPoints(point, baseDir))
+        }
+
+    /** 取全部直接子元素（按局部名；DOM 的 `child(name)` 只取第一个，树解析需要全部）。 */
+    private fun directChildren(parent: Element, name: String): List<Element> {
+        val nodes = parent.childNodes
+        val result = ArrayList<Element>(nodes.length)
+        for (i in 0 until nodes.length) {
+            val node = nodes.item(i)
+            if (node is Element && localName(node) == name) result.add(node)
+        }
+        return result
     }
 
     /** 从 manifest/spine 生成章节列表；标题按 toc 映射，缺失时回退文件名。 */

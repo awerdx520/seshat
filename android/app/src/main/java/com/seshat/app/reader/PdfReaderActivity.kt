@@ -23,6 +23,7 @@ import android.widget.FrameLayout
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.ViewCompat
@@ -183,6 +184,9 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
     /** 顶部浮层的文件名（PDF 没有书名元数据时显示文件名）。 */
     private lateinit var topTitleView: TextView
 
+    /** 目录抽屉（M10.9）。 */
+    private lateinit var tocDrawer: TocDrawer
+
     // 浮层上的按钮都是 TextView（本项目无 ViewBinding，按钮外观由布局的 background/文字属性承担）。
     private lateinit var inkToggleButton: TextView
     private lateinit var inkUndoButton: TextView
@@ -219,6 +223,11 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_pdf_reader)
+
+        // 目录抽屉（M10.9）：挂在内容容器最上层；点击可跳转行 → 跳页
+        tocDrawer = TocDrawer(findViewById(android.R.id.content)) { index ->
+            jumpToPage(index)
+        }
 
         // 先绑定视图，保证后续任何提前 finish 时 onDestroy 访问安全。
         recycler = findViewById(R.id.pdfPager)
@@ -379,6 +388,21 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
         // Store 与 docId 均就绪后再装配同步（内部三条守卫，任一不满足即完全跳过网络）。
         // 放在恢复进度之后：拉取只会写本地 Store，不会打断已完成的定位。
         setupSync()
+
+        // 返回键：抽屉开着时先关抽屉，不退出阅读器
+        onBackPressedDispatcher.addCallback(
+            this,
+            object : OnBackPressedCallback(true) {
+                override fun handleOnBackPressed() {
+                    if (::tocDrawer.isInitialized && tocDrawer.isShowing) {
+                        tocDrawer.hide()
+                    } else {
+                        isEnabled = false
+                        onBackPressedDispatcher.onBackPressed()
+                    }
+                }
+            },
+        )
     }
 
     /**
@@ -1168,36 +1192,46 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
         // 故再投递一次，在本轮布局结束后按真实高度补写（否则显示浮层后 padding 停在 0，
         // 正文前几行被顶栏压住）。
         bottomChrome.post { applyContentPadding() }
+        // 浮层收起时抽屉若开着也一并收起，避免「没有工具栏却浮着目录」的悬空态
+        if (::tocDrawer.isInitialized && tocDrawer.isShowing) tocDrawer.hide()
     }
 
     /**
-     * 显示 PDF 目录对话框（M10.8 / A-T6）。
+     * 打开目录抽屉（M10.9）。
      *
-     * PDF 没有 EPUB 那种现成章节表，目录来自书签树（[PdfOutlineReader]，PdfBox 解析）。
-     * 解析是阻塞 + 高内存操作，必须放在 [ioExecutor] 后台线程；失败/无 outline 时由
-     * [PdfTocEntries.build] 回退「第 N 页」页码目录（此时对话框永不空手）。
-     * 点击条目用 [jumpToPage] 跳转（与进度条拖动、页码输入同一条路径）。
-     *
-     * 并发防抖：解析期间 [tocLoading] 为 `true`，连点按钮不会叠加多份解析。
+     * 数据链：书签树（PdfBox 解析，后台线程）→ [TocRows.forPdf]（行模型）→ [TocDrawer]（树形抽屉）。
+     * 无书签的书回退「第 N 页」页码目录（[PdfOutlineReader.pageDirectory] 转成同构的树节点）。
      */
     private fun showPdfToc() {
         if (tocLoading) return
+        if (::tocDrawer.isInitialized && tocDrawer.isShowing) {
+            tocDrawer.hide()
+            return
+        }
         val uri = pdfUri
         if (uri == null) {
             toast(getString(R.string.reader_toc_empty))
             return
         }
         tocLoading = true
-        // 总页数取 lastPage + 1（lastPage 是最大页索引，至少为 0，故单页文档也是 1 页）
         val pageCount = lastPage + 1
+        val currentPage = firstVisiblePage()
         ioExecutor.execute {
             val outline = runCatching { readOutline(uri) }.getOrDefault(emptyList())
-            val entries = PdfTocEntries.build(outline, pageCount)
+            // 无书签 → 回退页码目录：把 FlatOutlineItem 转成同构树节点，复用同一套行模型
+            val tree = outline.ifEmpty {
+                PdfOutlineReader.pageDirectory(pageCount)
+                    .map { PdfOutlineReader.PdfOutlineItem(it.title, it.pageIndex) }
+            }
+            val rows = TocRows.forPdf(tree)
             runOnUiThread {
                 tocLoading = false
-                // 解析期间可能已退出：回调必须自我作废，否则会对已销毁的 Activity 弹框
                 if (isFinishing || isDestroyed) return@runOnUiThread
-                showTocDialog(entries)
+                if (rows.isEmpty()) {
+                    toast(getString(R.string.reader_toc_empty))
+                } else {
+                    tocDrawer.show(rows, currentPage)
+                }
             }
         }
     }
@@ -1221,30 +1255,6 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
         return contentResolver.openInputStream(uri)?.use { raw ->
             PdfOutlineReader.read(BoundedInputStream(raw, PdfOutlineReader.MAX_OUTLINE_BYTES), sizeHint)
         } ?: emptyList()
-    }
-
-    /** 弹出目录单选对话框；空表提示「本书没有目录」（正常路径不会为空，仅兜底）。 */
-    private fun showTocDialog(entries: List<PdfTocEntries.Entry>) {
-        if (entries.isEmpty()) {
-            toast(getString(R.string.reader_toc_empty))
-            return
-        }
-        val labels = entries.map { entry ->
-            // 用全角空格做缩进（TextView 单行无层级样式，缩进最直观）
-            "　".repeat(entry.depth) + entry.title
-        }.toTypedArray()
-        // 高亮当前页对应项（-1 表示空表，此处已提前返回，故必为合法索引）
-        val checked = PdfTocEntries.indexForPage(entries, firstVisiblePage())
-        AlertDialog.Builder(this)
-            .setTitle(R.string.reader_toc)
-            .setSingleChoiceItems(labels, checked) { dialog, which ->
-                val target = entries[which].pageIndex
-                // pageIndex < 0：该书签没有页目标（纯 URI 链接），只关闭对话框，不跳页
-                if (target >= 0) jumpToPage(target)
-                dialog.dismiss()
-            }
-            .setNegativeButton(android.R.string.cancel, null)
-            .show()
     }
 
     /**
