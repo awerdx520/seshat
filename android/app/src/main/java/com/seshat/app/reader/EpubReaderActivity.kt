@@ -261,6 +261,13 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
         // 浮层高度 → 阅读区 padding（常驻监听：高度/可见性变化时实时跟随）
         applyChromePaddingOnFirstLayout()
 
+        // 进入阅读即沉浸：浮层默认隐藏，阅读区铺满；点屏幕中间才调出工具栏（用户 2026-10-20 要求）
+        topChrome.visibility = View.GONE
+        bottomChrome.visibility = View.GONE
+        // 浮层 GONE → padding 应归零；此处显式算一次并补一次 post，防止此前已按可见浮层写入过非零值
+        applyContentPadding()
+        topChrome.post { applyContentPadding() }
+
         // 横向模式才需要 pager 的回调；竖向模式下 pager 不可见，回调不会触发。
         if (pageMode == ReaderPageMode.HORIZONTAL) {
             pager.registerOnPageChangeCallback(

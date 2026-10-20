@@ -56,7 +56,8 @@ import java.util.concurrent.Executors
  * 逐页渲染为 Bitmap，交由 [PdfPageAdapter] 在 [RecyclerView] 中显示。
  * 界面与 EPUB 侧同构（M10.8）：**顶部工具栏浮层**（返回 / 文件名 / 手写 / 批注 / 目录 / 设置）
  * + **底部进度浮层**（[SeekBar] + [TextView] 显示「当前页 / 总页数」，B2d：进度条拖动松手跳页、
- * 页码可点输入跳页），两块都是 overlay，不占布局。
+ * 页码可点输入跳页），两块都是 overlay，不占布局；**手写工具栏**是屏幕右侧的竖排浮动条
+ * （颜色 / 粗细 / 笔型 / 撤销 / 清空 / 退出），仅手写模式显示，独立于顶部浮层。
  * 阅读区（[RecyclerView]）的**上下** padding 都随对应浮层的**可见性**与实时高度联动
  * （可见时预留浮层高度、隐藏时归零）且 `clipToPadding = false`（B2e），故页尾/页首内容
  * 不会被叠加的浮层遮挡，沉浸阅读时也不会在两端留下空白。
@@ -192,6 +193,9 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
     private lateinit var inkUndoButton: TextView
     private lateinit var inkClearButton: TextView
 
+    /** 右侧手写工具栏的「退出手写」按钮（等价于顶栏【手写】开关）。 */
+    private lateinit var inkExitButton: TextView
+
     /** 手写模式开关（旋转经 savedInstanceState 恢复）。 */
     private var inkEnabled: Boolean = false
 
@@ -204,7 +208,7 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
     /** 当前笔型。 */
     private var inkStyle: InkStyle = InkStyle.PEN
 
-    /** 手写参数面板（仅手写模式显示）。 */
+    /** 手写工具栏（屏幕右侧竖排浮动条，仅手写模式显示）。 */
     private lateinit var inkPanel: View
 
     /**
@@ -239,8 +243,10 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
         inkToggleButton = findViewById(R.id.pdfInkToggleButton)
         inkUndoButton = findViewById(R.id.pdfInkUndoButton)
         inkClearButton = findViewById(R.id.pdfInkClearButton)
-        // 手写参数面板：必须先于 updateInkChrome() 初始化（该方法会按手写模式切它的显隐）。
+        // 手写工具栏（屏幕右侧竖排浮动条）：必须先于 updateInkChrome() 初始化
+        // （该方法会按手写模式切它的显隐）。
         inkPanel = findViewById(R.id.inkPanel)
+        inkExitButton = findViewById(R.id.inkExitButton)
         setupInkPanel()
 
         // 底部浮层贴底：按系统导航栏补底部 padding，避免控件被遮挡
@@ -273,6 +279,13 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
         // 阅读区上下 padding 自适应两块浮层的可见性与高度（B2e）：浮层叠在 RecyclerView 之上，
         // 不预留 padding 时页首/页尾内容会被压住。
         applyChromePaddingOnFirstLayout()
+
+        // 进入阅读即沉浸：浮层默认隐藏，阅读区铺满；点屏幕中间才调出工具栏（用户 2026-10-20 要求）
+        topChrome.visibility = View.GONE
+        bottomChrome.visibility = View.GONE
+        // 浮层 GONE → padding 应归零；此处显式算一次并补一次 post，防止此前已按可见浮层写入过非零值
+        applyContentPadding()
+        topChrome.post { applyContentPadding() }
 
         // 手写开关跨旋转恢复：否则转屏后手写层会静默关闭。
         inkEnabled = savedInstanceState?.getBoolean(STATE_INK_ENABLED) ?: false
@@ -831,12 +844,17 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
         inkUndoButton.visibility = if (inkEnabled && hasInk) View.VISIBLE else View.GONE
         inkClearButton.visibility = if (inkEnabled && hasInk) View.VISIBLE else View.GONE
         inkPanel.visibility = if (inkEnabled) View.VISIBLE else View.GONE
-        // 面板显隐会改变顶部浮层高度 → 重新算阅读区 padding（否则顶部正文被面板压住）
+        // 面板是右侧竖排浮动条（不属于顶部浮层），其显隐不改变顶部栏高度；
+        // 仍重算一次以兼容 insets 变化与「手写态 → 非手写态」时的顶部高度切换。
         applyContentPadding()
     }
 
-    /** 手写参数面板的点击接线（颜色 / 粗细 / 笔型），选中的控件用 alpha 区分。 */
+    /** 手写工具栏的点击接线（退出 / 颜色 / 粗细 / 笔型），选中的控件用 alpha 区分。 */
     private fun setupInkPanel() {
+        inkExitButton.setOnClickListener {
+            // 退出手写：面板随后由 updateInkChrome() 一并隐藏
+            if (inkEnabled) toggleInk()
+        }
         val colors = mapOf(
             R.id.inkColorRed to 0xFFE53935.toInt(),
             R.id.inkColorBlue to 0xFF1E88E5.toInt(),
