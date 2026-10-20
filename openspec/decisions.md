@@ -315,3 +315,28 @@
 **理由**：零新增依赖；`ResourceIndex` 的锁是实例锁，必须单实例才能保护同一 prefs 键；分片上传需服务端配合，超出本批。
 
 **代价**：无后台同步；>32 MiB 无法上传；同名不同目录的 move 跟随会跳过；`ondemand` 根的书无法重命名。
+
+## 2026-10-20 · 破例引入 PdfBox-Android（M10.8，零新增依赖的唯一例外）
+
+**决策**：引入 `com.tom-roush:pdfbox-android:2.0.27.0`，**仅**用于读 PDF 书签树（`/Outlines`）与单页文本提取；使用范围限定在 `reader/` 包内（`PdfOutlineReader` / `PdfTocEntries` / `PdfTextExtractor`），`PDFBoxResourceLoader.init(applicationContext)` 在 `PdfReaderActivity.onCreate` 调用一次且早于任何 `PDDocument` 使用。
+
+**理由**：系统 `PdfRenderer` 只暴露页数与逐页渲染，**不提供 outline API**，PDF「真目录」（用户 U4 的硬需求）没有任何系统路径可达；自研 PDF 书签解析要实现 xref / 对象流 / 压缩流解码与类型推断，成本与出错面都远大于一个成熟库。用户在 2026-10-20 明确授权这是「零新增依赖」强约束下的**唯一例外**（理由：不划算）。
+
+**影响**：① APK 约 +10 MB；② 依赖停在 fork 的最后一版（2.0.27.0，2023 年发布），上游 Apache PDFBox 后续对不可信输入解析健壮性的修复不会自动带入，需主动跟踪版本（记 `openspec/tech-debt.md`）；③ 库解析不可控 → 所有输入先过 50 MiB 大小闸门、`BoundedInputStream` 与节点数/深度预算，失败一律降级为空表或空串、不抛异常；④ 「只在 `reader/` 内使用」目前靠评审守住，无编译期约束。
+
+## 2026-10-20 · 阅读器浮层必须是 overlay，padding 随可见性动态联动（M10.8）
+
+**决策**：浮层保持**纯 overlay**（半透明叠加、不占布局），阅读区永远全屏，靠 `applyContentPadding()` 按「浮层是否 `VISIBLE` + 当前 height」动态设置阅读区上下 padding（隐藏即归零）；幂等闸 `appliedTopPadding` / `appliedBottomPadding`（EPUB 另加 `appliedContent` 比对 RecyclerView 身份）保证「值未变不写」；布局监听常驻而非一次性。
+
+**理由**：U1「浮层隐藏后底部留白」的根因不是「没算 padding」，而是两件事叠加——① M10.6 B2 的 padding 只按高度**一次性**写入，`toggleChrome()` 只切可见性、不参与计算，隐藏后空白必然留着；② 只在「浮层高度变化」时重算，漏掉 insets / 字体缩放 / 旋转等触发。把浮层改成占布局是更差的解（阅读区永久缩小）。代价是写 padding 会触发重布局，故必须用幂等闸把写入收敛到「值真的变了」。
+
+**影响**：① 任何新增浮层（如将来的阅读内设置面板）都必须走同一套 padding 计算，否则重新引入留白；② EPUB 侧 padding 变化后**必须**主动 `reportVisibleChapter()`——padding 变化不派发 `onScrolled`，不重算会让持久化的章内偏移漂移，破坏 M10.6 的进度不变量；③ 显隐浮层时仍可能有一次重布局抖动，实际可接受度待真机验收确认。
+
+## 2026-10-20 · 手写笔型存在 `InkStroke.style` 上、默认 `PEN`（M10.8）
+
+**决策**：笔型 `InkStyle { PEN, MARKER, HIGHLIGHTER }` 作为 `InkStroke` 的**per-stroke 字段**（默认 `PEN`），不做文档级「当前笔型」持久化设置；`PdfInkStore.defaultJson()` 开启 `coerceInputValues = true`。
+
+**理由**：笔型是每一笔的属性——同一页可能既有荧光笔高亮又有钢笔笔记，文档级设置无法表达；字段带默认值使 M10.5 的旧 JSON **零迁移**（缺字段即 `PEN`），不需要迁移脚本或双写过渡；`coerceInputValues` 让未知枚举值回退默认值，而不是整份笔迹反序列化失败（宁可丢笔型，不可丢笔迹）。
+
+**影响**：① 笔型只在渲染层生效（线宽倍率 1× / 2.2× / 3.5×、不透明度 255 / 170 / 90，且 `Paint.setColor` 后必须补 `setAlpha`），不改变归一化坐标语义；② 用户选中的笔型不跨文档记忆、无「最近使用」（记 tech-debt）；③ 未来加笔型只需扩枚举 + 渲染映射，但**不得**依赖枚举序号做持久化（默认序列化用名字）。
+

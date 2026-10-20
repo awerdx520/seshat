@@ -21,7 +21,7 @@
 | tab | Fragment | 承载内容 |
 |---|---|---|
 | 笔记 | `ui/NotesFragment` | 笔记库列表 + 笔记/Agenda 分段（M10.7，见 §8）：搜索框（只搜标题与标签）、刷新/选择目录；点文件行进 `ui/NoteViewActivity` 渲染阅读（可再进 `ui/NoteEditActivity` 编辑源码） |
-| 阅读 | `ui/ReaderFragment` | 书架网格（M10.6 B3 + M9.2 B 批：扫 `filesDir/books/` 并合并服务端清单、过滤/排序、点书进阅读器，见 §7 / §9）+ 底部 3 个入口：导入书籍、选择 EPUB、示例 EPUB（PDF 由书架点击打开） |
+| 阅读 | `ui/ReaderFragment` | 书架网格（M10.6 B3 + M9.2 B 批：扫 `filesDir/books/` 并合并服务端清单、过滤/排序、点书进阅读器，见 §7 / §9）+ 底部**单一**「导入书籍」入口（M10.8：epub / pdf 由 `BookImporter.detectType` 按扩展名自动识别，mobi 提示需转换；原「选择 EPUB」与「打开示例」两个入口已删除，示例书改为空库时静默播种，见 §7） |
 
 阅读器（`reader/EpubReaderActivity`、`reader/PdfReaderActivity`）仍是**独立全屏 Activity**，由 Fragment 内的入口启动——沉浸阅读不占内容区，且保证既有实现零改动。`gtd/GtdActivity`（三 Spinner 过滤的旧版 GTD 页）自 M10.6 B4d 起**不再有 Fragment 入口**（Notes 的 Agenda 段取代），保留为可独立启动的 Activity。
 
@@ -74,9 +74,9 @@
 | 渲染 | 单线程 `Executor`（`PdfRenderer` 非线程安全，必须串行）+ 白色占位；`shutdownNow()` 在 `onDestroy` |
 | 缓存 | `LruCache<Int, Bitmap>`，上限 `maxMemory/8`；目标页 ±2 预取 |
 | 进度 | `ScrollProgressMath` 把「首个可见项 + 顶部偏移」换算为页码，两种模式共用同一 key |
-| 手写批注（M10.5） | `InkOverlayView` 叠在页面 `ImageView` 之上；笔迹以**归一化坐标 0..1**（相对 FIT_CENTER 显示矩形）存于 `PdfInkStore`（键 `pdf_ink_<docId>`）；坐标换算走纯函数 `InkGeometry`（含 4 个数值示例的单测）；支持撤销上一笔、清除本页 |
-| 交互模式（M10.5） | 「阅读 / 手写」双模式：手写时 `InkOverlayView` 拦截触摸并 `requestDisallowInterceptTouchEvent(true)`，浮层显示「上一页 / 下一页」保证仍可翻页 |
-| 点击翻页与横屏（M10.5） | `GestureDetector` 三区点击（左 30% / 中 40% / 右 30%），`onInterceptTouchEvent` 恒返回 false 不吞滑动；横屏 + 横向模式下 `renderWidth` 按可用高度 × 首页宽高比（夹紧屏宽），浮层工具栏改为贴底半透明并加系统栏 insets |
+| 手写批注（M10.5，M10.8 加笔型） | `InkOverlayView` 叠在页面 `ImageView` 之上；笔迹以**归一化坐标 0..1**（相对 FIT_CENTER 显示矩形）存于 `PdfInkStore`（键 `pdf_ink_<docId>`）；坐标换算走纯函数 `InkGeometry`（含 4 个数值示例的单测）；支持撤销上一笔、清除本页。M10.8 起每笔带 `InkStyle`（钢笔 / 马克笔 / 荧光笔，见 §6.6） |
+| 交互模式（M10.5，M10.8 改入口） | 「阅读 / 手写」双模式：手写时 `InkOverlayView` 拦截触摸并 `requestDisallowInterceptTouchEvent(true)`。进入/退出手写改由**双击阅读区**或顶栏「手写」按钮触发（原「手写时浮层显示上一页/下一页」随时间工具栏改版取消，翻页改用 `SeekBar` / 点页码，见 §6.6） |
+| 点击翻页与横屏（M10.5，M10.8 改分区） | 三区点击改由纯函数 `TapZone` 判定（左 `[0, 0.25)` / 中 `[0.25, 0.75]` / 右 `(0.75, 1]`，见 §6.2；早期为左 30% / 中 40% / 右 30%），`onInterceptTouchEvent` 恒返回 false 不吞滑动；横屏 + 横向模式下 `renderWidth` 按可用高度 × 首页宽高比（夹紧屏宽），浮层工具栏改为贴底半透明并加系统栏 insets |
 
 ### 5.2 EPUB（`reader/EpubReaderActivity` + `ChapterScrollAdapter`）
 
@@ -89,15 +89,153 @@
 | 进度 | 语义不变：`ReadingProgress(chapterIndex, scrollY)`，竖向经 `ScrollProgressMath` 换算 |
 | 批注 | 横向取 `ChapterFragment` 选区；竖向取当前可见章 `WebView` 的选区，共用 `decodeJsString` |
 
-## 6. 阅读器交互（M10.6 B2）
+## 6. 阅读器交互（M10.6 B2 定基调，M10.8 重排）
 
-两个阅读器的浮层与导航交互统一到同一套语义。
+两个阅读器（`reader/EpubReaderActivity` / `reader/PdfReaderActivity`）的浮层、tap 与导航交互共用同一套语义：**浮层是 overlay、不占布局**（阅读区永远全屏，靠 padding 让内容避开浮层，§6.3），单击阅读区中央切换浮层显隐，左右两侧为翻页热区。
 
-- **工具栏显隐**：单击阅读区中央切换浮层显示/隐藏；左右各 30% 边缘不响应（横向模式下是翻页热区，也为将来 EPUB 翻页留位）。单击有 250ms 延迟——期间若按下第二击则取消待执行的切换，即**双击只缩放、不切换浮层**。
-- **章节导航（EPUB）**：底部 `SeekBar` 粗粒度跳章（拖动中不跳，松手才跳）；点击标题栏章号打开输入框，输入章号直接跳转（非法输入只提示「章号无效」，不跳转）；「目录」按钮弹出章节列表，当前章高亮，点击任一项跳章并关闭对话框。目录**无层级**（nav/NCX 已扁平化）。
-- **页导航（PDF）**：底部 `SeekBar` 松手跳页；点击页码打开输入框，输入页号跳转。PDF **无 TOC 数据源**，故不做目录。
-- **浮层与阅读区**：阅读区全屏，浮层半透明叠加其上；阅读区 `clipToPadding = false`，底部 padding 取**浮层运行时高度**（首次布局后写入，浮层高度变化时跟随更新），因此页尾/章尾内容不被浮层遮挡。**已知副作用**：浮层隐藏后 padding 仍保留，沉浸阅读时底部留一条与浮层等高的空白（回收 padding 会触发滚动重布局抖动，故不做，见 `openspec/tech-debt.md`）。
-- **已知限制**：EPUB 目录无层级（`TocEntry` 无 `depth`）；PDF 无 TOC；`SeekBar` 在章/页数很大时精度不足（一像素跨多项），故保留输入框兜底；窄屏下 4 个按钮（手写/撤销/清除/批注）文案可能截断。
+### 6.1 工具栏结构（两模式对照）
+
+| 位置 | EPUB | PDF |
+|---|---|---|
+| 顶部浮层 | `←` 返回 / 章节标题 / 批注 / 目录 / 设置 | `←` 返回 / 文件名 / 手写 / 批注 / 目录 / 设置 |
+| 底部浮层 | 章节 `SeekBar` + **可点击**的「第 n/N 章」 | 页 `SeekBar` + **可点击**页码 |
+
+- 底部「第 n/N 章」/ 页码可点击 → 输入章号 / 页号直接跳转（非法输入只提示，不跳转）；`SeekBar` 拖动中不跳、松手才跳。
+- 「设置」跳既有 `settings/SettingsActivity`（M10.8 未做阅读内浮层设置面板，见 §6.7）。
+- **M10.8 删除的控件**：EPUB 的 `prevChapterButton` / `nextChapterButton`、PDF 的 `pdfPrevPageButton` / `pdfNextPageButton`——翻页改由 tap 分区（§6.2）与 `SeekBar` 承担。
+- **一处偏离原计划的取舍**：EPUB 原底栏「批注」按钮没有删除，而是**移到顶栏**——`addAnnotationFromSelection()` 只有这一个入口，直接删会让批注能力消失。
+- 两块浮层都注册 `ViewCompat.setOnApplyWindowInsetsListener` 处理系统栏（`targetSdk 35` 起 edge-to-edge 强制，不避让会被状态栏/导航栏压住）。
+
+### 6.2 tap 三分区（U2）
+
+分区判定抽成纯函数 `reader/TapZone.kt`：`zone(fraction, leftEdge = 0.25f, rightEdge = 0.75f): Zone{PREV, TOGGLE, NEXT}`，越界值先 `coerceIn(0, 1)` 归一化，`NaN` 兜底为 `TOGGLE`。
+
+| 分区 | 区间 | EPUB | PDF |
+|---|---|---|---|
+| `PREV` | `[0, 0.25)` | `moveOneScreen(-1)`：横向 `moveBy(-1)`（上一章）/ 竖向 `scrollView.smoothScrollBy(0, -视口高)` | 横向 `movePage(-1)` / 竖向 `recycler.smoothScrollBy(0, -视口高)` |
+| `TOGGLE` | `[0.25, 0.75]`（闭区间） | `scheduleToggle()`：延迟 250ms 执行，期间第二击撤销 | `toggleChrome()`：延迟 `ViewConfiguration.getDoubleTapTimeout()` |
+| `NEXT` | `(0.75, 1]` | 同 `PREV` 反向 | 同 `PREV` 反向 |
+
+- 边界点（恰好 25% / 75%）归中间区——避免「擦边」翻页；`OnItemTouchListener.onInterceptTouchEvent` 仍恒返回 `false`（不吞滚动与吸附）。
+- 视口高 = `容器高度 - paddingTop - paddingBottom`（扣除浮层 padding），否则竖向翻屏会跳过多余或重复一段内容。
+- **两端的单击延迟口径不同**（已知不一致，见 §6.7）：EPUB 用常量 250ms（双击是 WebView 缩放，只需压过双击窗口）；PDF 用 `ViewConfiguration.getDoubleTapTimeout()`——PDF 侧双击要切手写，250ms 会让「慢双击」先翻页。
+
+### 6.3 浮层 padding 联动（U1）
+
+`applyContentPadding()`（两侧各一份）：按「浮层是否 `VISIBLE` + 当前 height」计算阅读区上下 padding，**浮层隐藏即归零**——M10.6 B2 遗留的「隐藏浮层后底部留白」由此修复。
+
+| 机制 | EPUB | PDF |
+|---|---|---|
+| 幂等闸 | `appliedTopPadding` / `appliedBottomPadding` / `appliedContent`（RecyclerView 身份，容器换绑才重写） | `appliedTopPadding` / `appliedBottomPadding` |
+| 触发 | 布局监听**常驻**（不再一次性移除）：字体缩放、旋转、insets、浮层高度变化都会重算 | 同 |
+| 附带动作 | 末尾调用 `reportVisibleChapter()` | — |
+
+- 幂等闸的作用：值没变就不写 padding，**避免打断滚动锚点**（`setPadding` 触发的重布局会让 `RecyclerView` 重算可见项与偏移，显隐浮层时表现为跳动）。
+- EPUB 必须主动 `reportVisibleChapter()`：padding 变化**不派发 `onScrolled`**，不主动重算会让持久化的章内偏移漂移——破坏 M10.6 的进度不变量。
+
+### 6.4 目录（M10.9：树形左侧抽屉）
+
+两个阅读器的目录都是**左侧滑出的树形抽屉**（`reader/TocDrawer.kt` + `reader/TocAdapter.kt`），取代 M10.6/M10.8 的 `AlertDialog.setSingleChoiceItems` 扁平列表。入口仍是顶栏「目录」（EPUB M10.8 从底栏移上来、PDF M10.8 新增）。
+
+**数据来源两条链**
+
+| 链 | 来源 | 层级 | 跳转目标 |
+|---|---|---|---|
+| EPUB | `EpubParser.parseNavTree(navXml, baseDir)`（EPUB3 nav）/ `parseNcxTree(ncxXml, baseDir)`（EPUB2 NCX）→ `EpubBook.tocTree` | 保留 `<ol><li>` / `<navPoint>` 嵌套 | `TocNode.href` 是**已归一化的 epub 根相对路径**，可直接与 `chapters[i].href` 精确比较 |
+| PDF | `reader/PdfOutlineReader.kt` 读书签树（PdfBox，后台线程）→ `PdfOutlineItem` | 保留书签嵌套（受下方三重上限约束） | `pageIndex`（0 起页索引）；`-1` = 纯 URI 链接书签，不可跳转 |
+| PDF 回退 | 无 outline 或解析失败 → `PdfOutlineReader.pageDirectory(pageCount)` 的「第 N 页」列表，转成同构 `PdfOutlineItem` | 一级 | 每行一页 |
+
+- **`href` 的 base 是 nav/ncx 文档自身所在目录**（不是 `opfDir`）：`OEBPS/text/nav.xhtml` 里的 `ch1.xhtml` 归一化为 `OEBPS/text/ch1.xhtml`。归一化在**解析层**完成一次，行模型里**不要**再传 `opfDir` 二次归一化（会拼出 `OEBPS/OEBPS/x`）。
+- 容器节点（只有子项、自身没有链接的 `<li>` / `<navPoint>`）：`title = ""`、`href = null`，行模型里 `targetIndex = -1`。
+- 两条链在**行模型**处汇合：`TocRows.forEpub` / `TocRows.forPdf` 产出统一的 `TocRow`；`tocTree` 为空（nav 与 NCX 都没解析出层级）时 EPUB 回退 `TocRows.forEpubFlat`（每章一行，等价于 M10.6 的扁平列表）。
+- `EpubBook.tocTree: List<TocNode> = emptyList()` 与既有扁平 `chapters` **并存**：`parseNav` / `parseNcx`（服务章节标题匹配与分页）**一行未改**，`parseNavTree` / `parseNcxTree` 是独立支路；nav 解析为空时仍回退 NCX（与既有 `parseToc` 口径一致）。
+- **既有缺陷（M10.9 未修，见 tech-debt）**：`buildChapters` 的 `titleByHref` 仍以 `opfDir` 作 base 匹配 nav 的 href，而 nav href 实际相对 nav 文档目录——nav 在子目录时章节标题匹配失败、回退成文件名。两条支路对 base 的口径因此不一致。
+
+**UI 形态**
+
+| 元素 | 实现 |
+|---|---|
+| 面板 | 左侧滑出，宽 `min(320dp, 屏宽 × 0.78)`——窄屏不铺满，留一道可见的阅读区提示「点遮罩可关」 |
+| 遮罩 | 半透明黑 `#99000000`，铺满内容容器（`android.R.id.content`），点击关闭；面板自身 `isClickable = true`，否则点面板空白会穿透到遮罩把抽屉关掉 |
+| 动画 | `translationX`：面板从 `-panel.width` 滑入 200ms、滑出 160ms；遮罩 `alpha` 0↔1（160ms）。首次打开要等一次布局后再取宽度设起点，否则未测量时 `width = 0` 会「闪出」无动画 |
+| 视图 | 全部**代码构建**（LinearLayout + RecyclerView + TextView），零新增 XML / drawable，**不引用任何 `R.id.`**；挂到 Activity 内容容器上，两个阅读器共用同一实现 |
+| 列表 | `LinearLayoutManager` + `itemAnimator = null`（折叠刷新走整体 `notifyDataSetChanged`，动画只会造成闪烁） |
+
+- **为什么不用 `DrawerLayout`**：它自带**边缘横向滑动手势**，会和横向阅读的左右翻页滑动抢事件；把边缘手势锁死又失去使用它的意义。故自实现「遮罩 + 面板 + `translationX`」，**只允许从顶栏「目录」按钮打开**（无边缘滑出手势）。
+- 抽屉是**覆盖层**，**开合不触碰阅读区 padding**——与浮层不是一回事（浮层走 §6.3 的 `applyContentPadding`）。
+- `isShowing` 取遮罩可见性（含滑出动画中），供「返回键 / 收起工具栏」判断。
+
+**交互**
+
+| 操作 | 行为 |
+|---|---|
+| 顶栏「目录」 | 打开抽屉；PDF 侧先在 `ioExecutor` 上读书签树、读完再弹；已打开时再点则关闭 |
+| 打开时 | 自动展开当前章 / 当前页的**祖先链**（长目录若整树全展开会把当前项挤出屏幕）、`scrollToPosition` 滚到该项并高亮 |
+| 点箭头 `▸/▾` | 折叠 / 展开（仅 `hasChildren` 的行有箭头） |
+| 点标题 | `targetIndex >= 0` → 关闭抽屉并跳转；`targetIndex = -1` 的纯容器行 → **只切换折叠**（不跳第一页） |
+| 返回键 | **优先关闭抽屉**（抽屉开着时消费返回，不退出阅读器） |
+| 收起工具栏 | 一并收起抽屉，避免「没有工具栏却浮着目录」的悬空态 |
+| 头部「×」/ 点遮罩 | 关闭抽屉 |
+
+**层级与折叠（纯函数，JVM 可测）**
+
+- `TocRow(title, targetIndex, depth, hasChildren, expanded, id)`；渲染缩进 = `depth × 16dp`。
+- `TocRows`（树 → 完整 DFS 前序行、保留 depth，**不做折叠**）与 `TocFlatten.visibleRows(rows, expanded)`（按展开集合算可见行，用「可见深度上限」单遍扫描、不重建树）各管一件事，便于分别单测。
+- `id` 用 **DFS 兄弟序号路径**（根层 `"0"`、`"1"`…，子层 `"0/2"`、`"0/2/1"`），**不用裸 href**，两个原因：① 容器节点 `href` 为 `null`，全都会撞车；② 同一文件的不同锚点（`ch1.xhtml#a` / `#b`）去掉 fragment 后同样撞车。兄弟序号路径对含容器在内的每个节点天然唯一，且**祖先 id 就是它的各级前缀**——「展开祖先链」因此是纯字符串操作。
+- href 命中不到章节（锚点、跨文件目录、容器节点）时 `targetIndex = -1`：**不可跳转好过跳到错章节**。
+- PDF 侧行模型复用同一套 `TocRow` / `TocFlatten`（`pageIndex` 直接作 `targetIndex`），故折叠与定位逻辑两端共用。
+- 单页文本提取另有 `reader/PdfTextExtractor.kt`（长按菜单「复制本页文字」用，见 §6.6），与目录无关。
+
+**已知限制**
+
+1. 父节点 href 映射不到 spine 时**不可跳转**（只可折叠）——这是**正确行为而非缺陷**：容器节点没有落点，硬跳只会跳错位置。
+2. 旋转屏会重建 Activity，抽屉的展开状态与滚动位置丢失（`expanded` 只在 `TocDrawer` 内存里），需重新点「目录」。
+3. `tocTree` 让书架扫描时每本书多一次 nav/NCX DOM 遍历（开销小；书架变慢时可改惰性解析，见 tech-debt）。
+4. `reader/PdfTocEntries.kt` 与 `reader/TocItemText.kt` 在改为抽屉后**已无生产代码引用**（两个测试类仍在跑），属待清理死代码。
+
+**安全上限**（`PdfOutlineReader`，针对不可信 PDF 输入）：
+
+| 上限 | 值 | 防的是什么 |
+|---|---|---|
+| `MAX_OUTLINE_BYTES` | 50 MiB | 文件大小闸门（超大 PDF 直接跳过解析，不 OOM） |
+| `MAX_DEPTH` | 64 | 书签树递归深度（防栈溢出） |
+| `MAX_NODES` | 5000 | 节点总数预算（防海量兄弟书签撑爆内存） |
+
+- `BoundedInputStream`：**不信任** `ContentResolver.openAssetFileDescriptor().length`——外部 provider 自报值可以谎报（`0` / `-1` / 远小于实际），包一层限流把 50 MiB 从「provider 说了算」变回「App 说了算」。
+- 加密 / 损坏 / 超大 / 越界一律返回**空表或空串**，不抛异常：目录解析或文本提取失败不得让阅读器崩。
+
+### 6.5 封面三级回退（U6）
+
+`EpubParser.pickCoverHref(manifest, epub2CoverId)` 按顺序回退：
+
+| 优先级 | 判据 | 说明 |
+|---|---|---|
+| 1 | EPUB3 `properties="cover-image"` | 规范写法，最可靠 |
+| 2 | EPUB2 `<meta name="cover" content="id">` → manifest 按 `id` 取 href | 存量旧书的主路径（M10.6 B3 未支持） |
+| 3 | manifest 中第一个 `media-type` 以 `image/` 开头的 item | **启发式**：首图若是出版社 logo 会显示错图（§6.7） |
+
+- 无封面（或解码失败）时书架卡片叠加 `coverInitial`：`CoverKeys.initialOf(title)` 取书名首字（大写，空书名 `?`），解码成功后才隐藏。
+- PDF 封面仍为渲染首页 + `inSampleSize` 降采样后落盘（§7）。
+
+### 6.6 手写（U7 / U8）
+
+- **笔型**：`InkStyle { PEN, MARKER, HIGHLIGHTER }`（`@Serializable`）；`InkStroke` 新增 `style` 字段且默认 `PEN`，旧 JSON 无需迁移；`PdfInkStore.defaultJson()` 加 `coerceInputValues = true`（未知笔型回退默认值，不因脏数据整份丢弃）。
+- **渲染**（`InkOverlayView`）：线宽倍率 1× / 2.2× / 3.5×，不透明度 255 / 170 / 90。**设定顺序有要求**：`Paint.setColor` 之后必须再设 `setAlpha`，否则颜色自带 alpha 会覆盖笔型的不透明度。
+- **手写面板**（布局 `activity_pdf_reader.xml` 的 `inkPanel`，在 PDF 顶部浮层内、仅手写模式显示）：6 色 × 3 档粗细（归一化 0.0025 / 0.004 / 0.007）× 3 种笔型；选中态用 alpha 1.0 / 0.35 区分；面板分「颜色行 / 粗细行 / 笔型行」三行，避免 360dp 屏横向溢出。
+- **进入 / 退出**：双击阅读区，或顶栏「手写」按钮；手写模式下单击**不翻页**（落笔优先）。
+- **长按菜单**：复制本页文字（`PDFTextStripper` 提取当前页，写入剪贴板前截断到 10 万字符，防 binder 事务超限）/ 高亮标注 / 进入手写。
+
+### 6.7 已知限制
+
+1. EPUB 侧 tap 延迟仍是 250ms 常量（PDF 已改用 `ViewConfiguration.getDoubleTapTimeout()`），两端口径不一致。
+2. 手写模式下无法 tap 翻页，只能拖进度条或点页码。
+3. 封面第三级回退是启发式，可能取到出版社 logo 当封面。
+4. 手写笔参数不跨文档记忆，也没有「最近使用」。
+5. 阅读内设置面板未做——顶栏「设置」直接跳 `SettingsActivity`（离开阅读器）。
+6. PDF 的 `INITIAL_CHROME_PADDING_DP = 6` 与布局 XML 的 `paddingVertical`（2dp / 4dp）不一致（既有行为，未随 M10.8 统一）。
+7. ~~EPUB 目录无层级（`TocEntry` 无 `depth`）~~ **已随 M10.9 解决**（`EpubBook.tocTree` + 树形抽屉，见 §6.4）；抽屉的展开态不跨旋转保存（M10.9 已知限制）。`SeekBar` 在章 / 页数很大时精度不足（一像素跨多项），故保留输入框兜底。
+8. PDF 解析的健壮性与主线程风险见 `openspec/tech-debt.md`：`pdfbox-android` 版本停在 2023、病态 PDF 可占死 `ioExecutor`、`PdfTextExtractor` 的真实 PDF 分支纯 JVM 下被 `assumeTrue` 跳过。
+
 
 ## 7. 书架（M10.6 B3）
 
@@ -111,15 +249,15 @@
 | 过滤 | 全部 / 未读（0%）/ 在读（1–99%）/ 已读（100%），判定在 `BookShelfLogic.matches` |
 | 排序 | 最近阅读（进度 `updatedAt` 降序，无进度为 0）/ 书名 / 导入时间（`file.lastModified()` 降序），在 `BookShelfLogic.sort` |
 | 封面缓存 | 内存 `LruCache<String, Bitmap>`（按 `byteCount` 计，上限 `Runtime.maxMemory() / 8`）+ 磁盘 `filesDir/covers/<key>.jpg`；同时把元数据（标题/作者/章节数/进度键）另存 `<key>.json`，下次扫描直接读缓存，**避免重复解析 EPUB 与重算内容哈希**。缓存键 = `文件名 + length + lastModified` 的 SHA-256 前 16 位 hex（`reader/CoverKeys`），文件一变即换键 |
-| 封面来源 | EPUB：manifest 中带 `properties="cover-image"` 的项；PDF：渲染首页并按 `inSampleSize` 降采样后落盘 |
+| 封面来源 | EPUB：三级回退（EPUB3 `properties="cover-image"` → EPUB2 `<meta name="cover">` → manifest 首个 `image/*`，见 §6.5）；PDF：渲染首页并按 `inSampleSize` 降采样后落盘。无封面或解码失败时卡片显示**书名首字占位**（`CoverKeys.initialOf`，大写，空书名 `?`） |
 | 打开 | EPUB → `EpubReaderActivity`；PDF → `PdfReaderActivity`。**M9.2 B 批起**：条目有 `uid` 时经 `intentForFile(..., uid)` / `intent(..., uid)` 带上 `EXTRA_UID`（进度/批注按 uid 同步，见 §9）；无 uid 时进度键为**内容哈希**（EPUB：SHA-256 前 16 字节共 32 位 hex；PDF：`file://` uri），与阅读器 `effectiveKey = uid ?: docId` 的无 uid 分支一致 |
-| 示例书迁移 | `assets/sample.epub` 首次复制到 `filesDir/books/`；旧版 `filesDir/sample.epub` 保留不删，作回滚点。进度键是内容哈希，故迁移后同一本书的进度仍然可见 |
+| 示例书播种 | M10.8 起 `seedSampleIfEmptyThenRefresh()`：**书籍目录为空**时把 `assets/sample.epub` 复制进去（**不打开**），在 `scanExecutor` 上执行、完成后回主线程刷新书架。原「打开示例」入口（`openSampleEpub()`）已删除；旧版 `filesDir/sample.epub` 保留不删作回滚点，进度键是内容哈希，故播种后同一本书的进度仍可见 |
 
 **已知限制**：
 
 1. 进度徽标仍按 `progressKey`（内容哈希 / `file://`）取值，而阅读器在有 uid 时把进度写在 uid 键下 → 有服务端 uid 的书徽标可能恒 0（B 批未改徽标的取值逻辑；打开阅读器后的进度同步本身是通的）。
 2. PDF 用书架 `file://` 与 SAF `content://` 打开是**两套进度**，互不共享。
-3. EPUB2 封面不支持：只认 EPUB3 的 `properties="cover-image"`，`<meta name="cover">` 不识别。
+3. ~~EPUB2 封面不支持~~ **已随 M10.8 解决**：`EpubParser.pickCoverHref` 改为三级回退（EPUB3 → EPUB2 `<meta name="cover">` → manifest 首个 `image/*`），无封面时卡片显示书名首字；第三级是启发式，可能取到出版社 logo（见 §6.5 / §6.7）。
 4. `covers/` 无自动清理：书籍删除后封面与元数据缓存滞留（无容量上限）；下载换文件后旧键的 `.jpg`/`.json` 同样残留（见 §9 已知限制 6）。
 5. 切 tab 不刷新书架：`show/hide` 不改变生命周期、`onResume` 不触发；从阅读器返回会刷新（`onResume` 里按需重扫 + 触发同步，见 §9）。
 6. 远端未下载的书**无封面、无作者、进度恒 0**（只有文件名与大小/时间）；下载并重新扫描后才补齐。

@@ -522,15 +522,15 @@
 - 影响：技术书/小说常有多级目录（卷→章→节），扁平化后层级信息丢失，用户无法看出归属关系；且这是**解析期**丢失，UI 侧无法补救（要恢复层级必须重解析）。
 - 建议：给 `TocEntry` 增加 `depth: Int`（解析 nav 的嵌套 `<ol>` 或 NCX 的 `playOrder`/嵌套 `navPoint` 时记录），目录对话框按 `depth` 做缩进；`parseNav`/`parseNcx` 的扁平化逻辑需补单测（含 3 层嵌套算例）。
 
-## PDF 无 TOC 数据源（M10.6 B2，2026-10-18）
-- 现状：Android 内置 `PdfRenderer` 只暴露页数与逐页渲染，**不提供 outline/书签（TOC）**；未引入第三方 PDF 解析库（零新增依赖约束）。
-- 影响：PDF 阅读器没有「目录」入口，长文档只能靠 `SeekBar` 或输入页号跳转；与 EPUB 侧交互不对称。
-- 建议：若要补，需引入能解析 `/Outlines` 的库（如 PdfBox-Android，违反零新增依赖）或自行解析 PDF 对象（成本高、易错）；短期维持不做，在 `docs/android.md` 明示「PDF 无 TOC」。
+## PDF 无 TOC 数据源（M10.6 B2，2026-10-18）——已随 M10.8 解决（2026-10-20）
+- 原问题：Android 内置 `PdfRenderer` 只暴露页数与逐页渲染，**不提供 outline/书签（TOC）**；彼时受「零新增依赖」约束，PDF 侧没有目录入口，与 EPUB 交互不对称。
+- 解决：经用户 2026-10-20 明确授权破例引入 `com.tom-roush:pdfbox-android:2.0.27.0`（`openspec/decisions.md`），新增 `reader/PdfOutlineReader`（读书签树）+ `reader/PdfTocEntries`（条目构造 / `indexForPage` 定位当前项），顶栏「目录」弹出单选列表；无 outline 或解析失败回退「第 N 页」页码目录；`pageIndex < 0` 的书签只关对话框不跳页。
+- 残余风险：见下文「`pdfbox-android` 版本停更」「病态 PDF 可占死主进程 `ioExecutor`」两条，勿在本条重复排查。
 
-## 浮层隐藏后阅读区 padding 仍保留（M10.6 B2，2026-10-18）
-- 现状：`applyChromePadding()` 一次性（高度变化时）把浮层高度写入阅读区底部 padding，`toggleChrome()` 只切浮层可见性，**不回收** padding。
-- 影响：沉浸阅读（隐藏浮层）时底部仍留一条与浮层等高的空白，竖向模式下「页尾到底」的观感与真正全屏不同；且浮层显隐后内容不重新铺满，用户可能误以为内容没加载完。
-- 建议：若要真正全屏，需在 `toggleChrome()` 里按可见性重设 padding（0 / 浮层高度）——代价是每次显隐都触发 RecyclerView 重新布局，滚动位置与 `PagerSnapHelper` 吸附会出现抖动；可考虑用 `setPadding` + `requestLayout` 前后记录并恢复 `scrollToPositionWithOffset` 抵消抖动，需真机实测是否可接受。
+## 浮层隐藏后阅读区 padding 仍保留（M10.6 B2，2026-10-18）——已随 M10.8 解决（2026-10-20）
+- 原问题：`applyChromePadding()` 一次性（高度变化时）把浮层高度写入阅读区底部 padding，`toggleChrome()` 只切浮层可见性、**不回收** padding → 沉浸阅读时底部留一条与浮层等高的空白。
+- 解决：两侧改为 `applyContentPadding()`，按「浮层是否 `VISIBLE` + 当前 height」实时计算上下 padding（**隐藏即归零**）；用 `appliedTopPadding` / `appliedBottomPadding`（EPUB 另加 `appliedContent` 比对 RecyclerView 身份）做幂等闸，**只写变化值**，把「每次显隐都重布局」的抖动压到最小；布局监听改为常驻，insets / 字体缩放 / 旋转变化都会重算。
+- 附带要求（别踩回去）：EPUB 的 padding 变化**不派发 `onScrolled`**，故 `applyContentPadding()` 末尾必须调 `reportVisibleChapter()`，否则持久化的章内偏移会漂移（决策见 `openspec/decisions.md`「阅读器浮层必须是 overlay」）。
 
 ## SeekBar 精度受章节/页数上限约束（M10.6 B2，2026-10-18）
 - 现状：底部 `SeekBar` 的 `max` = 章数-1 / 页数-1，`SeekBar` 的可用像素宽度有限（手机横屏约 200–300px）。
@@ -552,10 +552,10 @@
 - 影响：同一份 PDF 从书架读到的位置、批注、手写笔迹，从 SAF 再次打开时**全部看不到**（反之亦然），用户会认为数据丢失；且两套数据各自累积，无合并路径。
 - 建议：统一为按**内容或规范化路径**派生的稳定键（例如书架与 SAF 都取 `DocumentsContract` 的真实文件路径，或用内容哈希），并对既有两套键做一次惰性迁移；至少在 UI 上提示「来源不同，进度独立」。
 
-## EPUB2 封面不支持（M10.6 B3，2026-10-18）
-- 现状：`BookMeta` 的封面只认 EPUB3 manifest 里带 `properties="cover-image"` 的项；EPUB2 惯用的 `<meta name="cover" content="<id>"/>`（OPF2 元数据指向 cover 图 item）不识别。
-- 影响：存量 EPUB2 书籍（大量旧书）书架格子里没有封面，只有标题/作者占位，视觉上比静读天下等成熟阅读器差一截；且这是解析期判定，UI 无法补救。
-- 建议：`EpubParser` 补 EPUB2 回退——`properties="cover-image"` 未命中时读 `<meta name="cover">` 的 `content` 值，到 manifest 里按 `id` 找 href；再加一条「文件名形如 `cover.*` 的图片」兜底，并补 EPUB2 算例单测。
+## EPUB2 封面不支持（M10.6 B3，2026-10-18）——已随 M10.8 解决（2026-10-20）
+- 原问题：`BookMeta` 的封面只认 EPUB3 manifest 里带 `properties="cover-image"` 的项；EPUB2 惯用的 `<meta name="cover" content="<id>"/>` 不识别 → 存量旧书书架只有灰占位。
+- 解决：`EpubParser.pickCoverHref(manifest, epub2CoverId)` 三级回退（EPUB3 `cover-image` → EPUB2 `<meta name="cover">` 按 id 取 href → manifest 中第一个 `media-type` 以 `image/` 开头的 item）；仍无封面（或解码失败）时卡片叠 `coverInitial`（`CoverKeys.initialOf(title)` 取书名首字，空书名 `?`）。
+- 残余：第三级是**启发式**，首图若为出版社 logo 会显示错图 —— 已另立条目「封面第三级回退取首图可能取错」，勿重复排查本节。
 
 ## `covers/` 无自动清理（M10.6 B3，2026-10-18）
 - 现状：`filesDir/covers/` 只写不删——`CoverCache` 提供 `clearAll()` 但无任何调用方；书籍从 `filesDir/books/` 删除后，其 `<key>.jpg` 与 `<key>.json` 永久滞留；缓存键含文件 `length` + `lastModified`，同名文件被替换会产生**新键**，旧键文件成为孤儿。
@@ -726,3 +726,94 @@
 - 现状：`BookItem` 已有 `remote: RemoteBook?`（null = 纯本地书）与 `isDownloaded`，但 `BookGridAdapter` 只渲染「未下载 / 下载中」两个状态徽标，不提示条目的来源根（`remote.root`）与远端路径（`remote.path`）。
 - 影响：多根场景下用户看不出某本书来自哪个根；排查「这本书为什么上传失败 / 为什么服务端改名后没跟随」时缺少可见线索（`ondemand` 根只读、`move` 只对 mirror 根生效，这些约束全靠文档）。
 - 建议：封面占位或标题行下方追加来源徽标（如 `notes` / `ebooks` 的根 tag），长按条目弹出「来源 / 远端路径 / 重新下载 / 从书架移除」；`remote` 一并纳入书架过滤维度（按来源筛选）。同类问题见上文「笔记列表不区分内部/外部来源」（M10.7）——两处建议同一套 UI 方案，避免出现两种来源标注风格。
+
+## `pdfbox-android` 版本停更，上游健壮性修复不会自动带入（M10.8，2026-10-20）
+- 现状：引入的是 `com.tom-roush:pdfbox-android:2.0.27.0`（2023 年，`tom-roush` fork 的**最后一版**）；后续 Apache PDFBox 上游针对不可信输入（畸形 xref / 压缩流炸弹 / 循环引用）的解析健壮性与 CVE 修复不会流入该 artifact。
+- 影响：解析攻击面随时间**只增不减**——用户导入的 PDF 是不受信任输入（可能来自任何来源），而这一层正是最容易被打穿的历史区域；同时无升级路径意味着「修不了」，只能被动回避。
+- 建议：① 订阅上游 PDFBox 安全公告，出现影响 fork 的 CVE 时按「禁用目录/文本提取 + 仅保留 `PdfRenderer` 渲染」降级；② 评估迁移到仍在维护的 `pdfbox-android` 后继（或自建最小 outline 解析器）作为版本升级路径；③ 保持现有的输入闸门（50 MiB / `BoundedInputStream` / 节点与深度预算）不变，任何升级都不得放宽。
+- 触发条件：上游发布 CVE 公告，或需要解析新特性 PDF 时。
+
+## 病态 PDF 可占死主进程 `ioExecutor`，无法强杀（M10.8，2026-10-20）
+- 现状：PDF 目录/文本解析跑在 App **主进程**的 `ioExecutor`（单线程）上；PDFBox 对 `/Next` 成环、超大对象图等病态输入没有强制中断手段，线程无法被强杀。
+- 影响：一份恶意或损坏的 PDF 就能让解析线程长期占死——目录与文本提取永久无响应（UI 不崩但功能假死），且后续复用同一 executor 的其他 IO 会被排队阻塞；用户只能杀应用。
+- 建议：彻底解法是**独立进程解析**（`android:process` 的单独 Service + `IProcessObserver` 兜底超时，超时即 `Process.killProcess`）；轻量方案是给解析线程加软超时（解析前记时间戳 + 解析器提供不了中断点，只能靠「换线程 + 结果丢弃」保护 UI）。
+- 触发条件：解析耗时 > 数秒或用户反馈「PDF 打开后目录/复制文字无反应」。
+
+## `PdfTextExtractorTest.extractsTextFromRealPdfPage` 在纯 JVM 下被跳过（M10.8，2026-10-20）
+- 现状：`pdfbox` 的 glyphlist 等资源放在 AAR 的 `assets/` 里，纯 JVM 单测没有 `PDFBoxResourceLoader.init`，`PDFTextStripper` 取不到字形表 → 该用例用 `assumeTrue` 跳过（测试总数 721 中 1 例 skipped）。
+- 影响：真实 PDF 的文本提取路径**在 CI 上没有自动化覆盖**，只有几何/边界类的纯函数断言；回归可能要到真机才能发现（届时表现为「复制本页文字」得到空串或乱码）。
+- 建议：短期靠真机验收 + 人读覆盖，并在 CHANGELOG/tech-debt 保持这条显式记录；中期补 `androidTest`（仪器化，能 `PDFBoxResourceLoader.init(context)`）把该用例搬过去执行。
+- 触发条件：改动 `PdfTextExtractor` 或升级 pdfbox 版本。
+
+## EPUB 与 PDF 的 tap 单击延迟口径不一致（250ms vs `DoubleTapTimeout`）（M10.8，2026-10-20）
+- 现状：EPUB 用常量 `TAP_TOGGLE_DELAY_MS = 250L`，PDF 用 `ViewConfiguration.getDoubleTapTimeout()`（系统值，通常 300ms 且厂商可调）。
+- 影响：两端「单击响应速度」与「慢双击是否误触发翻页」的边界不同；用户在同一天内切两本书会感到手感不一致，也给后续把 tap 逻辑抽公共实现埋下分叉。
+- 建议：把延迟来源统一为 `ViewConfiguration.getDoubleTapTimeout()`（PDF 侧已验证该口径对「双击切手写」是必需的），EPUB 侧只需把常量换成系统值并补一条单测断言「延迟源来自 ViewConfiguration」。
+- 触发条件：下次触碰 EPUB tap 逻辑时。
+
+## PDF 的 `INITIAL_CHROME_PADDING_DP` 与布局 XML `paddingVertical` 不一致（M10.8，2026-10-20）
+- 现状：`PdfReaderActivity` 的 `INITIAL_CHROME_PADDING_DP = 6` 在 insets 回调里参与浮层初始 padding 计算，而布局 `activity_pdf_reader.xml` 给浮层的 `paddingVertical` 是 2dp / 4dp（既有行为，M10.8 未统一）。
+- 影响：系统栏 insets 生效前后浮层视觉高度会有 2–4dp 的跳变；由于 padding 联动已按「实际 measure 高度」计算，阅读区不会错位，但浮层内容本身的留白在两种状态下不一致（观感细节）。
+- 建议：把 6dp 的常量换成按布局实际 `paddingVertical` 推导（或直接从 `View.getPaddingTop()` 取值），删除重复定义；改动后需真机复核 insets 前后的浮层高度。
+- 触发条件：下次调整 PDF 浮层样式时。
+
+## 封面第三级回退取首图，可能取错（M10.8，2026-10-20）
+- 现状：`EpubParser.pickCoverHref` 的第三级回退是「manifest 中第一个 `media-type` 以 `image/` 开头的 item」，纯启发式，不看文件名、不看尺寸。
+- 影响：首图是出版社 logo / 装饰图的书会显示**错封面**（比没有封面更容易误导用户），且错图会被 `CoverCache` 缓存到磁盘，换书后仍显示旧图。
+- 建议：给第三级加启发式过滤——文件名含 `cover` 的优先，其次排除 `logo` / `spine` / `titlepage` 等关键词；再退一步用「宽高比接近 2:3 且尺寸最大」判定（需要读图片头，成本可控）。也可在书架长按菜单加「更换封面」手动纠正。
+- 触发条件：用户反馈封面张冠李戴时。
+
+## 手写笔参数不跨文档记忆，无「最近使用」（M10.8，2026-10-20）
+- 现状：手写面板的 6 色 × 3 档粗细 × 3 种笔型在打开每个文档时都回到默认值（`PdfInkStore`/`InkOverlayView` 不持久化「当前笔型」），也没有最近使用的快捷位。
+- 影响：习惯用荧光笔做标注的用户每次开书都要重选一遍（3 次点击起），高频操作被重复劳动拖慢；也容易出现「以为还在用荧光笔，实际已回默认钢笔」的误画。
+- 建议：把「上次使用的 color / width / style」存进 `AppPreferences`（非机密层，与阅读字号/翻页模式同级），打开手写模式时恢复；进一步可做「最近使用 3 组」的快捷行。注意这属于**默认值**记忆，不改变 `InkStroke.style` 的 per-stroke 语义（见 `openspec/decisions.md`）。
+- 触发条件：手写使用频率上升或用户明确反馈。
+
+## 阅读内设置面板未做：顶栏「设置」直接跳 `SettingsActivity`（M10.8，2026-10-20）
+- 现状：M10.8 重排后顶栏保留「设置」按钮，点击即 `startActivity(SettingsActivity)`——**离开阅读器**；未做「阅读内浮层设置面板」（字号/翻页模式/主题的就地调节）。
+- 影响：调一次字号就要退出阅读器（当前进度由 `onStop` 推送，虽不丢但会打断阅读心流）；与成熟阅读器「就地调参、实时预览」的体验有明显差距，也是 U3 需求的未完成部分。
+- 建议：新增一个与顶部浮层同构的 `settingsPanel`（overlay + 同一套 `applyContentPadding` 计算），暴露三项最高频设置（字号 / 翻页模式 / 主题）；改动需复用 `AppPreferences` 写入路径并触发「重新加载」而非重启 Activity。
+- 触发条件：用户反馈调参打断阅读时。
+
+## `BookImporter` 导入无大小上限、非原子写入、仍在主线程执行（M10.8，2026-10-20）
+- 现状：`BookImporter` 直接把 `ContentResolver` 的输入流复制到 `booksDir`——没有大小上限（不同于上传侧的 32 MiB 前置拦截）；先写目标文件名而非 `.part` + 原子改名；调用点（`ReaderFragment` 的 `pickImport` 回调）仍在**主线程**上做流拷贝。
+- 影响：① 磁盘满或 provider 中断会留下**残缺文件**，且残缺文件与正常书同扩展名，会被书架扫描后当作坏书（静默跳过或打开失败）；② 拷一个 200 MB 的书足以触发 ANR；③ 无上限意味着一个「误选」的巨型文件可以把存储写满。
+- 建议：参照 `RestClient.downloadFile` 的做法——写 `<name>.part` → `close()` 后 `renameTo` → 异常路径删 `.part`；加大小上限（与上传侧 32 MiB 对齐或另行设定并提示）；拷贝移到后台 executor（`scanExecutor` 或独立线程），完成后回主线程刷新书架。
+- 触发条件：导入大文件或 provider 异常时（ANR / 坏书上报）。
+
+## 手写模式下无法 tap 翻页（M10.8，2026-10-20）
+- 现状：手写模式里 `InkOverlayView` 独占触摸（落笔优先），tap 分区不生效；M10.5 的「浮层上一页/下一页」按钮随 M10.8 工具栏改版一并取消，翻页只剩 `SeekBar` 与点页码。
+- 影响：连续手写批注（例如逐页圈重点）时每翻一页都要退出手写或精准点/拖 `SeekBar`，是手写链路里最明显的效率瓶颈，也容易误触页码输入框。
+- 建议：① 在手写浮层恢复「上一页 / 下一页」两个按钮（不与 tap 冲突，M10.5 已验证可行）；② 手写模式把 tap 分区的左右区改为翻页、中间区仍切浮层（落笔与 tap 用位移/时长阈值区分）；③ 支持「笔写、手指翻」——用 `MotionEvent.getToolType` 区分触控笔与手指（需真机验证设备覆盖）。
+- 触发条件：手写功能被实际用于逐页批注时。
+
+## 目录抽屉：父节点 href 映射不到 spine 时不可跳转（M10.9，2026-10-20）
+- 现状：`TocRows.forEpub` 用 `chapters.indexOfFirst { it.href == node.href }` 定位落点，命中不到的一律 `targetIndex = -1`——包括容器节点（`href` 为 `null`）、指向锚点的 `ch1.xhtml#sec2`、指向非 spine 文件或跨文件目录的 href；`TocAdapter` 对这种行只允许「点标题 = 切换折叠」。
+- 影响：**这是正确行为而非缺陷**——容器节点没有落点，硬跳只会跳到首个匹配项 / 第一页的错位置，比不能跳更糟。代价是用户看到父级标题「点了只是折叠」，需要学习成本；层级深的书父节点多，容易被误判成功能坏了。
+- 建议：① 视觉区分——`targetIndex = -1` 且有子项的行用次要文字色、只留箭头，不给按下态；② 对「同文件不同锚点」的 href 可退化为跳到该文件的对应章（`href.substringBefore('#')` 再匹配），属**可选增强**而非缺陷修复；③ 文档保持显式记录（`docs/android.md` §6.4 已知限制 1），避免后来者把它当 bug 改坏。
+- 触发条件：用户反馈「点父级目录没反应」，或实现锚点精确跳转（WebView 滚动到 fragment）时。
+
+## `EpubBook.tocTree` 让书架扫描每本书多一次 nav/NCX DOM 遍历（M10.9，2026-10-20）
+- 现状：`EpubParser.parse()` 除既有扁平 `toc`（`parseNav` / `parseNcx`）外，还会再读一次 nav（为空再读 NCX）建 `tocTree`——同一份 nav XML 被解析两遍，且 `tocTree` 在书架扫描里完全用不到（只有打开阅读器才需要）。
+- 影响：书架扫描在后台单线程 executor 上跑，单本多一次 DOM 构建（开销小）；但书目上百时首次扫描的累计时间会线性增长，且这份纯为阅读器准备的数据拖慢了本不关心它的书架路径。
+- 建议：改**惰性解析**——`EpubBook` 保留 nav / ncx 路径，`tocTree` 由 `EpubReaderActivity` 打开时按需解析（`EpubParser` 需暴露一个「只解析目录树」的入口）；`CoverCache` 的元数据 JSON 不缓存 `tocTree`（当前也未缓存）。注意 `parse()` 返回时 zip source 已关闭，惰性化必须重开 source，不能靠 `by lazy` 捕获已关闭流。
+- 触发条件：书架首次扫描明显变慢，或书目规模到上百本。
+
+## `EpubParser.buildChapters` 匹配 nav href 时用错 base（`opfDir` vs nav 文档目录）（既存缺陷，M10.9 发现，2026-10-20）
+- 现状：`buildChapters(opf, opfDir, toc)` 以 `opfDir` 作 base 去匹配 `toc` 里 nav 的 href，而 nav 文档里的 href 实际相对 **nav 文档自身目录**。nav 在子目录（如 `OEBPS/text/nav.xhtml`）时，`ch1.xhtml` 被拼成 `OEBPS/OEBPS/text/ch1.xhtml`，匹配失败。
+- 影响：章节标题回退成文件名 / 空标题，连带影响顶栏章节标题、底栏「第 n/N 章」提示、以及 `tocTree` 为空时的 `TocRows.forEpubFlat` 回退列表。**M10.9 新增的 `tocTree` 不受影响**（它在解析层用 nav/ncx 文档目录归一化，见 `docs/android.md` §6.4）。本次未修（超出 M10.9 范围，避免同时动 `parseNav` / `parseNcx` 与目录标题匹配）。
+- 建议：优先方案——`parse()` 把 nav/ncx **文档路径**（含目录）传给 `buildChapters`，与 `parseNavTree` 用同一个 base；更彻底方案——`buildChapters` 直接吃 `tocTree` 的 `(href → title)` 映射，替掉一份重复解析，同时保留「nav 为空回退 NCX」的既有口径。
+- 触发条件：改动 `buildChapters` / nav 解析时，或用户反馈「章节标题变成文件名」。
+
+## `PdfTocEntries.kt` 与 `TocItemText.kt` 改为抽屉后已无生产引用（死代码，M10.9，2026-10-20）
+- 现状：M10.9 把两端目录改为 `TocDrawer` 后，`reader/PdfTocEntries.kt`（PDF 条目构造 + `indexForPage` 当前项定位）与 `reader/TocItemText.kt`（目录行文案 `labels`）在 `main` 里**已无任何调用方**——PDF 侧改走 `PdfOutlineReader` + `TocRows.forPdf`，EPUB 侧改走 `TocRows`。两个文件仍留着，是因为**它们的单测还在跑**（`PdfTocEntriesTest` / `TocItemTextTest`），删源文件就得同时删测试，超出本次「只改文档」的范围。
+- 影响：库里留下两个「活着但没人用」的类——后来者容易误以为它们是当前目录实现而改错地方；单测还在为已废弃行为背书（假绿）。另外 `PdfTocEntries.indexForPage` 的「当前项定位」语义已被 `TocDrawer.show(rows, currentTarget)` 取代，两套定位逻辑并存容易被混用。
+- 建议：一次性清理——删两个源文件 + 两个测试类，把仍值得保留的断言（如「页码目录 1-based 文案 / 0-based 索引」）迁到 `TocRowsTest` / `PdfOutlineReaderTest`（后者已覆盖 `pageDirectory`）。清理前先全局 grep 确认零引用（含 XML 与反射调用）。
+- 触发条件：下次触碰目录相关代码，或做死代码清理时。
+
+## 旋转屏后目录抽屉的展开态与滚动位置丢失（M10.9，2026-10-20）
+- 现状：抽屉的 `expanded`（展开节点 id 集合）与 `currentTarget` 只存在 `TocDrawer` 实例里；旋转重建 Activity 后 `TocDrawer` 重新构造，展开态回到「只展开当前项祖先链」，抽屉本身也是关闭的。
+- 影响：横竖屏切换（或 `uiMode` 变化触发的重建）后要继续在深目录里找条目，得重新点「目录」再一路展开；多层目录的书上这是可感知的重复劳动。功能不丢（重开后仍定位到当前章 / 页），属体验损失。
+- 建议：① 轻量方案——`onSaveInstanceState` 存 `expanded` 集合与「抽屉是否打开」，重建后重放；② 更彻底——把展开态提升到 `ViewModel`（纯 UI 状态，与书 / 页无关），配置变更天然存活；③ 若采纳 ②，顺手把「打开时滚动到当前项」也纳入同一状态，避免重开后跳回顶部。
+- 触发条件：用户反馈旋转后目录难用，或下次改阅读器的配置变更处理时。
+
