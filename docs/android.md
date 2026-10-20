@@ -100,6 +100,7 @@
 | 顶部浮层 | `←` 返回 / 章节标题 / 批注 / 目录 / 设置 | `←` 返回 / 文件名 / 手写 / 批注 / 目录 / 设置 |
 | 底部浮层 | 章节 `SeekBar` + **可点击**的「第 n/N 章」 | 页 `SeekBar` + **可点击**页码 |
 
+- **进入阅读默认隐藏两块浮层（沉浸）**：打开阅读器时不显示顶栏 / 底栏，正文铺满（上下 padding 为 0）；**点屏幕中央**（§6.2 的 `TOGGLE` 区）调出，再点中央收起；**退出**阅读用系统返回键（`←` 在浮层内，浮层隐藏时不可见）。只隐藏**应用内浮层**——系统状态栏 / 导航栏仍可见（未做系统栏 immersive，见 §6.7 第 12 条）。
 - 底部「第 n/N 章」/ 页码可点击 → 输入章号 / 页号直接跳转（非法输入只提示，不跳转）；`SeekBar` 拖动中不跳、松手才跳。
 - 「设置」跳既有 `settings/SettingsActivity`（M10.8 未做阅读内浮层设置面板，见 §6.7）。
 - **M10.8 删除的控件**：EPUB 的 `prevChapterButton` / `nextChapterButton`、PDF 的 `pdfPrevPageButton` / `pdfNextPageButton`——翻页改由 tap 分区（§6.2）与 `SeekBar` 承担。
@@ -221,7 +222,8 @@
 
 - **笔型**：`InkStyle { PEN, MARKER, HIGHLIGHTER }`（`@Serializable`）；`InkStroke` 新增 `style` 字段且默认 `PEN`，旧 JSON 无需迁移；`PdfInkStore.defaultJson()` 加 `coerceInputValues = true`（未知笔型回退默认值，不因脏数据整份丢弃）。
 - **渲染**（`InkOverlayView`）：线宽倍率 1× / 2.2× / 3.5×，不透明度 255 / 170 / 90。**设定顺序有要求**：`Paint.setColor` 之后必须再设 `setAlpha`，否则颜色自带 alpha 会覆盖笔型的不透明度。
-- **手写面板**（布局 `activity_pdf_reader.xml` 的 `inkPanel`，在 PDF 顶部浮层内、仅手写模式显示）：6 色 × 3 档粗细（归一化 0.0025 / 0.004 / 0.007）× 3 种笔型；选中态用 alpha 1.0 / 0.35 区分；面板分「颜色行 / 粗细行 / 笔型行」三行，避免 360dp 屏横向溢出。
+- **手写面板**（`activity_pdf_reader.xml` 的 `inkPanel`，仅手写模式显示）：参数面板是**屏幕右侧竖排浮动条**，宽 **96dp**、`layout_gravity="end|center_vertical"`（`R.id.content` 上覆一层，独立于顶部浮层），含 `✕`（退出手写）/ 撤销 / 清空 与 6 色 × 3 档粗细（归一化 0.0025 / 0.004 / 0.007）× 3 种笔型；选中态用 alpha 1.0 / 0.35 区分。**面板不属于顶部浮层**，故不计入 `ReaderChrome` / `applyContentPadding` 的浮层高度——不影响顶部栏高度，也不改变阅读区 padding。`c4a76d3` 之前该面板横排在顶栏内（分「颜色行 / 粗细行 / 笔型行」三行以避开 360dp 屏横向溢出），竖排后宽度固定、条数随内容纵向增长。
+- **手写条覆盖正文右缘**：96dp 在实测设备（`24091RPADC`，density 2.75）为 **264px**，手写模式下这条带内的正文不可书写（未做右侧留白），见 §6.7 第 10 条。
 - **进入 / 退出**：双击阅读区，或顶栏「手写」按钮；手写模式下单击**不翻页**（落笔优先）。
 - **长按菜单**：复制本页文字（`PDFTextStripper` 提取当前页，写入剪贴板前截断到 10 万字符，防 binder 事务超限）/ 高亮标注 / 进入手写。
 
@@ -235,6 +237,10 @@
 6. PDF 的 `INITIAL_CHROME_PADDING_DP = 6` 与布局 XML 的 `paddingVertical`（2dp / 4dp）不一致（既有行为，未随 M10.8 统一）。
 7. ~~EPUB 目录无层级（`TocEntry` 无 `depth`）~~ **已随 M10.9 解决**（`EpubBook.tocTree` + 树形抽屉，见 §6.4）；抽屉的展开态不跨旋转保存（M10.9 已知限制）。`SeekBar` 在章 / 页数很大时精度不足（一像素跨多项），故保留输入框兜底。
 8. PDF 解析的健壮性与主线程风险见 `openspec/tech-debt.md`：`pdfbox-android` 版本停在 2023、病态 PDF 可占死 `ioExecutor`、`PdfTextExtractor` 的真实 PDF 分支纯 JVM 下被 `assumeTrue` 跳过。
+9. **退出手写后的第一次单击不弹工具栏**：点 `✕` 退出手写后，第一次单击屏幕中央无反应，第二次才调出浮层。疑为模式切换瞬间触摸事件被 `InkOverlayView` 消费的时序问题，**尚未定位**（见 tech-debt）。
+10. **右侧手写条覆盖正文右缘**：面板宽 96dp（实测设备 264px），手写模式下这条纵向带内的正文被遮挡且不可书写；当前未做右侧留白。
+11. **手写条「荧光笔」文案颜色存疑**：截图中该项文字呈灰色（其余「钢笔 / 马克笔」为白色），未确认是选中态渲染还是刷新时机导致，**未验证**（见 tech-debt）。
+12. **沉浸只到应用内浮层**：进入阅读器时上下浮层隐藏，但**系统状态栏仍可见**——未做 `WindowInsetsController` 的系统栏 immersive 隐藏（阅读区靠 insets 避让，不与系统栏重叠）。
 
 
 ## 7. 书架（M10.6 B3）

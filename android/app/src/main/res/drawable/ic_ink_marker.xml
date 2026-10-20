@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 手写工具栏笔型图标：马克笔（border_color 造型：斜笔杆 + 底部色条，与荧光笔造型可区分） -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M17.75,7L14,3.25l-10,10V17h3.75l10,-10zM6.35,15.35l-1.1,-1.1L14,5.5l1.1,1.1 -8.75,8.75zM2,20h20v2H2z" />
+</vector>

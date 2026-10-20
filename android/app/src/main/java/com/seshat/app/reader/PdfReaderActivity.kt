@@ -4,6 +4,8 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.graphics.Color
+import android.graphics.drawable.GradientDrawable
 import android.graphics.pdf.PdfRenderer
 import android.net.Uri
 import android.os.Build
@@ -20,6 +22,7 @@ import android.view.ViewConfiguration
 import android.view.ViewGroup
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
@@ -48,6 +51,7 @@ import java.io.File
 import java.io.IOException
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import kotlin.math.roundToInt
 
 /**
  * PDF 阅读器（M3.3 MVP / M9.2 支持竖向连续滚动）。
@@ -56,8 +60,9 @@ import java.util.concurrent.Executors
  * 逐页渲染为 Bitmap，交由 [PdfPageAdapter] 在 [RecyclerView] 中显示。
  * 界面与 EPUB 侧同构（M10.8）：**顶部工具栏浮层**（返回 / 文件名 / 手写 / 批注 / 目录 / 设置）
  * + **底部进度浮层**（[SeekBar] + [TextView] 显示「当前页 / 总页数」，B2d：进度条拖动松手跳页、
- * 页码可点输入跳页），两块都是 overlay，不占布局；**手写工具栏**是屏幕右侧的竖排浮动条
- * （颜色 / 粗细 / 笔型 / 撤销 / 清空 / 退出），仅手写模式显示，独立于顶部浮层。
+ * 页码可点输入跳页），两块都是 overlay，不占布局；**手写工具栏**是屏幕右侧 56dp 的单列图标条
+ * （退出 / 颜色（主 3 色 + 更多可展开）/ 粗细 / 笔型 / 撤销 / 清空），仅手写模式显示，
+ * 独立于顶部浮层。
  * 阅读区（[RecyclerView]）的**上下** padding 都随对应浮层的**可见性**与实时高度联动
  * （可见时预留浮层高度、隐藏时归零）且 `clipToPadding = false`（B2e），故页尾/页首内容
  * 不会被叠加的浮层遮挡，沉浸阅读时也不会在两端留下空白。
@@ -73,7 +78,8 @@ import java.util.concurrent.Executors
  * - 阅读进度 → [PdfProgressStore]，键 `pdf_progress_<key>`。
  * - 批注     → [PdfAnnotationStore]，键 `pdf_annotations_<key>`。
  * - 笔迹     → [PdfInkStore]，键 `pdf_ink_<key>`。
- * 三者共用 `SharedPreferences("pdf_reader")`，与 epub 侧键空间隔离；
+ * - 书签     → [PdfBookmarkStore]，键 `pdf_bookmark_<key>`。
+ * 四者共用 `SharedPreferences("pdf_reader")`，与 epub 侧键空间隔离；
  * `<key>` 为服务端 uid（有则用）或 uri 字符串（无则退回）。
  */
 class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
@@ -176,6 +182,9 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
     private lateinit var annotationStore: PdfAnnotationStore
     private lateinit var inkStore: PdfInkStore
 
+    /** 书签存储（M10.10）：与进度/批注/笔迹共用 pdf_reader prefs。 */
+    private lateinit var bookmarkStore: PdfBookmarkStore
+
     /** 顶部工具栏浮层（返回/文件名/手写/批注/目录/设置）：与 [bottomChrome] 同步显隐。 */
     private lateinit var topChrome: View
 
@@ -188,13 +197,17 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
     /** 目录抽屉（M10.9）。 */
     private lateinit var tocDrawer: TocDrawer
 
-    // 浮层上的按钮都是 TextView（本项目无 ViewBinding，按钮外观由布局的 background/文字属性承担）。
+    // 顶栏按钮仍是 TextView；手写工具栏（M10.10 改版）改为纯图标 ImageView，
+    // 外观由布局的 background / src / padding 承担（本项目无 ViewBinding）。
     private lateinit var inkToggleButton: TextView
-    private lateinit var inkUndoButton: TextView
-    private lateinit var inkClearButton: TextView
+    private lateinit var inkUndoButton: ImageView
+    private lateinit var inkClearButton: ImageView
+
+    /** 顶栏书签按钮（M10.10）：图标随当前页是否有书签在实心/空心间切换。 */
+    private lateinit var bookmarkButton: ImageView
 
     /** 右侧手写工具栏的「退出手写」按钮（等价于顶栏【手写】开关）。 */
-    private lateinit var inkExitButton: TextView
+    private lateinit var inkExitButton: ImageView
 
     /** 手写模式开关（旋转经 savedInstanceState 恢复）。 */
     private var inkEnabled: Boolean = false
@@ -207,6 +220,9 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
 
     /** 当前笔型。 */
     private var inkStyle: InkStyle = InkStyle.PEN
+
+    /** 右侧手写条是否展开「更多颜色」（会话内状态，不持久化；每次进入手写模式重置为折叠）。 */
+    private var inkColorsExpanded: Boolean = false
 
     /** 手写工具栏（屏幕右侧竖排浮动条，仅手写模式显示）。 */
     private lateinit var inkPanel: View
@@ -240,12 +256,17 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
         topChrome = findViewById(R.id.pdfTopChrome)
         bottomChrome = findViewById(R.id.pdfBottomChrome)
         topTitleView = findViewById(R.id.pdfTopTitle)
+        bookmarkButton = findViewById(R.id.pdfBookmarkButton)
         inkToggleButton = findViewById(R.id.pdfInkToggleButton)
         inkUndoButton = findViewById(R.id.pdfInkUndoButton)
         inkClearButton = findViewById(R.id.pdfInkClearButton)
         // 手写工具栏（屏幕右侧竖排浮动条）：必须先于 updateInkChrome() 初始化
         // （该方法会按手写模式切它的显隐）。
         inkPanel = findViewById(R.id.inkPanel)
+        inkPanel.background = GradientDrawable().apply {
+            cornerRadius = 10 * resources.displayMetrics.density
+            setColor(0xE6000000.toInt())
+        }
         inkExitButton = findViewById(R.id.inkExitButton)
         setupInkPanel()
 
@@ -323,6 +344,12 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
             keys = { prefs.all.keys },
             remove = { key -> prefs.edit().remove(key).apply() },
         )
+        bookmarkStore = PdfBookmarkStore(
+            read = { prefs.getString(it, null) },
+            write = { key, value -> prefs.edit().putString(key, value).apply() },
+            keys = { prefs.all.keys },
+            remove = { key -> prefs.edit().remove(key).apply() },
+        )
         // 旧键一次性清理（三个 store 共用 pdf_reader prefs，故共用一个标记）
         clearLegacyOnce()
 
@@ -333,6 +360,7 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
             startActivity(Intent(this, SettingsActivity::class.java))
         }
         inkToggleButton.setOnClickListener { toggleInk() }
+        bookmarkButton.setOnClickListener { toggleBookmark() }
         inkUndoButton.setOnClickListener { undoInk() }
         inkClearButton.setOnClickListener { clearInk() }
         // 页码可点：输入页号直接跳页（B2d），与 EPUB 侧「点标题跳章」同一套交互。
@@ -397,6 +425,8 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
         updateIndicator(startPage)
         adapter?.preload(startPage)
         updateInkChrome()
+        // 初始定位也要刷一次书签图标（updateCurrentPage 会因 lastReportedPage 已同步而提前返回）
+        refreshBookmarkButton()
 
         // Store 与 docId 均就绪后再装配同步（内部三条守卫，任一不满足即完全跳过网络）。
         // 放在恢复进度之后：拉取只会写本地 Store，不会打断已完成的定位。
@@ -643,6 +673,8 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
         adapter?.preload(position)
         // 页面切换后「撤销 / 清除本页」的可见性要跟着当前页的笔迹状态变化。
         updateInkChrome()
+        // 顶栏书签图标跟随当前页：翻页后实心/空心要切换。
+        refreshBookmarkButton()
     }
 
     private fun updateIndicator(position: Int) {
@@ -782,6 +814,51 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
         toast(getString(R.string.pdf_annotation_saved, annotationStore.count(docId)))
     }
 
+    // ---- 书签（M10.10）----
+
+    /** 当前页有书签则取消，否则添加（标题固定为「第 N 页」，1-based）。 */
+    private fun toggleBookmark() {
+        if (!::bookmarkStore.isInitialized) return
+        val page = firstVisiblePage()
+        if (bookmarkStore.has(docId, page)) {
+            bookmarkStore.remove(docId, page)
+            toast(getString(R.string.pdf_bookmark_removed))
+        } else {
+            val added = bookmarkStore.add(
+                docId,
+                PdfBookmark(page = page, title = "第 ${page + 1} 页", createdAt = System.currentTimeMillis()),
+            )
+            if (added) toast(getString(R.string.pdf_bookmark_added))
+        }
+        refreshBookmarkButton()
+    }
+
+    /**
+     * 顶栏书签图标随当前页是否已有书签切换实心/空心。
+     *
+     * 调用点：翻页（[updateCurrentPage]）、初始定位、顶栏点击后、抽屉内增删后。
+     * 只在「页发生变化」时被触发（[updateCurrentPage] 对同页提前返回），故每次一次 JSON 读
+     * （[PdfBookmarkStore.list] 解析开销小、书签量级低）不会成为滚动热路径上的负担。
+     */
+    private fun refreshBookmarkButton() {
+        if (!::bookmarkButton.isInitialized || !::bookmarkStore.isInitialized) return
+        val has = bookmarkStore.has(docId, firstVisiblePage())
+        bookmarkButton.setImageResource(
+            if (has) R.drawable.ic_bookmark_filled else R.drawable.ic_bookmark_outline,
+        )
+    }
+
+    /** 抽屉里的「增加新书签」：把当前页加入并刷新抽屉（保持书签标签页可见）。 */
+    private fun onAddBookmarkFromDrawer() {
+        val page = firstVisiblePage()
+        bookmarkStore.add(
+            docId,
+            PdfBookmark(page = page, title = "第 ${page + 1} 页", createdAt = System.currentTimeMillis()),
+        )
+        refreshBookmarkButton()
+        loadAndShowToc()
+    }
+
     // ---- PdfInkHost ----
 
     override fun inkStrokes(page: Int): List<InkStroke> = inkStore.strokes(docId, page)
@@ -802,16 +879,34 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
      * 进入/退出有两条路径（M10.8）：顶栏「手写」按钮（本方法）、阅读区**双击**（见 [installTapPaging]）；
      * 手写模式下长按不弹菜单（落笔优先）。
      *
-     * 开启后落笔优先占用点击与滑动（见 [installTapPaging]），故此时翻页改由底部进度条
-     * 与「点页码输入页号」承担——原「手写时显示翻页按钮」的做法随工具栏改版取消（M10.8）。
+     * 开启后落笔优先占用点击与滑动（见 [installTapPaging]），故此时翻页改由阅读区滑动与双击退出
+     * 手写后的底部进度条承担——原「手写时显示翻页按钮」的做法随工具栏改版取消（M10.8）。
+     *
+     * 进入手写时 [topChrome] 与 [bottomChrome] 一并隐藏（书写要整屏、浮层既挡内容又易误触），
+     * 退出手写恢复显示并重算阅读区 padding；手写态的退出入口是面板上的 [inkExitButton]。
      */
     private fun toggleInk() {
         inkEnabled = !inkEnabled
+        // 每次进入手写模式都是精简态：颜色折叠回「主 3 色」（更多颜色需再次展开）
+        if (inkEnabled) {
+            inkColorsExpanded = false
+            findViewById<View>(R.id.inkColorsExtra).visibility = View.GONE
+        }
         adapter?.setInkEnabled(inkEnabled)
         adapter?.setInkColor(inkColor)
         adapter?.setInkWidth(inkWidth)
         adapter?.setInkStyle(inkStyle)
+        // 手写时隐藏上下浮层：书写要整屏空间，工具栏留在屏上既挡内容又容易误触
+        val chromeVisibility = if (inkEnabled) View.GONE else View.VISIBLE
+        topChrome.visibility = chromeVisibility
+        bottomChrome.visibility = chromeVisibility
+        applyContentPadding()
         updateInkChrome()
+        // 浮层 GONE→VISIBLE 时 height 仍为 0（applyContentPadding 会提前返回），布局后再补一次
+        topChrome.post { applyContentPadding() }
+        // 重置后再刷一次选中态：若当前色属于「更多颜色」，会按 refreshInkPanelSelection 的
+        // 自动展开逻辑重新展开该组，保证折叠态下也能看到当前色标（P1 遗留）
+        refreshInkPanelSelection()
         toast(getString(if (inkEnabled) R.string.pdf_ink_toggle_on else R.string.pdf_ink_toggle))
     }
 
@@ -849,25 +944,39 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
         applyContentPadding()
     }
 
-    /** 手写工具栏的点击接线（退出 / 颜色 / 粗细 / 笔型），选中的控件用 alpha 区分。 */
+    /** 手写工具栏的点击接线（退出 / 更多颜色 / 颜色 / 粗细 / 笔型），选中的控件用 alpha 区分。 */
     private fun setupInkPanel() {
         inkExitButton.setOnClickListener {
             // 退出手写：面板随后由 updateInkChrome() 一并隐藏
             if (inkEnabled) toggleInk()
         }
+        findViewById<View>(R.id.inkMoreButton).setOnClickListener {
+            inkColorsExpanded = !inkColorsExpanded
+            findViewById<View>(R.id.inkColorsExtra).visibility =
+                if (inkColorsExpanded) View.VISIBLE else View.GONE
+        }
         val colors = mapOf(
             R.id.inkColorRed to 0xFFE53935.toInt(),
             R.id.inkColorBlue to 0xFF1E88E5.toInt(),
             R.id.inkColorGreen to 0xFF43A047.toInt(),
-            R.id.inkColorBlack to 0xFF212121.toInt(),
+            R.id.inkColorBlack to 0xFF424242.toInt(),
             R.id.inkColorOrange to 0xFFFB8C00.toInt(),
             R.id.inkColorPurple to 0xFF8E24AA.toInt(),
         )
+        val borderPx = (1.5f * resources.displayMetrics.density).roundToInt()
         colors.forEach { (id, color) ->
-            findViewById<View>(id).setOnClickListener {
-                inkColor = color
-                adapter?.setInkColor(color)
-                refreshInkPanelSelection()
+            findViewById<View>(id).apply {
+                background = GradientDrawable().apply {
+                    shape = GradientDrawable.OVAL
+                    setColor(color)
+                    // 白色半透明描边：黑色色点在深色面板上也可见（真机截图曾整块消失）
+                    setStroke(borderPx, 0x99FFFFFF.toInt())
+                }
+                setOnClickListener {
+                    inkColor = color
+                    adapter?.setInkColor(color)
+                    refreshInkPanelSelection()
+                }
             }
         }
         val widths = mapOf(
@@ -897,43 +1006,59 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
         refreshInkPanelSelection()
     }
 
-    /** 刷新面板选中态：选中的不透明、未选中的半透明（比自绘边框省事且不依赖 drawable）。 */
+    /**
+     * 刷新面板选中态。
+     *
+     * 两类控件区分处理（M10.10 改成 56dp 图标条后，纯 alpha 的辨识度不够）：
+     * - **颜色点**：保持 alpha 方案（选中 1.0 / 未选 0.55），不额外加边框；
+     * - **图标按钮**（粗细 / 笔型，现为 [ImageView]）：选中 alpha 1.0 + 浅色高亮底块
+     *   `#33FFFFFF`，未选中 alpha 0.45 + 透明底。高亮底会覆盖布局里的
+     *   `selectableItemBackground`，属已知取舍（点击反馈由未选中态的底/水波纹承担）。
+     */
     private fun refreshInkPanelSelection() {
         if (!::inkPanel.isInitialized) return
-        val selected = buildSet {
-            add(
-                when (inkColor) {
-                    0xFF1E88E5.toInt() -> R.id.inkColorBlue
-                    0xFF43A047.toInt() -> R.id.inkColorGreen
-                    0xFF212121.toInt() -> R.id.inkColorBlack
-                    0xFFFB8C00.toInt() -> R.id.inkColorOrange
-                    0xFF8E24AA.toInt() -> R.id.inkColorPurple
-                    else -> R.id.inkColorRed
-                },
-            )
-            add(
-                when {
-                    inkWidth <= 0.003f -> R.id.inkWidthThin
-                    inkWidth >= 0.006f -> R.id.inkWidthThick
-                    else -> R.id.inkWidthMedium
-                },
-            )
-            add(
-                when (inkStyle) {
-                    InkStyle.PEN -> R.id.inkStylePen
-                    InkStyle.MARKER -> R.id.inkStyleMarker
-                    InkStyle.HIGHLIGHTER -> R.id.inkStyleHighlighter
-                },
-            )
+        val selectedColorId = when (inkColor) {
+            0xFF1E88E5.toInt() -> R.id.inkColorBlue
+            0xFF43A047.toInt() -> R.id.inkColorGreen
+            0xFF424242.toInt() -> R.id.inkColorBlack
+            0xFFFB8C00.toInt() -> R.id.inkColorOrange
+            0xFF8E24AA.toInt() -> R.id.inkColorPurple
+            else -> R.id.inkColorRed
         }
-        val all = listOf(
+        // 选中的是「更多颜色」里的色时自动展开该组，否则折叠状态下看不到当前色标
+        val extraIds = setOf(R.id.inkColorGreen, R.id.inkColorOrange, R.id.inkColorPurple)
+        if (selectedColorId in extraIds && !inkColorsExpanded) {
+            inkColorsExpanded = true
+            findViewById<View>(R.id.inkColorsExtra).visibility = View.VISIBLE
+        }
+        val selectedWidthId = when {
+            inkWidth <= 0.003f -> R.id.inkWidthThin
+            inkWidth >= 0.006f -> R.id.inkWidthThick
+            else -> R.id.inkWidthMedium
+        }
+        val selectedStyleId = when (inkStyle) {
+            InkStyle.PEN -> R.id.inkStylePen
+            InkStyle.MARKER -> R.id.inkStyleMarker
+            InkStyle.HIGHLIGHTER -> R.id.inkStyleHighlighter
+        }
+        val colorIds = listOf(
             R.id.inkColorRed, R.id.inkColorBlue, R.id.inkColorGreen, R.id.inkColorBlack,
             R.id.inkColorOrange, R.id.inkColorPurple,
+        )
+        colorIds.forEach { id ->
+            findViewById<View>(id).alpha = if (id == selectedColorId) 1f else 0.55f
+        }
+        val iconIds = listOf(
             R.id.inkWidthThin, R.id.inkWidthMedium, R.id.inkWidthThick,
             R.id.inkStylePen, R.id.inkStyleMarker, R.id.inkStyleHighlighter,
         )
-        all.forEach { id ->
-            findViewById<View>(id).alpha = if (id in selected) 1f else 0.35f
+        iconIds.forEach { id ->
+            // 粗细与笔型各有一项选中，两组互不影响
+            val selected = id == selectedWidthId || id == selectedStyleId
+            findViewById<View>(id).apply {
+                alpha = if (selected) 1f else 0.45f
+                setBackgroundColor(if (selected) 0x33FFFFFF else Color.TRANSPARENT)
+            }
         }
     }
 
@@ -1215,17 +1340,30 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
     }
 
     /**
-     * 打开目录抽屉（M10.9）。
+     * 顶栏「目录」入口：抽屉已开则关闭（toggle），否则加载并显示。
      *
-     * 数据链：书签树（PdfBox 解析，后台线程）→ [TocRows.forPdf]（行模型）→ [TocDrawer]（树形抽屉）。
-     * 无书签的书回退「第 N 页」页码目录（[PdfOutlineReader.pageDirectory] 转成同构的树节点）。
+     * 拆成两个方法的原因：抽屉内的「增加书签 / 删除书签」需要**刷新已打开的抽屉**
+     * （见 [loadAndShowToc]），若直接调本方法会被 toggle 逻辑挡住（开着 → 关掉）。
      */
     private fun showPdfToc() {
-        if (tocLoading) return
         if (::tocDrawer.isInitialized && tocDrawer.isShowing) {
             tocDrawer.hide()
             return
         }
+        loadAndShowToc()
+    }
+
+    /**
+     * 加载目录（后台解析）+ 书签列表并显示抽屉（不判断「是否已开」）。
+     *
+     * 数据链：书签树（PdfBox 解析，后台线程）→ [TocRows.forPdf]（行模型）→ [TocDrawer]（树形抽屉）。
+     * 无书签的书回退「第 N 页」页码目录（[PdfOutlineReader.pageDirectory] 转成同构的树节点）。
+     *
+     * 本方法同时服务于「首次打开」与「书签增删后刷新」两个场景：TocDrawer 不持有书签列表，
+     * 增删后必须重开一次才能反映新数据（见 TocDrawer.show 的「已显示则不做入场动画」）。
+     */
+    private fun loadAndShowToc() {
+        if (tocLoading) return
         val uri = pdfUri
         if (uri == null) {
             toast(getString(R.string.reader_toc_empty))
@@ -1234,6 +1372,7 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
         tocLoading = true
         val pageCount = lastPage + 1
         val currentPage = firstVisiblePage()
+        val bookmarks = bookmarkStore.list(docId)
         ioExecutor.execute {
             val outline = runCatching { readOutline(uri) }.getOrDefault(emptyList())
             // 无书签 → 回退页码目录：把 FlatOutlineItem 转成同构树节点，复用同一套行模型
@@ -1248,7 +1387,22 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
                 if (rows.isEmpty()) {
                     toast(getString(R.string.reader_toc_empty))
                 } else {
-                    tocDrawer.show(rows, currentPage)
+                    tocDrawer.show(
+                        allRows = rows,
+                        currentTarget = currentPage,
+                        statusLine = getString(
+                            R.string.pdf_toc_status,
+                            currentPage + 1, pageCount, bookmarks.size,
+                        ),
+                        bookmarks = bookmarks,
+                        onBookmarkAdd = { onAddBookmarkFromDrawer() },
+                        onBookmarkDelete = { bookmark ->
+                            bookmarkStore.remove(docId, bookmark.page)
+                            refreshBookmarkButton()
+                            // 抽屉不持有列表：删除后重新加载并刷新（保持当前标签页）
+                            loadAndShowToc()
+                        },
+                    )
                 }
             }
         }
@@ -1286,6 +1440,7 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
         progressStore.clearLegacy()
         annotationStore.clearLegacy()
         inkStore.clearLegacy()
+        bookmarkStore.clearLegacy()
         prefs.edit().putBoolean(LegacyKeys.CLEARED_FLAG, true).apply()
     }
 

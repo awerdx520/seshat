@@ -2,6 +2,9 @@ package com.seshat.app.reader
 
 import com.tom_roush.pdfbox.cos.COSDictionary
 import com.tom_roush.pdfbox.pdmodel.PDDocument
+import com.tom_roush.pdfbox.pdmodel.interactive.action.PDActionGoTo
+import com.tom_roush.pdfbox.pdmodel.interactive.documentnavigation.destination.PDDestination
+import com.tom_roush.pdfbox.pdmodel.interactive.documentnavigation.destination.PDNamedDestination
 import com.tom_roush.pdfbox.pdmodel.interactive.documentnavigation.destination.PDPageDestination
 import com.tom_roush.pdfbox.pdmodel.interactive.documentnavigation.outline.PDOutlineItem
 import java.io.File
@@ -55,6 +58,9 @@ internal object PdfOutlineReader {
 
     /** 书签树递归深度上限：防畸形 PDF 造成栈溢出（`StackOverflowError` 不属于 `RuntimeException`）。 */
     private const val MAX_DEPTH: Int = 64
+
+    /** 命名目标（`PDNamedDestination`）链式解析深度上限：防「A 指向 B、B 指向 A」的命名环。 */
+    private const val MAX_NAMED_DEST_DEPTH: Int = 8
 
     /**
      * 节点预算：一次 [read] 内所有分支共享的可变计数（DFS 顺序扣减）。
@@ -165,7 +171,7 @@ internal object PdfOutlineReader {
         if (roots.isEmpty()) return emptyList()
         val pageIndex = buildPageIndex(doc)
         val budget = NodeBudget()
-        return roots.mapNotNull { convertItem(it, pageIndex, 0, budget) }
+        return roots.mapNotNull { convertItem(it, doc, pageIndex, 0, budget) }
     }
 
     /**
@@ -183,10 +189,12 @@ internal object PdfOutlineReader {
     /**
      * 把 PDF 书签节点递归转换为 [PdfOutlineItem]。
      *
+     * @param document 用于解析命名目标（`PDNamedDestination`）——命名目标只在文档 catalog 里查得到
      * @param budget 全局节点预算（深度优先顺序扣减）；耗尽后返回 `null`（父项保留，子树被截断）
      */
     private fun convertItem(
         item: PDOutlineItem,
+        document: PDDocument,
         pageIndex: Map<COSDictionary, Int>,
         depth: Int,
         budget: NodeBudget,
@@ -196,29 +204,79 @@ internal object PdfOutlineReader {
         // 节点预算耗尽：截断剩余子树，避免海量书签撑爆内存
         if (budget.remaining <= 0) return null
         budget.remaining--
-        val children = item.children().mapNotNull { convertItem(it, pageIndex, depth + 1, budget) }
+        val children = item.children().mapNotNull {
+            convertItem(it, document, pageIndex, depth + 1, budget)
+        }
         return PdfOutlineItem(
             title = item.title ?: "",
-            pageIndex = resolvePageIndex(item, pageIndex),
+            // `PDOutlineItem.getDestination()` 声明 throws IOException（目标可能是命名目标），
+            // 单个书签失败不应毁掉整棵树，故在调用点收敛
+            pageIndex = runCatching {
+                resolvePage(outlineDestination(item), document, pageIndex)
+            }.getOrDefault(UNKNOWN_PAGE_INDEX),
             children = children,
         )
     }
 
     /**
-     * 解析书签目标页码；非页目标（URI 链接、命名目标）或解析失败 → [UNKNOWN_PAGE_INDEX]。
+     * 取书签声明的目标（两种写法都要看）。
      *
-     * `PDOutlineItem.getDestination()` 声明 `throws IOException`（目标可能是命名目标），
-     * 单个书签失败不应毁掉整棵树，故用 [runCatching] 局部收敛。
+     * 书签的目标有两种等价写法，规范里都合法，真实 PDF 各有大量使用：
+     * - `/Dest <目标>` —— 直接页引用或命名目标；
+     * - `/A << /S /GoTo /D <目标> >>` —— 「跳转动作」，Word / LaTeX(hyperref) 导出普遍是这种。
+     *
+     * [PDOutlineItem.getDestination] **只读 `/Dest`**，对这种书签恒为 `null`（实测：本文档
+     * 《The Art of Linear Algebra》6 条章节全部是 `/A /S /GoTo /D (section.N)`，无 `/Dest`），
+     * 所以必须再回退到 [PDOutlineItem.getAction] 里的 [PDActionGoTo]。
+     *
+     * @return 目标；两种写法都没有、或动作不是跳转 → `null`（上游视为解析失败）
      */
-    private fun resolvePageIndex(
-        item: PDOutlineItem,
+    private fun outlineDestination(item: PDOutlineItem): PDDestination? {
+        val direct = runCatching { item.destination }.getOrNull()
+        if (direct != null) return direct
+        val action = runCatching { item.action }.getOrNull()
+        return runCatching { (action as? PDActionGoTo)?.destination }.getOrNull()
+    }
+
+    /**
+     * 解析书签目标页。
+     *
+     * 书签目标可能是**直接页引用**（[PDPageDestination]），也可能是**命名目标**
+     * （[PDNamedDestination]，例如 `/Dest /chapter3`）——后者要先在文档 catalog 的名称树
+     * （`/Names /Dests`，老 PDF 还可能是 `/Dests`）里把名字解析成目标，再取页。
+     * 命名目标还可能再次指向另一个命名目标，故递归解析并限制深度防环。
+     *
+     * 命名目标的解析复用 PdfBox 现成的
+     * [com.tom_roush.pdfbox.pdmodel.PDDocumentCatalog.findNamedDestinationPage]——
+     * 它同时覆盖 `/Names /Dests` 名称树与 legacy `/Dests` 字典两种存放方式
+     * （pdfbox-android 2.0.27.0 的 `PDDocumentCatalog` **没有** `getNamedDestinations()`，
+     * 只有 `getNames().getDests()` 名称树 + `getDests()` 字典 + 这个组合查找方法）。
+     *
+     * 返回值约定：解析不出来一律 [UNKNOWN_PAGE_INDEX]，**绝不抛异常**（异常在内部收敛）。
+     *
+     * @param depth 命名目标链式解析深度，超过 [MAX_NAMED_DEST_DEPTH] 即放弃（防命名环）
+     */
+    private fun resolvePage(
+        destination: PDDestination?,
+        document: PDDocument,
         pageIndex: Map<COSDictionary, Int>,
+        depth: Int = 0,
     ): Int {
-        val destination = runCatching { item.destination as? PDPageDestination }.getOrNull()
-            ?: return UNKNOWN_PAGE_INDEX
-        val page = runCatching { destination.page }.getOrNull() ?: return UNKNOWN_PAGE_INDEX
-        pageIndex[page.cosObject]?.let { return it }
-        // 身份表未命中（极少见）：退回 PdfBox 原生查找，代价 O(n)
-        return runCatching { destination.retrievePageNumber() }.getOrDefault(UNKNOWN_PAGE_INDEX)
+        if (destination == null) return UNKNOWN_PAGE_INDEX
+        if (depth > MAX_NAMED_DEST_DEPTH) return UNKNOWN_PAGE_INDEX
+        return runCatching {
+            when (destination) {
+                is PDPageDestination -> {
+                    // 身份表 O(1) 命中（页表遍历只做一次）；未命中再退回 PdfBox 原生 O(n) 查找
+                    val byIdentity = destination.page?.let { pageIndex[it.cosObject] }
+                    byIdentity ?: destination.retrievePageNumber()
+                }
+                is PDNamedDestination -> {
+                    val resolved = document.documentCatalog?.findNamedDestinationPage(destination)
+                    resolvePage(resolved, document, pageIndex, depth + 1)
+                }
+                else -> UNKNOWN_PAGE_INDEX
+            }
+        }.getOrDefault(UNKNOWN_PAGE_INDEX)
     }
 }

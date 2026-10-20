@@ -27,6 +27,7 @@
     <!-- EPUB 章节目录对话框（M10.6 B2c） -->
     <string name="reader_toc">目录</string>
     <string name="reader_toc_empty">本书没有目录</string>
+    <string name="reader_toc_status">第 %1$d/%2$d 章</string>
     <!-- 目录项标题缺失占位（不复用 reader_chapter_missing：「本章内容缺失」指正文缺失，语义不同） -->
     <string name="reader_chapter_untitled">（无标题）</string>
     <!-- 阅读器工具栏浮层（M10.8）：返回/设置/批注按钮文案与底部章号指示 -->
@@ -199,6 +200,11 @@
     <string name="pdf_jump_to_page">跳转到第几页</string>
     <string name="pdf_jump_invalid">页码无效</string>
     <string name="pdf_jump_page_hint">页码（1-%1$d）</string>
+
+    <!-- PDF 书签（M10.10 Q3）：添加/取消提示 + 目录抽屉底部状态行 -->
+    <string name="pdf_bookmark_added">已添加书签</string>
+    <string name="pdf_bookmark_removed">已取消书签</string>
+    <string name="pdf_toc_status">第 %1$d/%2$d 页 · %3$d 个书签</string>
 
     <!-- 手写参数面板（M10.8 B-T2）：粗细 3 档 + 笔型 3 种 -->
     <string name="pdf_ink_width_thin">细</string>

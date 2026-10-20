@@ -528,6 +528,11 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
         scrollView.layoutManager = layoutManager
         // 禁复用：一级缓存与二级池都关；viewType 每章唯一，需逐类型设上限
         scrollView.setItemViewCacheSize(0)
+        // 每章一个 WebView 且离屏即销毁：任何 item 动画都会让「重建的章节」从 alpha=0 淡入，
+        // 滚动/跳章时成批重建 = 持续闪烁。本项目其它列表同样关了动画。
+        scrollView.itemAnimator = null
+        // 章高由适配器显式给定（不是靠子项测量反推），固定尺寸可省掉一轮布局
+        scrollView.setHasFixedSize(true)
         for (i in 0 until chapterCount()) scrollView.recycledViewPool.setMaxRecycledViews(i, 0)
         scrollView.adapter = adapter
         scrollView.addOnScrollListener(
@@ -588,7 +593,12 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
         val chapterIndex = ScrollProgressMath.visibleCenterPosition(bounds, viewportCenter)
             ?: return
         val centerView = layoutManager.findViewByPosition(chapterIndex) ?: return
-        val scrollY = (scrollView.paddingTop - centerView.top).coerceAtLeast(0)
+        // 夹紧到「该章真实可滚动范围」：短章（内容不足一屏）只可能是 0，
+        // 否则一次左右边缘翻屏（smoothScrollBy 一屏）或旧进度恢复就能把正文推出可视区 → 白屏
+        val viewportHeight =
+            (scrollView.height - scrollView.paddingTop - scrollView.paddingBottom).coerceAtLeast(1)
+        val maxScroll = (centerView.height - viewportHeight).coerceAtLeast(0)
+        val scrollY = (scrollView.paddingTop - centerView.top).coerceIn(0, maxScroll)
 
         if (chapterIndex == visibleChapterIndex && scrollY == visibleChapterScrollY) return
         visibleChapterIndex = chapterIndex
@@ -1024,12 +1034,11 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
      * - 横向：`pager.setCurrentItem(target, false)` 立即生效（无动画，与恢复进度一致）；
      * - 竖向：`scrollToPositionWithOffset(target, 0)`，章内偏移归 0（跳章语义是「到该章开头」）。
      *
-     * **为什么不手写 [visibleChapterIndex] / [scrollByChapter]**：竖向跳章后的状态更新走
-     * `onScrolled` → [reportVisibleChapter] 这条既有链路（并由 [onChapterMeasured] 的重锚保持位置）。
-     * 但 `scrollToPositionWithOffset` 是**布局型**跳转（RecyclerView 只在真实滚动时派发
-     * `onScrolled`），故用 `doOnNextLayout` 在跳转后的首次布局结束时补一次
-     * [reportVisibleChapter]——仍是既有链路，只是显式触发。手写两处状态会让「跳章」被误记为
-     * 「读过该章某偏移」，与既有不变量冲突。
+     * **为什么竖向要在此处手写 [visibleChapterIndex] / [scrollByChapter]**：跳章语义就是「到该章
+     * 开头」，状态必须立即定死。不能只靠 `doOnNextLayout` → [reportVisibleChapter] 回填——
+     * `scrollToPositionWithOffset` 是**布局型**跳转（RecyclerView 只在真实滚动时派发 `onScrolled`），
+     * 短章（内容不足一屏）的章内偏移一旦非 0，正文就会被推出可视区而表现为白屏且永不恢复。
+     * 章内偏移归 0 不构成「误记为读过某偏移」：跳章后的位置本就是该章开头。
      */
     private fun jumpToChapter(index: Int) {
         val count = chapterCount()
@@ -1037,9 +1046,14 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
         val target = index.coerceIn(0, count - 1)
         if (pageMode == ReaderPageMode.VERTICAL) {
             (scrollView.layoutManager as? LinearLayoutManager)?.scrollToPositionWithOffset(target, 0)
-            // 布局型跳转不派发 onScrolled → reportVisibleChapter 不会被自动调用；
-            // 下一次布局完成后主动走一次既有链路（不手写 visibleChapterIndex / scrollByChapter）
-            scrollView.doOnNextLayout { reportVisibleChapter() }
+            // 跳章语义就是「到该章开头」：立即把状态定死。
+            // 不能只靠 doOnNextLayout → reportVisibleChapter 回填——布局型跳转不派发 onScrolled，
+            // 而短章（内容不足一屏）的章内偏移一旦非 0，正文就会被推出可视区表现为白屏。
+            visibleChapterIndex = target
+            visibleChapterScrollY = 0
+            scrollByChapter[target] = 0
+            updateChapterTitle(target)
+            persistProgress(target)
         } else {
             pager.setCurrentItem(target, false)
         }
@@ -1103,7 +1117,16 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
             Toast.makeText(this, R.string.reader_toc_empty, Toast.LENGTH_SHORT).show()
             return
         }
-        tocDrawer.show(rows, currentChapterIndex())
+        val current = currentChapterIndex()
+        tocDrawer.show(
+            allRows = rows,
+            currentTarget = current,
+            statusLine = getString(R.string.reader_toc_status, current + 1, book.chapters.size),
+            // EPUB 暂无书签功能：传空表，抽屉书签页显示「尚无书签」空态
+            bookmarks = emptyList(),
+            onBookmarkAdd = {},
+            onBookmarkDelete = {},
+        )
     }
 
     // ---- 进度 ----

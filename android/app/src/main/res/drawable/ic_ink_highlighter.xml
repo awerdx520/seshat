@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 手写工具栏笔型图标：荧光笔，白色填充 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M6,14l3,3v5h6v-5l3,-3V9H6v5zM11,0h2v3h-2zM3.5,8.5l1.41,-1.41 2.12,2.12 -1.41,1.41zM16.97,9.21l2.12,-2.12 1.41,1.41 -2.12,2.12z" />
+</vector>

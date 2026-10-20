@@ -85,8 +85,8 @@ class ChapterScrollAdapter(
     override fun onBindViewHolder(holder: ChapterHolder, position: Int) {
         // 同一实例已承载该章：无需重载（重载会丢滚动锚点与已加载文档）。
         if (holder.loadedPosition == position) return
-        holder.loadedPosition = position
         val chapter = host.chapterAt(position) ?: return
+        holder.loadedPosition = position
         val html = host.readChapterHtml(chapter)
 
         holder.webView.webViewClient = EpubWebViewClient(assetLoader) measure@{ view, _ ->
@@ -133,7 +133,9 @@ class ChapterScrollAdapter(
         holder.loadedPosition = -1
         holder.webView.stopLoading()
         (holder.webView.parent as? ViewGroup)?.removeView(holder.webView)
-        holder.webView.destroy()
+        // 回收发生在布局/动画过程中，立即 destroy 会遇到「destroyed WebView 仍被调用」；
+        // post 到当前帧结束后再销毁
+        holder.webView.post { runCatching { holder.webView.destroy() } }
     }
 
     /** 取 [position] 章当前的 [WebView]（未附着到视口时返回 `null`）。 */
