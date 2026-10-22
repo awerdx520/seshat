@@ -12,7 +12,7 @@
 
 | 错误码 | HTTP 状态 | 含义 | 典型产生场景 |
 |---|---|---|---|
-| `invalid_argument` | 400 | 请求参数或请求体不合法 | `position`/`uid`/`location`/`text` 为空；`updated_at` 非 RFC 3339；请求体非法 JSON 或含未知字段；超过 1 MiB 或 32 MiB 上限；批注 `id` 非正整数；`since`/`limit` 非整数；`include_deleted` 非布尔；`root`+`path` 与 `doc_id` 互斥/均缺失；`direction` 非 `in`/`out`；路径含 `..`/NUL/为空；**路径任一段为 `.git`（大小写不敏感）或以 `.` 开头**（REST 与 WebDAV 两侧一致）；**写路径的目标自身是符号链接，或父目录真实路径越出根**；对目录用文件端点；未知根 tag |
+| `invalid_argument` | 400 | 请求参数或请求体不合法 | `position`/`uid`/`location` 为空；**批注 `kind=note`（含 `kind` 缺省，服务端兜底为 `note`）时 `text` 为空**——`highlight`/`ink` 以及未知 `kind` 允许空 `text`（服务端**不做** kind 枚举校验，故不能给未知 kind 报错）；`updated_at` 非 RFC 3339；请求体非法 JSON 或含未知字段；超过 1 MiB 或 32 MiB 上限；批注 `id` 非正整数；`since`/`limit` 非整数；`include_deleted` 非布尔；`root`+`path` 与 `doc_id` 互斥/均缺失；`direction` 非 `in`/`out`；路径含 `..`/NUL/为空；**路径任一段为 `.git`（大小写不敏感）或以 `.` 开头**（REST 与 WebDAV 两侧一致）；**写路径的目标自身是符号链接，或父目录真实路径越出根**；对目录用文件端点；未知根 tag |
 | `invalid_uid` | 400 | uid 形态非法（非 26 位 Crockford Base32） | 仍用旧 `document_id` 当文档键；含 `I`/`L`/`O`/`U` 或小写；长度不为 26；非 uid 的路径参数（如 `GET /api/resources/rescan`） |
 | `unauthorized` | 401 | 未认证或令牌不正确 | 缺失 `Authorization` 头、scheme 非 `Bearer`/`Basic`、令牌不匹配、服务端未配置令牌 |
 | `forbidden` | 403 | 已认证但无权访问该资源 | 预留：路径范围限制等授权策略（当前 REST 端点仅做认证，不产生该码） |
@@ -81,6 +81,11 @@ M7 起状态端点以 **uid** 为文档键（`document_id` 不再接受），身
 | 变更流 | `GET /api/changes` | `invalid_argument`、`unauthorized`、`unavailable`、`internal` |
 | 引用 | `GET /api/refs` | `invalid_argument`、`invalid_uid`、`unauthorized`、`unknown_uid`、`unavailable`、`internal` |
 | 维护 | `POST /api/resources/rescan` | `unauthorized`、`rescan_in_progress`、`unavailable`、`internal` |
+
+批注相关端点的 `invalid_argument` 按 `kind` 分支（schema v8 起）：`POST /api/annotations` 与
+`PUT /api/annotations/{id}` 只要求 `uid`（仅 POST）/ `location` 非空，**`text` 仅在 `kind=note` 时必填**；
+`kind` 缺省或空串由存储层兜底为 `note`（兜底先于校验，否则缺省 kind 会被误判）。`kind` 取 `highlight` / `ink`
+或任何未知值时允许空 `text`——服务端不做枚举校验，客户端不要指望服务端拒绝未知 `kind`。
 
 ## 4. 客户端动作指引
 

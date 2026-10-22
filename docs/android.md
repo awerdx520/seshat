@@ -242,6 +242,16 @@
 11. **手写条「荧光笔」文案颜色存疑**：截图中该项文字呈灰色（其余「钢笔 / 马克笔」为白色），未确认是选中态渲染还是刷新时机导致，**未验证**（见 tech-debt）。
 12. **沉浸只到应用内浮层**：进入阅读器时上下浮层隐藏，但**系统状态栏仍可见**——未做 `WindowInsetsController` 的系统栏 immersive 隐藏（阅读区靠 insets 避让，不与系统栏重叠）。
 
+### 6.8 批注抽屉（M10.3）
+
+两个阅读器的顶栏「批注」按钮改为打开**左侧滑出的批注抽屉**（`reader/AnnotationDrawer`），列出当前书的全部批注。
+
+- **复用 `TocDrawer` 骨架**：遮罩 + `translationX` 面板，**不用 `DrawerLayout`**（其边缘横向手势与横向翻页抢事件），面板宽 `min(320dp, 屏宽 × 0.78)`；零新增 XML / 零 `R.id.`，视图全部代码构建。与目录抽屉**互斥**（同时只开一个，由 Activity 打开前先关另一个）。
+- **按 `kind` 分组**：分组逻辑全在纯函数 `reader/AnnotationGrouping.group(items, currentPage)`，**顺序固定**「备注 → 高亮 → 手写 → 其它」，未知 `kind` 归入「其它」且每行保留原始 `kind` / `id`（仍可跳转与删除）。文案是取值契约：`[待同步]`（`dirty`）、「本页 N 处手写」/「共 N 处手写」。
+- **ink 默认折叠**：`kind=ink` 在服务端是**一笔一条**，逐条渲染会淹没文本批注，故折叠成一条汇总行（`AnnotationGrouping.INK_SUMMARY_ID`，`count` = 笔数）。**文案与页号是两件事**：页号取 `inkItems.map { it.page }.distinct().singleOrNull()`（全部笔迹同页才有 `page`），文案只由「是否同页且等于当前页」决定——同页且等于当前页 → 「本页 N 处手写」；其余（跨页 / 有笔迹缺页号 / 同页但不是当前页）→ 「共 N 处手写」。**因此「共 N 处手写」也可能带 `page`、可跳转**，只有跨页或缺页号时才 `page = null`、不可跳页（跳转目标取该组第一条 ink 记录的页）。
+- **跳转**：点条目行 → `RET` 语义的跳转（PDF 按 `page:<n>` 翻页；EPUB 按 `chapter:<i>@<s>-<e>` 跳章 + 章内按字符偏移滚动，见 §9 与 `LocationScroll`）；ink 汇总行按该组第一条 ink 记录的页定位。
+- **编辑 / 删除**：`note` / `highlight` 行有「⋮」菜单（编辑备注 / 删除）；`ink` 汇总行**不可删除**——「⋮」隐藏、长按只提示（背后是 N 条独立记录，批量删除需服务端按 location 前缀查询，属另一轮，见 `openspec/tech-debt.md`）。
+- **返回键优先关抽屉**：`OnBackPressedCallback` 中先判 `annotationDrawer.isShowing` → `hide()` 并吞掉返回，其次才是退出阅读器；打开目录/抽屉前也会先关另一块浮层。
 
 ## 7. 书架（M10.6 B3）
 
@@ -313,6 +323,11 @@ A 批交付但**无调用方**的 `sync/ResourceIndex` 与 `sync/SyncEngine` 在
 | 进度闭环 | 书架条目带 `uid`（`BookItem.uid`：远端条目直接来自 `RemoteBook.uid`，本地文件在与远端清单**按文件名对齐**后合并得到；未对齐则为 null），打开阅读器时经 `intentForFile(..., uid)` / `intent(..., uid)` 传入 → 阅读器按 uid 同步进度与批注（见 §12.2）。纯本地无 uid 的书仍走内容哈希 / `file://` 的纯本地路径 |
 | `move` 跟随 | 服务端 rename 事件 → `SyncEngine` 收集成 `SyncResult.renames`（`RenameEvent(uid, oldPath, newPath)`）→ `SyncCoordinator.followRenames` 把 `booksDir/<oldName>` 重命名为 `booksDir/<newName>`。**仅当目标不存在时才移动**（同名不同目录的会跳过，不覆盖不删除）；**仅 mirror 根可移动**——`ondemand` 根只读，不会有 rename 事件 |
 | 服务端前置 | `config.yaml` 的 `webdav.roots` 必须**显式声明** `ebooks`（`mode: ondemand`）根，客户端才能在书架上看到远端书；未配时 `RemoteBookSource` 只返回 mirror 根内的条目，功能优雅降级（不报错）。改配置需重启服务端，客户端无需额外设置（`/api/roots` 自动发现） |
+| 批注闭环（M10.3） | 阅读器打开带 uid 的书时，`createReaderSync` 装配 `SyncManager`（`pendingDeletes` 一并注入）后在该书的单线程 executor 上串行执行：`pullAnnotations` → （PDF）`backfillInkAnnotations` → `pullProgress`（仅本地无进度时）→ `pushProgressDetailed` → 补登有新条目时 `pushAnnotations`。批注合并按 `(kind, location, text)` 三路匹配（服务端 `id` → 内容键 → 新增），**同 location 不同 kind 不互相去重** |
+| 手写同步（M10.3 T6） | `PdfInkStore` 仍是笔迹的**渲染唯一真相**；同步的是 `kind=ink` 的**镜像批注**——落笔完成即以 `InkAnnotationMapper.inkLocation` 生成 `page:<n>;ink:<color>,<widthPt>,...`（页号 `pageIndex + 1`、坐标与线宽按页面 pt 换算、颜色 `#AARRGGBB`）并**一笔一条**登记待上传；打开带 uid 的书时把本地既有笔迹**一次性补登**，客户端先按 `(kind, location, text)` 跳过已有项，服务端 `(uid, kind, location, text)` 幂等命中返回 `200` 是第二道兜底（本地被清空后重复打开不会产生重复批注）。空点集不登记（不值得上传）。镜像不参与绘制 |
+| 离线 dirty 与待删队列（M10.3 T3） | `dirty` 只表示「新增/修改待上行」，删除**不复用**该标记：删掉已上传批注时把它的服务端 `serverId` 入 `PendingDeletes`（键 `pending_deletes_<uid>`，JSON 长整型数组，与按 docId 的批注数据键隔离），从未上传的记录（`serverId == null`）删除**不发请求、不入队**。flush = `SyncManager.pushDeletes`：逐条 `DELETE /api/annotations/{id}`、**404 视为成功**并出队，同时清掉残留的本地同 `serverId` 记录。**时机**：① 阅读器 `onStop`（与进度推送同一时点）；② 每次本地删除动作之后立即异步 flush 一次。顺序不变量：待删队列必须在拉取之前或之外处理，否则服务端会把它写回本地 |
+| 冲突合并（M10.3） | 批注 `PUT` 返回 409 → `UpdateAnnotationResult.Conflict` → `resolveConflict` 重拉服务端版本**以服务端为准**覆盖本地并清 `dirty`，本地被覆盖的快照作为冲突计数返回给调用方（不静默丢弃）；服务端记录已被别端删除时本地记录一并移除。删除端点 `DELETE` 的 404 在 `RestClient` 内直接当作成功 |
+| 进度冲突合并（M10.3/M10.4） | `pushProgressDetailed` 返回可判别结果：`Pushed`（服务端已存本地值，含 409 后带新时间戳重发成功）/ `Merged`（409 后判定服务端较新，已用服务端值覆盖本地）/ `Rejected`（重发仍 409，本地值**未上行**）/ `Skipped`（uid 空白或本地无进度，零请求）。重发时间戳取 `max(本地, 服务端 updated_at + 1s)`（服务端秒精度）。`pushProgress` 保留为兼容包装（`Pushed`/`Merged` → `Progress`，其余 `null`），`SyncSummary.progressRejected` 记录该结局。阅读器的两个推送点（打开时的首推、`onStop`）都按三态分支：`Pushed`/`Merged` 视为成功并记防抖位置，`Rejected` 记 warn 日志 + **一次** Toast「进度同步冲突，已保留服务端版本」（每 Activity 生命周期至多一次，`progressConflictNotified`） |
 
 **已知限制**（详见 `openspec/tech-debt.md`）：
 
@@ -388,11 +403,11 @@ M7 把服务端的文档身份从「客户端自定字符串」改成「服务�
 
 | 时机 | 动作 |
 |---|---|
-| 打开书籍（有 uid 且服务端已配置） | `pullAnnotations` 合并远端批注；**本地无进度时**才 `pullProgress`（避免覆盖本机正在读的位置）；随后 `pushProgress` |
+| 打开书籍（有 uid 且服务端已配置） | `pullAnnotations` 合并远端批注；**本地无进度时**才 `pullProgress`（避免覆盖本机正在读的位置）；随后 `pushProgressDetailed`（三态处置同 §9「进度冲突合并」） |
 | 新增批注 | 即时 `pushAnnotations`（按 `location + text` 去重，幂等） |
-| 离开阅读器（`onStop`） | `pushProgress` 一次（每次翻页推送会让请求爆炸；同值跳过只是防抖） |
+| 离开阅读器（`onStop`） | `pushProgressDetailed` 一次（每次翻页推送会让请求爆炸；同值跳过只是防抖）。`Rejected` 会弹一次「进度同步冲突，已保留服务端版本」 |
 
-- 全部网络调用在**单线程 executor** 上串行执行；异常由 `runCatching` 吞掉并记一条 warn 日志——阅读是本地优先功能，同步失败不得阻断或弹窗打扰。
+- 全部网络调用在**单线程 executor** 上串行执行；异常由 `runCatching` 吞掉并记一条 warn 日志——阅读是本地优先功能，同步失败不得阻断或弹窗打扰。**唯一例外**是进度 409 重发仍失败（`ProgressPushResult.Rejected`）：本地进度确实没上行，故记 warn + 每 Activity 生命周期一次 Toast（文案 `R.string.reader_progress_conflict`），避免两端长期分叉而无任何线索。
 - 已知限制：拉取到的**远端进度不立即跳转 UI**（当前阅读位置已按本地进度恢复，中途跳转会让正在读的用户丢失位置），下次打开本书才生效；`onStop` 可能因进程被杀而不执行（见 `openspec/tech-debt.md`）。
 - 设置页「连通性测试」探针由「带旧参数的批注端点」改为 `GET /api/roots`（无入参、只读、不写数据）——旧写法在 M7 服务端上恒失败：批注按 uid 查询且要求 uid 已登记，客户端没有可用的已登记 uid；`/api/roots` 无此约束。旧服务端（无 M7 路由）返回 404，客户端映射为 `ServerError(404)`，设置页应提示「服务端版本可能过旧」。
 

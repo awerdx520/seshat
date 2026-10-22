@@ -109,8 +109,8 @@ M0–M6 已完成并归档，见 `openspec/completed/personal-notes-system.md`�
 |---|---|
 | M10.1 | 书架（元数据来自服务端，封面/进度/按需下载）——本地书架 ✅ 完成（M10.6 B3，2026-10-18，真机验证通过 2026-10-19）；服务端元数据/按需下载 ✅ 随 M9.2 B 批完成（2026-10-19，真机验证通过） |
 | M10.2 | 阅读增强（目录/主题/字体/跳转）——字号/翻页模式已随 M9.2 落地；工具栏显隐/SeekBar/EPUB 目录 ✅ 完成（M10.6 B2，真机验证通过 2026-10-18/19）；**PDF 真目录**与 tap 三分区 ✅ 完成（M10.8，✅ 真机验证通过 2026-10-20）；目录形态已由 M10.9 升级为树形左侧抽屉 |
-| M10.3 | 批注侧车 + `location` 约定统一（PDF `page:<n>`+范围；EPUB 待定） |
-| M10.4 | 进度/批注 uid 化同步 |
+| M10.3 | 批注侧车 + `location` 约定统一（PDF `page:<n>`+范围；EPUB 待定）— ✅ **代码/单测/文档完成（2026-10-22），待提交与归档**：v8 契约已定稿（`annotations` 增 `kind` / `selected_text`，`text` 校验按 kind 分支，`(uid,kind,location,text)` 幂等命中 200）；EPUB location 定稿为 `chapter:<spineIndex>@<startOffset>-<endOffset>`（见 `docs/api.md` §4.6 与 `openspec/decisions.md` 2026-10-22 三条） |
+| M10.4 | 进度/批注 uid 化同步 — ✅ **代码/单测/文档完成（2026-10-22），待提交与归档**：批注 merge 按 `(kind, location, text)`、409 以服务端为准 + 冲突提示、`DELETE` 404 视为成功、离线待删队列 `pending_deletes_<uid>`；**遗留**：进度 409 未实现「重拉比较 + 重发」（见 `openspec/tech-debt.md`） |
 | M10.5 | **PDF 阅读增强**（用户 2026-10-18 提出，未开工，需另行走方案确认与计划确认）：手写批注（笔迹侧车，不写回 PDF）、点击翻页、横向翻页 / 竖向连续滚动双模式（滚动时页间首尾相接，保留上页最后一行）、横屏适配（fitWidth / fitHeight 选择）、后台渲染线程 + 位图 LRU 缓存（依赖 M10.1）✅ 完成（2026-10-18，手写批注 + 点击翻页 + 横屏），见 openspec/completed/2026-10-18-m10.5-pdf-ink-and-paging.md |
 | M10.7 | **笔记库与渲染阅读**（用户 2026-10-18 确认）：多文件笔记库（私有目录 + 可选 SAF 外部目录，framework `DocumentsContract` 零新增依赖）、org / markdown 渲染阅读页（WebView + 自研渲染器）、文件级源码编辑（`NoteEditActivity`）、设置页「笔记外部目录」（SAF 持久授权）✅ **完成并归档**（2026-10-18 开发，单测 468 → 562 例；2026-10-19 真机验收通过并修 2 处缺陷，单测 562 → 566 例）——见 openspec/completed/2026-10-18-m10.7-notes-reader.md |
 | M10.8 | **阅读器 UX 重排与手写增强**（用户 2026-10-20 确认 7 项需求）：① 浮层改纯 overlay + padding 随可见性联动（修「隐藏浮层后底部留白」）；② tap 三分区（左/中/右 = 上一屏 / 切浮层 / 下一屏，纯函数 `TapZone`）；③ 工具栏重排（顶栏导航与目录、底栏只留进度条 + 可点页码）；④ EPUB 与 PDF **真目录**（PDF 经破例引入的 PdfBox-Android 读书签树，含 50 MiB / 深度 64 / 节点 5000 三重上限）；⑤ 书架三按钮并为单一「导入书籍」（按扩展名自动识别，示例书改为空库静默播种）；⑥ 封面三级回退 + 书名首字占位；⑦ 手写笔型（钢笔/马克笔/荧光笔）+ 手写面板 + 双击进退 + 长按菜单。**已完成：代码已提交 · ✅ 真机验证通过（2026-10-20）**：commit `e50a23a`、`8c14494`、`0361faf`、`bb759f1`、`9e7ffd8`、`c4a76d3`，单测 649 → **721**（1 例 skipped）；文档已同步（`docs/android.md` §6、`CHANGELOG.md`、`openspec/decisions.md`、`openspec/tech-debt.md`），已归档，见 openspec/completed/2026-10-20-m10.8-reader-ux-polish.md |
@@ -179,7 +179,7 @@ M0–M6 已完成并归档，见 `openspec/completed/personal-notes-system.md`�
 1. 收录目录清单（哪些根、什么前缀）—— M7.2 需要 —— ✅ 已解决（M7.2 落地 `webdav.roots`：`tag`/`path`/`mode`，未配置时归一为单根 `notes`，2026-10-18）
 2. GTD 深度（只读 / 可编辑 / repeater·DEADLINE·状态流转）—— M9.4 需要
 3. Reader「基础功能」清单（排除 TTS/词典/统计？）—— M10 需要
-4. EPUB 的 location 约定（CFI vs `chapter:x`）—— M10.3 需要 —— **仍未定**（M7 不解决；M7 只把「身份」从路径换成 uid，location 语义未变）
+4. EPUB 的 location 约定（CFI vs `chapter:x`）—— M10.3 需要 —— ✅ 已定稿（2026-10-22）：`chapter:<spineIndex>@<startOffset>-<endOffset>`（spine 0-based、章内字符偏移半开区间、UTF-16 code unit；退化形态 `chapter-<n>`），见 `docs/api.md` §4.6 与 `openspec/decisions.md` 2026-10-22
 5. M11.8 T6（`SPC o P` 全局键位）未做，属 UX 待办（见 tech-debt）
 6. PDF 手写批注的 `location` 协议（现有约定仅支持 `page:<n>;rect:x0,y0,x1,y1`，多点笔迹需扩展，例如 `page:<n>;ink:...`；需与 Emacs 端 rect 约定共存）—— M10.5 需要（已定稿：`page:<n>;ink:<color>,<widthPt>,<x0>,<y0>,...`，页面坐标，见 docs/api.md 4.5.1；2026-10-18）
 7. 含 `#`/`%` 的文档名引用 —— ✅ 已缓解（M7 引入 uid 形态承载身份：服务端 `refs` 支持 uid 形态，解析不再受文件名字符限制；Emacs 侧 `seshat:` 链接文本仍为 doc-id 形态，故为「缓解」而非「解决」，见 tech-debt「含 `#`/`%` 的文档名不支持引用」）

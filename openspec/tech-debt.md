@@ -913,4 +913,60 @@
 - 现状（止血，2026-10-22）：`seshat-reader-page-join-lines` 默认值改为 `0`（strip 默认关闭，代码路径完全不插 strip）；`window-size-change-functions` 改挂 `seshat-reader--window-size-change`（遍历 frame 的窗口，只处理显示当前 buffer 的窗口，单窗口出错不影响其它）；`--set-window-vscroll` 的 `image-height`、`--get-prefix-width` 的返回值补 nil 守卫（后者恒返回数字），`--center-page` 短路时清掉旧 `line-prefix` 并把水平滚动归零。
 - 建议：彻底修法二选一——① 让页面 overlay 与 strip 行**彻底分离**（`move-overlay` 收回到当前页字符范围，页面几何只由页面 image 决定，strip 作为独立行处理，vscroll 上限不再叠加 strip 高）；② 改由 C 侧在渲染页面时**预留条带**（把上一页底部直接画进页面位图顶部），elisp 侧不再插行。任一方案落地并补真机验证后，再把默认值改回非 0。
 
+## PDF 文本选区层与 `rect:` 采集未做（M10.3，2026-10-22）
+- 现状：PDF **文本**批注/高亮在 Android 侧只记 `page:<n>`（`PdfReaderActivity` 长按菜单的「高亮标注」走 `"page:${firstVisiblePage() + 1}"`），没有选区层、也没有 `rect:` 坐标采集；`page:<n>;rect:...` 目前只有 Emacs 选区批注产生。本轮（M10.3）**明确不做**，原因：Android 侧 PDF 文本坐标需要 `PdfRenderer` 之外的文本布局信息（当前只有 `PDFTextStripper` 的纯文本，无字/行边界），属新能力而非文档同步。
+- 影响：Android 端 PDF 高亮只有「页 + 选中原文」，无法在页面上画出高亮；跨端显示不对称——Emacs 建的 `rect:` 批注在 Android 上只能按页展示。`docs/api.md` §4.5 已把「PDF 文本批注本轮不产 `rect:`」写入契约。
+- 建议：需要 PDF 高亮可视化时，先在 Android 引入文本行边界采集（`PDFTextStripper` 的 `TextPosition` 或换用带布局的抽取），再按 §4.5 的 `x0,y0,x1,y1` 换算；旋转页仍不支持（既有约束）。
+
+## Android 无 instrumentation，EPUB 偏移采集与抽屉交互只靠纯函数单测 + 手工验收（M10.3，2026-10-22）
+- 现状：`android/app/src/` 只有 `main` / `test` / `debug`，**没有 `androidTest`**（`./gradlew :app:testDebugUnitTest` 是唯一自动化入口）。M10.3 的新逻辑被刻意切成可 JVM 测试的纯函数（`LocationCodec` / `SelectionPayload` / `AnnotationGrouping` / `PendingDeletes` / `LocationScroll`），但**真正的 WebView 选区偏移采集**（注入脚本 + `Range` 前缀长度）与**抽屉的触摸/返回键交互**无法在 JVM 覆盖。
+- 影响：偏移口径（`document.body` 文本流、UTF-16 code unit、跨块级空白规范化）与抽屉手势是否抢横向翻页，只能靠真机人工验收；这些路径处于零自动化保护状态。
+- 建议：引入 `androidTest` + `Espresso`/`UiAutomator` 后优先补三条——① 真实 EPUB 上选中同一段文本两次，`chapter:<i>@<s>-<e>` 三段一致；② 抽屉打开时返回键只关抽屉；③ 抽屉开合不改变阅读区 padding。
+
+## 一笔一条 annotation 的量级风险（M10.3，2026-10-22）
+- 现状：`kind=ink` 的镜像批注**一笔一条**（协议见 `docs/api.md` §4.5.1），一页写 30 笔即 30 行；`GET /api/annotations?uid=` 按 uid **全量返回**（无分页、无 location 过滤），客户端 `pullAnnotations` 每次全量拉取并逐条合并。
+- 影响：手写密集的书（讲义、习题）批注表可达数千行；打开书时的拉取/合并成本随笔数线性增长，服务端亦无按「页 / location 前缀」的查询入口（这也是 ink 汇总行无法批量删除的原因）。
+- 建议：二选一——① 协议层加「按 location 前缀查询」或分页（`?page=` / `?prefix=page:12`）；② 客户端把 ink 合并为「按页一条」上传（`page:<n>;ink:` 后串联多笔），代价是单笔删除能力丧失。任一方案都要先量一次真实笔数分布（可用现有 `PdfInkStore` 数据统计）。
+
+## T7 实现遗留：ink 聚合行不可单条删除、`chapter:` 条目不支持跳章（T7，2026-10-22）
+- 现状 ①：Emacs 批注列表把同页 ink 合并为聚合条目（`seshat-reader-annotation--group-ink-items` / `--ink-aggregate-item`），该条目的 `:id` 与 `:uuid` 恒为 `nil`、只保留 `:ink-ids`（各笔服务端 id），因此 `d`（`seshat-reader-annotation-list-delete`）只弹一句提示、**删不掉**；要删只能回 Android 抽屉逐笔删或直接调 API。
+- 现状 ②：`seshat-reader-annotation-list-goto` 的跳转只看行属性 `seshat-reader-annotation-page`（由 `--page-from-location` 解析 `page:<n>`），`chapter:<i>@<s>-<e>` 形态解析不出页码 → 只提示「当前行没有可跳转的页码」，**不支持跳章**；`--chapter-from-location` 目前只用于摘要文案（「章节 N」）。
+- 影响：Emacs 侧对 EPUB 批注与 ink 批注只能「看」，不能「跳」或「删」，功能不对称。
+- 建议：① 删除路径改为按 `:ink-ids` 逐条 `DELETE`（逐条成功再刷新，失败保持原样）；② 跳转增补 chapter 分支——`chapter:` 条目需先按 `spineIndex` 换到对应页（`seshat-reader` 的页 ↔ 章映射）再走 `seshat-reader-goto-page`，或复用 EPUB 端「跳章 + 偏移滚动」思路（Emacs 侧无 DOM，按字符偏移找位置成本更高）。
+
+## Android 进度 409 未实现「重拉比较 + 带新时间戳重发」（M10.3/M10.4，2026-10-22）——已解决（2026-10-22 收尾轮：引擎 + UI 接线）
+- 现状（历史）：`docs/sync-protocol.md` §7.2 要求进度冲突时「重拉 → 比较 `updated_at` → 以较新者为准 → 本地较新则带新 `updated_at` 重发一次」；Android 的 `pushProgress` 只是「带本地时间戳 `PUT`」，409 经 `ensureSuccess` 抛 `ApiException` 后由阅读器 `runCatching` 记为「推送失败（已忽略）」，**没有重拉与重发**。批注分支已实现（`UpdateAnnotationResult.Conflict` → `resolveConflict`）。
+- 影响（历史）：两端同时阅读同一本书时，本地进度可能被服务端拒绝后丢失（下次 `onStop` 才再推，届时仍可能 409），用户可能看到「退出去再打开，进度跳回旧位置」。
+- 解决（引擎）：`sync/SyncManager.kt` 新增可判别结果 `ProgressPushResult`（`Pushed` / `Merged` / `Rejected` / `Skipped`）与 `pushProgressDetailed(uid)`——409 → `getProgress` 重拉 → 本地较新则用「严格大于服务端 `updated_at`」的时间戳（`RETRY_TIMESTAMP_STEP_MILLIS` = 1000ms，服务端为秒精度）重发**一次** → 仍 409 返回 `Rejected`；服务端较新则写回本地并返回 `Merged`。`pushProgress` 降级为兼容包装（`Pushed`/`Merged` → `Progress`，其余 `null`，**公共 API 保留**），`syncDocument` 把该结局记入 `SyncSummary.progressRejected`。
+- 解决（UI 接线）：`reader/EpubReaderActivity.kt`、`reader/PdfReaderActivity.kt` 的进度推送（`setupSync` 的打开时首推 + `enqueuePushProgress` 的 `onStop` 推）改调 `pushProgressDetailed` 并由私有 `handleProgressPush` 穷尽三态：`Pushed`/`Merged` 记 `lastPushedPosition`（防抖，`Merged` 静默因本地已被服务端值覆盖）→ 视为成功；`Rejected` 记 `Log.w`（含服务端 `updated_at`）+ 一次 Toast「进度同步冲突，已保留服务端版本」（`R.string.reader_progress_conflict`），由字段 `progressConflictNotified` 保证每个 Activity 生命周期只提示一次。
+- 验证：`SyncManagerTest` 覆盖 `Merged` / 本地较新重发成功（`Pushed`）/ 重发仍 409（`Rejected`）三条分支；`./gradlew :app:testDebugUnitTest --rerun-tasks` 934 例 / 0 失败 / 1 跳过。
+- 遗留：Activity 侧的三态 UI 分支无 JVM 单测覆盖（项目未引入 Robolectric，且 Toast 属设备级行为），只能真机/人工验收；「非 409 的异常」仍按原语义上抛给 `runCatching` 记 warn，不含用户提示（与批注分支一致）。
+
+## M12 遗留：`emacs/seshat-reader` 的 `make all` 有 30 处 byte-compile warning（M12 基线，未修，2026-10-22）
+- 现状：`emacs/seshat-reader` 执行 `make all` 产出约 30 处 byte-compile warning，集中在 `seshat-reader.el`（docstring 列宽、未使用参数、`free variable` 类告警）。这是**远程 M12 合并后的基线状态**，与 M10.3/M10.4 的改动无关（本轮未触碰 `seshat-reader.el`），为避免与 M12 归档内容冲突**未在本轮修**。
+- 影响：warning 噪声掩盖新增告警（M12 与 M10.3 的改动都不易从输出里看出是否引入新问题）；`make all` 仍退出 0，不影响功能。
+- 建议：单开一轮「seshat-reader 编译告警清零」——逐条分类（docstring 列宽可 `checkdoc` 自动修；`free variable` 需补 `defvar` 声明或改 `with-suppressed-warnings`），并把 `-Werror` 作为后续门禁的前提条件之一。
+
+## `PUT`/`DELETE /api/annotations/{id}` 不校验 uid 归属（M7 既有行为，M10.3 复审，2026-10-22）
+- 现状：`internal/api/server.go` 的 `handleUpdateAnnotation` / `handleDeleteAnnotation` 只把路径里的自增 `id` 交给 `storage.UpdateAnnotationAt` / `DeleteAnnotation`，**不比对记录实际的 `uid`**；任何持 Bearer token 的调用方用任意 id 即可改写/删除该批注（`uid` 创建后不可修改，但「谁能改哪一条」完全由自增 id 空间决定）。
+- 影响：单用户部署下 Bearer token 是唯一的安全边界，行为等价（这也是它至今未被当作缺陷的原因）；一旦引入多用户或不同权限的令牌，即构成跨 uid 越权（IDOR，id 自增可穷举）。`GET /api/annotations?uid=` 有 uid 约束，读写两路鉴权口径因此不对称。
+- 建议：二选一——① 端点接受可选 `uid`（query 或请求体）并与记录实际 `uid` 比对，不匹配返回 `404 not_found`（不泄露存在性）；② 改路径为 `/api/documents/{uid}/annotations/{id}`。两种都需 Emacs `seshat-rest.el` 与 Android `RestClient` 同步改动，故留待需要多用户时一并做。
+
+## EPUB location 换代后 pull 的幂等键不同形（M10.3，2026-10-22）
+- 现状：EPUB 批注 location 由旧形态 `chapter-<n>` 迁移到 `chapter:<spineIndex>@<startOffset>-<endOffset>`（`EpubSyncMapper.location()` 在 `BookAnnotation.location` 为空时仍回退 `chapter-<chapterIndex>`）；`SyncManager.pullAnnotations` 的「三路匹配」第 2 路按 `(kind, location, text)` 认领本地 `serverId == null` 的记录，两边形态一旦不同串就恒不相等 → 只能落到第 3 路「新增」。
+- 影响：存量旧记录（本地无 location、服务端已是新形态）理论上会在 pull 时**重复显示**（一条本地旧条目 + 一条服务端新条目）；`AnnotationStore` 没有跨形态去重键，重复对用户可见且会各自被后续操作独立处理。
+- 建议：① 认领键改为「归一化后比较」——用 `LocationCodec.parse` 解析出 `Chapter(spineIndex)` 即视为同章（需接受 `@start-end` 差异）；② 或一次性存量迁移（本地 `chapter-<n>` 补成 `chapter:<n>@0-0`，迁移须幂等）；③ 根治靠服务端稳定的客户端幂等键（另见「无服务端 client_uuid」）。
+
+## `LocationCodec` 对 location 长度与 ink 点数无上限（M10.3，2026-10-22）
+- 现状：`android/.../reader/LocationCodec.kt` 只用正则限制各段数字位数（`\d{1,9}`），对**整串长度**与 `ink:` 的**坐标点数**都没有上限（`grep -n "MAX_INK_POINTS\|MAX_OFFSET" LocationCodec.kt` 零命中）；`LocationScroll.MAX_OFFSET`（10_000_000）只夹紧「跳转脚本里注入的偏移量」，与 location 解析/存储无关。服务端 `annotations.location` 为 `location TEXT NOT NULL`（`internal/storage/db.go:58`，v8 只 ADD COLUMN，未动该列），除请求体 1 MiB 上限外无长度约束。
+- 影响：脏数据或恶意客户端可提交接近 1 MiB 的单个 location（数万坐标点），随 `GET /api/annotations?uid=` 全量 pull 进两端内存并参与列表渲染；Emacs 侧有 `seshat-reader-annotation--location-max-length`（65536）兜底，**Android 侧解析与 `InkAnnotationMapper` 切分都没有对应上限**（`kind=ink` 一笔一条放大了行数，见「一笔一条 annotation 的量级风险」）。
+- 建议：`LocationCodec` 增 `MAX_LOCATION_LENGTH`（建议 65536，与 Emacs 侧对齐）与 `MAX_INK_POINTS`（建议 4096；超出即拒绝或截断并计数），并补畸形输入单测（超长串、超大点数、`page:` 后跟 1e9 个逗号）。服务端如要根治需给 `location` 加长度校验并返回 `400 invalid_argument`，属协议变更，须与两端解析上限一并定稿。
+
+## `PdfInkStore` 的写方法未加锁（M10.3 进度接线轮观察，2026-10-22）
+- 现状：`reader/PdfInkStore.kt` 的 `appendStroke` / `undoLast` / `clearPage` 都是「读整份 `PdfInkDocument` JSON → 改内存 → 写回 SharedPreferences」的 read-modify-write，**未加 `@Synchronized`**。同目录的 `AnnotationStore` 因有「阅读器主线程（读者新增/删除）+ 同步线程（`pushAnnotations` 回填、`pullAnnotations` 合并、手写补登 `add`）」两条**并发写**路径，其写方法已全部 `@Synchronized`（见该类注释）。
+- 判定（当前**不是**缺陷）：`PdfInkStore` 目前只在主线程写（落笔 / 撤销 / 清页），同步线程只**读**一次快照（`PdfReaderActivity.backfillInkAnnotations` → `inkStore.document(docId)`），读路径不做 read-modify-write，故不存在「读到旧快照再写回、覆盖掉并发笔画」的丢更新路径。
+- 建议：若将来同步线程需要**写**笔迹（如把服务端下发的 `ink:` 落成本地笔迹、或按页批量删除），须先照 `AnnotationStore` 的做法给这三个写方法加 `@Synchronized`，并让 `document` 读也进同一把锁；否则会静默丢笔画。按「改前检查项」记录，当前无需改动。
+
+
+
 

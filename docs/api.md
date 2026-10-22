@@ -103,7 +103,7 @@ M7 起，服务端所有文档标识**一律使用 uid**（客户端不再自行
 |---|---|---|---|---|---|
 | 状态 | GET | `/api/progress/{uid}` | 获取阅读进度（`If-Modified-Since` 增量） | Bearer | 200 / 304 |
 | 状态 | PUT | `/api/progress/{uid}` | 设置（覆盖）阅读进度 | Bearer | 200 |
-| 状态 | POST | `/api/annotations` | 创建批注 | Bearer | 201 |
+| 状态 | POST | `/api/annotations` | 创建批注（`(uid,kind,location,text)` 幂等） | Bearer | 201 / 200 |
 | 状态 | GET | `/api/annotations?uid=` | 列出某文档全部批注 | Bearer | 200 |
 | 状态 | PUT | `/api/annotations/{id}` | 更新批注 | Bearer | 200 |
 | 状态 | DELETE | `/api/annotations/{id}` | 删除批注 | Bearer | 204 |
@@ -211,8 +211,10 @@ curl -s -X PUT -H "Authorization: Bearer $SESHAT_AUTH_TOKEN" \
 {
   "id": 1,
   "uid": "01K8Q3M7D2X9V6T1B8N5C0RDEX",
+  "kind": "note",
   "location": "page:12;rect:50.00,100.00,545.50,140.00",
   "text": "第一条批注",
+  "selected_text": "被选中的那句原文",
   "created_at": "2026-10-18T11:00:00Z",
   "updated_at": "2026-10-18T11:00:00Z"
 }
@@ -222,10 +224,20 @@ curl -s -X PUT -H "Authorization: Bearer $SESHAT_AUTH_TOKEN" \
 |---|---|---|
 | `id` | int64 | 服务端自增主键（批注自身的标识，非文档标识） |
 | `uid` | string | 所属文档 uid；创建后不可修改 |
-| `location` | string | 不透明位置串（约定见 §4.5） |
-| `text` | string | 批注正文 |
+| `kind` | string | 批注形态：约定 `note` / `highlight` / `ink`；缺省 `note`（服务端**不做**枚举校验，未知值原样保存与回传） |
+| `location` | string | 不透明位置串（约定见 §4.5 与 §4.6） |
+| `text` | string | 备注正文 / 显示摘要（`note` 必填；`highlight` 与 `ink` 为空串） |
+| `selected_text` | string | 选中原文（`highlight` 必非空；`note` 可空；`ink` 恒空） |
 | `created_at` | string | 创建时间（更新时保持不变） |
 | `updated_at` | string | 最后更新时间 |
+
+`kind` 与 `selected_text` 自 schema v8 起存在（存量行由迁移的 `DEFAULT` 回填为 `note` / `''`）。两者的**填充矩阵**是客户端约定，服务端只强制「`kind=note` 时 `text` 非空」这一条：
+
+| `kind` | `text` | `selected_text` | 典型来源 |
+|---|---|---|---|
+| `note` | 备注正文，**必非空** | 选中原文，可为空串 | 选中文本后写了备注（Emacs `C-c C-a`、Android 批注对话框） |
+| `highlight` | 空串 | 选中原文，**必非空** | 只选中原文、不写备注（Android EPUB / PDF 选区） |
+| `ink` | 空串 | 空串 | PDF 一笔手写（`page:<n>;ink:...`，见 §4.5.1） |
 
 ### 4.1 创建批注
 
@@ -238,15 +250,26 @@ POST /api/annotations
 ```json
 {
   "uid": "01K8Q3M7D2X9V6T1B8N5C0RDEX",
+  "kind": "note",
   "location": "page:12;rect:50.00,100.00,545.50,140.00",
-  "text": "第一条批注"
+  "text": "第一条批注",
+  "selected_text": "被选中的那句原文"
 }
 ```
 
-`uid`、`location`、`text` 均必填；`id`、`created_at`、`updated_at` 由服务端生成。
-- 成功响应 `201`：返回完整批注对象。
-- 错误：`400 invalid_argument`（字段为空、请求体非法）、`400 invalid_uid`、
-  `404 unknown_uid`、`401`、`500`。
+必填口径按 `kind` 分支：`uid` 与 `location` 恒必填；**仅 `kind=note`（含 `kind` 缺省）时 `text` 必填**，
+`highlight` / `ink` 以及任何未知 `kind` 允许空 `text`。`kind` 缺省为空串时由**存储层兜底为 `note`**
+（API 层只作文档说明——请求体反序列化后为空串，显式 `INSERT` 时 SQL 的 `DEFAULT 'note'` 不生效），
+兜底发生在校验之前，故缺省 `kind` 的请求不会被误判为「未知 kind 允许空 text」。
+`id`、`created_at`、`updated_at` 由服务端生成；`selected_text` 缺省为空串。
+
+**幂等**：服务端按 `(uid, kind, location, text)` 去重（`selected_text` **不参与**键）。命中既有记录时
+**不插新行、不刷新 `updated_at`**，直接返回该记录；同 `location` 不同 `kind` 视为两条独立批注。
+该语义让客户端的「本地既有批注/笔迹一次性补登」可安全重放（Android 打开带 uid 的书时补登历史笔迹即依赖它）。
+
+- 成功响应：**新建**返回 `201`，**命中幂等键**返回 `200`；两种情况响应体都是完整批注对象。
+- 错误：`400 invalid_argument`（`uid`/`location` 为空、`kind=note` 而 `text` 为空、请求体非法）、
+  `400 invalid_uid`、`404 unknown_uid`、`401`、`500`。
 
 ```bash
 curl -s -X POST -H "Authorization: Bearer $SESHAT_AUTH_TOKEN" \
@@ -276,12 +299,14 @@ curl -s -H "Authorization: Bearer $SESHAT_AUTH_TOKEN" \
 PUT /api/annotations/{id}
 ```
 
-- 请求体（整体替换 `location` 与 `text`）：
+- 请求体（整体替换 `kind`、`location`、`text` 与 `selected_text`）：
 
 ```json
 {
+  "kind": "note",
   "location": "page:12;rect:50.00,120.00,545.50,160.00",
   "text": "修改后的批注",
+  "selected_text": "被选中的那句原文",
   "updated_at": "2026-10-18T11:05:00Z"
 }
 ```
@@ -289,12 +314,14 @@ PUT /api/annotations/{id}
 | 字段 | 必填 | 说明 |
 |---|---|---|
 | `location` | 是 | 新位置，不能为空 |
-| `text` | 是 | 新内容，不能为空 |
+| `kind` | 否 | 新形态；缺省为空串时同样由存储层兜底为 `note`（服务端不做枚举校验） |
+| `text` | 按 `kind` | **仅 `kind=note` 时必填非空**；`highlight` / `ink` 允许空串 |
+| `selected_text` | 否 | 新选中原文，缺省为空串（整体替换语义：不传即清空） |
 | `updated_at` | 否 | RFC 3339；非空时既作为新时间戳又用于乐观冲突检测（早于服务端记录 → `409`） |
 
 `uid` 与 `created_at` 不可修改。
 - 成功响应 `200`：返回更新后的完整批注对象。
-- 错误：`400 invalid_argument`（`id` 非正整数、字段为空、时间戳非法）、
+- 错误：`400 invalid_argument`（`id` 非正整数、`location` 为空、`kind=note` 而 `text` 为空、时间戳非法）、
   `404 not_found`（批注不存在）、`409 conflict`（时间戳落后）、`401`、`500`。
 
 ```bash
@@ -338,7 +365,20 @@ page:<n>;rect:<x0>,<y0>,<x1>,<y1>
 page:12;rect:50.00,100.00,545.50,140.00
 ```
 
-#### 4.5.1 手写笔迹（`ink`，已定义、当前客户端未上传）
+PDF 的 `location` 共三形态（第一个 `;` 之后为可选尾段）：
+
+| 形态 | 串 | 谁在用 |
+|---|---|---|
+| 纯页号 | `page:<n>` | Android PDF 文本批注（顶栏「添加批注」按钮与长按菜单「高亮标注」都走 `PdfReaderActivity.addAnnotation`，只写 `page:<当前页>`）——`text` 承载内容，`location` 只记页。Emacs 侧**不产**此形态：`seshat-reader-annotation--location` 恒带 `rect:` |
+| 页号 + 矩形 | `page:<n>;rect:<x0>,<y0>,<x1>,<y1>` | Emacs 选区批注（M11.3 起），也是 Emacs M12 高亮的唯一数据来源 |
+| 页号 + 笔迹 | `page:<n>;ink:<color>,<widthPt>,...` | Android PDF 手写（见 §4.5.1） |
+
+> **本轮范围**：**Android 侧** PDF 文本批注不产 `rect:`——`PdfReaderActivity.addAnnotation` 只写
+> `page:<当前页>` 定页，矩形采集（`rect:`）不在 M10.3 范围内（见 `openspec/tech-debt.md`）。
+> **Emacs 侧**文本批注**恒产** `page:<n>;rect:<x0>,<y0>,<x1>,<y1>`（`seshat-reader-annotation--location`
+> 唯一构造点恒带 `rect:`，即表格第二形态；它同时是 Emacs M12 高亮的唯一数据来源）。
+
+#### 4.5.1 手写笔迹（`ink`）
 
 手写批注复用同一 `location` 字段，靠前缀区分（服务端仍按不透明字符串处理）：
 
@@ -346,13 +386,47 @@ page:12;rect:50.00,100.00,545.50,140.00
 page:<n>;ink:<color>,<widthPt>,<x0>,<y0>,<x1>,<y1>,...
 ```
 
-- **一笔一个批注**（笔迹过长时分条，便于单笔删除）。
+- **一笔一个批注**（一笔一条 annotation，笔迹过长时分条，便于单笔删除）。
 - `color`：`#AARRGGBB`（如 `#FFE53935`）。
 - `widthPt`：线宽，**PDF point 空间**，两位小数。
 - 点序列：页面坐标（PDF point、原点左上、y 轴向下），两位小数——与 `rect` **同口径**。
 - 客户端本地以归一化坐标（相对页面显示矩形的 0..1）存储，上传时按
   `x_pt = nx × page.width`、`y_pt = ny × page.height`、`width_pt = width × page.width` 换算。
-- **当前状态**：Android 端仅本地保存（`PdfInkStore`），尚未接入上传；Emacs 端只渲染 `rect`，无法显示笔迹。
+- **降级形态**：页面尺寸未知或点序列为空时只发 `page:<n>;ink:<color>,<widthPt>`（不带坐标），
+  仍可被解析，「第 n 页手写（0 笔）」不丢批注本体；Android 侧对空点集不登记（不值得上传）。
+- **当前状态（2026-10-22）**：Android 已接入同步——`PdfInkStore` 仍是渲染唯一真相，落笔完成时登记一条
+  `kind=ink` 的**镜像批注**并随批注队列上行（`InkAnnotationMapper` → `LocationCodec.encodeInk`）；打开带 uid 的书时
+  把本地既有笔迹一次性补登，靠服务端 `(uid, kind, location, text)` 幂等去重（§4.1）。
+  Emacs 端仍只渲染 `rect`、不渲染 `ink:`，但会按 `kind=ink` 聚合显示（「第 n 页手写（N 笔）」）。
+
+### 4.6 location 约定（EPUB）
+
+EPUB 没有「页」，位置由「章 + 章内字符偏移」表达（`M10.3` 定稿，取代此前「EPUB 待定」）：
+
+```
+chapter:<spineIndex>@<startOffset>-<endOffset>
+```
+
+- `spineIndex`：**0-based 的 spine 序号**（与 `EpubBook.chapters` / `ViewPager2` 的页序一致）。
+- `startOffset` / `endOffset`：**章内字符偏移**，`0-based`、**半开区间** `[start, end)`。
+- 偏移单位是 **UTF-16 code unit**（WebView 注入脚本的 `String.length` 与 Kotlin `String.length` 同口径）；
+  BMP 之外的字符（emoji 等）在按「字符数」处理的端（如 Emacs）可能 ±1 差异，属已知限制（见 `openspec/tech-debt.md`）。
+- 采集方式：`document.body` 文本流的前缀长度（`Range.toString().length` 双向计算），不假定 `end - start == text.length`
+  （跨块级元素时浏览器会规范化空白）。
+- **退化形态** `chapter-<n>`：偏移不可用时客户端回退为旧形态（只记章、不记偏移），两端解析器都需容忍。
+  解析侧只取首段的数字（`chapter:<n>` 前缀），因此**新增字段无需改解析**。
+
+PDF 与 EPUB 的 location 形态并列表：
+
+| 载体 | 形态 | 定页/定位粒度 |
+|---|---|---|
+| PDF 文本批注（Android） | `page:<n>`（1-based） | 页 |
+| PDF 文本批注 / 高亮（Emacs） | `page:<n>;rect:<x0>,<y0>,<x1>,<y1>` | 页 + 页面矩形 |
+| PDF 手写（Android） | `page:<n>;ink:<color>,<widthPt>,<x0>,<y0>,...`（一笔一条） | 页 + 笔迹点列 |
+| EPUB | `chapter:<spineIndex>@<startOffset>-<endOffset>` | 章 + 章内字符区间 |
+| EPUB（退化） | `chapter-<n>` | 章 |
+
+服务端对所有形态一视同仁：**不解析、只原样保存与回传**，`location` 的跨端语义完全由客户端约定承担（新形态无需服务端改动）。
 
 ## 5. 资源登记
 
@@ -987,7 +1061,7 @@ POST /api/revert
 
 | 错误码 | HTTP | 含义 | 典型场景 |
 |---|---|---|---|
-| `invalid_argument` | 400 | 请求参数/请求体不合法 | `position`/`location`/`text` 为空；`updated_at` 非 RFC 3339；请求体非法 JSON 或含未知字段；超过 1 MiB；`id` 非正整数；`since`/`limit` 非整数；`include_deleted` 非布尔；`root`+`path` 与 `doc_id` 互斥/均缺失；`direction` 非 `in`/`out`；路径含 `..`/NUL/为空；**路径任一段为 `.git`（大小写不敏感）或以 `.` 开头**；**目标自身是符号链接（写路径）或父目录真实路径越出根**；对目录用文件端点；未知根 tag |
+| `invalid_argument` | 400 | 请求参数/请求体不合法 | `position`/`location` 为空；**批注 `kind=note`（含缺省）时 `text` 为空**（`highlight`/`ink` 允许空 `text`，见 §4.1）；`updated_at` 非 RFC 3339；请求体非法 JSON 或含未知字段；超过 1 MiB；`id` 非正整数；`since`/`limit` 非整数；`include_deleted` 非布尔；`root`+`path` 与 `doc_id` 互斥/均缺失；`direction` 非 `in`/`out`；路径含 `..`/NUL/为空；**路径任一段为 `.git`（大小写不敏感）或以 `.` 开头**；**目标自身是符号链接（写路径）或父目录真实路径越出根**；对目录用文件端点；未知根 tag |
 | `invalid_uid` | 400 | uid 形态非法（非 26 位 Crockford Base32） | 用旧 `document_id`、含 `I`/`L`/`O`/`U` 或小写、长度不为 26、非 uid 的路径参数（如 `GET /api/resources/rescan`） |
 | `unauthorized` | 401 | 未认证或凭证不正确 | 缺失 `Authorization`、scheme 不匹配、令牌错误、服务端未配置令牌 |
 | `forbidden` | 403 | 已认证但无权访问 | 预留（当前 REST 端点仅做认证） |

@@ -266,6 +266,8 @@
 
 **理由**：① 归一化坐标使横竖屏切换、不同 `renderWidth`、不同缩放比下笔迹位置都正确，且无需数据迁移；若用 PDF point 空间则要在每次渲染宽度变化时重算（且依赖页面原始尺寸）。② 服务端 `location` 是单字段不透明字符串，一笔一 annotation 的 ink 串可直接复用批注表；但当 Android 侧批注同步 UI 尚未建立、Emacs 端只渲染 `rect` 时，上传只会产生「看不见的批注」，故本次仅本地 + 协议预留。③ 双模式比 `MotionEvent.getToolType` 更可靠（多数用户无触控笔，且无设备无法验证笔/手指行为）；手写时点击与滑动都被落笔占用，因此必须提供浮层翻页按钮，否则用户会以为卡死。
 
+> 本决定的第 ② 点（**手写批注只存本地**）已由 2026-10-22 决定反转，见下文「2026-10-22 · ink 批注接入服务端同步（反转 M10.5）」。
+
 **代价**：① 笔迹无法跨端查看（Emacs 端只显示 `rect`），也暂不进服务端备份；② 归一化坐标依赖「图片以 FIT_CENTER 显示」这一前提，若将来 item 改用其他 `scaleType` 必须同步改 `InkGeometry`；③ 手写模式与翻页互斥（需切换模式或点浮层按钮），不如「笔写、手指翻」自然；④ 横屏 + 横向模式下 `renderWidth` 用**首页**宽高比代表全书，混合横竖页面的 PDF 非首页分辨率为近似值。
 
 ## 2026-10-18 · Android 服务端改为可选配置（M10.6 B1）
@@ -355,4 +357,29 @@
 **理由**：① **Emacs 中同一文本区域的 `display` 属性互斥、不能叠加**——一处只有一份 `display` 规格生效，仓库内已有两次独立结论：`openspec/completed/2026-10-12-m11.2b-reader-selection.md`（M11.2b 选区实现记录）与 `seshat-reader-select.el` 的注释（只做文本属性、不做矩形绘制）。② `(space :width ...)` / `:box` / face 背景只作用于**文字所在位置**，会挤开 image 而不是叠在其上——阅读器每页是一整个 image，任何 elisp 侧「叠加」都会把页面推走。③ 复用 `ctm` 使缩放与旋转自动对齐，无需在 elisp 侧重复坐标推导（`rect_to_page_space` 是唯一的「Emacs rect → MuPDF 页面空间」换算点，渲染线程与 `seshat-reader-dyn--text-in-rect` 共用）。
 
 **代价 / 约束**：① 改 C 必须 `make clean all` 重建 `.so`，并在 `VENDORED.md` 登记本地改动（F23 不变量）。② 高亮表需在派发渲染任务时**快照**进 `DrawThreadArgs`（容量倍增表，每条退出路径释放）——渲染线程不碰 `DocState`，elisp 侧只改表并置 `highlights_dirty`。③ 旋转页的 `rect` 本身采不准（`seshat-reader-select.el` 明确不支持旋转页，属既有限制），高亮在旋转页可能错位（记 tech-debt）。④ 颜色与透明度当前是编译期常量（`HIGHLIGHT_COLOR_*` / `HIGHLIGHT_ALPHA` = 0.35），不可配置（记 tech-debt）。
+
+## 2026-10-22 · 批注契约扩展为 v8（`kind` + `selected_text`，服务端幂等）（M10.3）
+
+**决策**：`annotations` 表新增两列——`kind`（批注形态，约定 `note` / `highlight` / `ink`，**服务端不做枚举校验**）与 `selected_text`（选中原文），迁移为**纯 `ALTER TABLE ... ADD COLUMN`**（`DEFAULT 'note'` / `DEFAULT ''` 回填存量行）。`text` 语义保持不变（备注正文 / 显示摘要），但校验改为**按 `kind` 分支**：`kind=note` 时必填非空，`highlight` / `ink` 以及任何未知 `kind` 允许空串；`kind` 缺省（空串或全空白）由**存储层**在**校验之前**兜底为 `note`。同时 `CreateAnnotation` 增加**内容幂等**：按 `(uid, kind, location, text)` 查既有记录（`selected_text` **不参与**键），命中则原样返回、不插新行、不刷新 `updated_at`，API 层据此把新建映射 `201`、幂等命中映射 `200`。
+
+**理由**：① 单列 `text` 无法表达「只选中原文、没写备注」（高亮）与「一笔手写」（ink）——前者需要把选中原文与备注分开存，后者两者都为空；新增两列比复用 `location` 塞文本语义更干净，也与 Emacs/Android 两端已有的本地模型（`BookAnnotation.selectedText` / `PdfAnnotation.kind`）一一对应。② **不做枚举校验**是刻意的：`kind` 的取值集合会随阅读形态演进（未来可能有 `bookmark` / `underline`），服务端强校验会把「新增形态」变成「服务端发版」，而服务端的职责只是保存与回传不透明串——未知 `kind` 由客户端归入「其它」分组（Android）或按 `note` 兜底（Emacs）。③ 兜底必须在下层且先于校验：请求体反序列化后 `kind` 是空串，显式 `INSERT` 时 SQL 的 `DEFAULT 'note'` **不生效**；若兜底在校验之后，缺省 `kind` 的请求会被当成「未知 kind」，从而错误地允许 `text` 为空。④ 幂等键不带 `selected_text`：同一处选中原文的多次补登（Android 打开书时补登历史笔迹、Emacs 离线队列重放）应命中同一条记录，否则「补登」会变成「复制批注」；键带 `kind` 则保证同 `location` 上的一条 `highlight` 与一条 `note` 是两条独立批注。⑤ 两张迁移都只用 `ADD COLUMN`（可逆、无数据重写），故 `preMigrationChecks` **不登记 v8**——该钩子只服务不可逆迁移（v7 的 DROP + 重建）。
+
+**影响**：① `schemaVersion` 8 必须恒等于 `len(migrations)`（`TestMigrationsLengthMatchesVersion` 守卫）；② `UpdateAnnotationAt` 与 `CreateAnnotation` 同口径（`kind` 兜底 + 按 kind 校验），故「note → highlight」「highlight → note」的形态改造由调用方显式给出 `kind` 与 `text`；③ `selected_text` 在更新上是**整体替换**语义（不传即清空），客户端必须每次带上；④ 未知 `kind` 由三端各自兜底（服务端原样存、Android 归「其它」组、Emacs 当 `note`），因此**新增形态无需服务端改动**，但需要三端同时确认显示回退链。
+
+## 2026-10-22 · EPUB 批注 location 定稿为 `chapter:<i>@<s>-<e>`（M10.3）
+
+**决策**：EPUB 的 `location` 定稿为 `chapter:<spineIndex>@<startOffset>-<endOffset>`——`spineIndex` 为 **0-based spine 序号**，`startOffset`/`endOffset` 为**章内字符偏移、半开区间** `[start, end)`，单位是 **UTF-16 code unit**（与 WebView 侧 `String.length` / Kotlin `String.length` 同口径）；偏移以 `document.body` 文本流的**前缀长度**计算（`Range.toString().length` 双向算，不假定 `end - start == text.length`）。偏移不可用时退化到 `chapter-<n>`（只记章）。**不再采用 CFI**，HTML CFI 需解析 `EpubBook` 的包文档结构、且两端都要实现一套路径语法，收益不及「章序号 + 字符偏移」。
+
+**理由**：① 服务端 `location` 是不透明串，形态只需两端自洽；`chapter:<i>@<s>-<e>` 的解码是三个整数，Android（`LocationCodec`）与 Emacs（`--chapter-from-location`）各几十行即可，CFI 的 `epubcfi(/6/4!/4/2/2:0)` 则要两端各实现一套路径解析 + 边界语义。② 章序号与 `EpubBook.chapters` / `ViewPager2` 页序天然一致，跳转只需「跳章 + 滚到偏移」，无需在 XML DOM 里重新定位节点。③ 用前缀法算两端（而不是 `start + text.length`）：跨块级元素时浏览器会规范化空白，`Selection.toString()` 的长度与 body 文本流长度可能不等，两端同法算才保证 `[start, end)` 恰好切在文本流上。④ 退化形态 `chapter-<n>` 让「偏移采集失败」不至于变成「批注丢失」，且解析侧只取首段数字，新增字段无需改解析器。
+
+**代价 / 约束**：① 单位是 UTF-16 code unit，BMP 之外的字符（emoji 等）在按「字符数」处理的端（Emacs）会 ±1 偏移（记 tech-debt）；② spine 序号依赖 EPUB 的阅读顺序而非文件名，同一本书改版（增删章）后旧 location 会指向错的章——批注不跨版本迁移，属已知限制；③ 偏移采集在 WebView 注入脚本内完成，无 instrumentation 覆盖（纯 JVM 只能测 `SelectionRange` / `LocationCodec` 的解析与编码），真实 DOM 口径待真机验收。
+
+## 2026-10-22 · ink 批注接入服务端同步（反转 M10.5「仅本地保存」）
+
+**决策**：**反转 2026-10-18「PDF 手写批注用归一化坐标 + 仅本地存储（M10.5）」的第 ② 点**——手写笔迹不再是纯本地数据：`PdfInkStore` 仍是渲染唯一真相，同时把每一笔以 `kind=ink` 的**镜像批注**接入批注同步（`location = page:<n>;ink:<color>,<widthPt>,<x0>,<y0>,...`，**一笔一条**，依据 `docs/api.md` §4.5.1；`text` 与 `selected_text` 均为空串，靠 v8 的按 kind 放宽校验放行）。落笔完成即登记一条待上传；打开带 uid 的书时把本地既有笔迹**一次性补登**，客户端先按 `(kind, location, text)` 跳过已有项，服务端 `(uid, kind, location, text)` 幂等命中返回 `200` 为第二道兜底。M10.5 的第 ① 点（归一化坐标存储）与第 ③ 点（阅读/手写双模式）**不变**。
+
+**理由**：① 反转的直接原因是 M10.5 时的前提已消失——它的理由是「Android 侧批注同步 UI 尚未建立、Emacs 端只渲染 `rect`，上传只会产生看不见的批注」；M10.3 建了批注抽屉（按 kind 分组 + ink 折叠汇总），M12 让 Emacs 能看到 `rect` 与 `ink` 聚合文案，笔迹不再「看不见」。② **跨端一致 + 换设备不丢**：手写是阅读成果的一部分，只存 `SharedPreferences` 意味着卸载/换机即永久丢失，且 Emacs 侧永远看不到「这页有手写」。③ 协议零改动即可承载：`location` 是单字段不透明串、一笔一 annotation，服务端 schema v8 的 `kind` 恰好用来标记形态，`(uid, kind, location, text)` 幂等恰好兜住「补登可重放」——不需要新增表或端点。
+
+**代价 / 约束**：① **量级风险**：大页面笔数多时批注表行数会显著膨胀（一笔一行），列表接口按 uid 全量返回，记 tech-debt；② 坐标必须按不可变口径换算（页号 `+1`、pt、`#AARRGGBB`），任一处错都会跨端错位，故换算逻辑集中在 `InkAnnotationMapper` + `LocationCodec.encodeInk` 两个纯函数并对所有非法输入做夹紧/净化（编码结果必然可被解析）；③ 页面尺寸未就绪或点集为空时只发 `page:<n>;ink:<color>,<widthPt>`（降级但可解析），空点集在 Android 侧直接不登记；④ Emacs 端仍**不渲染** `ink:` 笔迹（只做聚合显示），该缺口保留在 tech-debt。
+
 

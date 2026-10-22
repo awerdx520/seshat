@@ -297,23 +297,75 @@ loop:
   - 相等或更早 → 覆盖，值即新的 `updated_at`；
 - 写入时**不带** `updated_at` → 服务端填当前 UTC，视为无条件覆盖（后写赢）。
 
-客户端建议：
+客户端行为约定（进度与批注两支语义不同，不要套用同一套）：
 
-1. 每次拉取进度/批注时记住 `updated_at`；
+**进度（可合并的标量，「较新者胜」）**
+
+1. 每次拉取进度时记住 `updated_at`；
 2. 上传时带上它；
-3. 收到 `409` 时重新拉取、合并本地变更（例如保留本地较新的 `position` 提示用户），
-   再用新时间戳重发——不要用「当前时间」硬覆盖（会掩盖另一端的最新状态）。
+3. 收到 `409` 时**先重拉**服务端进度，比较两侧 `updated_at`——**以较新者为准**：服务端较新则本地改用
+   服务端 `position`（本地这次改动作为提示记下，不静默丢弃）；本地较新则**带新 `updated_at` 重发一次**。
+   不要用「当前时间」硬覆盖（会掩盖另一端的最新状态），也不要原样重发（必然再 409）。
+
+**批注（按条，冲突时「服务端为准」）**
+
+- `PUT /api/annotations/{id}` 的 `409` **不做「本地较新则重发」**：它表示服务端记录已前进，客户端应
+  **重拉该 uid 的批注、以服务端版本覆盖本地**（同时清 `dirty`），并把被覆盖的本地改动**记成冲突提示**
+  反馈给用户——不得静默丢弃。
+- 重拉时若服务端已无该 `id`（被别端删除），本地记录一并移除：否则它永远推不上去、也永远拉不回来（幽灵条目）。
+- 新建（本地 `serverId == null`）不发生 409：先按 `(kind, location, text)` 在已拉取的服务端列表里**认领**
+  同键记录（上次 POST 成功但本地未回填时不会重复建），找不到才 `POST`。
+- 本地批注模型没有可靠的上行时间戳，客户端可传 `updated_at = null`（服务端不做冲突检测，最后写胜）；
+  传了就必须承担「本地时间戳陈旧 → 每次都被判 409」的后果。
+
+> **Android 现状（2026-10-22）**：批注分支已实现（`UpdateAnnotationResult.Conflict` → `resolveConflict`
+> 重拉并以服务端为准 + 冲突计数返回）；进度分支**只实现了「带时间戳上传」，未实现 409 后的
+> 「重拉比较 + 带新时间戳重发」**——409 时本次推送按失败忽略、等下一次 `onStop` 再推。
+> 该缺口记入 `openspec/tech-debt.md`。
 
 ### 7.3 location 约定
 
-`location` 对服务端是不透明字符串，跨端语义由客户端约定：
+`location` 对服务端是不透明字符串，跨端语义由客户端约定（三种载体、四类形态）：
 
-- PDF 矩形：`page:<n>;rect:<x0>,<y0>,<x1>,<y1>`（1-based 页码，PDF point 空间，
-  两位小数，不含缩放；不支持旋转页面）；
-- PDF 手写：`page:<n>;ink:<color>,<widthPt>,<x0>,<y0>,...`（已定义，客户端尚未上传）；
-- EPUB：**尚未定义**，见 `openspec/tech-debt.md`。
+| 载体 | 形态 | 说明 |
+|---|---|---|
+| PDF 文本批注（Android：顶栏「添加批注」/ 长按「高亮标注」） | `page:<n>` | 1-based 页码；内容在 `text` / `selected_text`，位置只定页（Android 侧本轮**不产** `rect:`；Emacs 建的文本批注恒带 `rect:`，见下一行） |
+| PDF 高亮（带矩形） | `page:<n>;rect:<x0>,<y0>,<x1>,<y1>` | PDF point 空间、两位小数、不含缩放；不支持旋转页面；Emacs M12 高亮的数据来源 |
+| PDF 手写 | `page:<n>;ink:<color>,<widthPt>,<x0>,<y0>,...` | **一笔一条**；Android 落笔即登记并随批注队列上行，打开带 uid 的书时把本地既有笔迹一次性补登（服务端幂等去重） |
+| EPUB | `chapter:<spineIndex>@<startOffset>-<endOffset>` | spine **0-based**，章内字符偏移 **半开区间** `[start, end)`，单位 UTF-16 code unit；退化形态 `chapter-<n>`（只记章） |
 
-细节见 [api.md §4.5](api.md#45-location-约定pdf)。
+细节见 [api.md §4.5](api.md#45-location-约定pdf) 与 [api.md §4.6](api.md#46-location-约定epub)。
+
+### 7.4 删除语义与离线队列
+
+**服务端语义**：`DELETE /api/annotations/{id}` 成功返回 `204`；`id` 不存在时返回 `404 not_found`
+（不幂等，服务端如实报错）。
+
+**客户端语义**：`404` **视为成功**——服务端已无该批注，等于「删除目标已达成」。这是离线重试的幂等前提：
+队列里的 `DELETE` 若因上次已成功但本地未出队而重放，第二次必然 404，不能被当成失败卡住队列。
+
+**本地删除的三条分支**（Android 实现口径）：
+
+| 本地记录状态 | 动作 |
+|---|---|
+| 已上传（有服务端 `id`） | 本地移除 + 把 `serverId` **入待删队列**，flush 时发 `DELETE` |
+| 从未上传（无 `serverId`） | **只做本地移除**：不发请求、**不入队**（服务端不认识这条记录） |
+| 无 uid（未登记文档） | 只做本地移除：队列按 uid 分键，没有身份就无处归属 |
+
+**待删队列 vs dirty 是两套语义**，不得共用一个布尔位：
+
+| | 待删队列 `pending_deletes_<uid>` | `dirty` 标记 |
+|---|---|---|
+| 表示 | 已删除、等上行 `DELETE` 的**服务端 id 列表** | 新增/修改待上行（`POST` / `PUT`） |
+| 存储 | 独立 prefs 键，JSON 长整型数组，按 uid 分键（与按 docId 的批注数据键隔离） | 批注记录自身字段 |
+| 出队条件 | `DELETE` 成功或返回 404 | 服务端返回对象回填本地后清 |
+
+**flush 时机**（Android）：① 阅读器 `onStop`（离开阅读器即同步，与进度推送同一时点）；② 每次本地删除动作之后立即
+异步 flush 一次。flush 逐条发 `DELETE`，成功后出队并把残留的本地同 `serverId` 记录一并移除。
+
+**顺序不变量**：待删队列必须在**拉取之前**或**拉取之外**处理——若先拉取，队列里尚未删除成功的记录会被服务端
+重新写回本地（「删了又出现」）。服务端一次全量同步（`syncDocument`）的顺序固定为
+`pushProgress → pushAnnotations → pushDeletes → pullProgress → pullAnnotations`。
 
 ## 8. 引用图
 
@@ -416,7 +468,10 @@ GET /api/refs?uid=<uid>&direction=in    # 谁引用了我
    `409 rescan_in_progress`（不排队）。客户端定时任务应先检查/退避，不要并发触发。
 6. **`GET /api/resources` 无 offset 分页**。只能用 `has_more` 判断是否还有更多，继续
    拉取需收窄 `prefix`/提高 `since`；需要「从头到尾」的可靠遍历时优先用变更流。
-7. **EPUB 批注位置尚无跨端约定**（PDF 已有），见 `openspec/tech-debt.md`。
+7. ~~**EPUB 批注位置尚无跨端约定**~~ → **已定稿（2026-10-22）**：`chapter:<spineIndex>@<startOffset>-<endOffset>`
+   （spine 0-based、章内字符偏移半开区间、单位 UTF-16 code unit），见 [api.md §4.6](api.md#46-location-约定epub)。
+   仍未闭合的是**退化形态**：偏移采集不可用时客户端发 `chapter-<n>`，只定位到章、定位不到段。
+   另见 `openspec/tech-debt.md`「EPUB 偏移采集无 instrumentation 覆盖」。
 8. **没有「查询最新游标」的端点**。服务端不暴露 `changes` 的最大 `seq`；客户端要得到
    当前最新游标，只能从 `since=0` 消费到 `has_more=false`（首次接入），或持续消费自己的
    游标直至清空。`GET /api/changes` 不带 `since` 等同于 `since=0`（返回最早的批次），
