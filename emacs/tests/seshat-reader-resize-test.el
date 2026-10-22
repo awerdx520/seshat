@@ -23,9 +23,10 @@
 ;;; Commentary:
 
 ;; `seshat-reader' 窗口尺寸变化自适应（M12 T3）的 ERT 测试套件：idle 去抖、
-;; refit 的 fit/manual/未设置三分支、四级守卫（死窗口 / 异 buffer / 模式已退出 /
-;; overlay 失效）、vscroll 夹紧四态、`scale-source' 语义、presentation-mode
-;; 不回归、多窗口各处理一次、死 buffer 的生命周期。
+;; refit 的 fit/manual/未设置三分支、fit 分支的 1% 偏差闸（目标 scale 与当前
+;; 几乎相同则不重渲染）、`--refitting' 防重入、四级守卫（死窗口 / 异 buffer /
+;; 模式已退出 / overlay 失效）、vscroll 夹紧四态、`scale-source' 语义、
+;; presentation-mode 不回归、多窗口各处理一次、死 buffer 的生命周期。
 ;;
 ;; 运行方式（在仓库根目录执行）：
 ;;
@@ -82,16 +83,22 @@ SOURCE is the `scale-source' window parameter: `fit', `manual' or nil for
   (dolist (parameter '(overlay scale scale-source))
     (set-window-parameter window parameter nil)))
 
-(cl-defun seshat-reader-resize-test--refit-counts (buffer window &key (live t) other-buffer)
+(cl-defun seshat-reader-resize-test--refit-counts (buffer window &key (live t) other-buffer (scale 1.5))
   "Call `seshat-reader--refit-window' on WINDOW in BUFFER and count its effects.
 
 LIVE nil stubs `window-live-p' to nil, OTHER-BUFFER stubs `window-buffer'
 to return it.  The fit step is counted where the refit actually rescales:
-`seshat-reader--contain-scale' returns the new scale and
+`seshat-reader--contain-scale' returns SCALE (default 1.5) and
 `seshat-reader-doc-scale-page' applies it, so both are stubbed and the
 counter increments on the apply call.  An implementation that went back to
 `(funcall seshat-reader-default-fit)' would rescale through neither stub
 and the counter would stay 0.
+
+SCALE defaults to 1.5 so that it is farther than one percent away from the
+scale the window carries when these tests run (nil, hence the 1.0
+fallback): since 2026-10-23 the fit branch skips the re-render when the
+target scale is within 1% of the current one, and a stub returning 1.0
+would be swallowed by that gate instead of exercising the rescale.
 
 `window-live-p' is left alone in the LIVE case: stubbing it breaks the
 `with-selected-window' expansion used by the fit branch.  The windows passed
@@ -103,7 +110,7 @@ here are real batch-frame windows, hence live."
     (cl-letf* (((symbol-function 'window-buffer)
                 (lambda (&optional _window) (or other-buffer target)))
                ((symbol-function 'seshat-reader--contain-scale)
-                (lambda (&optional _window) 1.0))
+                (lambda (&optional _window) scale))
                ((symbol-function 'seshat-reader-doc-scale-page)
                 (lambda (factor &optional _source)
                   (cl-incf fit)
@@ -121,11 +128,14 @@ here are real batch-frame windows, hence live."
             (seshat-reader--refit-window window)))))
     (list fit clamp center)))
 
-(cl-defun seshat-reader-resize-test--run-pending-counts (buffer &key windows)
+(cl-defun seshat-reader-resize-test--run-pending-counts (buffer &key windows (scale 1.5))
   "Run `seshat-reader--run-pending-refit' for BUFFER and count the refit steps.
 
-WINDOWS is what `get-buffer-window-list' is stubbed to return.  Returns
-\(FIT CLAMP CENTER) aggregated over every window."
+WINDOWS is what `get-buffer-window-list' is stubbed to return and SCALE is
+what `seshat-reader--contain-scale' returns.  SCALE defaults to 1.5 so that
+the 1% deviation gate of the fit branch lets the re-render through: the
+windows here carry no `scale' parameter, so the current scale falls back to
+1.0.  Returns (FIT CLAMP CENTER) aggregated over every window."
   (let ((fit 0)
         (clamp 0)
         (center 0)
@@ -135,7 +145,7 @@ WINDOWS is what `get-buffer-window-list' is stubbed to return.  Returns
                ((symbol-function 'window-buffer)
                 (lambda (&optional _window) target))
                ((symbol-function 'seshat-reader--contain-scale)
-                (lambda (&optional _window) 1.0))
+                (lambda (&optional _window) scale))
                ((symbol-function 'seshat-reader-doc-scale-page)
                 (lambda (_factor &optional _source) (cl-incf fit)))
                ((symbol-function 'seshat-reader--clamp-window-vscroll)
@@ -201,12 +211,16 @@ the ones returned by the previous schedules."
 
 A callback that refits the selected window only would count 1, one that
 runs the loop twice would count 4; both are caught by the exact count and
-the window identity set."
+the window identity set.  The `seshat-reader--refitting' flag must be
+non-nil inside every refit call, so that the size changes caused by the
+refit itself are dropped by `seshat-reader--schedule-refit' instead of
+queueing the next refit."
   (let* ((buffer (seshat-reader-resize-test--reader-buffer))
          (w1 (selected-window))
          (w2 (split-window w1))
          (timer (run-at-time 3600 nil #'ignore))
-         (calls nil))
+         (calls nil)
+         (flags nil))
     (unwind-protect
         (progn
           (with-current-buffer buffer
@@ -214,14 +228,19 @@ the window identity set."
           (cl-letf (((symbol-function 'get-buffer-window-list)
                      (lambda (&rest _) (list w1 w2)))
                     ((symbol-function 'seshat-reader--refit-window)
-                     (lambda (window) (push window calls))))
+                     (lambda (window)
+                       (push seshat-reader--refitting flags)
+                       (push window calls))))
             (seshat-reader--run-pending-refit buffer))
           (should (= 2 (length calls)))
           (should (memq w1 calls))
           (should (memq w2 calls))
           (should (= 2 (length (delete-dups (copy-sequence calls)))))
+          ;; 执行期间防重入标志必须是 t（在 let 作用域内）
+          (should (equal '(t t) flags))
           ;; 回调跑完后变量被清空，下一次调度不会取消已触发的 timer
-          (should-not (with-current-buffer buffer seshat-reader--resize-refit-timer)))
+          (should-not (with-current-buffer buffer seshat-reader--resize-refit-timer))
+          (should-not (with-current-buffer buffer seshat-reader--refitting)))
       (when (timerp timer) (cancel-timer timer))
       (delete-window w2)
       (kill-buffer buffer))))
@@ -447,16 +466,18 @@ branch and rescale through `seshat-reader--contain-scale'."
               (should (eq 'fit (seshat-reader--window-scale-source window)))
               (should (eql 0.5 (window-parameter window 'scale)))
               (should (= 1 center))
-              ;; 关闭前再 refit 一次：来源是 fit，必须走 contain 分支
+              ;; 关闭前再 refit 一次：来源是 fit，必须走 contain 分支。
+              ;; 桩返回 0.6 而当前 scale 是 0.5（相差 20% > 1%）：若桩原样返回
+              ;; 0.5，偏差闸会跳过重渲染，本用例就不再检验「真的重渲染」。
               (cl-letf* (((symbol-function 'window-buffer)
                           (lambda (&optional _window) buffer))
                          ((symbol-function 'seshat-reader--contain-scale)
-                          (lambda (&optional _window) (cl-incf fit) 0.5))
+                          (lambda (&optional _window) (cl-incf fit) 0.6))
                          ((symbol-function 'seshat-reader--clamp-window-vscroll)
                           (lambda (&optional _window) nil)))
                 (seshat-reader--refit-window window))
               (should (= 1 fit))
-              (should (eql 0.5 (window-parameter window 'scale)))
+              (should (eql 0.6 (window-parameter window 'scale)))
               (seshat-reader-presentation-mode -1)
               (should mode-line-format)
               (should (eq 'fit (seshat-reader--window-scale-source window))))))
@@ -727,6 +748,94 @@ window 而不是 frame。把 window 当 frame 传给 `window-list' 会抛
       (set-window-buffer window orig-buffer)
       (kill-buffer buffer)
       (kill-buffer other))))
+
+;;; 20. 偏差闸：目标 scale 与当前一致 → 不重渲染，但仍夹紧+居中
+
+(ert-deftest seshat-reader-resize-test--refit-fit-skip-when-scale-unchanged ()
+  "A fit window whose target scale equals the current one is not re-rendered.
+
+Re-rendering is synchronous (the C side waits for the cached page) and the
+re-render changes `line-prefix' and vscroll, which can be reported back as
+another size change; the 1% deviation gate breaks that loop.  Clamping and
+recentring still run, so the counts are (0 1 1) and the `scale' window
+parameter keeps its 1.6 value.  Without the gate the counts would be
+\(1 1 1) and `scale' would be written even though nothing changed."
+  (let* ((buffer (seshat-reader-resize-test--reader-buffer))
+         (window (selected-window)))
+    (unwind-protect
+        (progn
+          (seshat-reader-resize-test--set-page-overlay window buffer 'fit)
+          (set-window-parameter window 'scale 1.6)
+          (should (equal '(0 1 1)
+                         (seshat-reader-resize-test--refit-counts
+                          buffer window :scale 1.6)))
+          (should (eql 1.6 (window-parameter window 'scale)))
+          (should (eq 'fit (window-parameter window 'scale-source))))
+      (seshat-reader-resize-test--clear-window window)
+      (kill-buffer buffer))))
+
+;;; 21. 偏差闸：目标 scale 相差超过 1% → 重渲染，参数为目标值与 'fit
+
+(ert-deftest seshat-reader-resize-test--refit-fit-applies-when-scale-differs ()
+  "A target scale 12.5% away from the current one is applied once, as a fit.
+
+The recorded call pins both the value and the source: applying the current
+scale instead of the contain scale, or dropping the `fit' source, makes the
+assertion fail.  The threshold itself is 1% of the current scale (0.016
+here), so 1.8 is far outside it."
+  (let* ((buffer (seshat-reader-resize-test--reader-buffer))
+         (window (selected-window))
+         (applied nil))
+    (unwind-protect
+        (progn
+          (seshat-reader-resize-test--set-page-overlay window buffer 'fit)
+          (set-window-parameter window 'scale 1.6)
+          (cl-letf (((symbol-function 'window-buffer)
+                     (lambda (&optional _window) buffer))
+                    ((symbol-function 'seshat-reader--contain-scale)
+                     (lambda (&optional _window) 1.8))
+                    ((symbol-function 'seshat-reader-doc-scale-page)
+                     (lambda (factor &optional source)
+                       (push (cons factor source) applied)))
+                    ((symbol-function 'seshat-reader--clamp-window-vscroll)
+                     (lambda (&optional _window) nil))
+                    ((symbol-function 'seshat-reader--center-page)
+                     (lambda (&optional _window) nil)))
+            (with-current-buffer buffer
+              (seshat-reader--refit-window window)))
+          (should (equal '((1.8 . fit)) applied)))
+      (seshat-reader-resize-test--clear-window window)
+      (kill-buffer buffer))))
+
+;;; 22. 防重入：refit 执行期间产生的事件不再排队
+
+(ert-deftest seshat-reader-resize-test--schedule-refit-ignored-while-refitting ()
+  "A size change arriving during a refit is dropped instead of being queued.
+
+`run-with-idle-timer' must not be called and the pending timer must keep its
+identity: cancelling and re-arming it from inside a refit is exactly how the
+refit feeds itself.  The trailing counter-check schedules once with the flag
+back to nil, so the zero count cannot pass for a broken stub."
+  (let* ((buffer (seshat-reader-resize-test--reader-buffer))
+         (timer (run-at-time 3600 nil #'ignore))
+         (armed 0))
+    (unwind-protect
+        (with-current-buffer buffer
+          (setq seshat-reader--resize-refit-timer timer)
+          (cl-letf (((symbol-function 'run-with-idle-timer)
+                     (lambda (&rest _) (cl-incf armed) nil))
+                    ((symbol-function 'cancel-timer)
+                     (lambda (_object) nil)))
+            (let ((seshat-reader--refitting t))
+              (seshat-reader--schedule-refit))
+            (should (= 0 armed))
+            (should (eq timer seshat-reader--resize-refit-timer))
+            (let ((seshat-reader--refitting nil)
+                  (seshat-reader--resize-refit-enabled t))
+              (seshat-reader--schedule-refit))
+            (should (= 1 armed))))
+      (when (timerp timer) (cancel-timer timer))
+      (kill-buffer buffer))))
 
 (provide 'seshat-reader-resize-test)
 

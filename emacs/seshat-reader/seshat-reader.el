@@ -146,6 +146,15 @@ feature is kept, but opt-in, until that conflict is fixed."
 The timer is buffer-local on purpose: every window showing the buffer is
 refitted by one timer, so two windows cannot cancel each other's refit.")
 
+(defvar-local seshat-reader--refitting nil
+  "Non-nil while a pending refit is being applied for this buffer.
+
+A refit re-renders the page synchronously, and the re-render changes the
+`line-prefix' and the vertical scroll of the window, which can be reported
+back as another size change.  Size-change events arriving while this flag
+is non-nil are dropped instead of being queued, so a single refit cannot
+trigger the next one.")
+
 (defvar seshat-reader--resize-refit-delay 0.15
   "Idle delay, in seconds, before a pending refit is executed.")
 
@@ -842,8 +851,12 @@ event."
   "Schedule a debounced refit of the windows showing the current buffer.
 
 Scheduling cancels the timer armed by the previous event, so a burst of
-size changes results in a single refit."
-  (when seshat-reader--resize-refit-enabled
+size changes results in a single refit.  Nothing is scheduled while a
+refit is being applied (`seshat-reader--refitting') or when refitting is
+disabled: a refit changes the window layout itself, so queueing another
+one from inside it only feeds the loop."
+  (unless (or seshat-reader--refitting
+              (not seshat-reader--resize-refit-enabled))
     (seshat-reader--cancel-pending-refit)
     (let ((buffer (current-buffer)))
       (setq seshat-reader--resize-refit-timer
@@ -855,15 +868,21 @@ size changes results in a single refit."
 
 This is the idle timer callback.  It runs in whatever buffer is current
 at the time, so it switches to BUFFER before touching any buffer-local
-state, and it refits every window of BUFFER, not just the selected one."
+state, and it refits every window of BUFFER, not just the selected one.
+`seshat-reader--refitting' is bound while the windows are refitted, so the
+size changes caused by the refit itself are not queued again."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
       (setq seshat-reader--resize-refit-timer nil)
-      (dolist (window (get-buffer-window-list buffer nil t))
-        (seshat-reader--refit-window window)))))
+      (let ((seshat-reader--refitting t))
+        (dolist (window (get-buffer-window-list buffer nil t))
+          (seshat-reader--refit-window window))))))
 
 (defun seshat-reader--cancel-pending-refit ()
-  "Cancel the pending refit timer of the current buffer, if any."
+  "Cancel the pending refit timer of the current buffer, if any.
+
+`seshat-reader--refitting' is not touched here: it is only non-nil for the
+short span of an ongoing refit, where the `let' binding restores it."
   (when (timerp seshat-reader--resize-refit-timer)
     (cancel-timer seshat-reader--resize-refit-timer))
   (setq seshat-reader--resize-refit-timer nil))
@@ -874,7 +893,10 @@ state, and it refits every window of BUFFER, not just the selected one."
 A window whose scale source is `manual' keeps its scale and only gets its
 vertical scroll clamped and the page recentred.  Every other window,
 including one that never recorded a source, is rescaled to contain the
-page (`seshat-reader--contain-scale') first.
+page (`seshat-reader--contain-scale') first, but only when the new scale
+differs from the current one by more than one percent: re-rendering is
+synchronous and changes the window layout, so a sub-threshold difference
+only wastes work and feeds the resize callback it was called from.
 
 The window is skipped silently when it is no longer live, no longer shows
 the current buffer, has lost its page overlay, or shows a buffer that has
@@ -889,8 +911,21 @@ reported and does not prevent the other windows from being refitted."
             (progn
               (unless (eq (seshat-reader--window-scale-source window) 'manual)
                 ;; contain：取按高与按宽的较小者，保证窗口变窄时页面不溢出、不被裁切。
+                ;; 偏差闸：目标 scale 与当前 scale 相对差不足 1% 时跳过重渲染——重渲染是
+                ;; 同步的（C 侧 wait_for_cached_page），而 line-prefix / vscroll 的变化可能
+                ;; 再次触发尺寸变化回调；没有这道闸时两者会互相引发，表现为画面持续抖动。
                 (with-selected-window window
-                  (seshat-reader-doc-scale-page (seshat-reader--contain-scale window) 'fit)))
+                  (let* ((target (seshat-reader--contain-scale window))
+                         (current (or (seshat-reader-current-doc-scale-value) 1.0))
+                         ;; 阈值取当前 scale 的 1%；current 非正或非数字时退回 1.0 / 1e-6，
+                         ;; 保证阈值恒为正（阈值为 0 会让任何浮点尾差都触发重渲染）。
+                         (threshold (* 0.01 (max (if (numberp current) current 1.0)
+                                                 1e-6)))
+                         (changed (and (numberp target) (> target 0)
+                                       (numberp current)
+                                       (> (abs (- target current)) threshold))))
+                    (when changed
+                      (seshat-reader-doc-scale-page target 'fit)))))
               (seshat-reader--clamp-window-vscroll window)
               (seshat-reader--center-page window))
           (error

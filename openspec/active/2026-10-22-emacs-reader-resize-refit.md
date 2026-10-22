@@ -11,6 +11,7 @@
 - 下一步：**等用户在 GUI Emacs 上做 T4 的 8 条真机验收**（batch 无法自动化，`fit-to-height` 会报 `Window system frame should be used`）；通过后再做 T5 文档 + T6 归档
 - 2026-10-23 追加：真机验收发现窗口变窄时页面超宽裁切（主路径缺陷），按方案 C 修复（contain + 负偏移夹 0），详见 D6
 - 2026-10-23 真机第二次纠正：hook 实际传 window（非 frame），refit 链路此前从未运行；`--center-page` 的 prefix/hscroll 改为同成同败。见 D2 与「旧版计划的错误清单」第 7 条。
+- 2026-10-23 真机反馈：布局与居中已正常，但画面持续抖动；实现 D3 预留的偏差闸（1%）+ --refitting 防重入，阻断 refit 自我激发。
 
 ## 目标
 
@@ -180,11 +181,16 @@ SOURCE 非 nil 时，把它记为该窗口的缩放来源（`fit' 或 `manual'�
 **降级路径（按顺序取第一个可行者）**：
 
 1. **L3-8（daemon + `emacsclient -c`）通过** → 维持 idle timer。
-2. L3-8 不通过 → 降级为 `run-with-timer` 0.15s + **偏差闸**：仅当「渲染尺寸与窗口尺寸偏差 > 2%」时才 refit（避免定时器在拖拽过程中反复重渲染造成卡顿）。
-
-   第 2 级「偏差闸」的判据（执行时按此实现，勿现场臆定）：渲染尺寸取 `(seshat-reader--get-current-doc-image-size window)` 的宽/高，窗口尺寸取 `(window-body-width window t)` / `(window-body-height window t)`；宽偏差 `dw = |1 - 渲染宽/窗宽|`、高偏差 `dh = |1 - 渲染高/窗高|`，**取 `dw` 与 `dh` 中较小者**作为判定值，仅当该值 > 0.02 时才 refit。取较小者的理由：页面按较紧的一维贴合即是「已贴合」，另一维的富余属正常留白，不应触发重渲染。
-
+2. **偏差闸 → 已实现为默认行为（2026-10-23，不再等 L3 不达标才用）**，详见下条。
 3. 仍不通过 → 只 `clamp` + `center` 不 refit（即退回本设计 D2b 的「manual 分支」行为），并把「尺寸变化后不重算分辨率」记入 `openspec/tech-debt.md`。
+
+**降级路径第 2 级（偏差闸）已实现为默认行为（2026-10-23）**：
+
+- **动机（真机反馈）**：2026-10-23 用户在 GUI 上反馈「布局与居中已正常，但画面持续抖动」。`--refit-window` 里的 `seshat-reader-doc-scale-page` 是**同步**重渲染（C 侧 `wait_for_cached_page`），而重渲染会改变 overlay 的 `line-prefix` 与窗口 vscroll；这些变化可能被再次判定为「窗口尺寸变化」→ 再排 refit → 再重渲染，形成自我激发循环（refit ↔ 尺寸变化），表现为画面持续跳动。因此这道闸不再只作为 L3 不达标时的兜底，而是默认生效。
+- **偏差闸（阈值 1%，相对差）**：fit 分支先算 `target = (seshat-reader--contain-scale window)` 与 `current = (seshat-reader-current-doc-scale-value)`，仅当 `|target - current| > 0.01 × max(current, 1e-6)` 时才 `doc-scale-page`。低于阈值时**只 `clamp` + `center`，不重渲染**——位置照旧归位，但不再触碰渲染分辨率。`target` 非数字或 ≤ 0 时同样不重渲染（`--contain-scale` 在尺寸未知时返回 1.0，守卫只是兜底）。阈值以 `max current 1e-6` 计算，避免 current 为 0 时阈值为 0（那会让任何浮点尾差都触发重渲染）。
+- **阈值形态与原判据的差异**：原第 2 级写的是「渲染尺寸与窗口尺寸偏差 > 2%，取宽/高偏差较小者」。实现改为在**输入侧**（scale）比较，而不是在**输出侧**（渲染尺寸）比较：重渲染的触发量本来就是 scale，`target` 与 `current` 的相对差直接等于「这次重渲染会改变多少」，且不受非绑定维留白干扰。阈值由 2% 收紧到 1%：1% 足以吸收 scale 重算的浮点尾差，而真实尺寸变化（拖分割线、开关面板）带来的 visual 差异通常远大于 1%；小于 1% 的变化本身不可见，跳过重渲染是有意为之。
+- **`--refitting` 防重入**：新增 `defvar-local seshat-reader--refitting`；`--run-pending-refit` 遍历窗口期间把它 `let`-bind 为 `t`，`--schedule-refit` 在它为 `t` 时**直接丢弃**事件（既不 `cancel-timer` 也不重排），这样同一次 redisplay 内由 refit 自身引起的尺寸变化不会被排队成下一次 refit。`--cancel-pending-refit` 不重置该标志（它只在执行期短暂为 `t`，由 `let` 自动恢复）。
+- **可回退性**：`seshat-reader--resize-refit-enabled` 仍是内部开关（置 nil 退回「只重居中」的旧行为）；manual 分支与 clamp / center 语义未变；`--contain-scale` / `--center-page` / `--set-window-vscroll` / `--page-max-vscroll-pixels` 本体均未改动，只改调用处。
 
 ### D4 vscroll 夹紧复用既有 helper
 
@@ -242,7 +248,7 @@ SOURCE 非 nil 时，把它记为该窗口的缩放来源（`fit' 或 `manual'�
 
 1. **hook 处理：wrapper 内扩展，而非替换注册**。旧版把 `add-hook` 换成自己的函数并假设收到 window 参数；本版保留 `:1246` 的注册，handler 改为同时接受 window 与 frame 两种形态（frame 形态保留 `(window-list frame)` 遍历），只在 wrapper 内把「直接 center」换成「排入去抖队列」——这样 M12 已修的「frame vs window」回归不会被重新引入，也不会像 2026-10-23 之前那样因传 window 而抛 `(error "Window is on a different frame")` 被 `safe_call` 吞掉。
 2. **夹紧：复用 `--page-max-vscroll-pixels`，而非新写上限公式**。旧版另写一份 `max(0, 图高 + strip 高 - 窗高)` 并新增独立 helper；本版直接调既有 `:559`（公式 `:565-570`，已含 join-strip 高度），只补 `(max 0 …)` 下界，避免与 `seshat-reader-page-join-test.el:208` 锁定的公式产生第二份真相。
-3. **去抖：idle timer 必须论证，并留三级降级**。旧版直接用 `run-with-idle-timer` 未处理 `seshat-reader-annotation-queue.el:437-438` 的既有告诫；本版给出「前台 UI 重排 vs 无人交互后台同步」的差异论证，并准备 `run-with-timer` + 2% 偏差闸 → 只 clamp+center 的两级降级，末级记 tech-debt。
+3. **去抖：idle timer 必须论证，并留三级降级**。旧版直接用 `run-with-idle-timer` 未处理 `seshat-reader-annotation-queue.el:437-438` 的既有告诫；本版给出「前台 UI 重排 vs 无人交互后台同步」的差异论证。第 2 级降级（偏差闸）已按真机抖动反馈**提前实现为默认行为**：阈值 1%（目标 scale 与当前 scale 的相对差），低于阈值只 clamp + center；并加 `--refitting` 防重入。第三级（只 clamp+center 不 refit）与 tech-debt 记录仍作为后备保留。
 4. **scale-source 的写入面更窄**：本版给 `doc-scale-page` 加 `&optional source`，只让 5 个缩放命令传值，**4 个恢复路径保持 1 参**（`:985`/`:1008`/`:1083`/`seshat-reader-bookmark.el:48`），`--recent-scale-fallback` 不动——旧版未区分「来源」与「兜底数值」，也未钉死恢复路径不传参。
 5. **测试目标按真实基线设定**：旧版以 181 例为基线、只规划少量用例；本版基线 312 例、新增 13 例（合计 ≥325），并把「`page-join-test.el` 的 5 个 vscroll 用例零回归」写成硬性验收。
 6. **第三次修订（真机验收后，D6）**：首版把「不改 `--center-page`、不改首次 fit」当作不变量，真机验收证明这条不变量站不住——只按高度算 scale 的自动 fit 在窄窗口下必然超宽，而 `--center-page` 的负偏移会把超宽转成**两侧裁切**。本版据此放开两处最小改动（首次 fit 改 contain、`scroll-offset` 夹 `>= 0`），仍不动 `--set-window-vscroll`、`fit-to-height` / `fit-to-width` 本体与三条 hook 注册。
