@@ -316,44 +316,52 @@ pixel-per-col 多乘一次（50 × 25 = 1250），会先被夹到 1000，断言�
     (should (= 0 (seshat-reader--page-join-pixels)))))
 
 (ert-deftest seshat-reader-page-join-test--window-size-change ()
-  "钩子按 frame 遍历窗口，只对显示当前 buffer 的窗口重算居中。"
-  (with-temp-buffer
-    (let* ((win-a 'win-a)
-           (win-b 'win-b)
-           (other-buffer (generate-new-buffer " *other*"))
-           (calls nil))
-      (unwind-protect
-          (progn
-            (cl-letf (((symbol-function 'window-list)
-                       (lambda (&optional _frame) (list win-a win-b)))
-                      ((symbol-function 'window-buffer)
-                       (lambda (window)
-                         (if (eq window win-a) (current-buffer) other-buffer)))
-                      ((symbol-function 'seshat-reader--center-page)
-                       (lambda (&optional window) (push window calls) 'centered)))
-              (seshat-reader--window-size-change (selected-frame))
-              ;; 只有显示当前 buffer 的 win-a 被居中，且传入的是窗口本身
-              (should (equal (list win-a) calls))))
-        (kill-buffer other-buffer)))))
+  "钩子按 frame 遍历窗口，对匹配的 buffer 排入一次去抖 refit，不直接居中。
 
-(ert-deftest seshat-reader-page-join-test--window-size-change-errors ()
-  "单个窗口报错不影响其它窗口被居中，函数整体不抛错。"
+契约变更：去抖取代同步 center（2026-10-22，见计划 D2）。尺寸变化路径不再同步
+调 `seshat-reader--center-page'，而是排一个 idle timer，由
+`seshat-reader--run-pending-refit' 统一 refit 全部窗口。"
   (with-temp-buffer
     (let* ((win-a 'win-a)
            (win-b 'win-b)
-           (calls nil))
+           (refits 0)
+           (centers nil))
       (cl-letf (((symbol-function 'window-list)
                  (lambda (&optional _frame) (list win-a win-b)))
                 ((symbol-function 'window-buffer)
                  (lambda (_window) (current-buffer)))
+                ((symbol-function 'seshat-reader--schedule-refit)
+                 (lambda () (setq refits (1+ refits)) nil))
                 ((symbol-function 'seshat-reader--center-page)
-                 (lambda (&optional window)
-                   (push window calls)
-                   (when (eq window win-a)
-                     (error "centering failed")))))
+                 (lambda (&optional window) (push window centers) 'centered)))
+        (seshat-reader--window-size-change (selected-frame))
+        ;; 两个窗口都显示当前 buffer，但按 buffer 只排一次 refit
+        (should (= 1 refits))
+        ;; wrapper 内零调用 `--center-page'：居中移交 refit 阶段
+        (should-not centers)))))
+
+(ert-deftest seshat-reader-page-join-test--window-size-change-dedup ()
+  "同一 buffer 的多个窗口只排一次 refit，且窗口异常不会让 wrapper 抛错。
+
+「单窗口报错隔离」语义已移交 `seshat-reader--refit-window' 的
+`condition-case'（由 T3 的新用例 ⑫/⑬ 覆盖）。"
+  (with-temp-buffer
+    (let* ((win-a 'win-a)
+           (win-b 'win-b)
+           (refits 0))
+      (cl-letf (((symbol-function 'window-list)
+                 (lambda (&optional _frame) (list win-a win-b)))
+                ((symbol-function 'window-buffer)
+                 (lambda (_window) (current-buffer)))
+                ((symbol-function 'seshat-reader--schedule-refit)
+                 (lambda () (setq refits (1+ refits)) nil))
+                ;; 若实现回归为「wrapper 内同步 refit」，此桩会抛错，
+                ;; 使下面的 `should-not' 失败。
+                ((symbol-function 'seshat-reader--refit-window)
+                 (lambda (_window) (error "refit failed"))))
         (should-not (seshat-reader--window-size-change (selected-frame)))
-        ;; 两个窗口都被尝试过，且顺序为先 win-a 后 win-b
-        (should (equal (list win-b win-a) calls))))))
+        ;; win-a 与 win-b 命中同一 buffer，去重后只有一次排队
+        (should (= 1 refits))))))
 
 (ert-deftest seshat-reader-page-join-test--prefix-width-zero ()
   "center overlay 不存在或 line-prefix 为 nil 时前缀宽度是数字 0。"

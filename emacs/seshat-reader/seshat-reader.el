@@ -133,6 +133,22 @@ feature is kept, but opt-in, until that conflict is fixed."
 (defvar-local seshat-reader--reloading nil
   "Boolean flag to represent reloading status of a document.")
 
+(defvar-local seshat-reader--resize-refit-timer nil
+  "Pending debounced refit timer of the current buffer.
+
+The timer is buffer-local on purpose: every window showing the buffer is
+refitted by one timer, so two windows cannot cancel each other's refit.")
+
+(defvar seshat-reader--resize-refit-delay 0.15
+  "Idle delay, in seconds, before a pending refit is executed.")
+
+(defvar seshat-reader--resize-refit-enabled t
+  "Whether window size changes trigger a refit.
+
+Setting this to nil restores the previous behaviour, where a size change
+only recentred the page, without touching the rendering resolution or the
+vertical scroll.  It is an internal switch, not a user option.")
+
 ;; Setting of `auto-mode-list' fails if not autoloaded.
 ;;;###autoload
 (defconst seshat-reader-supported-formats (list "pdf" "epub" "mobi"
@@ -308,14 +324,29 @@ WINDOW must be a valid window and defaults to the selected one."
 	 (height (plist-get cdr-image :height)))
     (cons width height)))
 
-(defun seshat-reader-doc-scale-page (factor)
+(defun seshat-reader-doc-scale-page (factor &optional source)
   "Scales the page by a given FACTOR.
 
 It also updates `seshat-reader--recent-scale-fallback' and `scale' property of
-selected window to reflect the new, possibly clamped scale."
+selected window to reflect the new, possibly clamped scale.
+
+When SOURCE is non-nil, it is also recorded as the scale source of the selected
+window.  The expected values are `fit' (the scale was derived from the window
+size) and `manual' (the user chose the scale).  A nil SOURCE leaves the
+recorded source unchanged, so restoring a window's previous scale does not
+pretend to be a new scaling command."
   (when-let* ((factor-clamped (seshat-reader-dyn--scale-page factor)))
     (setq seshat-reader--recent-scale-fallback factor-clamped)
-    (set-window-parameter nil 'scale factor-clamped)))
+    (set-window-parameter nil 'scale factor-clamped)
+    (when source
+      (set-window-parameter nil 'scale-source source))))
+
+(defun seshat-reader--window-scale-source (&optional window)
+  "Return WINDOW's scale source, `fit' or `manual' (default `fit').
+
+WINDOW defaults to the selected window.  A window that never recorded a
+source, for example one restored from a bookmark, counts as `fit'."
+  (or (window-parameter (or window (selected-window)) 'scale-source) 'fit))
 
 (defun seshat-reader-enlarge-size (&optional scaling-factor)
   "Enlarge the size of the current page by the `seshat-reader-enlarge-factor'.
@@ -323,7 +354,7 @@ selected window to reflect the new, possibly clamped scale."
 Optionally scale it by the SCALING-FACTOR.  Scales on selected window."
   (interactive (list (float
 		      (* (seshat-reader-current-doc-scale-value) seshat-reader-enlarge-factor))))
-  (seshat-reader-doc-scale-page scaling-factor)
+  (seshat-reader-doc-scale-page scaling-factor 'manual)
   (seshat-reader--center-page)
   (seshat-reader--set-page-top-when-joined))
 
@@ -333,14 +364,14 @@ Optionally scale it by the SCALING-FACTOR.  Scales on selected window."
 Optionally scale it by the SCALING-FACTOR.  Scales on selected window."
   (interactive (list (float
 		      (* (seshat-reader-current-doc-scale-value) seshat-reader-shrink-factor))))
-  (seshat-reader-doc-scale-page scaling-factor)
+  (seshat-reader-doc-scale-page scaling-factor 'manual)
   (seshat-reader--center-page)
   (seshat-reader--set-page-top-when-joined))
 
 (defun seshat-reader-reset-size ()
   "Reset the size of the current page to 1.0."
   (interactive)
-  (seshat-reader-doc-scale-page 1.0)
+  (seshat-reader-doc-scale-page 1.0 'manual)
   (seshat-reader--center-page)
   (seshat-reader--set-page-top-when-joined))
 
@@ -351,7 +382,7 @@ Optionally scale it by the SCALING-FACTOR.  Scales on selected window."
 	 (pixel-window-height (window-body-height nil t))
 	 (unscaled-height (/ image-height (seshat-reader-current-doc-scale-value)))
 	 (scaling-factor (/ pixel-window-height unscaled-height)))
-    (seshat-reader-doc-scale-page scaling-factor)
+    (seshat-reader-doc-scale-page scaling-factor 'fit)
     (seshat-reader--center-page)
     (seshat-reader--set-page-top)))
 
@@ -362,7 +393,7 @@ Optionally scale it by the SCALING-FACTOR.  Scales on selected window."
 	 (pixel-window-width (window-body-width nil t))
 	 (unscaled-width (/ image-width (seshat-reader-current-doc-scale-value)))
 	 (scaling-factor (/ pixel-window-width unscaled-width)))
-    (seshat-reader-doc-scale-page scaling-factor)
+    (seshat-reader-doc-scale-page scaling-factor 'fit)
     (seshat-reader--center-page)
     (seshat-reader--set-page-top-when-joined)))
 
@@ -610,6 +641,22 @@ defaults to the selected window."
     (seshat-reader--set-window-vscroll
      window (seshat-reader--page-max-vscroll-pixels window) t)))
 
+(defun seshat-reader--clamp-window-vscroll (&optional window)
+  "Clamp the pixel vertical scroll of WINDOW to [0, maximum].
+
+The maximum is `seshat-reader--page-max-vscroll-pixels', which already
+accounts for the join strip height; the lower bound is added here because
+`seshat-reader--set-window-vscroll' only clamps above.  Nothing is sent
+when the current scroll is already inside the range, so that no useless
+redisplay is triggered.  WINDOW defaults to the selected window."
+  (let* ((window (or window (selected-window)))
+         (max-px (max 0 (seshat-reader--page-max-vscroll-pixels window)))
+         (cur (seshat-reader--window-vscroll-pixels window))
+         (clamped (max 0 (min cur max-px))))
+    (unless (= cur clamped)
+      (seshat-reader--set-window-vscroll window clamped t))
+    clamped))
+
 ;; Most of the scrolling functions here exist because of our handling
 ;; of centering in `seshat-reader--center-page'.
 
@@ -724,19 +771,85 @@ stuck to one side of the window."
           (set-window-hscroll window 0))))))
 
 (defun seshat-reader--window-size-change (frame)
-  "Recenter the document in the windows of FRAME showing this buffer.
+  "Schedule a refit for the windows of FRAME showing this buffer.
 
 `window-size-change-functions' is called with a frame as its argument,
 not with a window, so FRAME cannot be passed to functions such as
 `seshat-reader--center-page' which expect a valid window.  This wrapper
-walks the windows of FRAME and recenters every window whose buffer is
-the current buffer.
+walks the windows of FRAME and, as soon as one of them shows the current
+buffer, schedules a single debounced refit for the whole buffer.
 
-A failure while recentering one window is ignored, so that a single
-broken window cannot prevent the others from being recentered."
-  (dolist (window (window-list frame))
-    (when (eq (window-buffer window) (current-buffer))
-      (ignore-errors (seshat-reader--center-page window)))))
+The refit is deferred because resizing produces a burst of events:
+dragging a divider fires on every pixel, and rescaling re-renders the
+page synchronously in the dynamic module.  See
+`seshat-reader--run-pending-refit'."
+  ;; 同一 buffer 只排一次：调度本身就是 buffer 级的（取消并重排同一个 timer），
+  ;; 每个匹配窗口各排一次只会重复取消/重排，故命中首个窗口即停止扫描。
+  (catch 'scheduled
+    (dolist (window (window-list frame))
+      (when (eq (window-buffer window) (current-buffer))
+        (seshat-reader--schedule-refit)
+        (throw 'scheduled nil)))))
+
+(defun seshat-reader--schedule-refit ()
+  "Schedule a debounced refit of the windows showing the current buffer.
+
+Scheduling cancels the timer armed by the previous event, so a burst of
+size changes results in a single refit."
+  (when seshat-reader--resize-refit-enabled
+    (seshat-reader--cancel-pending-refit)
+    (let ((buffer (current-buffer)))
+      (setq seshat-reader--resize-refit-timer
+            (run-with-idle-timer seshat-reader--resize-refit-delay nil
+                                 #'seshat-reader--run-pending-refit buffer)))))
+
+(defun seshat-reader--run-pending-refit (buffer)
+  "Refit the windows showing BUFFER and clear the pending timer.
+
+This is the idle timer callback.  It runs in whatever buffer is current
+at the time, so it switches to BUFFER before touching any buffer-local
+state, and it refits every window of BUFFER, not just the selected one."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (setq seshat-reader--resize-refit-timer nil)
+      (dolist (window (get-buffer-window-list buffer nil t))
+        (seshat-reader--refit-window window)))))
+
+(defun seshat-reader--cancel-pending-refit ()
+  "Cancel the pending refit timer of the current buffer, if any."
+  (when (timerp seshat-reader--resize-refit-timer)
+    (cancel-timer seshat-reader--resize-refit-timer))
+  (setq seshat-reader--resize-refit-timer nil))
+
+(defun seshat-reader--refit-window (window)
+  "Refit the page of WINDOW to its current size.
+
+A window whose scale source is `manual' keeps its scale and only gets its
+vertical scroll clamped and the page recentred.  Every other window,
+including one that never recorded a source, is rescaled with
+`seshat-reader-default-fit' first.
+
+The window is skipped silently when it is no longer live, no longer shows
+the current buffer, has lost its page overlay, or shows a buffer that has
+left `seshat-reader-mode'.  An error while refitting one window is
+reported and does not prevent the other windows from being refitted."
+  (when (and (window-live-p window)
+             (eq (window-buffer window) (current-buffer))
+             (overlayp (window-parameter window 'overlay)))
+    (with-current-buffer (window-buffer window)
+      (when (derived-mode-p 'seshat-reader-mode)
+        (condition-case err
+            (progn
+              (unless (eq (seshat-reader--window-scale-source window) 'manual)
+                ;; fit 内部读 (window-body-height nil t)，必须在目标窗口内求值，
+                ;; 否则同 buffer 多窗口时按当前选中窗口重算非选中窗口的 scale。
+                (with-selected-window window
+                  (funcall seshat-reader-default-fit)))
+              (seshat-reader--clamp-window-vscroll window)
+              (seshat-reader--center-page window))
+          (error
+           (message "seshat-reader: resize refit skipped in %s: %S"
+                    (buffer-name) err)))))))
 
 
 (defun seshat-reader-scroll-up (&optional amount)
@@ -963,8 +1076,11 @@ See also `seshat-reader-shrink-size'."
 (defun seshat-reader--clear-doc-memory ()
   "Clear document memory if we are in `seshat-reader-mode'.
 
-Intended for use in `kill-buffer-hook'."
+Intended for use in `kill-buffer-hook'.  A refit that is still pending
+for this buffer is cancelled as well, so that no timer survives the
+buffer."
   (when (derived-mode-p 'seshat-reader-mode)
+    (seshat-reader--cancel-pending-refit)
     (seshat-reader-dyn--close-doc)))
 (add-hook 'kill-buffer-hook 'seshat-reader--clear-doc-memory nil t)
 
