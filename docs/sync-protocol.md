@@ -318,10 +318,17 @@ loop:
 - 本地批注模型没有可靠的上行时间戳，客户端可传 `updated_at = null`（服务端不做冲突检测，最后写胜）；
   传了就必须承担「本地时间戳陈旧 → 每次都被判 409」的后果。
 
-> **Android 现状（2026-10-22）**：批注分支已实现（`UpdateAnnotationResult.Conflict` → `resolveConflict`
-> 重拉并以服务端为准 + 冲突计数返回）；进度分支**只实现了「带时间戳上传」，未实现 409 后的
-> 「重拉比较 + 带新时间戳重发」**——409 时本次推送按失败忽略、等下一次 `onStop` 再推。
-> 该缺口记入 `openspec/tech-debt.md`。
+> **Android 现状（2026-10-22 收尾轮后）**：批注分支已实现（`UpdateAnnotationResult.Conflict` →
+> `resolveConflict` 重拉并以服务端为准 + 冲突计数返回）；进度分支**两支均已实现**——
+> `SyncManager.pushProgressDetailed` 返回可判别结果 `ProgressPushResult`（`sync/SyncManager.kt` 顶层声明）
+> （`Pushed` / `Merged` / `Rejected` / `Skipped`）：命中 409 后先 `GET /api/progress/{uid}` 重拉，
+> 比较两侧 `updated_at`，**本地较新则以新时间戳（严格大于服务端 `updated_at`，
+> `RETRY_TIMESTAMP_STEP_MILLIS`）重发一次**，成功为 `Pushed`；服务端较新则写回本地、返回 `Merged`
+> 且不重发；重发仍 409 返回 `Rejected`（调用方必须提示，不得静默忽略）。`pushProgress` 保留为
+> 兼容包装，`syncDocument` 把该结局记入 `SyncSummary.progressRejected`。
+> **仍未覆盖**：阅读器侧（`EpubReaderActivity` / `PdfReaderActivity`）的 `handleProgressPush` 三态 UI
+> 分支无 JVM 单测、无 instrumentation 测试（项目未引入 Robolectric，Toast 属设备级行为），只能真机
+> 人工验收；「非 409 的异常」仍按原语义上抛、不含用户提示。细节见 `openspec/tech-debt.md` 该条目（已解决）。
 
 ### 7.3 location 约定
 
