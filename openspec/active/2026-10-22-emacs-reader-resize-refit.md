@@ -4,10 +4,11 @@
 
 ## 当前状态
 
-- 阶段：Phase 3（Implement）· 进行中
+- 阶段：Phase 3（Implement）· T0–T3 完成，L1+L2 全绿
 - 已确认：方案 ✅（用户 2026-10-22 确认）、计划 ✅（用户 2026-10-22 确认）
-- 实施：T0–T2 进行中
-- 下一步：T0–T3 完成后停下，等用户做 T4 的 8 条真机验收，再执行 T5/T6
+- 实施：T0–T3 ✅（commit `c47100c` / `0d5edbd` + 本批测试）；T4 真机、T5 文档、T6 归档待做
+- 验证：L1 警告集零新增（33 条）；L2 **325** 例 / 0 unexpected / 2 skipped
+- 下一步：**等用户在 GUI Emacs 上做 T4 的 8 条真机验收**（batch 无法自动化，`fit-to-height` 会报 `Window system frame should be used`）；通过后再做 T5 文档 + T6 归档
 
 ## 目标
 
@@ -222,33 +223,37 @@ SOURCE 非 nil 时，把它记为该窗口的缩放来源（`fit' 或 `manual'�
 
 ## 任务
 
-### T0 基线与安全点
+### [x] T0 基线与安全点
 
 - 动作：① `cd emacs/seshat-reader && make all` 记录输出（应零 warning/error）；② 跑 `emacs/tests/` 全部 10 个文件，逐文件记录数字；③ 打轻量 tag `pre-reader-resize`（**只打 tag，不动工作区**）。
 - 依赖：无
 - 验收：`make all` 零 warning；合计 312 例 / 310 passed / 2 skipped / 0 unexpected；「## 基线」表填写完毕；`git tag -l pre-reader-resize` 有输出。
+- ✅ 2026-10-22 完成：`make all` EXIT=0、警告集 33 条（零新增）；10 个文件合计 312 例 / 310 passed / 2 skipped / 0 unexpected；tag `pre-reader-resize` → `ca01af6`。
 
-### T1 scale-source（D1）
+### [x] T1 scale-source（D1）
 
 - 动作：新增 `seshat-reader--window-scale-source`；`seshat-reader-doc-scale-page` 加 `&optional source`；5 个缩放命令各加一个实参（`enlarge`/`shrink`/`reset` → `'manual`，`fit-to-height`/`fit-to-width` → `'fit`）；逐一核对 8 个 elisp 调用点 + `seshat-reader-bookmark.el:48` 的实参数（`grep -n "seshat-reader-doc-scale-page" emacs/seshat-reader/`，应得 9 个调用点，其中 5 处 2 实参、4 处 1 实参）。
 - 依赖：T0
 - 验收：新增 ERT ≥3 例（`fit` / `manual` / 未设置 → `'fit`）；恢复路径调用点仍为 1 实参；`make all` 零 warning。
+- ✅ 2026-10-22 完成：`--window-scale-source` + `doc-scale-page` 的 `&optional source` 落地；5 个缩放命令传 2 实参（3 manual / 2 fit）、4 个恢复路径仍 1 实参；source 语义由 T3 的 `--doc-scale-page-source` 等 3 例锁定。
 
-### T2 wrapper 扩展 + 新函数 + timer 生命周期（D2 / D2b / D3 / D4）
+### [x] T2 wrapper 扩展 + 新函数 + timer 生命周期（D2 / D2b / D3 / D4）
 
 - 动作：改 `seshat-reader--window-size-change`（`:726`）；新增 `--schedule-refit` / `--run-pending-refit` / `--cancel-pending-refit` / `--refit-window` / `--clamp-window-vscroll`；新增 `defvar seshat-reader--resize-refit-enabled`、`defvar-local seshat-reader--resize-refit-timer`、`defvar seshat-reader--resize-refit-delay`；`--clear-doc-memory`（`:963`）内补 `--cancel-pending-refit`。
 - 依赖：T1
 - 验收：`:1246`/`:1247`/`:1248` 三条 hook 的注册行未变；`--center-page` / `--set-window-vscroll` / `--page-max-vscroll-pixels` 函数体零改动（`git diff` 核对）；`make all` 零 warning。
+- ✅ 2026-10-22 完成：5 个新函数 + 3 个内部变量落地，`--clear-doc-memory` 补 `--cancel-pending-refit`；三条 hook 注册行未变；`page-join-test` 24 例（含 5 个 vscroll 用例）零回归。
 - 适配 `emacs/tests/seshat-reader-page-join-test.el` 中锁定了旧契约（size-change 同步 center）的两个用例：`--window-size-change` 改为断言 `--schedule-refit` 被调用 1 次且 `--center-page` 零调用；`--window-size-change-errors` 改为断言「同 buffer 多窗口只排一次 refit」，其「单窗口报错隔离」语义移交 `--refit-window` 的 `condition-case`（由 T3 覆盖）。**不得改动该文件其它 22 个用例。**
 
-### T3 新增 `emacs/tests/seshat-reader-resize-test.el`（13 例）
+### [x] T3 新增 `emacs/tests/seshat-reader-resize-test.el`（13 例）
 
 - 动作：全部用 `cl-letf` 桩（stub `seshat-reader-default-fit` 指向的符号、`--clamp-window-vscroll`、`--center-page`、`--set-window-vscroll`、`--page-max-vscroll-pixels`），不触真实 GUI。
 - 13 例清单：① 去抖——两次 schedule 后旧 timer 被 cancel、只留一个；② 去抖重排——多次 schedule 后回调只执行一次 refit；③ `fit` 分支调 default-fit；④ `manual` 分支不调 default-fit，只 clamp+center；⑤ 未设置 source 走 fit；⑥ 窗口已死（`delete-window` 后）不动作不报错；⑦ 非 `seshat-reader-mode` 的 buffer 不动作；⑧ `'overlay` 参数失效（非 overlay 对象）不动作；⑨ clamp 三态（cur < 0 / cur > max / 区间内，前两态下发、第三态不下发）**加 `max-px = 0` 且 `cur > 0` 的子情形**（页面比窗口矮：上限算出来为 0，`cur` 为正时夹到 0 并下发；`cur` 已为 0 时零调用）；⑩ `doc-scale-page` 的 source 参数语义（传 `'manual` 写入、传 nil 不覆盖已有值）；⑪ `presentation-mode` 开关不回归；⑫ 同一 buffer 两个窗口各处理一次；⑬ buffer 已 kill 时回调不报错且 `--clear-doc-memory` 清掉了 timer。
 - 依赖：T2
 - 验收：13 例全绿（`unexpected = 0`）；整套 10 + 1 个文件合计 ≥325 例、`skipped ≤ 2`。
+- ✅ 2026-10-22 完成：13 例全绿（`unexpected = 0`）；11 个文件合计 **325** 例 / 323 passed / 2 skipped / 0 unexpected；4 处单点变异（manual 分支、clamp 下界、去抖 cancel、`--clear-doc-memory` cancel）各自只红对应用例。
 
-### T4 L3 真机手工验收（8 条）
+### [ ] T4 L3 真机手工验收（8 条）
 
 - 动作（batch 无法自动化——`fit-to-height` 在 `emacs -Q --batch` 下报 `Window system frame should be used`）：
   - **L3-1** 开批注面板（`C-c C-l`）→ 右侧 side window 出现、阅读区变窄 → 页面重新贴合，无单侧裁切。
@@ -262,7 +267,9 @@ SOURCE 非 nil 时，把它记为该窗口的缩放来源（`fit' 或 `manual'�
 - 依赖：T3
 - 验收：8 条逐条记录「通过 / 失败 + 现象」；L3-5 与 L3-8 是 D3 是否降级的判据。
 
-### T5 文档
+> **观察项（实施中发现）**：`--refit-window` 的 fit 分支用了 `with-selected-window`，在 idle timer 回调里会短暂切换选中窗口，可能触发 `window-selection-change-functions` 或 mode-line 重绘。若真机上观察到闪烁/mode-line 抖动，替代方案是不经 `seshat-reader-default-fit`，改按 `(window-body-height window t)` 直接算 scale 后调 `(seshat-reader-doc-scale-page factor 'fit)`。
+
+### [ ] T5 文档
 
 - 动作：见「## 文档清单」。
 - 补充：`tech-debt.md` 除原有两条外，再加一条「书签恢复不携带缩放来源，跨会话手动缩放会被尺寸变化重置」。
@@ -276,7 +283,7 @@ SOURCE 非 nil 时，把它记为该窗口的缩放来源（`fit' 或 `manual'�
 - 依赖：T2（T4 结论用于回填 `docs/emacs-reader.md` §12）
 - 验收：6 个文件按要求更新；`VENDORED.md` 新增第 ⑦ 项（本计划变更域），三处过期信息由独立 doc-fix commit 更正。
 
-### T6 归档与沉淀
+### [ ] T6 归档与沉淀
 
 - 动作：计划移入 `openspec/completed/`、`## 当前状态` 收尾更新、`memory_lesson_save` 沉淀可复用经验（按 `rules/workflow.md` 记忆归属规则：涉及 elisp MCP / Emacs 全局行为时省略 `project`）。
 - 依赖：T4、T5
@@ -314,7 +321,7 @@ T0 ──▶ T1 ──▶ T2 ──┬──▶ T3 ──▶ T4 ──┐
 ### L1 语法与静态检查（必须通过）
 
 - 命令：`cd emacs/seshat-reader && make all` 退出码 0。
-- **判据是「警告集零新增」，不是「零 warning」**：本仓库基线本来就有存量警告（2026-10-22 实测 **28 条**：`cl` 动态模块函数 `not known to be defined`、若干 docstring 超 80 列、`with-demoted-errors` 缺参）。`make all | grep Warning` 在产物已是最新时为**假阴性**（不重编译就不输出警告），**不能用它判定零 warning**。正确做法：`rm -f *.elc && make all 2>&1 | grep -E "Warning|Error" > /tmp/after.txt`，与基线（`git stash` 或 pristine 副本编译得到的 `/tmp/before.txt`）逐条 diff，要求**无新增行**。
+- **判据是「警告集零新增」，不是「零 warning」**：本仓库基线本来就有存量警告（2026-10-22 实测 **33 条**，含 checkdoc 输出；口径为 `rm -f *.elc && make all 2>&1 | grep -E "Warning|Error"` 的全部匹配行；主体是 `cl` 动态模块函数 `not known to be defined`、若干 docstring 超 80 列、`with-demoted-errors` 缺参）。`make all | grep Warning` 在产物已是最新时为**假阴性**（不重编译就不输出警告），**不能用它判定零 warning**。正确做法：`rm -f *.elc && make all 2>&1 | grep -E "Warning|Error" > /tmp/after.txt`，与基线（`git stash` 或 pristine 副本编译得到的 `/tmp/before.txt`）逐条 diff，要求**无新增行**。
 - `elisp_check_parens` 或 `check-parens` 对 `seshat-reader.el` 与新增测试文件通过。
 
 ### L2 功能验证
@@ -355,24 +362,61 @@ git clean -fd -- emacs/tests/seshat-reader-resize-test.el
 8. **checkdoc**：`make all` 含 checkdoc，新增函数的 docstring 首句须为完整句并带句号（中英文均可，与文件既有风格一致）。
 9. **L3 是唯一能验证 idle timer / 重渲染观感的环节**：L2 全绿不代表「页面贴合」，T4 的 L3-5（拖拽不卡顿）与 L3-8（daemon）是 D3 降级的判据，不得省略。
 
-## 基线（待 T0 填写）
+## 基线（2026-10-22 实测）
 
-**期望值来自 HEAD `f56dcce` 勘察**；`实测` 列由 T0 填写，与期望不一致时先停下核对（可能意味着工作区有未提交改动）。
+**期望值来自 HEAD `f56dcce` 勘察**；`实测` 列由 T0（2026-10-22，HEAD `ca01af6`，工作区干净）逐文件跑 `ert-run-tests-batch-and-exit` 填入——**与期望完全一致**，勘察的 312 例清单无误。
 
-| 测试文件 | 期望用例数 | 实测（T0 填写） | 通过 | 跳过 | unexpected |
+| 测试文件 | 期望用例数 | 实测 | 通过 | 跳过 | unexpected |
 |---|---|---|---|---|---|
-| `seshat-reader-annotation-queue-test.el` | 27 | 待填 | 待填 | 待填 | 待填 |
-| `seshat-reader-annotation-test.el` | 48 | 待填 | 待填 | 待填 | 待填 |
-| `seshat-reader-annotation-v8-test.el` | 14 | 待填 | 待填 | 待填 | 待填 |
-| `seshat-reader-etaf-test.el` | 18 | 待填 | 待填 | 待填 | 待填 |
-| `seshat-reader-outline-test.el` | 20 | 待填 | 待填 | 待填 | 待填 |
-| `seshat-reader-page-join-test.el` | 24 | 待填 | 待填 | 待填 | 待填 |
-| `seshat-reader-reference-test.el` | 50 | 待填 | 待填 | 待填 | 待填 |
-| `seshat-reader-select-flash-test.el` | 8 | 待填 | 待填 | 待填 | 待填 |
-| `seshat-reader-sidebar-test.el` | 56 | 待填 | 待填 | 待填 | 待填 |
-| `seshat-reader-translate-test.el` | 47 | 待填 | 待填 | 待填 | 待填 |
-| **合计** | **312**（310 passed / 2 skipped） | 待填 | 待填 | 待填 | 待填 |
+| `seshat-reader-annotation-queue-test.el` | 27 | 27 | 27 | 0 | 0 |
+| `seshat-reader-annotation-test.el` | 48 | 48 | 48 | 0 | 0 |
+| `seshat-reader-annotation-v8-test.el` | 14 | 14 | 14 | 0 | 0 |
+| `seshat-reader-etaf-test.el` | 18 | 18 | 18 | 0 | 0 |
+| `seshat-reader-outline-test.el` | 20 | 20 | 20 | 0 | 0 |
+| `seshat-reader-page-join-test.el` | 24 | 24 | 24 | 0 | 0 |
+| `seshat-reader-reference-test.el` | 50 | 50 | 50 | 0 | 0 |
+| `seshat-reader-select-flash-test.el` | 8 | 8 | 8 | 0 | 0 |
+| `seshat-reader-sidebar-test.el` | 56 | 56 | 56 | 0 | 0 |
+| `seshat-reader-translate-test.el` | 47 | 47 | 45 | 2 | 0 |
+| **小计（10 个既有文件 = T0 基线）** | **312**（310 passed / 2 skipped） | **312** | **310** | **2** | **0** |
+| `seshat-reader-resize-test.el`（T3 新增，非基线） | 13 | 13 | 13 | 0 | 0 |
+| **合计（11 个文件，T3 后）** | **325** | **325** | **323** | **2** | **0** |
 
-- `make all` 基线输出：待填（判据：`grep -E "Warning|Error"` 无输出）
-- 安全点 tag：待填（`git tag -l pre-reader-resize` 的输出）
-- 基线 commit：`f56dcce`
+### S1 git 安全点
+
+- 分支 `master`；本轮工作起点 HEAD `0d5edbd`（T0 实测时为 `ca01af6`；中间 `c47100c` = D1–D4 实现，`0d5edbd` = 计划修正）。
+- 安全点 tag：`pre-reader-resize` → **`ca01af6`**（`git tag -l pre-reader-resize` 有输出，`git rev-parse --short pre-reader-resize` = `ca01af6`）。
+- 回滚方式见「### 回滚」；新测试文件是未跟踪文件，`git checkout` 不删它，须 `git clean -fd -- emacs/tests/seshat-reader-resize-test.el` 一并清理。
+
+### S2 L1
+
+- `cd emacs/seshat-reader && rm -f *.elc && make all` → **EXIT=0**。
+- 警告集 **33 条**（口径 = `rm -f *.elc && make all 2>&1 | grep -E "Warning|Error"` 的**全部匹配行**，含 checkdoc 输出；主体是 `cl` 动态模块函数 `not known to be defined`、docstring 超 80 列、`with-demoted-errors` 缺参）。改动后重测仍 33 条，去掉行号前缀并排序后 `diff` **为空** → 零新增。
+- 口径陷阱（已实测）：产物最新时 `make all` 不重编译，`grep Warning` 输出 **0 行**——假阴性，故必须先 `rm -f *.elc`。
+
+### S3 L2
+
+逐文件跑（11 个），命令模板 `emacs --batch -Q <13 个 -L> -l <TEST-FILE> -f ert-run-tests-batch-and-exit`：
+
+| 测试文件 | Ran | passed | skipped | unexpected |
+|---|---|---|---|---|
+| `seshat-reader-annotation-queue-test.el` | 27 | 27 | 0 | 0 |
+| `seshat-reader-annotation-test.el` | 48 | 48 | 0 | 0 |
+| `seshat-reader-annotation-v8-test.el` | 14 | 14 | 0 | 0 |
+| `seshat-reader-etaf-test.el` | 18 | 18 | 0 | 0 |
+| `seshat-reader-outline-test.el` | 20 | 20 | 0 | 0 |
+| `seshat-reader-page-join-test.el` | 24 | 24 | 0 | 0 |
+| `seshat-reader-reference-test.el` | 50 | 50 | 0 | 0 |
+| `seshat-reader-select-flash-test.el` | 8 | 8 | 0 | 0 |
+| `seshat-reader-sidebar-test.el` | 56 | 56 | 0 | 0 |
+| `seshat-reader-translate-test.el` | 47 | 45 | 2 | 0 |
+| `seshat-reader-resize-test.el`（新增） | 13 | 13 | 0 | 0 |
+| **合计** | **325** | **323** | **2** | **0** |
+
+- 判据全部满足：合计 **325 ≥ 325**、`unexpected = 0`、`skipped = 2`（translate 的 2 例既有跳过）。
+- `seshat-reader-page-join-test.el` 24 例全绿，含 `--vscroll-max` / `--vscroll-max-not-negative` / `--page-max-vscroll-pixels` 等 5 个 vscroll 用例 → 上限公式与 `--set-window-vscroll` 未被改动。
+- 新测试文件的变异自检（在 `/tmp` 副本上改坏实现、不改仓库文件）：① 删 `--refit-window` 的 manual 分支 → 仅 `--refit-manual-branch` 红；② 去掉 `--clamp-window-vscroll` 的 `(max 0 …)` 下界 → 仅 `--clamp-window-vscroll` 红；③ 删 `--schedule-refit` 里的 `--cancel-pending-refit` → 仅 `--schedule-refit-debounce` 红；④ 删 `--clear-doc-memory` 里的 `--cancel-pending-refit` → 仅 `--run-pending-refit-dead-buffer` 红。未改动的副本 13/13 绿。
+
+- `make all` 基线输出：EXIT=0，警告集 33 条（详见 S2）
+- 安全点 tag：`pre-reader-resize` → `ca01af6`
+- 基线 commit：勘察 `f56dcce` → T0 实测 `ca01af6` → T3 后 `0d5edbd`
