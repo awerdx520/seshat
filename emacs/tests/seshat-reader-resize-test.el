@@ -665,6 +665,69 @@ it on both sides."
       (seshat-reader-resize-test--clear-window window)
       (kill-buffer buffer))))
 
+;;; 18. --window-size-change：buffer-local 条目实际收到的是 window
+
+(ert-deftest seshat-reader-resize-test--window-size-change-accepts-window ()
+  "A real window argument is accepted and never signals.
+
+`add-hook ... local = t` 注册的 `window-size-change-functions' 条目收到的是
+window 而不是 frame。把 window 当 frame 传给 `window-list' 会抛
+`(error \"Window is on a different frame\")'，异常被 `safe_call' 吞掉后 refit
+链路一次都跑不到（2026-10-23 真机复现）。本用例同时锁两件事：window 形态
+不抛错，且确实排入一次 refit。"
+  (let ((window (selected-window))
+        (orig-buffer (window-buffer (selected-window)))
+        (buffer (seshat-reader-resize-test--reader-buffer))
+        (refits 0)
+        (signaled nil))
+    (unwind-protect
+        (progn
+          ;; 真实 window，且它显示的正是当前 buffer
+          (set-window-buffer window buffer)
+          (cl-letf (((symbol-function 'seshat-reader--schedule-refit)
+                     (lambda () (setq refits (1+ refits)) nil)))
+            (with-current-buffer buffer
+              (condition-case err
+                  (seshat-reader--window-size-change window)
+                (error (setq signaled err)))
+              ;; 回归锁：window 形态不得抛任何错
+              (should-not signaled)
+              (should (= 1 refits)))))
+      (set-window-buffer window orig-buffer)
+      (kill-buffer buffer))))
+
+;;; 19. --window-size-change：frame 形态仍走遍历，且两形态判定一致
+
+(ert-deftest seshat-reader-resize-test--window-size-change-accepts-frame ()
+  "The frame shape still works and agrees with the window shape.
+
+`window-size-change-functions' 的 global / default 值收到 frame，这条路径必须
+继续用 `(window-list FRAME)' 遍历。行为一致性由一个反向断言钉住：当没有任何
+窗口显示当前 buffer 时，两种形态都不排 refit。"
+  (let ((window (selected-window))
+        (frame (selected-frame))
+        (orig-buffer (window-buffer (selected-window)))
+        (buffer (seshat-reader-resize-test--reader-buffer))
+        (other (generate-new-buffer " *seshat-reader-resize-test-other*"))
+        (refits 0))
+    (unwind-protect
+        (progn
+          (set-window-buffer window buffer)
+          (cl-letf (((symbol-function 'seshat-reader--schedule-refit)
+                     (lambda () (setq refits (1+ refits)) nil)))
+            ;; frame 形态：窗口显示当前 buffer → 排一次（与 window 形态一致）
+            (with-current-buffer buffer
+              (seshat-reader--window-size-change frame)
+              (should (= 1 refits)))
+            ;; 当前 buffer 没有任何窗口显示 → 两种形态都不排
+            (with-current-buffer other
+              (seshat-reader--window-size-change frame)
+              (seshat-reader--window-size-change window)
+              (should (= 1 refits)))))
+      (set-window-buffer window orig-buffer)
+      (kill-buffer buffer)
+      (kill-buffer other))))
+
 (provide 'seshat-reader-resize-test)
 
 ;;; seshat-reader-resize-test.el ends here

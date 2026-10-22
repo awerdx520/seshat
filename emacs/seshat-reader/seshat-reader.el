@@ -785,19 +785,27 @@ being clipped on both sides."
       (if (and (overlayp overlay) window-width doc-image-width)
           (let* ((max-left-offset (max 0 (- window-width doc-image-width)))
                  (overlay-offset `(space :width (,max-left-offset)))
+                 (center-overlay (seshat-reader--ensure-center-overlay))
                  (pixel-per-col (seshat-reader--get-pixel-per-col window))
                  (doc-left-offset (- window-width doc-image-width))
                  (doc-center-offset (/ doc-left-offset 2))
                  ;; 页面比窗口宽时 doc-center-offset 为负；夹到 0 让页面左对齐，避免两侧裁切
                  (scroll-offset (max 0 (round (/ doc-center-offset pixel-per-col)))))
-            ;; Add prefix so that the page is at the leftmost point of the window.
-            ;; The prefix is carried by a buffer-wide overlay instead of the page
-            ;; overlay, so that the cross-page join strip line gets it as well.
-            (overlay-put overlay 'line-prefix nil)
-            (overlay-put (seshat-reader--ensure-center-overlay)
-                         'line-prefix overlay-offset)
-            ;; scroll window back to the center of the doc
-            (seshat-reader--set-window-hscroll window scroll-offset t))
+            ;; 居中由「line-prefix 右推 + hscroll 左滚」两步配合完成：只落下
+            ;; hscroll 会把页面推出窗口左侧（真机已复现），因此两者必须同成
+            ;; 同败——先确认 buffer-wide 的居中 overlay 可用，再同时写入。
+            (if (overlayp center-overlay)
+                (progn
+                  ;; Add prefix so that the page is at the leftmost point of the window.
+                  ;; The prefix is carried by a buffer-wide overlay instead of the page
+                  ;; overlay, so that the cross-page join strip line gets it as well.
+                  (overlay-put overlay 'line-prefix nil)
+                  (overlay-put center-overlay 'line-prefix overlay-offset)
+                  ;; scroll window back to the center of the doc
+                  (seshat-reader--set-window-hscroll window scroll-offset t))
+              ;; 居中 overlay 不可用：宁可回到左对齐，也不要只写下 hscroll 把页面推出窗口
+              (ignore-errors (seshat-reader--set-window-hscroll window 0 t))
+              (ignore-errors (set-window-hscroll window 0))))
         ;; Fallback: the geometry is unknown, so clear any stale prefix and
         ;; reset the horizontal scroll instead of leaving the page offset.
         (dolist (ov (list overlay seshat-reader--center-overlay))
@@ -808,26 +816,27 @@ being clipped on both sides."
         (ignore-errors
           (set-window-hscroll window 0))))))
 
-(defun seshat-reader--window-size-change (frame)
-  "Schedule a refit for the windows of FRAME showing this buffer.
+(defun seshat-reader--window-size-change (window-or-frame)
+  "Schedule a refit after a size change of WINDOW-OR-FRAME.
 
-`window-size-change-functions' is called with a frame as its argument,
-not with a window, so FRAME cannot be passed to functions such as
-`seshat-reader--center-page' which expect a valid window.  This wrapper
-walks the windows of FRAME and, as soon as one of them shows the current
-buffer, schedules a single debounced refit for the whole buffer.
-
-The refit is deferred because resizing produces a burst of events:
-dragging a divider fires on every pixel, and rescaling re-renders the
-page synchronously in the dynamic module.  See
-`seshat-reader--run-pending-refit'."
-  ;; 同一 buffer 只排一次：调度本身就是 buffer 级的（取消并重排同一个 timer），
-  ;; 每个匹配窗口各排一次只会重复取消/重排，故命中首个窗口即停止扫描。
-  (catch 'scheduled
-    (dolist (window (window-list frame))
-      (when (eq (window-buffer window) (current-buffer))
-        (seshat-reader--schedule-refit)
-        (throw 'scheduled nil)))))
+`window-size-change-functions' passes a window when the hook entry is
+buffer-local (which is how this package registers it) and a frame when it
+is the global or default value.  Both shapes are accepted: a window is
+checked directly, a frame is walked for windows showing the current
+buffer.  Scheduling is buffer-wide, so at most one refit is queued per
+event."
+  (cond
+   ((windowp window-or-frame)
+    (when (eq (window-buffer window-or-frame) (current-buffer))
+      (seshat-reader--schedule-refit)))
+   ((frame-live-p window-or-frame)
+    ;; 同一 buffer 只排一次：调度本身就是 buffer 级的（取消并重排同一个
+    ;; timer），每个匹配窗口各排一次只会重复取消/重排。
+    (catch 'scheduled
+      (dolist (window (window-list window-or-frame))
+        (when (eq (window-buffer window) (current-buffer))
+          (seshat-reader--schedule-refit)
+          (throw 'scheduled nil)))))))
 
 (defun seshat-reader--schedule-refit ()
   "Schedule a debounced refit of the windows showing the current buffer.
