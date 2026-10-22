@@ -10,6 +10,7 @@
 - 验证：L1 警告集零新增（33 条）；L2 **329** 例 / 0 unexpected / 0 skipped
 - 下一步：**等用户在 GUI Emacs 上做 T4 的 8 条真机验收**（batch 无法自动化，`fit-to-height` 会报 `Window system frame should be used`）；通过后再做 T5 文档 + T6 归档
 - 2026-10-23 追加：真机验收发现窗口变窄时页面超宽裁切（主路径缺陷），按方案 C 修复（contain + 负偏移夹 0），详见 D6
+- 2026-10-23 真机第二次纠正：hook 实际传 window（非 frame），refit 链路此前从未运行；`--center-page` 的 prefix/hscroll 改为同成同败。见 D2 与「旧版计划的错误清单」第 7 条。
 
 ## 目标
 
@@ -33,7 +34,7 @@
 | H1 | 「页面不再贴合」的根因是尺寸变化路径只调 `--center-page`，不重算 C 侧渲染分辨率 | 事实✓（`:737-739` 只调 center；`doc-scale-page` 是 resolution 的唯一更新点，`:316-318`） |
 | H2 | 「推到一边/边缘被裁」由 `--center-page` 的负 `scroll-offset` 以 unconstrained 写入造成，无需改 `--center-page` 本身 | 事实✓（`:705-715` 算术 + `:715` 的 `t` 实参）+ 假设?（是否还有其它成因由 L3-1 / L3-3 真机观察确认） |
 | H3 | 「页面被下推」根因是 `--set-window-vscroll` 缺下界夹紧 | 事实✓（`:533-538`：`:535` 的 `max 0` 只作用于上限值，`:537` 只 `min`） |
-| H4 | 该 hook 必须保留 frame 参数语义与 `(window-list frame)` 遍历，不能改成按 window 参数设计 | 事实✓（docstring `:727-736` 明写「以 frame 为参数调用」；实现 `:737-739`；`docs/emacs-reader.md:373`（`docs/` 下的行号取自 HEAD `f56dcce` 实测）记录 M12 的同类回归已修） |
+| H4 | ~~该 hook 必须保留 frame 参数语义与 `(window-list frame)` 遍历~~ → **handler 必须同时接受 window 与 frame** | ✗ **被推翻**（2026-10-23 真机 `(error "Window is on a different frame")`）：buffer-local 条目收到的是 window；原判据（docstring `:727-736`、`docs/emacs-reader.md:373`）只对 global / default 值成立，见 D2「参数形态」与错误清单第 7 条 |
 | H5 | fit 分支必须复用 `seshat-reader-default-fit`（可能是 `fit-to-width`），不得硬编码 `fit-to-height` | 用户显式 + 事实✓（defcustom `:106`，默认 `'seshat-reader-fit-to-height`） |
 | H6 | 手动缩放过的窗口在尺寸变化时应保留 scale、只夹紧并归位滚动 | 用户显式 |
 | H7 | 0.15s 的 idle 去抖足以合并一次分割线拖拽（拖动期间始终非 idle，计时不断重置） | 假设?（L3-5 实测；不成立按 D3 降级） |
@@ -86,18 +87,28 @@ SOURCE 非 nil 时，把它记为该窗口的缩放来源（`fit' 或 `manual'�
 
 **已知取舍：跨会话恢复一律视为 `fit`。** 4 个恢复路径都不传 `source`，因此恢复后 `scale-source` 为 nil（按 `fit` 处理）。`seshat-reader-bookmark.el:48` 是其中最典型的一例：书签只存 `'scale` 数值（`:29` 写 / `:39` 读），不含来源信息 —— 用户手动放大到 2.0 后存书签，退出再恢复，`scale` 仍是 2.0 但 source 变成 `fit`，此后一旦窗口尺寸变化就会走 `fit-to-height` 把缩放重置。这**不是实现缺陷**，而是书签格式缺字段导致的信息缺失；当前取舍是「宁可重新贴合，也不保留一个可能不合适的旧缩放」（与方案 A 目标一致）。若要跨会话保留手动缩放来源，需扩展书签存储格式（`'scale` → `(scale . source)`）并考虑旧标签兼容，**超出本计划范围**，登记为技术债。
 
-### D2 扩展现有 wrapper（不替换注册，不改参数语义）
+### D2 扩展现有 wrapper（不替换注册；handler 同时接受 window 与 frame）
+
+**参数形态（2026-10-23 真机纠正）**：`window-size-change-functions` 的 buffer-local 条目实际收到的是 **window**（`add-hook ... local = t` 就是这种情形），只有 global / default 值才收到 frame。真机报错 `(error "Window is on a different frame")` 证实了这一点——`docs/emacs-reader.md:373` 记录的「拿到 frame 而非 window」只对 global 值成立。因此 handler 必须**同时接受两种形态**：`(windowp X)` 直接检查该 window，`(frame-live-p X)` 才遍历 `(window-list X)`。
 
 - 注册点保持 `:1246`：`(add-hook 'window-size-change-functions #'seshat-reader--window-size-change nil t)` **原样不动**。
-- `seshat-reader--window-size-change` 从「直接 center」改为「排入去抖队列」：
+- `seshat-reader--window-size-change` 从「直接 center」改为「双形态判定 + 排入去抖队列」：
 
 ```elisp
-(defun seshat-reader--window-size-change (frame)
-  "在 FRAME 尺寸变化后为显示当前 buffer 的窗口安排一次重贴合。
-`window-size-change-functions' 以 FRAME 为参数调用本函数。"
-  (dolist (window (window-list frame))
-    (when (eq (window-buffer window) (current-buffer))
-      (seshat-reader--schedule-refit))))
+(defun seshat-reader--window-size-change (window-or-frame)
+  "Schedule a refit after a size change of WINDOW-OR-FRAME.
+`window-size-change-functions' 传 window（buffer-local 条目）或 frame
+（global / default 值），两种形态都要接受。"
+  (cond
+   ((windowp window-or-frame)
+    (when (eq (window-buffer window-or-frame) (current-buffer))
+      (seshat-reader--schedule-refit)))
+   ((frame-live-p window-or-frame)
+    (catch 'scheduled
+      (dolist (window (window-list window-or-frame))
+        (when (eq (window-buffer window) (current-buffer))
+          (seshat-reader--schedule-refit)
+          (throw 'scheduled nil)))))))
 ```
 
 - 去抖与回调：
@@ -223,12 +234,13 @@ SOURCE 非 nil 时，把它记为该窗口的缩放来源（`fit' 或 `manual'�
 | 4 | `seshat-reader-outline.el` 仅 157 行；`show` 在 `:64`、`:85` 走 `pop-to-buffer` | 文件 **677 行**；`seshat-reader-outline-show` 在 `:124`，`:186` 走 `(seshat-reader-sidebar-show (get-buffer bufname) 'outline t)`；全文唯一的 `pop-to-buffer` 在 `:554`（切回阅读窗口，与本流程无关） |
 | 5 | `seshat-reader-doc-scale-page` 定义在 `:269`（函数体 `:274-276`），5 个缩放命令在 `:278/:287/:296/:302/:313` | 定义在 **`:311`**，函数体 **`:316-318`**；调用点 9 处全为 1 实参：`:326/:336/:343/:354/:365`（5 个命令）、`:985/:1008/:1083`（3 个恢复路径）、`seshat-reader-bookmark.el:48` |
 | 6 | `emacs/tests/` 下 6 个 ERT 文件、基线 181 例（179 passed / 2 skipped），无 `page-join` / `outline` / `select-flash` / `annotation-v8` 测试 | **10 个文件 / 312 例**（310 passed / 2 skipped）：annotation-queue 27、annotation 48、annotation-v8 14、etaf 18、outline 20、page-join 24、reference 50、select-flash 8、sidebar 56、translate 47；`seshat-reader-page-join-test.el:208` 的 `--vscroll-max` 用例直接锁定 vscroll 上限公式 |
+| 7 | `window-size-change-functions` 的 buffer-local 条目收到 frame（据此保留 `(window-list frame)`） | **收到 window**：真机 `(error "Window is on a different frame")` 直接证明；handler 必须接受两种形态（见 D2 参数形态） |
 
 **据此重写，旧版所有行号作废**（旧版本的行号整体漂移约 300–700 行，且三个技术前提错误、ERT 清单漏 4 个文件）。
 
 ## 与旧版的技术差异
 
-1. **hook 处理：wrapper 内扩展，而非替换注册**。旧版把 `add-hook` 换成自己的函数并假设收到 window 参数；本版保留 `:1246` 的注册与 frame 参数语义、保留 `(window-list frame)` 遍历，只在 wrapper 内把「直接 center」换成「排入去抖队列」——这样 M12 已修的「frame vs window」回归不会被重新引入。
+1. **hook 处理：wrapper 内扩展，而非替换注册**。旧版把 `add-hook` 换成自己的函数并假设收到 window 参数；本版保留 `:1246` 的注册，handler 改为同时接受 window 与 frame 两种形态（frame 形态保留 `(window-list frame)` 遍历），只在 wrapper 内把「直接 center」换成「排入去抖队列」——这样 M12 已修的「frame vs window」回归不会被重新引入，也不会像 2026-10-23 之前那样因传 window 而抛 `(error "Window is on a different frame")` 被 `safe_call` 吞掉。
 2. **夹紧：复用 `--page-max-vscroll-pixels`，而非新写上限公式**。旧版另写一份 `max(0, 图高 + strip 高 - 窗高)` 并新增独立 helper；本版直接调既有 `:559`（公式 `:565-570`，已含 join-strip 高度），只补 `(max 0 …)` 下界，避免与 `seshat-reader-page-join-test.el:208` 锁定的公式产生第二份真相。
 3. **去抖：idle timer 必须论证，并留三级降级**。旧版直接用 `run-with-idle-timer` 未处理 `seshat-reader-annotation-queue.el:437-438` 的既有告诫；本版给出「前台 UI 重排 vs 无人交互后台同步」的差异论证，并准备 `run-with-timer` + 2% 偏差闸 → 只 clamp+center 的两级降级，末级记 tech-debt。
 4. **scale-source 的写入面更窄**：本版给 `doc-scale-page` 加 `&optional source`，只让 5 个缩放命令传值，**4 个恢复路径保持 1 参**（`:985`/`:1008`/`:1083`/`seshat-reader-bookmark.el:48`），`--recent-scale-fallback` 不动——旧版未区分「来源」与「兜底数值」，也未钉死恢复路径不传参。
@@ -256,6 +268,7 @@ SOURCE 非 nil 时，把它记为该窗口的缩放来源（`fit' 或 `manual'�
 - 动作：改 `seshat-reader--window-size-change`（`:726`）；新增 `--schedule-refit` / `--run-pending-refit` / `--cancel-pending-refit` / `--refit-window` / `--clamp-window-vscroll`；新增 `defvar seshat-reader--resize-refit-enabled`、`defvar-local seshat-reader--resize-refit-timer`、`defvar seshat-reader--resize-refit-delay`；`--clear-doc-memory`（`:963`）内补 `--cancel-pending-refit`。
 - 依赖：T1
 - 验收：`:1246`/`:1247`/`:1248` 三条 hook 的注册行未变；`--center-page` / `--set-window-vscroll` / `--page-max-vscroll-pixels` 函数体零改动（`git diff` 核对）；**自动 fit 路径（首次 + refit）使用 `--contain-scale`；`--center-page` 负偏移夹 0 且有用例覆盖**（D6，2026-10-23 追加）；`make all` 零 warning。
+- 验收追加（2026-10-23，真机纠正后）：handler 同时接受 window 与 frame 两种形态，且有 ERT 锁住 window 形态不抛错（`seshat-reader-resize-test--window-size-change-accepts-window`，变异回 `(window-list window)` 即变红）。原「`--center-page` 函数体零改动」一条已被 D6 与本轮修订取代：D6 放开负偏移夹 0，本轮放开 prefix/hscroll 同成同败。
 - ✅ 2026-10-22 完成：5 个新函数 + 3 个内部变量落地，`--clear-doc-memory` 补 `--cancel-pending-refit`；三条 hook 注册行未变；`page-join-test` 24 例（含 5 个 vscroll 用例）零回归。
 - 适配 `emacs/tests/seshat-reader-page-join-test.el` 中锁定了旧契约（size-change 同步 center）的两个用例：`--window-size-change` 改为断言 `--schedule-refit` 被调用 1 次且 `--center-page` 零调用；`--window-size-change-errors` 改为断言「同 buffer 多窗口只排一次 refit」，其「单窗口报错隔离」语义移交 `--refit-window` 的 `condition-case`（由 T3 覆盖）。**不得改动该文件其它 22 个用例。**
 
