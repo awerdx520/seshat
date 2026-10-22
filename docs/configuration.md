@@ -175,12 +175,15 @@ Emacs 端通过 `seshat-reader-annotation` 采集 PDF 页面选区并同步为�
 
 ### 阅读器面板（M11.7–M11.14）
 
-> 与批注侧车同属**客户端侧**配置（由 `seshat-reader-sidebar` 承载层读取，该模块零依赖、不渲染内容），与服务端无关。批注列表与译文/解释统一显示在底部弹出面板中。
+> 与批注侧车同属**客户端侧**配置（由 `seshat-reader-sidebar` 承载层读取，该模块零依赖、不渲染内容），与服务端无关。批注列表与译文/解释统一显示在承载层面板中（M12 起默认**右侧** side window，可配 `left` / `below-selected` / `at-bottom`）。
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `seshat-reader-sidebar-enabled` | `t` | 是否用面板展示批注列表与译文/解释；`nil` 时批注列表退回 `pop-to-buffer`，译文按 `seshat-reader-translate-render` 处理（取 `sidebar` 时退回 `pop` 式 posframe） |
-| `seshat-reader-sidebar-position` | `below-selected` | 面板弹出位置：`below-selected`（当前窗口下方分割，形如 `*Help*`）或 `at-bottom`（frame 底部整宽） |
+| `seshat-reader-sidebar-position` | `right` | **信息栏**（`annotations` / `translate`）的弹出位置：`right`（frame 右侧 side window，**宽度语义**）/ `left`（frame 左侧 side window，宽度语义）/ `below-selected`（当前窗口下方分割，形如 `*Help*`，**高度语义**）/ `at-bottom`（frame 底部整宽，高度语义）。**M12 起默认值由 `below-selected` 改为 `right`**（破坏性变更，回退写法见本节末） |
+| `seshat-reader-sidebar-width` | `0.24` | 信息栏在 `left` / `right` 下的宽度：**小数**按 frame 根窗口总宽的比例换算为列数，**整数**直接作列数。仅 side 模式生效（底部模式改用 `seshat-reader-sidebar-height`），且改动仅对**新建**面板窗口生效 |
+| `seshat-reader-outline-sidebar-position` | `left` | **目录栏**（`outline`）的弹出位置，取值同 `seshat-reader-sidebar-position` 的四项，但只作用于目录面板；默认与信息栏分居两侧，构成「左目录 / 右信息 / 中间阅读区」 |
+| `seshat-reader-outline-sidebar-width` | `0.20` | 目录栏在 `left` / `right` 下的宽度（语义同 `seshat-reader-sidebar-width`，默认更窄——目录标题通常短于批注/译文卡片）。仅 side 模式生效 |
 | `seshat-reader-sidebar-height` | `0.35` | 面板**首次显示**时的初始高度，作为 `display-buffer` 的 `window-height`（按比例）；译文/解释面板随后按内容自适应（见 `seshat-reader-sidebar-min-height` / `seshat-reader-sidebar-max-height`），批注列表固定用本值。改动仅对**新建**面板窗口生效，对已显示窗口不自动重排 |
 | `seshat-reader-sidebar-max-height` | `0.8` | 译文/解释面板按内容自适应时的**高度上限**（占 frame 比例）；自适应范围夹紧在 `seshat-reader-sidebar-min-height`（默认 0.25）与本值之间。仅对 `translate` 且未挂载 ETAF runtime 的面板生效，批注列表固定高度不受影响 |
 | `seshat-reader-sidebar-min-height` | `0.25` | 译文/解释面板按内容自适应的**下限**（占 frame 比例，至少 1 行）；与 `max-height` 共同夹紧。仅对 `translate` 且未挂载 ETAF runtime 的面板生效，批注列表不受影响；`min` 配得比 `max` 大时以 `max` 为准 |
@@ -189,13 +192,29 @@ Emacs 端通过 `seshat-reader-annotation` 采集 PDF 页面选区并同步为�
 
 说明：
 
-- **底部弹出、单窗口**：批注列表与译文共用同一个底部窗口，**后显示者接管**（这是 pop 式面板的既有语义，非缺陷）；需要两者同屏需另立方案。译文/解释已改为同一面板内的 Markdown 文本 buffer，互斥语义不变。
+- **三栏版式（M12）**：`left` / `right` 下侧栏是 **side window**（`display-buffer-in-side-window` + 独立 slot），显示/收起不挤压阅读区；且侧栏是 **per-kind 独立窗口**——目录（默认 `left`）与批注/译文（默认 `right`）可同时存在，不再「后显示者接管」，`C-c C-o` 收起/展开左侧目录。底部模式（`below-selected` / `at-bottom`）仍是单窗口、后显示者接管（M11 语义，非缺陷）。
+- **破坏性变更与回退（M12）**：`seshat-reader-sidebar-position` 默认值由 `below-selected` 改为 `right`，升级后批注/译文面板出现在**右侧**而非底部。恢复旧观感：`(setq seshat-reader-sidebar-position 'below-selected)`；`left` / `right` 为 M12 新增取值，`below-selected` / `at-bottom` 仍然可用。
 - **译文/解释为 Markdown 文本 buffer**：面板正文是普通只读 buffer，用 `gfm-view-mode`（缺失时降级 `markdown-view-mode` / `text-mode`）渲染，`truncate-lines` 为 nil 且显式开 `word-wrap`；`header-line` 显示「Seshat 译文」/「Seshat 解释」；`q`（关面板）与 `C-c C-s`（存为批注）由 minor mode `seshat-reader-translate-panel-mode` 承载。**markdown-mode 为软依赖**：未安装时降级 `text-mode`（不折行美化、不隐藏标记），功能仍可用。正文按模板渲染——翻译面板用 `seshat-reader-translate-template`（默认「语言对 + 原文块 + 分隔线 + 正文」）、解释面板用 `seshat-reader-translate-explain-template`（默认「原文块 + 分隔线 + 正文」）；两者默认都**不含正文标题**，因为 `header-line` 已显示「Seshat 译文」/「Seshat 解释」，需要正文标题时自定义模板加 `%k`（或设模板为 `nil` 退回纯正文）。
 - **高度自适应**：译文/解释面板显示后按内容实际行数（`window-text-pixel-size` 换算）调整高度，夹紧 `seshat-reader-sidebar-min-height`（默认 0.25）到 `seshat-reader-sidebar-max-height`（默认 0.8），并把实测比例写入该 kind 的高度记忆；同帧内面板增高会压缩上方阅读窗口（预期行为）。单行像素高取首行 `line-pixel-height` 与 `frame-char-height` 的**较小值**（Markdown 标题行通常比正文行高，直接用首行会把内容行数低估），测量上限 120 行（超长内容按上限计，避免测量耗时）。
 - **连续流展示**：批注列表**不分页**，全量条目一次性单列渲染（无页脚、无 `]`/`[` 翻页键）；徽章始终显示「N 条」，`n`/`p` 只移动选中、不再切页。列表超出面板高度时由**面板窗口**滚动查看；ETAF 渲染层按条目数显式计算 viewport 高度（`--content-viewport-height`，已挂载时经 `etaf-runtime-refit` 放大），保证新增条目不被裁剪。
-- **per-kind 高度记忆（仅会话内）**：同一时刻只有一个面板窗口，但 `annotations` 与 `translate` **各自记住自己的高度**——切换内容前先把当前窗口的实际高度（比例）记给它的类型，再用目标类型记住的高度新建窗口；同一类型重复显示走 `display-buffer` 复用，不重建、也不重置用户手动调整过的窗口高度。某类型首次显示时使用 `seshat-reader-sidebar-height`。状态保存在内存 alist 中，**重启 Emacs 后回到默认值**。
+- **per-kind 尺寸记忆（仅会话内，带方向标签）**：M11 的单窗口语义下同一时刻只有一个面板窗口，但 `annotations` 与 `translate` **各自记住自己的尺寸**——切换内容前先把当前窗口的实际尺寸（比例）记给它的类型，再用目标类型记住的尺寸新建窗口；同一类型重复显示走 `display-buffer` 复用，不重建、也不重置用户手动调整过的尺寸。M12 起记忆项带**方向标签**（宽度语义 vs 高度语义），因此把方位在 `left`/`right` 与 `below-selected`/`at-bottom` 之间切换时，旧值不会被按错误单位复用。某类型首次显示时，side 模式用 `seshat-reader-sidebar-width` / `seshat-reader-outline-sidebar-width`，底部模式用 `seshat-reader-sidebar-height`。状态保存在内存 alist 中，**重启 Emacs 后回到默认值**。
 - **关闭**：面板是非固定窗口；面板内 `q` 由 minor mode 承载（批注列表与译文面板各有其 minor mode 键位），`seshat-reader-sidebar-toggle` 可开合（关闭本包面板窗口，打开时按最近一次的内容类型重开，含 `translate`）。toggle **不使用** `window-toggle-side-windows`——它是 frame 级全量开关，会连带删除/恢复 eca-chat、which-key 的侧窗。
-- **popper 集成**：`*Seshat Annotations*` 与 `*Seshat Sidebar*` 两个 buffer 名已在 `thomas-emacs/lisp/init-window.el` 登记为 popper popup，可用 `C-'` 或 `` M-` `` 开关；popper 重开时经 `seshat-reader-sidebar-display-buffer` 分流回本包的显示逻辑，因此**布局（`position` / `height` / per-kind 高度）仍由本包掌控**，不会被 popper 的默认 bottom side window 规则改写。该分流由用户配置侧（`init-window.el`）接入，本包只提供函数。
+- **popper 集成**：`*Seshat Annotations*` 与 `*Seshat Sidebar*` 两个 buffer 名已在 `thomas-emacs/lisp/init-window.el` 登记为 popper popup，可用 `C-'` 或 `` M-` `` 开关；popper 重开时经 `seshat-reader-sidebar-display-buffer` 分流回本包的显示逻辑，因此**布局（`position` / `width` / `height` / per-kind 尺寸）仍由本包掌控**，不会被 popper 的默认 bottom side window 规则改写。该分流由用户配置侧（`init-window.el`）接入，本包只提供函数。
+
+### 阅读器版式、跨页衔接与批注高亮（M12）
+
+> 客户端侧配置（分别由 `seshat-reader` / `seshat-reader-annotation` 读取），与服务端无关。版式类变量（`seshat-reader-sidebar-position` / `-width` / `seshat-reader-outline-sidebar-position` / `-width`）见上一节表格。
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `seshat-reader-page-join-lines` | `1` | 跨页衔接 strip 的高度，**单位是页面文本行高**（默认 1 行，允许小数）。翻页时在当前页 image 上方插入一行显示上一页底部，形成阅读上下文；设 `0` 完全关闭，翻页行为与 M12 之前一致。改动在下次翻页生效 |
+| `seshat-reader-annotation-highlight-enabled` | `t` | 是否把批注 `location` 的 `rect:` 段绘制为页面上的半透明高亮。`nil` 时只清空已有高亮并重绘（不添加矩形）；高亮由 C 渲染层绘制，与页面共用同一 `ctm`，故缩放/旋转自动对齐。改动后按 `C-c C-h` 立即刷新 |
+
+说明：
+
+- **avy 是软依赖**：目录面板的 `f` 跳转由本包**零依赖自实现**（`seshat-reader-outline-avy-jump`），未安装 avy 时功能等价；标签字符表优先读 `avy-keys`（avy 已加载且其值为字符列表时），否则退回内置表。按本项目惯例（与 `markdown-mode` / `visual-fill-column` / `etaf-ui` 同类处理），**软依赖不写入 `Package-Requires`**，也不在加载期 `require`。
+- **`C-c C-h`**：批注高亮的手动刷新入口（重投当前文档的矩形并触发 C 侧 `--refresh-highlights`）；自动刷新发生在打开文档与批注列表增删之后。
+- **`C-c C-o`**：收起/展开左侧目录面板（目录不再 `pop-to-buffer` 抢窗口，改由承载层按 `seshat-reader-outline-sidebar-position` 显示）。
 
 ### 双向引用（M11.4）
 
@@ -203,7 +222,8 @@ Emacs 端通过 `seshat-reader-annotation` 采集 PDF 页面选区并同步为�
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `seshat-reader-reference-target-file` | `nil` | 摘录/引用写入的目标 org 笔记文件。`nil` 时首次交互询问落点文件，并把所选文件**仅在会话内记忆**（不写回用户配置）；也可直接设为固定路径（可含 `~`）。插入位置统一为文件末尾 |
+| `seshat-reader-reference-target-file` | `nil` | 摘录/引用写入的目标 org 笔记文件。`nil` 时首次交互询问落点文件，并把所选文件**仅在会话内记忆**（不写回用户配置）；也可直接设为固定路径（可含 `~`）。插入位置由 `seshat-reader-reference-insert-position` 决定（M12 起可配） |
+| `seshat-reader-reference-insert-position` | `end-of-file` | 摘录写入目标文件的插入位置：`end-of-file`（文件末尾，与 M12 之前行为一致）/ `headline`（**当前 headline 子树的末尾**，即整个子树之后、下一个同级或更高级 headline 之前；需 `featurep 'org` 且 `derived-mode-p 'org-mode'` 双守卫）/ `point`（目标文件 visiting buffer 中 `point` 处）。后两种在目标文件**没有 visiting buffer** 时一并回退 `end-of-file`——不为支持新语义强行打开用户未打开的笔记 |
 | `seshat-reader-reference-format` | `"#+begin_quote\n%s\n#+end_quote\n来源：[[%s][%s]]\n"` | 摘录块模板，三个 `%s` 依次为**正文文本**、**链接**、**链接描述**；正文为空时以空串填充 |
 
 说明：
@@ -212,6 +232,7 @@ Emacs 端通过 `seshat-reader-annotation` 采集 PDF 页面选区并同步为�
 - **`doc-id` 不得包含 `#` 或 `%`**：含这两个字符时生成链接会 `user-error` 并提示重命名文件（本实现不做百分号转义，理由见 [`docs/architecture.md`](architecture.md) 的「`seshat:` 引用协议」小节）。
 - 键位：阅读器内 `C-c C-r` 插入**选区摘录**；批注列表 buffer 内 `C-c C-r` 插入**该条批注的引用**（服务端项与本地待同步项都支持，取值不触网）。
 - 阅读器内执行 `M-x org-store-link` 可直接把当前文档（或当前页）存为 `seshat:` 链接；在笔记里 `C-c C-o` 即可跳回对应文档与页码。
+- **补全与导出（M12）**：该协议另注册 `:complete`（候选来自 `seshat-reader-annotation-roots` 下的书库文件，当前文档优先）与 `:export`（导出为「文件名 第 N 页」的可读文本，不输出裸 `seshat:` 协议串——下游读者点开假链接比纯文本更有害）。
 
 ### ETAF 渲染层（M11.9 引入，M11.10 收敛，可选）
 

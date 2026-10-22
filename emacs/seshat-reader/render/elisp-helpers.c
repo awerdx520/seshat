@@ -22,6 +22,16 @@
 #include "emacs-module.h"
 #include "render-core.h"
 
+/* Upper bound on one outline title, in bytes.  MuPDF reads the title
+ * straight out of the PDF and nothing upstream validates it, so a
+ * corrupted or hostile document could hand us a title of unbounded
+ * length; the bytes then get copied twice more (unibyte string +
+ * decoded multibyte string).  8 KiB is far beyond any real bookmark
+ * label.  Truncation is by byte, which may split a multi-byte UTF-8
+ * sequence — `decode-coding-string' keeps the incomplete tail as raw
+ * bytes instead of signalling, so this stays safe. */
+#define OUTLINE_TITLE_MAX 8192
+
 /**
  * elisp_2_c_str - Convert an Elisp string to a C string.
  * @env: Pointer (of type `emacs_env') to the environment of the Emacs runtime
@@ -534,14 +544,11 @@ display_img_to_overlay(emacs_env *env, int width, int height, char *img_data,
  * Return:       Emacs Lisp list of plists representing the outline.
  */
 
-emacs_value
-outline2plist(emacs_env *env, DocState *state, fz_outline *node)
+static emacs_value
+outline2plist_nodes(emacs_env *env, DocState *state, fz_outline *node,
+		    emacs_value Qdecode, emacs_value Qutf8)
 {
 	emacs_value outline_plist = EMACS_NIL;
-	if (!node)
-	{
-		return outline_plist;
-	}
 
 	while (node)
 	{
@@ -551,9 +558,32 @@ outline2plist(emacs_env *env, DocState *state, fz_outline *node)
 			continue;
 		}
 
-		/* Build the base plist: (:title TITLE :page PAGE) */
-		emacs_value node_title
-		    = env->make_unibyte_string(env, node->title, strlen(node->title));
+		/* Build the base plist: (:title TITLE :page PAGE).
+		 * MuPDF hands out UTF-8 bytes, so wrap them in a unibyte
+		 * string first and let Emacs decode them; otherwise
+		 * non-ASCII titles reach elisp as unibyte strings and show
+		 * up as octal escapes ("\346\226\207").  decode-coding-string
+		 * keeps invalid bytes as raw bytes instead of signalling, so
+		 * a malformed outline cannot abort `emacs-load-doc'.
+		 * The byte length is capped first: nothing in the PDF
+		 * guarantees a bounded title, and every byte is copied
+		 * again by the decoder below. */
+		size_t title_len = strlen(node->title);
+		if (title_len > OUTLINE_TITLE_MAX)
+			title_len = OUTLINE_TITLE_MAX;
+		emacs_value node_title = env->make_unibyte_string(
+		    env, node->title, (ptrdiff_t)title_len);
+		emacs_value decoded_title = env->funcall(
+		    env, Qdecode, 2, (emacs_value[]){ node_title, Qutf8 });
+		if (env->non_local_exit_check(env) == emacs_funcall_exit_return)
+		{
+			node_title = decoded_title;
+		}
+		else
+		{
+			/* Last line of defence: fall back to the raw bytes. */
+			env->non_local_exit_clear(env);
+		}
 		fz_location page_location = fz_resolve_link(
 		    state->ctx, state->doc, node->uri, &node->x, &node->y);
 		int page_num = fz_page_number_from_location(
@@ -569,7 +599,8 @@ outline2plist(emacs_env *env, DocState *state, fz_outline *node)
 		if (node->down)
 		{
 			emacs_value children
-			    = outline2plist(env, state, node->down);
+			    = outline2plist_nodes(env, state, node->down,
+						  Qdecode, Qutf8);
 			emacs_value child_pair_args[]
 			    = { env->intern(env, ":children"), children };
 			emacs_value children_pair = env->funcall(
@@ -598,6 +629,33 @@ outline2plist(emacs_env *env, DocState *state, fz_outline *node)
 	    (emacs_value[]){ env->intern(env, "seshat-reader-current-doc-outline"),
 			     outline_plist });
 	return outline_plist;
+}
+
+/**
+ * outline2plist - Entry point of the outline walk.
+ *
+ * Resolves the two coding symbols once and delegates to
+ * `outline2plist_nodes', so a document with N outline nodes pays for
+ * two `intern' calls instead of 2*N.  Only the main thread reaches this
+ * (from `emacs-load-doc'), hence the values are plain locals rather than
+ * anything shared.
+ *
+ * @param env    Emacs module environment.
+ * @param state  DocState owning the MuPDF context and document.
+ * @param node   Root of the fz_outline tree (from MuPDF).
+ * Return:       Emacs Lisp list of plists representing the outline.
+ */
+
+emacs_value
+outline2plist(emacs_env *env, DocState *state, fz_outline *node)
+{
+	if (!node)
+		return EMACS_NIL;
+
+	emacs_value Qdecode = env->intern(env, "decode-coding-string");
+	emacs_value Qutf8 = env->intern(env, "utf-8");
+
+	return outline2plist_nodes(env, state, node, Qdecode, Qutf8);
 }
 
 float

@@ -61,6 +61,22 @@ typedef struct
 	pthread_mutex_t mutex;
 } DocPage;
 
+/***********************************************************************/
+/* A page-anchored highlight rectangle, expressed in page coordinates   */
+/* (PDF points, origin at the top-left of the page, y growing down) and */
+/* therefore independent of the current zoom and rotation.	     */
+/*								     */
+/* `page' is stored 0-based, while the Emacs-facing API speaks 1-based  */
+/* page numbers; the conversion happens in the module functions which   */
+/* own this table (see emacs_add_highlight in render-core.c).	     */
+/***********************************************************************/
+
+typedef struct
+{
+	int page;
+	float x0, y0, x1, y1;
+} Highlight;
+
 /************************************************************************/
 /* The primary representation of the entire document. DocState holds    */
 /* DocPages and each EmacsWinState links to some DocState. It shall     */
@@ -82,6 +98,17 @@ typedef struct
 	fz_outline *outline;
 	float frame_scale; // Emacs' frame-scale-factor
 	int invert;
+
+	/* Document-level highlight table.  Owned by whichever thread runs the
+	 * module functions (Emacs' main thread); the render threads never read
+	 * it, they get a per-page snapshot copied into DrawThreadArgs instead. */
+	Highlight *highlights;
+	int highlight_count;
+	int highlight_cap;
+
+	/* Set by the mutating module functions, cleared by the refresh one.
+	 * Only touched from the Emacs main thread. */
+	bool highlights_dirty;
 
 	atomic_int active_jobs;
 	bool is_reloading;
@@ -175,6 +202,17 @@ emacs_page_text(emacs_env *env, ptrdiff_t nargs, emacs_value *args, void *data);
 
 emacs_value
 emacs_text_in_rect(emacs_env *env, ptrdiff_t nargs, emacs_value *args, void *data);
+
+emacs_value
+emacs_add_highlight(emacs_env *env, ptrdiff_t nargs, emacs_value *args, void *data);
+
+emacs_value
+emacs_clear_highlights(emacs_env *env, ptrdiff_t nargs, emacs_value *args,
+		       void *data);
+
+emacs_value
+emacs_refresh_highlights(emacs_env *env, ptrdiff_t nargs, emacs_value *args,
+			 void *data);
 
 emacs_value
 emacs_close_doc(emacs_env *env, ptrdiff_t nargs, emacs_value *args, void *data);

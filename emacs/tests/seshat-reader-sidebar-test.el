@@ -385,7 +385,7 @@ T10 第 1 轮反馈的验收：用户要求译文面板也跟随光标。分两�
     (should (equal (cdr (assq 'window-height
                               (seshat-reader-sidebar--display-params 'annotations)))
                    0.35))
-    (setq seshat-reader-sidebar--state '((annotations . 0.5)))
+    (setq seshat-reader-sidebar--state '((annotations height 0.5)))
     (should (equal (cdr (assq 'window-height
                               (seshat-reader-sidebar--display-params 'annotations)))
                    0.5))
@@ -397,27 +397,29 @@ T10 第 1 轮反馈的验收：用户要求译文面板也跟随光标。分两�
                    0.35))))
 
 (ert-deftest seshat-reader-sidebar-test--switch-captures-and-restores-height ()
-  "切换 kind 时先捕获当前窗口高度，再按目标 kind 的记忆高度新建窗口."
+  "显示另一 kind 时先捕获当前窗口高度，且不关闭其它 kind 的窗口."
   (let ((seshat-reader-sidebar-height 0.35)
         (seshat-reader-sidebar-position 'below-selected)
         (seshat-reader-sidebar--state nil)
-        (fake-kind nil)
-        (win 'fake-sidebar-window)
+        (wins nil)                      ; alist（WINDOW . KIND），模拟已显示面板
         (deleted 0)
         (shown nil)
         (buf (get-buffer-create "*seshat-sidebar-test-switch*")))
     (unwind-protect
         (cl-letf (((symbol-function 'seshat-reader-sidebar--windows)
-                   (lambda () (if fake-kind (list win) nil)))
+                   (lambda () (mapcar #'car wins)))
                   ((symbol-function 'window-parameter)
-                   (lambda (_w param)
+                   (lambda (w param)
                      (pcase param
-                       ('seshat-reader-sidebar (and fake-kind t))
-                       ('seshat-reader-sidebar-kind fake-kind))))
+                       ('seshat-reader-sidebar (and (assq w wins) t))
+                       ('seshat-reader-sidebar-kind (cdr (assq w wins)))
+                       ('window-side nil))))
                   ((symbol-function 'window-total-height) (lambda (&rest _) 20))
                   ((symbol-function 'frame-height) (lambda (&rest _) 40))
                   ((symbol-function 'delete-window)
-                   (lambda (&optional _w) (cl-incf deleted) (setq fake-kind nil)))
+                   (lambda (&optional w)
+                     (cl-incf deleted)
+                     (setq wins (assq-delete-all w wins))))
                   ((symbol-function 'display-buffer)
                    (lambda (_b &optional _action)
                      (push (cdr (assq 'window-height
@@ -428,25 +430,27 @@ T10 第 1 轮反馈的验收：用户要求译文面板也跟随光标。分两�
           (seshat-reader-sidebar--display buf 'annotations)
           (should (equal (car shown) 0.35))
           (should (= deleted 0))
-          (setq fake-kind 'annotations)   ; 模拟窗口已显示且 kind=annotations
-          ;; 2) 切到 translate：捕获 annotations=0.5 → 关闭旧窗口 → 用默认 0.35
+          (setq wins '((w-a . annotations)))   ; 模拟批注窗口已显示
+          ;; 2) 显示 translate：捕获 annotations=0.5，但**不关闭**它（多 kind 共存）
           (seshat-reader-sidebar--display buf 'translate)
-          (should (= deleted 1))
-          (should (equal (cdr (assq 'annotations seshat-reader-sidebar--state)) 0.5))
+          (should (= deleted 0))
+          (should (equal (nth 2 (assq 'annotations seshat-reader-sidebar--state))
+                         0.5))
           (should (equal (car shown) 0.35))
-          (setq fake-kind 'translate)
-          ;; 3) 切回 annotations：捕获 translate=0.5 → 用记忆的 annotations=0.5
+          (setq wins '((w-a . annotations) (w-b . translate)))
+          ;; 3) 再显示 annotations：同 kind 同侧 → 复用不重建，高度用记忆值 0.5
           (seshat-reader-sidebar--display buf 'annotations)
-          (should (= deleted 2))
+          (should (= deleted 0))
           (should (equal (car shown) 0.5))
-          (should (equal (cdr (assq 'translate seshat-reader-sidebar--state)) 0.5)))
+          (should (equal (nth 2 (assq 'translate seshat-reader-sidebar--state))
+                         0.5)))
       (kill-buffer buf))))
 
 (ert-deftest seshat-reader-sidebar-test--same-kind-display-idempotent ()
   "同 kind 再次显示不调用 `delete-window'，并沿用该 kind 的记忆高度."
   (let ((seshat-reader-sidebar-height 0.35)
         (seshat-reader-sidebar-position 'below-selected)
-        (seshat-reader-sidebar--state '((annotations . 0.5)))
+        (seshat-reader-sidebar--state '((annotations height 0.5)))
         (deleted 0)
         (shown nil)
         (win 'fake-sidebar-window)
@@ -478,6 +482,9 @@ T10 第 1 轮反馈的验收：用户要求译文面板也跟随光标。分两�
   "`toggle' 关闭窗口前先捕获其高度到 `seshat-reader-sidebar--state'."
   (let ((seshat-reader-sidebar--state nil)
         (seshat-reader-sidebar--last-buffer nil)
+        ;; `--capture-state' 按该窗口 kind 的方位取宽或高；本用例断言高度语义，
+        ;; 故固定底部模式（T3 起默认位置为 `right'）。
+        (seshat-reader-sidebar-position 'below-selected)
         (win 'fake-sidebar-window)
         (deleted 0)
         (buf (get-buffer-create "*seshat-sidebar-test-toggle-capture*")))
@@ -497,7 +504,7 @@ T10 第 1 轮反馈的验收：用户要求译文面板也跟随光标。分两�
                   ((symbol-function 'message) (lambda (&rest _) nil)))
           (seshat-reader-sidebar-toggle)
           (should (= deleted 1))
-          (should (equal (cdr (assq 'annotations seshat-reader-sidebar--state)) 0.4))
+          (should (equal (nth 2 (assq 'annotations seshat-reader-sidebar--state)) 0.4))
           (should (eq seshat-reader-sidebar--last-buffer buf)))
       (kill-buffer buf))))
 
@@ -528,7 +535,11 @@ KIND 为面板内容类型，CONTENT-LINES 为桩出的内容行数，INIT-HEIGH
           (set-window-buffer win buf)
           (when etaf-runtime
             (fset 'etaf-runtime-for-buffer (lambda (_buffer) etaf-runtime)))
-          (let ((seshat-reader-sidebar--state nil))
+          (let ((seshat-reader-sidebar--state nil)
+                ;; M12 T3 起 `seshat-reader-sidebar-position' 默认 `right'
+                ;; （side window，宽度语义 → 自适应整体停用），故这组「按内容
+                ;; 自适应高度」用例显式固定底部模式。
+                (seshat-reader-sidebar-position 'below-selected))
             (cl-letf (((symbol-function 'line-pixel-height)
                        (lambda () line-height))
                       ((symbol-function 'frame-char-height)
@@ -567,7 +578,7 @@ KIND 为面板内容类型，CONTENT-LINES 为桩出的内容行数，INIT-HEIGH
     (should (eq (caar resizes) win))
     (should (= (cadar resizes) -6))
     (should (= (plist-get result :final-height) 14))
-    (should (equal (cdr (assq 'translate (plist-get result :state)))
+    (should (equal (nth 2 (assq 'translate (plist-get result :state)))
                    0.28))
     (should (assq 'translate (plist-get result :state)))))
 
@@ -581,7 +592,7 @@ KIND 为面板内容类型，CONTENT-LINES 为桩出的内容行数，INIT-HEIGH
     (should (= (length resizes) 1))
     (should (= (+ 20 (cadar resizes)) expect))
     (should (= (plist-get result :final-height) expect))
-    (should (equal (cdr (assq 'translate (plist-get result :state)))
+    (should (equal (nth 2 (assq 'translate (plist-get result :state)))
                    (/ (float expect) 50.0)))))
 
 (ert-deftest seshat-reader-sidebar-test--fit-height-for-content-clamps-min ()
@@ -603,7 +614,7 @@ KIND 为面板内容类型，CONTENT-LINES 为桩出的内容行数，INIT-HEIGH
          (resizes (plist-get result :resizes)))
     (should-not resizes)
     (should (= (plist-get result :final-height) 20))
-    (should (equal (cdr (assq 'translate (plist-get result :state)))
+    (should (equal (nth 2 (assq 'translate (plist-get result :state)))
                    0.4))))
 
 (ert-deftest seshat-reader-sidebar-test--fit-height-for-content-min-over-max ()
@@ -616,7 +627,7 @@ KIND 为面板内容类型，CONTENT-LINES 为桩出的内容行数，INIT-HEIGH
     (should (= expect 40))
     (should (= (length resizes) 1))
     (should (= (plist-get result :final-height) expect))
-    (should (equal (cdr (assq 'translate (plist-get result :state)))
+    (should (equal (nth 2 (assq 'translate (plist-get result :state)))
                    (/ (float expect) 50.0)))))
 
 (ert-deftest seshat-reader-sidebar-test--fit-height-for-content-floor-one-line ()
@@ -666,6 +677,8 @@ KIND 为面板内容类型，CONTENT-LINES 为桩出的内容行数，INIT-HEIGH
 (ert-deftest seshat-reader-sidebar-test--fit-applicable-p ()
   "两重限制判据：仅 translate 且未挂载 ETAF runtime 的 buffer 适用."
   (let ((buf (get-buffer-create "*seshat-sidebar-test-applicable*"))
+        ;; 自适应只在**底部模式**下适用；T3 起默认位置是 `right'。
+        (seshat-reader-sidebar-position 'below-selected)
         (etaf-defined (fboundp 'etaf-runtime-for-buffer))
         (etaf-original (and (fboundp 'etaf-runtime-for-buffer)
                             (symbol-function 'etaf-runtime-for-buffer))))
@@ -710,13 +723,565 @@ KIND 为面板内容类型，CONTENT-LINES 为桩出的内容行数，INIT-HEIGH
                          (cl-incf h delta))))
               (seshat-reader-sidebar--display buf 'translate)
               (should (= (length resizes) 1))
-              (should (equal (cdr (assq 'translate seshat-reader-sidebar--state))
+              (should (equal (nth 2 (assq 'translate seshat-reader-sidebar--state))
                              0.28))
               (setq resizes nil)
               (seshat-reader-sidebar--display buf 'annotations)
               (should-not resizes))))
       (set-window-buffer win orig-buffer)
       (kill-buffer buf))))
+
+;;; 方向感知版式：left / right side window（M12 T2）
+
+(ert-deftest seshat-reader-sidebar-test--display-params-left-side-window ()
+  "`left' 时动作函数换成 `display-buffer-in-side-window'，尺寸键换成 `window-width'."
+  (let ((seshat-reader-sidebar-position 'left)
+        ;; 目录不在本用例的关注范围，固定到右侧，使左侧只剩信息栏 kind
+        (seshat-reader-outline-sidebar-position 'right)
+        (seshat-reader-sidebar-width 0.24)
+        (seshat-reader-outline-sidebar-width 0.20)
+        (seshat-reader-sidebar-height 0.35)
+        (seshat-reader-sidebar--state nil)
+        (params nil))
+    (setq params (seshat-reader-sidebar--display-params 'annotations))
+    ;; 动作函数元素只含函数名；side / slot 与 window-width 同级放在顶层 alist
+    ;; （`display-buffer' 只把 `(cdr ACTION)' 整体传给动作函数）
+    (should (equal (car params) '(display-buffer-in-side-window)))
+    (should (eq (caar params) 'display-buffer-in-side-window))
+    (should (eq (cdr (assq 'side params)) 'left))
+    (should (zerop (cdr (assq 'slot params))))
+    ;; 宽度语义：只带 window-width，不带 window-height
+    (should (equal (cdr (assq 'window-width params)) 0.24))
+    (should-not (assq 'window-height params))
+    (should (equal (cdr (assq 'window-parameters params))
+                   '((seshat-reader-sidebar . t)
+                     (seshat-reader-sidebar-kind . annotations))))
+    ;; 目录 kind 用独立的宽度默认值
+    (should (equal (cdr (assq 'window-width
+                              (seshat-reader-sidebar--display-params 'outline)))
+                   0.20))
+    ;; T3 起按 kind 分槽：同一侧内按 `--kind-order' 从 0 编号。此处侧为 `left'
+    ;; 时同侧 kind 是 (outline translate)（translate 跟随全局 left）。
+    (should (zerop (seshat-reader-sidebar--slot-for-kind 'outline)))
+    (should (= 1 (seshat-reader-sidebar--slot-for-kind 'translate)))))
+
+(ert-deftest seshat-reader-sidebar-test--display-params-right-side-window ()
+  "`right' 时 side 为 `right'，且记忆尺寸优先于默认宽度."
+  (let ((seshat-reader-sidebar-position 'right)
+        (seshat-reader-sidebar-width 0.24)
+        (seshat-reader-outline-sidebar-width 0.20)
+        (seshat-reader-sidebar--state '((annotations width 0.3)))
+        (params nil))
+    (setq params (seshat-reader-sidebar--display-params 'annotations))
+    ;; 动作函数元素只含函数名；side / slot 与 window-width 同级放在顶层 alist
+    (should (equal (car params) '(display-buffer-in-side-window)))
+    (should (eq (caar params) 'display-buffer-in-side-window))
+    (should (eq (cdr (assq 'side params)) 'right))
+    (should (zerop (cdr (assq 'slot params))))
+    (should (equal (cdr (assq 'window-width params)) 0.3))
+    (should-not (assq 'window-height params))
+    ;; 未记忆的 kind 仍回落方向默认值
+    (should (equal (cdr (assq 'window-width
+                              (seshat-reader-sidebar--display-params
+                               'translate)))
+                  0.24))))
+
+(ert-deftest seshat-reader-sidebar-test--display-params-bottom-unaffected ()
+  "底部两种位置不受左右分栏扩展影响：仍用 `window-height'、不带 side/slot."
+  ;; 只断言**跟随全局位置**的 kind（`annotations' / `translate'）：`outline' 自
+  ;; M12 T3 起由 `seshat-reader-outline-sidebar-position' 单独管辖，默认左侧
+  ;; side window（其底部模式见 `--display-params-outline-bottom-when-configured'）。
+  (dolist (case '((below-selected . display-buffer-below-selected)
+                  (at-bottom . display-buffer-at-bottom)))
+    (let* ((seshat-reader-sidebar-position (car case))
+           (seshat-reader-sidebar-height 0.35)
+           (seshat-reader-sidebar--state nil)
+           (params (seshat-reader-sidebar--display-params 'annotations)))
+      (should (equal (car params) (list (cdr case))))
+      (should (equal (cdr (assq 'window-height params)) 0.35))
+      (should-not (assq 'window-width params))
+      (should-not (assq 'side params))
+      (should-not (assq 'slot params)))))
+
+(ert-deftest seshat-reader-sidebar-test--size-key-and-defaults-follow-direction ()
+  "尺寸键与默认尺寸随方向切换：左右分栏用宽度、底部用高度."
+  (dolist (case '((below-selected . window-height)
+                  (at-bottom . window-height)
+                  (left . window-width)
+                  (right . window-width)))
+    (let ((seshat-reader-sidebar-position (car case)))
+      (should (eq (seshat-reader-sidebar--size-key) (cdr case)))
+      ;; side 只有 left/right 非 nil，底部模式为 nil
+      (should (eq (seshat-reader-sidebar--position-side)
+                  (pcase (car case)
+                    ('left 'left)
+                    ('right 'right)
+                    (_ nil))))))
+  (let ((seshat-reader-sidebar-width 0.24)
+        (seshat-reader-outline-sidebar-width 0.20)
+        (seshat-reader-sidebar-height 0.35)
+        (seshat-reader-sidebar--state nil))
+    ;; 宽度语义
+    (let ((seshat-reader-sidebar-position 'right))
+      (should (= (seshat-reader-sidebar--size-for-kind 'annotations) 0.24))
+      (should (= (seshat-reader-sidebar--size-for-kind 'translate) 0.24))
+      (should (= (seshat-reader-sidebar--size-for-kind 'outline) 0.20))
+      (should (= (seshat-reader-sidebar--size-for-kind nil) 0.24)))
+    ;; 高度语义：`annotations' 跟随全局位置；`outline' 要**自己**也在底部模式
+    ;; 时才回落到 `seshat-reader-sidebar-height'（M12 T3 起它默认在左侧、宽度
+    ;; 语义，用 `seshat-reader-outline-sidebar-width'）
+    (let ((seshat-reader-sidebar-position 'below-selected))
+      (should (= (seshat-reader-sidebar--size-for-kind 'annotations) 0.35))
+      (should (= (seshat-reader-sidebar--size-for-kind 'outline) 0.20)))
+    (let ((seshat-reader-sidebar-position 'below-selected)
+          (seshat-reader-outline-sidebar-position 'below-selected))
+      (should (= (seshat-reader-sidebar--size-for-kind 'outline) 0.35)))))
+
+(ert-deftest seshat-reader-sidebar-test--window-size-ratio-direction ()
+  "尺寸读写取键方向：左右分栏读宽、底部模式读高."
+  (let ((win 'fake-sidebar-window))
+    (cl-letf (((symbol-function 'window-total-width) (lambda (&rest _) 48))
+              ((symbol-function 'window-total-height) (lambda (&rest _) 16))
+              ((symbol-function 'frame-width) (lambda (&rest _) 200))
+              ((symbol-function 'frame-height) (lambda (&rest _) 40)))
+      (dolist (case '((left . 0.24) (right . 0.24)
+                      (below-selected . 0.4) (at-bottom . 0.4)))
+        (let ((seshat-reader-sidebar-position (car case)))
+          (should (= (seshat-reader-sidebar--window-size-ratio win)
+                     (cdr case))))))))
+
+(ert-deftest seshat-reader-sidebar-test--capture-state-uses-width-in-side-mode ()
+  "左右分栏下 `--capture-state' 记宽度比例，底部模式记高度比例."
+  (let ((win 'fake-sidebar-window))
+    (cl-letf (((symbol-function 'window-total-width) (lambda (&rest _) 40))
+              ((symbol-function 'window-total-height) (lambda (&rest _) 16))
+              ((symbol-function 'frame-width) (lambda (&rest _) 200))
+              ((symbol-function 'frame-height) (lambda (&rest _) 40))
+              ((symbol-function 'window-parameter)
+               (lambda (_w param)
+                 (pcase param
+                   ('seshat-reader-sidebar t)
+                   ('seshat-reader-sidebar-kind 'annotations)))))
+      (let ((seshat-reader-sidebar-position 'left)
+            (seshat-reader-sidebar--state nil))
+        (seshat-reader-sidebar--capture-state (list win))
+        (should (= (nth 2 (assq 'annotations seshat-reader-sidebar--state))
+                   0.2))
+        ;; 记忆条目同步记录方向：宽度语义
+        (should (eq (nth 1 (assq 'annotations seshat-reader-sidebar--state))
+                    'width)))
+      (let ((seshat-reader-sidebar-position 'below-selected)
+            (seshat-reader-sidebar--state nil))
+        (seshat-reader-sidebar--capture-state (list win))
+        (should (= (nth 2 (assq 'annotations seshat-reader-sidebar--state))
+                   0.4))
+        (should (eq (nth 1 (assq 'annotations seshat-reader-sidebar--state))
+                    'height))))))
+
+(ert-deftest seshat-reader-sidebar-test--fit-applicable-p-disabled-in-side-mode ()
+  "左右分栏下停用「按内容自适应高度」，底部模式仍适用."
+  (let ((buf (get-buffer-create "*seshat-sidebar-test-fit-side*")))
+    (unwind-protect
+        (progn
+          (dolist (pos '(left right))
+            (let ((seshat-reader-sidebar-position pos))
+              (should-not (seshat-reader-sidebar--fit-applicable-p
+                           buf 'translate))))
+          (let ((seshat-reader-sidebar-position 'below-selected))
+            (should (seshat-reader-sidebar--fit-applicable-p buf 'translate))))
+      (kill-buffer buf))))
+
+;;; 目录面板 buffer 名与 popper 分流（M12 T2）
+
+(ert-deftest seshat-reader-sidebar-test--buffer-p-outline ()
+  "`--buffer-p' 正则识别目录 buffer 名，且仍识别批注/译文面板名."
+  (should (seshat-reader-sidebar-buffer-p "*Outline of foo.pdf*"))
+  (should (seshat-reader-sidebar-buffer-p (get-buffer-create
+                                           "*Outline of foo.pdf*")))
+  (should (seshat-reader-sidebar-buffer-p
+           seshat-reader-sidebar--annotation-buffer-name))
+  (should (seshat-reader-sidebar-buffer-p
+           seshat-reader-sidebar-translate-buffer-name))
+  ;; 无关 buffer 与非字符串输入
+  (should-not (seshat-reader-sidebar-buffer-p "*scratch*"))
+  (should-not (seshat-reader-sidebar-buffer-p "*Annotations of foo*"))
+  ;; 锚定：名字只是**包含**该片段不算目录面板
+  (should-not (seshat-reader-sidebar-buffer-p "foo*Outline of bar*"))
+  (should-not (seshat-reader-sidebar-buffer-p nil))
+  (should-not (seshat-reader-sidebar-buffer-p 42)))
+
+(ert-deftest seshat-reader-sidebar-test--kind-for-buffer-name-three-branches ()
+  "popper 分流的 kind 推断三分支，且 outline 不会被误判为 annotations."
+  (should (eq (seshat-reader-sidebar--kind-for-buffer-name
+               seshat-reader-sidebar-translate-buffer-name)
+              'translate))
+  (should (eq (seshat-reader-sidebar--kind-for-buffer-name
+               "*Outline of foo.pdf*")
+              'outline))
+  (should (eq (seshat-reader-sidebar--kind-for-buffer-name
+               seshat-reader-sidebar--annotation-buffer-name)
+              'annotations))
+  (should (eq (seshat-reader-sidebar--kind-for-buffer-name "*whatever*")
+              'annotations))
+  (should (eq (seshat-reader-sidebar--kind-for-buffer-name nil) 'annotations)))
+
+(ert-deftest seshat-reader-sidebar-test--display-buffer-outline-routes-to-outline-kind ()
+  "popper 重开目录 buffer 时按 `outline' kind 与 side 参数显示."
+  (let ((seshat-reader-sidebar-enabled t)
+        (seshat-reader-sidebar-position 'left)
+        (seshat-reader-sidebar-width 0.24)
+        (seshat-reader-outline-sidebar-width 0.20)
+        (seshat-reader-sidebar--state nil)
+        (captured nil)
+        (buf (get-buffer-create "*Outline of t2.pdf*")))
+    (unwind-protect
+        (progn
+          (cl-letf (((symbol-function 'display-buffer)
+                     (lambda (_b &optional _action)
+                       (setq captured display-buffer-overriding-action)
+                       'fake-win)))
+            (should (eq (seshat-reader-sidebar-display-buffer buf nil)
+                        'fake-win)))
+          (should (eq (car captured) 'display-buffer-in-side-window))
+          (should (eq (alist-get 'side (cdr captured)) 'left))
+          (should (equal (alist-get 'window-width (cdr captured)) 0.20))
+          (should (eq (alist-get 'seshat-reader-sidebar-kind
+                                 (alist-get 'window-parameters (cdr captured)))
+                      'outline))
+          (should (eq seshat-reader-sidebar--last-kind 'outline))
+          (should (eq seshat-reader-sidebar--last-buffer buf)))
+      (kill-buffer buf))))
+
+;;; per-kind 方位解析与多面板共存（M12 T3）
+
+(ert-deftest seshat-reader-sidebar-test--position-for-kind-defaults ()
+  "默认：outline → left、annotations / translate → right（全局默认 right）."
+  ;; 默认值本身（破坏性变更：`seshat-reader-sidebar-position' 旧默认
+  ;; `below-selected'，M12 T3 改为 `right'）
+  (should (eq (default-value 'seshat-reader-sidebar-position) 'right))
+  (should (eq (default-value 'seshat-reader-outline-sidebar-position) 'left))
+  (let ((seshat-reader-sidebar-position 'right)
+        (seshat-reader-outline-sidebar-position 'left))
+    (should (eq (seshat-reader-sidebar--position-for-kind 'outline) 'left))
+    (should (eq (seshat-reader-sidebar--position-for-kind 'annotations) 'right))
+    (should (eq (seshat-reader-sidebar--position-for-kind 'translate) 'right))
+    (should (eq (seshat-reader-sidebar--position-for-kind nil) 'right))
+    ;; 方向 / 侧 / 尺寸键随之按 kind 解析
+    (should (seshat-reader-sidebar--horizontal-p 'outline))
+    (should (eq (seshat-reader-sidebar--position-side 'outline) 'left))
+    (should (eq (seshat-reader-sidebar--position-side 'annotations) 'right))
+    (should (eq (seshat-reader-sidebar--size-key 'outline) 'window-width))))
+
+(ert-deftest seshat-reader-sidebar-test--position-for-kind-custom-override ()
+  "自定义目录位置覆盖其侧；未知 kind 与 nil 回落全局位置."
+  ;; 目录改到右侧：与信息栏同侧（slot 依次分配，见 --slot-for-kind 用例）
+  (let ((seshat-reader-sidebar-position 'right)
+        (seshat-reader-outline-sidebar-position 'right))
+    (should (eq (seshat-reader-sidebar--position-for-kind 'outline) 'right))
+    (should (eq (seshat-reader-sidebar--position-side 'outline) 'right)))
+  ;; 目录放底部：只有目录回到底部模式，信息栏仍在右侧
+  (let ((seshat-reader-sidebar-position 'right)
+        (seshat-reader-outline-sidebar-position 'at-bottom))
+    (should (eq (seshat-reader-sidebar--position-for-kind 'outline) 'at-bottom))
+    (should-not (seshat-reader-sidebar--position-side 'outline))
+    (should-not (seshat-reader-sidebar--horizontal-p 'outline))
+    (should (eq (seshat-reader-sidebar--position-side 'annotations) 'right)))
+  ;; 全局改底部：信息栏跟随，目录仍按自己的变量（默认 left）
+  (let ((seshat-reader-sidebar-position 'below-selected)
+        (seshat-reader-outline-sidebar-position 'left))
+    (should (eq (seshat-reader-sidebar--position-for-kind 'annotations)
+                'below-selected))
+    (should (eq (seshat-reader-sidebar--position-for-kind 'outline) 'left)))
+  ;; 未知 kind 与 nil 一律回落 `seshat-reader-sidebar-position'
+  (let ((seshat-reader-sidebar-position 'at-bottom)
+        (seshat-reader-outline-sidebar-position 'left))
+    (should (eq (seshat-reader-sidebar--position-for-kind 'unknown-kind)
+                'at-bottom))
+    (should (eq (seshat-reader-sidebar--position-for-kind nil) 'at-bottom))))
+
+(ert-deftest seshat-reader-sidebar-test--slot-for-kind-per-kind-and-stable ()
+  "同侧不同 kind 得到不同 slot，同 kind 稳定；不同侧各自从 0 开始."
+  (let ((seshat-reader-sidebar-position 'right)
+        (seshat-reader-outline-sidebar-position 'left))
+    (should (= (seshat-reader-sidebar--slot-for-kind 'outline) 0))
+    (should (= (seshat-reader-sidebar--slot-for-kind 'annotations) 0))
+    (should (= (seshat-reader-sidebar--slot-for-kind 'translate) 1))
+    ;; 稳定性：重复调用结果不变
+    (should (= (seshat-reader-sidebar--slot-for-kind 'translate) 1))
+    (should (equal (seshat-reader-sidebar--kinds-on-side 'left) '(outline)))
+    (should (equal (seshat-reader-sidebar--kinds-on-side 'right)
+                   '(annotations translate))))
+  ;; 目录改到右侧：右侧三个 kind 依次 0 / 1 / 2
+  (let ((seshat-reader-sidebar-position 'right)
+        (seshat-reader-outline-sidebar-position 'right))
+    (should (= (seshat-reader-sidebar--slot-for-kind 'outline) 0))
+    (should (= (seshat-reader-sidebar--slot-for-kind 'annotations) 1))
+    (should (= (seshat-reader-sidebar--slot-for-kind 'translate) 2)))
+  ;; 未知 kind 排在已知 kind 之后，不与任何已知 kind 撞槽
+  (let ((seshat-reader-sidebar-position 'right)
+        (seshat-reader-outline-sidebar-position 'left))
+    (should (= (seshat-reader-sidebar--slot-for-kind 'unknown-kind) 2))))
+
+(ert-deftest seshat-reader-sidebar-test--display-params-per-kind-sides ()
+  "三栏共存的 action list：左目录 slot 0、右批注 slot 0、右译文 slot 1."
+  (let ((seshat-reader-sidebar-position 'right)
+        (seshat-reader-outline-sidebar-position 'left)
+        (seshat-reader-sidebar-width 0.24)
+        (seshat-reader-outline-sidebar-width 0.20)
+        (seshat-reader-sidebar--state nil))
+    (let ((outline (seshat-reader-sidebar--display-params 'outline)))
+      (should (eq (caar outline) 'display-buffer-in-side-window))
+      (should (eq (cdr (assq 'side outline)) 'left))
+      (should (zerop (cdr (assq 'slot outline))))
+      (should (equal (cdr (assq 'window-width outline)) 0.20)))
+    (let ((ann (seshat-reader-sidebar--display-params 'annotations))
+          (tr (seshat-reader-sidebar--display-params 'translate)))
+      (should (eq (cdr (assq 'side ann)) 'right))
+      (should (zerop (cdr (assq 'slot ann))))
+      (should (equal (cdr (assq 'window-width ann)) 0.24))
+      (should (eq (cdr (assq 'side tr)) 'right))
+      (should (= 1 (cdr (assq 'slot tr))))
+      (should (equal (cdr (assq 'window-width tr)) 0.24)))
+    ;; per-kind 尺寸记忆互不串台：目录记 0.3 不影响信息栏
+    (let ((seshat-reader-sidebar--state '((outline width 0.3))))
+      (should (equal (cdr (assq 'window-width
+                                (seshat-reader-sidebar--display-params
+                                 'outline)))
+                     0.3))
+      (should (equal (cdr (assq 'window-width
+                                (seshat-reader-sidebar--display-params
+                                 'annotations)))
+                     0.24)))))
+
+(ert-deftest seshat-reader-sidebar-test--display-params-outline-bottom-when-configured ()
+  "目录面板也支持底部模式：位置变量设为底部位时退回高度语义，信息栏不受影响."
+  (dolist (case '((below-selected . display-buffer-below-selected)
+                  (at-bottom . display-buffer-at-bottom)))
+    (let* ((seshat-reader-sidebar-position 'right)
+           (seshat-reader-outline-sidebar-position (car case))
+           (seshat-reader-sidebar-height 0.35)
+           (params (seshat-reader-sidebar--display-params 'outline)))
+      (should (equal (car params) (list (cdr case))))
+      (should (equal (cdr (assq 'window-height params)) 0.35))
+      (should-not (assq 'window-width params))
+      (should-not (assq 'side params))
+      (should (eq (cdr (assq 'side (seshat-reader-sidebar--display-params
+                                    'annotations)))
+                  'right)))))
+
+(ert-deftest seshat-reader-sidebar-test--window-for-kind-lookup ()
+  "按 kind 查找既有面板窗口（判据不再是「只看第一个窗口」）."
+  (cl-letf (((symbol-function 'window-parameter)
+             (lambda (win param)
+               (pcase param
+                 ('seshat-reader-sidebar-kind
+                  (cdr (assq win '((w-a . annotations) (w-b . outline)))))
+                 (_ nil)))))
+    (should (eq (seshat-reader-sidebar--window-for-kind 'outline '(w-a w-b))
+                'w-b))
+    (should (eq (seshat-reader-sidebar--window-for-kind 'annotations
+                                                        '(w-a w-b))
+                'w-a))
+    (should-not (seshat-reader-sidebar--window-for-kind 'translate
+                                                         '(w-a w-b)))
+    (should-not (seshat-reader-sidebar--window-for-kind 'outline nil))))
+
+(ert-deftest seshat-reader-sidebar-test--display-keeps-other-kinds ()
+  "显示目录既不关闭也不重建已显示的批注/译文窗口."
+  (let* ((seshat-reader-sidebar-position 'right)
+         (seshat-reader-outline-sidebar-position 'left)
+         (seshat-reader-sidebar--state nil)
+         (deleted nil)
+         (shown-action nil)
+         (buf (get-buffer-create "*Outline of t3.pdf*")))
+    (unwind-protect
+        (cl-letf (((symbol-function 'seshat-reader-sidebar--windows)
+                   (lambda () '(w-a w-b)))
+                  ((symbol-function 'window-parameter)
+                   (lambda (win param)
+                     (pcase param
+                       ('seshat-reader-sidebar-kind
+                        (cdr (assq win '((w-a . annotations)
+                                         (w-b . translate)))))
+                       ('window-side 'right)
+                       (_ nil))))
+                  ((symbol-function 'delete-window)
+                   (lambda (&optional w) (push w deleted)))
+                  ((symbol-function 'display-buffer)
+                   (lambda (&rest _)
+                     (setq shown-action display-buffer-overriding-action)
+                     'fake-win)))
+          (seshat-reader-sidebar--display buf 'outline)
+          ;; 两个既有窗口都不是 outline kind → 一个都没被关闭
+          (should-not deleted)
+          (should (eq (alist-get 'side (cdr shown-action)) 'left))
+          (should (zerop (alist-get 'slot (cdr shown-action))))
+          (should (eq (alist-get 'seshat-reader-sidebar-kind
+                                 (alist-get 'window-parameters
+                                            (cdr shown-action)))
+                      'outline)))
+      (kill-buffer buf))))
+
+(ert-deftest seshat-reader-sidebar-test--display-rebuilds-target-kind-only ()
+  "该 kind 的旧窗口侧已变化时只关它；其它 kind 的窗口保留."
+  (let* ((seshat-reader-sidebar-position 'left)  ; 运行中从 right 改到 left
+         (seshat-reader-outline-sidebar-position 'left)
+         (seshat-reader-sidebar--state nil)
+         (deleted nil)
+         (buf (get-buffer-create "*seshat-sidebar-test-rebuild*")))
+    (unwind-protect
+        (cl-letf (((symbol-function 'seshat-reader-sidebar--windows)
+                   (lambda () '(w-a w-b)))
+                  ((symbol-function 'window-parameter)
+                   (lambda (win param)
+                     (pcase param
+                       ('seshat-reader-sidebar-kind
+                        (cdr (assq win '((w-a . annotations)
+                                         (w-b . translate)))))
+                       ('window-side 'right)
+                       (_ nil))))
+                  ((symbol-function 'delete-window)
+                   (lambda (&optional w) (push w deleted)))
+                  ((symbol-function 'display-buffer)
+                   (lambda (&rest _) 'fake-win)))
+          (seshat-reader-sidebar--display buf 'annotations)
+          ;; 只关批注窗口（侧已从 right 变 left），译文窗口保留
+          (should (equal deleted '(w-a))))
+      (kill-buffer buf))))
+
+(ert-deftest seshat-reader-sidebar-test--toggle-kind-closes-only-that-kind ()
+  "`toggle' 带 kind 时只关闭该 kind 的窗口，并把其 buffer 记入 per-kind 记忆."
+  (let ((seshat-reader-sidebar-position 'right)
+        (seshat-reader-outline-sidebar-position 'left)
+        (seshat-reader-sidebar--state nil)
+        (seshat-reader-sidebar--last-buffers nil)
+        (deleted nil)
+        (messages nil)
+        (outline-buf (get-buffer-create "*Outline of t3-toggle.pdf*")))
+    (unwind-protect
+        (cl-letf (((symbol-function 'seshat-reader-sidebar--windows)
+                   (lambda () '(w-a w-b)))
+                  ((symbol-function 'window-parameter)
+                   (lambda (win param)
+                     (pcase param
+                       ('seshat-reader-sidebar-kind
+                        (cdr (assq win '((w-a . annotations)
+                                         (w-b . outline)))))
+                       ('window-side 'right)
+                       (_ nil))))
+                  ((symbol-function 'window-buffer)
+                   (lambda (&optional _w) outline-buf))
+                  ((symbol-function 'delete-window)
+                   (lambda (&optional w) (push w deleted)))
+                  ((symbol-function 'message)
+                   (lambda (fmt &rest args)
+                     (push (apply #'format fmt args) messages))))
+          (seshat-reader-sidebar-toggle 'outline)
+          (should (equal deleted '(w-b)))
+          (should (eq (cdr (assq 'outline seshat-reader-sidebar--last-buffers))
+                      outline-buf))
+          (should (cl-some (lambda (m) (string-match-p "outline" m)) messages)))
+      (kill-buffer outline-buf))))
+
+(ert-deftest seshat-reader-sidebar-test--toggle-kind-reopens-remembered-buffer ()
+  "`toggle' 带 kind 且该 kind 无窗口时用 per-kind 记忆重开（并允许跟随光标）."
+  (let* ((buf (get-buffer-create "*Outline of t3-reopen.pdf*"))
+         (seshat-reader-sidebar--last-buffers (list (cons 'outline buf)))
+         (seshat-reader-sidebar--last-kind 'annotations)
+         (seshat-reader-sidebar--last-buffer nil)
+         (shown nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'seshat-reader-sidebar--windows)
+                   (lambda () nil))
+                  ((symbol-function 'seshat-reader-sidebar-show)
+                   (lambda (b k &optional s) (setq shown (list b k s)) 'win))
+                  ((symbol-function 'message) (lambda (&rest _) nil)))
+          (seshat-reader-sidebar-toggle 'outline)
+          (should (eq (car shown) buf))
+          (should (eq (cadr shown) 'outline))
+          (should (nth 2 shown)))
+      (kill-buffer buf))))
+
+(ert-deftest seshat-reader-sidebar-test--toggle-outline-command-and-binding ()
+  "`C-c C-o' 绑定目录开合命令，`o' 仍是 `seshat-reader-outline-show'."
+  (should (commandp 'seshat-reader-sidebar-toggle-outline))
+  (should (eq (lookup-key seshat-reader-mode-map (kbd "C-c C-o"))
+              'seshat-reader-sidebar-toggle-outline))
+  (should (eq (lookup-key seshat-reader-mode-map (kbd "o"))
+              'seshat-reader-outline-show))
+  (let ((calls nil))
+    (cl-letf (((symbol-function 'seshat-reader-sidebar-toggle)
+               (lambda (&optional kind) (push kind calls))))
+      (seshat-reader-sidebar-toggle-outline))
+    (should (equal calls '(outline)))))
+
+;;; 尺寸记忆的方向标签（M12 审查修复：方位切换后不得误用旧记忆值）
+
+(ert-deftest seshat-reader-sidebar-test--size-for-kind-reuses-memory-same-direction ()
+  "同方向下复用 per-kind 记忆值（左右切换仍属同一方向）。"
+  (let ((seshat-reader-sidebar-width 0.24)
+        (seshat-reader-outline-sidebar-width 0.20)
+        (seshat-reader-sidebar-height 0.35)
+        (seshat-reader-sidebar--state '((annotations width 0.42))))
+    ;; 左右分栏都是宽度语义 → 记忆值可用
+    (dolist (pos '(left right))
+      (let ((seshat-reader-sidebar-position pos))
+        (should (equal (seshat-reader-sidebar--size-for-kind 'annotations)
+                       0.42))
+        ;; 未记忆的 kind 仍回落默认值
+        (should (equal (seshat-reader-sidebar--size-for-kind 'translate)
+                       0.24))))
+    ;; 另一 kind 的记忆互不串台
+    (let ((seshat-reader-sidebar-position 'right)
+          (seshat-reader-sidebar--state '((annotations width 0.42)
+                                          (outline width 0.3))))
+      (should (equal (seshat-reader-sidebar--size-for-kind 'outline) 0.3))
+      (should (equal (seshat-reader-sidebar--size-for-kind 'annotations) 0.42)))))
+
+(ert-deftest seshat-reader-sidebar-test--size-for-kind-falls-back-across-directions ()
+  "记忆值的方向与当前方位不符时回落方向默认值（不把宽度比例当高度用）。"
+  ;; 记忆是宽度比例（记录时在 left/right），当前切到底部模式 → 用高度默认值
+  (let ((seshat-reader-sidebar-height 0.35)
+        (seshat-reader-sidebar-width 0.24)
+        (seshat-reader-sidebar--state '((annotations width 0.9))))
+    (dolist (pos '(below-selected at-bottom))
+      (let ((seshat-reader-sidebar-position pos))
+        (should (equal (seshat-reader-sidebar--size-for-kind 'annotations)
+                       0.35))
+        (should (equal (cdr (assq 'window-height
+                                  (seshat-reader-sidebar--display-params
+                                   'annotations)))
+                       0.35))
+        (should-not (assq 'window-width
+                          (seshat-reader-sidebar--display-params
+                           'annotations))))))
+  ;; 反向：记忆是高度比例（记录时在底部模式），当前在左右分栏 → 用宽度默认值
+  (let ((seshat-reader-sidebar-height 0.35)
+        (seshat-reader-sidebar-width 0.24)
+        (seshat-reader-sidebar--state '((annotations height 0.9))))
+    (dolist (pos '(left right))
+      (let ((seshat-reader-sidebar-position pos))
+        (should (equal (seshat-reader-sidebar--size-for-kind 'annotations)
+                       0.24))
+        (should (equal (cdr (assq 'window-width
+                                  (seshat-reader-sidebar--display-params
+                                   'annotations)))
+                       0.24))))))
+
+(ert-deftest seshat-reader-sidebar-test--size-for-kind-tolerates-legacy-format ()
+  "旧格式（二元 `(KIND . RATIO)'）按方向未知处理：回落默认值且不报错."
+  (let ((seshat-reader-sidebar-height 0.35)
+        (seshat-reader-sidebar-width 0.24)
+        (seshat-reader-sidebar--state '((annotations . 0.9))))
+    (dolist (pos '(left right below-selected at-bottom))
+      (let ((seshat-reader-sidebar-position pos))
+        (should (= (seshat-reader-sidebar--size-for-kind 'annotations)
+                   (seshat-reader-sidebar--default-size 'annotations)))))
+    ;; 畸形条目（值不是数字）同样不报错
+    (let ((seshat-reader-sidebar-position 'right)
+          (seshat-reader-sidebar--state '((annotations width "oops"))))
+      (should (equal (seshat-reader-sidebar--size-for-kind 'annotations)
+                     0.24)))))
 
 (provide 'seshat-reader-sidebar-test)
 ;;; seshat-reader-sidebar-test.el ends here

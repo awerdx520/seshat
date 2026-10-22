@@ -43,6 +43,13 @@ reset_doc_state(DocState *state)
 		.frame_scale = 1,
 		.outline = NULL,
 		.invert = 0,
+		/* A reset drops the highlight table: it belongs to the document
+		 * that was just replaced.  `highlights' is owned by DocState and
+		 * allocated lazily, so it starts out empty. */
+		.highlights = NULL,
+		.highlight_count = 0,
+		.highlight_cap = 0,
+		.highlights_dirty = false,
 		.active_jobs = current_active_jobs,
 		.is_reloading = current_is_reloading
 	};
@@ -162,6 +169,9 @@ free_doc_pages(DocState *state)
 {
     if (!state || !state->doc_pages) return;
 
+    /* Called from `free_doc_state' once the render threads are idle and
+     * no EmacsWinState is left, so no slot can still reference these
+     * pages and no mutex can be held. */
     for (int i = 0; i < state->pagecount; ++i) {
         DocPage *dp = &state->doc_pages[i];
         pthread_mutex_destroy(&dp->mutex);
@@ -289,6 +299,20 @@ free_doc_state(DocState *state)
 	if (!state)
 		return;
 
+	/* Release the per-page array before the MuPDF context goes away:
+	 * `free_doc_pages' drops each page's display list through
+	 * `state->ctx', so dropping the context first would leak them (or
+	 * crash).  `state->pagecount' is exactly the number of DocPages
+	 * initialised in `emacs_load_doc' — the loader grows it one page at
+	 * a time and bails out on failure — so a partially built array is
+	 * torn down correctly too.
+	 *
+	 * Callers must have quiesced the render threads and freed every
+	 * EmacsWinState first (`wait_for_doc_jobs' + `free_cache_window');
+	 * all three call sites do exactly that.  Without it the pages would
+	 * still be referenced by CachedPage slots. */
+	free_doc_pages(state);
+
 	// Drop MuPDF objects
 	if (state->outline)
 	{
@@ -312,6 +336,15 @@ free_doc_state(DocState *state)
 		free(state->path);
 		state->path = NULL;
 	}
+
+	// Free the document-level highlight table
+	if (state->highlights)
+	{
+		free(state->highlights);
+		state->highlights = NULL;
+	}
+	state->highlight_count = 0;
+	state->highlight_cap = 0;
 
 	// Free the state struct itself
 	free(state);

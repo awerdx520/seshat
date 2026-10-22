@@ -298,6 +298,10 @@ BODY 为批注正文；为 nil 或去掉空白后为空串时退回使用最近�
                       (message "Seshat Reader annotation: 已创建批注 %s（%s，%s）"
                                (format "%s" (alist-get 'id response))
                                document-id location)
+                      ;; 已在服务端落地：若列表缓存属于本文档，增量追加该条并
+                      ;; 重投页面高亮（不发请求、不重渲染列表）。
+                      (seshat-reader-annotation--note-created-annotation
+                       file (alist-get 'id response) location text)
                       ;; 机会性同步：服务端此刻可达，顺手把积压的本地队列推进一次。
                       (seshat-reader-annotation--require-queue)
                       (when (> (seshat-reader-annotation-queue-count) 0)
@@ -423,6 +427,268 @@ HTTP 非 2xx（如 401 鉴权失败、400 uid 非法、500 服务端错误）时
      (message "Seshat Reader annotation: 拉取批注列表失败（请求失败或响应异常）：%s"
               (error-message-string err))
      seshat-reader-annotation--fetch-error)))
+
+;;; 页面高亮同步（C 层 rect 高亮）
+
+;; 三个模块函数由动态模块提供（render/render-core.c），elisp 侧只声明签名，
+;; 以免字节编译告警「not known to be defined」。声明不改变运行时行为。
+(declare-function seshat-reader-dyn--add-highlight "seshat-render-core"
+                  (page x0 y0 x1 y1))
+(declare-function seshat-reader-dyn--clear-highlights "seshat-render-core" ())
+(declare-function seshat-reader-dyn--refresh-highlights "seshat-render-core" ())
+
+(defcustom seshat-reader-annotation-highlight-enabled t
+  "是否把批注 location 中的 `rect:' 段绘制为页面高亮.
+非 nil 时 `seshat-reader-annotation--apply-highlights' 把解析出的矩形
+逐条交给动态模块，绘制成半透明高亮；为 nil 时该函数只清空已有高亮并
+重绘（不添加任何矩形），从而关闭批注高亮显示。"
+  :type 'boolean
+  :group 'seshat-reader-annotation)
+
+(defun seshat-reader-annotation--quiet-doc-id (file)
+  "安静地求 FILE 的显示标识（doc-id）；FILE 不是字符串时返回 nil.
+与 `seshat-reader-annotation--doc-id' 是同一套派生规则，只是临时抑制其
+「降级为 local:」的 `message'，供高亮同步这类只做**比对**的场景复用，
+避免每次重绘都往回显区刷一条提示。"
+  (when (stringp file)
+    (let ((inhibit-message t))
+      (seshat-reader-annotation--doc-id file))))
+
+(defun seshat-reader-annotation--parse-coordinate (field)
+  "把坐标字段 FIELD 解析为浮点数；不是合法数字时返回 nil.
+合法形态是十进制数（可带正负号、小数点与指数），字段两端允许空白；
+\"abc\"、空串等一律返回 nil，绝不以 0 兜底（否则非法坐标会被画到
+页角）。"
+  (when (and (stringp field)
+             (string-match-p
+              (concat "\\`[ \t]*\\(?:-?\\(?:[0-9]+\\(?:\\.[0-9]*\\)?"
+                      "\\|\\.[0-9]+\\)\\(?:[eE][-+]?[0-9]+\\)?\\)[ \t]*\\'")
+              field))
+    (float (string-to-number (string-trim field)))))
+
+(defun seshat-reader-annotation--rect-from-segment (segment)
+  "把单个 \"rect:\" 段 SEGMENT 解析为 (X0 Y0 X1 Y1)，失败时返回 nil.
+SEGMENT 须以 \"rect:\" 开头且其后为四个逗号分隔的数字。下列情形返回
+nil：字段数不为 4、任一字段不是数字、X1 小于 X0 或 Y1 小于 Y0（负面积
+矩形无法绘制）。"
+  (when (and (stringp segment)
+             (string-prefix-p "rect:" segment))
+    (let* ((fields (split-string (substring segment (length "rect:")) "," nil))
+           (coords (mapcar #'seshat-reader-annotation--parse-coordinate fields))
+           (x0 (nth 0 coords))
+           (y0 (nth 1 coords))
+           (x1 (nth 2 coords))
+           (y1 (nth 3 coords)))
+      (when (and (= (length fields) 4)
+                 (not (memq nil coords))
+                 (<= x0 x1)
+                 (<= y0 y1))
+        (list x0 y0 x1 y1)))))
+
+(defconst seshat-reader-annotation--location-max-length 65536
+  "解析 location 时接受的最大字符数（超出部分截断丢弃）.
+LOCATION 来自**不可信的服务端响应**：恶意或有缺陷的服务端可能返回数百万
+字符的 location，`split-string' 会一次产出上万段，把一次重绘变成 CPU 与
+内存的放大攻击。故解析前先截断到本上限，**截断后仍解析前面合法的段**
+（不整体放弃）；正常 location 只有几十字符，不受影响。")
+
+(defconst seshat-reader-annotation--rect-max-segments 2000
+  "解析 location 时最多处理的 `rect:' 段数.
+超过本上限即**停止解析**并保留已解析出的矩形——同样是为了给不可信的服务端
+响应一个有界的工作量上界（每段解析都要做正则与浮点转换）。正常批注的
+location 至多几段 `rect:'，2000 段已远超实际需要。")
+
+(defun seshat-reader-annotation--rects-from-location (location)
+  "从 LOCATION 中解析出全部可用的 `rect:' 矩形，返回 rect 列表.
+LOCATION 的约定形态是 \"page:<n>;rect:<x0>,<y0>,<x1>,<y1>\"；按 \";\"
+切段后**只**处理以 \"rect:\" 开头的段，出现多个 \"rect:\" 段时逐个解析，
+顺序与 LOCATION 中一致。每段的四个坐标须为数字且 X0<=X1、Y0<=Y1
+（负面积矩形跳过），任一条件不满足即跳过该段。\"ink:\"（手写笔迹）段
+**本期不解析、不渲染**，只在 tech-debt 记录。全部段都不可用时返回 nil，
+否则返回 ((X0 Y0 X1 Y1) …) 形式的列表，坐标为浮点数，单位与页面坐标系
+一致（见 `seshat-reader-annotation--location'）。
+
+LOCATION 来自不可信的服务端响应，故解析**有界**：长度先按
+`seshat-reader-annotation--location-max-length' 截断（截断后仍解析前面合法
+的段），解析出的 `rect:' 段数达到
+`seshat-reader-annotation--rect-max-segments' 即停止（保留已解析的）。"
+  (when (stringp location)
+    (let* ((limit seshat-reader-annotation--location-max-length)
+           (text (if (> (length location) limit)
+                     (substring location 0 limit)
+                   location))
+           (rest (split-string text ";"))
+           (rects nil)
+           (count 0))
+      ;; 用 while 而非 dolist：达到段数上限后不再继续尝试解析后续段。
+      (while (and rest (< count seshat-reader-annotation--rect-max-segments))
+        (let ((rect (seshat-reader-annotation--rect-from-segment
+                     (string-trim (car rest)))))
+          (when rect
+            (push rect rects)
+            (setq count (1+ count))))
+        (setq rest (cdr rest)))
+      (nreverse rects))))
+
+(defun seshat-reader-annotation--item-location (item)
+  "取条目 ITEM 的 location 字符串；取不到时返回 nil.
+ITEM 可以是 plist（含 `:location'，如
+`seshat-reader-annotation--all-items' 的元素），也可以是服务端返回的
+alist（含 `location'）。"
+  (cond
+   ((not (listp item)) nil)
+   ((plist-member item :location) (plist-get item :location))
+   ((assq 'location item) (cdr (assq 'location item)))
+   (t nil)))
+
+(defvar seshat-reader-annotation--highlight-warned nil
+  "是否已就「高亮模块不可用」提示过一次（避免每次重绘刷屏）.
+动态模块未加载是**稳定状态**（会话内不会自愈），每次刷新都提示只会把回显区
+淹没，故只提示首次。用户重装模块后可用
+`(setq seshat-reader-annotation--highlight-warned nil)' 复位。")
+
+(defun seshat-reader-annotation--highlight-module-available-p ()
+  "判断动态模块提供的三个高亮函数是否都已可用.
+三者缺一都意味着模块未加载（或版本过旧），此时投喂必然失败，调用方据此
+提前跳过并提示一次。"
+  (and (fboundp 'seshat-reader-dyn--clear-highlights)
+       (fboundp 'seshat-reader-dyn--add-highlight)
+       (fboundp 'seshat-reader-dyn--refresh-highlights)
+       t))
+
+(defun seshat-reader-annotation--warn-highlight-unavailable ()
+  "提示一次「高亮模块未加载」（同一会话内不重复）.
+只在**真正尝试投喂**而失败时由 `seshat-reader-annotation--apply-highlights'
+调用；提示本身不影响返回值，也不抛错。"
+  (unless seshat-reader-annotation--highlight-warned
+    (setq seshat-reader-annotation--highlight-warned t)
+    (message "Seshat Reader annotation: 高亮模块未加载，跳过批注高亮")))
+
+(defun seshat-reader-annotation--apply-highlights (items)
+  "把 ITEMS 的批注矩形批量投喂给 C 层并触发重绘，返回添加的 rect 数.
+ITEMS 为条目列表，元素形态见 `seshat-reader-annotation--item-location'
+（plist 或服务端 alist 皆可）；没有 location 或 location 里没有可用
+`rect:' 段的条目直接跳过。流程固定为：先
+`seshat-reader-dyn--clear-highlights' 清空，再对每个条目的每个 rect 调
+`seshat-reader-dyn--add-highlight'，最后
+`seshat-reader-dyn--refresh-highlights' 重建缓存并重绘——全量重投，不做
+增量，避免 C 侧表与 elisp 侧缓存在删除/离线同步后漂移。
+
+`seshat-reader-annotation-highlight-enabled' 为 nil 时只清空与重绘、不加
+任何矩形，返回 0。三次 C 调用都包在 `ignore-errors' 里：动态模块未加载
+或当前没有载入任何文档时不打断批注流程；elisp 侧的解析错误**不**吞掉。
+
+模块不可用（三函数任一缺 `fboundp'）或某次 `--add-highlight' 调用失败时，
+经 `seshat-reader-annotation--warn-highlight-unavailable' `message' 提示
+一次（会话内不重复），**仍返回 0 且不抛错**——高亮是可选增强，不得让批注
+列表因它报错。"
+  (let ((enabled seshat-reader-annotation-highlight-enabled)
+        (count 0)
+        (failed nil))
+    (ignore-errors (seshat-reader-dyn--clear-highlights))
+    (when (and enabled items)
+      (if (not (seshat-reader-annotation--highlight-module-available-p))
+          (setq failed t)
+        (dolist (item items)
+          (let* ((location (seshat-reader-annotation--item-location item))
+                 (page (seshat-reader-annotation--page-from-location location)))
+            (when page
+              (dolist (rect (seshat-reader-annotation--rects-from-location location))
+                (if (ignore-errors
+                      (seshat-reader-dyn--add-highlight page
+                                                        (nth 0 rect)
+                                                        (nth 1 rect)
+                                                        (nth 2 rect)
+                                                        (nth 3 rect)))
+                    (setq count (1+ count))
+                  (setq failed t))))))))
+    (ignore-errors (seshat-reader-dyn--refresh-highlights))
+    (when failed
+      (seshat-reader-annotation--warn-highlight-unavailable))
+    count))
+
+(defun seshat-reader-annotation--source-document-p (source document-id)
+  "判断 SOURCE 缓冲区所显示的文档是否就是 DOCUMENT-ID 指向的文档.
+SOURCE 须为存活的、处于 `seshat-reader-mode' 且关联了文件的缓冲区；
+文档标识按 `seshat-reader-annotation--quiet-doc-id' 派生后与
+DOCUMENT-ID 比较。不满足时返回 nil，调用方据此**跳过**高亮同步，避免把
+A 文档的批注画到 B 文档上（动态模块的高亮表是文档级的）。"
+  (and (buffer-live-p source)
+       (with-current-buffer source
+         (and (eq major-mode 'seshat-reader-mode)
+              (equal document-id
+                     (seshat-reader-annotation--quiet-doc-id buffer-file-name))))))
+
+(defun seshat-reader-annotation--note-created-annotation (file id location text)
+  "新建批注成功后把该条追加进缓存并重投页面高亮.
+FILE 为批注所属文档路径，ID 为服务端返回的批注 id（可为 nil），
+LOCATION 与 TEXT 为该批注的位置与正文。只有同时满足下面三个条件才增量
+追加到缓存末尾并调用 `seshat-reader-annotation--apply-highlights' 重投：
+
+1. 列表缓冲区存在；
+2. 其缓存（`seshat-reader-annotation-list-entries'）属于 FILE 所指文档
+   （doc-id 相等）；
+3. **当前载入文档就是该文件**——经 `seshat-reader-annotation--source-document-p'
+   校验列表缓冲区记录的发起方 reader 缓冲区（`-list-source'）确实显示着
+   FILE 这份文档。仅比对 doc-id 不足以保证这一点（A 文档的列表缓存可能
+   仍然存在，而用户已经切去读 B 文档），而 C 层高亮表是**文档级**的，
+   错投会把 A 的矩形画到 B 的页面上。
+
+任一条件不满足时什么都不做（下次
+`\\[seshat-reader-annotation-list]' 再全量同步）。
+本函数**不发起任何网络请求**，也不重渲染列表缓冲区。"
+  (let* ((buffer (get-buffer seshat-reader-annotation-list-buffer-name))
+         (document-id (seshat-reader-annotation--quiet-doc-id file))
+         (source (and (buffer-live-p buffer)
+                      (buffer-local-value
+                       'seshat-reader-annotation-list-source buffer))))
+    (when (and document-id
+               (buffer-live-p buffer)
+               (equal document-id
+                      (buffer-local-value
+                       'seshat-reader-annotation-list-document-id buffer))
+               ;; 当前载入文档 == 目标文件，否则不投喂（防跨文档画高亮）。
+               (seshat-reader-annotation--source-document-p source document-id))
+      (with-current-buffer buffer
+        (let ((entries (append seshat-reader-annotation-list-entries
+                               (list (list (cons 'id id)
+                                           (cons 'location location)
+                                           (cons 'text text))))))
+          (setq-local seshat-reader-annotation-list-entries entries)
+          (seshat-reader-annotation--apply-highlights entries))))))
+
+(defun seshat-reader-annotation-refresh-highlights ()
+  "按最近一次成功拉取的批注重新投喂页面高亮.
+取列表缓冲区 `*Seshat Annotations*' 缓存的最近一次**服务端拉取结果**
+（`seshat-reader-annotation-list-entries'），重新解析其 rect 段并调用
+`seshat-reader-annotation--apply-highlights' 全量重投与重绘。本命令
+**不发起任何网络请求**（缓存已在内存里）。
+
+缓存缺失（从未成功拉取）、缓存属于**其它文档**或当前缓冲区没有关联
+文件时只 `message' 提示先用 `\\[seshat-reader-annotation-list]'
+拉取一次，不做任何修改。返回实际添加的 rect 数量（提示情形返回 0）。"
+  (interactive)
+  (let ((document-id (seshat-reader-annotation--quiet-doc-id buffer-file-name))
+        (buffer (get-buffer seshat-reader-annotation-list-buffer-name))
+        (hint (substitute-command-keys
+               "\\[seshat-reader-annotation-list]")))
+    (cond
+     ((null document-id)
+      (message "Seshat Reader annotation: 当前缓冲区没有关联文件，无法同步高亮。")
+      0)
+     ((not (buffer-live-p buffer))
+      (message "Seshat Reader annotation: 还没有批注缓存，请先用 %s 拉取一次。"
+               hint)
+      0)
+     ((not (equal document-id
+                  (buffer-local-value
+                   'seshat-reader-annotation-list-document-id buffer)))
+      (message "Seshat Reader annotation: 缓存的批注属于其它文档，请先在本文档用 %s 拉取一次。"
+               hint)
+      0)
+     (t
+      (seshat-reader-annotation--apply-highlights
+       (buffer-local-value 'seshat-reader-annotation-list-entries buffer))))))
 
 ;;; ETAF 渲染层接入
 
@@ -617,6 +883,12 @@ DOCUMENT-ID 为**显示标识（doc-id）**；SOURCE 为发起列表的 seshat-r
            (t
             (message "Seshat Reader annotation: 当前没有可显示的批注（本地也没有待同步条目）。"))))
       (seshat-reader-annotation--render-list document-id source result queued uid)
+      ;; 服务端拉取成功：顺手把批注矩形同步到页面高亮。数据全部来自本轮已经
+      ;; 拿到手的 RESULT 与本地队列 QUEUED，不新增任何请求；SOURCE 不是本文档
+      ;; 的 reader 缓冲区时跳过（防止把 A 文档的批注画到 B 文档上）。
+      (when (seshat-reader-annotation--source-document-p source document-id)
+        (seshat-reader-annotation--apply-highlights
+         (seshat-reader-annotation--all-items result queued)))
       (seshat-reader-annotation--maybe-sync-queue))))
 
 ;;; 跳页与删除
@@ -775,7 +1047,11 @@ evil；在 evil 环境下它们可能被 evil 接管（evil 会覆盖 `special-m
 
 (with-eval-after-load 'seshat-reader
   (define-key seshat-reader-mode-map (kbd "C-c C-a") #'seshat-reader-annotation-create)
-  (define-key seshat-reader-mode-map (kbd "C-c C-l") #'seshat-reader-annotation-list))
+  (define-key seshat-reader-mode-map (kbd "C-c C-l") #'seshat-reader-annotation-list)
+  ;; C-c C-h 在 `seshat-reader-mode-map' 中未被占用（已占用：C-a / C-l /
+  ;; C-r / C-o / C-t / C-e），用于按缓存重投页面高亮。
+  (define-key seshat-reader-mode-map (kbd "C-c C-h")
+              #'seshat-reader-annotation-refresh-highlights))
 
 (provide 'seshat-reader-annotation)
 ;;; seshat-reader-annotation.el ends here

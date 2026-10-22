@@ -104,6 +104,16 @@
   :type '(radio (function-item seshat-reader-fit-to-height)
 		(function-item seshat-reader-fit-to-width)))
 
+(defcustom seshat-reader-page-join-lines 1
+  "Height of the cross-page join strip, measured in page text lines.
+
+The strip above the current page shows the bottom of the previous page.
+Its height is this many times the frame character height; fractional
+values are allowed.  A value of 0 disables the strip, in which case page
+turning behaves exactly as it did before the feature existed."
+  :group 'seshat-reader
+  :type '(number :tag "Lines from the previous page"))
+
 (defvar-local seshat-reader--recent-scale-fallback 1.0
   "Previous scaling factor applied to the document.")
 
@@ -226,36 +236,55 @@ other file format will simply not show up as a candidate."
 (define-queue-command next-page ()
   "Go to the next page of the document."
   (interactive)
+  (seshat-reader--remember-current-page-spec)
   (when (seshat-reader-dyn--next-page)
+    (seshat-reader--update-join-strip)
+    ;; Land at the strip top, so that the last line of the previous page
+    ;; stays visible right above the new page.
+    (seshat-reader--set-window-vscroll nil 0)
     ;; Must return `t' when the command succeeds.
     (force-mode-line-update) t))
 
 (define-queue-command previous-page ()
   "Go to the previous page of the document."
   (interactive)
+  (seshat-reader--remember-current-page-spec)
   (when (seshat-reader-dyn--prev-page)
+    (seshat-reader--update-join-strip)
+    ;; Landing at the page bottom keeps the pages continuous when
+    ;; scrolling upwards.
+    (seshat-reader--set-page-bottom)
     ;; Must return `t' when the command succeeds.
     (force-mode-line-update) t))
 
 (defun seshat-reader-first-page ()
   "Go to the first page of the document."
   (interactive)
+  (seshat-reader--remember-current-page-spec)
   (seshat-reader-dyn--first-page)
+  (seshat-reader--update-join-strip)
   (seshat-reader--center-page)
+  (seshat-reader--set-window-vscroll nil 0)
   (force-mode-line-update))
 
 (defun seshat-reader-last-page ()
   "Go to the last page of the document."
   (interactive)
+  (seshat-reader--remember-current-page-spec)
   (seshat-reader-dyn--last-page)
+  (seshat-reader--update-join-strip)
   (seshat-reader--center-page)
+  (seshat-reader--set-page-bottom)
   (force-mode-line-update))
 
 (defun seshat-reader-goto-page (n)
   "Go to page number N in the current document."
   (interactive "nGoto page: ")
+  (seshat-reader--remember-current-page-spec)
   (seshat-reader-dyn--goto-page (- n 1)) ; MuPDF does 0-indexing
-  (seshat-reader--center-page))
+  (seshat-reader--update-join-strip)
+  (seshat-reader--center-page)
+  (seshat-reader--set-window-vscroll nil 0))
 
 (defun seshat-reader--get-current-doc-image-size (&optional window)
   "Get the dimensions of the page in WINDOW.
@@ -282,7 +311,8 @@ Optionally scale it by the SCALING-FACTOR.  Scales on selected window."
   (interactive (list (float
 		      (* (seshat-reader-current-doc-scale-value) seshat-reader-enlarge-factor))))
   (seshat-reader-doc-scale-page scaling-factor)
-  (seshat-reader--center-page))
+  (seshat-reader--center-page)
+  (seshat-reader--set-page-top-when-joined))
 
 (defun seshat-reader-shrink-size (&optional scaling-factor)
   "Shrink the size of the current page by the `seshat-reader-shrink-factor'.
@@ -291,13 +321,15 @@ Optionally scale it by the SCALING-FACTOR.  Scales on selected window."
   (interactive (list (float
 		      (* (seshat-reader-current-doc-scale-value) seshat-reader-shrink-factor))))
   (seshat-reader-doc-scale-page scaling-factor)
-  (seshat-reader--center-page))
+  (seshat-reader--center-page)
+  (seshat-reader--set-page-top-when-joined))
 
 (defun seshat-reader-reset-size ()
   "Reset the size of the current page to 1.0."
   (interactive)
   (seshat-reader-doc-scale-page 1.0)
-  (seshat-reader--center-page))
+  (seshat-reader--center-page)
+  (seshat-reader--set-page-top-when-joined))
 
 (defun seshat-reader-fit-to-height ()
   "Scale the current page in the selected window to fit its height."
@@ -308,7 +340,7 @@ Optionally scale it by the SCALING-FACTOR.  Scales on selected window."
 	 (scaling-factor (/ pixel-window-height unscaled-height)))
     (seshat-reader-doc-scale-page scaling-factor)
     (seshat-reader--center-page)
-    (seshat-reader--set-window-vscroll nil 0)))
+    (seshat-reader--set-page-top)))
 
 (defun seshat-reader-fit-to-width ()
   "Scale the current page in the selected window to fit its width."
@@ -318,13 +350,155 @@ Optionally scale it by the SCALING-FACTOR.  Scales on selected window."
 	 (unscaled-width (/ image-width (seshat-reader-current-doc-scale-value)))
 	 (scaling-factor (/ pixel-window-width unscaled-width)))
     (seshat-reader-doc-scale-page scaling-factor)
-    (seshat-reader--center-page)))
+    (seshat-reader--center-page)
+    (seshat-reader--set-page-top-when-joined)))
 
 (defun seshat-reader--get-pixel-per-col (&optional window)
   "Get the no of pixels per column for WINDOW.
 
 WINDOW must be a valid window and defaults to the selected one."
   (/ (window-body-width window t) (window-body-width window)))
+
+;;; Cross-page join
+
+;; The bottom strip of the previous page is drawn as a single buffer line
+;; inserted before the current page, using a `slice' display specification
+;; over the image spec of the previous page.  The image spec of a page is
+;; only available while that page is displayed, hence the spec cache below.
+
+(defconst seshat-reader--page-image-specs-limit 5
+  "Maximum number of page image specs kept in the spec cache.")
+
+(defvar-local seshat-reader--page-image-specs nil
+  "Cache of recently displayed page image specs.
+
+Each element is a cons cell of (PAGE . SPEC), where PAGE is the 1-based
+page number and SPEC is the image spec of that page.  The newest element
+comes first and at most `seshat-reader--page-image-specs-limit' elements
+are kept.")
+
+(defvar-local seshat-reader--join-strip-height 0
+  "Height in pixels of the cross-page join strip, or 0 if there is none.")
+
+(defvar-local seshat-reader--join-strip-end nil
+  "Marker at the end of the cross-page join strip line, or nil.
+
+The marker is nil when the buffer holds no join strip.")
+
+(defvar-local seshat-reader--center-overlay nil
+  "Buffer-wide overlay carrying the centering `line-prefix'.
+
+The overlay spans the whole accessible buffer so that the prefix also
+applies to the cross-page join strip line.  It is kept up to date by
+`seshat-reader--ensure-center-overlay'.")
+
+(defun seshat-reader--page-join-pixels ()
+  "Return the height in pixels of the cross-page join strip.
+
+The height is `seshat-reader-page-join-lines' times the frame character
+height, rounded to whole pixels.  The value 0 means the feature is
+disabled."
+  (let ((lines seshat-reader-page-join-lines))
+    (if (numberp lines)
+	(max 0 (round (* lines (frame-char-height))))
+      0)))
+
+(defun seshat-reader--remember-current-page-spec (&optional window)
+  "Remember the image spec of the page displayed in WINDOW.
+
+WINDOW defaults to the selected window.  The spec is needed later to
+draw the strip of the page that is about to be left, so this function is
+called right before the page of WINDOW changes.  Entries for the same
+page are de-duplicated and at most
+`seshat-reader--page-image-specs-limit' entries are kept, newest first."
+  (let* ((window (or window (selected-window)))
+	 (overlay (seshat-reader-current-doc-overlay window))
+	 (page (seshat-reader-current-doc-pagenumber window))
+	 (spec (and (overlayp overlay)
+		    (overlay-get overlay 'display))))
+    (when (and (integerp page) (consp spec))
+      (let ((cell (cons (cons page spec)
+			(assq-delete-all
+			 page seshat-reader--page-image-specs)))
+	    (tail nil))
+	(setq tail cell)
+	(dotimes (_ (1- seshat-reader--page-image-specs-limit))
+	  (when (cdr tail)
+	    (setq tail (cdr tail))))
+	(when (cdr tail)
+	  (setcdr tail nil))
+	(setq seshat-reader--page-image-specs cell)))))
+
+(defun seshat-reader--ensure-center-overlay ()
+  "Return the buffer-wide centering overlay, creating it if needed.
+
+The overlay is repositioned to cover the whole buffer on every call, so
+that it stays valid after the join strip is inserted or deleted."
+  (unless (and (overlayp seshat-reader--center-overlay)
+	       (eq (overlay-buffer seshat-reader--center-overlay)
+		   (current-buffer)))
+    (setq seshat-reader--center-overlay
+	  (make-overlay (point-min) (point-max))))
+  (move-overlay seshat-reader--center-overlay
+		(point-min) (point-max) (current-buffer))
+  seshat-reader--center-overlay)
+
+(defun seshat-reader--remove-join-strip ()
+  "Delete the cross-page join strip from the current buffer.
+
+The strip height is reset to 0, so the page height semantics fall back
+to the plain page image height."
+  (when (and (markerp seshat-reader--join-strip-end)
+	     (eq (marker-buffer seshat-reader--join-strip-end)
+		 (current-buffer)))
+    (let ((inhibit-read-only t))
+      (delete-region (point-min) seshat-reader--join-strip-end)))
+  (when (markerp seshat-reader--join-strip-end)
+    (set-marker seshat-reader--join-strip-end nil))
+  (setq seshat-reader--join-strip-end nil
+	seshat-reader--join-strip-height 0))
+
+(defun seshat-reader--insert-join-strip (spec height)
+  "Insert a strip of HEIGHT pixels cut from the bottom of image SPEC.
+
+SPEC is the image spec of the previous page.  The strip is inserted as a
+single line at the beginning of the current buffer and displays the
+bottom HEIGHT pixels of SPEC through a `slice' display specification.
+The newline ending the strip line carries a non-nil `line-height'
+property so that no extra leading is added below the strip."
+  (let* ((image-height (plist-get (cdr spec) :height))
+	 (image-width (plist-get (cdr spec) :width)))
+    (when (and (integerp image-height) (integerp image-width)
+	       (> image-height 0) (> image-width 0) (> height 0))
+      (let* ((strip-height (min height image-height))
+	     (start (point-min)))
+	(let ((inhibit-read-only t))
+	  (goto-char start)
+	  (insert " ")
+	  (put-text-property
+	   start (point) 'display
+	   (list (list 'slice 0 (- image-height strip-height)
+		       image-width strip-height)
+		 spec))
+	  (insert (propertize "\n" 'line-height t)))
+	(setq seshat-reader--join-strip-end (copy-marker (point))
+	      seshat-reader--join-strip-height strip-height)))))
+
+(defun seshat-reader--update-join-strip ()
+  "Redraw the cross-page join strip for the current buffer.
+
+The strip shows the bottom of the previous page above the current page,
+and is only drawn when the spec of the previous page is cached and
+`seshat-reader--page-join-pixels' is non-zero.  The function is
+idempotent: an existing strip is always removed before a new one is
+inserted."
+  (seshat-reader--remove-join-strip)
+  (let* ((page (seshat-reader-current-doc-pagenumber))
+	 (height (seshat-reader--page-join-pixels))
+	 (spec (and (integerp page) (> page 1)
+		    (alist-get (1- page) seshat-reader--page-image-specs))))
+    (when (and spec (> height 0))
+      (seshat-reader--insert-join-strip spec height))))
 
 ;; We need to do this because scrolling is possible in one direction
 ;; (downwards) indefinitely.
@@ -335,19 +509,92 @@ WINDOW must be a valid window and defaults to the selected one."
 If setting VSCROLL makes the document page's top disappear, it sets the
 maximum vertical scroll possible without doing that.
 
-If PIXELS-P is non-nil, VSCROLL is considered to be in pixels.
+If PIXELS-P is non-nil, VSCROLL is considered to be in pixels and is
+used as-is.
 Also see `set-window-vscroll'."
   (let* ((image-height (cdr (seshat-reader--get-current-doc-image-size window)))
 	 (pixel-window-height (window-body-height window t))
 	 (window-height (window-body-height window))
 	 (pixel-per-col (/ pixel-window-height window-height))
-	 (pixel-vscroll (* pixel-per-col vscroll))
-	 (max-pixel-vscroll (- image-height pixel-window-height))
+	 (pixel-vscroll (if pixels-p vscroll (* pixel-per-col vscroll)))
+	 (max-pixel-vscroll
+	  (max 0 (- (+ image-height (or seshat-reader--join-strip-height 0))
+		    pixel-window-height)))
 	 (corrected-pixel-vscroll (min pixel-vscroll max-pixel-vscroll))
 	 (corrected-vscroll (/ corrected-pixel-vscroll pixel-per-col)))
     (set-window-vscroll window
 			(if pixels-p corrected-pixel-vscroll corrected-vscroll)
 			pixels-p)))
+
+;;; Page landing points
+
+;; Cross-page joining shifts the vertical scroll origin: the join strip of
+;; the previous page occupies the first `seshat-reader--join-strip-height'
+;; pixels of the window.  The helpers below name the three landing points
+;; that every page turning and scaling command has to use.
+
+(defun seshat-reader--window-vscroll-pixels (&optional window)
+  "Return the vertical scroll of WINDOW in pixels.
+
+WINDOW defaults to the selected window.  Emacs reports the vertical
+scroll in lines unless the pixel argument is used, so every caller that
+works with the join strip goes through this function to keep a single
+unit across the code base."
+  (window-vscroll (or window (selected-window)) t))
+
+(defun seshat-reader--page-max-vscroll-pixels (&optional window)
+  "Return the maximum vertical scroll of WINDOW in pixels.
+
+The value is the page image height plus the join strip height minus the
+pixel body height of WINDOW, floored at 0.  WINDOW defaults to the
+selected window."
+  (let* ((window (or window (selected-window)))
+         (image-height
+          (or (cdr (seshat-reader--get-current-doc-image-size window)) 0))
+         (window-height (window-body-height window t)))
+    (max 0 (- (+ image-height (or seshat-reader--join-strip-height 0))
+              window-height))))
+
+(defun seshat-reader--at-page-top-p (&optional window)
+  "Return non-nil if the top of the page in WINDOW is visible.
+
+The join strip occupies the first `seshat-reader--join-strip-height'
+pixels of the window, so the page top counts as visible as soon as the
+vertical scroll does not exceed the strip height.  With the join feature
+disabled the strip height is 0 and the predicate degenerates to a plain
+zero scroll check.  WINDOW defaults to the selected window."
+  (<= (seshat-reader--window-vscroll-pixels window)
+      (or seshat-reader--join-strip-height 0)))
+
+(defun seshat-reader--set-page-top (&optional window)
+  "Scroll WINDOW so that the page top sits at the window top.
+
+The landing point is the join strip height: scrolling by exactly that
+amount hides the strip of the previous page and keeps the whole page
+visible.  WINDOW defaults to the selected window."
+  (seshat-reader--set-window-vscroll (or window (selected-window))
+                                     (or seshat-reader--join-strip-height 0)
+                                     t))
+
+(defun seshat-reader--set-page-top-when-joined (&optional window)
+  "Scroll WINDOW to the page top only when a join strip is displayed.
+
+Commands that never touched the vertical scroll before cross-page
+joining existed must stay inert when `seshat-reader-page-join-lines' is
+0, so that disabling the feature restores the previous behaviour
+exactly.  WINDOW defaults to the selected window."
+  (when (> (or seshat-reader--join-strip-height 0) 0)
+    (seshat-reader--set-page-top window)))
+
+(defun seshat-reader--set-page-bottom (&optional window)
+  "Scroll WINDOW so that the bottom of the page is visible.
+
+The landing point is `seshat-reader--page-max-vscroll-pixels', which
+shows the page bottom together with the strip of the next page.  WINDOW
+defaults to the selected window."
+  (let ((window (or window (selected-window))))
+    (seshat-reader--set-window-vscroll
+     window (seshat-reader--page-max-vscroll-pixels window) t)))
 
 ;; Most of the scrolling functions here exist because of our handling
 ;; of centering in `seshat-reader--center-page'.
@@ -355,11 +602,20 @@ Also see `set-window-vscroll'."
 (defun seshat-reader--get-prefix-width (&optional window)
   "Get the line prefix width set by `seshat-reader--center-page'.
 
+The width is read from the buffer-wide centering overlay.  Buffers that
+were centered before the join strip existed have no such overlay, in
+which case the window's document overlay is consulted instead.
+
 WINDOW must be a valid window and defaults to the selected one."
-  (car
-   (plist-get
-    (cdr (overlay-get (seshat-reader-current-doc-overlay window) 'line-prefix))
-    :width)))
+  (or (when (overlayp seshat-reader--center-overlay)
+	(car (plist-get
+	      (cdr (overlay-get seshat-reader--center-overlay 'line-prefix))
+	      :width)))
+      (car
+       (plist-get
+	(cdr (overlay-get (seshat-reader-current-doc-overlay window)
+			  'line-prefix))
+	:width))))
 
 (defun seshat-reader--right-most-window-hscroll (&optional window)
   "Get the maximum horizontal scroll value for WINDOW.
@@ -423,7 +679,11 @@ WINDOW must be a valid window and defaults to the selected one."
               (doc-center-offset (/ doc-left-offset 2))
               (scroll-offset (round (/ doc-center-offset pixel-per-col))))
     ;; Add prefix so that the page is at the leftmost point of the window.
-    (overlay-put overlay 'line-prefix overlay-offset)
+    ;; The prefix is carried by a buffer-wide overlay instead of the page
+    ;; overlay, so that the cross-page join strip line gets it as well.
+    (overlay-put overlay 'line-prefix nil)
+    (overlay-put (seshat-reader--ensure-center-overlay)
+		 'line-prefix overlay-offset)
     ;; scroll window back to the center of the doc
     (seshat-reader--set-window-hscroll window scroll-offset t)))
 
@@ -515,13 +775,14 @@ Only scrolls when the document page width is larger then the window width."
 AMOUNT defaults to 1."
   (interactive "p")
   (or amount (setq amount 1))
-  (when-let* (((and (= 0 (seshat-reader-scroll-up amount))
-		    (seshat-reader--non-queue-previous-page))) ; if succeeds
-	      (image-height (cdr (seshat-reader--get-current-doc-image-size)))
-	      (pixel-window-height (window-body-height nil t))
-	      (bottom-most-scroll-pixel
-	       (- image-height pixel-window-height)))
-    (seshat-reader--set-window-vscroll nil bottom-most-scroll-pixel t)))
+  (seshat-reader-scroll-up amount)
+  ;; The join strip makes "the top of the page is on screen" the boundary
+  ;; of a page, which `seshat-reader--at-page-top-p' detects even when the
+  ;; strip itself is still visible.
+  (when (and (seshat-reader--at-page-top-p)
+	     (seshat-reader--non-queue-previous-page)) ; if succeeds
+    ;; Bottom landing keeps the pages continuous when reading upwards.
+    (seshat-reader--set-page-bottom)))
 
 (define-queue-command scroll-down-or-next-page (&optional amount)
   "Scroll down the current page by AMOUNT, otherwise switch to the next page.
@@ -637,13 +898,15 @@ See also `seshat-reader-shrink-size'."
   "Rotate the current window's view by 90 degrees, clockwise."
   (interactive)
   (seshat-reader-dyn--rotate-page 90)
-  (seshat-reader--center-page))
+  (seshat-reader--center-page)
+  (seshat-reader--set-page-top-when-joined))
 
 (defun seshat-reader-rotate-counter-clockwise ()
   "Rotate the current window's view by 90 degrees, counter-clockwise."
   (interactive)
   (seshat-reader-dyn--rotate-page -90)
-  (seshat-reader--center-page))
+  (seshat-reader--center-page)
+  (seshat-reader--set-page-top-when-joined))
 
 (defun seshat-reader--clear-doc-memory ()
   "Clear document memory if we are in `seshat-reader-mode'.
@@ -709,7 +972,10 @@ Load the PAGE if provided."
 	  (seshat-reader-dyn--load-doc file p)
 	  ;; seshat-reader-dyn--load-doc resets the window state, which also
 	  ;; needs to be reflected in the frontend.
-	  (set-window-parameter nil 'scale 1.0)))
+	  (set-window-parameter nil 'scale 1.0)
+	  ;; The page images are rendered anew, so cached specs are stale.
+	  (setq seshat-reader--page-image-specs nil)
+	  (seshat-reader--update-join-strip)))
     (message "No file associated with buffer.")))
 
 ;; We have an overlay per window, since we (naturally) need to be able

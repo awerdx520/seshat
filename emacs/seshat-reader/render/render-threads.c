@@ -254,6 +254,48 @@ submit_render_job(DocState *doc_state,
 	args->cp        = cp;
 	args->dp        = dp;
 
+	/* Snapshot the highlights of this page into the job.
+	 *
+	 * DocState is documented as being usable by one thread at a time, and
+	 * the render threads run on a cloned ctx, so they must never walk
+	 * doc_state->highlights.  Taking a private copy here keeps the table
+	 * free to be mutated by the Emacs main thread while pages render.
+	 * A failed allocation is not fatal: the page simply renders without
+	 * highlights. */
+	Highlight *hl = NULL;
+	int hl_count = 0;
+
+	if (doc_state->highlights && doc_state->highlight_count > 0)
+		{
+			int page = dp->page_num;
+
+			for (int i = 0; i < doc_state->highlight_count; ++i)
+				if (doc_state->highlights[i].page == page)
+					++hl_count;
+
+			if (hl_count > 0)
+				{
+					hl = malloc((size_t)hl_count * sizeof(Highlight));
+					if (hl)
+						{
+							int j = 0;
+							for (int i = 0;
+							     i < doc_state->highlight_count;
+							     ++i)
+								if (doc_state->highlights[i].page
+								    == page)
+									hl[j++] =
+										doc_state
+											->highlights[i];
+						}
+					else
+						hl_count = 0;
+				}
+		}
+
+	args->hl = hl;
+	args->hl_count = hl_count;
+
 	pthread_mutex_lock(&cp->mutex);
 	cp->status = PAGE_STATUS_RENDERING;
 	pthread_mutex_unlock(&cp->mutex);

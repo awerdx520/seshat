@@ -66,12 +66,25 @@ EMACS = emacs --batch -Q --eval '(setq enable-dir-local-variables nil)' -L . -L 
 # ETAF 不 vendored 进本仓库（见 openspec/completed/2026-10-17-m11.9-etaf-render.md），
 # 只在本地存在时加入 load-path；不存在时 seshat-reader-etaf.el 不参与 .elc 编译
 # （运行期由接入点 `(require 'seshat-reader-etaf nil t)` 软加载并降级）。
-# 可用 `make ETAF_ROOT=/path/to/emacs-taf` 覆盖位置。
-ETAF_ROOT ?= $(HOME)/WorkSpace/emacs-taf
+# 可用 `make ETAF_ROOT=/path/to/emacs-taf` 覆盖位置；未显式给出时按下面的
+# 两级探测定位（源码树优先，straight.el build 目录兜底）。
+ETAF_ROOT ?= $(firstword $(wildcard $(HOME)/Workspace/emacs-taf \
+                                    $(HOME)/WorkSpace/emacs-taf))
+# straight.el 的 build 目录（本机 ETAF 只有这种形态：build 下是到
+# straight/repos 的软链与 .elc，没有完整源码树）。
+ETAF_STRAIGHT_BUILDS ?= $(wildcard $(HOME)/.emacs.d/straight/build-* \
+                                    $(HOME)/.config/emacs/straight/build-* \
+                                    $(HOME)/thomas-emacs/.local/straight/build-*)
 ETAF_LISP_DIRS := $(wildcard $(ETAF_ROOT)/ecss $(ETAF_ROOT)/ecss/lisp \
                               $(ETAF_ROOT)/ebox $(ETAF_ROOT)/ebox/lisp \
                               $(ETAF_ROOT)/etaf $(ETAF_ROOT)/etaf/lisp \
                               $(ETAF_ROOT)/etaf-ui $(ETAF_ROOT)/etaf-ui/lisp)
+ifeq ($(ETAF_LISP_DIRS),)
+  # 无源码树：回退 straight.el build 目录（取最后一个，仅统计真的含 etaf/ 的）
+  ETAF_STRAIGHT_DIRS := $(patsubst %/etaf,%,$(wildcard $(addsuffix /etaf,$(ETAF_STRAIGHT_BUILDS))))
+  ETAF_LISP_DIRS := $(foreach b,$(lastword $(ETAF_STRAIGHT_DIRS)),\
+                       $(wildcard $(addprefix $(b)/,etaf etaf-ui ecss ebox)))
+endif
 ifneq ($(ETAF_LISP_DIRS),)
   EMACS += $(foreach dir,$(ETAF_LISP_DIRS),-L $(dir))
 endif

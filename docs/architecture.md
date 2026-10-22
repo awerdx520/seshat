@@ -94,7 +94,7 @@ Emacs 阅读器（`seshat-reader`）的批注同步在客户端侧叠加一层**
 - **不做任何百分号转义**：不使用 `url-hexify-string`（它会把 `:`、`/` 一并转义，破坏 doc-id 可读性并切断与批注文档键（M7 起为 uid，展示与链接仍用 doc-id 文本）的复用），也不自造 `%23` 链路（org 自身会对 `%` 二次转义，双重转义无法自洽）；
 - 因此 **doc-id 不得包含 `#` 与 `%`**：构造链接时检测到这两个字符即 `user-error` 并提示重命名文件；非法链接解析返回 nil。
 
-**与批注 `location` 的同构关系**：批注的 `location` 形如 `page:<n>;rect:<x0>,<y0>,<x1>,<y1>`（页码 1-based、页面坐标），链接片段**直接复用同一字符串**，不新增解析器。批注列表的行携带该字符串（文本属性），故「批注 → 引用」取值不触网；`page:` 段直接传给 `seshat-reader-goto-page`，`rect:` 段当前仅做格式校验（无高亮承载）。
+**与批注 `location` 的同构关系**：批注的 `location` 形如 `page:<n>;rect:<x0>,<y0>,<x1>,<y1>`（页码 1-based、页面坐标），链接片段**直接复用同一字符串**，不新增解析器。批注列表的行携带该字符串（文本属性），故「批注 → 引用」取值不触网；`page:` 段直接传给 `seshat-reader-goto-page`，`rect:` 段在 M11 只做数据保留，自 M12 起在 Emacs 客户端渲染为页面半透明高亮（见「Emacs 阅读器：展示层与渲染层（M12）」节）；`ink:` 段仍不渲染。
 
 **双形态（M7 起）**：`<target>` 可以是 **uid**（服务端权威身份，如 `seshat:01J8ZK4Q7M2X9VYB3TR6NDW5PC#page:3`）或 **doc-id 文本**（`tag:path` 或纯 path，人可读、可手写）。服务端解析优先级为 **uid → `tag:path` → 纯 path（默认根）**（`registry.Resolve`）：uid 形态跨改名稳定，doc-id 形态在改名后失效，需重新构造。含 `#`/`%` 的非法 target 仍按上述规则拒绝。
 
@@ -108,10 +108,10 @@ Emacs 阅读器（`seshat-reader`）的批注同步在客户端侧叠加一层**
 
 **承载层 `seshat-reader-sidebar`（零依赖）**：
 
-- **pop 式底部弹出**：`seshat-reader-sidebar-position` 取 `below-selected`（当前窗口下方分割，形如 `*Help*`）或 `at-bottom`（frame 底部整宽）。同一时刻只有一个面板窗口，批注与译文**后显示者接管**。
+- **弹出位置（M11 语义，M12 已扩展）**：`seshat-reader-sidebar-position` 取 `below-selected`（当前窗口下方分割，形如 `*Help*`）或 `at-bottom`（frame 底部整宽）；M12 新增 `left` / `right` 两个 side window 取值并把默认改为 `right`，批注与译文改为 per-kind 独立窗口并存，详见下节「Emacs 阅读器：展示层与渲染层（M12）」。M11 语义下同一时刻只有一个面板窗口，批注与译文**后显示者接管**。
 - **必须经 `display-buffer`**：首次显示、gt 的 `:window-config`、popper 重开三条路径都走 `display-buffer`，以保证**幂等**（同 buffer 同 kind 重复显示只复用窗口、不重建）；面板参数由 `seshat-reader-sidebar--display-params` **单一来源**生成。
 - **`display-buffer-overriding-action`**：显示时用它包住 action list，使本包布局优先于 popper 在 `display-buffer-alist` 表头插入的规则；popper 重开（裸 `display-buffer`）时改由 `seshat-reader-sidebar-display-buffer` 分流回本包逻辑，故两条路径布局一致。
-- **per-kind 高度记忆**：`seshat-reader-sidebar--state` 为内存 alist（零依赖）；切换内容前先捕获当前窗口高度（比例）存给其 kind，再用目标 kind 记住的高度新建窗口。仅会话内有效，不持久化。
+- **per-kind 尺寸记忆**：`seshat-reader-sidebar--state` 为内存 alist（零依赖）；切换内容前先捕获当前窗口尺寸（比例）存给其 kind，再用目标 kind 记住的尺寸新建窗口；M12 起记忆项带**方向标签**（宽度语义 / 高度语义），方位在宽/高之间切换时不复用旧值。仅会话内有效，不持久化。
 - **禁用 `window-toggle-side-windows`**：它是 frame 级全量开关（会连带删除/恢复 eca-chat、which-key 的侧窗），toggle 只对本包面板窗口做 `delete-window`。
 
 **渲染层 `seshat-reader-etaf`（可选，依赖 `etaf-ui`；只负责批注卡片）**：
@@ -141,6 +141,45 @@ Emacs 阅读器（`seshat-reader`）的批注同步在客户端侧叠加一层**
 - 译文/解释：`seshat-reader-translate--render-panel` 的 Markdown 文本 buffer 路径（见上一小节）；只有 `seshat-reader-translate-render` 取 `pop` / `pin`（或禁用面板）时回退 posframe，由 gt 的 `gt-posframe-pop-render` / `gt-posframe-pin-render` 承载。
 
 **数据流**：`seshat-reader-annotation--refresh-list`（拉服务端批注 + 读本地队列）→ items（服务端项在前、本地待同步项在后；本地项以 `:uuid` 标识、无 `:id`）→ **全量条目**（不分页、不切片）→ 渲染层（ETAF 卡片或文本兜底；ETAF 按条目数显式计算 viewport 高度、条目增多时 `etaf-runtime-refit`）→ `seshat-reader-sidebar-show` → `display-buffer`（参数单一来源、幂等、可选光标跟随）；译文/解释的数据流为 gt → 隐藏中转 buffer → `:then` 回调 → `seshat-reader-translate--render-panel` → 同一 `sidebar-show`。
+
+## Emacs 阅读器：展示层与渲染层（M12）
+
+M12 把 M11 的「单个底部面板」升级为「左目录 / 右信息 / 中阅读」三栏，并把批注高亮下沉到 C 渲染层。展示层归 elisp（`seshat-reader-sidebar` / `seshat-reader-outline`），渲染层归 `render-core.c`。
+
+**三分栏版式**：
+
+- **用 `display-buffer-in-side-window` 而非自建 `split-window`**：显示参数为 `(side . left|right)` + `(slot . N)`。自建 `split-window` 每显示一次就重新切分主窗口，多开几次会把阅读区**逐次挤压**，关闭时又不自动回收；side window 由 Emacs 维护独立的窗口树，同侧不同 slot 互不顶替，故目录与批注可同时存在，阅读区尺寸只受两侧宽度影响。
+- **per-kind 方位映射**：kind `outline` → `left`（`seshat-reader-outline-sidebar-position`，默认 `left`），kind `annotations` / `translate` → `right`（`seshat-reader-sidebar-position`，默认 `right`）；方位由单一判据 `seshat-reader-sidebar--position-for-kind` 解析，side / slot / 尺寸默认值全部由它派生。slot 由 `seshat-reader-sidebar--slot-for-kind` 按稳定 kind 顺序分配（同一 kind 恒定同 slot，显示/关闭一个 kind 不会顶掉其它 kind 的窗口）；slot 数量上限受 `window-sides-slots` 约束，超出会被 `display-buffer-in-side-window` 拒绝而回落为普通窗口。
+- **尺寸语义方向化**：side 模式是**宽度**语义（`seshat-reader-sidebar-width` / `seshat-reader-outline-sidebar-width`，小数按 frame 根窗口总宽比例换算列数、整数直接作列数）；底部模式（`below-selected` / `at-bottom`）是**高度**语义（`seshat-reader-sidebar-height` 与 min/max）。per-kind 尺寸记忆因此带**方向标签**——方位在宽/高之间切换后，旧值不会按错误单位复用。
+
+**目录面板**：
+
+- **纯函数行模型**：`seshat-reader-outline--rows`（按 **DFS 前序**摊平成行列表，入参为树、折叠态集合、当前页）与 `--current-path`（按当前页求根→叶路径）。折叠态用**行路径**（自根到该节点的标题列表）而非标题字符串，以免同名节点互相折叠；折叠节点自身仍出行、其子树不出行。
+- **渲染规则**：行首保留 outline 星号（去掉会令 `outline-regexp` 失配、TAB 折叠失效）→ 每级 2 空格缩进 → `▾`/`▸` 折叠符号（无子节点用 2 空格占位对齐）→ 标题按钮 → 弹性空白 `display` 属性把页码推向右缘 → 按深度取三级 face；当前章另用 `line-prefix` 画竖线（`line-prefix` 只是显示属性、不进 buffer 文本，故不破坏 outline 结构）。
+- **avy 风格跳转**：`f` 触发 `seshat-reader-outline-avy-jump`，候选为可见区带页号属性的按钮，标签由 overlay `before-string` 承载（不写 buffer 文本），`read-key` 逐键匹配，`unwind-protect` 清理标签。**零新增依赖**：不 `require` avy，只在 `avy-keys` 已绑定时复用自己的字符表，未加载时用内置表。
+
+**批注高亮（渲染层）**：
+
+- **为何必须改 C**：elisp 层无法在已有页面 image 上叠加半透明矩形——同一区域的 `display` 属性**互斥**（一处只有一份 `display` 规格生效），image 规格里也没有「第二个矩形」这一层。既有两个证据：M11.2b 计划记录（`openspec/completed/2026-10-12-m11.2b-reader-selection.md:25`）与 `seshat-reader-select.el` 的选区实现注释（只做文本属性、不做矩形绘制）。因此高亮在 `draw_page_thread` 内绘制。
+- **绘制点**：在 `fz_invert_pixmap_luminance` / `fz_gamma_pixmap` **之后**、写 PNM **之前**。反色与 gamma 是整页像素变换，若在高亮之后做会连高亮一起反色；写 PNM 之后再画则进不了缓存位图，翻页回来高亮消失。
+- **`ctm` 复用**：直接复用该页 rasterize 用的同一个 `fz_transform_page(dp->bbox, resolution, rotate)`，因此缩放与旋转自动对齐，不必另算变换；`rect_to_page_space` 是「Emacs rect → MuPDF 页面空间」的**唯一**换算点（被 `--text-in-rect` 与绘制共用）。
+- **线程安全**：高亮表在派发时**快照**进 `DrawThreadArgs`（容量倍增表，每条退出路径释放），渲染线程不碰 `DocState`；elisp 侧只改表并置 `highlights_dirty` 标志。
+- **`--refresh-highlights` 的重绘序列**：非 dirty 直接返回 `t`；dirty 时 `wait_for_win_jobs` → `nullify_window_cache` → `build_cache_window` → `wait_for_cached_page` → `display_cached_page`（与 `seshat-reader-dyn-redisplay-doc` 同形），故不另建渲染管线、也不与既有缓存失效逻辑分叉。
+
+**跨页衔接**：
+
+- **buffer 结构**：`[strip 行]` + `[页面 image]`。strip 是上一页底部若干像素，由页面 image spec 上的 `:slice` 裁出——`:slice` 是 **`display` 属性的包装**（`(slice X Y W H)` 与 image 同处一份 `display` 规格），不是 image 关键字，故不能当作 image plist 的键使用。
+- **起点对齐**：`line-prefix` 必须由 **buffer 级 overlay** 承载（`seshat-reader--center-overlay` 覆盖整个可访问区）。若只用行内属性，strip 行与页面 image 行的前缀不一致，横向居中会差出一个前缀宽度（实测 84 px）。
+- **三态落点**：向下翻页 = 「上页末行可见 + 新页顶部紧接」；向上翻页 = 落到上一页底部；`fit-to-height` 等整页操作是第三态（整页适配，不叠加 strip 偏移）。三者分别处理，不共用同一 vscroll 公式。
+
+**防御上限**（针对不可信输入，全部在实现侧硬夹紧）：
+
+| 对象 | 上限 | 越界行为 |
+|---|---|---|
+| 高亮条数 | 100000（`HIGHLIGHT_MAX_COUNT`） | 静默返回 nil，不覆盖已有条目 |
+| 高亮坐标 | ±1e6 点（`HIGHLIGHT_MAX_ABS_COORD`） | 判非法、不进表（`--text-in-rect` 同受此限） |
+| outline 标题 | 8192 字节（`OUTLINE_TITLE_MAX`） | 截断，不中断开书 |
+| 批注 `location` | 64 KB、至多 2000 段 `rect:` | 超限不解析，不影响列表渲染 |
 
 ## 数据流
 

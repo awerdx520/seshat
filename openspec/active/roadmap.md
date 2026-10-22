@@ -1,4 +1,4 @@
-# Seshat 路线图（M7–M11）：资源 ID · 引用 · 增量同步
+# Seshat 路线图（M7–M12）：资源 ID · 引用 · 增量同步
 
 ## 当前状态
 
@@ -8,7 +8,7 @@
 - 下一步：M8（Emacs 端接入）需另行方案确认与计划确认
 - 2026-10-19 进展：**M10.7 真机验收通过并归档**（七项全过；同步修 2 处缺陷：渲染页 toolbar 标题不随内容更新、笔记列表不读 `#+FILETAGS:`；新增 5 条 tech-debt，单测 562 → 566）；M9.1 / M9.2（设置项·连续滚动）/ M10.5（手写·点击翻页·横屏）/ M10.6-B1（服务端可选）已完成并归档；M10.6-B2（阅读器交互：浮层显隐·SeekBar·目录）、M10.6-B3（书架：封面网格·进度徽标·过滤排序·点击打开）、M10.6-B4（Notes：树列表·搜索·编辑页·GTD 并入 + `NotesSync` 抽取与数据源统一）代码/单测/文档完成（**真机验证通过**，2026-10-18/19，见 openspec/completed/2026-10-18-m10.6-reader-books-notes-alignment.md「B1~B4 全部完成（真机全通过）」）；M9.2 B 批（文件同步：接入 `ResourceIndex`/`SyncEngine`、服务端书架数据源、按需下载、本地导入上传（≤32 MiB）、元数据回填、`move` 跟随）代码/单测/文档完成（2026-10-19，真机验证通过，单测 566 → 641）；M7 服务端已完成（待提交）
 - 2026-10-20 进展：**M10.8（阅读器 UX 重排与手写增强，7 项需求）与 M10.9（目录树形左侧抽屉）均已实现并归档**（代码已提交 `e50a23a` / `8c14494` / `0361faf` / `bb759f1` / `9e7ffd8` / `cd55316` / `c4a76d3`；单测 649 → **721** → **754**，含 1 例 skipped），**✅ 真机验证通过（2026-10-20，设备 24091RPADC / Android 16，EPUB 与 PDF 两个阅读器）**；`c4a76d3` 追加两项：进入阅读默认沉浸、手写参数面板移到屏幕右侧竖排浮条；文档已同步 `docs/android.md` §6 / `CHANGELOG.md` / `openspec/decisions.md` / `openspec/tech-debt.md`（新增 4 条未通过项）；破例引入 `com.tom-roush:pdfbox-android:2.0.27.0`（用户 2026-10-20 授权的唯一例外，见 decisions.md）
-- 下一步：**M10.10（待定）**（M10.6 B2/B3/B4、M9.2 B 批、M10.8、M10.9 均已验收通过并归档）
+- 下一步：**M12 已完成并归档（openspec/completed/2026-10-22-m12-reader-ux-layout-and-highlight.md，残余视觉项待用户目视）；下一个里程碑待定**（M10.6 B2/B3/B4、M9.2 B 批、M10.8、M10.9 均已验收通过并归档）
 - 未决问题（阻塞后续里程碑，不阻塞本文件）：收录目录清单、GTD 深度、Reader 功能清单、EPUB location 约定
 
 ## 背景与起点
@@ -63,6 +63,7 @@ M0–M6 已完成并归档，见 `openspec/completed/personal-notes-system.md`�
 | M9 | Android 三区 UI 重构 + Notes/GTD | M7 | 大 | 中 |
 | M10 | Android Reader（书架 + 阅读增强 + 批注侧车） | M7、M9 | 中 | 中 |
 | M11 | 批注与引用闭环（Emacs 阅读批注 + 双向引用） | M8、M10 | 中 | 高（需改 emacs-reader） |
+| M12 | Emacs 阅读器：三分栏版式 · 目录导航 · 批注高亮 · 跨页衔接 · 引用闭环 | M11 | 中 | 中（需改 C 渲染器） |
 
 **关键路径**：`M7 → M8 → M11`；`M7 → M9 → M10` 可与 M8 并行。
 
@@ -135,6 +136,33 @@ M0–M6 已完成并归档，见 `openspec/completed/personal-notes-system.md`�
 | M11.12 | 译文/解释面板模板拆分、去正文重复标题、原文默认显示 | ✅ 完成（2026-10-18）；见 openspec/completed/2026-10-18-reader-panel-template-split.md |
 | M11.13 | 批注列表去分页，改单列连续流（全量渲染 + 按内容设置 ETAF viewport 高度） | ✅ 完成（2026-10-18）；见 openspec/completed/2026-10-18-annotation-list-continuous-flow.md |
 | M11.14 | 译文/解释面板启用 visual-fill-column-mode（软依赖、可关） | ✅ 完成（2026-10-18）；见 openspec/completed/2026-10-18-reader-panel-visual-fill-column.md |
+
+### M12 Emacs 阅读器（已完成）
+
+**已完成 2026-10-22**，见 `openspec/completed/2026-10-22-m12-reader-ux-layout-and-highlight.md`。
+
+| 子项 | 内容 | 状态 |
+|---|---|---|
+| T1 | 修复目录中文乱码（`outline2plist` 的 outline 标题 UTF-8 安全构造，目录与 imenu 同口径） | ✅ 2026-10-22 |
+| T2 | sidebar 支持 left/right side window（`seshat-reader-sidebar--display-params` 按方向返回 `display-buffer-in-side-window`、宽度 defcustom、方向感知尺寸读写） | ✅ 2026-10-22 |
+| T3 | per-kind 多面板共存（kind→窗口映射、`seshat-reader-sidebar--slot-for-kind` 分槽、`toggle` 可选 kind、`C-c C-o` 键位） | ✅ 2026-10-22 |
+| T4 | 目录面板接入 sidebar + 每次 show 都重建（修「buffer 非空不重建」） | ✅ 2026-10-22 |
+| T5 | 目录面板美化（行模型纯函数 `seshat-reader-outline--rows`：层级缩进 / 折叠符号 / 页码右对齐 / 三级 face / 当前章竖线） | ✅ 2026-10-22 |
+| T6 | avy 式跳转（`f` 键、实读 avy 源码后选择零依赖自实现、overlay 标签 + `read-key` 逐键匹配） | ✅ 2026-10-22 |
+| T7 | 跨页衔接 PoC（`:slice` + 行高 + `:ascent` + vscroll 定位 + `--center-page` 兼容性三条判据） | ✅ 2026-10-22 |
+| T8 | 跨页保留上页末行（strip 行 + 翻页 vscroll 定位、书签 vscroll 语义、`--at-page-top-p` 谓词、关闭开关等价性） | ✅ 2026-10-22（T8a/T8b） |
+| T9 | C 层 rect 高亮绘制（`DocState` 高亮表 + 渲染线程快照 + `draw_page_thread` 绘制 + 三个模块函数 + 缓存失效） | ✅ 2026-10-22 |
+| T10 | elisp 侧高亮同步（`--rects-from-location` + `--apply-highlights` + 开关 + `C-c C-h` 刷新命令 + 两处零新增请求挂接点） | ✅ 2026-10-22 |
+| T11 | `seshat:` 链接 `:complete`（候选来自 annotation-roots 的文件清单，可选 `#page:<n>`） | ✅ 2026-10-22 |
+| T12 | `seshat:` 链接 `:export`（输出「文件名 第 N 页」可读文本，不生成假 URL） | ✅ 2026-10-22 |
+| T13 | 摘录按位置插入（`seshat-reader-reference-insert-position`：`end-of-file` / `headline` / `point`） | ✅ 2026-10-22 |
+| T14 | `--parse-link` 尾部 `#` 的空 location 归一为 nil | ✅ 2026-10-22 |
+| T15 | 文档沉淀（CHANGELOG / architecture / configuration / api / decisions / tech-debt / VENDORED / roadmap） | ✅ 2026-10-22 |
+| T16 | 全量验证与归档（`make clean all` + 全部 ERT 无 skipped + L3 验收清单，计划移入 `openspec/completed/`） | ✅ 2026-10-22 |
+
+配套决策见 `openspec/decisions.md` 的两条 2026-10-22 条目（side window 三分栏、C 层高亮绘制）；已知限制见 `openspec/tech-debt.md` 的 M12 条目（旋转页高亮可能错位、`ink:` 仍不显示、高亮颜色不可配置、多窗口 strip 缓存局限等）。
+
+**状态：✅ 已完成并归档（2026-10-22）**；L1/L2 全绿（271 用例 0 unexpected / 0 skipped），L3 功能级经隔离实例验证 46 条断言全过；残余视觉项（高亮绘制观感、三栏布局、配色）待用户目视，不阻塞归档
 
 ## 风险登记
 

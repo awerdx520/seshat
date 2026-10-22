@@ -58,6 +58,14 @@
 - Android 手写笔型、手写面板与双击/长按（M10.8，2026-10-20）：① `InkStyle { PEN, MARKER, HIGHLIGHTER }`（`@Serializable`），`InkStroke` 新增 `style` 字段默认 `PEN`——旧 JSON 零迁移；`PdfInkStore.defaultJson()` 加 `coerceInputValues = true`，未知笔型回退默认值而非整份丢弃。② 渲染线宽倍率 1× / 2.2× / 3.5×、不透明度 255 / 170 / 90（`Paint.setColor` 后必须再设 `setAlpha`，否则颜色自带 alpha 覆盖笔型不透明度）。③ 手写面板（PDF 顶部浮层内 `inkPanel`，仅手写模式显示）6 色 × 3 档粗细（归一化 0.0025 / 0.004 / 0.007）× 3 种笔型，选中态 alpha 1.0 / 0.35，分「颜色 / 粗细 / 笔型」三行避免 360dp 屏溢出。④ 双击阅读区进入 / 退出手写，长按弹菜单（复制本页文字 / 高亮标注 / 进入手写），手写模式下单击不翻页（落笔优先）；「复制本页文字」用 `PDFTextStripper` 提取当前页，写剪贴板前截断到 10 万字符（防 binder 事务超限）。
 - Android 目录树形左侧抽屉（M10.9，2026-10-20）：目录从 `AlertDialog` 扁平列表改为**左侧滑出的树形抽屉**。① **解析层**——新增 `TocNode` 与 `EpubParser.parseNavTree(navXml, baseDir)` / `parseNcxTree(ncxXml, baseDir)`，保留 `<ol><li>` 与 `<navPoint>` 嵌套；`TocNode.href` 是**已归一化的 epub 根相对路径**（用 nav/ncx **文档自身所在目录**作 base，nav 在子目录时也正确）；只有子项、自身无链接的容器节点 `title = ""` / `href = null`；`EpubBook.tocTree` 与既有扁平 `chapters` 并存，`parseNav` / `parseNcx` **一行未改**（仍服务章节标题匹配与分页），nav 解析为空时仍回退 NCX。② **行模型（纯函数）**——`TocRows`（`forEpub` / `forEpubFlat` / `forPdf`，树 → DFS 前序行并保留 depth）与 `TocFlatten.visibleRows`（按展开集合算可见行，单遍「可见深度上限」扫描，不重建树）；`TocRow.id` 用 **DFS 兄弟序号路径**（如 `"0/2/1"`），容器节点（`href` 为 null）与「同文件不同锚点」都不会撞车，祖先 id 即其各级前缀。③ **抽屉组件**——新增 `TocDrawer`（遮罩 + 面板 + `translationX` 动画，面板宽 `min(320dp, 屏宽 × 0.78)`）与 `TocAdapter`（行视图代码构建，缩进 `depth × 16dp`，箭头 `▸/▾`），全部视图代码构建、**零新增 XML / 零 `R.id.` 引用**，**不用 `DrawerLayout`**（其边缘横向手势会与横向翻页抢事件）；打开时自动展开当前章/页的祖先链并滚动到该项，点箭头折叠、点标题跳转，`targetIndex = -1` 的容器行点击只切折叠（不跳第一页），返回键优先关闭抽屉，收起工具栏时一并收起；抽屉是**覆盖层**，开合**不触碰**阅读区 padding。④ **PDF 回退**——无书签时 `PdfOutlineReader.pageDirectory(pageCount)` 的「第 N 页」列表转成同构树节点，复用同一行模型。新增 JVM 单测 33 例（`EpubParserTest` 14 / `TocRowsTest` 11 / `TocFlattenTest` 8），单测总数 721 → **754**。**零新增依赖；UI 观感与手势冲突需真机验收（设备离线，尚未验证）。**
 
+- Emacs 阅读器**三分栏版式**（M12）：`seshat-reader-sidebar-position` 新增 `left` / `right` 两个取值（`display-buffer-in-side-window` + 独立 slot），侧栏与阅读区互不挤压；目录面板占左侧、批注/译文面板占右侧，三栏可同时存在（per-kind 独立窗口）；`C-c C-o` 收起/展开左侧目录。
+- 阅读器**目录面板重做**（M12）：接入统一承载层（不再 `pop-to-buffer` 抢窗口）、切换文档后自动重建内容（修「换书后目录不更新」）、层级缩进 + `▾`/`▸` 折叠符号 + 页码右对齐 + 三级 face + 当前章节高亮（`line-prefix` 竖线）、`f` 触发 avy 风格单键跳转（零新增依赖，字符表复用 `avy-keys`）。
+- 阅读器**批注页面高亮**（M12）：页面渲染时按 `page:<n>;rect:...` 在页面上绘制半透明高亮，与页面共用同一 `ctm` 故缩放/旋转自动对齐；`C-c C-h` 手动刷新；新增开关 `seshat-reader-annotation-highlight-enabled`。
+- 阅读器**跨页衔接**（M12）：翻页时保留上一页最后一行作为上下文（新增 `seshat-reader-page-join-lines`，默认 1，设 0 关闭）；向下翻页落点为「上页末行可见 + 新页顶部紧接」，向上翻页落点为上一页底部，与 `fit-to-height` 等整页操作分别处理。
+- `seshat:` 链接**补全与导出**（M12）：注册 `:complete`（候选来自 `seshat-reader-annotation-roots` 下的书库文件，当前文档优先）与 `:export`（导出为「文件名 第 N 页」可读文本，不输出裸协议串）。
+- 摘录**按位置插入**（M12）：新增 `seshat-reader-reference-insert-position`（`end-of-file` / `headline` / `point`），默认仍是文件末尾；`headline` 模式插到光标所在 headline 子树末尾（`featurep 'org` 且 `derived-mode-p 'org-mode` 双守卫）。
+- 阅读器 C 模块**三个高亮导出函数**（M12）：`seshat-reader-dyn--add-highlight` / `--clear-highlights` / `--refresh-highlights`。
+
 ### 变更
 
 - 状态端点改以 uid 为键（M7，B4）：`GET|PUT /api/progress/{uid}`、`GET /api/annotations?uid=`，批注写入按 uid 关联；`reading_progress` / `annotations` 在 v7 迁移中重建（`DROP` + 按 uid 新建，见「破坏性」）。
@@ -85,7 +93,13 @@
 - 阅读器**进入即沉浸**（Android，M10.9 追加，`c4a76d3`，2026-10-20）：打开 EPUB / PDF 阅读器时默认隐藏顶部与底部两块浮层，阅读区铺满全屏（上下 padding 为 0）；点屏幕中央调出浮层、再点收起，退出阅读用系统返回键。仅隐藏应用内浮层，**系统状态栏仍可见**（未做系统栏 immersive）。实测（`24091RPADC` / Android 16）：进入时 `uiautomator dump` 无任何工具栏文本、WebView bounds `[0,0][3200,2136]`、无满宽暗带；点中央后顶栏 `0..240`、底栏 `1931..2107`、WebView 变 `[0,241][3200,2136]`；连续 4 次显隐 WebView top 在 `241 ↔ 0` 之间无漂移。
 - 手写参数面板改为**屏幕右侧竖排浮动条**（Android，M10.9 追加，`c4a76d3`，2026-10-20）：原横排在 PDF 顶部浮层内的「颜色 / 粗细 / 笔型」三行 `inkPanel` 改为右侧竖排浮条（宽 96dp，`end|center_vertical`），仅手写模式显示，自上而下为 `✕`（退出手写）/ 撤销 / 清空 / 6 色 / 3 档粗细 / 3 种笔型；面板不属于顶部浮层，不影响顶部栏高度与阅读区 padding。实测面板 bounds `[2936,520][3200,1615]`（264px = 96dp × 2.75，纵向居中），点 `✕` 后手写控件全部消失。**已知**：该条覆盖正文右缘 264px（手写模式下不可书写，未做右侧留白），退出手写后首次单击不弹工具栏，见 `openspec/tech-debt.md`。
 
+- 阅读器目录面板不再用 `pop-to-buffer`（M12），改由 `seshat-reader-sidebar-show` 承载，受 `seshat-reader-sidebar-enabled` / `-position` 管辖。
+- `seshat-reader--set-window-vscroll` 的像素路径不再对已按像素传入的值再乘一次 `pixel-per-col`（M12；此前仅因 clamp 而「看起来正确」）。
+- 阅读器翻页/跳页命令现在会显式设置纵向落点（M12）：此前部分命令不改 vscroll，依赖 C 侧重置。
+
 ### 破坏性
+
+- **`seshat-reader-sidebar-position` 默认值由 `below-selected` 改为 `right`**（M12，破坏性变更）：升级后批注/译文面板出现在右侧而非底部。恢复旧观感：在配置中设 `(setq seshat-reader-sidebar-position 'below-selected)`；`left` / `right` 为新增取值，`below-selected` / `at-bottom` 仍然可用。
 
 - **状态 API 不再接受 `document_id`**（M7）：改用 uid——形态非法返回 `400 invalid_uid`，uid 未登记或已墓碑返回 `404 unknown_uid`。服务端尚未部署、无存量数据，故 v7 迁移直接 `DROP` 重建 `reading_progress` / `annotations`；迁移前 `preMigrationChecks[7]` 对两表做 `COUNT(*)` 防御，任一非空即中止（整条迁移回滚、`user_version` 保持 v6）。
 - **Emacs 客户端必须同步升级**（M7）：旧客户端仍发 `document_id`，批注/阅读进度不再可用；升级后 `uid` 经 `GET /api/resolve` 首次解析并缓存。Android 端的 uid 适配留待后续里程碑。
@@ -114,6 +128,12 @@
 - 修复笔记列表只显示 denote 文件名里的标签、忽略 org `#+FILETAGS:`（M10.7 真机验收，2026-10-19）：`sample.org` 带 `#+FILETAGS: :notes:` 但列表行 meta 只有 `ORG · 时间`。`NoteScanner` 新增 `fileTags(text)`（行首匹配 `#+FILETAGS:`，允许前导空白与大小写差异，去首尾 `:` 后按 `:` 分割并过滤空串），标签合并改为「denote 文件名标签优先，denote 缺失或为空时回退 FILETAGS」。**IO 影响**：只在「denote 未命中」（原本就要读内容找 heading）或「denote 命中但无标签」（新增的一次读取）时读文件，有标签的 denote 文件仍然零读取；SAF 外部目录同理。新增 4 例单测（`fileTags` 三例 + 「denote 无标签回退 FILETAGS」一例），单测 562 → 566。
 - 修复阅读器浮层隐藏后底部仍留白（Android，M10.8，2026-10-20）：M10.6 B2 的 `applyChromePadding()` 是**一次性**的（只在高度变化时把浮层高度写进阅读区 padding），`toggleChrome()` 只切可见性、**不回收** padding，沉浸阅读时底部恒留一条与浮层等高的空白。现改为两侧各一个 `applyContentPadding()`，按「浮层是否 `VISIBLE` + 当前 height」实时计算上下 padding（隐藏即归零），配 `appliedTopPadding` / `appliedBottomPadding`（EPUB 另加 `appliedContent`）幂等闸只在值真变时才写，避免 `setPadding` → 重布局打断滚动锚点；布局监听改为常驻，字体缩放 / 旋转 / insets 变化都会重算。EPUB 侧在 padding 变化后主动 `reportVisibleChapter()`（padding 变化不派发 `onScrolled`，不重算会让持久化的章内偏移漂移）。
 - 修复 EPUB2 旧书无封面（Android，M10.8，2026-10-20）：原封面只认 EPUB3 `properties="cover-image"`，`<meta name="cover">` 不识别，存量 EPUB2 在书架上只剩灰占位。现 `EpubParser.pickCoverHref` 三级回退（EPUB3 → EPUB2 `<meta name="cover">` → manifest 首个 `image/*`），仍无封面时卡片叠书名首字占位。详见 `docs/android.md` §6.5。
+
+- 修复阅读器**目录中文标题显示为 `\346\226\207` 八进制转义**（M12）：C 侧 outline 标题改用 `decode-coding-string 'utf-8` 解码（非法字节保留 raw byte、不中断开书），imenu 路径同步修复。
+- 修复阅读器**目录面板切换文档后内容不刷新**（M12）：改为每次显示都按当前文档重建，且先校验再重建（无目录时不清空已有内容）。
+- 修复 `seshat-reader-dyn--text-in-rect` / `--add-highlight` 对**逆序角点**（如 `x0 > x1`）的误拒（M12）：`fz_is_valid_rect` 要求 `x0 <= x1`，原实现在归一化之前校验；现改为先归一化再校验。
+- 修复 C 模块**换文档/关文档时泄漏整份 `DocPage` 数组与每页 mutex**（M12）：`free_doc_pages` 此前零调用点，现接入 `free_doc_state`（在 drop MuPDF 上下文之前）。
+- 修复 `seshat:` 链接对**尾部裸 `#`** 解析出空串 location（M12）：现归一为 `nil`。
 
 ## [0.2.0] - 2026-10-12
 

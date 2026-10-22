@@ -43,6 +43,13 @@
 (require 'cl-lib)
 (require 'seshat-reader-annotation-queue)
 
+(defconst seshat-reader-annotation-queue-test--temp-root
+  (file-name-as-directory (if (file-directory-p "/tmp") "/tmp"
+                            temporary-file-directory))
+  "测试临时目录的根：优先系统 /tmp.
+`temporary-file-directory' 会跟随 `TMPDIR'，而本机 `TMPDIR' 可能被设为
+仓库根（ECA 客户端所为），那时 `make-temp-file' 会把测试目录建进工作树。")
+
 ;; 模块加载时会依 `-auto-sync' 自动启用定时器，这里立即关闭。
 (seshat-reader-annotation-queue-disable-timer)
 
@@ -110,7 +117,9 @@ FN 接收一个 document-id 参数并作为拉取结果返回。"
 临时目录在 BODY-FORMS 结束后递归删除，避免写入用户真实队列文件。"
   (declare (indent 1) (debug t))
   `(let* ((seshat-reader-annotation-queue-test--dir
-           (make-temp-file "seshat-queue-test" t))
+           (let ((temporary-file-directory
+                  seshat-reader-annotation-queue-test--temp-root))
+             (make-temp-file "seshat-queue-test" t)))
           (,var (expand-file-name "annotation-queue.eld"
                                   seshat-reader-annotation-queue-test--dir))
           (seshat-reader-annotation-queue-file ,var))
@@ -123,8 +132,10 @@ FN 接收一个 document-id 参数并作为拉取结果返回。"
   "在临时目录中求值 BODY-FORMS，并把带末尾斜杠的目录名绑定到 VAR.
 临时目录在 BODY-FORMS 结束后递归删除。"
   (declare (indent 1) (debug t))
-  `(let ((,var (file-name-as-directory
-                (make-temp-file "seshat-queue-test-dir" t))))
+  `(let ((,var (let ((temporary-file-directory
+                      seshat-reader-annotation-queue-test--temp-root))
+                 (file-name-as-directory
+                  (make-temp-file "seshat-queue-test-dir" t)))))
      (unwind-protect
          (progn ,@body-forms)
        (when (file-directory-p ,var)

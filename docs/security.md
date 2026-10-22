@@ -401,3 +401,46 @@ Android 客户端的访问令牌（等同服务端 `SESHAT_AUTH_TOKEN`）按以�
 （`default-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'`，
 `internal/api/embed.go`）。**残余**：`/api/` 的其它响应（JSON 端点与错误响应）仍无安全头，
 `Strict-Transport-Security` 仍由反代负责（§5）。
+
+## 9. 客户端防御上限（M12，2026-10-22）
+
+M12 把批注页面高亮下沉到 C 渲染层（`render/render-core.c` 的 `draw_page_thread`）——
+高亮不再是 elisp 侧的文本属性，而是在页面位图上绘制的**半透明高亮**矩形——并把服务端
+返回的 `location` 直接喂进渲染路径。这条链路的两端都不可信——PDF 文件可来自任何来源，
+批注 `location` 则是服务端返回的字符串——因此补了一组**显式上限**，判据以代码为准，
+此处只做归纳。
+
+### 9.1 渲染层上限
+
+| 边界 | 取值 | 位置 / 行为 |
+|---|---|---|
+| 单文档高亮条数 | 100 000（`HIGHLIGHT_MAX_COUNT`） | `--add-highlight` 达上限时静默返回 nil，**不覆盖**已有条目 |
+| 单条 `rect` 坐标绝对幅值 | ±1 000 000 点（`HIGHLIGHT_MAX_ABS_COORD`） | `rect_to_page_space` 在 `isfinite` 之后校验四角，超限返回 false、不进高亮表（`--text-in-rect` 与选区取文共用该换算点，同受此限） |
+| outline 标题字节数 | 8 192 字节（`OUTLINE_TITLE_MAX`，`render/elisp-helpers.c`） | `outline2plist` 取 `strlen` 后**截断**再构造 Lisp 字符串；按字节截断可能切断多字节序列，`decode-coding-string` 会把不完整序列保留为 raw byte 而非报错 |
+
+### 9.2 客户端解析上限（elisp 侧）
+
+| 边界 | 取值 | 行为 |
+|---|---|---|
+| `location` 字符串总长 | 64 KB（`seshat-reader-annotation--location-max-length`） | 超长先**截断**再解析（不整条丢弃），避免对不可信响应做无界解析 |
+| 单条 `location` 的 `rect:` 段数 | 2 000（`seshat-reader-annotation--rect-max-segments`） | 只解析前 2 000 段，其余忽略（已解析的保留） |
+
+两处上限的目的都是「单条不可信字符串不得把解析/渲染成本放大到无界」：一条
+`location` 若含数万段 `rect:`，未设限时会在 elisp 解析与 C 侧逐段 `fz_fill_path`
+上同时放大。
+
+### 9.3 已修的真实泄漏（M12，code-reviewer minor-2）
+
+`render/mupdf-helpers.c` 的 `free_doc_pages` 此前**零调用点**——换文档
+（`emacs_load_doc`）与关文档（`emacs_close_doc`）都走 `free_doc_state`，而它没有
+拆 `DocPage` 数组，于是每次切换文档都**泄漏整份 `DocPage` 数组与每页 mutex**
+（连同其已缓存的 display list）。M12 在 `free_doc_state` 开头接入
+`free_doc_pages(state)`，位置在 drop MuPDF 对象之前，覆盖 `free_doc_state` 的三个
+调用点（换文档、加载失败清理、关文档）。这与本节的「上限」不同——它是**无上限的线性泄漏**，
+只是恰好也在 M12 的高亮/render 加固轮里被发现并修掉。
+
+### 9.4 威胁模型（一句话）
+
+上述上限针对**不可信 PDF**（恶意 outline 标题、超大/极其密集的批注矩形）与
+**不可信服务端响应**（超长 `location` 字符串），目的是防止 UI 冻结与内存膨胀；
+它们不提供任何机密性保证，也不试图防御已经攻陷的服务进程（见 §1.3）。

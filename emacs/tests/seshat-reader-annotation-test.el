@@ -46,8 +46,24 @@
 ;; 测试隔离：绝不写用户的真实队列文件，也不在测试期间启用自动同步定时器。
 (require 'seshat-reader-annotation-queue)
 (seshat-reader-annotation-queue-disable-timer)
+(defconst seshat-reader-annotation-test--temp-root
+  (file-name-as-directory (if (file-directory-p "/tmp") "/tmp"
+                            temporary-file-directory))
+  "测试临时目录的根：优先系统 /tmp.
+`temporary-file-directory' 会跟随 `TMPDIR'，而本机 `TMPDIR' 可能被设为
+仓库根（ECA 客户端所为），那时 `make-temp-file' 会把测试目录建进工作树。")
+(defconst seshat-reader-annotation-test--queue-dir
+  (let ((temporary-file-directory seshat-reader-annotation-test--temp-root))
+    (make-temp-file "seshat-annotation-test-queue" t))
+  "本套件独占的队列临时目录，`kill-emacs-hook' 时递归删除.")
+(add-hook 'kill-emacs-hook
+          (lambda ()
+            (when (file-directory-p seshat-reader-annotation-test--queue-dir)
+              (ignore-errors
+                (delete-directory seshat-reader-annotation-test--queue-dir t)))))
 (setq seshat-reader-annotation-queue-file
-      (expand-file-name "annotation-queue.eld" (make-temp-file "seshat-annotation-test-queue" t)))
+      (expand-file-name "annotation-queue.eld"
+                        seshat-reader-annotation-test--queue-dir))
 
 (defvar seshat-reader-annotation-test--calls nil
   "最近一批桩替调用记录，元素形如 (METHOD PATH REQUEST-BODY).")
@@ -98,7 +114,9 @@ STATUS 与 BODY 是 `--request' 桩恒定返回的假响应；`--resolve' 桩按
   "在临时目录中执行 BODY，并把目录名绑定到 VAR.
 临时目录在 BODY 结束后递归删除；VAR 绑定为带末尾斜杠的目录名。"
   (declare (indent 1) (debug t))
-  `(let ((,var (file-name-as-directory (make-temp-file "seshat-annotation-test" t))))
+  `(let ((,var (let ((temporary-file-directory
+                      seshat-reader-annotation-test--temp-root))
+                 (file-name-as-directory (make-temp-file "seshat-annotation-test" t)))))
      (unwind-protect
          (progn ,@body)
        (when (file-directory-p ,var)
@@ -624,6 +642,311 @@ ANNOTATIONS 为将作为服务端 JSON 响应返回的 Lisp 数据。"
                           seshat-reader-annotation-list-prev-page
                           seshat-reader-annotation-list-first-page
                           seshat-reader-annotation-list-last-page))))))
+
+;;; T10：location rect 解析与页面高亮投喂（C 层 `seshat-reader-dyn--*'）
+
+(ert-deftest seshat-reader-annotation-test--rects-from-location-single ()
+  "单个合法 `rect:' 段解析为一个 4 元素浮点列表."
+  (let ((rects (seshat-reader-annotation--rects-from-location
+                "page:3;rect:10.00,20.00,110.00,40.00")))
+    (should (= (length rects) 1))
+    (should (equal (nth 0 rects) '(10.0 20.0 110.0 40.0)))
+    (should (cl-every #'floatp (nth 0 rects)))))
+
+(ert-deftest seshat-reader-annotation-test--rects-from-location-multi ()
+  "两个 `rect:' 段逐段解析，顺序与 location 中一致."
+  (let ((rects (seshat-reader-annotation--rects-from-location
+                "page:3;rect:1,2,3,4;rect:5.5,6.5,7.5,8.5")))
+    (should (= (length rects) 2))
+    (should (equal (nth 0 rects) '(1.0 2.0 3.0 4.0)))
+    (should (equal (nth 1 rects) '(5.5 6.5 7.5 8.5)))
+    (should (cl-every #'floatp (append (nth 0 rects) (nth 1 rects))))))
+
+(ert-deftest seshat-reader-annotation-test--rects-from-location-tolerance ()
+  "非法数字、缺字段、负面积、无 rect 段、`ink:' 段的容错行为."
+  ;; 非法数字：整段跳过
+  (should-not (seshat-reader-annotation--rects-from-location
+               "page:1;rect:abc,20,30,40"))
+  ;; 缺字段（只有 3 个坐标）：整段跳过
+  (should-not (seshat-reader-annotation--rects-from-location
+               "page:1;rect:10,20,30"))
+  ;; x1 < x0：负面积跳过
+  (should-not (seshat-reader-annotation--rects-from-location
+               "page:1;rect:100,40,10,10"))
+  ;; y1 < y0：负面积跳过
+  (should-not (seshat-reader-annotation--rects-from-location
+               "page:1;rect:10,40,100,10"))
+  ;; 空 location / nil / 无 rect 段：nil
+  (should-not (seshat-reader-annotation--rects-from-location ""))
+  (should-not (seshat-reader-annotation--rects-from-location nil))
+  (should-not (seshat-reader-annotation--rects-from-location "page:5"))
+  ;; `ink:' 段被忽略（本期不渲染手写笔迹），合法 rect 仍解析出来
+  (should (equal (seshat-reader-annotation--rects-from-location
+                  "page:2;ink:1,2,3,4;rect:10,20,30,40")
+                 '((10.0 20.0 30.0 40.0))))
+  ;; 一段非法一段合法：只保留合法那段
+  (should (equal (seshat-reader-annotation--rects-from-location
+                  "page:2;rect:abc,1,2,3;rect:4,5,6,7")
+                 '((4.0 5.0 6.0 7.0)))))
+
+(ert-deftest seshat-reader-annotation-test--rects-from-location-truncates-long-input ()
+  "超长 location 截断到上限：截断前的合法 rect 保留，越界之后的被丢弃."
+  (let* ((head "page:1;rect:1,2,3,4;")
+         (long (concat head (make-string 70000 ?x) ";rect:5,6,7,8")))
+    (should (> (length long) seshat-reader-annotation--location-max-length))
+    (should (equal (seshat-reader-annotation--rects-from-location long)
+                   '((1.0 2.0 3.0 4.0))))
+    ;; 正常长度不受截断影响（对照）
+    (should (equal (seshat-reader-annotation--rects-from-location
+                    "page:1;rect:1,2,3,4;rect:5,6,7,8")
+                   '((1.0 2.0 3.0 4.0) (5.0 6.0 7.0 8.0))))))
+
+(ert-deftest seshat-reader-annotation-test--rects-from-location-caps-segment-count ()
+  "`rect:' 段数超过上限即停止解析，保留已解析的上限条数."
+  (let* ((max seshat-reader-annotation--rect-max-segments)
+         (location (concat "page:1;"
+                           (mapconcat (lambda (_) "rect:1,2,3,4")
+                                      (number-sequence 1 (+ max 100))
+                                      ";"))))
+    ;; 长度仍在字符上限之内，故本用例只检验段数上限
+    (should (< (length location) seshat-reader-annotation--location-max-length))
+    (should (= max (length (seshat-reader-annotation--rects-from-location
+                            location))))))
+
+(defmacro seshat-reader-annotation-test--with-highlight-stubs (cell &rest body)
+  "在三个 C 层高亮函数被桩替（调用记录进 CELL 的 car）的环境中求值 BODY.
+CELL 是一个 (LIST) 形态的 cons 表达式，`(car CELL)' 收集按调用顺序 `push'
+的 `clear'、`refresh' 与 `(add PAGE X0 Y0 X1 Y1)'；调用方用
+`(nreverse (car CELL))' 取正序记录。三个桩恒返回 t（等价于 C 侧成功）。"
+  (declare (indent 1) (debug t))
+  (let ((var (make-symbol "cell")))
+    `(let ((,var ,cell))
+       (cl-letf (((symbol-function 'seshat-reader-dyn--clear-highlights)
+                  (lambda () (push 'clear (car ,var)) t))
+                 ((symbol-function 'seshat-reader-dyn--add-highlight)
+                  (lambda (page x0 y0 x1 y1)
+                    (push (list 'add page x0 y0 x1 y1) (car ,var))
+                    t))
+                 ((symbol-function 'seshat-reader-dyn--refresh-highlights)
+                  (lambda () (push 'refresh (car ,var)) t)))
+         ,@body))))
+
+(ert-deftest seshat-reader-annotation-test--apply-highlights-order-and-args ()
+  "投喂顺序为 clear → N 次 add → refresh，页号 1-based、坐标为浮点."
+  (let ((cell (list nil)))
+    (seshat-reader-annotation-test--with-highlight-stubs cell
+      (let* ((items (list (list :id 1
+                                :location "page:3;rect:10.00,20.00,110.00,40.00")
+                          (list :id 2
+                                :location "page:2;rect:1,2,3,4;rect:5,6,7,8")
+                          ;; 服务端 alist 形态同样接受
+                          (list (cons 'id 3)
+                                (cons 'location "page:1;rect:9,9,10,10"))
+                          ;; 无 rect 段 / 无 location：跳过，不计入返回值
+                          (list :id 4 :location "page:5")
+                          (list :id 5 :location nil)))
+             (added (seshat-reader-annotation--apply-highlights items))
+             (calls (nreverse (car cell))))
+        (should (= added 4))
+        (should (equal calls
+                       '(clear
+                         (add 3 10.0 20.0 110.0 40.0)
+                         (add 2 1.0 2.0 3.0 4.0)
+                         (add 2 5.0 6.0 7.0 8.0)
+                         (add 1 9.0 9.0 10.0 10.0)
+                         refresh)))
+        (dolist (entry (cl-remove-if-not (lambda (call) (eq (car-safe call) 'add))
+                                         calls))
+          (should (integerp (nth 1 entry)))
+          (should (cl-every #'floatp (nthcdr 2 entry))))))))
+
+(ert-deftest seshat-reader-annotation-test--apply-highlights-disabled ()
+  "开关关闭时只 clear + refresh，add 零次，返回 0."
+  (let ((cell (list nil))
+        (seshat-reader-annotation-highlight-enabled nil))
+    (seshat-reader-annotation-test--with-highlight-stubs cell
+      (should (= 0 (seshat-reader-annotation--apply-highlights
+                    (list (list :id 1 :location "page:2;rect:1,2,3,4")))))
+      (should (equal (nreverse (car cell)) '(clear refresh))))))
+
+(ert-deftest seshat-reader-annotation-test--apply-highlights-c-unavailable ()
+  "C 层函数抛错（模块未加载）时不崩溃且返回 0：`ignore-errors' 生效."
+  (cl-letf (((symbol-function 'seshat-reader-dyn--clear-highlights)
+             (lambda () (error "Module function not available")))
+            ((symbol-function 'seshat-reader-dyn--add-highlight)
+             (lambda (&rest _) (error "Module function not available")))
+            ((symbol-function 'seshat-reader-dyn--refresh-highlights)
+             (lambda () (error "Module function not available"))))
+    (should (= 0 (seshat-reader-annotation--apply-highlights
+                  (list (list :id 1 :location "page:2;rect:1,2,3,4")))))))
+
+(ert-deftest seshat-reader-annotation-test--apply-highlights-warns-once ()
+  "模块不可用时返回 0、`message' 提示一次；第二次刷新不再重复提示."
+  (let ((seshat-reader-annotation--highlight-warned nil)
+        (seshat-reader-annotation-highlight-enabled t)
+        (messages nil)
+        (items (list (list :id 1 :location "page:2;rect:1,2,3,4"))))
+    (cl-letf (((symbol-function
+                'seshat-reader-annotation--highlight-module-available-p)
+               (lambda () nil))
+              ((symbol-function 'seshat-reader-dyn--clear-highlights)
+               (lambda () (error "Module function not available")))
+              ((symbol-function 'seshat-reader-dyn--refresh-highlights)
+               (lambda () (error "Module function not available")))
+              ((symbol-function 'message)
+               (lambda (format-string &rest args)
+                 (push (apply #'format format-string args) messages))))
+      (should (= 0 (seshat-reader-annotation--apply-highlights items)))
+      (should (= 1 (length messages)))
+      (should (string-match-p "高亮模块未加载" (car messages)))
+      ;; 第二次刷新：仍返回 0，但不重复提示（`--highlight-warned' 已置 t）
+      (should (= 0 (seshat-reader-annotation--apply-highlights items)))
+      (should (= 1 (length messages)))
+      ;; 没有可投喂的条目时不算「尝试投喂」：不提示
+      (setq seshat-reader-annotation--highlight-warned nil
+            messages nil)
+      (should (= 0 (seshat-reader-annotation--apply-highlights nil)))
+      (should-not messages))))
+
+      (ert-deftest seshat-reader-annotation-test--refresh-highlights-from-cache ()
+        "刷新命令：无缓存返回 0 且不碰 C；有本文档缓存时按缓存全量重投."
+  (seshat-reader-annotation-test--with-temp-dir dir
+    (let* ((file (expand-file-name "book.pdf" dir))
+           (seshat-reader-annotation-roots (list (cons "lib" dir)))
+           (cell (list nil)))
+      (with-temp-file file)
+      (unwind-protect
+          (with-temp-buffer
+            (setq buffer-file-name file)
+            (seshat-reader-annotation-test--with-highlight-stubs cell
+              ;; 1) 从未拉取过：只提示，不调 C
+              (should (= 0 (seshat-reader-annotation-refresh-highlights)))
+              (should-not (car cell))
+              ;; 2) 造一份属于本文档的缓存
+              (with-current-buffer
+                  (get-buffer-create seshat-reader-annotation-list-buffer-name)
+                (setq-local seshat-reader-annotation-list-document-id
+                            "lib:book.pdf")
+                (setq-local seshat-reader-annotation-list-entries
+                            (list (list (cons 'id 1)
+                                        (cons 'location
+                                              "page:4;rect:1.00,2.00,3.00,4.00")))))
+              (should (= 1 (seshat-reader-annotation-refresh-highlights)))
+              (should (equal (nreverse (car cell))
+                             '(clear (add 4 1.0 2.0 3.0 4.0) refresh)))))
+        (when (get-buffer seshat-reader-annotation-list-buffer-name)
+          (kill-buffer seshat-reader-annotation-list-buffer-name))))))
+
+(defun seshat-reader-annotation-test--fake-reader-buffer (file)
+  "创建一个模拟 reader 缓冲区：`buffer-file-name' 为 FILE、`major-mode' 为
+`seshat-reader-mode'。直接设变量而不调用 mode 体——批量测试里只需满足
+`seshat-reader-annotation--source-document-p' 的两条判据。调用方负责
+`kill-buffer'。"
+  (let ((buffer (generate-new-buffer " *seshat-fake-reader*")))
+    (with-current-buffer buffer
+      (setq buffer-file-name file
+            major-mode 'seshat-reader-mode))
+    buffer))
+
+(ert-deftest seshat-reader-annotation-test--note-created-annotation-appends ()
+  "新建批注成功后把该条追加进缓存并重投高亮；缓存不属于本文档时不动."
+  (seshat-reader-annotation-test--with-temp-dir dir
+    (let* ((file (expand-file-name "book.pdf" dir))
+           (seshat-reader-annotation-roots (list (cons "lib" dir)))
+           (source (seshat-reader-annotation-test--fake-reader-buffer
+                    (expand-file-name "other.pdf" dir)))
+           (cell (list nil)))
+      (with-temp-file file)
+      (unwind-protect
+          (seshat-reader-annotation-test--with-highlight-stubs cell
+            (with-current-buffer
+                (get-buffer-create seshat-reader-annotation-list-buffer-name)
+              (setq-local seshat-reader-annotation-list-document-id "lib:other.pdf")
+              (setq-local seshat-reader-annotation-list-source source)
+              (setq-local seshat-reader-annotation-list-entries nil))
+            ;; 缓存属于其它文档：不追加、不调 C
+            (seshat-reader-annotation--note-created-annotation
+             file 7 "page:2;rect:1,2,3,4" "新批注")
+            (should (= 0 (length (buffer-local-value
+                                  'seshat-reader-annotation-list-entries
+                                  (get-buffer
+                                   seshat-reader-annotation-list-buffer-name)))))
+            (should-not (car cell))
+            ;; 改成本文档，并把发起方 reader 缓冲区指向同一文件：追加成功并重投
+            (with-current-buffer source
+              (setq buffer-file-name file))
+            (with-current-buffer
+                (get-buffer seshat-reader-annotation-list-buffer-name)
+              (setq-local seshat-reader-annotation-list-document-id "lib:book.pdf")
+              (setq-local seshat-reader-annotation-list-entries
+                          (list (list (cons 'id 1)
+                                      (cons 'location "page:1;rect:1,1,2,2")))))
+            (seshat-reader-annotation--note-created-annotation
+             file 7 "page:2;rect:1,2,3,4" "新批注")
+            (with-current-buffer
+                (get-buffer seshat-reader-annotation-list-buffer-name)
+              (should (= 2 (length seshat-reader-annotation-list-entries)))
+              (should (equal (alist-get 'location
+                                        (nth 1 seshat-reader-annotation-list-entries))
+                             "page:2;rect:1,2,3,4")))
+            (should (equal (nreverse (car cell))
+                           '(clear (add 1 1.0 1.0 2.0 2.0)
+                                   (add 2 1.0 2.0 3.0 4.0)
+                                   refresh))))
+        (when (get-buffer seshat-reader-annotation-list-buffer-name)
+          (kill-buffer seshat-reader-annotation-list-buffer-name))
+        (when (buffer-live-p source) (kill-buffer source))))))
+
+(ert-deftest seshat-reader-annotation-test--note-created-annotation-checks-current-doc ()
+  "doc-id 匹配但**当前载入文档不是该文件**时不追加、不投喂 C（重要-3 守卫）."
+  (seshat-reader-annotation-test--with-temp-dir dir
+    (let* ((file (expand-file-name "book.pdf" dir))
+           (seshat-reader-annotation-roots (list (cons "lib" dir)))
+           (wrong-source (seshat-reader-annotation-test--fake-reader-buffer
+                          (expand-file-name "other.pdf" dir)))
+           (cell (list nil)))
+      (with-temp-file file)
+      (unwind-protect
+          (seshat-reader-annotation-test--with-highlight-stubs cell
+            ;; 缓存与 doc-id 都属于 book.pdf，但当前载入的是 other.pdf
+            (with-current-buffer
+                (get-buffer-create seshat-reader-annotation-list-buffer-name)
+              (setq-local seshat-reader-annotation-list-document-id "lib:book.pdf")
+              (setq-local seshat-reader-annotation-list-source wrong-source)
+              (setq-local seshat-reader-annotation-list-entries
+                          (list (list (cons 'id 1)
+                                      (cons 'location "page:1;rect:1,1,2,2")))))
+            (seshat-reader-annotation--note-created-annotation
+             file 7 "page:2;rect:1,2,3,4" "新批注")
+            ;; 缓存未变长、C 一次都没被调用
+            (with-current-buffer
+                (get-buffer seshat-reader-annotation-list-buffer-name)
+              (should (= 1 (length seshat-reader-annotation-list-entries))))
+            (should-not (car cell))
+            ;; 发起方缓冲区已死：同样不投喂
+            (kill-buffer wrong-source)
+            (seshat-reader-annotation--note-created-annotation
+             file 8 "page:2;rect:5,6,7,8" "新批注")
+            (with-current-buffer
+                (get-buffer seshat-reader-annotation-list-buffer-name)
+              (should (= 1 (length seshat-reader-annotation-list-entries))))
+            (should-not (car cell)))
+        (when (get-buffer seshat-reader-annotation-list-buffer-name)
+          (kill-buffer seshat-reader-annotation-list-buffer-name))
+        (when (buffer-live-p wrong-source) (kill-buffer wrong-source))))))
+
+
+(ert-deftest seshat-reader-annotation-test--refresh-highlights-command-bound ()
+  "刷新高亮命令存在；`seshat-reader' 已加载时绑在未被占用的 `C-c C-h'."
+  (should (commandp 'seshat-reader-annotation-refresh-highlights))
+  (interactive-form 'seshat-reader-annotation-refresh-highlights)
+  (when (boundp 'seshat-reader-mode-map)
+    (should (eq (lookup-key seshat-reader-mode-map (kbd "C-c C-h"))
+                #'seshat-reader-annotation-refresh-highlights))
+    (should (eq (lookup-key seshat-reader-mode-map (kbd "C-c C-l"))
+                #'seshat-reader-annotation-list))
+    (should (eq (lookup-key seshat-reader-mode-map (kbd "C-c C-a"))
+                #'seshat-reader-annotation-create))))
 
 (provide 'seshat-reader-annotation-test)
 ;;; seshat-reader-annotation-test.el ends here

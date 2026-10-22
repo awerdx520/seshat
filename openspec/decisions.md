@@ -340,3 +340,19 @@
 
 **影响**：① 笔型只在渲染层生效（线宽倍率 1× / 2.2× / 3.5×、不透明度 255 / 170 / 90，且 `Paint.setColor` 后必须补 `setAlpha`），不改变归一化坐标语义；② 用户选中的笔型不跨文档记忆、无「最近使用」（记 tech-debt）；③ 未来加笔型只需扩枚举 + 渲染映射，但**不得**依赖枚举序号做持久化（默认序列化用名字）。
 
+## 2026-10-22 · Emacs 阅读器采用 side window 三分栏（M12）
+
+**决策**：信息面板与目录面板改用 `display-buffer-in-side-window`（`(side . left|right)` + per-kind `slot`），目录固定左侧、批注/译文固定右侧，`seshat-reader-sidebar-position` 的默认位置由 `below-selected` 改为 `right`；目录另用 `seshat-reader-outline-sidebar-position`（默认 `left`）。`seshat-reader-sidebar--slot-for-kind` 按 kind 分槽（同侧 0/1/2、不同侧各自从 0），`sidebar-show` 只重建目标 kind，`sidebar-toggle` 增可选 `kind` 参数并新增 `C-c C-o` → `seshat-reader-sidebar-toggle-outline`。
+
+**理由**：① 自建 `split-window` 会在 kind 切换时反复 split/delete，导致主窗口逐次变窄；side window 由 Emacs 维护独立窗口树，同侧同 `slot` 复用，主窗口宽度不受增删面板影响。② 单窗口承载（M11 的底部弹出）无法同屏对照目录与批注——底部单窗口下后显示者接管同一窗口，M11.7 起即为已知限制。③ 底部模式（`below-selected` / `at-bottom`）作为兼容值保留，用户可一键回退旧版式。
+
+**代价 / 约束**：① 默认值变更是**破坏性**行为变更（面板从底部移到右侧、尺寸语义从高度变为宽度），docstring 已给回退写法（设 `seshat-reader-sidebar-position` 为 `below-selected`）。② per-kind 尺寸记忆需带**方向标签**——宽度与高度语义不同，同一 alist 混存会让左右栏与底部面板互相污染。③ `window-toggle-side-windows` 是 frame 级全量开关，仍禁用（会连带删除 eca-chat / which-key 的侧窗）。
+
+## 2026-10-22 · 批注页面高亮在 C 渲染层实现而非 elisp 叠加（M12）
+
+**决策**：在 `draw_page_thread` 的反色（`fz_invert_pixmap_luminance` / `fz_gamma_pixmap`）之后、PNM 编码之前，用 `fz_new_draw_device` + `fz_rectto` + `fz_fill_path` 在页面 pixmap 上绘制高亮，复用该页 rasterize 用的同一个 `ctm`；elisp 侧只解析 `location` 的 `rect:` 段并按页投喂（`seshat-reader-dyn--clear-highlights` → `seshat-reader-dyn--add-highlight` × N → `seshat-reader-dyn--refresh-highlights`），不参与绘制。
+
+**理由**：① **Emacs 中同一文本区域的 `display` 属性互斥、不能叠加**——一处只有一份 `display` 规格生效，仓库内已有两次独立结论：`openspec/completed/2026-10-12-m11.2b-reader-selection.md`（M11.2b 选区实现记录）与 `seshat-reader-select.el` 的注释（只做文本属性、不做矩形绘制）。② `(space :width ...)` / `:box` / face 背景只作用于**文字所在位置**，会挤开 image 而不是叠在其上——阅读器每页是一整个 image，任何 elisp 侧「叠加」都会把页面推走。③ 复用 `ctm` 使缩放与旋转自动对齐，无需在 elisp 侧重复坐标推导（`rect_to_page_space` 是唯一的「Emacs rect → MuPDF 页面空间」换算点，渲染线程与 `seshat-reader-dyn--text-in-rect` 共用）。
+
+**代价 / 约束**：① 改 C 必须 `make clean all` 重建 `.so`，并在 `VENDORED.md` 登记本地改动（F23 不变量）。② 高亮表需在派发渲染任务时**快照**进 `DrawThreadArgs`（容量倍增表，每条退出路径释放）——渲染线程不碰 `DocState`，elisp 侧只改表并置 `highlights_dirty`。③ 旋转页的 `rect` 本身采不准（`seshat-reader-select.el` 明确不支持旋转页，属既有限制），高亮在旋转页可能错位（记 tech-debt）。④ 颜色与透明度当前是编译期常量（`HIGHLIGHT_COLOR_*` / `HIGHLIGHT_ALPHA` = 0.35），不可配置（记 tech-debt）。
+

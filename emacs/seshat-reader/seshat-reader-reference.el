@@ -45,7 +45,8 @@
 ;; 文件、不得覆盖（vendor 边界见同目录 VENDORED.md）。
 ;;
 ;; `org' 为**软依赖**：`(require 'org nil t)'，未加载 org 时本模块仍可加载，
-;; 只是链接注册与 `org-store-link' 集成不可用。
+;; 只是链接注册（`:follow' / `:store' / `:complete' / `:export'）与
+;; `org-store-link' 集成不可用。
 
 ;;; Code:
 
@@ -56,6 +57,12 @@
 ;; 顶部 require 它（避免循环 require）；改为声明其公开函数，并在真正需要时
 ;; 于函数体内 `require'（Emacs 会缓存 feature，重复 require 只是一次查表）。
 (declare-function seshat-reader-annotation-queue-entries "seshat-reader-annotation-queue")
+;; 位置计算用到的 org / outline API（签名已用 `elisp-describe-function' 核实：
+;; `org-back-to-heading' 见 `org.el:21369'，可选 INVISIBLE-OK，失败 `user-error'；
+;; `outline-next-heading' 见 `outline.el'，无参）。
+(declare-function org-back-to-heading "org" (&optional invisible-ok))
+(declare-function org-outline-level "org" ())
+(declare-function outline-next-heading "outline" ())
 
 (defgroup seshat-reader-reference nil
   "笔记与阅读器之间的 `seshat:' 链接协议与摘录插入."
@@ -66,9 +73,31 @@
   "摘录/引用写入的目标 org 笔记文件.
 为 nil 时 `seshat-reader-reference-insert' 交互询问落点文件，并把所选文件
 `setq' 到本变量（**仅会话内记忆**，不写回用户配置文件）；也可直接设为固定
-文件路径（可含 `~'）。插入位置统一为文件末尾。"
+文件路径（可含 `~'）。插入位置由
+`seshat-reader-reference-insert-position' 决定（默认仍为文件末尾）。"
   :type '(choice (const :tag "每次交互选择" nil)
                  (file :tag "固定目标文件"))
+  :group 'seshat-reader-reference)
+
+(defcustom seshat-reader-reference-insert-position 'end-of-file
+  "摘录写入目标笔记文件时的插入位置.
+- `end-of-file'：插入到文件末尾（默认值，与历史行为完全一致）。
+- `headline'：插入到「当前 headline 子树的末尾」——即整个子树（含其全部
+  子标题）之后、下一个同级或更高级 headline 之前的位置；判定用 org 既有 API
+  （`org-back-to-heading' + `org-outline-level' + `outline-next-heading'），
+  详见 `seshat-reader-reference--insert-position'。
+- `point'：插入到目标文件 visiting buffer 中 `point' 所在位置。
+
+**回退规则**（三种模式共用）：位置计算只在目标文件存在 visiting buffer
+（`find-buffer-visiting' 命中）时才有可能生效。`headline' / `point' 在没有
+visiting buffer 时无从得知「当前 headline」与光标，一并回退为
+`end-of-file'（即 `append-to-file' 追加到末尾，**不为支持新语义强行打开
+文件**，避免产生用户未预期的 buffer 与文件锁）；此外 `headline' 在 org 未
+加载、或光标位于第一个 headline 之前、或 buffer 内没有任何 headline 时
+同样回退。"
+  :type '(choice (const :tag "文件末尾" end-of-file)
+                 (const :tag "当前 headline 子树末尾" headline)
+                 (const :tag "visiting buffer 的光标处" point))
   :group 'seshat-reader-reference)
 
 (defcustom seshat-reader-reference-format
@@ -112,7 +141,10 @@ DOC-ID 先经 `seshat-reader-reference--doc-id-check-encodable' 校验。LOCATIO
 LINK 可带或不带 \"seshat:\" 前缀；剥掉前缀后按**最后一个** `#' 分割为
 doc-id 与 location（`#' 本身不接受转义，见 Commentary）。无 `#'' 时
 `:location' 为 nil，但该键仍然存在，便于调用方用 `plist-get' 判定。
-LINK 非字符串、剥前缀后为空、或 `#' 之前的 doc-id 为空时返回 nil。"
+LINK 非字符串、剥前缀后为空、或 `#' 之前的 doc-id 为空时返回 nil。
+
+尾部裸 `#'（location 为空串，如 \"seshat:ebook:a.pdf#\"）归一为 nil：空
+location 与「无 location」语义相同，两种写法解析结果一致。"
   (when (stringp link)
     (let ((s (if (string-prefix-p "seshat:" link)
                  (substring link (length "seshat:"))
@@ -120,9 +152,11 @@ LINK 非字符串、剥前缀后为空、或 `#' 之前的 doc-id 为空时返�
       (cond
        ((string-empty-p s) nil)
        ((string-match "#\\([^#]*\\)\\'" s)
-        (let ((doc-id (substring s 0 (match-beginning 0))))
+        (let ((doc-id (substring s 0 (match-beginning 0)))
+              (loc (match-string 1 s)))
           (unless (string-empty-p doc-id)
-            (list :doc-id doc-id :location (match-string 1 s)))))
+            (list :doc-id doc-id
+                  :location (and (not (string-empty-p loc)) loc)))))
        (t (list :doc-id s :location nil))))))
 
 (defun seshat-reader-reference--file-from-doc-id (doc-id)
@@ -143,6 +177,57 @@ LINK 非字符串、剥前缀后为空、或 `#' 之前的 doc-id 为空时返�
                               seshat-reader-annotation-roots)))
         (when entry
           (expand-file-name rel (expand-file-name (cdr entry)))))))))
+
+;;; 链接补全候选（`:complete' 的数据层）
+
+(defun seshat-reader-reference--doc-file-regexp ()
+  "返回匹配受支持文档文件名的正则；扩展名列表不可得时返回 nil.
+扩展名列表复用 variable `seshat-reader-supported-formats'（**软依赖**：
+未加载时先 `(require \\='seshat-reader nil t)' 试探，仍不可得则返回 nil，由
+调用方放弃补全而不是自行维护一份格式清单）。"
+  (let ((formats (or (and (boundp 'seshat-reader-supported-formats)
+                          (symbol-value 'seshat-reader-supported-formats))
+                     (progn
+                       (require 'seshat-reader nil t)
+                       (and (boundp 'seshat-reader-supported-formats)
+                            (symbol-value 'seshat-reader-supported-formats))))))
+    (when formats
+      (concat "\\.\\(?:" (regexp-opt formats) "\\)\\'"))))
+
+(defun seshat-reader-reference--complete-link ()
+  "返回 `seshat:' 链接的补全候选：去重、按字典序排序的 doc-id 列表.
+候选枚举 `seshat-reader-annotation-roots' 中每个根目录下受支持的文档文件
+（扩展名正则见 `seshat-reader-reference--doc-file-regexp'），doc-id 一律由
+`seshat-reader-annotation--doc-id' 派生（**不自行拼接路径**，保证与批注模块
+的 doc-id 同源）。含 `#'/`%' 的 doc-id 无法承载于链接（见 Commentary），
+直接剔除。
+
+当前缓冲区处于 `seshat-reader-mode' 且其 doc-id 已在候选中时，该 doc-id 被
+移到首位（其余保持字典序）；不在候选中则不添加。根列表为空、格式列表不可
+得、目录不存在/不可读、无匹配文档时返回 nil，**不报错**。
+
+本期**只补 doc-id**，不构造 `#page:<n>' 位置片段（位置插入语义见摘录任务）。"
+  (let ((regexp (seshat-reader-reference--doc-file-regexp))
+        (ids nil))
+    (when regexp
+      (dolist (entry seshat-reader-annotation-roots)
+        (let ((dir (expand-file-name (cdr entry))))
+          (when (and (file-directory-p dir) (file-readable-p dir))
+            (dolist (file (ignore-errors
+                            (directory-files-recursively dir regexp nil t)))
+              (let ((id (seshat-reader-annotation--doc-id file)))
+                (when (and (stringp id)
+                           (not (string-empty-p id))
+                           (not (string-match-p "[#%]" id)))
+                  (push id ids))))))))
+    (let* ((sorted (delete-dups (sort ids #'string<)))
+           (current (and (derived-mode-p 'seshat-reader-mode)
+                         (buffer-file-name)
+                         (seshat-reader-annotation--doc-id
+                          (buffer-file-name)))))
+      (if (and current (member current sorted))
+          (cons current (delete current sorted))
+        sorted))))
 
 (defun seshat-reader-reference--description (doc-id &optional location)
   "为 DOC-ID 与可选 LOCATION 生成人类可读的链接描述.
@@ -178,6 +263,53 @@ DOC-ID 因此取绝对路径为其后的部分）。页非 nil 时返回 \"<文�
 各自漂移。"
   (seshat-reader-annotation--summary text))
 
+(defun seshat-reader-reference--insert-position (mode)
+  "在当前 buffer 中按 MODE 计算摘录的插入位置，返回整数 position.
+MODE 的取值语义与 `seshat-reader-reference-insert-position' 一致：
+
+- `point'：返回当前 `point'。
+- `headline'：返回 `point' 所在 headline **子树的末尾**（下一个同级或更高级
+  headline 之前，即整个子树——含其全部子标题——之后）。一律用 org 既有 API
+  计算，不自行解析星号：`org-back-to-heading'（`org.el:21369'，可选
+  INVISIBLE-OK，本调用传 t；point 在第一个 headline 之前时抛 `user-error'）
+  先回到所在 headline，`org-outline-level'（无参，返回当前 headline 的星号
+  数）取当前层级，再用 `outline-next-heading'（`outline.el'，无参，移动到
+  下一个 headline 行首、无下一个时到 `point-max'）逐级前进，直到层级**不深于**
+  当前层级或到达 `point-max'——该位置正是子树边界。org 未加载（`featurep'
+  对 `org' 返回 nil）、**当前 buffer 不是 org-mode**（`derived-mode-p'
+  对 `org-mode' 返回 nil——org 已加载但本 buffer 是 Markdown / 纯文本时
+  星号行未必是 headline，不能按 org 规则解析）、上述调用抛错（如 point 位于
+  第一个 headline 之前、buffer 内无 headline、`outline-regexp' 不可用）时
+  回退 `(point-max)'。
+- 其它任何值（含默认的 `end-of-file' 与未知值）：返回 `(point-max)'。
+
+本函数**只做当前 buffer 内的位置计算**：不读写文件、不插入文本、不切换
+buffer、不移动 `point'（`save-excursion' 保证）。「目标文件无 visiting buffer」
+这一层的回退由调用方 `seshat-reader-reference--insert-into-file' 负责（直接
+`append-to-file'）。抽成独立函数是为了让 ERT 能在 batch 下直接断言三种模式
+的位置计算。"
+  (pcase mode
+    ('point (point))
+    ('headline
+     ;; 双重守卫：org 已加载**且**当前 buffer 处于 org-mode（含派生 mode）才走
+     ;; org API。只看 `featurep' 不够——org 已加载但当前 buffer 是 Markdown /
+     ;; 纯文本时，`org-back-to-heading' 会按 org 的 `outline-regexp' 匹配星号
+     ;; 行，可能把非 org 文档的 `* ' 列表项误认成 headline。
+     (if (not (and (featurep 'org) (derived-mode-p 'org-mode)))
+         (point-max)
+       (or (condition-case nil
+               (save-excursion
+                 (org-back-to-heading t)
+                 (let ((level (org-outline-level)))
+                   ;; 跳过更深的子标题：只在层级不深于当前层级时停下
+                   (while (and (outline-next-heading)
+                               (not (eobp))
+                               (> (org-outline-level) level)))
+                   (point)))
+             (error nil))
+           (point-max))))
+    (_ (point-max))))
+
 (defun seshat-reader-reference--read-target-file ()
   "返回摘录应写入的目标文件路径.
 `seshat-reader-reference-target-file' 非空时展开并直接返回；为空时用
@@ -194,17 +326,21 @@ DOC-ID 因此取绝对路径为其后的部分）。页非 nil 时返回 \"<文�
       file)))
 
 (defun seshat-reader-reference--insert-into-file (text file)
-  "把 TEXT 追加写入 FILE 末尾，并返回 FILE.
-TEXT 先补齐换行结尾（缺失时补一个换行）。FILE 已有关联 buffer 时在该 buffer
-中插入到 `point-max'：插入前 buffer 无未保存修改则 `save-buffer'，否则只
-`message' 提示用户自行保存（不静默覆盖用户未保存的改动）。FILE 无关联
-buffer 时用 `append-to-file' 直接追加，不打开 buffer、不干扰用户。"
+  "把 TEXT 写入 FILE 的插入位置（由 `seshat-reader-reference-insert-position' 指定）.
+TEXT 先补齐换行结尾（缺失时补一个换行）。FILE 已有关联 buffer（visiting
+buffer）时在该 buffer 中插入到 `seshat-reader-reference--insert-position' 按
+`seshat-reader-reference-insert-position' 算出的位置：插入前 buffer 无未保存
+修改则 `save-buffer'，否则只 `message' 提示用户自行保存（不静默覆盖用户未保存
+的改动）。FILE 无关联 buffer 时用 `append-to-file' 直接追加到末尾——此时
+`headline' / `point' 一律按 `end-of-file' 语义处理，**不为支持它们强行打开
+文件**（避免副作用）。返回 FILE。"
   (let* ((payload (if (string-suffix-p "\n" text) text (concat text "\n")))
          (buf (find-buffer-visiting file))
          (modified (and buf (buffer-modified-p buf))))
     (if buf
         (with-current-buffer buf
-          (goto-char (point-max))
+          (goto-char (seshat-reader-reference--insert-position
+                      seshat-reader-reference-insert-position))
           (insert payload)
           (if modified
               (message "Seshat Reader reference: 目标文件有未保存修改，请在插入后自行保存：%s"
@@ -213,7 +349,7 @@ buffer 时用 `append-to-file' 直接追加，不打开 buffer、不干扰用户
       (append-to-file payload nil file))
     file))
 
-;;; 链接注册与 :follow / :store
+;;; 链接注册与 :follow / :store / :complete
 
 (defun seshat-reader-reference-open (path &optional _arg)
   "打开 PATH 指向的文档并跳到链接记录的位置.
@@ -291,14 +427,76 @@ location 优先取最近一次选区（`seshat-reader-select-last'，其 `:file'
     (org-link-store-props :type "seshat" :link link :description desc)
     t))
 
+(defun seshat-reader-reference-complete-link (&optional _arg)
+  "为 `seshat:' 链接提供补全并返回**完整的链接字符串**.
+本函数是 `org-link-set-parameters' 的 `:complete' 处理函数，按 org 的
+约定（`org-link-parameters' 的 `:complete' 条目）接收**一个可选前缀参数**，
+返回值为完整链接字符串（含 \"seshat:\" 前缀），插入动作由 `org-insert-link'
+完成；它不返回候选列表，也不是 `completion-at-point' 函数。
+
+候选由 `seshat-reader-reference--complete-link' 生成（roots 下的 doc-id，
+去重排序、当前文档优先）；无候选时退回 `read-string'，初值 \"seshat:\"，
+与 org 对无补全支持类型的兜底行为（`org-link--try-special-completion'）
+一致。可选 _ARG 被忽略。"
+  (let ((candidates (seshat-reader-reference--complete-link)))
+    (if candidates
+        (concat "seshat:" (completing-read "Seshat 文档: " candidates nil t))
+      (read-string "Seshat 链接: " "seshat:"))))
+
+(defun seshat-reader-reference-export-link (path desc format &optional _backend)
+  "把 `seshat:' 链接导出为**人类可读文本**，供 org 导出后端调用.
+本函数是 `org-link-set-parameters' 的 `:export' 处理函数。**实读本机 org 9.8.7
+源码确认的契约**——`ol.el.gz:119-128'（`:export' 的属性说明）：「Function that
+accepts four arguments: the path, as a string, the description as a string, or
+nil, the export backend, the export communication channel, as a plist」，
+且「When nil, export for that type of link is delegated to the backend」；
+调用点 `org-export-custom-protocol-maybe'（`ox.el.gz:4352-4377'）以
+`(funcall protocol path desc backend info)' 调用，遇 `wrong-number-of-arguments'
+再按 3 参重试（兼容 org < 9.4 的旧式处理函数），故第 4 参数声明为可选。
+其返回值非 nil 时**优先于后端自身的链接转义**（调用点例：`ox-html.el.gz:3374'
+`(org-export-custom-protocol-maybe link desc \\='html info)'、`ox-md.el.gz:576'、
+`ox-latex.el.gz:3089'、`ox-ascii.el.gz:1591'），返回 nil 则交回后端——本实现
+**恒返回字符串**，从不返回 nil。
+
+PATH 为链接路径（允许缺 \"seshat:\" 前缀，本函数自行补齐后解析）；DESC 为
+链接描述，非空时**原样采用**，为空或 nil 时用
+`seshat-reader-reference--description' 现算（\"<文件名> 第 <页> 页\"）——与
+摘录块、`:store' 的描述同源，**不重写一份**逻辑。FORMAT 为导出后端符号
+（常见取值 `html' / `latex' / `ascii' / `md' / `texinfo' / `odt' / `org'，也可能
+为 nil），本实现**对所有后端输出同一份纯文本**，不按后端区分；可选 _BACKEND
+为导出通信通道 plist，忽略。
+
+取舍（**有意如此，不是遗漏**）：本实现不生成可点击的跨文档 URL——`seshat:'
+链接指向本机书库里的 PDF 与其页码，没有稳定的服务端 URL 方案，凭空拼一个
+`http://...' 式的假链接比纯文本更有害（下游读者点开即 404）。因此 `:export'
+的职责收敛为「把协议串变成人能读的描述」，不承担定位跳转。
+
+PATH 无法解析（非字符串、空串、剥掉 `#' 后 doc-id 为空）时**不报错**，退回
+原始文本 \"seshat:<path>\"：一个坏链接不应让整份导出失败。"
+  (let ((parsed (seshat-reader-reference--parse-link
+                 (if (and (stringp path) (string-prefix-p "seshat:" path))
+                     path
+                   (concat "seshat:" (if (stringp path) path ""))))))
+    ;; FORMAT 不参与计算（所有后端输出同一份纯文本，见 docstring 的取舍）；
+    ;; 显式 `ignore' 以避免 byte-compile 的「未使用词法参数」告警。
+    (ignore format)
+    (cond
+     ((not parsed) (concat "seshat:" (if (stringp path) path "")))
+     ((and (stringp desc) (not (string-empty-p desc))) desc)
+     (t (seshat-reader-reference--description (plist-get parsed :doc-id)
+                                              (plist-get parsed :location))))))
+
 ;; 注册 `seshat:' 链接类型：`:follow' 收 (path arg)、`:store' 收
-;; (interactive?)。**不注册 `:export'**——导出沿用 org 默认行为（保留链接
-;; 信息）已足够，本步不做导出定制（见 tech-debt）。放在
+;; (interactive?)、`:complete' 收可选前缀参数并返回完整链接字符串、
+;; `:export' 收 (path desc backend info) 并返回可读文本（契约与取舍见
+;; `seshat-reader-reference-export-link' 的 docstring）。放在
 ;; `with-eval-after-load 'org' 中，保证 org 就绪时才注册且只注册一次。
 (with-eval-after-load 'org
   (org-link-set-parameters "seshat"
                            :follow #'seshat-reader-reference-open
-                           :store #'seshat-reader-reference-store-link))
+                           :store #'seshat-reader-reference-store-link
+                           :complete #'seshat-reader-reference-complete-link
+                           :export #'seshat-reader-reference-export-link))
 
 ;;; 交互命令
 
@@ -358,7 +556,9 @@ BODY 为摘录正文；去空白后非空时使用它，否则回退到最近一
 
 摘录块由 `seshat-reader-reference--format-block' 按
 `seshat-reader-reference-format' 组装，写入
-`seshat-reader-reference--read-target-file' 返回的文件；完成后 `message'
+`seshat-reader-reference--read-target-file' 返回的文件，**插入位置**由
+`seshat-reader-reference-insert-position' 决定（默认文件末尾；`headline' /
+`point' 需目标文件已有 visiting buffer，否则回退文件末尾）。完成后 `message'
 报告目标文件与写入字符数。"
   (interactive (list (when current-prefix-arg (read-string "摘录正文: "))))
   (let* ((selection seshat-reader-select-last)

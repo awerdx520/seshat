@@ -380,12 +380,13 @@
 ;;; org 链接注册
 
 (ert-deftest seshat-reader-reference-test--org-registration ()
-  "`seshat:' 已注册 :follow/:store，且未定制 :export."
+  "`seshat:' 已注册 :follow/:store/:export."
   (should (eq (org-link-get-parameter "seshat" :follow)
               #'seshat-reader-reference-open))
   (should (eq (org-link-get-parameter "seshat" :store)
               #'seshat-reader-reference-store-link))
-  (should-not (org-link-get-parameter "seshat" :export)))
+  (should (eq (org-link-get-parameter "seshat" :export)
+              #'seshat-reader-reference-export-link)))
 
 (ert-deftest seshat-reader-reference-test--org-registration-idempotent ()
   "重复求值注册 form 后 :follow/:store 仍是同一函数（幂等）."
@@ -399,7 +400,279 @@
               #'seshat-reader-reference-open))
   (should (eq (org-link-get-parameter "seshat" :store)
               #'seshat-reader-reference-store-link))
-  (should-not (org-link-get-parameter "seshat" :export)))
+  (should (eq (org-link-get-parameter "seshat" :export)
+              #'seshat-reader-reference-export-link)))
+
+;;; 链接补全（:complete）
+
+(ert-deftest seshat-reader-reference-test--complete-link-candidates ()
+  "枚举 roots 下受支持的文档：剔除不支持格式与含 `#'/`%' 的名称、去重、按字典序排序."
+  (seshat-reader-reference-test--with-temp-dir dir
+    (let ((sub (expand-file-name "sub" dir))
+          (seshat-reader-annotation-roots (list (cons "ebook" dir))))
+      (make-directory sub)
+      (dolist (name '("a.pdf" "b.pdf" "notes.txt" "bad#name.pdf"))
+        (with-temp-file (expand-file-name name dir)))
+      (with-temp-file (expand-file-name "c.epub" sub))
+      (should (equal (seshat-reader-reference--complete-link)
+                     '("ebook:a.pdf" "ebook:b.pdf" "ebook:sub/c.epub")))
+      ;; 同一根被重复配置时不产生重复候选
+      (let ((seshat-reader-annotation-roots (list (cons "ebook" dir)
+                                                  (cons "ebook" dir))))
+        (should (equal (seshat-reader-reference--complete-link)
+                       '("ebook:a.pdf" "ebook:b.pdf" "ebook:sub/c.epub")))))))
+
+(ert-deftest seshat-reader-reference-test--complete-link-empty-roots ()
+  "roots 为空、或根目录不存在时返回 nil，不报错."
+  (let ((seshat-reader-annotation-roots nil))
+    (should-not (seshat-reader-reference--complete-link)))
+  (let ((seshat-reader-annotation-roots
+         (list (cons "ghost" "/nonexistent/seshat-root/"))))
+    (should-not (seshat-reader-reference--complete-link))))
+
+(ert-deftest seshat-reader-reference-test--complete-link-current-doc-first ()
+  "阅读器 buffer 内且当前 doc-id 已在候选中时排首位，其余保持字典序."
+  (seshat-reader-reference-test--with-temp-dir dir
+    (let ((seshat-reader-annotation-roots (list (cons "ebook" dir)))
+          (file (expand-file-name "m.pdf" dir)))
+      (dolist (name '("a.pdf" "m.pdf" "z.pdf"))
+        (with-temp-file (expand-file-name name dir)))
+      (with-temp-buffer
+        (setq buffer-file-name file)
+        (cl-letf (((symbol-function 'derived-mode-p)
+                   (lambda (&rest _) t)))
+          (should (equal (seshat-reader-reference--complete-link)
+                         '("ebook:m.pdf" "ebook:a.pdf" "ebook:z.pdf"))))))))
+
+(ert-deftest seshat-reader-reference-test--complete-link-returns-full-link ()
+  ":complete 处理函数返回带前缀的完整链接字符串（org 约定），不自行插入文本."
+  (cl-letf (((symbol-function 'seshat-reader-reference--complete-link)
+             (lambda () '("ebook:a.pdf" "ebook:b.pdf")))
+            ((symbol-function 'completing-read)
+             (lambda (&rest _) "ebook:b.pdf")))
+    (should (equal (seshat-reader-reference-complete-link)
+                   "seshat:ebook:b.pdf")))
+  (cl-letf (((symbol-function 'seshat-reader-reference--complete-link)
+             (lambda () nil))
+            ((symbol-function 'read-string)
+             (lambda (_prompt &optional initial &rest _) initial)))
+    (should (equal (seshat-reader-reference-complete-link) "seshat:"))))
+
+(ert-deftest seshat-reader-reference-test--org-registration-complete ()
+  "`seshat:' 的 `:complete' 参数为补全处理函数（org 已加载时生效）."
+  (require 'org nil t)
+  (should (eq (org-link-get-parameter "seshat" :complete)
+              #'seshat-reader-reference-complete-link)))
+
+;;; 尾部 `#' 归一（T14）
+
+(ert-deftest seshat-reader-reference-test--parse-link-trailing-hash ()
+  "尾部裸 `#' 的 location 归一为 nil，有 location 时原样返回."
+  (let ((parsed (seshat-reader-reference--parse-link "seshat:ebook:a.pdf#")))
+    (should (plist-member parsed :location))
+    (should-not (plist-get parsed :location))
+    (should (equal (plist-get parsed :doc-id) "ebook:a.pdf")))
+  (should (equal (plist-get
+                  (seshat-reader-reference--parse-link
+                   "seshat:ebook:a.pdf#page:3")
+                  :location)
+                 "page:3"))
+  (should-not (plist-get
+               (seshat-reader-reference--parse-link "seshat:ebook:a.pdf")
+               :location)))
+
+;;; 链接导出（`:export'，M12 T12）
+
+(ert-deftest seshat-reader-reference-test--export-link-uses-desc ()
+  "有 DESC 时各 FORMAT（含 nil）原样采用 DESC，且输出不含裸协议串."
+  (dolist (format '(html latex ascii md nil))
+    (let ((out (seshat-reader-reference-export-link
+                "ebook:a.pdf#page:3" "我的摘录描述" format)))
+      (should (stringp out))
+      (should (equal out "我的摘录描述"))
+      (should-not (string-match-p "seshat:" out))
+      (should-not (string-match-p "\\[\\[seshat:" out)))))
+
+(ert-deftest seshat-reader-reference-test--export-link-without-desc ()
+  "无 DESC（或空 DESC）时导出为「文件名 + 页号」，各 FORMAT 输出一致."
+  (dolist (format '(html latex ascii md nil))
+    ;; 带页号：与摘录块描述同源
+    (should (equal (seshat-reader-reference-export-link
+                    "ebook:a.pdf#page:3" nil format)
+                   "a.pdf 第 3 页"))
+    ;; 允许缺 `seshat:' 前缀
+    (should (equal (seshat-reader-reference-export-link
+                    "seshat:ebook:a.pdf#page:3" nil format)
+                   "a.pdf 第 3 页"))
+    ;; 无 location：只给文件名
+    (should (equal (seshat-reader-reference-export-link
+                    "ebook:a.pdf" nil format)
+                   "a.pdf"))
+    ;; 含 rect 的完整 location：描述只看页号
+    (should (equal (seshat-reader-reference-export-link
+                    "ebook:a.pdf#page:112;rect:50.00,100.00,545.00,140.00"
+                    nil format)
+                   "a.pdf 第 112 页")))
+  ;; 空串 DESC 视同无 DESC
+  (should (equal (seshat-reader-reference-export-link "ebook:a.pdf#page:3" "" 'html)
+                 "a.pdf 第 3 页")))
+
+(ert-deftest seshat-reader-reference-test--export-link-invalid-path-falls-back ()
+  "非法 path 退回原始 `seshat:<path>' 文本，不报错、不返回 nil."
+  (should (equal (seshat-reader-reference-export-link "#page:3" nil 'html)
+                 "seshat:#page:3"))
+  (should (equal (seshat-reader-reference-export-link "" nil 'latex)
+                 "seshat:"))
+  (should (equal (seshat-reader-reference-export-link nil nil 'ascii)
+                 "seshat:"))
+  ;; 三个必选实参之外的通信通道参数（org 传 info）也应被接受
+  (should (equal (seshat-reader-reference-export-link
+                  "ebook:a.pdf#page:3" nil 'html '(:ascii-links-to-notes t))
+                 "a.pdf 第 3 页")))
+
+;;; 插入位置（M12 T13）
+
+(defmacro seshat-reader-reference-test--with-org-buffer (content &rest body)
+  "在临时 org buffer 中插入 CONTENT 后执行 BODY.
+buffer 启用 `org-mode'，`point' 置 `point-min'，便于用 `search-forward' 定位。"
+  (declare (indent 1) (debug t))
+  `(with-temp-buffer
+     (insert ,content)
+     (org-mode)
+     (goto-char (point-min))
+     ,@body))
+
+(ert-deftest seshat-reader-reference-test--insert-position-default-is-end-of-file ()
+  "defcustom 默认值为 `end-of-file'（存量行为不变）."
+  (should (eq seshat-reader-reference-insert-position 'end-of-file))
+  (should (eq (default-value 'seshat-reader-reference-insert-position)
+              'end-of-file)))
+
+(ert-deftest seshat-reader-reference-test--insert-position-end-of-file ()
+  "`end-of-file' 与未知值都返回 `(point-max)'."
+  (with-temp-buffer
+    (insert "abc\ndef\n")
+    (should (= (seshat-reader-reference--insert-position 'end-of-file)
+               (point-max)))
+    (should (= (seshat-reader-reference--insert-position 'no-such-mode)
+               (point-max)))))
+
+(ert-deftest seshat-reader-reference-test--insert-position-point ()
+  "`point' 返回当前 `point'，且不移动光标."
+  (with-temp-buffer
+    (insert "abcdef\n")
+    (goto-char 3)
+    (should (= (seshat-reader-reference--insert-position 'point) 3))
+    (should (= (point) 3))))
+
+(ert-deftest seshat-reader-reference-test--insert-position-headline-last-subtree ()
+  "光标在最后一个 headline 正文内时返回该子树末尾（= `point-max'）."
+  (seshat-reader-reference-test--with-org-buffer "* 第一章\n正文一\n* 第二章\n正文二\n"
+    (search-forward "正文二")
+    (should (= (seshat-reader-reference--insert-position 'headline)
+               (point-max)))))
+
+(ert-deftest seshat-reader-reference-test--insert-position-headline-next-sibling ()
+  "光标在第一个 headline 正文内、后面还有同级 headline 时返回下一个 headline 起点之前."
+  (seshat-reader-reference-test--with-org-buffer "* 第一章\n正文一\n* 第二章\n正文二\n"
+    (search-forward "正文一")
+    (let ((expected (save-excursion
+                      (goto-char (point-min))
+                      (search-forward "* 第二章")
+                      (match-beginning 0))))
+      (should (= (seshat-reader-reference--insert-position 'headline)
+                 expected))
+      ;; 边界：插入点之前不应包含第二个 headline，之后不应包含第一段正文
+      (should (eq (char-after expected) ?*)))))
+
+(ert-deftest seshat-reader-reference-test--insert-position-headline-nested-subtree ()
+  "嵌套子标题属于当前子树 → 返回整个子树末尾（子标题之后）."
+  (seshat-reader-reference-test--with-org-buffer "* 甲\n正文甲\n** 甲子\n正文子\n* 乙\n正文乙\n"
+    (search-forward "正文甲")
+    (let ((expected (save-excursion
+                      (goto-char (point-min))
+                      (search-forward "* 乙")
+                      (match-beginning 0))))
+      (should (= (seshat-reader-reference--insert-position 'headline)
+                 expected)))))
+
+(ert-deftest seshat-reader-reference-test--insert-position-headline-no-headline ()
+  "buffer 内没有任何 headline 时回退 `(point-max)'."
+  (seshat-reader-reference-test--with-org-buffer "只有正文，没有标题\n"
+    (search-forward "正文")
+    (should (= (seshat-reader-reference--insert-position 'headline)
+               (point-max)))))
+
+(ert-deftest seshat-reader-reference-test--insert-position-headline-before-first ()
+  "光标在第一个 headline 之前时回退 `(point-max)'."
+  (seshat-reader-reference-test--with-org-buffer "前言\n* 第一章\n正文一\n"
+    ;; point 在 point-min（第一个 headline 之前）
+    (should (= (seshat-reader-reference--insert-position 'headline)
+               (point-max)))))
+
+(ert-deftest seshat-reader-reference-test--insert-position-headline-without-org ()
+  "org 不可用（`featurep' 桩为 nil）时 `headline' 回退 `(point-max)'."
+  (with-temp-buffer
+    (insert "* 第一章\n正文一\n* 第二章\n正文二\n")
+    (goto-char (point-min))
+    (search-forward "正文一")
+    (cl-letf (((symbol-function 'featurep)
+               (lambda (&rest _) nil)))
+      (should (= (seshat-reader-reference--insert-position 'headline)
+                 (point-max))))))
+
+(ert-deftest seshat-reader-reference-test--insert-position-headline-non-org-buffer ()
+  "org 已加载但 buffer 不是 org-mode 时 `headline' 回退 `(point-max)'."
+  (skip-unless (require 'org nil t))
+  ;; fundamental-mode 下星号行只是普通文本，不是 headline：不得按 org 规则解析
+  (with-temp-buffer
+    (insert "* 不是标题\n正文\n* 也不是标题\n")
+    (goto-char (point-min))
+    (search-forward "正文")
+    (should (featurep 'org))
+    (should-not (derived-mode-p 'org-mode))
+    (should (= (seshat-reader-reference--insert-position 'headline)
+               (point-max)))))
+
+;;; 插入位置接入写入函数（`--insert-into-file'）
+
+(ert-deftest seshat-reader-reference-test--insert-into-file-headline-position ()
+  "`insert-position' 为 `headline' 且目标有 visiting buffer 时插到子树末尾."
+  (let ((file (make-temp-file "seshat-ref-insert-head-" nil ".org")))
+    (unwind-protect
+        (progn
+          (with-temp-file file (insert "* 第一章\n正文一\n* 第二章\n正文二\n"))
+          (let ((buf (find-file-noselect file))
+                (seshat-reader-reference-insert-position 'headline))
+            (unwind-protect
+                (with-current-buffer buf
+                  (goto-char (point-min))
+                  (search-forward "正文一")
+                  (seshat-reader-reference--insert-into-file "插入块" file))
+              (kill-buffer buf)))
+          (let ((content (with-temp-buffer
+                           (insert-file-contents file)
+                           (buffer-string))))
+            ;; 插在第一章正文之后、第二个 headline 之前
+            (should (string-match-p "正文一\n插入块\n\\* 第二章" content))
+            (should-not (string-match-p "正文二\n插入块" content))))
+      (delete-file file))))
+
+(ert-deftest seshat-reader-reference-test--insert-into-file-point-mode-no-buffer ()
+  "`point' 模式但目标无 visiting buffer 时回退 `append-to-file'（不动用其它 buffer）."
+  (let ((file (make-temp-file "seshat-ref-insert-point-" nil ".org")))
+    (unwind-protect
+        (progn
+          (with-temp-file file (insert "既有\n"))
+          (should-not (find-buffer-visiting file))
+          (let ((seshat-reader-reference-insert-position 'point))
+            (seshat-reader-reference--insert-into-file "追加" file))
+          (should-not (find-buffer-visiting file))
+          (should (equal (with-temp-buffer
+                           (insert-file-contents file)
+                           (buffer-string))
+                         "既有\n追加\n")))
+      (delete-file file))))
 
 (provide 'seshat-reader-reference-test)
 ;;; seshat-reader-reference-test.el ends here

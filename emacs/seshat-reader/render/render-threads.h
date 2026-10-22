@@ -51,6 +51,14 @@ typedef struct
 	EmacsWinState *win_state;
 	CachedPage *cp;
 	DocPage *dp;
+
+	/* Snapshot of the highlight rectangles that belong to this page.
+	 * Copied out of DocState at submission time (see submit_render_job)
+	 * because DocState must not be read concurrently by the render
+	 * thread.  Owned by the job: freed together with the argument block
+	 * by free_draw_thread_args() in draw_page_thread(). */
+	Highlight *hl;
+	int hl_count;
 } DrawThreadArgs;
 
 extern ThreadPool g_thread_pool;

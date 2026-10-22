@@ -421,7 +421,8 @@
             ;; 新排版：首项自动选中，只有一行带 `▌' 选中标记（其余留空格占位，
             ;; 该列宽 `(ch 2)'——按 2 列测量的 `▌' 在 `(ch 1)' 里会被裁成空格）。
             (should (= 1 (seshat-reader-etaf-test--count-matches "▌" text)))
-            (should (string-match-p "▌ p\\.12" text)))
+            ;; `▌' 后是两个空格：页码列宽为 `(ch 2)'（见上一条注释）。
+            (should (string-match-p "▌  p\\.12" text)))
           (should (etaf-runtime-for-buffer buf)))
       (when (buffer-live-p buf)
         (kill-buffer buf)))))

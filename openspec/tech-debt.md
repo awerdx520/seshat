@@ -78,8 +78,10 @@
 - 本步只定义 PDF 的 `page:<n>;rect:…`；EPUB 约定（CFI vs `chapter:x`）仍待 M10.3。
 - 影响延伸（M11.4，2026-10-17）：`seshat:` 链接复用同一 location 约定，故 EPUB 的引用目前只能定位到**书**、定位不到章节/段落；待 M10.3 定稿后链接自动获得精确定位（解析端无需改动）。
 
-## 页面高亮缺口（M11.3，2026-10-16）
+## 页面高亮缺口（M11.3，2026-10-16）——已解决（M12，2026-10-22）
 - 批注在页面上无可视化，只能通过列表查看与跳页；需改 C 渲染器（另立里程碑）。
+- 解决：M12 在 C 渲染层绘制 `rect` 高亮——`draw_page_thread` 在反色之后、写 PNM 之前用 `fz_new_draw_device` + `fz_rectto` + `fz_fill_path` 绘制半透明矩形，复用页面同一 `ctm`（缩放/旋转自动对齐）；elisp 侧 `seshat-reader-annotation--apply-highlights` 按 `location` 的 `rect:` 段投喂。
+- 遗留：`ink:`（手写笔迹）段仍不显示，另见「Emacs 端仍不显示手写笔迹（`ink:` 段）」条目。
 
 ## 离线队列缺失（M11.3，2026-10-16）
 - REST 失败即报错，无本地暂存与重试。
@@ -134,29 +136,34 @@
 ## 队列写为无锁 read-modify-write（M11.6，2026-10-16）
 - 队列的 `-enqueue`/`-remove`/`-sync` 均为「读取 → 改内存 → 原子写回」，`--write` 只保证「不写坏文件」，**不保证「不丢更新」**：两个 Emacs 实例并发写同一队列文件时，后写会覆盖先写（单实例假设）。根治需文件锁（`lock-file`）或读回比较（CAS）；当前不做，仅记录。
 
-## `rect` 无高亮承载（M11.4，2026-10-17）
+## `rect` 无高亮承载（M11.4，2026-10-17）——已解决（M12，2026-10-22）
 - 影响：`seshat:` 链接与摘录可携带 `;rect:<x0>,<y0>,<x1>,<y1>`，但阅读器页面上没有任何矩形可视化，用户只能看到「第 n 页」。
 - 现状：页面高亮缺口与 M11.3 同源，需改 C 渲染器（另立里程碑）；当前 rect 仅作数据保留，为将来的高亮与精确定位留位。
+- 解决：同「页面高亮缺口（M11.3）」——C 层绘制 `rect` 半透明高亮，`seshat:` 链接与摘录携带的 `rect:` 段现在既有格式校验也有页面可视化。
 
-## `:complete` 未实现（M11.4，2026-10-17）
+## `:complete` 未实现（M11.4，2026-10-17）——已解决（M12，2026-10-22）
 - 影响：笔记里输入 `seshat:` 链接无法补全 doc-id / location，只能手写或从阅读器 `org-store-link` 存出。
 - 建议：`org-link-set-parameters "seshat"` 增 `:complete`，候选来自 `seshat-reader-annotation-roots` 下的文件清单（或 M7 的 uid 目录接口）；当前不在范围。
+- 解决：M12 T11 注册 `:complete`，候选来自 `seshat-reader-annotation-roots` 的文件清单（doc-id 形态，可选补 `#page:<n>`）；含 `#`/`%` 的文档名仍按既有约定报错（另见「含 `#`/`%` 的文档名不支持引用」）。
 
-## 摘录固定末尾插入（M11.4，2026-10-17）
+## 摘录固定末尾插入（M11.4，2026-10-17）——已解决（M12，2026-10-22）
 - 影响：`seshat-reader-reference-insert` 一律把摘录块**追加到目标笔记文件末尾**，不识别 headline/光标位置，长笔记中会越积越乱。
 - 建议：加目标定位（交互选 headline 或 `org-capture` 模板）；当前靠用户配置固定落点文件 + 事后整理规避。
+- 解决：M12 T13 新增 defcustom `seshat-reader-reference-insert-position`（`end-of-file` 默认 / `headline` / `point`）与纯函数 `seshat-reader-reference--insert-position`；`headline` 模式插到**当前子树末尾**（含子标题之后、下一个同级/更高级 headline 之前），无 visiting buffer 时回退 `append-to-file`。
 
 ## 含 `#`/`%` 的文档名不支持引用（M11.4，2026-10-17）
 - 影响：`doc-id`（`<标签>:<相对路径>`）含 `#` 或 `%` 时生成链接直接 `user-error`（提示重命名），这类电子书无法建立 `seshat:` 引用。
 - 理由：本实现刻意不做百分号转义（`url-hexify-string` 会转义 `:`/`/`，org 又对 `%` 二次转义）。根治需协议层引入转义或改用 uid 承载身份（M7）。
 
-## `:export` 未定制（M11.4，2026-10-17）
+## `:export` 未定制（M11.4，2026-10-17）——已解决（M12，2026-10-22）
 - 影响：导出（HTML/LaTeX 等）时 `seshat:` 链接走 org 默认行为，输出为无法点击的原始协议串。
 - 现状：本步只需要在 Emacs 内跳转，未注册 `:export`；将来如需导出阅读笔记，再补 `:export`（可导出为 `seshat:<doc-id>#<location>` 文本或转成脚注）。
+- 解决：M12 T12 注册 `:export`（`seshat-reader-reference-export-link`），输出「文件名 第 N 页」可读文本而非裸协议串；形态取「可读文本」不取 org 脚注——脚注会在表格/标题等受限上下文插入 `[fn:]` 引用并产生排版噪声，而该链接本身没有可跳转目标，纯文本更诚实。所有后端（`html` / `latex` / `ascii` / `md`）输出同一份纯文本，不生成假 URL。
 
-## `--parse-link` 对尾部 `#` 返回空串 location（M11.4，2026-10-17）
+## `--parse-link` 对尾部 `#` 返回空串 location（M11.4，2026-10-17）——已解决（M12，2026-10-22）
 - 影响：`seshat:ebook:a.pdf#` 解析出 `location` 为空串而非 nil，与「无 location」语义不一致（对称性小瑕疵）。
 - 现状：不影响功能（空串与 nil 在下游都当作「无 location」处理）；修法是把解析结果空串归一为 nil。
+- 解决：M12 T14 把解析结果的空串归一为 nil，`seshat:ebook:a.pdf#` 现返回 `location` = nil；ERT 覆盖该用例。
 
 ## 反向解析按 tag 精确匹配（M11.4，2026-10-17）
 - 影响：`seshat-reader-reference--file-from-doc-id` 用 doc-id 首段 tag 精确匹配 `seshat-reader-annotation-roots`，**同 tag 配置多个根时只取第一个**命中的根，可能解析到错误文件。
@@ -172,9 +179,10 @@
 - 建议：如需即时生效，可在设置后对已存在窗口调 `window-resize`；当前不做。
 - **部分缓解（M11.10，2026-10-18）**：译文/解释面板现由 `seshat-reader-sidebar--fit-height-for-content` 按内容自适应高度（上限 `seshat-reader-sidebar-max-height`），重新执行翻译/解释即自动贴合内容，无需重开；**批注列表仍需关闭再打开**才能应用新的固定高度。
 
-## 包内窗口语义不统一（M11.7，2026-10-17）
+## 包内窗口语义不统一（M11.7，2026-10-17）——已解决（M12，2026-10-22）
 - 影响：`seshat-reader-outline` 与 `seshat-reader-reference`（以及 M11.4 的 `:follow` 跳页）仍用 `pop-to-buffer`，不受 `seshat-reader-sidebar-enabled`/`position` 管辖；用户在不同命令间会遇到两套窗口行为。
 - 建议：后续把 outline/目录类 buffer 也接入 sidebar 承载层（需先确认 nav 类面板与阅读区的布局关系）。
+- 解决：M12 T4 把目录面板接入 `seshat-reader-sidebar-show`（`sidebar-show buf 'outline`，`sidebar-enabled` 为 nil 时由 `sidebar-show` 内部回退 `pop-to-buffer`），并新增 `seshat-reader-outline-sidebar-position`（默认 `left`）+ `C-c C-o` → `seshat-reader-sidebar-toggle-outline`。目录、批注、译文现同受 sidebar 承载层管辖（三栏 side window 共存）。
 
 ## `seshat-reader-sidebar-toggle` 无法重开译文面板（M11.7，2026-10-17）——已解决（M11.10，2026-10-18）
 - 原因（历史）：译文由 gt 自行 `display-buffer`，不经过 `sidebar-show`，故不记录 `--last-kind=translate`；`toggle` 只能在批注面板上往返。
@@ -840,4 +848,62 @@
 - 影响：与成熟阅读器的「全屏沉浸」相比，顶部仍留一条系统状态栏（时间 / 电量 / 通知图标），可用高度少一条状态栏；且状态栏图标颜色可能与阅读背景对比不足（深色主题下尤其）。功能上无影响，属「沉浸感差一口气」的体验缺口。
 - 建议：接入 `WindowCompat.getInsetsController(window, window.decorView).hide(WindowInsetsCompat.Type.systemBars())` + `systemBarsBehavior = BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE`，并处理三件事：① 浮层显示时应否恢复系统栏（阅读器习惯：浮层出现时状态栏一起回来，否则顶栏贴不到屏幕顶端）；② insets 变化会让 `applyContentPadding()` 重算，需复验「显隐浮层不漂移」（§6.3 的幂等闸）；③ 与既有 edge-to-edge（`targetSdk 35`）的 insets 监听合并，避免两套逻辑互相覆盖。
 - 触发条件：用户反馈「阅读时想看全屏」或做阅读器沉浸体验专项时。
+
+
+## 目录折叠符号不与 TAB 联动（M12 T5，2026-10-22）
+- 现状：目录面板每次 `show` 都按 `seshat-reader-current-doc-outline` 重建，行模型 `seshat-reader-outline--rows` 的 `collapsed` 集合恒传 `nil`，于是所有有子节点的行恒显示展开符号 `▾`。buffer 内的 `TAB` 折叠走 `outline-mode` 自身的不可见性（`outline-hide-subtree`），不改动行模型、也不重绘面板，因此用户 TAB 折叠后符号仍停在 `▾`。
+- 影响：仅视觉误导——折叠功能本身正常（正文确实隐去），但符号不随状态变化，用户容易误以为折叠失败或符号只是装饰。不影响跳转、当前章高亮与页码对齐。
+- 建议：二选一——① 把折叠态（行路径集合，与 `--rows` 的 `collapsed` 元素同构）持久化到 buffer-local 变量，在每次 `show` 重建时传给 `--rows`，重建后按集合恢复符号；② 不改行模型，改为渲染后用 `outline-invisible-p` 动态判定并就地更新折叠符号的显示属性（需要重建符号文本或用 overlay，注意别破坏 `outline-regexp` 的星号前缀）。推荐 ①，与「折叠态集合恒为 nil」的既有接口天然契合。
+- 触发条件：用户反馈「TAB 折叠后 ▾ 不变」，或下次改目录面板折叠/刷新逻辑时。
+
+## Emacs 端仍不显示手写笔迹（`ink:` 段）（M12 T10，2026-10-22）
+- 现状：`seshat-reader-annotation--rects-from-location` 只解析 `rect:` 段，`ink:`（手写笔迹）段被显式忽略，页面高亮只覆盖批注矩形；服务端其余端已能返回 ink 形态的 location。
+- 影响：在移动端用笔迹标注过的批注，桌面端仍看不到笔迹轮廓，只看到列表里的摘要文字；用户需要在两端来回切换才能理解标注指向的位置。
+- 建议：C 层把 `ink:` 的折线点集转成 `fz_path`（polyline，`fz_stroke_path` 而非 fill），elisp 侧新增 `--ink-from-location` 解析并把点集按页喂入（与 `--add-highlight` 同形的新模块函数 `--add-ink`），共用 `--refresh-highlights` 的缓存失效路径。
+- 触发条件：用户反馈「手机上手写的批注在桌面看不到」，或做批注跨端一致性专项时。
+
+## 高亮颜色与透明度不可配置（M12 T10，2026-10-22）
+- 现状：高亮颜色与透明度是 `render/render-core.c` 的编译期常量（`HIGHLIGHT_COLOR_R/G/B` = 1.0/0.85/0.0、`HIGHLIGHT_ALPHA` = 0.35），elisp 侧只暴露开关 `seshat-reader-annotation-highlight-enabled`，无法按主题调整颜色。
+- 影响：暗色页（反色后）与彩色页面上的黄色半透明高亮可读性不同，用户无法按偏好调整；计划 D3 里提到的「颜色/透明度配置」本期未落地。
+- 建议：新增 0 参以外形态的模块函数 `seshat-reader-dyn--set-highlight-style (r g b alpha)`（写入 `DocState` 并置 `highlights_dirty`），elisp 侧加 defcustom `seshat-reader-annotation-highlight-color`（`(R G B)` 浮点三元组）与 `-highlight-alpha`，在 `--apply-highlights` 的 refresh 前同步一次。
+- 触发条件：用户反馈高亮看不清（尤其暗色模式），或做主题适配专项时。
+
+## `is_reloading` 跨线程非原子读（M12 审查，2026-10-22）
+- 现状：`render/render-core.h` 的 `bool is_reloading` 由主线程写（`emacs_load_doc` / `emacs_close_doc` 置 `true`），渲染线程 `draw_page_thread` 读，两边都没有原子操作或锁。C11 意义上属数据竞争（UB），x86-64 实践上可工作。同文件的 `highlights_dirty` 只在主线程读写（投喂与 refresh 都在主线程），不存在该问题。非 M12 引入。
+- 影响：当前平台观察不到故障；换弱内存序架构或编译器做激进优化时，可能出现「渲染线程读到陈旧的 false，继续渲染即将被释放的文档」。
+- 建议：改成 `atomic_bool`（`atomic_load` / `atomic_store`，与同文件 `doc_pages[i].refcount`、`active_jobs` 的既有风格一致），或至少在字段上注明「仅主线程写、渲染线程只读、依赖 x86-64 强序」。
+- 触发条件：改动渲染线程生命周期、换目标架构，或做 C 层并发专项时。
+
+## MuPDF 对超大矩形是否内部裁剪未确认（M12 审查，2026-10-22）
+- 现状：`rect_to_page_space` 已加 ±1e6 点的绝对幅值上限（`HIGHLIGHT_MAX_ABS_COORD`），但 MuPDF 1.28.5 源码不在本机，无法代码级确认 draw device 对超大坐标（如 1e6 × 1e6 的填充）究竟是内部裁剪、还是按像素面积分配临时缓冲。
+- 影响：当前靠上限兜底——1e6 点远超任何真实页面（A0 约 3400 点），经 `fz_transform_page` 的 ctm 缩放后仍在安全范围；但没有源码级证据说明「超上限区域会被 MuPDF 丢弃而非扩张」。
+- 建议：升级 MuPDF 后复核 `fz_fill_path` / draw device 的 bbox 处理（`source/fitz/draw-device.c` 的 `fz_fill_path` → `fz_scan_convert`），确认超大路径的裁剪点；若发现按面积分配，则在 C 层把 rect 先与 `fz_bound_page` 求交再绘制。
+- 触发条件：升级 MuPDF 版本，或出现与高亮相关的 OOM / 卡顿报告时。
+
+## 目录行模型假定页号单调递增（M12 审查，2026-10-22）
+- 现状：`seshat-reader-outline--current-path` 以「前序节点里页号 ≤ current 的最后一个」判定当前章，隐含假设 outline 页号单调不减。PDF 规范允许 outline 跳转乱序，MuPDF 也不排序，乱序目录下当前章标记可能指向错误节点。
+- 影响：仅影响目录面板的当前章高亮（视觉误导），不影响跳转本身——`RET` 跳到的是各行自己的页号。
+- 建议：在 `--current-path` 里做一次单调性检测（遍历行，出现 `page < 前一个 page` 即判非单调），非单调时降级为不标记当前章。补一条 ERT：乱序 outline 下 `--current-path` 返回 nil 而非错节点。
+- 触发条件：遇到乱序目录的文档，或下次改目录当前章逻辑时。
+
+## `submit_job` 的 malloc 未检查（M12 审查，2026-10-22）
+- 现状：`render/render-threads.c` 的 `submit_job` 对 `malloc` 返回值未判空即解引用，内存耗尽时 NULL 解引用崩溃。M12 在 `submit_render_job` 内增加第二处 `malloc`（每页高亮快照），提高了触发概率（快照失败本身已优雅处理，返回 false）。
+- 影响：低概率但后果严重（崩溃而非降级），且发生在渲染路径上，用户只会看到 Emacs 进程消失。
+- 建议：`submit_job` 内对 `malloc` 判空，失败时返回 false，由调用方把该 CachedPage 置 `PAGE_STATUS_ERROR`（已有 `mark_cp_error` 可用），让渲染失败降级为错误页而不是崩溃。
+- 触发条件：内存紧张环境，或下次改 job 提交路径时。
+
+## 旋转页的 rect 采不准导致高亮可能错位（M12，2026-10-22）
+- 现状：`seshat-reader-select.el` 的选区取文**明确不支持旋转页**（`docs/api.md` §4.5 已把「不支持已旋转页面」写进 `location` 约定：页面旋转状态存于客户端渲染器内部，约定无法表达，旋转页上采集的坐标**静默错误**）。M12 的高亮按 `rect` 在 C 层按页面 `ctm` 绘制——`ctm` 含 `rotate`/缩放，而 `rect` 本身是「未旋转页面坐标」，两者对同一个 `rect` 的解释在旋转页上不一致。
+- 影响：旋转页上的批注高亮位置可能偏移（数据本身已错，渲染忠实反映了错的数据）；不旋转的页无此问题。
+- 建议：二选一——① 旋转页禁用高亮（渲染/投喂时按当前 `rotate` 跳过该页，用 `DocState` 或模块函数暴露的 `rotate` 判定）；② 让 C 暴露当前 `rotate` / `frame_scale` 供 elisp 侧先做坐标校正再投喂。②的收益更大（顺带修好 `location` 采集本身），但需要先在选区采集端对齐同一变换。
+
+## 高亮刷新与 strip 缓存的多窗口局限（M12，2026-10-22）
+- 现状：① `--refresh-highlights` 只重建**当前窗口**的 ±5 页缓存（`wait_for_win_jobs` → `nullify_window_cache` → `build_cache_window` → `display_cached_page`，均以当前 `EmacsWinState` 为作用域），同文档的其它窗口在各自下次 redisplay 前仍显示旧位图；② 跨页 strip 用的上一页 image spec 缓存 `seshat-reader--page-image-specs` 是 **buffer 级** `defvar-local`（上限 5 条），而记录时页号取「当前选中窗口」显示的页——多窗口显示同一文档的不同页时，strip 取到的「上一页」可能与自身窗口的上一页不符。
+- 影响：**仅多窗口场景**（同一 PDF 在两个窗口并排对照）。单窗口下两条局限都观察不到。
+- 建议：①刷新时遍历同 buffer 的全部窗口（`get-buffer-window-list`）逐个失效并重建，或至少对其它窗口打「高亮已过期」标记，在其 redisplay 时强制重建；②把 spec 缓存改为按窗口维度（`window-parameter` 或 `(window . page)` 为键的 alist），而不是 buffer 级。
+
+## 缩放/旋转后 strip 的上一页 spec 是旧尺寸（M12，2026-10-22）
+- 现状：`seshat-reader--page-image-specs` 缓存的是**页面已显示时**的 image spec（含当时的像素尺寸），缩放（`seshat-reader-increase-size` / `fit-to-width` / `fit-to-height`）或旋转后只重渲染当前页，**不清空该缓存**；strip 按缓存的旧图像尺寸裁取，再以 `:slice` 插到新尺寸的当前页之前。
+- 影响：缩放后跨页 strip 的高度/内容与新页不匹配（旧尺寸的底部若干行被拉成固定像素高，比例与当前页不一致），旋转后同理；关掉 `seshat-reader-page-join-lines`（设 0）可规避。
+- 建议：在缩放/旋转/重排尺寸的入口统一清空 `seshat-reader--page-image-specs`（或按新尺寸重新 `--remember-current-page-spec`），并保证下一次「上一页」可见时重建缓存；补一条 ERT 断言「缩放后缓存为空/尺寸已更新」。
 

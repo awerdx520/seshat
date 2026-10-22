@@ -18,6 +18,8 @@
 #include "render-core.h"
 #include "elisp-helpers.h"
 #include "emacs-module.h"
+#include <limits.h>
+#include <math.h>
 #include "mupdf-helpers.h"
 #include "render-theme.h"
 #include "render-threads.h"
@@ -25,6 +27,106 @@
 int plugin_is_GPL_compatible;
 
 pthread_mutex_t g_mupdf_mutex[FZ_LOCK_MAX];
+
+/* Highlight tuning: a yellow wash at ~35% opacity.  Highlights are
+ * composited onto the page pixmap *after* the optional luminance
+ * inversion, so one colour works on light and dark pages alike. */
+#define HIGHLIGHT_COLOR_R 1.0f
+#define HIGHLIGHT_COLOR_G 0.85f
+#define HIGHLIGHT_COLOR_B 0.0f
+#define HIGHLIGHT_ALPHA 0.35f
+
+/* Hard ceilings on what one document may accumulate.  They exist so that
+ * a hostile or corrupted annotation source cannot exhaust memory: the
+ * table is fed in bulk from Elisp, one rectangle per call, and nothing
+ * upstream bounds the number of calls.  Both limits are silent — a
+ * rejected entry is simply not stored, because aborting a bulk feed over
+ * one bogus annotation would also lose all the valid ones. */
+#define HIGHLIGHT_MAX_COUNT 100000	   /* entries per document */
+#define HIGHLIGHT_MAX_ABS_COORD 1000000.0f /* PDF points, per corner */
+
+/**
+ * Convert an Emacs-facing rectangle into ordered MuPDF page space.
+ *
+ * The API contract (docs/api.md) says rect corners are page coordinates
+ * (PDF points) whose origin is the top-left corner of the page with the
+ * y axis growing downwards.  MuPDF's page space — the space of
+ * `fz_bound_page', of display lists and of structured-text quads — uses
+ * that same orientation, and `fz_transform_page' maps it onto the (also
+ * y-down) pixmap space.  No axis flip is therefore needed: painting a
+ * highlight with the very ctm that rasterized the page aligns it by
+ * construction.  This helper only rejects non-finite corners and
+ * normalises the corner order, and it is shared by
+ * `emacs_text_in_rect' and `draw_page_thread' so the two entry points
+ * cannot drift apart.
+ *
+ * @param x0, y0, x1, y1  Corners as received from Elisp.
+ * @param out             Receives the normalised rectangle on success.
+ * Return:                true when the rectangle is usable.
+ */
+
+static bool
+rect_to_page_space(float x0, float y0, float x1, float y1, fz_rect *out)
+{
+	if (!out)
+		return false;
+
+	/* Reject non-finite corners first: fz_is_valid_rect() only compares
+	 * coordinates and treats NaN comparisons as false, so an infinity
+	 * would otherwise be accepted (see <mupdf/fitz/geometry.h>). */
+	if (!isfinite(x0) || !isfinite(y0) || !isfinite(x1) || !isfinite(y1))
+		return false;
+
+	/* Bound the absolute magnitude as well.  Non-finite values are gone
+	 * at this point, but a finite-yet-absurd corner (1e30) would still
+	 * reach MuPDF, whose internal clipping for such rectangles is not
+	 * guaranteed.  No real page comes close: even an A0 poster is about
+	 * 3400 points across, so 1e6 leaves three orders of magnitude of
+	 * headroom while keeping every intermediate product in float range. */
+	if (fabsf(x0) > HIGHLIGHT_MAX_ABS_COORD
+	    || fabsf(y0) > HIGHLIGHT_MAX_ABS_COORD
+	    || fabsf(x1) > HIGHLIGHT_MAX_ABS_COORD
+	    || fabsf(y1) > HIGHLIGHT_MAX_ABS_COORD)
+		return false;
+
+	/* Normalise the diagonal *before* validating it: callers may hand us
+	 * the bottom-right corner first, and fz_is_valid_rect() rejects such
+	 * a pair (it requires x0 <= x1 && y0 <= y1 — see
+	 * <mupdf/fitz/geometry.h>), which would make a reversed rule or a
+	 * reversed annotation rect silently unusable.  Zero-area rects stay
+	 * "valid" here on purpose; each caller drops them separately. */
+	fz_rect corners;
+	corners.x0 = x0 < x1 ? x0 : x1;
+	corners.y0 = y0 < y1 ? y0 : y1;
+	corners.x1 = x0 < x1 ? x1 : x0;
+	corners.y1 = y0 < y1 ? y1 : y0;
+
+	if (!fz_is_valid_rect(corners))
+		return false;
+
+	out->x0 = corners.x0;
+	out->y0 = corners.y0;
+	out->x1 = corners.x1;
+	out->y1 = corners.y1;
+
+	return true;
+}
+
+/**
+ * Free a render job's argument block together with the per-page
+ * highlight snapshot it owns.  Every exit path of `draw_page_thread'
+ * must release both through this helper.
+ */
+
+static void
+free_draw_thread_args(DrawThreadArgs *args)
+{
+	if (!args)
+		return;
+
+	free(args->hl);
+	free(args);
+}
 
 /**
  * Load and cache the display list for a page.
@@ -113,7 +215,7 @@ draw_page_thread(void *arg)
 
 	if (!doc_state || !win_state || !cp || !dp)
 		{
-			free(args);
+			free_draw_thread_args(args);
 			return NULL;
 		}
 
@@ -127,7 +229,7 @@ draw_page_thread(void *arg)
 			atomic_fetch_sub(&doc_state->active_jobs, 1);
 			atomic_fetch_sub(&win_state->active_jobs, 1);
 
-			free(args);
+			free_draw_thread_args(args);
 			return NULL;
 		}
 
@@ -140,7 +242,7 @@ draw_page_thread(void *arg)
 			release_doc_page(doc_state, dp);
 			atomic_fetch_sub(&doc_state->active_jobs, 1);
 			atomic_fetch_sub(&win_state->active_jobs, 1);
-			free(args);
+			free_draw_thread_args(args);
 			return NULL;
 		}
 
@@ -151,7 +253,7 @@ draw_page_thread(void *arg)
 			release_doc_page(doc_state, dp);
 			atomic_fetch_sub(&doc_state->active_jobs, 1);
 			atomic_fetch_sub(&win_state->active_jobs, 1);
-			free(args);
+			free_draw_thread_args(args);
 			return NULL;
 		}
 
@@ -170,6 +272,10 @@ draw_page_thread(void *arg)
 	if (frame_scale <= 0.0f)
 		frame_scale = 1.0f;
 
+	/* Colour used to wash the highlight rectangles onto the pixmap. */
+	float highlight_color[3] = { HIGHLIGHT_COLOR_R, HIGHLIGHT_COLOR_G,
+				     HIGHLIGHT_COLOR_B };
+
 	fz_try(ctx)
 		{
 			pixmap = fz_new_pixmap_from_display_list(ctx, dp->display_list,
@@ -179,6 +285,59 @@ draw_page_thread(void *arg)
 				{
 					fz_invert_pixmap_luminance(ctx, pixmap);
 					fz_gamma_pixmap(ctx, pixmap, 1 / 1.4f);
+				}
+
+			/* Wash this page's highlight rectangles over the
+			 * rasterized page.  The order matters: the
+			 * inversion above must already be done, otherwise
+			 * the highlight colour would be inverted too, and
+			 * the PNM encoding below must see the result.
+			 * All rectangles go into one path filled once, so
+			 * overlapping highlights keep a uniform alpha
+			 * instead of stacking up. */
+			if (args->hl_count > 0)
+				{
+					fz_device *dev = NULL;
+					fz_path *path = NULL;
+
+					fz_try(ctx)
+						{
+							dev = fz_new_draw_device(
+								ctx, ctm, pixmap);
+							path = fz_new_path(ctx);
+
+							for (int i = 0;
+							     i < args->hl_count; ++i)
+								{
+									fz_rectto(
+										ctx, path,
+										args->hl[i].x0,
+										args->hl[i].y0,
+										args->hl[i].x1,
+										args->hl[i].y1);
+								}
+
+							fz_fill_path(
+								ctx, dev, path,
+								0 /* non-zero winding */,
+								ctm,
+								fz_device_rgb(ctx),
+								highlight_color,
+								HIGHLIGHT_ALPHA,
+								fz_default_color_params);
+
+							fz_close_device(ctx, dev);
+						}
+					fz_always(ctx)
+						{
+							fz_drop_path(ctx, path);
+							fz_drop_device(ctx, dev);
+						}
+					fz_catch(ctx)
+						{
+							/* Highlights are decorative:
+							 * never fail the page for them. */
+						}
 				}
 
 			local_imgh = (int)(fz_pixmap_height(ctx, pixmap) / frame_scale);
@@ -214,7 +373,7 @@ draw_page_thread(void *arg)
 			release_doc_page(doc_state, dp);
 			atomic_fetch_sub(&doc_state->active_jobs, 1);
 			atomic_fetch_sub(&win_state->active_jobs, 1);
-			free(args);
+			free_draw_thread_args(args);
 			return NULL;
 		}
 
@@ -229,7 +388,7 @@ draw_page_thread(void *arg)
 			release_doc_page(doc_state, dp);
 			atomic_fetch_sub(&doc_state->active_jobs, 1);
 			atomic_fetch_sub(&win_state->active_jobs, 1);
-			free(args);
+			free_draw_thread_args(args);
 			return NULL;
 		}
 
@@ -259,7 +418,7 @@ draw_page_thread(void *arg)
 	atomic_fetch_sub(&doc_state->active_jobs, 1);
 	atomic_fetch_sub(&win_state->active_jobs, 1);
 
-	free(args);
+	free_draw_thread_args(args);
 	return NULL;
 }
 
@@ -1291,32 +1450,22 @@ emacs_text_in_rect(emacs_env *env, ptrdiff_t nargs, emacs_value *args,
 			return EMACS_NIL;
 		}
 
-	/* Reject non-finite corners before normalizing the rectangle.
-	 * fz_is_empty_rect() only compares coordinates and treats every
-	 * comparison against a NaN as false, so a NaN rectangle would be
-	 * classified as non-empty and would wrongly match every character
-	 * on the page.  fz_is_valid_rect() requires x0 <= x1 and y0 <= y1,
-	 * which is false as soon as any corner is NaN (see
-	 * <mupdf/fitz/geometry.h>). */
-	fz_rect corners;
-	corners.x0 = ax;
-	corners.y0 = ay;
-	corners.x1 = bx;
-	corners.y1 = by;
+	/* Validate and normalize the rectangle through the same helper the
+	 * highlight painter uses, so both entry points share one notion of
+	 * page space (see rect_to_page_space).
+	 *
+	 * Rejecting non-finite corners matters here: fz_is_empty_rect()
+	 * treats every comparison against a NaN as false, so a NaN
+	 * rectangle would otherwise be classified as non-empty and would
+	 * wrongly match every character on the page. */
+	fz_rect rect;
 
-	if (!fz_is_valid_rect(corners))
+	if (!rect_to_page_space(ax, ay, bx, by, &rect))
 		{
 			emacs_message(env,
-				      "Invalid rectangle: coordinates must be finite and ordered.");
+				      "Invalid rectangle: coordinates must be finite.");
 			return EMACS_NIL;
 		}
-
-	/* Normalize the rectangle so that x0 < x1 and y0 < y1. */
-	fz_rect rect;
-	rect.x0 = ax < bx ? ax : bx;
-	rect.y0 = ay < by ? ay : by;
-	rect.x1 = ax < bx ? bx : ax;
-	rect.y1 = ay < by ? by : ay;
 
 	fz_context *ctx = fz_clone_context(doc_state->ctx);
 	if (!ctx)
@@ -1408,6 +1557,290 @@ emacs_text_in_rect(emacs_env *env, ptrdiff_t nargs, emacs_value *args,
 	return result;
 }
 
+/**
+ * grow_highlight_table - Make room for at least NEED highlight entries.
+ *
+ * Doubles the capacity (starting from 16) so that feeding a whole
+ * document's annotations costs amortised constant time per entry.
+ *
+ * @param doc_state  DocState owning the table.
+ * @param need       Required number of entries.
+ * Return:           true when the table can hold NEED entries.
+ */
+
+static bool
+grow_highlight_table(DocState *doc_state, int need)
+{
+	if (!doc_state || need <= 0)
+		return false;
+
+	if (need <= doc_state->highlight_cap)
+		return true;
+
+	int cap = doc_state->highlight_cap > 0 ? doc_state->highlight_cap : 16;
+
+	/* Grow by doubling, but stop the doubling before it can overflow an
+	 * int: past INT_MAX / 2 one more `cap *= 2' would be undefined
+	 * behaviour.  Jumping straight to NEED keeps the table usable (a
+	 * caller that lands here is already at the practical ceiling, since
+	 * HIGHLIGHT_MAX_COUNT keeps NEED far below it). */
+	while (cap < need)
+		{
+			if (cap > INT_MAX / 2)
+				{
+					cap = need;
+					break;
+				}
+
+			cap *= 2;
+		}
+
+	Highlight *grown
+		= realloc(doc_state->highlights, (size_t)cap * sizeof(Highlight));
+
+	if (!grown)
+		return false;
+
+	doc_state->highlights = grown;
+	doc_state->highlight_cap = cap;
+
+	return true;
+}
+
+/**
+ * extract_float_coerced - Read an Elisp number as a float.
+ *
+ * `extract_float' only accepts floats and signals on integers, while the
+ * Elisp side naturally writes `(add-highlight 1 10 10 100 40)' with
+ * integer literals.  Coerce through the `float' builtin instead of
+ * forcing every caller to spell out `10.0'.  A non-numeric argument is
+ * swallowed (the pending signal is cleared) so that one bogus annotation
+ * cannot abort a bulk feed.
+ *
+ * @param env    Emacs module environment.
+ * @param value  Elisp value to read.
+ * @param out    Receives the float value on success.
+ * Return:       true when VALUE was a number.
+ */
+
+static bool
+extract_float_coerced(emacs_env *env, emacs_value value, float *out)
+{
+	if (!env || !out)
+		return false;
+
+	emacs_value coerced
+		= env->funcall(env, env->intern(env, "float"), 1, &value);
+
+	if (env->non_local_exit_check(env) != emacs_funcall_exit_return)
+		{
+			env->non_local_exit_clear(env);
+			return false;
+		}
+
+	*out = env->extract_float(env, coerced);
+
+	if (env->non_local_exit_check(env) != emacs_funcall_exit_return)
+		{
+			env->non_local_exit_clear(env);
+			return false;
+		}
+
+	return true;
+}
+
+/**
+ * emacs_add_highlight - Record one highlight rectangle for a page.
+ *
+ * PAGE is 1-based, matching the elisp side; DocState keeps pages 0-based,
+ * hence the decrement below.  Out-of-range pages and unusable rectangles
+ * are ignored silently — a stale or half-parsed annotation must not abort
+ * a bulk feed.  Storing a rectangle only marks the document dirty: the
+ * bitmap is not re-rendered here, the caller is expected to batch its
+ * updates and then call `seshat-reader-dyn--refresh-highlights'.
+ *
+ * @param env    Emacs module environment.
+ * @param nargs  Number of Elisp args (5).
+ * @param args   Elisp arguments: page, x0, y0, x1, y1.
+ * @param data   Additional data (unused).
+ * Return:       Elisp `t' when the rectangle was stored, `nil' otherwise.
+ */
+
+emacs_value
+emacs_add_highlight(emacs_env *env, ptrdiff_t nargs, emacs_value *args,
+		    void *data)
+{
+	(void)data;
+
+	DocState *doc_state = get_doc_state_ptr(env);
+
+	if (!doc_state || doc_state->is_reloading || nargs < 5)
+		return EMACS_NIL;
+
+	if (doc_state->pagecount <= 0)
+		return EMACS_NIL;
+
+	float page_f = 0.0f;
+	float x0 = 0.0f, y0 = 0.0f, x1 = 0.0f, y1 = 0.0f;
+
+	if (!extract_float_coerced(env, args[0], &page_f)
+	    || !extract_float_coerced(env, args[1], &x0)
+	    || !extract_float_coerced(env, args[2], &y0)
+	    || !extract_float_coerced(env, args[3], &x1)
+	    || !extract_float_coerced(env, args[4], &y1))
+		return EMACS_NIL;
+
+	/* Elisp speaks 1-based page numbers, DocState stores 0-based ones.
+	 * The range check happens in float space so that NaN, infinities and
+	 * absurd values are rejected before the integer cast. */
+	if (!(page_f >= 1.0f && page_f <= (float)doc_state->pagecount))
+		return EMACS_NIL;
+
+	/* The cast below truncates towards zero, so a fractional page number
+	 * would silently land on the page before it.  Require an integral
+	 * value instead of guessing what the caller meant. */
+	if (page_f != floorf(page_f))
+		return EMACS_NIL;
+
+	/* Refuse to grow without bound.  Storing nothing is the friendlier
+	 * failure here: the entries already held stay valid, and the caller
+	 * keeps its document rather than getting an error mid-feed. */
+	if (doc_state->highlight_count >= HIGHLIGHT_MAX_COUNT)
+		return EMACS_NIL;
+
+	int page = (int)page_f - 1;
+
+	fz_rect rect;
+
+	if (!rect_to_page_space(x0, y0, x1, y1, &rect))
+		return EMACS_NIL;
+
+	/* A zero-area rectangle would be invisible; drop it. */
+	if (rect.x1 <= rect.x0 || rect.y1 <= rect.y0)
+		return EMACS_NIL;
+
+	if (!grow_highlight_table(doc_state, doc_state->highlight_count + 1))
+		return EMACS_NIL;
+
+	Highlight *hl = &doc_state->highlights[doc_state->highlight_count];
+
+	hl->page = page;
+	hl->x0 = rect.x0;
+	hl->y0 = rect.y0;
+	hl->x1 = rect.x1;
+	hl->y1 = rect.y1;
+
+	doc_state->highlight_count += 1;
+	doc_state->highlights_dirty = true;
+
+	return EMACS_T;
+}
+
+/**
+ * emacs_clear_highlights - Drop every highlight of the current document.
+ *
+ * Frees the table and marks the document dirty; like
+ * `seshat-reader-dyn--add-highlight' it does not re-render anything, the
+ * caller triggers that through `seshat-reader-dyn--refresh-highlights'.
+ *
+ * @param env    Emacs module environment.
+ * @param nargs  Number of Elisp args (ignored).
+ * @param args   Elisp arguments (ignored).
+ * @param data   Additional data (unused).
+ * Return:       Elisp `t' on success, `nil' when no document is loaded.
+ */
+
+emacs_value
+emacs_clear_highlights(emacs_env *env, ptrdiff_t nargs, emacs_value *args,
+		       void *data)
+{
+	(void)nargs;
+	(void)args;
+	(void)data;
+
+	DocState *doc_state = get_doc_state_ptr(env);
+
+	if (!doc_state)
+		return EMACS_NIL;
+
+	free(doc_state->highlights);
+	doc_state->highlights = NULL;
+	doc_state->highlight_count = 0;
+	doc_state->highlight_cap = 0;
+	doc_state->highlights_dirty = true;
+
+	return EMACS_T;
+}
+
+/**
+ * emacs_refresh_highlights - Re-render the page with the current
+ * highlights.
+ *
+ * Adding or clearing highlights deliberately does not repaint: those
+ * functions receive one rectangle at a time and can be called in bulk,
+ * while every repaint re-rasterizes the whole ±5 page cache window.  The
+ * caller therefore batches its mutations and asks for a single refresh.
+ *
+ * The sequence mirrors `emacs_redisplay_doc' step by step — wait for this
+ * window's in-flight render jobs, nullify the cache window, rebuild it
+ * around the current page and display the result — which is known to be
+ * safe to invoke from Elisp: it runs on the Emacs main thread and never
+ * runs concurrently with a render job of the same window.
+ *
+ * @param env    Emacs module environment.
+ * @param nargs  Number of Elisp args (ignored).
+ * @param args   Elisp arguments (ignored).
+ * @param data   Additional data (unused).
+ * Return:       Elisp `t' on success, `nil' on failure.
+ */
+
+emacs_value
+emacs_refresh_highlights(emacs_env *env, ptrdiff_t nargs, emacs_value *args,
+			 void *data)
+{
+	(void)nargs;
+	(void)args;
+	(void)data;
+
+	DocState *doc_state = NULL;
+	EmacsWinState *win_state = NULL;
+	emacs_value overlay = EMACS_NIL;
+
+	if (!get_reader_current_state(env, &doc_state, &win_state, &overlay))
+		return EMACS_NIL;
+
+	if (doc_state->pagecount <= 0)
+		return EMACS_NIL;
+
+	/* Nothing changed since the last refresh: skip the re-render. */
+	if (!doc_state->highlights_dirty)
+		return EMACS_T;
+
+	wait_for_win_jobs(win_state);
+	nullify_window_cache(win_state);
+	build_cache_window(doc_state, win_state,
+			   win_state->current_page_number);
+
+	CachedPage *cp = win_state->current_cached_page;
+
+	if (!wait_for_cached_page(cp))
+		{
+			emacs_message(env, "Failed to render the page.");
+			return EMACS_NIL;
+		}
+
+	if (!display_cached_page(env, cp, overlay))
+		{
+			emacs_message(env, "Failed to display the rendered page.");
+			return EMACS_NIL;
+		}
+
+	doc_state->highlights_dirty = false;
+	set_current_render_status(env);
+
+	return EMACS_T;
+}
+
 // Entrypoint for the dynamic module
 int
 emacs_module_init(struct emacs_runtime *runtime)
@@ -1489,6 +1922,25 @@ emacs_module_init(struct emacs_runtime *runtime)
 			     "seshat-reader-dyn--text-in-rect", 5, 5,
 			     "Extracts the text intersecting the rectangle "
 			     "(X0 Y0 X1 Y1) on PAGE, in page coordinates.");
+
+	register_module_func(env, emacs_add_highlight,
+			     "seshat-reader-dyn--add-highlight", 5, 5,
+			     "Adds a highlight rectangle (X0 Y0 X1 Y1) on "
+			     "PAGE (1-based), in page coordinates. Call "
+			     "seshat-reader-dyn--refresh-highlights to make "
+			     "it visible.");
+
+	register_module_func(env, emacs_clear_highlights,
+			     "seshat-reader-dyn--clear-highlights", 0, 0,
+			     "Removes every highlight of the current document. "
+			     "Call seshat-reader-dyn--refresh-highlights to "
+			     "repaint.");
+
+	register_module_func(env, emacs_refresh_highlights,
+			     "seshat-reader-dyn--refresh-highlights", 0, 0,
+			     "Re-renders the cache window of the current "
+			     "window so that pending highlight changes become "
+			     "visible.");
 
 	// Register buffer-local variables.
 	permanent_buffer_local_var(env, "seshat-reader-current-doc-pagecount");
