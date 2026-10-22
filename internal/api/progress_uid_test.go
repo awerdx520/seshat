@@ -189,9 +189,15 @@ func TestAnnotationsCreateWithUID(t *testing.T) {
 func TestAnnotationsListFiltersByUID(t *testing.T) {
 	h := newRegistryServer(t, seedStateResources())
 
-	for _, u := range []string{uidStateA, uidStateA, uidStateB} {
+	// location 逐条不同：同 (uid, kind, location, text) 会被服务端幂等去重（返回 200、
+	// 不新增行），本用例验证的是按 uid 隔离，故需构造互不相同的批注。
+	for _, tc := range []struct{ uid, location string }{
+		{uidStateA, "loc-1"},
+		{uidStateA, "loc-2"},
+		{uidStateB, "loc-1"},
+	} {
 		rec := do(t, h, http.MethodPost, "/api/annotations", testToken, map[string]string{
-			"uid": u, "location": "loc", "text": "text",
+			"uid": tc.uid, "location": tc.location, "text": "text",
 		}, nil)
 		if rec.Code != http.StatusCreated {
 			t.Fatalf("POST 状态码 = %d, 期望 201 (body=%q)", rec.Code, rec.Body.String())

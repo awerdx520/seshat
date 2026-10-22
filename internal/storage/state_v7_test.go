@@ -113,8 +113,9 @@ func tableColumns(t *testing.T, db *DB, table string) map[string]bool {
 	return cols
 }
 
-// TestSchemaV7RebuildsStateTables 验证 v7 后 user_version = 7，且状态表以 uid 为键：
-// document_id 列与旧索引随重建消失，新索引 idx_annotations_uid 建立。
+// TestSchemaV7RebuildsStateTables 验证新库迁移到最新 schema（v7 引入 uid 状态表，
+// 当前为 schemaVersion）后，状态表以 uid 为键：document_id 列与旧索引随重建消失，
+// 新索引 idx_annotations_uid 建立。
 func TestSchemaV7RebuildsStateTables(t *testing.T) {
 	db := openTestDB(t)
 
@@ -122,8 +123,12 @@ func TestSchemaV7RebuildsStateTables(t *testing.T) {
 	if err := db.db.QueryRow("PRAGMA user_version").Scan(&v); err != nil {
 		t.Fatalf("读取 user_version 失败: %v", err)
 	}
-	if want := 7; v != want || schemaVersion != want {
-		t.Fatalf("user_version = %d, 期望 7（schemaVersion = %d）", v, schemaVersion)
+	// 新库应一路迁移到最新版本；断言引用 schemaVersion 常量，使加新迁移时无需改本用例。
+	if v != schemaVersion {
+		t.Fatalf("user_version = %d, 期望 %d（schemaVersion 常量）", v, schemaVersion)
+	}
+	if schemaVersion < 7 {
+		t.Fatalf("schemaVersion = %d, 不应低于引入 uid 状态表的 v7", schemaVersion)
 	}
 
 	progress := tableColumns(t, db, "reading_progress")
@@ -222,8 +227,9 @@ func TestSchemaV7RejectsNonEmptyAnnotations(t *testing.T) {
 	}
 }
 
-// TestSchemaV7UpgradesEmptyV6DB 验证两表为空的 v6 库可正常升到 v7，且升级后新表
-// 可直接以 uid 读写（数据面可用，不只是建表成功）。
+// TestSchemaV7UpgradesEmptyV6DB 验证两表为空的 v6 库可正常升到最新 schema
+// （v6 → v7 重建状态表 → v8 批注列扩展），且升级后新表可直接以 uid 读写
+// （数据面可用，不只是建表成功）。
 func TestSchemaV7UpgradesEmptyV6DB(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "seshat.db")
 
@@ -241,7 +247,7 @@ func TestSchemaV7UpgradesEmptyV6DB(t *testing.T) {
 
 	db, err := Open(path, "")
 	if err != nil {
-		t.Fatalf("空表 v6 库升级到 v7 失败: %v", err)
+		t.Fatalf("空表 v6 库升级到最新 schema 失败: %v", err)
 	}
 	defer func() { _ = db.Close() }()
 
@@ -249,16 +255,17 @@ func TestSchemaV7UpgradesEmptyV6DB(t *testing.T) {
 	if err := db.db.QueryRow("PRAGMA user_version").Scan(&v); err != nil {
 		t.Fatalf("读取 user_version 失败: %v", err)
 	}
-	if v != 7 {
-		t.Fatalf("user_version = %d, 期望 7", v)
+	// 升级终点是最新 schema（当前含 v8 的批注列扩展），断言引用常量以免每次加迁移都改用例。
+	if v != schemaVersion {
+		t.Fatalf("user_version = %d, 期望 %d（schemaVersion 常量）", v, schemaVersion)
 	}
 
 	if err := db.SetProgress(testUID1, "p1", "2026-10-18T12:00:00Z"); err != nil {
-		t.Fatalf("v7 库写入进度失败: %v", err)
+		t.Fatalf("升级后写入进度失败: %v", err)
 	}
 	got, err := db.GetProgress(testUID1)
 	if err != nil {
-		t.Fatalf("v7 库读取进度失败: %v", err)
+		t.Fatalf("升级后读取进度失败: %v", err)
 	}
 	if got.UID != testUID1 || got.Position != "p1" {
 		t.Fatalf("v7 库读回进度不符: %+v", got)

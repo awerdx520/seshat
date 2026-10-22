@@ -99,10 +99,10 @@ func TestProgressErrors(t *testing.T) {
 func TestAnnotationCRUD(t *testing.T) {
 	db := openTestDB(t)
 
-	if _, err := db.CreateAnnotation(testUID2, "loc-1", "文本"); err != nil {
+	if _, _, err := db.CreateAnnotation(testUID2, "loc-1", "note", "文本", ""); err != nil {
 		t.Fatalf("CreateAnnotation() 返回错误: %v", err)
 	}
-	created, err := db.CreateAnnotation(testUID1, "loc-2", "文本2")
+	created, _, err := db.CreateAnnotation(testUID1, "loc-2", "note", "文本2", "")
 	if err != nil {
 		t.Fatalf("二次 CreateAnnotation() 返回错误: %v", err)
 	}
@@ -131,7 +131,7 @@ func TestAnnotationCRUD(t *testing.T) {
 		t.Fatalf("空结果应为非 nil 空切片, 实际 %#v", empty)
 	}
 
-	updated, err := db.UpdateAnnotation(created.ID, "loc-3", "文本3")
+	updated, err := db.UpdateAnnotation(created.ID, "loc-3", "note", "文本3", "")
 	if err != nil {
 		t.Fatalf("UpdateAnnotation() 返回错误: %v", err)
 	}
@@ -161,16 +161,16 @@ func TestAnnotationCRUD(t *testing.T) {
 func TestAnnotationErrors(t *testing.T) {
 	db := openTestDB(t)
 
-	_, err := db.UpdateAnnotation(404, "loc", "文本")
+	_, err := db.UpdateAnnotation(404, "loc", "note", "文本", "")
 	assertCode(t, err, logging.ErrNotFound)
 
 	err = db.DeleteAnnotation(404)
 	assertCode(t, err, logging.ErrNotFound)
 
-	_, err = db.CreateAnnotation(testUID1, "", "文本")
+	_, _, err = db.CreateAnnotation(testUID1, "", "note", "文本", "")
 	assertCode(t, err, logging.ErrInvalidArgument)
 
-	_, err = db.CreateAnnotation(testUID1, "loc", "")
+	_, _, err = db.CreateAnnotation(testUID1, "loc", "note", "", "")
 	assertCode(t, err, logging.ErrInvalidArgument)
 
 	_, err = db.ListAnnotations("")
@@ -191,7 +191,7 @@ func TestAnnotationsSurviveReopen(t *testing.T) {
 	if err := db.SetProgress(testUID1, "p1", "2026-10-11T10:00:00Z"); err != nil {
 		t.Fatalf("SetProgress() 返回错误: %v", err)
 	}
-	if _, err := db.CreateAnnotation(testUID1, "loc", "文本"); err != nil {
+	if _, _, err := db.CreateAnnotation(testUID1, "loc", "note", "文本", ""); err != nil {
 		t.Fatalf("CreateAnnotation() 返回错误: %v", err)
 	}
 	if err := db.Close(); err != nil {
@@ -289,7 +289,7 @@ func TestProgressEmptyTimestampUnconditional(t *testing.T) {
 func TestAnnotationConflictDetection(t *testing.T) {
 	db := openTestDB(t)
 
-	created, err := db.CreateAnnotation(testUID1, "loc", "原始文本")
+	created, _, err := db.CreateAnnotation(testUID1, "loc", "note", "原始文本", "")
 	if err != nil {
 		t.Fatalf("CreateAnnotation() 返回错误: %v", err)
 	}
@@ -301,7 +301,7 @@ func TestAnnotationConflictDetection(t *testing.T) {
 	newer := base.Add(time.Hour).Format(time.RFC3339)
 
 	// 旧于已存：ErrConflict，记录保持原样。
-	_, err = db.UpdateAnnotationAt(created.ID, "loc-stale", "陈旧文本", older)
+	_, err = db.UpdateAnnotationAt(created.ID, "loc-stale", "note", "陈旧文本", "", older)
 	assertCode(t, err, logging.ErrConflict)
 	items, err := db.ListAnnotations(testUID1)
 	if err != nil {
@@ -312,7 +312,7 @@ func TestAnnotationConflictDetection(t *testing.T) {
 	}
 
 	// 新于已存：正常覆盖，updated_at 采用客户端值。
-	updated, err := db.UpdateAnnotationAt(created.ID, "loc-new", "新文本", newer)
+	updated, err := db.UpdateAnnotationAt(created.ID, "loc-new", "note", "新文本", "", newer)
 	if err != nil {
 		t.Fatalf("较新 UpdateAnnotationAt() 返回错误: %v", err)
 	}
@@ -324,7 +324,7 @@ func TestAnnotationConflictDetection(t *testing.T) {
 	}
 
 	// 空时间戳：无条件覆盖。
-	updated, err = db.UpdateAnnotationAt(created.ID, "loc-empty", "空时间文本", "")
+	updated, err = db.UpdateAnnotationAt(created.ID, "loc-empty", "note", "空时间文本", "", "")
 	if err != nil {
 		t.Fatalf("空时间戳 UpdateAnnotationAt() 返回错误: %v", err)
 	}
@@ -333,7 +333,7 @@ func TestAnnotationConflictDetection(t *testing.T) {
 	}
 
 	// 旧签名 UpdateAnnotation：无条件覆盖（向后兼容）。
-	updated, err = db.UpdateAnnotation(created.ID, "loc-legacy", "旧签名文本")
+	updated, err = db.UpdateAnnotation(created.ID, "loc-legacy", "note", "旧签名文本", "")
 	if err != nil {
 		t.Fatalf("UpdateAnnotation() 返回错误: %v", err)
 	}
@@ -347,6 +347,6 @@ func TestAnnotationConflictDetection(t *testing.T) {
 func TestAnnotationUpdateAtMissing(t *testing.T) {
 	db := openTestDB(t)
 
-	_, err := db.UpdateAnnotationAt(404, "loc", "文本", "2026-10-11T10:00:00Z")
+	_, err := db.UpdateAnnotationAt(404, "loc", "note", "文本", "", "2026-10-11T10:00:00Z")
 	assertCode(t, err, logging.ErrNotFound)
 }

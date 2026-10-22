@@ -277,10 +277,16 @@ func TestAnnotationsCRUD(t *testing.T) {
 func TestAnnotationsListSeparatesUIDs(t *testing.T) {
 	h := newTestHandler(t)
 
-	for _, doc := range []string{uidDoc, uidDoc, uidOther} {
+	// location 逐条不同：同 (uid, kind, location, text) 会被服务端幂等去重（返回 200、
+	// 不新增行），本用例验证的是按 uid 隔离，故需构造互不相同的批注。
+	for _, tc := range []struct{ uid, location string }{
+		{uidDoc, "loc-1"},
+		{uidDoc, "loc-2"},
+		{uidOther, "loc-1"},
+	} {
 		rec := do(t, h, http.MethodPost, "/api/annotations", testToken, map[string]string{
-			"uid":      doc,
-			"location": "loc",
+			"uid":      tc.uid,
+			"location": tc.location,
 			"text":     "text",
 		}, nil)
 		if rec.Code != http.StatusCreated {

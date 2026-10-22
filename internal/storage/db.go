@@ -29,7 +29,7 @@ import (
 // 语义：migrations 中第 i 条脚本将 user_version 从 i 迁移到 i+1，因此
 // schemaVersion 必须恒等于 len(migrations)（由 TestMigrationsLengthMatchesVersion 守卫）。
 // 新增迁移时：追加脚本到 migrations 末尾，并把 schemaVersion 加一。
-const schemaVersion = 7
+const schemaVersion = 8
 
 // migrations 按版本顺序保存 schema 迁移脚本。
 //
@@ -183,6 +183,18 @@ CREATE TABLE IF NOT EXISTS annotations (
   updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_annotations_uid ON annotations(uid);`,
+	// v8：批注契约扩展（M10.3：批注闭环）。
+	//
+	// kind 区分批注形态（约定取值 note / highlight / ink，服务端不做枚举校验），
+	// selected_text 保存高亮/文本批注的选中原文。text 语义保持不变（备注正文 /
+	// 显示摘要）：kind=note 时必填，highlight 与 ink 允许空串——该放宽由
+	// CreateAnnotation / UpdateAnnotationAt 按 kind 分支实现，不在 SQL 层约束。
+	//
+	// 两条语句均为纯 ADD COLUMN，可逆（回滚靠回退本条目 + 重建库），故
+	// preMigrationChecks 不登记本版本。存量行由 DEFAULT 回填（kind='note'、
+	// selected_text=''），重跑安全性由 applyMigration 的 user_version 机制保证。
+	`ALTER TABLE annotations ADD COLUMN kind TEXT NOT NULL DEFAULT 'note';
+ALTER TABLE annotations ADD COLUMN selected_text TEXT NOT NULL DEFAULT '';`,
 }
 
 // errEmptyPath 表示调用方传入了空的数据库路径。

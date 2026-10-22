@@ -68,13 +68,18 @@ type progressResponse struct {
 }
 
 // annotationResponse 是批注的对外表示（uid 指向所属文档）。
+//
+// Kind 为批注形态（约定 note / highlight / ink，服务端不做枚举校验），
+// SelectedText 为选中原文；Text 仍是备注正文/显示摘要（highlight 与 ink 下为空串）。
 type annotationResponse struct {
-	ID        int64  `json:"id"`
-	UID       string `json:"uid"`
-	Location  string `json:"location"`
-	Text      string `json:"text"`
-	CreatedAt string `json:"created_at"`
-	UpdatedAt string `json:"updated_at"`
+	ID           int64  `json:"id"`
+	UID          string `json:"uid"`
+	Kind         string `json:"kind"`
+	Location     string `json:"location"`
+	Text         string `json:"text"`
+	SelectedText string `json:"selected_text"`
+	CreatedAt    string `json:"created_at"`
+	UpdatedAt    string `json:"updated_at"`
 }
 
 // progressRequest 是设置进度的请求体（uid 取自路径参数 /api/progress/{uid}）。
@@ -84,16 +89,25 @@ type progressRequest struct {
 }
 
 // annotationCreateRequest 是创建批注的请求体。
+//
+// Kind 缺省为空串，由存储层兜底为 note（结构体反序列化后为空串，显式 INSERT 时
+// SQL 的 DEFAULT 'note' 不生效）；SelectedText 缺省为空串。
 type annotationCreateRequest struct {
-	UID      string `json:"uid"`
-	Location string `json:"location"`
-	Text     string `json:"text"`
+	UID          string `json:"uid"`
+	Location     string `json:"location"`
+	Kind         string `json:"kind"`
+	Text         string `json:"text"`
+	SelectedText string `json:"selected_text"`
 }
 
 // annotationUpdateRequest 是更新批注的请求体。
+//
+// Kind 缺省为空串，由存储层兜底为 note；SelectedText 缺省为空串（整体替换语义）。
 type annotationUpdateRequest struct {
-	Location string `json:"location"`
-	Text     string `json:"text"`
+	Location     string `json:"location"`
+	Kind         string `json:"kind"`
+	Text         string `json:"text"`
+	SelectedText string `json:"selected_text"`
 	// UpdatedAt 是客户端视角的批注版本时间戳：非空时用于乐观冲突检测，
 	// 早于服务端记录则返回 409；为空时由服务端回填当前时间（无条件覆盖）。
 	UpdatedAt string `json:"updated_at"`
@@ -439,8 +453,11 @@ func (s *Server) handlePutProgress(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, toProgressResponse(progress))
 }
 
-// handleCreateAnnotation 创建批注并返回 201 + 完整记录（含服务端生成的 id 与时间戳）。
+// handleCreateAnnotation 创建批注并返回创建结果（含服务端生成的 id 与时间戳）。
 // 目标文档由请求体的 uid 指定。
+//
+// 状态码：新建返回 201；命中幂等键 (uid, kind, location, text) 返回 200 + 既有记录
+// （不插新行、不刷新 updated_at），使客户端的一次性补登可安全重放。
 func (s *Server) handleCreateAnnotation(w http.ResponseWriter, r *http.Request) {
 	var req annotationCreateRequest
 	if err := decodeBody(w, r, &req); err != nil {
@@ -451,12 +468,18 @@ func (s *Server) handleCreateAnnotation(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	annotation, err := s.db.CreateAnnotation(req.UID, req.Location, req.Text)
+	annotation, created, err := s.db.CreateAnnotation(
+		req.UID, req.Location, req.Kind, req.Text, req.SelectedText)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, toAnnotationResponse(annotation))
+
+	status := http.StatusCreated
+	if !created {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, toAnnotationResponse(annotation))
 }
 
 // handleListAnnotations 按 uid 列出某个文档的批注（GET /api/annotations?uid=）。
@@ -494,7 +517,8 @@ func (s *Server) handleUpdateAnnotation(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	annotation, err := s.db.UpdateAnnotationAt(id, req.Location, req.Text, req.UpdatedAt)
+	annotation, err := s.db.UpdateAnnotationAt(
+		id, req.Location, req.Kind, req.Text, req.SelectedText, req.UpdatedAt)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -914,12 +938,14 @@ func toProgressResponse(p *storage.Progress) progressResponse {
 // toAnnotationResponse 将存储层批注转换为对外表示。
 func toAnnotationResponse(a *storage.Annotation) annotationResponse {
 	return annotationResponse{
-		ID:        a.ID,
-		UID:       a.UID,
-		Location:  a.Location,
-		Text:      a.Text,
-		CreatedAt: a.CreatedAt,
-		UpdatedAt: a.UpdatedAt,
+		ID:           a.ID,
+		UID:          a.UID,
+		Kind:         a.Kind,
+		Location:     a.Location,
+		Text:         a.Text,
+		SelectedText: a.SelectedText,
+		CreatedAt:    a.CreatedAt,
+		UpdatedAt:    a.UpdatedAt,
 	}
 }
 
