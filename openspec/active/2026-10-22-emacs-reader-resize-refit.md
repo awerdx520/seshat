@@ -155,6 +155,8 @@ SOURCE 非 nil 时，把它记为该窗口的缩放来源（`fit' 或 `manual'�
 - 分支语义：`fit`（含未设置）→ 调 `(funcall seshat-reader-default-fit)` 重算分辨率；`manual` → **不动 scale**；两支都执行 `--clamp-window-vscroll` + `--center-page`。
 - `fit` 分支里 `seshat-reader-fit-to-height` 自身还会调一次 `--center-page`（`seshat-reader-mode` 中 fit 命令的后置动作），重复调用是幂等的，不做特例处理。
 
+**fit 分支必须在目标窗口内求值**：`seshat-reader-default-fit` 默认指向 `fit-to-height`，其内部用 `(window-body-height nil t)` 读**当前选中窗口**；而 refit 遍历 `(get-buffer-window-list buffer nil t)` 的全部窗口。因此 fit 分支必须写成 `(with-selected-window window (funcall seshat-reader-default-fit))`，否则同一 buffer 显示在两个尺寸不同窗口时会按选中窗口重算非选中窗口的 scale。（clamp 与 center 已显式传 window，不需要包。）
+
 ### D3 去抖用 idle timer，但必须论证差异 + 留降级
 
 - 实现：`run-with-idle-timer 0.15`，每次先 `cancel-timer` 前一个（buffer-local `defvar-local seshat-reader--resize-refit-timer`）。
@@ -237,6 +239,7 @@ SOURCE 非 nil 时，把它记为该窗口的缩放来源（`fit' 或 `manual'�
 - 动作：改 `seshat-reader--window-size-change`（`:726`）；新增 `--schedule-refit` / `--run-pending-refit` / `--cancel-pending-refit` / `--refit-window` / `--clamp-window-vscroll`；新增 `defvar seshat-reader--resize-refit-enabled`、`defvar-local seshat-reader--resize-refit-timer`、`defvar seshat-reader--resize-refit-delay`；`--clear-doc-memory`（`:963`）内补 `--cancel-pending-refit`。
 - 依赖：T1
 - 验收：`:1246`/`:1247`/`:1248` 三条 hook 的注册行未变；`--center-page` / `--set-window-vscroll` / `--page-max-vscroll-pixels` 函数体零改动（`git diff` 核对）；`make all` 零 warning。
+- 适配 `emacs/tests/seshat-reader-page-join-test.el` 中锁定了旧契约（size-change 同步 center）的两个用例：`--window-size-change` 改为断言 `--schedule-refit` 被调用 1 次且 `--center-page` 零调用；`--window-size-change-errors` 改为断言「同 buffer 多窗口只排一次 refit」，其「单窗口报错隔离」语义移交 `--refit-window` 的 `condition-case`（由 T3 覆盖）。**不得改动该文件其它 22 个用例。**
 
 ### T3 新增 `emacs/tests/seshat-reader-resize-test.el`（13 例）
 
@@ -310,8 +313,9 @@ T0 ──▶ T1 ──▶ T2 ──┬──▶ T3 ──▶ T4 ──┐
 
 ### L1 语法与静态检查（必须通过）
 
-- 命令：`cd emacs/seshat-reader && make all`
-- 判据：零 warning / 零 error；检查用 `grep -E "Warning|Error"` 无输出（**勿用 `grep -i error`**——会误命中 `with-demoted-errors`）。
+- 命令：`cd emacs/seshat-reader && make all` 退出码 0。
+- **判据是「警告集零新增」，不是「零 warning」**：本仓库基线本来就有存量警告（2026-10-22 实测 **28 条**：`cl` 动态模块函数 `not known to be defined`、若干 docstring 超 80 列、`with-demoted-errors` 缺参）。`make all | grep Warning` 在产物已是最新时为**假阴性**（不重编译就不输出警告），**不能用它判定零 warning**。正确做法：`rm -f *.elc && make all 2>&1 | grep -E "Warning|Error" > /tmp/after.txt`，与基线（`git stash` 或 pristine 副本编译得到的 `/tmp/before.txt`）逐条 diff，要求**无新增行**。
+- `elisp_check_parens` 或 `check-parens` 对 `seshat-reader.el` 与新增测试文件通过。
 
 ### L2 功能验证
 
