@@ -33,6 +33,11 @@
 
 (require 'image)
 
+;; 该变量由 C 模块（`permanent_buffer_local_var'）注册为 buffer-local；编译期不可见，
+;; 故在此声明以消除 byte-compiler 的 free variable 警告。C 侧会覆盖 buffer-local 值。
+(defvar seshat-reader--recent-pagenumber-fallback nil
+  "Registered by the native module; declared here to silence the byte-compiler.")
+
 (defconst seshat-reader-directory
   (or (and load-file-name
            (file-name-directory load-file-name))
@@ -104,13 +109,21 @@
   :type '(radio (function-item seshat-reader-fit-to-height)
 		(function-item seshat-reader-fit-to-width)))
 
-(defcustom seshat-reader-page-join-lines 1
+(defcustom seshat-reader-page-join-lines 0
   "Height of the cross-page join strip, measured in page text lines.
 
 The strip above the current page shows the bottom of the previous page.
 Its height is this many times the frame character height; fractional
 values are allowed.  A value of 0 disables the strip, in which case page
-turning behaves exactly as it did before the feature existed."
+turning behaves exactly as it did before the feature existed.
+
+The default is 0 because the strip line is known to conflict with the
+geometry of the page overlay: the strip is inserted before `point-min'
+of the buffer, which the vertical scroll limits and landing points of
+the page assume to be the top of the page image, so with
+`seshat-reader-fit-to-height' an enabled strip can push the top of the
+page out of the window and crop it.  See `openspec/tech-debt.md'.  The
+feature is kept, but opt-in, until that conflict is fixed."
   :group 'seshat-reader
   :type '(number :tag "Lines from the previous page"))
 
@@ -512,7 +525,8 @@ maximum vertical scroll possible without doing that.
 If PIXELS-P is non-nil, VSCROLL is considered to be in pixels and is
 used as-is.
 Also see `set-window-vscroll'."
-  (let* ((image-height (cdr (seshat-reader--get-current-doc-image-size window)))
+  (let* ((image-height
+	  (or (cdr (seshat-reader--get-current-doc-image-size window)) 0))
 	 (pixel-window-height (window-body-height window t))
 	 (window-height (window-body-height window))
 	 (pixel-per-col (/ pixel-window-height window-height))
@@ -604,18 +618,22 @@ defaults to the selected window."
 
 The width is read from the buffer-wide centering overlay.  Buffers that
 were centered before the join strip existed have no such overlay, in
-which case the window's document overlay is consulted instead.
+which case the window's document overlay is consulted instead.  The
+function always returns a number: when neither overlay carries a
+`line-prefix', the width is 0, so callers can use the value in
+arithmetic without guarding against nil.
 
 WINDOW must be a valid window and defaults to the selected one."
   (or (when (overlayp seshat-reader--center-overlay)
 	(car (plist-get
 	      (cdr (overlay-get seshat-reader--center-overlay 'line-prefix))
 	      :width)))
-      (car
-       (plist-get
-	(cdr (overlay-get (seshat-reader-current-doc-overlay window)
-			  'line-prefix))
-	:width))))
+      (when-let* ((overlay (seshat-reader-current-doc-overlay window))
+		  ((overlayp overlay)))
+	(car (plist-get
+	      (cdr (overlay-get overlay 'line-prefix))
+	      :width)))
+      0))
 
 (defun seshat-reader--right-most-window-hscroll (&optional window)
   "Get the maximum horizontal scroll value for WINDOW.
@@ -667,25 +685,59 @@ not return the actual horizontal scroll value; for that, see
 (defun seshat-reader--center-page (&optional window)
   "Center the document with respect to WINDOW.
 
-WINDOW must be a valid window and defaults to the selected one."
-  (when-let* ((overlay (seshat-reader-current-doc-overlay window))
-              ((overlayp overlay))
-	      (window-width (window-body-width window t))
-              (doc-image-width (car (seshat-reader--get-current-doc-image-size window)))
-	      (max-left-offset (max 0 (- window-width doc-image-width)))
-	      (overlay-offset `(space :width (,max-left-offset)))
-	      (pixel-per-col (seshat-reader--get-pixel-per-col window))
-	      (doc-left-offset (- window-width doc-image-width))
-              (doc-center-offset (/ doc-left-offset 2))
-              (scroll-offset (round (/ doc-center-offset pixel-per-col))))
-    ;; Add prefix so that the page is at the leftmost point of the window.
-    ;; The prefix is carried by a buffer-wide overlay instead of the page
-    ;; overlay, so that the cross-page join strip line gets it as well.
-    (overlay-put overlay 'line-prefix nil)
-    (overlay-put (seshat-reader--ensure-center-overlay)
-		 'line-prefix overlay-offset)
-    ;; scroll window back to the center of the doc
-    (seshat-reader--set-window-hscroll window scroll-offset t)))
+WINDOW must be a valid window and defaults to the selected one.
+
+Centering needs a page overlay, the pixel width of WINDOW and the width
+of the page image.  When one of them is missing the function does not
+return silently: it drops the `line-prefix' of both the page overlay and
+the buffer-wide centering overlay and resets the horizontal scroll, so
+that a stale offset left by an earlier centering cannot keep the page
+stuck to one side of the window."
+  (let ((window (or window (selected-window))))
+    (let* ((overlay (seshat-reader-current-doc-overlay window))
+           (window-width (window-body-width window t))
+           (doc-image-width
+            (car (seshat-reader--get-current-doc-image-size window))))
+      (if (and (overlayp overlay) window-width doc-image-width)
+          (let* ((max-left-offset (max 0 (- window-width doc-image-width)))
+                 (overlay-offset `(space :width (,max-left-offset)))
+                 (pixel-per-col (seshat-reader--get-pixel-per-col window))
+                 (doc-left-offset (- window-width doc-image-width))
+                 (doc-center-offset (/ doc-left-offset 2))
+                 (scroll-offset (round (/ doc-center-offset pixel-per-col))))
+            ;; Add prefix so that the page is at the leftmost point of the window.
+            ;; The prefix is carried by a buffer-wide overlay instead of the page
+            ;; overlay, so that the cross-page join strip line gets it as well.
+            (overlay-put overlay 'line-prefix nil)
+            (overlay-put (seshat-reader--ensure-center-overlay)
+                         'line-prefix overlay-offset)
+            ;; scroll window back to the center of the doc
+            (seshat-reader--set-window-hscroll window scroll-offset t))
+        ;; Fallback: the geometry is unknown, so clear any stale prefix and
+        ;; reset the horizontal scroll instead of leaving the page offset.
+        (dolist (ov (list overlay seshat-reader--center-overlay))
+          (when (overlayp ov)
+            (overlay-put ov 'line-prefix nil)))
+        (ignore-errors
+          (seshat-reader--set-window-hscroll window 0 t))
+        (ignore-errors
+          (set-window-hscroll window 0))))))
+
+(defun seshat-reader--window-size-change (frame)
+  "Recenter the document in the windows of FRAME showing this buffer.
+
+`window-size-change-functions' is called with a frame as its argument,
+not with a window, so FRAME cannot be passed to functions such as
+`seshat-reader--center-page' which expect a valid window.  This wrapper
+walks the windows of FRAME and recenters every window whose buffer is
+the current buffer.
+
+A failure while recentering one window is ignored, so that a single
+broken window cannot prevent the others from being recentered."
+  (dolist (window (window-list frame))
+    (when (eq (window-buffer window) (current-buffer))
+      (ignore-errors (seshat-reader--center-page window)))))
+
 
 (defun seshat-reader-scroll-up (&optional amount)
   "Scroll up the current page by AMOUNT.
@@ -1191,7 +1243,7 @@ Keybindings:
   (run-hooks 'seshat-reader-mode-hook)
 
   (funcall seshat-reader-default-fit)
-  (add-hook 'window-size-change-functions #'seshat-reader--center-page nil t)
+  (add-hook 'window-size-change-functions #'seshat-reader--window-size-change nil t)
   (add-hook 'window-configuration-change-hook #'seshat-reader--manage-window-overlays nil t)
   (add-hook 'window-buffer-change-functions #'seshat-reader--handle-window-buffer-change nil t))
 

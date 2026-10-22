@@ -100,6 +100,12 @@
 加载时该变量仍有 nil 绑定，使 `seshat-reader-annotation-create' 的
 “无选区”检查走 `user-error' 而不是 void-variable 崩溃。")
 
+(defvar seshat-reader-select--flash-rects nil
+  "当前缓冲区待闪现的选区矩形，正式定义与完整语义见 `seshat-reader-select'.
+元素形如 (PAGE X0 Y0 X1 Y1)（PAGE 1-based、坐标为页面坐标）。此处声明仅用于
+避免字节编译告警，并保证 `seshat-reader-select' 尚未加载时
+`seshat-reader-annotation--redraw-highlights' 仍能安全读取（nil）。")
+
 (defgroup seshat-reader-annotation nil
   "批注采集与侧车同步（seshat-reader 文档）."
   :group 'seshat-reader
@@ -439,9 +445,14 @@ HTTP 非 2xx（如 401 鉴权失败、400 uid 非法、500 服务端错误）时
 
 (defcustom seshat-reader-annotation-highlight-enabled t
   "是否把批注 location 中的 `rect:' 段绘制为页面高亮.
-非 nil 时 `seshat-reader-annotation--apply-highlights' 把解析出的矩形
-逐条交给动态模块，绘制成半透明高亮；为 nil 时该函数只清空已有高亮并
-重绘（不添加任何矩形），从而关闭批注高亮显示。"
+非 nil 时 `seshat-reader-annotation--redraw-highlights' 把解析出的批注矩形
+逐条交给动态模块，绘制成半透明高亮；为 nil 时批注矩形一个都不投（只清空
+已有高亮并重绘），从而关闭批注高亮显示。
+
+本开关**只管批注高亮**：框选松手后的闪现高亮（
+`seshat-reader-select-flash-duration' /
+`seshat-reader-select--flash-selection'）不受它约束，关闭批注高亮时闪现
+仍然可见。"
   :type 'boolean
   :group 'seshat-reader-annotation)
 
@@ -564,48 +575,120 @@ alist（含 `location'）。"
     (setq seshat-reader-annotation--highlight-warned t)
     (message "Seshat Reader annotation: 高亮模块未加载，跳过批注高亮")))
 
-(defun seshat-reader-annotation--apply-highlights (items)
-  "把 ITEMS 的批注矩形批量投喂给 C 层并触发重绘，返回添加的 rect 数.
-ITEMS 为条目列表，元素形态见 `seshat-reader-annotation--item-location'
-（plist 或服务端 alist 皆可）；没有 location 或 location 里没有可用
-`rect:' 段的条目直接跳过。流程固定为：先
-`seshat-reader-dyn--clear-highlights' 清空，再对每个条目的每个 rect 调
-`seshat-reader-dyn--add-highlight'，最后
-`seshat-reader-dyn--refresh-highlights' 重建缓存并重绘——全量重投，不做
-增量，避免 C 侧表与 elisp 侧缓存在删除/离线同步后漂移。
+(defun seshat-reader-annotation--annotation-rects (items)
+  "把条目列表 ITEMS 解析为矩形列表，元素形如 (PAGE X0 Y0 X1 Y1).
+ITEMS 的元素形态见 `seshat-reader-annotation--item-location'（plist 或
+服务端 alist 皆可）；没有 location、location 里没有可用 `rect:' 段或页码
+无法解析的条目直接跳过。坐标为浮点数、PAGE 为 1-based 整数，可直接交给
+`seshat-reader-dyn--add-highlight'。顺序与服务端返回的条目顺序一致。
 
-`seshat-reader-annotation-highlight-enabled' 为 nil 时只清空与重绘、不加
-任何矩形，返回 0。三次 C 调用都包在 `ignore-errors' 里：动态模块未加载
-或当前没有载入任何文档时不打断批注流程；elisp 侧的解析错误**不**吞掉。
+本函数是**纯解析**：既不清空也不投喂，供
+`seshat-reader-annotation--redraw-highlights' 消费。"
+  (let (rects)
+    (dolist (item items)
+      (let* ((location (seshat-reader-annotation--item-location item))
+             (page (seshat-reader-annotation--page-from-location location)))
+        (when page
+          (dolist (rect (seshat-reader-annotation--rects-from-location location))
+            (push (list page (nth 0 rect) (nth 1 rect) (nth 2 rect) (nth 3 rect))
+                  rects)))))
+    (nreverse rects)))
+
+(defun seshat-reader-annotation--cached-annotation-rects ()
+  "从列表缓冲区缓存派生批注矩形列表（元素形如 (PAGE X0 Y0 X1 Y1)）.
+缓存取列表缓冲区 `*Seshat Annotations*' 的
+`seshat-reader-annotation-list-entries'，即**最近一次成功拉取**的结果
+（不发起任何网络请求）。
+
+缓存缺失、属于**其它文档**或当前缓冲区没有关联文件时返回 nil：C 层高亮表
+是**文档级**的，把 A 文档的矩形投到 B 文档的页面上就是错误高亮。"
+  (let* ((buffer (get-buffer seshat-reader-annotation-list-buffer-name))
+         (document-id (seshat-reader-annotation--quiet-doc-id buffer-file-name)))
+    (when (and document-id
+               (buffer-live-p buffer)
+               (equal document-id
+                      (buffer-local-value
+                       'seshat-reader-annotation-list-document-id buffer)))
+      (seshat-reader-annotation--annotation-rects
+       (buffer-local-value 'seshat-reader-annotation-list-entries buffer)))))
+
+(defun seshat-reader-annotation--flash-rects ()
+  "返回当前缓冲区待闪现的选区矩形（元素形如 (PAGE X0 Y0 X1 Y1)），无则 nil.
+数据源是 buffer-local 变量 `seshat-reader-select--flash-rects'，由
+`seshat-reader-select--flash-selection' 在框选松手后设置、由它武装的定时器
+清除。`seshat-reader-select' 未加载时该变量为 nil 绑定，本函数返回 nil。"
+  (when (boundp 'seshat-reader-select--flash-rects)
+    seshat-reader-select--flash-rects))
+
+(defun seshat-reader-annotation--redraw-highlights (&optional rects)
+  "全量重投页面高亮：批注矩形 RECTS + 当前缓冲区的闪现矩形.
+RECTS 为 (PAGE X0 Y0 X1 Y1) 列表；省略或 nil 时改用列表缓冲区的最近一次
+拉取缓存（见 `seshat-reader-annotation--cached-annotation-rects'）。
+
+闪现矩形取自**当前缓冲区**的 `seshat-reader-select--flash-rects'
+（`seshat-reader-select--flash-selection' 设置）。闪现**不受**
+`seshat-reader-annotation-highlight-enabled' 约束：该开关只关闭批注高亮，
+而闪现是框选松手后的独立反馈（用户明确要求的交互反馈，关闭批注高亮时仍
+应可见）。
+
+流程固定为 `seshat-reader-dyn--clear-highlights' → 逐条
+`seshat-reader-dyn--add-highlight'（批注在前、闪现在后）→
+`seshat-reader-dyn--refresh-highlights'：全量重投、不做增量，避免 C 侧表与
+elisp 侧缓存在删除/离线同步后漂移。三次 C 调用都包在 `ignore-errors' 里
+（模块未加载、没有载入文档时不打断调用方）；elisp 侧的解析错误**不**吞掉。
 
 模块不可用（三函数任一缺 `fboundp'）或某次 `--add-highlight' 调用失败时，
-经 `seshat-reader-annotation--warn-highlight-unavailable' `message' 提示
-一次（会话内不重复），**仍返回 0 且不抛错**——高亮是可选增强，不得让批注
-列表因它报错。"
-  (let ((enabled seshat-reader-annotation-highlight-enabled)
-        (count 0)
-        (failed nil))
+经 `seshat-reader-annotation--warn-highlight-unavailable' 提示一次（会话内
+不重复），**仍不抛错**——高亮是可选增强。
+
+返回值为成功投喂的**批注**矩形数；闪现矩形不计入，以保持
+`seshat-reader-annotation--apply-highlights' 既有的计数语义。"
+  (let* ((annotation-rects
+          (and seshat-reader-annotation-highlight-enabled
+               (or rects
+                   (seshat-reader-annotation--cached-annotation-rects))))
+         (flash (seshat-reader-annotation--flash-rects))
+         (count 0)
+         (failed nil))
     (ignore-errors (seshat-reader-dyn--clear-highlights))
-    (when (and enabled items)
+    (when (or annotation-rects flash)
       (if (not (seshat-reader-annotation--highlight-module-available-p))
           (setq failed t)
-        (dolist (item items)
-          (let* ((location (seshat-reader-annotation--item-location item))
-                 (page (seshat-reader-annotation--page-from-location location)))
-            (when page
-              (dolist (rect (seshat-reader-annotation--rects-from-location location))
-                (if (ignore-errors
-                      (seshat-reader-dyn--add-highlight page
-                                                        (nth 0 rect)
-                                                        (nth 1 rect)
-                                                        (nth 2 rect)
-                                                        (nth 3 rect)))
-                    (setq count (1+ count))
-                  (setq failed t))))))))
+        (dolist (rect annotation-rects)
+          (if (ignore-errors
+                (seshat-reader-dyn--add-highlight (nth 0 rect) (nth 1 rect)
+                                                  (nth 2 rect) (nth 3 rect)
+                                                  (nth 4 rect)))
+              (setq count (1+ count))
+            (setq failed t)))
+        (dolist (rect flash)
+          (ignore-errors
+            (seshat-reader-dyn--add-highlight (nth 0 rect) (nth 1 rect)
+                                              (nth 2 rect) (nth 3 rect)
+                                              (nth 4 rect))))))
     (ignore-errors (seshat-reader-dyn--refresh-highlights))
     (when failed
       (seshat-reader-annotation--warn-highlight-unavailable))
     count))
+
+(defun seshat-reader-annotation--apply-highlights (items)
+  "把 ITEMS 的批注矩形批量投喂给 C 层并触发重绘，返回添加的 rect 数.
+ITEMS 为条目列表，元素形态见 `seshat-reader-annotation--item-location'
+（plist 或服务端 alist 皆可）；没有 location 或 location 里没有可用
+`rect:' 段的条目直接跳过。
+
+本函数只做「解析」，投喂与重绘统一交给
+`seshat-reader-annotation--redraw-highlights'（全量重投：clear → add × N
+→ refresh，不做增量，避免 C 侧表与 elisp 侧缓存在删除/离线同步后漂移），
+从而闪现与批注共用一套投喂逻辑。
+
+`seshat-reader-annotation-highlight-enabled' 为 nil 时批注矩形一个都不投
+（返回值 0），但当前缓冲区的闪现矩形仍会被投——闪现不受该开关约束，详见
+`seshat-reader-annotation--redraw-highlights'。
+
+返回值是成功投喂的批注矩形数；模块不可用时返回 0、提示一次且不抛错。"
+  (seshat-reader-annotation--redraw-highlights
+   (seshat-reader-annotation--annotation-rects items)))
 
 (defun seshat-reader-annotation--source-document-p (source document-id)
   "判断 SOURCE 缓冲区所显示的文档是否就是 DOCUMENT-ID 指向的文档.

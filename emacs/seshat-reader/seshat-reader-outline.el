@@ -201,8 +201,12 @@ document without outline never leaves the panel blanked."
 
 插在标题之后、页码之前的一个空格上，把其后的页码推到窗口右边缘往左 6 列处.")
 
-(defconst seshat-reader-outline--indent-width 2
-  "目录面板每级的缩进列数.")
+(defconst seshat-reader-outline--indent-width 1
+  "目录面板每级的缩进列数.
+
+星号前缀改为零宽显示后（见 `seshat-reader--outline-insert-outline'），每级的
+视觉缩进 = 本值 × depth 个空格 + 折叠符号的 2 列，故取 1 列即够：星号不再占位，
+若仍取 2 列，深层条目会明显右飘.")
 
 (defun seshat-reader-outline--node-page (node)
   "返回 outline plist NODE 的 1-based 页号（原树 `:page' 是 0-based）.
@@ -305,9 +309,12 @@ COLLAPSED 为折叠态集合，元素是**行路径**——自根到该节点的
   "把 `seshat-reader-outline--rows' 产出的行列表 ROWS 插入当前 buffer.
 
 每行 plist 的字段见 `seshat-reader-outline--rows'。渲染规则：
-① 缩进：每级 `seshat-reader-outline--indent-width'（2）个空格，叠在 outline 的
-星号标题前缀之后——星号**必须**留在行首，否则 `outline-regexp' 失配、TAB 折叠
-（`outline-hide-subtree'）失效；
+① 缩进：每级 `seshat-reader-outline--indent-width'（1）个空格，叠在 outline 的
+星号标题前缀之后——星号**必须**留在行首的 buffer 文本里，否则 `outline-regexp'
+失配、TAB 折叠（`outline-hide-subtree'）失效；但星号不该出现在视觉上，故给
+星号所在区间加一个显示属性 `display`（值为空字符串）：它只影响显示，buffer 文本
+不变、`outline-regexp' 照常匹配（`outline-on-heading-p' 仍为 t）、星号也不再
+占显示列；星号后那一个空格保留，作为每行的固定左边距；
 ② 折叠符号：有子节点插 `▾'（展开）/ `▸'（折叠），无子节点插 2 空格占位对齐；
 ③ 标题：`insert-text-button'，保留 `seshat-reader-page' 属性与 `action'，face 按
 深度取 `seshat-reader-outline--level-face'；
@@ -331,8 +338,12 @@ COLLAPSED 为折叠态集合，元素是**行路径**——自根到该节点的
                           'seshat-reader-outline-current-face
                         'seshat-reader-outline-page-face))
            (line-start (point)))
-      ;; ① 星号前缀（outline 结构，必须行首）+ ② 层级缩进
+      ;; ① 星号前缀（outline 结构，必须留在行首的 buffer 文本里）+ ② 层级缩进
       (insert (make-string (1+ depth) ?*) " ")
+      ;; 星号视觉零宽：`outline-regexp' 与 `outline-hide-subtree' 依赖行首星号
+      ;; 文本，但星号本身不该被看见——`display ""' 只改显示，不改 buffer 文本，
+      ;; 也不影响 `outline-regexp' 的匹配，且星号不再占显示列。
+      (put-text-property line-start (+ line-start (1+ depth)) 'display "")
       (insert (make-string (* seshat-reader-outline--indent-width depth) ?\s))
       ;; ③ 折叠符号（无子节点用 2 空格占位）
       (insert (cond ((not has-children) "  ")
@@ -576,6 +587,91 @@ overlay 的 `before-string' 在其前面显示 1-2 个字符的标签（face 为
     (end-of-line)   ; This is done to make sure the we always have a
     (backward-char) ; button at point.
     (seshat-reader-outline-goto-entry (button-at (point)))))
+
+;;; 阅读器 buffer 关闭时的目录面板清理
+
+;; 用户反馈：关掉 PDF buffer 后目录面板窗口仍留着，点里面的按钮还会因为源 buffer
+;; 已死而报错。故在 `kill-buffer-hook' 上挂一个**全局**回调（不是 buffer-local：
+;; 阅读器 buffer 可能在别的模块打开时就已经存在，buffer-local 钩子只对之后打开
+;; 的 buffer 生效）。
+
+(defun seshat-reader-outline--kill-buffer-cleanup ()
+  "Close and empty the outline panel of a seshat-reader buffer being killed.
+Runs from the **global** `kill-buffer-hook' (not a buffer-local one), so it
+also covers buffers opened before this library got loaded; it returns
+immediately unless the dying buffer is still in `seshat-reader-mode'
+\(`major-mode' is valid while `kill-buffer-hook' runs).
+
+The panel of that document, `*Outline of NAME*', is closed through
+`seshat-reader-sidebar-close-buffer-kind' with kind `outline' — only the
+window of that kind showing that very panel is removed, other panels are
+untouched.  The panel buffer is then emptied (`inhibit-read-only' bound)
+and `seshat-reader-outline--doc-buffername' reset to nil, so the entries of
+a dead document cannot survive and the outline toggle key
+\(\\[seshat-reader-sidebar-toggle-outline]) cannot resurrect them.  The
+panel buffer itself is **not** killed: keeping it empty lets the next
+`seshat-reader-outline-show' rebuild into the same buffer.
+
+The body is wrapped in `ignore-errors' because it runs inside
+`kill-buffer-hook', where a signal would abort the kill.
+
+Note: this library is loaded lazily (`seshat-reader-outline-show' is
+autoloaded), so the hook only gets registered once an outline panel has
+been opened in the session.  That is sufficient — with no panel ever
+opened there is no panel to close."
+  (ignore-errors
+    (when (derived-mode-p 'seshat-reader-mode)
+      (let ((panel (get-buffer (format "*Outline of %s*" (buffer-name)))))
+        (when (buffer-live-p panel)
+          (seshat-reader-sidebar-close-buffer-kind 'outline panel)
+          (with-current-buffer panel
+            (setq seshat-reader-outline--doc-buffername nil)
+            (let ((inhibit-read-only t))
+              (erase-buffer))))))))
+
+(add-hook 'kill-buffer-hook #'seshat-reader-outline--kill-buffer-cleanup)
+
+;;; Evil 兼容（软依赖）
+
+;; evil 是**软依赖**：本包不 `require'、不写进 `Package-Requires'，也不做任何
+;; 版本探测；evil 不在时下面的注册整体静默跳过。
+;;
+;; 为什么需要它：evil 把各 state 的 keymap（`evil-normal-state-map' →
+;; `evil-motion-state-map'）经 `emulation-mode-map-alists' 挂在 major-mode-map
+;; **之前**，所以 `seshat-reader-outline-mode-map' 里的 `f' 会被
+;; `evil-find-char' 抢走（`q' 会被 `evil-record-macro'、`RET' 会被 `evil-ret'
+;; 抢）。要靠用户自己在配置里补绑才可用，显然是包的责任没尽到。
+;;
+;; 为什么用 `evil-define-key*'：它是**函数**（evil-core.el，实读签名
+;; `(STATE KEYMAP KEY DEF &rest BINDINGS)'，STATE 为 `normal'/`insert'/... 或
+;; 其列表，KEYMAP 可给符号 `global'/`local'），把绑定写进 KEYMAP 关联的
+;; **auxiliary keymap**；`evil-normalize-keymaps' 装载时 auxiliary keymap 的
+;; 优先级高于 state 自身的 map，因此这些绑定只在**本 major mode** 生效、且压过
+;; `evil-motion-state-map'，同时**不触碰** evil 的全局 map（传的 KEYMAP 是本
+;; mode 的 map，不是 `global'）。`evil-define-key'（无星号）是宏、且会把绑定
+;; 延迟到 `after-load-functions'，不如函数版确定。
+;;
+;; KEY 的形式：`define-key'/`evil-define-key*' 对**字符串**不做 `kbd' 解析
+;; （实测 Emacs 31.1：`"RET"' 会被当成 R、E、T 三个键的序列），故特殊键必须传
+;; `(kbd "RET")' 这样的向量。
+(defun seshat-reader-outline--install-evil-bindings ()
+  "Install the outline panel's single-key bindings for evil's normal state.
+
+Soft dependency: does nothing when evil (or `evil-define-key*') is absent, so
+loading this library never requires evil.  Extracted from the
+`with-eval-after-load' block below only so that it can be unit-tested."
+  (when (fboundp 'evil-define-key*)
+    (evil-define-key* 'normal seshat-reader-outline-mode-map
+      "f"           #'seshat-reader-outline-avy-jump
+      "p"           #'previous-line
+      "n"           #'next-line
+      "o"           #'seshat-reader-outline-select-doc-window
+      "q"           #'quit-window
+      (kbd "RET")   #'seshat-reader-outline-visit-page
+      (kbd "M-RET") #'seshat-reader-outline-visit-page)))
+
+(with-eval-after-load 'evil
+  (seshat-reader-outline--install-evil-bindings))
 
 (provide 'seshat-reader-outline)
 ;;; seshat-reader-outline.el ends here

@@ -561,5 +561,241 @@ Section 1.2 5 / Chapter 2 7 / Part II 10.")
   (should (eq (lookup-key seshat-reader-outline-mode-map (kbd "M-RET"))
               #'seshat-reader-outline-visit-page)))
 
+(defmacro seshat-reader-outline-test--with-rendered (rows &rest body)
+  "在临时 buffer 中渲染 ROWS，然后执行 BODY（point 在 buffer 开头）.
+
+复刻目录面板的最小环境：`outline-regexp' 按 `seshat-reader-outline-mode' 的
+设置给出（不跑 mode body，避免 `buffer-read-only' 干扰插入）。"
+  (declare (indent 1))
+  `(with-temp-buffer
+     (setq-local outline-regexp "^\\*+ ")
+     (let ((inhibit-read-only t))
+       (seshat-reader--outline-insert-outline ,rows))
+     (goto-char (point-min))
+     ,@body))
+
+(defun seshat-reader-outline-test--line-depths ()
+  "返回当前渲染 buffer 中每行的 `(LINE-START . DEPTH)'（按行首星号数 - 1 推算）."
+  (save-excursion
+    (goto-char (point-min))
+    (let (result)
+      (while (not (eobp))
+        (unless (looking-at "^\\(\\*+\\) ")
+          (error "Line does not match `outline-regexp': %S"
+                 (buffer-substring-no-properties (line-beginning-position)
+                                                 (line-end-position))))
+        (push (cons (line-beginning-position) (1- (length (match-string 1))))
+              result)
+        (forward-line 1))
+      (nreverse result))))
+
+(defun seshat-reader-outline-test--hidden-p (pos)
+  "POS 处是否被 outline 折叠隐藏.
+
+Emacs 31 的 `outline-hide-subtree' 用 **overlay**（`invisible' = `outline'）
+实现隐藏，旧版用同名 text property；`invisible-p' 两者都认，故用它，并额外
+兼容 text property 形态。"
+  (or (invisible-p pos) (get-text-property pos 'invisible)))
+
+;;; 14. 渲染层：行首星号零宽（保留 outline 结构，但不占显示列）
+
+(ert-deftest seshat-reader-outline-test--render-stars-zero-width ()
+  "星号区间带 `display \"\"'：星号文本仍在、行仍是标题、星号之后不留零宽."
+  (let ((rows (seshat-reader-outline--rows
+               seshat-reader-outline-test--tree-3level nil nil)))
+    (seshat-reader-outline-test--with-rendered rows
+      (let ((line-depths (seshat-reader-outline-test--line-depths)))
+        (should (= 6 (length line-depths)))
+        (dolist (entry line-depths)
+          (let* ((line-start (car entry))
+                 (depth (cdr entry))
+                 (stars (1+ depth)))
+            ;; ① 星号文本**仍在 buffer 里**（零宽是显示属性，不是删除文本）
+            (should (string-prefix-p
+                     "*" (buffer-substring-no-properties line-start
+                                                        (1+ line-start))))
+            (should (equal (buffer-substring-no-properties
+                            line-start (+ line-start stars))
+                           (make-string stars ?*)))
+            ;; ② (1+depth) 个星号逐个零宽
+            (dotimes (i stars)
+              (should (equal (get-text-property (+ line-start i) 'display) "")))
+            ;; ③ 星号之后那一列**不是**零宽（星号后的固定空格保留）
+            (should-not (equal (get-text-property (+ line-start stars) 'display)
+                               ""))
+            ;; ④ `outline-regexp' / `outline-on-heading-p' 仍认这是标题行
+            (save-excursion
+              (goto-char line-start)
+              (should (looking-at "^\\*+ "))
+              (should (outline-on-heading-p)))))))))
+
+;;; 15. 渲染层：缩进规则（星号后 1 个固定空格 + `--indent-width' × depth）
+
+(ert-deftest seshat-reader-outline-test--render-indent-width ()
+  "缩进：`--indent-width' 默认 1，行前缀 = 星号 + 1 空格 + depth × 1 空格."
+  (should (= 1 seshat-reader-outline--indent-width))
+  (let ((rows (seshat-reader-outline--rows
+               seshat-reader-outline-test--tree-3level nil nil)))
+    (seshat-reader-outline-test--with-rendered rows
+      (let ((line-depths (seshat-reader-outline-test--line-depths)))
+        ;; 三层都覆盖到（depth 0/1/2）
+        (should (equal (mapcar #'cdr line-depths) '(0 1 2 2 1 0)))
+        (dolist (entry line-depths)
+          (let* ((line-start (car entry))
+                 (depth (cdr entry))
+                 (indent (* seshat-reader-outline--indent-width depth))
+                 (prefix-len (+ (1+ depth) 1 indent))
+                 (prefix (buffer-substring-no-properties
+                          line-start (+ line-start prefix-len))))
+            ;; 星号之后的空格数 = 1（固定左边距）+ indent-width × depth
+            (should (equal prefix
+                           (concat (make-string (1+ depth) ?*)
+                                   " "
+                                   (make-string indent ?\s))))
+            (should (= (+ 1 indent) (- (length prefix) (1+ depth))))
+            ;; 缩进区之后紧跟折叠符号（有子节点）或 2 空格占位（叶子）
+            (should (memq (char-after (+ line-start prefix-len))
+                          '(?▾ ?▸ ?\s)))))))))
+
+;;; 16. 折叠：星号零宽后 TAB 折叠仍可用
+
+(ert-deftest seshat-reader-outline-test--fold-still-works ()
+  "星号零宽后 `outline-hide-subtree' / `outline-show-subtree' 仍生效（`invisible'）."
+  (with-temp-buffer
+    (seshat-reader-outline-mode)
+    (let ((inhibit-read-only t))
+      (seshat-reader--outline-insert-outline
+       (seshat-reader-outline--rows
+        seshat-reader-outline-test--tree-3level nil nil))
+      (goto-char (point-min)))
+    ;; 面板模式的两条不变量未被本批改动
+    (should buffer-read-only)
+    (should (equal outline-regexp "^\\*+ "))
+    (should (outline-on-heading-p))
+    (let ((chapter-1 (save-excursion
+                       (goto-char (point-min))
+                       (search-forward "Chapter 1")
+                       (match-beginning 0))))
+      ;; 折叠 "Part I" 的子树 → 子树（含 Chapter 1 行）变不可见
+      (should-not (seshat-reader-outline-test--hidden-p chapter-1))
+      (outline-hide-subtree)
+      (should (seshat-reader-outline-test--hidden-p chapter-1))
+      ;; 零宽属性不被折叠影响
+      (should (equal (get-text-property (point-min) 'display) ""))
+      (outline-show-subtree)
+      (should-not (seshat-reader-outline-test--hidden-p chapter-1)))
+    ;; 折叠/展开只改显示属性，buffer 文本（含星号与标题）不变
+    (should (save-excursion (goto-char (point-min)) (looking-at "^\\* ")))
+    (should (save-excursion
+              (goto-char (point-min))
+              (search-forward "Part I" nil t)))))
+
+;;; 17. evil 软依赖：包内补绑（不依赖用户配置）
+
+(ert-deftest seshat-reader-outline-test--evil-soft-dependency ()
+  "evil 缺失时静默跳过；evil 存在时把面板 7 个键（含 `f'）补绑到 normal state."
+  ;; ① evil 未加载（`evil-define-key*' 不可用）→ 静默跳过，不改 mode-map
+  (cl-letf (((symbol-function 'evil-define-key*) nil))
+    (should-not (fboundp 'evil-define-key*))
+    (should-not (seshat-reader-outline--install-evil-bindings)))
+  (should (eq (lookup-key seshat-reader-outline-mode-map "f")
+              #'seshat-reader-outline-avy-jump))
+  ;; ② 桩替 `evil-define-key*'：断言实参是 (normal <本 mode 的 map> 7 对绑定)
+  (let (calls)
+    (cl-letf (((symbol-function 'evil-define-key*)
+               (lambda (&rest args) (push args calls) nil)))
+      (seshat-reader-outline--install-evil-bindings))
+    (should (= 1 (length calls)))
+    (let* ((args (car calls))
+           (pairs (cl-loop for (key def) on (cddr args) by #'cddr
+                           collect (cons key def))))
+      (should (eq (nth 0 args) 'normal))
+      (should (eq (nth 1 args) seshat-reader-outline-mode-map))
+      (should (= 7 (length pairs)))
+      ;; `f' 必须补绑（evil 的 `evil-find-char' 会抢它）
+      (should (equal (assoc "f" pairs)
+                     '("f" . seshat-reader-outline-avy-jump)))
+      (should (equal (assoc "p" pairs) '("p" . previous-line)))
+      (should (equal (assoc "n" pairs) '("n" . next-line)))
+      (should (equal (assoc "o" pairs)
+                     '("o" . seshat-reader-outline-select-doc-window)))
+      (should (equal (assoc "q" pairs) '("q" . quit-window)))
+      ;; 特殊键必须走 `kbd' 向量（`define-key' 不解析字符串 "RET"）
+      (should (equal (assoc (kbd "RET") pairs)
+                     (cons (kbd "RET") 'seshat-reader-outline-visit-page)))
+      (should (equal (assoc (kbd "M-RET") pairs)
+                     (cons (kbd "M-RET") 'seshat-reader-outline-visit-page))))
+    ;; ③ 注册路径：`with-eval-after-load' 在 evil **已加载**时立即执行
+    (let ((calls nil)
+          (saved-features features)
+          (source (expand-file-name
+                   "seshat-reader-outline.el"
+                   (file-name-directory
+                    (locate-library "seshat-reader-outline")))))
+      (unwind-protect
+          (progn
+            ;; `featurep' 读的是 `features' 的全局值（C 层），故直接 push 伪造
+            ;; 「evil 已加载」，结束后原样还原，不真的加载 evil。
+            (push 'evil features)
+            (should (featurep 'evil))
+            (cl-letf (((symbol-function 'evil-define-key*)
+                       (lambda (&rest args) (push args calls) nil)))
+              (load source nil t)))
+        (setq features saved-features))
+      (should (= 1 (length calls)))
+      (should (eq (nth 0 (car calls)) 'normal))
+      (should (eq (nth 1 (car calls)) seshat-reader-outline-mode-map)))))
+
+;;; 7. 阅读器 buffer 被 kill 时的目录面板清理（T3b）
+
+(ert-deftest seshat-reader-outline-test--kill-buffer-cleanup-ignores-non-reader ()
+  "非 `seshat-reader-mode' buffer 上零动作：不查面板 buffer、不关窗口."
+  (let ((buf (get-buffer-create "*seshat-outline-test-plain*"))
+        (queried nil)
+        (closed nil))
+    (unwind-protect
+        (with-current-buffer buf
+          (setq major-mode 'fundamental-mode)
+          (cl-letf (((symbol-function 'get-buffer)
+                     (lambda (name) (push name queried) nil))
+                    ((symbol-function 'seshat-reader-sidebar-close-buffer-kind)
+                     (lambda (kind buffer) (push (list kind buffer) closed))))
+            (seshat-reader-outline--kill-buffer-cleanup)))
+      (when (buffer-live-p buf) (kill-buffer buf)))
+    ;; 连 `get-buffer' 都不该调用：早期返回必须发生在查面板之前
+    (should-not queried)
+    (should-not closed)))
+
+(ert-deftest seshat-reader-outline-test--kill-buffer-cleanup-closes-and-empties-panel ()
+  "阅读器 buffer 被 kill 时：关闭 outline 面板窗口、清空内容、归属信息置 nil."
+  (let* ((doc "seshat-outline-test-kill.pdf")
+         (panel (get-buffer-create
+                 (seshat-reader-outline-test--outline-buffer-name doc)))
+         (reader (get-buffer-create doc))
+         (closed nil))
+    (unwind-protect
+        (progn
+          (with-current-buffer panel
+            (insert "stale outline entry\n")
+            (setq seshat-reader-outline--doc-buffername doc))
+          (with-current-buffer reader
+            (setq major-mode 'seshat-reader-mode))
+          ;; 钩子必须是**全局**注册（不是 buffer-local），否则只有加载本库之后
+          ;; 才打开的阅读器 buffer 才受保护
+          (should (memq #'seshat-reader-outline--kill-buffer-cleanup
+                        kill-buffer-hook))
+          (cl-letf (((symbol-function 'seshat-reader-sidebar-close-buffer-kind)
+                     (lambda (kind buffer) (push (list kind buffer) closed))))
+            (with-current-buffer reader
+              (seshat-reader-outline--kill-buffer-cleanup)))
+          ;; ① 以 kind `outline' + 该文档的面板 buffer 调用承载层的关闭原语
+          (should (equal closed (list (list 'outline panel))))
+          ;; ② 面板内容被清空（不 kill 面板 buffer，下次 show 可重建）
+          (with-current-buffer panel
+            (should (zerop (buffer-size)))
+            (should-not seshat-reader-outline--doc-buffername)))
+      (dolist (buf (list panel reader))
+        (when (buffer-live-p buf) (kill-buffer buf))))))
+
 (provide 'seshat-reader-outline-test)
 ;;; seshat-reader-outline-test.el ends here

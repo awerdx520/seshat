@@ -779,6 +779,46 @@ SELECT 非 nil 表示「面板内容已就绪，可以跟随光标」：批注�
       (seshat-reader-sidebar--display buffer kind select)
     (pop-to-buffer buffer)))
 
+(defun seshat-reader-sidebar-close-buffer-kind (kind buffer)
+  "Close the sidebar window of KIND that is displaying BUFFER.
+KIND is a panel content type (`outline' / `annotations' / `translate'), BUFFER
+is a buffer object or a buffer name.  Only windows whose
+`seshat-reader-sidebar-kind' window parameter equals KIND **and** whose
+`window-buffer' is BUFFER are handled: panels of other kinds are untouched,
+and neither is a panel of the same kind showing a different buffer.  Before
+closing, the dimensions of the matching windows are captured by
+`seshat-reader-sidebar--capture-state' (so a user resize survives), then
+`delete-window' runs inside `ignore-errors' (the window may be the frame's
+last non-side window, or already deleted).
+
+The KIND entry is also dropped from `seshat-reader-sidebar--last-buffers'
+\(and from `seshat-reader-sidebar--last-buffer' / `--last-kind') when it
+points at BUFFER, so `seshat-reader-sidebar-toggle' (\\[seshat-reader-sidebar-toggle-outline])
+cannot resurrect the removed panel by re-displaying a buffer whose document
+is gone.
+
+Deliberately **not** implemented on top of `seshat-reader-sidebar-toggle':
+`toggle' re-opens a panel when no window of that kind exists, which is the
+opposite of what a cleanup needs."
+  (let ((buffer (if (bufferp buffer) buffer (get-buffer buffer))))
+    (when (buffer-live-p buffer)
+      (let (targets)
+        (dolist (win (seshat-reader-sidebar--windows))
+          (when (and (eq (window-parameter win 'seshat-reader-sidebar-kind) kind)
+                     (eq (window-buffer win) buffer))
+            (push win targets)))
+        (when targets
+          (seshat-reader-sidebar--capture-state targets)
+          (dolist (win targets)
+            (ignore-errors (delete-window win))))
+        ;; 记忆里的死面板必须一并清掉，否则 `C-c C-o' 会拿它复活。
+        (when (eq (cdr (assq kind seshat-reader-sidebar--last-buffers)) buffer)
+          (setq seshat-reader-sidebar--last-buffers
+                (assq-delete-all kind seshat-reader-sidebar--last-buffers)))
+        (when (eq seshat-reader-sidebar--last-buffer buffer)
+          (setq seshat-reader-sidebar--last-buffer nil
+                seshat-reader-sidebar--last-kind nil))))))
+
 (defun seshat-reader-sidebar--toggle-kind (kind)
   "**只**开或**只**关 kind 为 KIND 的面板窗口，其它 kind 不受影响.
 KIND 有窗口时：先 `seshat-reader-sidebar--capture-state' 记住这些窗口的实测

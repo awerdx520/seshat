@@ -15,6 +15,7 @@
 
 ## 文档
 - 架构设计：docs/architecture.md
+- Emacs 阅读器使用手册：[docs/emacs-reader.md](docs/emacs-reader.md)
 - 实施计划：openspec/completed/personal-notes-system.md
 - 决策日志：openspec/decisions.md
 - ADR：docs/adr/

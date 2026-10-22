@@ -948,5 +948,121 @@ CELL 是一个 (LIST) 形态的 cons 表达式，`(car CELL)' 收集按调用顺
     (should (eq (lookup-key seshat-reader-mode-map (kbd "C-c C-a"))
                 #'seshat-reader-annotation-create))))
 
+;;; 闪现矩形与合并重投（`--redraw-highlights'）
+
+(ert-deftest seshat-reader-annotation-test--redraw-highlights-merges-cache-and-flash ()
+  "合并重投：批注矩形（缓存）在前、闪现矩形在后，顺序 clear → add × N → refresh."
+  (seshat-reader-annotation-test--with-temp-dir dir
+    (let* ((file (expand-file-name "book.pdf" dir))
+           (seshat-reader-annotation-roots (list (cons "lib" dir)))
+           (cell (list nil)))
+      (with-temp-file file)
+      (unwind-protect
+          (with-temp-buffer
+            (setq buffer-file-name file)
+            ;; 闪现矩形：页号 1-based、页面坐标，与 `--add-highlight' 同口径
+            (setq-local seshat-reader-select--flash-rects
+                        '((7 100.0 200.0 300.0 400.0)))
+            (with-current-buffer
+                (get-buffer-create seshat-reader-annotation-list-buffer-name)
+              (setq-local seshat-reader-annotation-list-document-id "lib:book.pdf")
+              (setq-local seshat-reader-annotation-list-entries
+                          (list (list (cons 'id 1)
+                                      (cons 'location
+                                            (concat "page:2;"
+                                                    "rect:1.00,2.00,3.00,4.00;"
+                                                    "rect:5.00,6.00,7.00,8.00"))))))
+            (seshat-reader-annotation-test--with-highlight-stubs cell
+              ;; 0 参调用：批注矩形来自缓存（2 条），闪现 1 条 → 共 3 次 add
+              (should (= 2 (seshat-reader-annotation--redraw-highlights)))
+              (should (equal (nreverse (car cell))
+                             '(clear
+                               (add 2 1.0 2.0 3.0 4.0)
+                               (add 2 5.0 6.0 7.0 8.0)
+                               (add 7 100.0 200.0 300.0 400.0)
+                               refresh)))))
+        (when (get-buffer seshat-reader-annotation-list-buffer-name)
+          (kill-buffer seshat-reader-annotation-list-buffer-name))))))
+
+(ert-deftest seshat-reader-annotation-test--redraw-highlights-flash-not-gated-by-enabled ()
+  "`highlight-enabled' 为 nil 时批注矩形不投，但闪现矩形仍投（闪现独立）。"
+  (seshat-reader-annotation-test--with-temp-dir dir
+    (let* ((file (expand-file-name "book.pdf" dir))
+           (seshat-reader-annotation-roots (list (cons "lib" dir)))
+           (seshat-reader-annotation-highlight-enabled nil)
+           (cell (list nil)))
+      (with-temp-file file)
+      (unwind-protect
+          (with-temp-buffer
+            (setq buffer-file-name file)
+            (setq-local seshat-reader-select--flash-rects
+                        '((1 10.0 10.0 100.0 40.0)))
+            (with-current-buffer
+                (get-buffer-create seshat-reader-annotation-list-buffer-name)
+              (setq-local seshat-reader-annotation-list-document-id "lib:book.pdf")
+              (setq-local seshat-reader-annotation-list-entries
+                          (list (list (cons 'id 1)
+                                      (cons 'location "page:2;rect:1.00,2.00,3.00,4.00")))))
+            (seshat-reader-annotation-test--with-highlight-stubs cell
+              (should (= 0 (seshat-reader-annotation--redraw-highlights)))
+              (should (equal (nreverse (car cell))
+                             '(clear (add 1 10.0 10.0 100.0 40.0) refresh)))))
+        (when (get-buffer seshat-reader-annotation-list-buffer-name)
+          (kill-buffer seshat-reader-annotation-list-buffer-name))))))
+
+(ert-deftest seshat-reader-annotation-test--redraw-highlights-without-flash ()
+  "无闪现矩形时 0 参重投与 `--apply-highlights' 按同一批条目投喂完全一致."
+  (seshat-reader-annotation-test--with-temp-dir dir
+    (let* ((file (expand-file-name "book.pdf" dir))
+           (seshat-reader-annotation-roots (list (cons "lib" dir)))
+           (entries (list (list (cons 'id 1)
+                                (cons 'location "page:3;rect:1.00,2.00,3.00,4.00"))
+                          (list (cons 'id 2)
+                                (cons 'location "page:1;rect:9.00,9.00,10.00,10.00"))))
+           (cell-a (list nil))
+           (cell-b (list nil)))
+      (with-temp-file file)
+      (unwind-protect
+          (with-temp-buffer
+            (setq buffer-file-name file)
+            (setq-local seshat-reader-select--flash-rects nil)
+            (with-current-buffer
+                (get-buffer-create seshat-reader-annotation-list-buffer-name)
+              (setq-local seshat-reader-annotation-list-document-id "lib:book.pdf")
+              (setq-local seshat-reader-annotation-list-entries entries))
+            (let ((count-a nil)
+                  (count-b nil)
+                  (calls-a nil)
+                  (calls-b nil))
+              (seshat-reader-annotation-test--with-highlight-stubs cell-a
+                (setq count-a (seshat-reader-annotation--redraw-highlights))
+                (setq calls-a (nreverse (car cell-a))))
+              (seshat-reader-annotation-test--with-highlight-stubs cell-b
+                (setq count-b (seshat-reader-annotation--apply-highlights entries))
+                (setq calls-b (nreverse (car cell-b))))
+              (should (= 2 count-a count-b))
+              (should (equal calls-a calls-b))))
+        (when (get-buffer seshat-reader-annotation-list-buffer-name)
+          (kill-buffer seshat-reader-annotation-list-buffer-name))))))
+
+(ert-deftest seshat-reader-annotation-test--cached-annotation-rects-ignores-other-document ()
+  "缓存属于其它文档时不取用（C 层高亮表是文档级的，防跨文档错投）."
+  (seshat-reader-annotation-test--with-temp-dir dir
+    (let* ((file (expand-file-name "book.pdf" dir))
+           (seshat-reader-annotation-roots (list (cons "lib" dir))))
+      (with-temp-file file)
+      (unwind-protect
+          (with-temp-buffer
+            (setq buffer-file-name file)
+            (with-current-buffer
+                (get-buffer-create seshat-reader-annotation-list-buffer-name)
+              (setq-local seshat-reader-annotation-list-document-id "lib:other.pdf")
+              (setq-local seshat-reader-annotation-list-entries
+                          (list (list (cons 'id 1)
+                                      (cons 'location "page:2;rect:1.00,2.00,3.00,4.00")))))
+            (should-not (seshat-reader-annotation--cached-annotation-rects)))
+        (when (get-buffer seshat-reader-annotation-list-buffer-name)
+          (kill-buffer seshat-reader-annotation-list-buffer-name))))))
+
 (provide 'seshat-reader-annotation-test)
 ;;; seshat-reader-annotation-test.el ends here

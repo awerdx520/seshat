@@ -65,6 +65,7 @@
 - `seshat:` 链接**补全与导出**（M12）：注册 `:complete`（候选来自 `seshat-reader-annotation-roots` 下的书库文件，当前文档优先）与 `:export`（导出为「文件名 第 N 页」可读文本，不输出裸协议串）。
 - 摘录**按位置插入**（M12）：新增 `seshat-reader-reference-insert-position`（`end-of-file` / `headline` / `point`），默认仍是文件末尾；`headline` 模式插到光标所在 headline 子树末尾（`featurep 'org` 且 `derived-mode-p 'org-mode` 双守卫）。
 - 阅读器 C 模块**三个高亮导出函数**（M12）：`seshat-reader-dyn--add-highlight` / `--clear-highlights` / `--refresh-highlights`。
+- 阅读器框选松手后闪现选区高亮（`seshat-reader-select-flash-duration` 默认 2 秒，0 关闭），建批注后转为持久高亮。
 
 ### 变更
 
@@ -96,6 +97,7 @@
 - 阅读器目录面板不再用 `pop-to-buffer`（M12），改由 `seshat-reader-sidebar-show` 承载，受 `seshat-reader-sidebar-enabled` / `-position` 管辖。
 - `seshat-reader--set-window-vscroll` 的像素路径不再对已按像素传入的值再乘一次 `pixel-per-col`（M12；此前仅因 clamp 而「看起来正确」）。
 - 阅读器翻页/跳页命令现在会显式设置纵向落点（M12）：此前部分命令不改 vscroll，依赖 C 侧重置。
+- 阅读器目录面板行首星号改为零宽显示（保留 outline 折叠能力），缩进收窄；`f` 等单键在 evil 下由包内补绑，不再依赖用户配置。
 
 ### 破坏性
 
@@ -134,6 +136,8 @@
 - 修复 `seshat-reader-dyn--text-in-rect` / `--add-highlight` 对**逆序角点**（如 `x0 > x1`）的误拒（M12）：`fz_is_valid_rect` 要求 `x0 <= x1`，原实现在归一化之前校验；现改为先归一化再校验。
 - 修复 C 模块**换文档/关文档时泄漏整份 `DocPage` 数组与每页 mutex**（M12）：`free_doc_pages` 此前零调用点，现接入 `free_doc_state`（在 drop MuPDF 上下文之前）。
 - 修复 `seshat:` 链接对**尾部裸 `#`** 解析出空串 location（M12）：现归一为 `nil`。
+- 修阅读器默认不居中与页面裁切（M12 回归）：`window-size-change-functions` 钩子此前把 frame 当 window 传导致居中从不重算；跨页衔接（strip 行）在 `fit-to-height` 下会裁切页面，现默认关闭（`seshat-reader-page-join-lines` 默认 0）
+- 阅读器退出文档后目录面板窗口残留（现随 buffer 关闭一并关闭并清空内容）
 
 ## [0.2.0] - 2026-10-12
 

@@ -305,6 +305,110 @@ pixel-per-col 多乘一次（50 × 25 = 1250），会先被夹到 1000，断言�
         ;; 前缀宽度优先从 center overlay 读取
         (should (= 300 (seshat-reader--get-prefix-width)))))))
 
+;;; 5b. 回归修复：默认关闭 strip、居中兜底、窗口尺寸钩子
+
+(ert-deftest seshat-reader-page-join-test--join-lines-default-zero ()
+  "`seshat-reader-page-join-lines' 默认 0，默认值下 strip 像素高度为 0。"
+  (should (= 0 (default-value 'seshat-reader-page-join-lines)))
+  (cl-letf (((symbol-function 'frame-char-height)
+             (lambda (&optional _frame) 20)))
+    ;; 不绑定同名局部变量，直接走 defcustom 的默认值
+    (should (= 0 (seshat-reader--page-join-pixels)))))
+
+(ert-deftest seshat-reader-page-join-test--window-size-change ()
+  "钩子按 frame 遍历窗口，只对显示当前 buffer 的窗口重算居中。"
+  (with-temp-buffer
+    (let* ((win-a 'win-a)
+           (win-b 'win-b)
+           (other-buffer (generate-new-buffer " *other*"))
+           (calls nil))
+      (unwind-protect
+          (progn
+            (cl-letf (((symbol-function 'window-list)
+                       (lambda (&optional _frame) (list win-a win-b)))
+                      ((symbol-function 'window-buffer)
+                       (lambda (window)
+                         (if (eq window win-a) (current-buffer) other-buffer)))
+                      ((symbol-function 'seshat-reader--center-page)
+                       (lambda (&optional window) (push window calls) 'centered)))
+              (seshat-reader--window-size-change (selected-frame))
+              ;; 只有显示当前 buffer 的 win-a 被居中，且传入的是窗口本身
+              (should (equal (list win-a) calls))))
+        (kill-buffer other-buffer)))))
+
+(ert-deftest seshat-reader-page-join-test--window-size-change-errors ()
+  "单个窗口报错不影响其它窗口被居中，函数整体不抛错。"
+  (with-temp-buffer
+    (let* ((win-a 'win-a)
+           (win-b 'win-b)
+           (calls nil))
+      (cl-letf (((symbol-function 'window-list)
+                 (lambda (&optional _frame) (list win-a win-b)))
+                ((symbol-function 'window-buffer)
+                 (lambda (_window) (current-buffer)))
+                ((symbol-function 'seshat-reader--center-page)
+                 (lambda (&optional window)
+                   (push window calls)
+                   (when (eq window win-a)
+                     (error "centering failed")))))
+        (should-not (seshat-reader--window-size-change (selected-frame)))
+        ;; 两个窗口都被尝试过，且顺序为先 win-a 后 win-b
+        (should (equal (list win-b win-a) calls))))))
+
+(ert-deftest seshat-reader-page-join-test--prefix-width-zero ()
+  "center overlay 不存在或 line-prefix 为 nil 时前缀宽度是数字 0。"
+  (with-temp-buffer
+    (let ((seshat-reader--center-overlay nil))
+      ;; 连 doc overlay 都没有：不得报错，返回 0
+      (cl-letf (((symbol-function 'seshat-reader-current-doc-overlay)
+                 (lambda (&optional _window) nil)))
+        (should (numberp (seshat-reader--get-prefix-width)))
+        (should (= 0 (seshat-reader--get-prefix-width))))
+      ;; doc overlay 存在但没有 line-prefix：同样是 0
+      (let ((overlay (make-overlay (point-min) (point-max))))
+        (cl-letf (((symbol-function 'seshat-reader-current-doc-overlay)
+                   (lambda (&optional _window) overlay)))
+          (should (numberp (seshat-reader--get-prefix-width)))
+          (should (= 0 (seshat-reader--get-prefix-width))))))))
+
+(ert-deftest seshat-reader-page-join-test--vscroll-nil-image-size ()
+  "页面尺寸未知时 `seshat-reader--set-window-vscroll' 不报错，按 0 处理。"
+  (let ((calls nil))
+    (cl-letf (((symbol-function 'seshat-reader--get-current-doc-image-size)
+               (lambda (&optional _window) (cons nil nil)))
+              ((symbol-function 'window-body-height)
+               (lambda (&optional _window pixels-p) (if pixels-p 700 40)))
+              ((symbol-function 'set-window-vscroll)
+               (lambda (_window vscroll &optional pixels-p)
+                 (push (list vscroll pixels-p) calls)
+                 vscroll)))
+      (should (= 0 (seshat-reader--set-window-vscroll nil 100 t)))
+      (should (equal '((0 t)) calls)))))
+
+(ert-deftest seshat-reader-page-join-test--center-page-fallback ()
+  "页面宽度未知时 `--center-page' 清旧前缀并把水平滚动归零，而非静默放弃。"
+  (with-temp-buffer
+    (let ((seshat-reader--center-overlay nil)
+          (hscroll-calls nil)
+          (plain-calls nil))
+      (let ((overlay (make-overlay (point-min) (point-max))))
+        (overlay-put overlay 'line-prefix '(space :width (300)))
+        (cl-letf (((symbol-function 'seshat-reader-current-doc-overlay)
+                   (lambda (&optional _window) overlay))
+                  ((symbol-function 'seshat-reader--get-current-doc-image-size)
+                   (lambda (&optional _window) (cons nil nil)))
+                  ((symbol-function 'window-body-width)
+                   (lambda (&optional _window pixels-p) (if pixels-p 800 80)))
+                  ((symbol-function 'seshat-reader--set-window-hscroll)
+                   (lambda (_window ncol &optional _unconstrained)
+                     (push ncol hscroll-calls) 0))
+                  ((symbol-function 'set-window-hscroll)
+                   (lambda (_window ncol) (push ncol plain-calls) 0)))
+          (seshat-reader--center-page)
+          (should-not (overlay-get overlay 'line-prefix))
+          (should (equal '(0) hscroll-calls))
+          (should (equal '(0) plain-calls)))))))
+
 ;;; 6. 翻页落点语义（T8b）
 
 (defun seshat-reader-page-join-test--window-stubs (image-height window-height

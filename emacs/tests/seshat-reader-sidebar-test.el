@@ -1283,5 +1283,111 @@ KIND 为面板内容类型，CONTENT-LINES 为桩出的内容行数，INIT-HEIGH
       (should (equal (seshat-reader-sidebar--size-for-kind 'annotations)
                      0.24)))))
 
+;;; 按 kind + buffer 定向关闭面板（T3b：退出 PDF 后关闭目录面板）
+
+(defmacro seshat-reader-sidebar-test--with-fake-panel-windows (windows-var
+                                                              delete-var
+                                                              &rest body)
+  "在桩替窗口原语的环境中求值 BODY.
+WINDOWS-VAR 绑定为 `(WINDOW KIND BUFFER)' 三元列表的列表（模拟已显示的面板），
+`window-parameter' / `window-buffer' 直接从该三元列表取 KIND / BUFFER，
+DELETE-VAR 收集 `delete-window' 收到的窗口名（三元列表的 `car'）。
+`seshat-reader-sidebar-position' 与 `seshat-reader-outline-sidebar-position' 均
+固定为 `below-selected'（高度语义、`window-total-height'/`frame-height' =
+20/40），故 `--capture-state' 写入的比例恒为 0.5。「最近显示缓冲」的记忆变量一并
+置空，由用例自行设置。"
+  (declare (indent 2))
+  `(let ((,windows-var nil)
+         (,delete-var nil)
+         (seshat-reader-sidebar--state nil)
+         (seshat-reader-sidebar--last-buffers nil)
+         (seshat-reader-sidebar--last-buffer nil)
+         (seshat-reader-sidebar--last-kind nil)
+         (seshat-reader-sidebar-position 'below-selected)
+         (seshat-reader-outline-sidebar-position 'below-selected))
+     (cl-letf (((symbol-function 'seshat-reader-sidebar--windows)
+                (lambda () ,windows-var))
+               ((symbol-function 'window-parameter)
+                (lambda (w param)
+                  (pcase param
+                    ('seshat-reader-sidebar (and (consp w) t))
+                    ('seshat-reader-sidebar-kind (nth 1 w))
+                    ('window-side nil))))
+               ((symbol-function 'window-buffer)
+                (lambda (&optional w) (nth 2 w)))
+               ((symbol-function 'window-total-height) (lambda (&rest _) 20))
+               ((symbol-function 'window-total-width) (lambda (&rest _) 40))
+               ((symbol-function 'frame-height) (lambda (&rest _) 40))
+               ((symbol-function 'frame-width) (lambda (&rest _) 100))
+               ((symbol-function 'delete-window)
+                (lambda (&optional w) (push (car-safe w) ,delete-var))))
+       ,@body)))
+
+(ert-deftest seshat-reader-sidebar-test--close-buffer-kind-matches-kind-and-buffer ()
+  "只删除 kind 与 buffer 都匹配的面板窗口，并清掉该 kind 的死面板记忆."
+  (let ((outline-panel (get-buffer-create "*Outline of doc.pdf*"))
+        (outline-other (get-buffer-create "*Outline of other.pdf*"))
+        (ann-panel (get-buffer-create "*Seshat Annotations*")))
+    (unwind-protect
+        (seshat-reader-sidebar-test--with-fake-panel-windows windows delete-calls
+          (setq windows (list (list 'w-outline 'outline outline-panel)
+                              (list 'w-other 'outline outline-other)
+                              (list 'w-ann 'annotations ann-panel))
+                seshat-reader-sidebar--last-buffers
+                (list (cons 'outline outline-panel)
+                      (cons 'annotations ann-panel))
+                seshat-reader-sidebar--last-buffer outline-panel
+                seshat-reader-sidebar--last-kind 'outline)
+          (seshat-reader-sidebar-close-buffer-kind 'outline outline-panel)
+          ;; ① 只删「kind=outline 且显示该面板 buffer」的那一个窗口
+          (should (equal delete-calls '(w-outline)))
+          ;; ② 删除前先捕获尺寸（用户手动 resize 的记忆不丢）
+          (should (equal (nth 2 (assq 'outline seshat-reader-sidebar--state))
+                         0.5))
+          ;; ③ `C-c C-o' 的死面板记忆被清掉：outline 条目消失，annotations 保留
+          (should-not (assq 'outline seshat-reader-sidebar--last-buffers))
+          (should (eq (cdr (assq 'annotations
+                                 seshat-reader-sidebar--last-buffers))
+                      ann-panel))
+          (should-not seshat-reader-sidebar--last-buffer)
+          (should-not seshat-reader-sidebar--last-kind))
+      (dolist (buf (list outline-panel outline-other ann-panel))
+        (when (buffer-live-p buf) (kill-buffer buf))))))
+
+(ert-deftest seshat-reader-sidebar-test--close-buffer-kind-requires-both-matches ()
+  "kind 或 buffer 不匹配时零删除，且不动任何记忆."
+  (let ((outline-panel (get-buffer-create "*Outline of doc.pdf*"))
+        (ann-panel (get-buffer-create "*Seshat Annotations*")))
+    (unwind-protect
+        (seshat-reader-sidebar-test--with-fake-panel-windows windows delete-calls
+          (setq windows (list (list 'w-outline 'outline outline-panel)
+                              (list 'w-ann 'annotations ann-panel))
+                seshat-reader-sidebar--last-buffers
+                (list (cons 'outline outline-panel)))
+          ;; ① buffer 匹配但 kind 不同
+          (seshat-reader-sidebar-close-buffer-kind 'annotations outline-panel)
+          ;; ② kind 匹配但 buffer 不同
+          (seshat-reader-sidebar-close-buffer-kind 'outline ann-panel)
+          ;; ③ 根本没有该 kind 的窗口
+          (seshat-reader-sidebar-close-buffer-kind 'translate outline-panel)
+          (should-not delete-calls)
+          (should (eq (cdr (assq 'outline seshat-reader-sidebar--last-buffers))
+                      outline-panel)))
+      (dolist (buf (list outline-panel ann-panel))
+        (when (buffer-live-p buf) (kill-buffer buf))))))
+
+(ert-deftest seshat-reader-sidebar-test--close-buffer-kind-ignores-dead-buffer ()
+  "BUFFER 已死（对象或名字）时零删除：原语在窗口遍历之前就返回."
+  (let* ((dead (generate-new-buffer " *seshat-sidebar-dead*"))
+         (dead-name (buffer-name dead)))
+    ;; 在桩环境之外 kill，避免 `replace-buffer-in-windows' 撞上被桩替的窗口原语
+    (kill-buffer dead)
+    (seshat-reader-sidebar-test--with-fake-panel-windows windows delete-calls
+      ;; 窗口仍记着这个已死的 buffer：若没有早期返回就会命中并删除
+      (setq windows (list (list 'w-dead 'outline dead)))
+      (seshat-reader-sidebar-close-buffer-kind 'outline dead)
+      (seshat-reader-sidebar-close-buffer-kind 'outline dead-name)
+      (should-not delete-calls))))
+
 (provide 'seshat-reader-sidebar-test)
 ;;; seshat-reader-sidebar-test.el ends here

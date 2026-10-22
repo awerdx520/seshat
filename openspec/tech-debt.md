@@ -907,3 +907,10 @@
 - 影响：缩放后跨页 strip 的高度/内容与新页不匹配（旧尺寸的底部若干行被拉成固定像素高，比例与当前页不一致），旋转后同理；关掉 `seshat-reader-page-join-lines`（设 0）可规避。
 - 建议：在缩放/旋转/重排尺寸的入口统一清空 `seshat-reader--page-image-specs`（或按新尺寸重新 `--remember-current-page-spec`），并保证下一次「上一页」可见时重建缓存；补一条 ERT 断言「缩放后缓存为空/尺寸已更新」。
 
+## 跨页衔接（M12 strip）在 fit-to-height 下裁切页面（2026-10-22 真机反馈）
+- 现象：`seshat-reader-page-join-lines` 取非 0（M12 默认值曾是 `1`）时，刚打开 PDF 页面不居中、整体挤向左侧，且只显示当前页的一小部分——`seshat-reader-fit-to-height` 下尤其明显。
+- 根因：① 纵向——`seshat-reader--insert-join-strip` 在 `point-min` 插入 strip 行，破坏了页面 overlay 的几何假设：`seshat-reader--set-window-vscroll` 的上限与落点按「strip 高 + 图高」计算，而实际渲染的页面 image 并不包含 strip（strip 是另一行的独立 image），`fit-to-height` 把页高压到窗高之后任何正 vscroll 都会把页顶挤出窗口。② 横向——`seshat-reader--center-page` 把 `line-prefix` 从页面 overlay 移到 buffer 级 overlay 后，一旦 `when-let*` 链路短路就零兜底；叠加**既有缺陷**：`window-size-change-functions` 把 frame 当 window 传给 `--center-page`（参数类型不符，实际不生效），窗口尺寸变化后居中从不重算。
+- 现状（止血，2026-10-22）：`seshat-reader-page-join-lines` 默认值改为 `0`（strip 默认关闭，代码路径完全不插 strip）；`window-size-change-functions` 改挂 `seshat-reader--window-size-change`（遍历 frame 的窗口，只处理显示当前 buffer 的窗口，单窗口出错不影响其它）；`--set-window-vscroll` 的 `image-height`、`--get-prefix-width` 的返回值补 nil 守卫（后者恒返回数字），`--center-page` 短路时清掉旧 `line-prefix` 并把水平滚动归零。
+- 建议：彻底修法二选一——① 让页面 overlay 与 strip 行**彻底分离**（`move-overlay` 收回到当前页字符范围，页面几何只由页面 image 决定，strip 作为独立行处理，vscroll 上限不再叠加 strip 高）；② 改由 C 侧在渲染页面时**预留条带**（把上一页底部直接画进页面位图顶部），elisp 侧不再插行。任一方案落地并补真机验证后，再把默认值改回非 0。
+
+

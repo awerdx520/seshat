@@ -55,10 +55,15 @@
 ;;     rotation lives only in the C side `EmacsWinState' and is not
 ;;     readable from Lisp, so a rotated page yields silently wrong
 ;;     coordinates.
-;;   - No visual highlight is produced: `seshat-reader-mode' displays a page
-;;     with a single overlay per window and overlay `display' properties
-;;     do not compose, so a selection rectangle needs a change in the C
-;;     renderer (tracked separately).
+;;   - The visual feedback for a selection is limited to a short-lived
+;;     "flash": the C renderer's rect highlight table is filled with the
+;;     selection rectangle right after the button is released and cleared
+;;     again after `seshat-reader-select-flash-duration' seconds (see
+;;     `seshat-reader-select--flash-selection').  Overlays are not used:
+;;     `seshat-reader-mode' displays a page with a single overlay per window
+;;     and overlay `display' properties do not compose.  A persistent
+;;     highlight comes from creating an annotation (`C-c C-a'), which feeds
+;;     the same C table through `seshat-reader-annotation'.
 ;;   - Only pages carrying a text layer can be read; scanned images
 ;;     produce no text.
 ;;   - The frame scale used here is sampled from the frame displaying
@@ -95,6 +100,147 @@ area."
 Longer selections are truncated in the echo area; the full text is
 still pushed onto the kill ring when
 `seshat-reader-select-copy-to-kill-ring' is non-nil.")
+
+(defcustom seshat-reader-select-flash-duration 2.0
+  "How long the selection rectangle is highlighted after a drag, in seconds.
+After the mouse button is released the selection rectangle is fed to
+the C renderer's rect highlight table and cleared again after this
+many seconds, so the user gets a visual confirmation of what was
+selected.  The flash is independent of
+`seshat-reader-annotation-highlight-enabled': it is transient feedback
+for the selection, not an annotation highlight.
+
+A value of 0 (or any non-positive number) disables the flash
+completely; there is no second on/off switch."
+  :type 'number
+  :group 'seshat-reader-select)
+
+(defvar seshat-reader-select--flash-rects nil
+  "Rectangles currently flashed, as a list of (PAGE X0 Y0 X1 Y1).
+PAGE is 1-based, the four coordinates are page coordinates (the same
+units accepted by `seshat-reader-dyn--add-highlight'), so the list can
+be handed to the C renderer unchanged.
+
+The variable is buffer-local: it describes the document displayed in
+that buffer.  It is set by `seshat-reader-select--flash-selection' and
+cleared by the timer it arms (or straight away when another selection
+replaces it).  `seshat-reader-annotation--redraw-highlights' reads it
+to feed the flash together with the annotation rectangles.")
+
+(defvar-local seshat-reader-select--flash-timer nil
+  "Timer that clears the flash armed by `seshat-reader-select--flash-selection'.
+Kept so that a new selection can cancel the pending clear of the
+previous one; a stale timer would otherwise wipe the fresh flash.
+
+The variable is buffer-local, like `seshat-reader-select--flash-rects':
+the timer belongs to the document displayed in that buffer.  A global
+value would let two nearly simultaneous selections in two documents
+interfere — the second `cancel-timer' would cancel the first document's
+pending clear, leaving its flash rectangle on the page forever.")
+
+;; 下面三个函数由动态模块（`render/render-core.c'）与批注模块提供：此处只
+;; 声明签名，避免字节编译告警；运行时用 `fboundp' 判断可用性，缺模块时
+;; 闪现静默跳过（取文本功能不受影响）。
+(declare-function seshat-reader-dyn--add-highlight "seshat-render-core"
+                  (page x0 y0 x1 y1))
+(declare-function seshat-reader-dyn--clear-highlights "seshat-render-core" ())
+(declare-function seshat-reader-dyn--refresh-highlights "seshat-render-core" ())
+(declare-function seshat-reader-annotation--redraw-highlights
+                  "seshat-reader-annotation" (&optional rects))
+
+(defun seshat-reader-select--rect-valid-p (page rect)
+  "Return non-nil when PAGE and RECT describe a flashable rectangle.
+PAGE must be a positive integer (the module takes 1-based page
+numbers) and RECT a list of four numbers (X0 Y0 X1 Y1) with a strictly
+positive width and height; a degenerate rectangle has nothing to draw."
+  (and (integerp page)
+       (> page 0)
+       (listp rect)
+       (= 4 (length rect))
+       (let ((x0 (nth 0 rect))
+             (y0 (nth 1 rect))
+             (x1 (nth 2 rect))
+             (y1 (nth 3 rect)))
+         (and (numberp x0) (numberp y0) (numberp x1) (numberp y1)
+              (> (- x1 x0) 0)
+              (> (- y1 y0) 0)))))
+
+(defun seshat-reader-select--redraw-highlights ()
+  "Redraw the page highlights, feeding the flash rectangles.
+Delegates to `seshat-reader-annotation--redraw-highlights' when the
+annotation module is loaded, so that annotation rectangles and the
+flash are fed through a single code path (and neither clobbers the
+other: a redraw always clears the C table first).
+
+When that function is not available, the flash is fed alone: clear,
+add every rectangle of `seshat-reader-select--flash-rects', refresh.
+The C module may not be loaded at all, so every call is inside
+`ignore-errors' and guarded by `fboundp' — the flash is optional
+feedback and must never break text extraction."
+  (ignore-errors
+    (cond
+     ((fboundp 'seshat-reader-annotation--redraw-highlights)
+      (seshat-reader-annotation--redraw-highlights))
+     ((and (fboundp 'seshat-reader-dyn--clear-highlights)
+           (fboundp 'seshat-reader-dyn--add-highlight))
+      (seshat-reader-dyn--clear-highlights)
+      (dolist (rect seshat-reader-select--flash-rects)
+        (seshat-reader-dyn--add-highlight (nth 0 rect) (nth 1 rect)
+                                          (nth 2 rect) (nth 3 rect)
+                                          (nth 4 rect)))
+      (when (fboundp 'seshat-reader-dyn--refresh-highlights)
+        (seshat-reader-dyn--refresh-highlights))))))
+
+(defun seshat-reader-select--clear-flash (buffer)
+  "Clear the flash of BUFFER and redraw the page highlights.
+BUFFER is the seshat-reader buffer the flash belongs to; it may be
+dead already (the user closed the document), in which case nothing is
+done.  Called from the timer armed by
+`seshat-reader-select--flash-selection'."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      ;; 两个变量都是 buffer-local，故在 BUFFER 内赋值（`setq-local'）：只清
+      ;; 该文档自己的 timer 与矩形，另一个文档的闪现不受影响。
+      (setq-local seshat-reader-select--flash-timer nil)
+      (setq-local seshat-reader-select--flash-rects nil)
+      (seshat-reader-select--redraw-highlights))))
+
+(defun seshat-reader-select--flash-selection (page rect)
+  "Flash the selection rectangle RECT on PAGE for a moment.
+PAGE is the 1-based page number and RECT the selection rectangle as
+a list (X0 Y0 X1 Y1) in page coordinates — exactly what
+`seshat-reader-select-last' stores under :rect, so the flash and the
+annotation create path (`seshat-reader-annotation-create') use the same
+units.
+
+The rectangle is stored in the buffer-local
+`seshat-reader-select--flash-rects' and fed to the C renderer; a timer
+clears it again after `seshat-reader-select-flash-duration' seconds.
+The flash is skipped when the duration is not positive or when PAGE /
+RECT are unusable (a degenerate rectangle cannot be drawn).
+
+Repeated selections in the **same buffer** cancel the previous timer, so
+that an old clear cannot wipe a fresh flash; selections in different
+buffers keep independent timers (both
+`seshat-reader-select--flash-timer' and `seshat-reader-select--flash-rects'
+are buffer-local).  Everything is wrapped in `ignore-errors': a missing
+module or an unusable C call must never break text extraction."
+  (let ((duration seshat-reader-select-flash-duration))
+    (when (and (numberp duration) (> duration 0)
+               (seshat-reader-select--rect-valid-p page rect))
+      (ignore-errors
+        (when (timerp seshat-reader-select--flash-timer)
+          (cancel-timer seshat-reader-select--flash-timer))
+        (setq-local seshat-reader-select--flash-rects
+                    (list (list page (nth 0 rect) (nth 1 rect)
+                                (nth 2 rect) (nth 3 rect))))
+        (seshat-reader-select--redraw-highlights)
+        (let ((buffer (current-buffer)))
+          (setq-local seshat-reader-select--flash-timer
+                      (run-at-time duration nil
+                                   (lambda ()
+                                     (seshat-reader-select--clear-flash
+                                      buffer)))))))))
 
 (defvar seshat-reader-select-last nil
   "Most recent mouse selection, as a plist, or nil when there is none.
@@ -234,6 +380,13 @@ coordinates, or when the corresponding rectangle contains no text."
                         :rect (list x0 y0 x1 y1)
                         :file (buffer-file-name (window-buffer window))))
             (seshat-reader-select--report text)
+            ;; 选区已确定（不论矩形内是否有文本）就用高亮闪一下，让用户看到自己
+            ;; 选中的区域；闪现落在发起拖拽的 buffer 上（`--flash-selection' 读写
+            ;; 的 `seshat-reader-select--flash-rects' 是 buffer-local 的）。
+            (with-current-buffer (window-buffer window)
+              (seshat-reader-select--flash-selection
+               (seshat-reader-current-doc-pagenumber window)
+               (list x0 y0 x1 y1)))
             text)))))))
 
 (defun seshat-reader-select-drag (start-event)

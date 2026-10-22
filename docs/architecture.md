@@ -155,7 +155,7 @@ M12 把 M11 的「单个底部面板」升级为「左目录 / 右信息 / 中�
 **目录面板**：
 
 - **纯函数行模型**：`seshat-reader-outline--rows`（按 **DFS 前序**摊平成行列表，入参为树、折叠态集合、当前页）与 `--current-path`（按当前页求根→叶路径）。折叠态用**行路径**（自根到该节点的标题列表）而非标题字符串，以免同名节点互相折叠；折叠节点自身仍出行、其子树不出行。
-- **渲染规则**：行首保留 outline 星号（去掉会令 `outline-regexp` 失配、TAB 折叠失效）→ 每级 2 空格缩进 → `▾`/`▸` 折叠符号（无子节点用 2 空格占位对齐）→ 标题按钮 → 弹性空白 `display` 属性把页码推向右缘 → 按深度取三级 face；当前章另用 `line-prefix` 画竖线（`line-prefix` 只是显示属性、不进 buffer 文本，故不破坏 outline 结构）。
+- **渲染规则**：行首保留 outline 星号（去掉会令 `outline-regexp` 失配、TAB 折叠失效），但把星号区间设为**零宽显示**（`display ""` 只改显示、不改 buffer 文本，故 `outline-regexp` 照常匹配、`outline-hide-subtree` 仍可用）→ 每级 1 列缩进（`seshat-reader-outline--indent-width`）+ 折叠符号的 2 列，标题落在第 3/4/5 列 → `▾`/`▸` 折叠符号（无子节点用 2 空格占位对齐）→ 标题按钮 → 弹性空白 `display` 属性把页码推向右缘 → 按深度取三级 face；当前章另用 `line-prefix` 画竖线（`line-prefix` 只是显示属性、不进 buffer 文本，故不破坏 outline 结构）。
 - **avy 风格跳转**：`f` 触发 `seshat-reader-outline-avy-jump`，候选为可见区带页号属性的按钮，标签由 overlay `before-string` 承载（不写 buffer 文本），`read-key` 逐键匹配，`unwind-protect` 清理标签。**零新增依赖**：不 `require` avy，只在 `avy-keys` 已绑定时复用自己的字符表，未加载时用内置表。
 
 **批注高亮（渲染层）**：
@@ -165,6 +165,13 @@ M12 把 M11 的「单个底部面板」升级为「左目录 / 右信息 / 中�
 - **`ctm` 复用**：直接复用该页 rasterize 用的同一个 `fz_transform_page(dp->bbox, resolution, rotate)`，因此缩放与旋转自动对齐，不必另算变换；`rect_to_page_space` 是「Emacs rect → MuPDF 页面空间」的**唯一**换算点（被 `--text-in-rect` 与绘制共用）。
 - **线程安全**：高亮表在派发时**快照**进 `DrawThreadArgs`（容量倍增表，每条退出路径释放），渲染线程不碰 `DocState`；elisp 侧只改表并置 `highlights_dirty` 标志。
 - **`--refresh-highlights` 的重绘序列**：非 dirty 直接返回 `t`；dirty 时 `wait_for_win_jobs` → `nullify_window_cache` → `build_cache_window` → `wait_for_cached_page` → `display_cached_page`（与 `seshat-reader-dyn-redisplay-doc` 同形），故不另建渲染管线、也不与既有缓存失效逻辑分叉。
+
+**框选闪现（M12 补）**：
+
+- **数据流**：`seshat-reader-select--flash-selection` 把选区矩形按 `(PAGE X0 Y0 X1 Y1)` 存进 buffer-local 的 `seshat-reader-select--flash-rects`，再调 `seshat-reader-select--redraw-highlights`——后者委托 `seshat-reader-annotation--redraw-highlights`，把**批注矩形在前、闪现矩形在后**合并成一次投喂（一次 clear + 逐条 add + 一次 refresh），因此闪现不会抹掉批注、批注重绘也不会抹掉闪现；批注模块未加载时退化为「只投闪现」。
+- **timer 到点**：武装一个 `run-at-time` 定时器，到点由 `seshat-reader-select--clear-flash` 清空该 buffer 的 `--flash-rects` 并**重投一次**（批注仍在、闪现消失）；timer 指向的 buffer 已死（用户已关文档）时静默跳过。
+- **buffer-local**：`--flash-timer` 与 `--flash-rects` **都是** buffer-local。两份文档几乎同时框选时，第二次 `cancel-timer` 只取消自己那份 timer，前一文档的闪现不会被「取消 + 遗留」——全局变量正是本补丁修掉的缺陷。
+- **与批注高亮的关系**：闪现**不受** `seshat-reader-annotation-highlight-enabled` 约束（它是框选的即时反馈，不是批注），时长由 `seshat-reader-select-flash-duration` 决定，`<= 0` 关闭。
 
 **跨页衔接**：
 
