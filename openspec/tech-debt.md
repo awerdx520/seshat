@@ -967,6 +967,18 @@
 - 判定（当前**不是**缺陷）：`PdfInkStore` 目前只在主线程写（落笔 / 撤销 / 清页），同步线程只**读**一次快照（`PdfReaderActivity.backfillInkAnnotations` → `inkStore.document(docId)`），读路径不做 read-modify-write，故不存在「读到旧快照再写回、覆盖掉并发笔画」的丢更新路径。
 - 建议：若将来同步线程需要**写**笔迹（如把服务端下发的 `ink:` 落成本地笔迹、或按页批量删除），须先照 `AnnotationStore` 的做法给这三个写方法加 `@Synchronized`，并让 `document` 读也进同一把锁；否则会静默丢笔画。按「改前检查项」记录，当前无需改动。
 
+## `seshat-reader--center-page` 以 `unconstrained` 设 hscroll，超宽页被两侧裁切（2026-10-22 观察，2026-10-23 已缓解）
+- 现状：`seshat-reader--center-page` 用 `(seshat-reader--set-window-hscroll window scroll-offset t)` 写入水平偏移，第三个实参 `unconstrained = t` 绕过 `--right-most-window-hscroll` 的夹紧；当页面 image 宽于窗口（`doc-left-offset` 为负）时 `scroll-offset` 也是负值，页面整体左移、左右各裁掉约一半。放大到超宽（`+` / `W`）时同样命中。
+- 缓解（2026-10-23）：`scroll-offset` 计算加 `(max 0 …)`，超宽时页面左对齐而不是两侧裁切；自动 fit（首次 + 尺寸变化后）改为 `seshat-reader--contain-scale`（`min(按高, 按宽)`），默认路径不再产生超宽页。仍未实现「横向滚动跟随翻页」（超宽页只能用 `scroll-left` / `scroll-right` 手动左右看），`unconstrained = t` 本身也未收紧。
+- 建议：若要根治，给 `unconstrained` 路径补「页面至少留 N 列可见」的下界夹紧，并在翻页 / vscroll 变化时把水平偏移按阅读位置（左/中/右三段）跟随；须与 `seshat-reader-page-join-test.el` 的 5 个 vscroll 用例同步。
+
+## `seshat-reader-default-fit` 在自动 fit 路径上已成 no-op（2026-10-23，D6 副作用）
+- 现状：自动 fit（`seshat-reader-mode` 首次 fit 与 `--refit-window` 的 fit 分支）改走 `seshat-reader--contain-scale`（`min(按高, 按宽)`）后，`seshat-reader-default-fit` 在整个仓库里只剩 defcustom 自身，没有任何调用点（`grep -n seshat-reader-default-fit emacs/seshat-reader/` 仅命中定义与一条 docstring 引用）。它不是缺陷的成因，但会让用户误以为可配置。
+- 影响：设成 `seshat-reader-fit-to-width` 与 `seshat-reader-fit-to-height` 在自动 fit 下行为完全一样；任何「用该选项覆盖 contain」的实现都会让另一维溢出，因此**无法**在不溢出的前提下恢复区分度。
+- 建议：二选一 —— ① 删除该 defcustom（破坏性变更，需在 CHANGELOG 记 BREAKING 并同步 `docs/configuration.md`）；② 重新定义为「手动 `H`/`W` 之外的默认命令」或彻底改语义（例如「是否允许放大到填满」）。在定稿前保留原样，并在 docstring 注明「自动 fit 不再使用本选项」。
+
+
+
 
 
 

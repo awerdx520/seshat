@@ -382,4 +382,25 @@
 
 **代价 / 约束**：① **量级风险**：大页面笔数多时批注表行数会显著膨胀（一笔一行），列表接口按 uid 全量返回，记 tech-debt；② 坐标必须按不可变口径换算（页号 `+1`、pt、`#AARRGGBB`），任一处错都会跨端错位，故换算逻辑集中在 `InkAnnotationMapper` + `LocationCodec.encodeInk` 两个纯函数并对所有非法输入做夹紧/净化（编码结果必然可被解析）；③ 页面尺寸未就绪或点集为空时只发 `page:<n>;ink:<color>,<widthPt>`（降级但可解析），空点集在 Android 侧直接不登记；④ Emacs 端仍**不渲染** `ink:` 笔迹（只做聚合显示），该缺口保留在 tech-debt。
 
+## 2026-10-23 · 阅读器自动 fit 改为 contain（页面完整可见优先）
+
+真机验收发现 `fit-to-height` 只按高度算 scale，窗口变窄（打开目录/侧栏）后
+页面渲染宽度可达窗口 2 倍，而 `--center-page` 以 `unconstrained = t` 写入负
+hscroll，导致页面左右各裁掉约一半；首次 fit 走同一路径，故打开文档即复现。
+
+决定：新增 `seshat-reader--contain-scale`（取按高与按宽的较小者），自动 fit
+（首次 + 尺寸变化后）一律走它；`--center-page` 的 `scroll-offset` 夹到
+`>= 0`，超宽时页面左对齐而不是两侧裁切。
+
+取舍：选择「页面变小但完整可见」而非「保持尺寸 + 横向滚动」。理由是默认
+场景（打开目录）下页面宽达窗口 2 倍，横向滚动等于看不全。代价是
+`seshat-reader-default-fit` 在两维冲突时失去区分度（只在两者都放得下时
+决定优先填满哪一维）；显式命令 `H`/`W` 保持原语义。
+
+**补充（实施复核）**：`min(按高, 按宽)` 之下 `seshat-reader-default-fit` 在自动
+fit 路径上已无任何调用点（`grep` 只剩 defcustom 自身）——想让该选项「覆盖」
+contain 就必然让另一维溢出，故其区分度实际为零。是否删除该用户选项属破坏
+性变更，留待用户决定（记 tech-debt / D6「待确认」）。
+
+
 

@@ -7,8 +7,9 @@
 - 阶段：Phase 3（Implement）· T0–T3 完成，L1+L2 全绿
 - 已确认：方案 ✅（用户 2026-10-22 确认）、计划 ✅（用户 2026-10-22 确认）
 - 实施：T0–T3 ✅（commit `c47100c` / `0d5edbd` + 本批测试）；T4 真机、T5 文档、T6 归档待做
-- 验证：L1 警告集零新增（33 条）；L2 **325** 例 / 0 unexpected / 2 skipped
+- 验证：L1 警告集零新增（33 条）；L2 **329** 例 / 0 unexpected / 0 skipped
 - 下一步：**等用户在 GUI Emacs 上做 T4 的 8 条真机验收**（batch 无法自动化，`fit-to-height` 会报 `Window system frame should be used`）；通过后再做 T5 文档 + T6 归档
+- 2026-10-23 追加：真机验收发现窗口变窄时页面超宽裁切（主路径缺陷），按方案 C 修复（contain + 负偏移夹 0），详见 D6
 
 ## 目标
 
@@ -197,8 +198,20 @@ SOURCE 非 nil 时，把它记为该窗口的缩放来源（`fit' 或 `manual'�
 
 - `:1247` `window-configuration-change-hook` → `--manage-window-overlays`、`:1248` `window-buffer-change-functions` → `--handle-window-buffer-change`（均 `nil t`）**不动**。
 - `seshat-reader-presentation-mode`（`:1274`）**不动**：开启时清 `mode-line-format` + `fit-to-height`，关闭时 `kill-local-variable`。由于 `fit-to-height` 经 D1 会把 source 记为 `fit`，presentation-mode 的意图与新机制一致；它不改变 scale 语义，也不与新 hook 冲突。
-- `seshat-reader-mode`（`:1196`）的 `:1245` 首次 `(funcall seshat-reader-default-fit)` **不动**。
-- `--center-page`（`:685`）、`--set-page-top`（`:583`）、`--set-page-top-when-joined`（`:593`）、`--at-page-top-p`（`:572`）、`--join-strip-height`（`:393`）**全部不动**。
+- `seshat-reader-mode` 内首次 fit 那一行（原为 `(funcall seshat-reader-default-fit)`）在 D6 中**改为走 contain**（真机验收后追加，见 D6）。
+- **不改 `--set-window-vscroll`**；`--center-page` 仅新增一处负值夹紧（`scroll-offset` 的 `(max 0 …)`），其余语义不动（真机验收后追加，见 D6）。
+- `--set-page-top`（`:583`）、`--set-page-top-when-joined`（`:593`）、`--at-page-top-p`（`:572`）、`--join-strip-height`（`:393`）**全部不动**。
+
+### D6 自动 fit 改为 contain（2026-10-22 真机验收后追加）
+
+- **问题**：`seshat-reader-fit-to-height` 只按高度算 scale，**完全不读窗口宽度**；窗口变窄（打开目录 / 侧栏 / 分割）后 scale 不变，页面渲染宽度可达窗口宽度的 2 倍。`--center-page` 在「image 宽 > 窗口宽」时算出**负** `doc-center-offset`，并以 `unconstrained = t` 原样写入 → 页面左移，左右各被裁掉约一半。**首次 fit 也走同一路径**（`seshat-reader-mode` 内 `(funcall seshat-reader-default-fit)`），所以**打开文档时**就复现。用户 2026-10-22 截图证据：PDF 窗口约 750px，页面渲染宽约 1490px，两侧各裁约 370px。
+- **方案**：新增 `seshat-reader--contain-scale`，取 `min(按高 scale, 按宽 scale)` 做**纯计算**（不调用 `fit-to-height` / `fit-to-width`，避免副作用式改 scale），由调用方再调 `seshat-reader-doc-scale-page`：
+  - `--refit-window` 的 fit 分支（尺寸变化后）：`(seshat-reader-doc-scale-page (seshat-reader--contain-scale window) 'fit)`；
+  - 首次 fit（`seshat-reader-mode` 内）：同上。
+  - `--center-page` 的 `scroll-offset` 加 `(max 0 …)`，页面比窗口宽时左对齐而不是两侧裁切。
+- **附带影响（必须写明）**：`seshat-reader-default-fit` 在「两维冲突」时**不再决定最终结果**（contain 的 `min` 会覆盖），它只在两者都放得下时决定优先填满哪一维；显式命令 `H`（`fit-to-height`）/ `W`（`fit-to-width`）**保持原语义**，用户主动选择时仍可能超宽（需横向滚动）。
+- **取舍**：选择「页面变小但完整可见」而非「保持大小 + 横向滚动」，理由是真机默认场景（开目录）下后者等于看不全。
+- **待确认**：实施中发现 `seshat-reader-default-fit` 在自动 fit 路径上已无任何调用点（`grep` 只剩 defcustom 自身），即该 defcustom 事实上变为 no-op；任何「让它覆盖 contain」的写法都会导致另一维溢出，故无法在不溢出的前提下恢复其区分度。是否删除该用户选项属破坏性变更，留给用户决定（见 tech-debt / decisions）。
 
 ## 旧版计划的错误清单
 
@@ -220,6 +233,7 @@ SOURCE 非 nil 时，把它记为该窗口的缩放来源（`fit' 或 `manual'�
 3. **去抖：idle timer 必须论证，并留三级降级**。旧版直接用 `run-with-idle-timer` 未处理 `seshat-reader-annotation-queue.el:437-438` 的既有告诫；本版给出「前台 UI 重排 vs 无人交互后台同步」的差异论证，并准备 `run-with-timer` + 2% 偏差闸 → 只 clamp+center 的两级降级，末级记 tech-debt。
 4. **scale-source 的写入面更窄**：本版给 `doc-scale-page` 加 `&optional source`，只让 5 个缩放命令传值，**4 个恢复路径保持 1 参**（`:985`/`:1008`/`:1083`/`seshat-reader-bookmark.el:48`），`--recent-scale-fallback` 不动——旧版未区分「来源」与「兜底数值」，也未钉死恢复路径不传参。
 5. **测试目标按真实基线设定**：旧版以 181 例为基线、只规划少量用例；本版基线 312 例、新增 13 例（合计 ≥325），并把「`page-join-test.el` 的 5 个 vscroll 用例零回归」写成硬性验收。
+6. **第三次修订（真机验收后，D6）**：首版把「不改 `--center-page`、不改首次 fit」当作不变量，真机验收证明这条不变量站不住——只按高度算 scale 的自动 fit 在窄窗口下必然超宽，而 `--center-page` 的负偏移会把超宽转成**两侧裁切**。本版据此放开两处最小改动（首次 fit 改 contain、`scroll-offset` 夹 `>= 0`），仍不动 `--set-window-vscroll`、`fit-to-height` / `fit-to-width` 本体与三条 hook 注册。
 
 ## 任务
 
@@ -241,24 +255,30 @@ SOURCE 非 nil 时，把它记为该窗口的缩放来源（`fit' 或 `manual'�
 
 - 动作：改 `seshat-reader--window-size-change`（`:726`）；新增 `--schedule-refit` / `--run-pending-refit` / `--cancel-pending-refit` / `--refit-window` / `--clamp-window-vscroll`；新增 `defvar seshat-reader--resize-refit-enabled`、`defvar-local seshat-reader--resize-refit-timer`、`defvar seshat-reader--resize-refit-delay`；`--clear-doc-memory`（`:963`）内补 `--cancel-pending-refit`。
 - 依赖：T1
-- 验收：`:1246`/`:1247`/`:1248` 三条 hook 的注册行未变；`--center-page` / `--set-window-vscroll` / `--page-max-vscroll-pixels` 函数体零改动（`git diff` 核对）；`make all` 零 warning。
+- 验收：`:1246`/`:1247`/`:1248` 三条 hook 的注册行未变；`--center-page` / `--set-window-vscroll` / `--page-max-vscroll-pixels` 函数体零改动（`git diff` 核对）；**自动 fit 路径（首次 + refit）使用 `--contain-scale`；`--center-page` 负偏移夹 0 且有用例覆盖**（D6，2026-10-23 追加）；`make all` 零 warning。
 - ✅ 2026-10-22 完成：5 个新函数 + 3 个内部变量落地，`--clear-doc-memory` 补 `--cancel-pending-refit`；三条 hook 注册行未变；`page-join-test` 24 例（含 5 个 vscroll 用例）零回归。
 - 适配 `emacs/tests/seshat-reader-page-join-test.el` 中锁定了旧契约（size-change 同步 center）的两个用例：`--window-size-change` 改为断言 `--schedule-refit` 被调用 1 次且 `--center-page` 零调用；`--window-size-change-errors` 改为断言「同 buffer 多窗口只排一次 refit」，其「单窗口报错隔离」语义移交 `--refit-window` 的 `condition-case`（由 T3 覆盖）。**不得改动该文件其它 22 个用例。**
 
-### [x] T3 新增 `emacs/tests/seshat-reader-resize-test.el`（13 例）
+### [x] T3 新增 `emacs/tests/seshat-reader-resize-test.el`（17 例）
 
-- 动作：全部用 `cl-letf` 桩（stub `seshat-reader-default-fit` 指向的符号、`--clamp-window-vscroll`、`--center-page`、`--set-window-vscroll`、`--page-max-vscroll-pixels`），不触真实 GUI。
-- 13 例清单：① 去抖——两次 schedule 后旧 timer 被 cancel、只留一个；② 去抖重排——多次 schedule 后回调只执行一次 refit；③ `fit` 分支调 default-fit；④ `manual` 分支不调 default-fit，只 clamp+center；⑤ 未设置 source 走 fit；⑥ 窗口已死（`delete-window` 后）不动作不报错；⑦ 非 `seshat-reader-mode` 的 buffer 不动作；⑧ `'overlay` 参数失效（非 overlay 对象）不动作；⑨ clamp 三态（cur < 0 / cur > max / 区间内，前两态下发、第三态不下发）**加 `max-px = 0` 且 `cur > 0` 的子情形**（页面比窗口矮：上限算出来为 0，`cur` 为正时夹到 0 并下发；`cur` 已为 0 时零调用）；⑩ `doc-scale-page` 的 source 参数语义（传 `'manual` 写入、传 nil 不覆盖已有值）；⑪ `presentation-mode` 开关不回归；⑫ 同一 buffer 两个窗口各处理一次；⑬ buffer 已 kill 时回调不报错且 `--clear-doc-memory` 清掉了 timer。
+- 动作：全部用 `cl-letf` 桩（`--contain-scale`、`seshat-reader-doc-scale-page` 的 apply 步骤、`--clamp-window-vscroll`、`--center-page`、`--set-window-vscroll`、`--page-max-vscroll-pixels`），不触真实 GUI。
+- 13 例清单：① 去抖——两次 schedule 后旧 timer 被 cancel、只留一个；② 去抖重排——多次 schedule 后回调只执行一次 refit；③ `fit` 分支走自动重算（原为「调 default-fit」，D6 起改为「走 contain + `doc-scale-page`」，用例改为桩 `--contain-scale` + `doc-scale-page` 计数）；④ `manual` 分支不重算 scale，只 clamp+center；⑤ 未设置 source 走 fit；⑥ 窗口已死（`delete-window` 后）不动作不报错；⑦ 非 `seshat-reader-mode` 的 buffer 不动作；⑧ `'overlay` 参数失效（非 overlay 对象）不动作；⑨ clamp 三态（cur < 0 / cur > max / 区间内，前两态下发、第三态不下发）**加 `max-px = 0` 且 `cur > 0` 的子情形**（页面比窗口矮：上限算出来为 0，`cur` 为正时夹到 0 并下发；`cur` 已为 0 时零调用）；⑩ `doc-scale-page` 的 source 参数语义（传 `'manual` 写入、传 nil 不覆盖已有值）；⑪ `presentation-mode` 开关不回归（refit 段改桩 `--contain-scale`）；⑫ 同一 buffer 两个窗口各处理一次；⑬ buffer 已 kill 时回调不报错且 `--clear-doc-memory` 清掉了 timer。
+- **D6 追加的 4 例（⑭–⑰）**：
+  - ⑭ `--contain-scale-height-limited`：image 1000×1400、scale 1.0、window 900×1000 → `min(0.9, 1000/1400) = 0.714…`（高度维胜出，`1e-9` 浮点容差）。
+  - ⑮ `--contain-scale-width-limited`：同 image、window 400×1000 → `min(0.4, 0.714…) = 0.4`（宽度维胜出，即真机缺陷的回归用例）。
+  - ⑯ `--contain-scale-degenerate`：size 为 nil / 宽 0 / 高 0 → `1.0`；scale 为 nil / 0 → 按 `1.0` 处理（不得除零，`0.5` 结果验证）。
+  - ⑰ `--center-page-clamps-negative-offset`：桩 image 宽 2000 > 窗口宽、桩 `--ensure-center-overlay`、记录 `--set-window-hscroll` 实参 → 断言 `NCOL = 0`（改动前为负值，故该用例有牙）。
 - 依赖：T2
-- 验收：13 例全绿（`unexpected = 0`）；整套 10 + 1 个文件合计 ≥325 例、`skipped ≤ 2`。
+- 验收：17 例全绿（`unexpected = 0`）；整套 10 + 1 个文件合计 ≥329 例、`skipped ≤ 2`。
 - ✅ 2026-10-22 完成：13 例全绿（`unexpected = 0`）；11 个文件合计 **325** 例 / 323 passed / 2 skipped / 0 unexpected；4 处单点变异（manual 分支、clamp 下界、去抖 cancel、`--clear-doc-memory` cancel）各自只红对应用例。
+- ✅ 2026-10-23 追加完成（D6）：17 例全绿；11 个文件合计 **329** 例 / 329 passed / 0 skipped / 0 unexpected；变异自检 —— 去掉 `(max 0 …)` → 仅 ⑰ 红；自动 fit 回到 `(funcall seshat-reader-default-fit)` → ③⑤⑪⑫ 红（4 例）；`contain` 的 `min` 改 `max` → ⑭⑮⑯ 红。
 
 ### [ ] T4 L3 真机手工验收（8 条）
 
 - 动作（batch 无法自动化——`fit-to-height` 在 `emacs -Q --batch` 下报 `Window system frame should be used`）：
-  - **L3-1** 开批注面板（`C-c C-l`）→ 右侧 side window 出现、阅读区变窄 → 页面重新贴合，无单侧裁切。
+  - **L3-1** 开批注面板（`C-c C-l`）→ 右侧 side window 出现、阅读区变窄 → 页面重新贴合，无单侧裁切。**页面应缩小到完整可见**（contain 生效），而非仅居中。
   - **L3-2** 关批注面板 → 阅读区变宽 → 页面重新贴合，vscroll 夹回 `[0, 上限]`。
-  - **L3-3** `o` 开目录 → **左侧** side window（默认 `'left`），阅读区再变窄 → 重新贴合；再 `o` 关闭同理。
+  - **L3-3** `o` 开目录 → **左侧** side window（默认 `'left`），阅读区再变窄 → 重新贴合；再 `o` 关闭同理。**页面应缩小到完整可见**（contain 生效），而非仅居中。
   - **L3-4** 手动放大 3 次（`+`）后开/关面板 → scale 保持不变（`scale-source = manual`），只有滚动位置归位。
   - **L3-5** 拖动左右/上下分割线 → 不卡顿（停手后只出现一次 refit）。
   - **L3-6** 页面比窗口矮（`fit-to-width` 后的短页）→ 滚到底时 vscroll 不为负、图像不被下推。
@@ -328,7 +348,7 @@ T0 ──▶ T1 ──▶ T2 ──┬──▶ T3 ──▶ T4 ──┐
 
 - 范围：既有 **10 个**测试文件 + 新增 `seshat-reader-resize-test.el` 全跑。
 - 基线：312 例 / 310 passed / 2 skipped / 0 unexpected。
-- 改动后判据：合计 **≥325 例**、`unexpected = 0`、`skipped ≤ 2`（translate 的 2 例既有跳过）。
+- 改动后判据：合计 **≥329 例**、`unexpected = 0`、`skipped ≤ 2`（2026-10-23 实测为 329 例 / 0 unexpected / 0 skipped，见 S3）。
 - 特别要求：`seshat-reader-page-join-test.el` 的 `--vscroll-max`（`:208`）、`--vscroll-max-not-negative`（`:226`）、`--page-max-vscroll-pixels`（`:449`）等 5 个 vscroll 用例**零回归**——即上限公式与 `--set-window-vscroll` 未被改动。
 
 ### L3 真机手工验收
@@ -410,10 +430,11 @@ git clean -fd -- emacs/tests/seshat-reader-resize-test.el
 | `seshat-reader-select-flash-test.el` | 8 | 8 | 0 | 0 |
 | `seshat-reader-sidebar-test.el` | 56 | 56 | 0 | 0 |
 | `seshat-reader-translate-test.el` | 47 | 45 | 2 | 0 |
-| `seshat-reader-resize-test.el`（新增） | 13 | 13 | 0 | 0 |
-| **合计** | **325** | **323** | **2** | **0** |
+| `seshat-reader-resize-test.el`（新增） | 17 | 17 | 0 | 0 |
+| **合计** | **329** | **329** | **0** | **0** |
 
-- 判据全部满足：合计 **325 ≥ 325**、`unexpected = 0`、`skipped = 2`（translate 的 2 例既有跳过）。
+- 判据全部满足：合计 **329 ≥ 329**、`unexpected = 0`、`skipped = 0`（2026-10-22 实测时 translate 有 2 例跳过；2026-10-23 复跑为 0 跳过，该 2 例的跳过条件当日未触发）。
+- 2026-10-23 追加（D6）：`seshat-reader-resize-test.el` 由 13 例增至 17 例（新增 contain 三态 + `--center-page` 负偏移夹紧），合计 329；变异自检：①去掉 `scroll-offset` 的 `(max 0 …)` → 仅 `--center-page-clamps-negative-offset` 红；②自动 fit 回到 `(funcall seshat-reader-default-fit)` → `--refit-fit-branch` / `--refit-unset-source` / `--refit-multi-window` / `--presentation-mode-keeps-fit` 红；③`(min width-factor height-factor)` 改 `max` → 3 个 contain 用例红。
 - `seshat-reader-page-join-test.el` 24 例全绿，含 `--vscroll-max` / `--vscroll-max-not-negative` / `--page-max-vscroll-pixels` 等 5 个 vscroll 用例 → 上限公式与 `--set-window-vscroll` 未被改动。
 - 新测试文件的变异自检（在 `/tmp` 副本上改坏实现、不改仓库文件）：① 删 `--refit-window` 的 manual 分支 → 仅 `--refit-manual-branch` 红；② 去掉 `--clamp-window-vscroll` 的 `(max 0 …)` 下界 → 仅 `--clamp-window-vscroll` 红；③ 删 `--schedule-refit` 里的 `--cancel-pending-refit` → 仅 `--schedule-refit-debounce` 红；④ 删 `--clear-doc-memory` 里的 `--cancel-pending-refit` → 仅 `--run-pending-refit-dead-buffer` 红。未改动的副本 13/13 绿。
 
