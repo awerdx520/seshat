@@ -215,8 +215,9 @@ COLOR 为 nil 时继承上层色；WEIGHT 取 nil 或 `bold'。样式落在父�
 
 (defun seshat-reader-etaf--item-key (it)
   "Return the stable key of annotation plist IT.
-服务端项用 `:id'，本地待同步项用 `:uuid'；两者都缺失时返回 nil。"
-  (or (plist-get it :id) (plist-get it :uuid)))
+服务端项用 `:id'，本地待同步项用 `:uuid'，ink 聚合行用合成键 `:key'
+（见 `seshat-reader-annotation--ink-aggregate-item'）；都缺失时返回 nil。"
+  (or (plist-get it :id) (plist-get it :uuid) (plist-get it :key)))
 
 (defconst seshat-reader-etaf--list-ref 'seshat-etaf-annotations-list
   "批注列表面板中可滚动列表容器的 Host 引用名.")
@@ -243,9 +244,12 @@ KEY 为 nil 时返回 nil。每张卡片行都带该 `:ref'，`next'/`prev' 据�
 
 (defun seshat-reader-etaf--item-text (it)
   "Return the single-line summary text of annotation plist IT.
-复用 `seshat-reader-annotation--summary' 压缩换行并截断；正文为空时返回
+文本取自 `seshat-reader-annotation--display-text' 的回退链（备注 → 选中
+原文 `selected_text' → ink 聚合文案），再复用
+`seshat-reader-annotation--summary' 压缩换行并截断；三者都为空时返回
 \"（无正文）\"。"
-  (let ((summary (seshat-reader-annotation--summary (plist-get it :text))))
+  (let ((summary (seshat-reader-annotation--summary
+                  (seshat-reader-annotation--display-text it))))
     (if (string-empty-p summary) "（无正文）" summary)))
 
 (defun seshat-reader-etaf--item-selected-p (it)
@@ -264,6 +268,9 @@ COLORS 为 `seshat-reader-etaf--colors' 返回的 alist。一行一卡，列结�
   项该列留空格占位，故各行文字起点不会因选中而错位。该列宽取 `(ch 2)'：
   `▌'（U+258C）在 ETAF 里按 2 列测量，`(ch 1)' 的盒子会把它裁成空格（实测）；
 - 页码列宽固定 `(ch 6)'，`p.9' 与 `p.112' 因此右对齐在同一条竖线上；
+  location 为 EPUB 的 `chapter:' 形态时该列显示「章 N」（见
+  `seshat-reader-annotation--chapter-from-location'），仍解析不出时显示
+  `p.?'；
 - 摘要单行截断（`seshat-reader-etaf--truncate'），不折行，行高一致；
 - 卡片之间用 `:border' 色的细底线分隔（不用 `etaf-divider'，避免过密）。
 
@@ -271,6 +278,12 @@ COLORS 为 `seshat-reader-etaf--colors' 返回的 alist。一行一卡，列结�
 决定——列表**全量**渲染（不分页、不切片）。选中态（`▌' 与底色）取
 `seshat-reader-etaf--selected'。"
   (let* ((page (seshat-reader-etaf--item-page it))
+         (chapter (and (null page)
+                       (seshat-reader-annotation--chapter-from-location
+                        (plist-get it :location))))
+         (page-label (cond (page (format "p.%s" page))
+                           (chapter (format "章%s" chapter))
+                           (t "p.?")))
          (key (seshat-reader-etaf--item-key it))
          (selected (seshat-reader-etaf--item-selected-p it)))
     (etaf-view
@@ -292,7 +305,7 @@ COLORS 为 `seshat-reader-etaf--colors' 返回的 alist。一行一卡，列结�
                                              'bold)))
        (box :width '(ch 6)
          (expr (seshat-reader-etaf--text-view
-                (if page (format "p.%s" page) "p.?")
+                page-label
                 (if selected
                     (alist-get :accent colors)
                   (alist-get :muted colors)))))

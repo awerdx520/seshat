@@ -367,6 +367,146 @@ LOCATION 的约定为 \"page:<n>;rect:...\"，其中 <n> 为 1-based 十进制
              (string-match "page:\\([0-9]+\\)" location))
     (string-to-number (match-string 1 location))))
 
+(defun seshat-reader-annotation--chapter-from-location (location)
+  "从 LOCATION 解析 EPUB 章节序号；解析失败时返回 nil.
+支持 v8 契约的 \"chapter:<spine>@<start>-<end>\" 与更早的旧形态
+\"chapter-<n>\"；返回的序号原样取自字符串（不做 +1/-1 换算，仅用于显示）。
+\"page:<n>\" 形态不属于本函数职责，返回 nil（页码由
+`seshat-reader-annotation--page-from-location' 负责）。
+
+本函数只做解析，不抛错：location 为 nil、非字符串或其他形态时一律返回
+nil，调用方据此决定是否展示「章节 N」而不是空白或错误页码。"
+  (when (stringp location)
+    (cond
+     ((string-match "\\`chapter:\\([0-9]+\\)" location)
+      (string-to-number (match-string 1 location)))
+     ((string-match "\\`chapter-\\([0-9]+\\)\\'" location)
+      (string-to-number (match-string 1 location)))
+     (t nil))))
+
+(defun seshat-reader-annotation--item-field (item field)
+  "取条目 ITEM 中名为 FIELD（**不带**冒号的符号）的字段值；缺失时返回 nil.
+ITEM 既可以是服务端返回的 alist（键为符号，如 `location'），也可以是渲染
+层使用的 plist（键为 `:location'）：两种形态对同名字段返回同一个值，故
+本函数是纯文本渲染与 ETAF 渲染两条路径共用的取字段入口。"
+  (let ((plist-key (intern (concat ":" (symbol-name field)))))
+    (cond
+     ((not (listp item)) nil)
+     ((plist-member item plist-key) (plist-get item plist-key))
+     ((assq field item) (cdr (assq field item)))
+     (t nil))))
+
+(defun seshat-reader-annotation--kind (item)
+  "返回条目 ITEM 的批注类型字符串，缺键或空值时视为 \"note\".
+v8 契约的服务端响应带 `kind' 字段（`note' / `highlight' / `ink'）；
+老服务端与 M12 之前的存量记录没有该字段，此时返回 \"note\"，从而既有字段
+解析与显示行为与改动前完全一致。ITEM 可为 alist 或 plist（见
+`seshat-reader-annotation--item-field'）。"
+  (let ((kind (seshat-reader-annotation--item-field item 'kind)))
+    (if (and (stringp kind) (not (string-empty-p kind)))
+        kind
+      "note")))
+
+(defun seshat-reader-annotation--selected-text (item)
+  "返回条目 ITEM 的选中原文（v8 字段 `selected_text'）.
+缺键、非字符串时返回 nil；空串原样返回（调用方按「无可用原文」处理），
+因此老记录不会因该字段缺失而改变任何既有行为。
+
+服务端 alist 的键是 `selected_text'（JSON 原名），渲染层 plist 的键是
+`:selected-text'（Emacs 风格），两种形态都识别——否则 ETAF 路径拿到的
+选中原文永远是 nil。"
+  (cond
+   ((not (listp item)) nil)
+   ((plist-member item :selected-text)
+    (let ((selected (plist-get item :selected-text)))
+      (and (stringp selected) selected)))
+   (t
+    (let ((selected (or (cdr (assq 'selected_text item))
+                        (cdr (assq 'selected-text item)))))
+      (and (stringp selected) selected)))))
+
+(defun seshat-reader-annotation--ink-page (item)
+  "返回 ink 条目 ITEM 的 **1-based** 页码；取不到时返回 nil.
+优先用已解析好的 `page' 字段，否则从 `location' 的 \"page:<n>;ink:...\"
+前缀解析（与 rect 批注共用 `seshat-reader-annotation--page-from-location'）。"
+  (or (seshat-reader-annotation--item-field item 'page)
+      (seshat-reader-annotation--page-from-location
+       (seshat-reader-annotation--item-field item 'location))))
+
+(defun seshat-reader-annotation--ink-label (item)
+  "返回 ink 条目 ITEM 的聚合文案（形如 \"第 3 页手写（2 笔）\"）.
+页码取 `seshat-reader-annotation--ink-page'，无法解析时退化为
+\"手写（N 笔）\"；笔数取 `ink-count' 字段，缺省按 1 笔计。"
+  (let* ((page (seshat-reader-annotation--ink-page item))
+         (count (let ((n (seshat-reader-annotation--item-field item 'ink-count)))
+                  (if (integerp n) n 1))))
+    (if page
+        (format "第 %s 页手写（%d 笔）" page count)
+      (format "手写（%d 笔）" count))))
+
+(defun seshat-reader-annotation--display-text (item)
+  "返回条目 ITEM 在批注列表中应显示的**原始**文本（未压缩、未截断）.
+回退链：`text' 非空白 → `text'；否则 `selected_text' 非空白 →
+`selected_text'；否则 `kind' 为 \"ink\" 时返回聚合文案（见
+`seshat-reader-annotation--ink-label'）；都不满足时返回空串（不抛错）。
+压缩与截断仍由 `seshat-reader-annotation--summary' 负责。"
+  (let ((text (seshat-reader-annotation--item-field item 'text))
+        (selected (seshat-reader-annotation--selected-text item)))
+    (cond
+     ((and (stringp text) (not (string-empty-p (string-trim text)))) text)
+     ((and (stringp selected)
+           (not (string-empty-p (string-trim selected))))
+      selected)
+     ((equal (seshat-reader-annotation--kind item) "ink")
+      (seshat-reader-annotation--ink-label item))
+     (t ""))))
+
+(defun seshat-reader-annotation--ink-aggregate-item (page entries)
+  "把同一页的 ink 条目 ENTRIES 合并为一条聚合条目 plist.
+PAGE 为 **1-based** 页码（可为 nil）。聚合条目保留 `:ink-ids'（各笔的服务端
+id，供调试与将来按笔删除）与 `:ink-count'（笔数）；`:id' / `:uuid' 恒为
+nil——它不对应服务端的单条记录。`:key' 是合成键（\"ink-page:<n>\"），让
+ETAF 路径仍能选中该行并据 `:page' 跳页。"
+  (list :id nil
+        :uuid nil
+        :key (format "ink-page:%s" page)
+        :location (seshat-reader-annotation--item-field (car entries) 'location)
+        :page page
+        :text ""
+        :dirty nil
+        :kind "ink"
+        :ink-count (length entries)
+        :ink-ids (delq nil
+                       (mapcar (lambda (entry)
+                                 (seshat-reader-annotation--item-field
+                                  entry 'id))
+                               entries))
+        :aggregate t))
+
+(defun seshat-reader-annotation--group-ink-items (items)
+  "把 ITEMS 中同一页的 `ink' 条目按页聚合为一条汇总行，返回新列表.
+聚合行出现在该页**首个** ink 条目的原位置，其余条目相对顺序不变（服务端
+项在前、本地待同步项在后的既有顺序因此得以保留）。页码解析不出的 ink 条目
+全部并入同一条无页码的汇总行。非 ink 条目原样返回（同一个 cons 对象）。
+ITEMS 为 nil 时返回 nil；本函数不修改 ITEMS。"
+  (let ((by-page (make-hash-table :test #'equal))
+        (emitted (make-hash-table :test #'equal))
+        result)
+    (dolist (item items)
+      (when (equal (seshat-reader-annotation--kind item) "ink")
+        (let ((page (seshat-reader-annotation--ink-page item)))
+          (puthash page (append (gethash page by-page) (list item)) by-page))))
+    (dolist (item items)
+      (if (not (equal (seshat-reader-annotation--kind item) "ink"))
+          (push item result)
+        (let ((page (seshat-reader-annotation--ink-page item)))
+          (unless (gethash page emitted)
+            (puthash page t emitted)
+            (push (seshat-reader-annotation--ink-aggregate-item
+                   page (gethash page by-page))
+                  result)))))
+    (nreverse result)))
+
 (defun seshat-reader-annotation--summary (text)
   "把 TEXT 压缩为单行摘要，超过配置宽度时以 \"…\" 截断.
 TEXT 中的换行、回车与制表符被替换为空格；TEXT 为 nil 时返回空串。"
@@ -380,10 +520,14 @@ TEXT 中的换行、回车与制表符被替换为空格；TEXT 为 nil 时返�
 
 (defun seshat-reader-annotation--insert-entry (annotation &optional queued-uuid)
   "把一条批注 ANNOTATION 插入当前缓冲区的一行.
-ANNOTATION 为服务端返回的 alist，含 `id'、`location'、`text' 等字段。
-该行以 **1-based** 页码开头（无法解析时显示 \"?\" 并在行尾标注），后接
-正文摘要；整行携带 `seshat-reader-annotation-id'、`seshat-reader-annotation-page'
-与 `seshat-reader-annotation-location' 三个文本属性，供 `RET' 与 `d' 使用。
+ANNOTATION 为服务端返回的 alist 或渲染层的 plist，含 `id'、`location'、
+`text' 等字段（v8 契约还可能带 `kind' 与 `selected_text'）。
+该行以 **1-based** 页码开头；location 为 EPUB 的 `chapter:' 形态时改以
+\"章节 N\" 开头；两者都解析不出时显示 \"?\" 并在行尾标注。页码/章节之后是
+摘要，取 `seshat-reader-annotation--display-text' 的回退链（备注优先，其次
+选中原文，ink 条目走聚合文案）；整行携带 `seshat-reader-annotation-id'、
+`seshat-reader-annotation-page' 与 `seshat-reader-annotation-location'
+三个文本属性，供 `RET' 与 `d' 使用。
 
 QUEUED-UUID 非 nil 时表示该条来自本地离线队列、尚未同步到服务端：行尾
 追加 \"[待同步]\" 标记，且该行携带值为 QUEUED-UUID 的
@@ -391,16 +535,21 @@ QUEUED-UUID 非 nil 时表示该条来自本地离线队列、尚未同步到服
 函数时不传 QUEUED-UUID，该属性因此为 nil，供
 `seshat-reader-annotation-list-delete' 区分「取消本地条目」与「删除服务端
 批注」两条路径。"
-  (let* ((id (alist-get 'id annotation))
-         (location (alist-get 'location annotation))
-         (text (alist-get 'text annotation))
+  (let* ((id (seshat-reader-annotation--item-field annotation 'id))
+         (location (seshat-reader-annotation--item-field annotation 'location))
          (page (seshat-reader-annotation--page-from-location location))
-         (start (point)))
+         (chapter (and (null page)
+                       (seshat-reader-annotation--chapter-from-location location)))
+         (label (cond (page (number-to-string page))
+                      (chapter (format "章节 %s" chapter))
+                      (t "?")))
+         (start (point))
+         (summary (seshat-reader-annotation--summary
+                   (seshat-reader-annotation--display-text annotation))))
     (insert (format "  %5s  %s%s%s\n"
-                    (if page (number-to-string page) "?")
-                    (let ((summary (seshat-reader-annotation--summary text)))
-                      (if (string-empty-p summary) "（无正文）" summary))
-                    (if page "" "  [无法从 location 解析页码]")
+                    label
+                    (if (string-empty-p summary) "（无正文）" summary)
+                    (if (or page chapter) "" "  [无法从 location 解析页码]")
                     (if queued-uuid "  [待同步]" "")))
     (add-text-properties start (point)
                          (list 'seshat-reader-annotation-id id
@@ -794,6 +943,10 @@ ANNOTATIONS 为服务端返回的批注 alist 列表，QUEUED 为本地离线队
   `seshat-reader-annotation--page-from-location' 从 `:location' 解析；
 - 本地待同步项取队列条目的 `:uuid'（`:id' 为 nil，`:dirty' 为 t）。
 
+v8 契约的 `kind' / `selected_text' 一并转成 `:kind' / `:selected-text'：
+缺键时 `:kind' 为 \"note\"、`:selected-text' 为 nil，故两条渲染路径对老
+记录的行为与改动前完全一致。
+
 顺序与 `seshat-reader-annotation--render-list' 的文本渲染一致：**服务端项
 在前、本地待同步项在后**。"
   (append
@@ -804,6 +957,9 @@ ANNOTATIONS 为服务端返回的批注 alist 列表，QUEUED 为本地离线队
                      :location location
                      :page (seshat-reader-annotation--page-from-location location)
                      :text (alist-get 'text annotation)
+                     :selected-text (seshat-reader-annotation--selected-text
+                                     annotation)
+                     :kind (seshat-reader-annotation--kind annotation)
                      :dirty nil)))
            annotations)
    (mapcar (lambda (entry)
@@ -813,6 +969,9 @@ ANNOTATIONS 为服务端返回的批注 alist 列表，QUEUED 为本地离线队
                      :location location
                      :page (seshat-reader-annotation--page-from-location location)
                      :text (plist-get entry :text)
+                     :selected-text (seshat-reader-annotation--selected-text
+                                     entry)
+                     :kind (seshat-reader-annotation--kind entry)
                      :dirty t)))
            queued)))
 
@@ -824,8 +983,14 @@ ANNOTATIONS 为服务端批注列表，QUEUED 为本地离线队列中待同步�
 顺序漂移。
 
 本函数是列表渲染的全量条目合并入口：纯文本路径与 ETAF 路径都只接受本
-函数的返回值，且都**全量**渲染，不做任何切片。"
-  (seshat-reader-annotation--etaf-items annotations queued))
+函数的返回值，且都**全量**渲染，不做任何切片。
+
+合并结果随后经 `seshat-reader-annotation--group-ink-items' 聚合：同一页的
+`ink' 条目（`kind' 为 \"ink\"，一笔一条）折叠为一条「第 N 页手写（M 笔）」
+汇总行，避免 `text' / `selected_text' 均为空串的笔迹条目渲染成空白行、也
+避免它们淹没文本批注。其他 kind 的条目原样保留、顺序不变。"
+  (seshat-reader-annotation--group-ink-items
+   (seshat-reader-annotation--etaf-items annotations queued)))
 
 (defun seshat-reader-annotation--render-list-etaf (items document-id source)
   "用 ETAF 渲染层把 ITEMS 渲染到当前缓冲区；成功返回 t，否则返回 nil.
@@ -914,9 +1079,7 @@ create 条目列表（plist 列表，见
             (insert "（该文档没有批注）\n")
           (dolist (item all-items)
             (seshat-reader-annotation--insert-entry
-             (list (cons 'id (plist-get item :id))
-                   (cons 'location (plist-get item :location))
-                   (cons 'text (plist-get item :text)))
+             item
              (plist-get item :uuid)))))
       (goto-char (point-min)))
     ;; 列表缓冲区在 `*Seshat Annotations*' 中渲染完毕后，经信息面板统一入口

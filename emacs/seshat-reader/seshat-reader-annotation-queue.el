@@ -269,13 +269,17 @@ ENTRY 为队列中的 create 操作 plist（含 `:uid'、`:location'、`:text'�
 - 否则先经 `seshat-reader-annotation--fetch' 按 uid 拉取该文档的服务端批注：
   - 返回失败哨兵 `seshat-reader-annotation--fetch-error' 时视为服务暂不可达，
     返回 `stop'（保留本条，稍后重试）；
-  - 返回批注列表时，若其中某条批注的 `location' 与 `text' 已与本条完全一致，
-    视为已同步，返回 `ok' 且**不**发起 POST（去重）；
+  - 返回批注列表时，若其中某条批注的 `kind'、`location' 与 `text' 均与本条
+    完全一致，视为已同步，返回 `ok' 且**不**发起 POST（去重）。去重键与
+    Android 侧 `(kind, location, text)'、服务端 `(uid, kind, location,
+    text)' 三端一致：同 location 上一条 note 与一条 ink 因此不会被误判为
+    重复；`:kind' 缺失的旧条目按 \"note\" 参与比较。
   - 否则调用 `seshat-rest-create-annotation'（首个实参为 uid）创建：成功
     （返回含 `id' 的 alist）返回 `ok'，失败（返回 nil 或抛 error）返回 `stop'。"
   (let* ((uid (plist-get entry :uid))
          (location (plist-get entry :location))
-         (text (plist-get entry :text)))
+         (text (plist-get entry :text))
+         (kind (seshat-reader-annotation--kind entry)))
     (cond
      ((not (and (stringp uid) (not (string-empty-p uid))))
       'skip)
@@ -285,7 +289,8 @@ ENTRY 为队列中的 create 操作 plist（含 `:uid'、`:location'、`:text'�
          ((eq existing seshat-reader-annotation--fetch-error)
           'stop)
          ((cl-some (lambda (item)
-                     (and (equal (alist-get 'location item) location)
+                     (and (equal (seshat-reader-annotation--kind item) kind)
+                          (equal (alist-get 'location item) location)
                           (equal (alist-get 'text item) text)))
                    existing)
           'ok)
@@ -341,8 +346,9 @@ UID 非 nil 时只同步该文档（服务端权威身份，**不是** doc-id）
 
 - create：先按 `:uid' 经 `seshat-reader-annotation--fetch' 拉取该文档的
   服务端批注；返回失败哨兵视为服务暂不可达，停止本轮；返回列表时若已有
-  `location' 与 `text' 均与队列条目完全一致的批注，视为已同步、不重复
-  创建；否则经 `seshat-rest-create-annotation'（实参为 uid）创建，失败即
+  `kind'、`location' 与 `text' 均与队列条目完全一致的批注，视为已同步、
+  不重复创建（缺 `:kind' 的旧条目按 \"note\" 比较）；否则经
+  `seshat-rest-create-annotation'（实参为 uid）创建，失败即
   停止本轮。**缺 `:uid' 的旧条目在本轮被跳过**（不发送、不移除），并只
   提示一次「旧队列条目缺少 uid，已跳过」。
 - delete：直接查 `seshat-rest--request' 的 HTTP 状态码，2xx 或 404 视为
