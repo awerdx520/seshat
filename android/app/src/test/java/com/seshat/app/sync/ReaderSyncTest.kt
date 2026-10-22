@@ -26,10 +26,27 @@ class ReaderSyncTest {
             return Progress(uid = uid, position = position, updatedAt = "2026-10-18T10:00:00Z")
         }
 
-        override fun createAnnotation(uid: String, location: String, text: String): Annotation =
-            Annotation(id = 1, uid = uid, location = location, text = text)
+        override fun createAnnotation(
+            uid: String,
+            location: String,
+            text: String,
+            kind: String,
+            selectedText: String,
+        ): Annotation = Annotation(id = 1, uid = uid, location = location, text = text, kind = kind)
 
         override fun listAnnotations(uid: String): List<Annotation> = emptyList()
+
+        /** 断言守卫路径不发生更新/删除（本文件的用例只关心 pushProgress 透传）。 */
+        override fun updateAnnotation(
+            id: Long,
+            location: String,
+            text: String,
+            kind: String,
+            selectedText: String,
+            updatedAt: String?,
+        ): UpdateAnnotationResult = UpdateAnnotationResult.Conflict
+
+        override fun deleteAnnotation(id: Long) = Unit
     }
 
     /** 内存版本地存储：`localProgress` 非 null 时 `pushProgress` 才会真正发请求。 */
@@ -46,6 +63,10 @@ class ReaderSyncTest {
         override fun loadAnnotations(uid: String): List<String> = emptyList()
 
         override fun addAnnotation(uid: String, annotation: String) = Unit
+
+        override fun updateAnnotation(uid: String, annotation: String): Boolean = false
+
+        override fun removeAnnotation(uid: String, annotation: String): Boolean = false
     }
 
     /** 恒等映射：进度/批注在本地与远端使用同一字符串，断言不必关心编码细节。 */
@@ -61,6 +82,14 @@ class ReaderSyncTest {
         override fun location(annotation: String): String = annotation
 
         override fun text(annotation: String): String = annotation
+
+        override fun kind(annotation: String): String = "note"
+
+        override fun selectedText(annotation: String): String = ""
+
+        override fun serverId(annotation: String): Long? = null
+
+        override fun isDirty(annotation: String): Boolean = false
 
         override fun fromRemote(remote: Annotation): String = remote.text
     }

@@ -21,6 +21,22 @@ data class PdfAnnotation(
     val text: String,
     val createdAt: Long,
     val updatedAt: Long,
+    /** 批注种类：`note` / `highlight` / `ink`（对齐服务端 v8 `kind`；旧 JSON 缺键按 `note`）。 */
+    val kind: String = "note",
+    /** 选中原文（对齐服务端 v8 `selected_text`；旧 JSON 缺键按空串）。 */
+    val selectedText: String = "",
+    /**
+     * 服务端分配 id（`null` 表示尚未上传）。
+     *
+     * 本地 [id] 由 store 自行分配，**绝不复用**服务端 id，两者互不污染。
+     */
+    val serverId: Long? = null,
+    /**
+     * 新增或修改尚未上行。
+     *
+     * 仅表示「需要 push」；删除**不复用**该标记，走独立的待删队列（PendingDeletes）。
+     */
+    val dirty: Boolean = false,
 )
 
 /**
@@ -42,17 +58,68 @@ class PdfAnnotationStore(
     private val keys: () -> Set<String> = { emptySet() },
     private val remove: (String) -> Unit = {},
 ) {
-    /** 列出某文档的全部批注（按写入顺序）；无记录或 JSON 损坏时返回空列表。 */
+    /** 列出某文档的全部批注（按写入顺序）；无记录或 JSON 损坏时返回空列表（副本）。 */
+    @Synchronized
     fun list(docId: String): List<PdfAnnotation> {
         val raw = read(key(docId)) ?: return emptyList()
         return runCatching { json.decodeFromString<List<PdfAnnotation>>(raw) }
             .getOrDefault(emptyList())
     }
 
-    /** 追加一条批注。 */
-    fun add(annotation: PdfAnnotation) {
-        val next = list(annotation.documentId) + annotation
-        write(key(annotation.documentId), json.encodeToString(next))
+    /**
+     * 追加一条批注，返回落库后的对象。
+     *
+     * `id <= 0` 时按 [nextId] 语义（当前最大 id + 1）分配本地 id——服务端拉取后入库的记录
+     * 不再复用服务端 id（服务端 id 只写入 [PdfAnnotation.serverId]），否则 id 恒为 0。
+     *
+     * `@Synchronized`：写入有两条并发路径——阅读器主线程（读者新增/删除批注）与同步线程
+     * （`SyncManager` 回填 serverId、pull 合并）。`add`/`update`/`remove` 都是「读整表 → 改 →
+     * 整表回写」，无锁时后写覆盖先写（丢新增、丢 serverId → 重复上传 / 幽灵记录）。
+     */
+    @Synchronized
+    fun add(annotation: PdfAnnotation): PdfAnnotation {
+        val current = list(annotation.documentId)
+        val stored = if (annotation.id <= 0L) {
+            annotation.copy(id = (current.maxOfOrNull { it.id } ?: 0L) + 1L)
+        } else {
+            annotation
+        }
+        write(key(annotation.documentId), json.encodeToString(current + stored))
+        return stored
+    }
+
+    /**
+     * 按 [PdfAnnotation.id] 原地替换（保持列表顺序）。
+     *
+     * @return 是否命中既有记录；未命中不做任何写入（避免静默追加）。
+     */
+    @Synchronized
+    fun update(annotation: PdfAnnotation): Boolean {
+        val current = list(annotation.documentId)
+        val index = current.indexOfFirst { it.id == annotation.id }
+        if (index < 0) return false
+        write(
+            key(annotation.documentId),
+            json.encodeToString(current.toMutableList().also { it[index] = annotation }),
+        )
+        return true
+    }
+
+    /**
+     * 按 id 删除批注。
+     *
+     * 只做本地持久化移除；是否需要把 [PdfAnnotation.serverId] 加入待删队列由调用方判定
+     * （`serverId == null` 表示从未上传，不发 DELETE、不入队）。
+     *
+     * @return 是否真的删除了记录。
+     */
+    @Synchronized
+    fun remove(docId: String, id: Long): Boolean {
+        val current = list(docId)
+        val remaining = current.filterNot { it.id == id }
+        if (remaining.size == current.size) return false
+        write(key(docId), json.encodeToString(remaining))
+        return true
     }
 
     /** 某文档的批注条数。 */
@@ -69,6 +136,7 @@ class PdfAnnotationStore(
      *
      * @return 实际删除的键数量（未注入 [keys]/[remove] 时为 0）。
      */
+    @Synchronized
     fun clearLegacy(): Int = LegacyKeys.clearByPrefix(PREFIX, keys, remove)
 
     companion object {

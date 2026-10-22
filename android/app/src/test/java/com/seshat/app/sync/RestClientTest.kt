@@ -521,4 +521,155 @@ class RestClientTest {
         assertEquals("x/y.org", resp.to)
         assertEquals(9L, resp.seq)
     }
+
+    // ---- M10.3 T3：批注 kind / selected_text / updated_at / 409 / 404 ----
+
+    /** 请求体 JSON 解析（`buildXxx` 与 MockWebServer 记录的请求共用）。 */
+    private fun bodyOf(req: okhttp3.Request): kotlinx.serialization.json.JsonObject =
+        Json.parseToJsonElement(
+            okio.Buffer().also { req.body!!.writeTo(it) }.readUtf8(),
+        ).jsonObject
+
+    /** 创建请求体带 `kind` 与 `selected_text`（非默认值才会被 `encodeDefaults=false` 序列化）。 */
+    @Test
+    fun buildCreateAnnotationSerializesKindAndSelectedText() {
+        val req = client.buildCreateAnnotation(
+            "book-1",
+            "chapter:3@10-20",
+            "",
+            kind = "highlight",
+            selectedText = "选中原文",
+        )
+        val body = bodyOf(req)
+        assertEquals("POST", req.method)
+        assertEquals("highlight", body["kind"]?.jsonPrimitive?.content)
+        assertEquals("选中原文", body["selected_text"]?.jsonPrimitive?.content)
+        assertEquals("", body["text"]?.jsonPrimitive?.content)
+        assertEquals("book-1", body["uid"]?.jsonPrimitive?.content)
+    }
+
+    /**
+     * 缺省值被 `encodeDefaults=false` 省略：服务端对缺键按 `kind="note"` / `selected_text=""` 兜底，
+     * 与显式传默认值等价（保持既有调用方的请求体形状不变）。
+     */
+    @Test
+    fun buildCreateAnnotationOmitsDefaultKindAndSelectedText() {
+        val body = bodyOf(client.buildCreateAnnotation("book-1", "page:1", "备注"))
+        assertNull(body["kind"])
+        assertNull(body["selected_text"])
+        assertEquals("备注", body["text"]?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun createAnnotationPostsKindAndSelectedText() {
+        server.enqueue(
+            MockResponse().setResponseCode(201)
+                .setBody(
+                    """{"id":3,"uid":"book-1","location":"chapter:1@0-5","text":"","kind":"highlight","selected_text":"选中","created_at":"2026-10-11T10:00:00Z","updated_at":"2026-10-11T10:00:00Z"}""",
+                ),
+        )
+        val ann = client.createAnnotation("book-1", "chapter:1@0-5", "", kind = "highlight", selectedText = "选中")
+        val sent = Json.parseToJsonElement(server.takeRequest().body.readUtf8()).jsonObject
+        assertEquals("highlight", sent["kind"]?.jsonPrimitive?.content)
+        assertEquals("选中", sent["selected_text"]?.jsonPrimitive?.content)
+        assertEquals("highlight", ann.kind)
+        assertEquals("选中", ann.selectedText)
+    }
+
+    /** `updatedAt` 非空 → 请求体带 `updated_at`。 */
+    @Test
+    fun buildUpdateAnnotationIncludesUpdatedAtWhenPresent() {
+        val req = client.buildUpdateAnnotation(
+            id = 7L,
+            location = "page:2",
+            text = "改后备注",
+            kind = "note",
+            selectedText = "选中",
+            updatedAt = "2026-10-22T10:00:00Z",
+        )
+        val body = bodyOf(req)
+        assertEquals("PUT", req.method)
+        assertEquals("/api/annotations/7", req.url.encodedPath)
+        assertEquals("2026-10-22T10:00:00Z", body["updated_at"]?.jsonPrimitive?.content)
+        assertEquals("选中", body["selected_text"]?.jsonPrimitive?.content)
+        assertEquals("改后备注", body["text"]?.jsonPrimitive?.content)
+    }
+
+    /** `updatedAt` 为空 → 请求体不含 `updated_at`（服务端自行填当前时间，不做冲突检测）。 */
+    @Test
+    fun buildUpdateAnnotationOmitsUpdatedAtWhenAbsent() {
+        val body = bodyOf(client.buildUpdateAnnotation(7L, "page:2", "改后备注"))
+        assertNull(body["updated_at"])
+        assertNull(body["kind"])
+        assertNull(body["selected_text"])
+    }
+
+    @Test
+    fun updateAnnotationReturnsOkOn200() {
+        server.enqueue(
+            MockResponse().setResponseCode(200)
+                .setBody(
+                    """{"id":7,"uid":"book-1","location":"page:2","text":"改后","kind":"note","selected_text":"","updated_at":"2026-10-22T11:00:00Z"}""",
+                ),
+        )
+        val result = client.updateAnnotation(7L, "page:2", "改后", updatedAt = "2026-10-22T10:00:00Z")
+        val request = server.takeRequest()
+        assertEquals("PUT", request.method)
+        assertEquals("/api/annotations/7", request.path)
+        val ok = result as UpdateAnnotationResult.Ok
+        assertEquals(7L, ok.annotation.id)
+        assertEquals("2026-10-22T11:00:00Z", ok.annotation.updatedAt)
+    }
+
+    /** 409 → 可判别的 `Conflict`（不抛异常，交由同步层按「服务端版本为准」合并）。 */
+    @Test
+    fun updateAnnotationReturnsConflictOn409() {
+        server.enqueue(
+            MockResponse().setResponseCode(409)
+                .setBody("""{"error":{"code":"conflict","message":"批注已被他人修改"}}"""),
+        )
+        val result = client.updateAnnotation(7L, "page:2", "改后", updatedAt = "2026-10-22T09:00:00Z")
+        assertEquals(UpdateAnnotationResult.Conflict, result)
+    }
+
+    /** 其它非 2xx 仍按统一约定抛 [ApiException]（只有 409 被特判）。 */
+    @Test
+    fun updateAnnotationThrowsOnOtherErrors() {
+        server.enqueue(
+            MockResponse().setResponseCode(500)
+                .setBody("""{"error":{"code":"internal","message":"写入失败"}}"""),
+        )
+        try {
+            client.updateAnnotation(7L, "page:2", "改后")
+            fail("应抛出 ApiException")
+        } catch (e: ApiException) {
+            assertEquals(500, e.statusCode)
+            assertEquals("internal", e.code)
+        }
+    }
+
+    /** DELETE 404 视为成功（服务端批注已不存在 = 删除目标已达成）。 */
+    @Test
+    fun deleteAnnotationTreats404AsSuccess() {
+        server.enqueue(
+            MockResponse().setResponseCode(404)
+                .setBody("""{"error":{"code":"not_found","message":"批注不存在"}}"""),
+        )
+        client.deleteAnnotation(7L)
+        assertEquals("DELETE", server.takeRequest().method)
+    }
+
+    @Test
+    fun deleteAnnotationThrowsOnOtherErrors() {
+        server.enqueue(
+            MockResponse().setResponseCode(500)
+                .setBody("""{"error":{"code":"internal","message":"删除失败"}}"""),
+        )
+        try {
+            client.deleteAnnotation(7L)
+            fail("应抛出 ApiException")
+        } catch (e: ApiException) {
+            assertEquals(500, e.statusCode)
+        }
+    }
 }

@@ -8,11 +8,14 @@ import android.os.Handler
 import android.os.Looper
 import android.text.InputType
 import android.view.GestureDetector
+import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
+import android.webkit.WebView
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.LinearLayout
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
@@ -36,6 +39,7 @@ import com.seshat.app.settings.SettingsActivity
 import com.seshat.app.settings.SettingsStore
 import com.seshat.app.sync.EpubLocalSyncStore
 import com.seshat.app.sync.EpubSyncMapper
+import com.seshat.app.sync.ProgressPushResult
 import com.seshat.app.sync.RestClient
 import com.seshat.app.sync.RestClientSyncAdapter
 import com.seshat.app.sync.SecurePrefs
@@ -100,6 +104,15 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
 
     /** 目录抽屉（M10.9）：挂在 Activity 内容容器上，覆盖在阅读区之上。 */
     private lateinit var tocDrawer: TocDrawer
+
+    /**
+     * 批注抽屉（M10.3 / T5）：与 [tocDrawer] 挂在同一内容容器上，但两者互斥
+     * （打开任一方前先关另一方）。
+     */
+    private lateinit var annotationDrawer: AnnotationDrawer
+
+    /** 待删批注队列（M10.3 T3）：键 `pending_deletes_<uid>`，与 [annotationStore] 同一 prefs 文件。 */
+    private lateinit var pendingDeletes: PendingDeletes
 
     private lateinit var progressStore: ReadingProgressStore
     private lateinit var annotationStore: AnnotationStore
@@ -193,6 +206,14 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
      */
     private var lastPushedPosition: String? = null
 
+    /**
+     * 「进度冲突已提示过」标记（同一 Activity 生命周期内只提示一次）。
+     *
+     * 只在同步线程写入、只被 [notifyProgressConflict] 读取；`true` 之后不再弹提示，
+     * 避免服务端持续冲突时每退出一次阅读器就打扰读者一次。
+     */
+    private var progressConflictNotified: Boolean = false
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_epub_reader)
@@ -201,6 +222,14 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
         tocDrawer = TocDrawer(findViewById(android.R.id.content)) { index ->
             jumpToChapter(index)
         }
+
+        // 批注抽屉（M10.3 / T5）：必须在目录抽屉之后创建，两层遮罩才不会有层级歧义
+        annotationDrawer = AnnotationDrawer(
+            root = findViewById(android.R.id.content),
+            onItemClick = { row -> jumpToAnnotation(row) },
+            onItemEdit = { row -> editAnnotationRow(row) },
+            onItemDelete = { row -> deleteAnnotationRow(row) },
+        )
 
         // 模式与字号只在打开阅读器时读取一次（设置页改动下次进来生效）。
         val prefs = AppPreferences.open(this)
@@ -216,6 +245,8 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
         pageIndicator = findViewById(R.id.pageIndicator)
         progressStore = ReadingProgressStore(this)
         annotationStore = AnnotationStore(this)
+        // 待删队列与批注 store 共用同一个 prefs 文件（键空间由前缀隔离）
+        pendingDeletes = PendingDeletes(this)
         uid = intent.getStringExtra(EXTRA_UID)?.trim()?.takeIf { it.isNotEmpty() }
         // 旧键一次性清理（幂等；每 prefs 文件各自标记，只跑第一次）
         clearLegacyOnce()
@@ -228,6 +259,8 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
         findViewById<TextView>(R.id.settingsButton).setOnClickListener {
             startActivity(Intent(this, SettingsActivity::class.java))
         }
+        // 顶栏「列表」入口（打开批注抽屉）：代码插入，零新增 XML / 零新增 R.id.
+        installAnnotationListButton()
         setupSeekBar()
         // 章号指示可点：输入章号直接跳章（章节数极大时比拖 SeekBar 更精确）
         pageIndicator.setOnClickListener { showJumpToChapterDialog() }
@@ -288,11 +321,18 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
             this,
             object : OnBackPressedCallback(true) {
                 override fun handleOnBackPressed() {
-                    if (::tocDrawer.isInitialized && tocDrawer.isShowing) {
-                        tocDrawer.hide()
-                    } else {
-                        isEnabled = false
-                        onBackPressedDispatcher.onBackPressed()
+                    // 三态优先级与 M10.9 目录抽屉一致（抽屉是模态层，必须先关），判定收敛在纯函数里
+                    when (AnnotationGrouping.backKeyAction(anyDrawerShowing(), chromeVisible())) {
+                        BackKeyAction.CloseDrawer -> {
+                            if (tocDrawer.isShowing) tocDrawer.hide()
+                            if (annotationDrawer.isShowing) annotationDrawer.hide()
+                        }
+                        // 工具栏可见时返回键先收起工具栏（与点屏幕中央同一个动作）
+                        BackKeyAction.HideChrome -> toggleChrome()
+                        BackKeyAction.SystemBack -> {
+                            isEnabled = false
+                            onBackPressedDispatcher.onBackPressed()
+                        }
                     }
                 }
             },
@@ -314,6 +354,8 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
         // 离开阅读器（切后台 / 退出）时推送一次进度：这是「同步」语义的唯一天然时点。
         // 必须在 super.onStop() 之前入队，保证提交时同步线程仍存活且 Activity 尚未销毁。
         enqueuePushProgress()
+        // 删除传播与「新增/修改」同源时机：离线删除的批注在这里补发 DELETE（M10.3 T3）
+        enqueuePushDeletes()
         super.onStop()
     }
 
@@ -448,6 +490,8 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
             restFactory = { RestClientSyncAdapter(RestClient(it)) },
             store = EpubLocalSyncStore(progressStore, annotationStore),
             mapper = EpubSyncMapper(),
+            // 待删队列：离线删除的服务端 id 在这里持久化，flush 时补发 DELETE（M10.3 T3）
+            pendingDeletes = pendingDeletes,
         ) ?: return
         syncManager = manager
         val executor = Executors.newSingleThreadExecutor().also { syncExecutor = it }
@@ -457,8 +501,10 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
                 manager.pullAnnotations(id)
                 // 进度：仅本地没有进度时拉取（避免覆盖本机正在读的位置）
                 if (progressStore.load(id) == null) manager.pullProgress(id)
-                // 本地已有进度：推送上去（服务端 updated_at 会因此前进）
-                manager.pushProgress(id)
+                // 本地已有进度：推送上去（服务端 updated_at 会因此前进）。
+                // 用 detailed 版本：409 冲突重发仍失败的结局必须单独处置，否则会落进下面这条
+                // 笼统的「拉取失败（已忽略）」，冲突再次被静默吞掉（计划 T3）。
+                handleProgressPush(manager.pushProgressDetailed(id), position = null)
             }.onFailure { Log.w(TAG, "拉取阅读状态失败（已忽略）", it) }
         }
     }
@@ -488,12 +534,63 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
                 val position = progressStore.load(id)
                     ?.let { "${it.chapterIndex}:${it.scrollY}" } ?: return@execute
                 if (position == lastPushedPosition) return@execute
-                runCatching { manager.pushProgress(id) }
-                    // pushProgress 返回 Progress?：不抛异常即视为推送成功，此时才记住该位置。
-                    .onSuccess { lastPushedPosition = position }
+                runCatching { manager.pushProgressDetailed(id) }
+                    // 三态（Pushed/Merged/Rejected）逐一处置：不得再用「不抛异常即成功」判定，
+                    // 否则 409 冲突被拒的结局会被当成「已推送」，两端就此长期分叉。
+                    .onSuccess { result -> handleProgressPush(result, position) }
                     .onFailure { Log.w(TAG, "推送阅读进度失败（已忽略）", it) }
             }
         }.onFailure { Log.w(TAG, "同步任务提交失败（已忽略）", it) }
+    }
+
+    /**
+     * 进度推送结果的三态处置（[SyncManager.pushProgressDetailed]）。
+     *
+     * | 结果 | 含义 | 处置 |
+     * |---|---|---|
+     * | `Pushed` | 服务端已保存本地值 | 成功，记住位置（防抖） |
+     * | `Merged` | 409 后判定服务端较新，本地已被服务端值覆盖 | 成功（预期语义），不打扰读者 |
+     * | `Rejected` | 409 后重发仍冲突，本地值**未上行** | warn 日志 + 一次性提示，**不得静默** |
+     * | `Skipped` | 零请求（本地无进度 / uid 空白） | 什么都不做，也不记位置 |
+     *
+     * @param position 本次推送的位置串；仅「服务端已认可」（`Pushed` / `Merged`）时写入
+     *   [lastPushedPosition]。`null` 表示调用方不在同步线程的防抖路径上（如打开书时的首推）。
+     */
+    private fun handleProgressPush(result: ProgressPushResult, position: String?) {
+        when (result) {
+            is ProgressPushResult.Pushed, is ProgressPushResult.Merged ->
+                if (position != null) lastPushedPosition = position
+            is ProgressPushResult.Rejected -> {
+                // 服务端有记录时，其 updated_at 是判断「谁较新」的唯一线索，一并记进日志。
+                Log.w(
+                    TAG,
+                    "进度同步冲突：409 后重发仍失败，本地进度未上行" +
+                        "（服务端 updated_at=${result.remote?.updatedAt ?: "<无记录>"}）",
+                )
+                notifyProgressConflict()
+            }
+            ProgressPushResult.Skipped -> Unit
+        }
+    }
+
+    /**
+     * 进度冲突的一次性用户提示（同一 Activity 生命周期内最多一次）。
+     *
+     * 为什么必须提示：冲突意味着**本地进度没有上行**，服务端仍是旧值；读者下次在别的设备打开
+     * 会回到旧位置却没有任何线索可循——计划 T3 明确禁止静默吞错。
+     * 为什么去重：进度推送每次 [onStop] 都会尝试，「服务端持续冲突则每次退出都弹一次」等于骚扰；
+     * 同一份「已保留服务端版本」的信息说一次足够。
+     *
+     * 线程：[handleProgressPush] 在 [syncExecutor] 线程调用本方法，故用 `runOnUiThread` 投递到
+     * 主线程，并在投递后再判一次存活，避免 Activity 已销毁时仍操作 UI。
+     */
+    private fun notifyProgressConflict() {
+        if (progressConflictNotified) return
+        progressConflictNotified = true
+        runOnUiThread {
+            if (isFinishing || isDestroyed) return@runOnUiThread
+            Toast.makeText(this, R.string.reader_progress_conflict, Toast.LENGTH_SHORT).show()
+        }
     }
 
     /** 新增批注后异步推送（无同步管理器时直接返回，零网络行为）。 */
@@ -912,6 +1009,7 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
         topChrome.post { applyContentPadding() }
         // 浮层收起时抽屉若开着也一并收起，避免「没有工具栏却浮着目录」的悬空态
         if (::tocDrawer.isInitialized && tocDrawer.isShowing) tocDrawer.hide()
+        if (::annotationDrawer.isInitialized && annotationDrawer.isShowing) annotationDrawer.hide()
     }
 
     // ---- 导航与标题 ----
@@ -1129,6 +1227,217 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
         )
     }
 
+    // ---- 批注抽屉（M10.3 / T5）----
+
+    /** 是否有任一抽屉正在显示（返回键分派用）。 */
+    private fun anyDrawerShowing(): Boolean =
+        (::tocDrawer.isInitialized && tocDrawer.isShowing) ||
+            (::annotationDrawer.isInitialized && annotationDrawer.isShowing)
+
+    /** 顶栏是否可见：沉浸模式（浮层已隐藏）时返回键应退出页面，而不是「隐藏一个已隐藏的工具栏」。 */
+    private fun chromeVisible(): Boolean = topChrome.visibility == View.VISIBLE
+
+    /**
+     * 顶栏「列表」入口（打开批注抽屉）。
+     *
+     * 顶栏已有「批注」（`annotateButton`，对选中文本新建批注），故本按钮文案取「列表」以区分。
+     * 视图由代码克隆同排「目录」按钮的可视属性后插入其左侧：零新增 XML、零新增 `R.id.`，
+     * 与同排按钮高度/涟漪一致，浮层显隐与 insets 联动自动生效。
+     */
+    private fun installAnnotationListButton() {
+        val row = topChrome as? LinearLayout ?: return
+        val tocButton = findViewById<TextView>(R.id.tocButton)
+        val density = resources.displayMetrics.density
+        val button = TextView(this).apply {
+            text = ANNOTATION_DRAWER_ENTRY_LABEL
+            textSize = 14f
+            gravity = Gravity.CENTER
+            setTextColor(0xFFFFFFFF.toInt())
+            minWidth = (48 * density).toInt()
+            val horizontal = (10 * density).toInt()
+            val vertical = (12 * density).toInt()
+            setPadding(horizontal, vertical, horizontal, vertical)
+            isClickable = true
+            isFocusable = true
+            // 复用目录按钮的 selectableItemBackground（涟漪），不引入新 drawable
+            background = tocButton.background?.constantState?.newDrawable(resources)?.mutate()
+            setOnClickListener { showAnnotationList() }
+        }
+        val index = row.indexOfChild(tocButton)
+        row.addView(button, if (index >= 0) index else row.childCount)
+    }
+
+    /** store → 中性条目；EPUB 没有「页」，故 `page` 恒为 `null`（跳转目标由 location/chapterIndex 决定）。 */
+    private fun annotationItems(): List<AnnotationItem> =
+        annotationStore.list(effectiveKey).map { annotation ->
+            AnnotationItem(
+                id = "epub:${annotation.id}",
+                kind = annotation.kind,
+                note = annotation.note,
+                selectedText = annotation.selectedText,
+                page = null,
+                pending = annotation.dirty,
+            )
+        }
+
+    /**
+     * 打开批注抽屉（已开则关闭，与目录按钮的 toggle 语义一致）。
+     *
+     * 两个抽屉互斥：打开批注前先关目录，否则两个遮罩叠在一起、返回键的归属会变得靠运气。
+     */
+    private fun showAnnotationList() {
+        if (::tocDrawer.isInitialized && tocDrawer.isShowing) tocDrawer.hide()
+        if (annotationDrawer.isShowing) {
+            annotationDrawer.hide()
+            return
+        }
+        annotationDrawer.show(annotationItems())
+    }
+
+    /** 数据变更后刷新已打开的抽屉（未打开时无操作，避免无谓构建视图）。 */
+    private fun refreshAnnotationDrawer() {
+        if (!::annotationDrawer.isInitialized || !annotationDrawer.isShowing) return
+        annotationDrawer.show(annotationItems())
+    }
+
+    /** 行 → store 记录（ink 汇总行在 EPUB 侧不存在，保留同一套判定以便将来对齐）。 */
+    private fun annotationsForRow(row: AnnotationRow): List<BookAnnotation> {
+        val all = annotationStore.list(effectiveKey)
+        return if (row.id == AnnotationGrouping.INK_SUMMARY_ID) {
+            all.filter { it.kind == AnnotationGrouping.KIND_INK }
+        } else {
+            all.filter { "epub:${it.id}" == row.id }
+        }
+    }
+
+    /**
+     * 点击条目 → 跳转。
+     *
+     * 两级降级：
+     * 1. location 是定稿形态 `chapter:<i>@<s>-<e>` → 跳章 + **章内按字符偏移滚动**；
+     * 2. 旧记录（location 为空或 `chapter-<n>` 解析不出）→ 用本地 `chapterIndex` 只跳章。
+     *
+     * 章内定位失败（WebView 未就绪 / 偏移超出文本流）不报错，等价于「跳到章首」。
+     */
+    private fun jumpToAnnotation(row: AnnotationRow) {
+        val target = annotationsForRow(row).firstOrNull() ?: return
+        annotationDrawer.hide()
+        val parsed = LocationCodec.parse(target.location)
+        if (parsed is LocationCodec.Parsed.Chapter) {
+            jumpToChapterWithOffset(parsed.spineIndex, parsed.startOffset)
+        } else {
+            jumpToChapter(target.chapterIndex)
+        }
+    }
+
+    /** 跳章 + 尝试章内定位（偏移 <= 0 时只跳章，省一次 JS 往返）。 */
+    private fun jumpToChapterWithOffset(chapterIndex: Int, startOffset: Int) {
+        jumpToChapter(chapterIndex)
+        if (startOffset <= 0) return
+        val attempt = Runnable {
+            LocationScroll.scrollTo(chapterWebView(chapterIndex), startOffset)
+        }
+        // 两次尝试：第一次覆盖「该章 WebView 已就绪（同章跳转）」，第二次兜住「刚切章、页面还在加载」
+        scrollView.postDelayed(attempt, WEBVIEW_LOCATE_FIRST_DELAY_MS)
+        scrollView.postDelayed(attempt, WEBVIEW_LOCATE_SECOND_DELAY_MS)
+    }
+
+    /**
+     * 取某章的 WebView（章内定位用）。
+     *
+     * 两种翻页模式的承载方式不同：竖向模式 [scrollView] 的每个 item 就是 WebView；
+     * 横向模式 [pager] 的每个 item 是承载 [ChapterFragment] 的容器 View，需再找
+     * `R.id.chapterWebView`（该 id 属既有资源，不新增）。
+     */
+    private fun chapterWebView(index: Int): WebView? {
+        val host = if (pageMode == ReaderPageMode.VERTICAL) {
+            scrollView
+        } else {
+            pager.getChildAt(0) as? RecyclerView
+        } ?: return null
+        val item = host.findViewHolderForAdapterPosition(index)?.itemView ?: return null
+        return (item as? WebView) ?: item.findViewById(R.id.chapterWebView)
+    }
+
+    /**
+     * 编辑备注：与「添加批注」同款对话框，预填现有备注与选中原文。
+     *
+     * 保存后置 `dirty = true` 并异步推送；写过备注即视为 `note`（服务端 `kind=note` 时 `text` 必填），
+     * 原本的 `highlight`（仅选中原文）因此升级为 `note`。
+     */
+    private fun editAnnotationRow(row: AnnotationRow) {
+        val target = annotationsForRow(row).firstOrNull() ?: return
+        val input = EditText(this).apply {
+            setText(target.note)
+            hint = getString(R.string.reader_annotation_hint)
+            minLines = 3
+        }
+        val container = FrameLayout(this).apply {
+            setPadding(48, 32, 48, 0)
+            addView(
+                input,
+                FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                ),
+            )
+        }
+        val builder = AlertDialog.Builder(this)
+            .setTitle("编辑批注")
+            .setView(container)
+            .setPositiveButton(android.R.string.ok) { _, _ ->
+                val note = input.text?.toString()?.trim().orEmpty()
+                if (note.isEmpty()) return@setPositiveButton
+                annotationStore.update(
+                    target.copy(note = note, kind = BookAnnotation.KIND_NOTE, dirty = true),
+                )
+                enqueuePushAnnotations()
+                refreshAnnotationDrawer()
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+        // 选中原文为空时不留一行空白 message
+        if (target.selectedText.isNotBlank()) builder.setMessage(target.selectedText.take(200))
+        builder.show()
+    }
+
+    /**
+     * 删除一条批注。
+     *
+     * **不要重复移除**：装配了 [syncManager] 时，本地移除与 `pendingDeletes` 入队都由
+     * `SyncManager.deleteAnnotation` 完成（`serverId == null` 的记录不入队、不发 DELETE）。
+     * 未装配同步（服务端未配置）时才由本方法直接删本地，并把 `serverId` 落进队列等下次 flush。
+     */
+    private fun deleteAnnotationRow(row: AnnotationRow) {
+        val target = annotationsForRow(row).firstOrNull() ?: return
+        val manager = syncManager
+        if (manager != null) {
+            manager.deleteAnnotation(effectiveKey, target)
+            enqueuePushDeletes()
+        } else {
+            annotationStore.remove(effectiveKey, target.id)
+            val serverId = target.serverId
+            val identity = uid
+            if (serverId != null && !identity.isNullOrBlank()) {
+                pendingDeletes.add(identity, serverId)
+            }
+        }
+        refreshAnnotationDrawer()
+    }
+
+    /** 异步 flush 待删队列（无同步管理器时直接返回，零网络行为）。 */
+    private fun enqueuePushDeletes() {
+        val manager = syncManager ?: return
+        val id = effectiveKey
+        val executor = syncExecutor ?: return
+        // 同 [enqueuePushProgress]：shutdown() 之后提交会被拒绝，异常一并兜住。
+        runCatching {
+            executor.execute {
+                runCatching { manager.pushDeletes(id) }
+                    .onFailure { Log.w(TAG, "推送批注删除失败（已忽略）", it) }
+            }
+        }.onFailure { Log.w(TAG, "同步任务提交失败（已忽略）", it) }
+    }
+
     // ---- 进度 ----
 
     private fun persistProgress(chapterIndex: Int) {
@@ -1173,14 +1482,7 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
                 Toast.makeText(this, R.string.reader_annotation_no_page, Toast.LENGTH_SHORT).show()
                 return
             }
-            web.evaluateJavascript("(function(){return String(window.getSelection());})()") { raw ->
-                val selected = decodeJsString(raw)
-                if (selected.isBlank()) {
-                    Toast.makeText(this, R.string.reader_annotation_empty_selection, Toast.LENGTH_SHORT).show()
-                } else {
-                    showAnnotationDialog(visibleChapterIndex, selected)
-                }
-            }
+            readSelection(web) { selected, range -> onSelectionCaptured(visibleChapterIndex, selected, range) }
             return
         }
         val fragment = currentChapterFragment()
@@ -1188,12 +1490,22 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
             Toast.makeText(this, R.string.reader_annotation_no_page, Toast.LENGTH_SHORT).show()
             return
         }
-        fragment.selectedText { selected ->
-            if (selected.isBlank()) {
-                Toast.makeText(this, R.string.reader_annotation_empty_selection, Toast.LENGTH_SHORT).show()
-            } else {
-                showAnnotationDialog(fragment.chapterIndex, selected)
-            }
+        fragment.selection { selected, range ->
+            onSelectionCaptured(fragment.chapterIndex, selected, range)
+        }
+    }
+
+    /**
+     * 选区 → 弹窗：空选区给提示；非空进备注对话框。
+     *
+     * [range] 为 `null` 表示取不到章内偏移（旧 WebView / JS 失败），此时仍可创建批注，
+     * location 退回旧形态 `chapter-<chapterIndex>`（见 [SelectionPayload.locationFor]）。
+     */
+    private fun onSelectionCaptured(chapterIndex: Int, selectedText: String, range: SelectionRange?) {
+        if (selectedText.isBlank()) {
+            Toast.makeText(this, R.string.reader_annotation_empty_selection, Toast.LENGTH_SHORT).show()
+        } else {
+            showAnnotationDialog(chapterIndex, selectedText, range)
         }
     }
 
@@ -1201,7 +1513,11 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
         .filterIsInstance<ChapterFragment>()
         .firstOrNull { it.chapterIndex == pager.currentItem }
 
-    private fun showAnnotationDialog(chapterIndex: Int, selectedText: String) {
+    private fun showAnnotationDialog(
+        chapterIndex: Int,
+        selectedText: String,
+        range: SelectionRange?,
+    ) {
         val input = EditText(this).apply {
             hint = getString(R.string.reader_annotation_hint)
             minLines = 3
@@ -1221,12 +1537,21 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
             .setMessage(selectedText.take(200))
             .setView(container)
             .setPositiveButton(android.R.string.ok) { _, _ ->
+                val note = input.text.toString()
                 annotationStore.add(
                     BookAnnotation(
                         documentId = effectiveKey,
                         chapterIndex = chapterIndex,
                         selectedText = selectedText,
-                        note = input.text.toString(),
+                        note = note,
+                        // 偏移可用 → chapter:<i>@<s>-<e>；不可用 → 旧形态 chapter-<i>（不崩溃）
+                        location = SelectionPayload.locationFor(chapterIndex, range),
+                        // 只选中原文、没写备注 = highlight（text 允许空串）；写了备注 = note
+                        kind = if (note.isBlank()) {
+                            BookAnnotation.KIND_HIGHLIGHT
+                        } else {
+                            BookAnnotation.KIND_NOTE
+                        },
                     ),
                 )
                 // 本地已落盘，再异步推送（失败静默，下次推送会因幂等去重补齐）。
@@ -1272,6 +1597,12 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
 
         /** 单击 → 切换浮层的延迟（毫秒）：跨过双击判定窗口，避免双击缩放第一击触发切换。 */
         private const val TAP_TOGGLE_DELAY_MS = 250L
+
+        /** 章内定位的第一次尝试延迟（毫秒）：同章跳转时 WebView 已就绪，等一次主线程排空即可。 */
+        private const val WEBVIEW_LOCATE_FIRST_DELAY_MS = 250L
+
+        /** 章内定位的第二次尝试延迟（毫秒）：兜住「刚切章、页面仍在加载」的情况。 */
+        private const val WEBVIEW_LOCATE_SECOND_DELAY_MS = 800L
 
         /**
          * 顶部浮层的垂直基础 padding（dp）：与 `activity_epub_reader.xml` 的

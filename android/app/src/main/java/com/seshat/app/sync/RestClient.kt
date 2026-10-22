@@ -39,6 +39,10 @@ data class Annotation(
     @SerialName("uid") val uid: String,
     @SerialName("location") val location: String,
     @SerialName("text") val text: String,
+    /** 批注种类（v8）：`note` / `highlight` / `ink`；缺键按 `note`。 */
+    @SerialName("kind") val kind: String = "note",
+    /** 选中原文（v8）；缺键按空串。 */
+    @SerialName("selected_text") val selectedText: String = "",
     @SerialName("created_at") val createdAt: String? = null,
     @SerialName("updated_at") val updatedAt: String? = null,
 )
@@ -49,14 +53,38 @@ data class CreateAnnotationRequest(
     @SerialName("uid") val uid: String,
     @SerialName("location") val location: String,
     @SerialName("text") val text: String,
+    @SerialName("kind") val kind: String = "note",
+    @SerialName("selected_text") val selectedText: String = "",
 )
 
-/** 更新批注的请求体（整体替换语义）。 */
+/**
+ * 更新批注的请求体（整体替换语义）。
+ *
+ * `updated_at` 非空时服务端据此做冲突检测（落后于库内值 → 409）；为空则由服务端填当前时间。
+ */
 @Serializable
 data class UpdateAnnotationRequest(
     @SerialName("location") val location: String,
     @SerialName("text") val text: String,
+    @SerialName("kind") val kind: String = "note",
+    @SerialName("selected_text") val selectedText: String = "",
+    @SerialName("updated_at") val updatedAt: String? = null,
 )
+
+/**
+ * `PUT /api/annotations/{id}` 的可判别结果。
+ *
+ * 只有 409 被特判为 [Conflict]（冲突是同步流程**预期内**的分支，需要「重拉 + 以服务端版本为准」，
+ * 用返回值而非异常强制调用方在编译期穷尽处理）；其余非 2xx 仍抛 [ApiException]，
+ * 不影响其它端点的统一抛错行为。
+ */
+sealed class UpdateAnnotationResult {
+    /** 更新成功，携带服务端返回的最新对象（含 `updated_at`）。 */
+    data class Ok(val annotation: Annotation) : UpdateAnnotationResult()
+
+    /** 409 冲突：本地版本落后，调用方需重拉后以服务端版本为准。 */
+    data object Conflict : UpdateAnnotationResult()
+}
 
 /** 仓库根（M7 `GET /api/roots` 的条目）。 */
 @Serializable
@@ -172,8 +200,8 @@ class ApiException(val statusCode: Int, val code: String?, message: String) : IO
  * - `PUT  /api/progress/{uid}`
  * - `POST /api/annotations`（201）
  * - `GET  /api/annotations?uid={id}`
- * - `PUT  /api/annotations/{id}`
- * - `DELETE /api/annotations/{id}`（204）
+ * - `PUT  /api/annotations/{id}`（409 返回 [UpdateAnnotationResult.Conflict]，其余非 2xx 抛错）
+ * - `DELETE /api/annotations/{id}`（204；404 视为成功，幂等删除）
  * - `GET  /api/roots`（外层 `{"roots":[...]}`）
  * - `GET  /api/resources?root=&prefix=&since=&include_deleted=&limit=`（`since` 为 mtime 秒级）
  * - `GET  /api/resolve?root=&path=`
@@ -238,13 +266,19 @@ class RestClient(
             .header("Authorization", bearer())
             .build()
 
-    fun buildCreateAnnotation(uid: String, location: String, text: String): Request =
+    fun buildCreateAnnotation(
+        uid: String,
+        location: String,
+        text: String,
+        kind: String = "note",
+        selectedText: String = "",
+    ): Request =
         Request.Builder()
             .url(apiUrl("annotations"))
             .post(
                 encode(
                     CreateAnnotationRequest.serializer(),
-                    CreateAnnotationRequest(uid, location, text),
+                    CreateAnnotationRequest(uid, location, text, kind, selectedText),
                 ),
             )
             .header("Authorization", bearer())
@@ -257,10 +291,22 @@ class RestClient(
             .header("Authorization", bearer())
             .build()
 
-    fun buildUpdateAnnotation(id: Long, location: String, text: String): Request =
+    fun buildUpdateAnnotation(
+        id: Long,
+        location: String,
+        text: String,
+        kind: String = "note",
+        selectedText: String = "",
+        updatedAt: String? = null,
+    ): Request =
         Request.Builder()
             .url(apiUrl("annotations", id.toString()))
-            .put(encode(UpdateAnnotationRequest.serializer(), UpdateAnnotationRequest(location, text)))
+            .put(
+                encode(
+                    UpdateAnnotationRequest.serializer(),
+                    UpdateAnnotationRequest(location, text, kind, selectedText, updatedAt),
+                ),
+            )
             .header("Authorization", bearer())
             .build()
 
@@ -412,8 +458,14 @@ class RestClient(
     }
 
     /** 创建批注，返回含服务端分配 id 的完整对象。 */
-    fun createAnnotation(uid: String, location: String, text: String): Annotation {
-        client.newCall(buildCreateAnnotation(uid, location, text)).execute().use { resp ->
+    fun createAnnotation(
+        uid: String,
+        location: String,
+        text: String,
+        kind: String = "note",
+        selectedText: String = "",
+    ): Annotation {
+        client.newCall(buildCreateAnnotation(uid, location, text, kind, selectedText)).execute().use { resp ->
             ensureSuccess(resp)
             return json.decodeFromString(Annotation.serializer(), resp.body?.string().orEmpty())
         }
@@ -430,17 +482,42 @@ class RestClient(
         }
     }
 
-    /** 更新批注，返回更新后的完整对象。 */
-    fun updateAnnotation(id: Long, location: String, text: String): Annotation {
-        client.newCall(buildUpdateAnnotation(id, location, text)).execute().use { resp ->
-            ensureSuccess(resp)
-            return json.decodeFromString(Annotation.serializer(), resp.body?.string().orEmpty())
-        }
+    /**
+     * 更新批注（整体替换），返回可判别结果。
+     *
+     * - 2xx → [UpdateAnnotationResult.Ok]（含服务端最新对象，`updated_at` 供本地回写）；
+     * - 409 → [UpdateAnnotationResult.Conflict]（不抛异常：冲突是同步流程的预期分支）；
+     * - 其它非 2xx → 抛 [ApiException]（与其它端点一致）。
+     */
+    fun updateAnnotation(
+        id: Long,
+        location: String,
+        text: String,
+        kind: String = "note",
+        selectedText: String = "",
+        updatedAt: String? = null,
+    ): UpdateAnnotationResult {
+        client.newCall(buildUpdateAnnotation(id, location, text, kind, selectedText, updatedAt))
+            .execute()
+            .use { resp ->
+                if (resp.code == 409) return UpdateAnnotationResult.Conflict
+                ensureSuccess(resp)
+                return UpdateAnnotationResult.Ok(
+                    json.decodeFromString(Annotation.serializer(), resp.body?.string().orEmpty()),
+                )
+            }
     }
 
-    /** 删除批注（服务端返回 204）。 */
+    /**
+     * 删除批注（服务端返回 204）。
+     *
+     * 404 视为成功——服务端批注已不存在即「删除目标已达成」，这是离线重试的幂等前提
+     * （服务端 `DeleteAnnotation` 对不存在 id 返回 `not_found` → 404）。
+     * 其余非 2xx 仍抛 [ApiException]。
+     */
     fun deleteAnnotation(id: Long) {
         client.newCall(buildDeleteAnnotation(id)).execute().use { resp ->
+            if (resp.code == 404) return
             ensureSuccess(resp)
         }
     }

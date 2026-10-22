@@ -35,6 +35,8 @@
     <string name="reader_settings">设置</string>
     <string name="reader_annotate_short">批注</string>
     <string name="reader_page_indicator">第 %1$d/%2$d 章</string>
+    <!-- 进度 409 冲突重发仍失败（epub / pdf 阅读器共用）：本地进度未上行、已按服务端版本覆盖 -->
+    <string name="reader_progress_conflict">进度同步冲突，已保留服务端版本</string>
 
     <!-- PDF 阅读器（M3.3） -->
     <string name="main_open_pdf">打开 PDF 阅读</string>

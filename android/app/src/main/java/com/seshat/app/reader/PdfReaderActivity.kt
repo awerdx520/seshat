@@ -16,6 +16,7 @@ import android.os.ParcelFileDescriptor
 import android.text.InputType
 import android.util.Log
 import android.view.GestureDetector
+import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
@@ -23,6 +24,7 @@ import android.view.ViewGroup
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.ImageView
+import android.widget.LinearLayout
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
@@ -42,6 +44,7 @@ import com.seshat.app.settings.SettingsActivity
 import com.seshat.app.settings.SettingsStore
 import com.seshat.app.sync.PdfLocalSyncStore
 import com.seshat.app.sync.PdfSyncMapper
+import com.seshat.app.sync.ProgressPushResult
 import com.seshat.app.sync.RestClient
 import com.seshat.app.sync.RestClientSyncAdapter
 import com.seshat.app.sync.SecurePrefs
@@ -49,8 +52,10 @@ import com.seshat.app.sync.SyncManager
 import com.seshat.app.sync.createReaderSync
 import java.io.File
 import java.io.IOException
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import kotlin.math.roundToInt
 
 /**
@@ -77,7 +82,9 @@ import kotlin.math.roundToInt
  * 持久化：
  * - 阅读进度 → [PdfProgressStore]，键 `pdf_progress_<key>`。
  * - 批注     → [PdfAnnotationStore]，键 `pdf_annotations_<key>`。
- * - 笔迹     → [PdfInkStore]，键 `pdf_ink_<key>`。
+ * - 笔迹     → [PdfInkStore]，键 `pdf_ink_<key>`（**渲染唯一真相**）。
+ * 手写笔迹同时以 `kind=ink` 批注的形式进 [PdfAnnotationStore] 作为**同步镜像**（M10.3 T6，
+ * 由 [InkAnnotationMapper] 生成 location），镜像不参与绘制。
  * - 书签     → [PdfBookmarkStore]，键 `pdf_bookmark_<key>`。
  * 四者共用 `SharedPreferences("pdf_reader")`，与 epub 侧键空间隔离；
  * `<key>` 为服务端 uid（有则用）或 uri 字符串（无则退回）。
@@ -163,6 +170,14 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
      */
     private var lastPushedPosition: String? = null
 
+    /**
+     * 「进度冲突已提示过」标记（同一 Activity 生命周期内只提示一次）。
+     *
+     * 只在同步线程写入、只被 [notifyProgressConflict] 读取；`true` 之后不再弹提示，
+     * 避免服务端持续冲突时每退出一次阅读器就打扰读者一次。
+     */
+    private var progressConflictNotified: Boolean = false
+
     /** 最后一页索引（`pageCount - 1`，至少为 0）。 */
     private var lastPage: Int = 0
 
@@ -197,6 +212,20 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
     /** 目录抽屉（M10.9）。 */
     private lateinit var tocDrawer: TocDrawer
 
+    /**
+     * 批注抽屉（M10.3 / T5）。
+     *
+     * 与 [tocDrawer] 挂在**同一个内容容器**上（本组件后创建 → 视图层级在上层），
+     * 但两者互斥：打开任一方前先关另一方，避免「两个遮罩叠着、返回键不知关哪个」。
+     */
+    private lateinit var annotationDrawer: AnnotationDrawer
+
+    /**
+     * 待删批注队列（M10.3 T3）：与 EPUB 侧共用同一个队列文件（`reader_annotations`），
+     * 键为 `pending_deletes_<uid>`，因此与 PDF 自己的批注数据键（`pdf_reader`）互不干扰。
+     */
+    private lateinit var pendingDeletes: PendingDeletes
+
     // 顶栏按钮仍是 TextView；手写工具栏（M10.10 改版）改为纯图标 ImageView，
     // 外观由布局的 background / src / padding 承担（本项目无 ViewBinding）。
     private lateinit var inkToggleButton: TextView
@@ -224,6 +253,14 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
     /** 右侧手写条是否展开「更多颜色」（会话内状态，不持久化；每次进入手写模式重置为折叠）。 */
     private var inkColorsExpanded: Boolean = false
 
+    /**
+     * 页索引（0-based）→ `(宽 pt, 高 pt)` 缓存，供手写镜像登记换算坐标（M10.3 T6）。
+     *
+     * 只在主线程读写（落笔回调与撤销/清空都在主线程），无需加锁；[PdfRenderer] 在同一
+     * Activity 生命周期内不变，故缓存无失效问题。
+     */
+    private val pageSizesPt = mutableMapOf<Int, Pair<Double, Double>>()
+
     /** 手写工具栏（屏幕右侧竖排浮动条，仅手写模式显示）。 */
     private lateinit var inkPanel: View
 
@@ -248,6 +285,14 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
         tocDrawer = TocDrawer(findViewById(android.R.id.content)) { index ->
             jumpToPage(index)
         }
+
+        // 批注抽屉（M10.3 / T5）：必须在目录抽屉之后创建，两层遮罩才不会有层级歧义
+        annotationDrawer = AnnotationDrawer(
+            root = findViewById(android.R.id.content),
+            onItemClick = { row -> jumpToAnnotation(row) },
+            onItemEdit = { row -> editAnnotationRow(row) },
+            onItemDelete = { row -> deleteAnnotationRow(row) },
+        )
 
         // 先绑定视图，保证后续任何提前 finish 时 onDestroy 访问安全。
         recycler = findViewById(R.id.pdfPager)
@@ -352,6 +397,8 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
         )
         // 旧键一次性清理（三个 store 共用 pdf_reader prefs，故共用一个标记）
         clearLegacyOnce()
+        // 待删队列：队列键 uid 维度，与 PDF 的批注数据键（pdf_reader）互不干扰
+        pendingDeletes = PendingDeletes(this)
 
         findViewById<TextView>(R.id.annotateButton).setOnClickListener { promptAnnotation() }
         findViewById<TextView>(R.id.backButton).setOnClickListener { finish() }
@@ -359,6 +406,8 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
         findViewById<TextView>(R.id.settingsButton).setOnClickListener {
             startActivity(Intent(this, SettingsActivity::class.java))
         }
+        // 顶栏「列表」入口（打开批注抽屉）：代码插入，零新增 XML / 零新增 R.id.
+        installAnnotationListButton()
         inkToggleButton.setOnClickListener { toggleInk() }
         bookmarkButton.setOnClickListener { toggleBookmark() }
         inkUndoButton.setOnClickListener { undoInk() }
@@ -437,11 +486,18 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
             this,
             object : OnBackPressedCallback(true) {
                 override fun handleOnBackPressed() {
-                    if (::tocDrawer.isInitialized && tocDrawer.isShowing) {
-                        tocDrawer.hide()
-                    } else {
-                        isEnabled = false
-                        onBackPressedDispatcher.onBackPressed()
+                    // 三态优先级与 M10.9 目录抽屉一致（抽屉是模态层，必须先关），判定收敛在纯函数里
+                    when (AnnotationGrouping.backKeyAction(anyDrawerShowing(), chromeVisible())) {
+                        BackKeyAction.CloseDrawer -> {
+                            if (tocDrawer.isShowing) tocDrawer.hide()
+                            if (annotationDrawer.isShowing) annotationDrawer.hide()
+                        }
+                        // 工具栏可见时返回键先收起工具栏（与点屏幕中央同一个动作）
+                        BackKeyAction.HideChrome -> toggleChrome()
+                        BackKeyAction.SystemBack -> {
+                            isEnabled = false
+                            onBackPressedDispatcher.onBackPressed()
+                        }
                     }
                 }
             },
@@ -462,7 +518,9 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
      * **已知限制**：拉取到的进度只写入本地 Store，**不立即跳转页面**（当前页已按本地进度恢复，
      * 中途跳转会让正在读的用户丢失位置）；远端进度在下次打开本文档时生效。
      *
-     * **不参与同步**：手写笔迹（[inkStore]）不走状态同步 API，保持纯本地。
+     * **手写笔迹（[inkStore]）的同步方式**（M10.3 T6）：笔迹本身仍只存本地，同步的是
+     * `kind=ink` 的**镜像批注**——落笔完成时登记一条，打开带 uid 的书时把「本地已有的历史笔迹」
+     * 一次性补登（[backfillInkAnnotations]），服务端 `(uid, kind, location, text)` 幂等去重兜底。
      *
      * 线程约定：本方法只在主线程读配置，所有网络调用都在 [syncExecutor] 单线程上执行。
      */
@@ -480,6 +538,8 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
             restFactory = { RestClientSyncAdapter(RestClient(it)) },
             store = PdfLocalSyncStore(progressStore, annotationStore),
             mapper = PdfSyncMapper(),
+            // 待删队列：离线删除的服务端 id 在这里持久化，flush 时补发 DELETE（M10.3 T3）
+            pendingDeletes = pendingDeletes,
         ) ?: return
         syncManager = manager
         val executor = Executors.newSingleThreadExecutor().also { syncExecutor = it }
@@ -487,12 +547,68 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
             runCatching {
                 // 批注：合并（幂等，按 location + text 去重），远端新增写入本地
                 manager.pullAnnotations(id)
+                // 手写补登（T6）：**必须排在 pull 之后**——pull 会把服务端已有的 ink 批注落到本地，
+                // 补登时按本地幂等键就能跳过它们，省掉 N 个「发了也白发」的 POST
+                val backfilled = backfillInkAnnotations()
                 // 进度：仅本地没有进度时拉取（避免覆盖本机正在读的页码）
                 if (progressStore.load(id) == null) manager.pullProgress(id)
-                // 本地已有进度：推送上去（服务端 updated_at 会因此前进）
-                manager.pushProgress(id)
+                // 本地已有进度：推送上去（服务端 updated_at 会因此前进）。
+                // 用 detailed 版本：409 冲突重发仍失败的结局必须单独处置，否则会落进下面这条
+                // 笼统的「拉取失败（已忽略）」，冲突再次被静默吞掉（计划 T3）。
+                handleProgressPush(manager.pushProgressDetailed(id), position = null)
+                // 补登出东西才推一次（否则每次打开都多一轮无意义的批注往返）
+                if (backfilled > 0) manager.pushAnnotations(id)
             }.onFailure { Log.w(TAG, "拉取阅读状态失败（已忽略）", it) }
         }
+    }
+
+    /**
+     * 把本地已有的手写笔迹一次性登记为 `kind=ink` 的待上传批注（M10.3 T6）。
+     *
+     * **幂等键在客户端先判**（[InkAnnotationMapper.pendingInkLocations]）：本地已有同
+     * `(kind, location, text)` 的批注一律跳过，因此重复打开同一本书不会每次都发 N 个 POST；
+     * 服务端 `(uid, kind, location, text)` 命中返回 200 是第二道兜底（本地被清空后再次补登）。
+     *
+     * **失败不影响阅读**：整段 `runCatching`，异常只记一条 warn 日志——补登是后台增强，
+     * 不能让它把「打开书」这条主路径拖垮。
+     *
+     * 线程约定：在 [syncExecutor] 单线程上执行（[PdfInkStore] / [PdfAnnotationStore] 都是
+     * SharedPreferences 读写；与同步线程同源，但**与主线程（读者落笔/删除批注）是并发写**，
+     * 因此两个 store 的写方法各自用 `@Synchronized` 串行化 read-modify-write）。
+     *
+     * @return 本次新增的待上传条数（0 表示无需上传）
+     */
+    private fun backfillInkAnnotations(): Int = runCatching {
+        if (!::inkStore.isInitialized || !::annotationStore.isInitialized) return@runCatching 0
+        val pages = inkStore.document(docId).pages
+        if (pages.isEmpty()) return@runCatching 0
+        val pending = InkAnnotationMapper.pendingInkLocations(
+            pages = pages,
+            existing = annotationStore.list(docId),
+            // 页尺寸仍需 openPage，故回到主线程读；读不到（渲染器已关）该页跳过
+            pageSizePt = { page -> mainThreadPageSizePt(page) },
+        )
+        if (pending.isEmpty()) return@runCatching 0
+        val now = System.currentTimeMillis()
+        pending.forEach { location ->
+            annotationStore.add(InkAnnotationMapper.inkAnnotation(docId, location, now))
+        }
+        Log.i(TAG, "手写补登：新增 ${pending.size} 条待上传批注")
+        pending.size
+    }.onFailure { Log.w(TAG, "手写补登失败（已忽略）", it) }.getOrDefault(0)
+
+    /** 在同步线程上取页尺寸：`PdfRenderer` 只能在主线程之外的同一把锁里打开，故切回主线程取。 */
+    private fun mainThreadPageSizePt(page: Int): Pair<Double, Double>? {
+        if (Looper.myLooper() == Looper.getMainLooper()) return pageSizePt(page)
+        val holder = arrayOfNulls<Pair<Double, Double>>(1)
+        val latch = CountDownLatch(1)
+        tapHandler.post {
+            holder[0] = pageSizePt(page)
+            latch.countDown()
+        }
+        // 有界等待：主线程正忙于渲染时宁可放弃该页补登，也不让同步线程无限阻塞
+        latch.await(2, TimeUnit.SECONDS)
+        return holder[0]
     }
 
     /**
@@ -519,12 +635,63 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
                 // 以本地已落盘的进度为准（saveProgress 已先写本地），读不到说明还没有进度。
                 val position = progressStore.load(id)?.page?.toString() ?: return@execute
                 if (position == lastPushedPosition) return@execute
-                runCatching { manager.pushProgress(id) }
-                    // pushProgress 返回 Progress?：不抛异常即视为推送成功，此时才记住该页。
-                    .onSuccess { lastPushedPosition = position }
+                runCatching { manager.pushProgressDetailed(id) }
+                    // 三态（Pushed/Merged/Rejected）逐一处置：不得再用「不抛异常即成功」判定，
+                    // 否则 409 冲突被拒的结局会被当成「已推送」，两端就此长期分叉。
+                    .onSuccess { result -> handleProgressPush(result, position) }
                     .onFailure { Log.w(TAG, "推送阅读进度失败（已忽略）", it) }
             }
         }.onFailure { Log.w(TAG, "同步任务提交失败（已忽略）", it) }
+    }
+
+    /**
+     * 进度推送结果的三态处置（[SyncManager.pushProgressDetailed]）。
+     *
+     * | 结果 | 含义 | 处置 |
+     * |---|---|---|
+     * | `Pushed` | 服务端已保存本地值 | 成功，记住页码（防抖） |
+     * | `Merged` | 409 后判定服务端较新，本地已被服务端值覆盖 | 成功（预期语义），不打扰读者 |
+     * | `Rejected` | 409 后重发仍冲突，本地值**未上行** | warn 日志 + 一次性提示，**不得静默** |
+     * | `Skipped` | 零请求（本地无进度 / uid 空白） | 什么都不做，也不记页码 |
+     *
+     * @param position 本次推送的页码串；仅「服务端已认可」（`Pushed` / `Merged`）时写入
+     *   [lastPushedPosition]。`null` 表示调用方不在同步线程的防抖路径上（如打开文档时的首推）。
+     */
+    private fun handleProgressPush(result: ProgressPushResult, position: String?) {
+        when (result) {
+            is ProgressPushResult.Pushed, is ProgressPushResult.Merged ->
+                if (position != null) lastPushedPosition = position
+            is ProgressPushResult.Rejected -> {
+                // 服务端有记录时，其 updated_at 是判断「谁较新」的唯一线索，一并记进日志。
+                Log.w(
+                    TAG,
+                    "进度同步冲突：409 后重发仍失败，本地进度未上行" +
+                        "（服务端 updated_at=${result.remote?.updatedAt ?: "<无记录>"}）",
+                )
+                notifyProgressConflict()
+            }
+            ProgressPushResult.Skipped -> Unit
+        }
+    }
+
+    /**
+     * 进度冲突的一次性用户提示（同一 Activity 生命周期内最多一次）。
+     *
+     * 为什么必须提示：冲突意味着**本地进度没有上行**，服务端仍是旧值；读者下次在别的设备打开
+     * 会回到旧位置却没有任何线索可循——计划 T3 明确禁止静默吞错。
+     * 为什么去重：进度推送每次 [onStop] 都会尝试，「服务端持续冲突则每次退出都弹一次」等于骚扰；
+     * 同一份「已保留服务端版本」的信息说一次足够。
+     *
+     * 线程：[handleProgressPush] 在 [syncExecutor] 线程调用本方法，故用 `runOnUiThread` 投递到
+     * 主线程，并在投递后再判一次存活，避免 Activity 已销毁时仍操作 UI。
+     */
+    private fun notifyProgressConflict() {
+        if (progressConflictNotified) return
+        progressConflictNotified = true
+        runOnUiThread {
+            if (isFinishing || isDestroyed) return@runOnUiThread
+            toast(getString(R.string.reader_progress_conflict))
+        }
     }
 
     /** 新增批注后异步推送（无同步管理器时直接返回，零网络行为）。 */
@@ -545,6 +712,12 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
         // 离开阅读器（切后台 / 退出）时推送一次进度：这是「同步」语义的唯一天然时点。
         // 必须在 super.onStop() 之前入队，保证提交时同步线程仍存活且 Activity 尚未销毁。
         enqueuePushProgress()
+        // 删除传播与「新增/修改」同源时机：离线删除的批注在这里补发 DELETE（M10.3 T3）
+        enqueuePushDeletes()
+        // 新增/修改的补推（M10.3 T6）：落笔时那次 push 可能因离线失败，手写镜像会一直停在
+        // dirty 状态；补登产生的 ink 批注同样在这里兜底。pushAnnotations 内部先 list 一次、
+        // 「未 dirty 且已有 serverId」的条目零请求跳过，故代价是一次 GET。
+        enqueuePushAnnotations()
         super.onStop()
     }
 
@@ -814,6 +987,188 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
         toast(getString(R.string.pdf_annotation_saved, annotationStore.count(docId)))
     }
 
+    // ---- 批注抽屉（M10.3 / T5）----
+
+    /** 是否有任一抽屉正在显示（返回键分派用）。 */
+    private fun anyDrawerShowing(): Boolean =
+        (::tocDrawer.isInitialized && tocDrawer.isShowing) ||
+            (::annotationDrawer.isInitialized && annotationDrawer.isShowing)
+
+    /** 顶栏是否可见：沉浸模式（浮层已隐藏）时返回键应退出页面，而不是「隐藏一个已隐藏的工具栏」。 */
+    private fun chromeVisible(): Boolean = topChrome.visibility == View.VISIBLE
+
+    /**
+     * 顶栏「列表」入口（打开批注抽屉）。
+     *
+     * 顶栏已有「添加批注」（`annotateButton`），故本按钮文案取「列表」以区分。
+     * **视图由代码克隆同排「目录」按钮的可视属性后插入其左侧**：零新增 XML、零新增 `R.id.`，
+     * 高度/padding/可点击涟漪与同排按钮完全一致，`pdfTopChrome` 的显隐与 insets 联动自动生效。
+     */
+    private fun installAnnotationListButton() {
+        val row = topChrome as? LinearLayout ?: return
+        val tocButton = findViewById<TextView>(R.id.tocButton)
+        val density = resources.displayMetrics.density
+        val button = TextView(this).apply {
+            text = ANNOTATION_DRAWER_ENTRY_LABEL
+            textSize = 14f
+            gravity = Gravity.CENTER
+            setTextColor(0xFFFFFFFF.toInt())
+            minWidth = (48 * density).toInt()
+            val horizontal = (10 * density).toInt()
+            val vertical = (12 * density).toInt()
+            setPadding(horizontal, vertical, horizontal, vertical)
+            isClickable = true
+            isFocusable = true
+            // 复用目录按钮的 selectableItemBackground（涟漪），不引入新 drawable
+            background = tocButton.background?.constantState?.newDrawable(resources)?.mutate()
+            setOnClickListener { showAnnotationList() }
+        }
+        val index = row.indexOfChild(tocButton)
+        row.addView(button, if (index >= 0) index else row.childCount)
+    }
+
+    /** store → 中性条目：抽屉与 [AnnotationGrouping] 只认 [AnnotationItem]，不碰本地模型。 */
+    private fun annotationItems(): List<AnnotationItem> = annotationStore.list(docId).map { annotation ->
+        AnnotationItem(
+            id = "pdf:${annotation.id}",
+            kind = annotation.kind,
+            note = annotation.text,
+            selectedText = annotation.selectedText,
+            page = pageOf(annotation),
+            pending = annotation.dirty,
+        )
+    }
+
+    /** location → 页号（1-based）；`LocationCodec` 的三种 page 形态都能取，`Unknown` 返回 `null`。 */
+    private fun pageOf(annotation: PdfAnnotation): Int? =
+        when (val parsed = LocationCodec.parse(annotation.location)) {
+            is LocationCodec.Parsed.Page -> parsed.page
+            is LocationCodec.Parsed.PageRect -> parsed.page
+            is LocationCodec.Parsed.PageInk -> parsed.page
+            else -> null
+        }
+
+    /**
+     * 打开批注抽屉（已开则关闭，与目录按钮的 toggle 语义一致）。
+     *
+     * 两个抽屉互斥：打开批注前先关目录，否则两个遮罩叠在一起、返回键的归属会变得靠运气。
+     */
+    private fun showAnnotationList() {
+        if (::tocDrawer.isInitialized && tocDrawer.isShowing) tocDrawer.hide()
+        if (annotationDrawer.isShowing) {
+            annotationDrawer.hide()
+            return
+        }
+        annotationDrawer.show(annotationItems(), currentPage = firstVisiblePage() + 1)
+    }
+
+    /** 数据变更后刷新已打开的抽屉（未打开时无操作，避免无谓构建视图）。 */
+    private fun refreshAnnotationDrawer() {
+        if (!::annotationDrawer.isInitialized || !annotationDrawer.isShowing) return
+        annotationDrawer.show(annotationItems(), currentPage = firstVisiblePage() + 1)
+    }
+
+    /**
+     * 行 → store 记录。
+     *
+     * ink 汇总行（[AnnotationGrouping.INK_SUMMARY_ID]）代表整组 N 笔，这里返回该组全部记录，
+     * 调用方取第一条做定位（同组 ink 通常在同一页）。
+     */
+    private fun annotationsForRow(row: AnnotationRow): List<PdfAnnotation> {
+        val all = annotationStore.list(docId)
+        return if (row.id == AnnotationGrouping.INK_SUMMARY_ID) {
+            all.filter { it.kind == AnnotationGrouping.KIND_INK }
+        } else {
+            all.filter { "pdf:${it.id}" == row.id }
+        }
+    }
+
+    /** 点击条目 → 跳页（location 是 1-based，[jumpToPage] 收 0-based 索引）。 */
+    private fun jumpToAnnotation(row: AnnotationRow) {
+        val page = annotationsForRow(row).firstNotNullOfOrNull(::pageOf) ?: return
+        annotationDrawer.hide()
+        jumpToPage(page - 1)
+    }
+
+    /**
+     * 编辑备注：复用「添加批注」的对话框写法，预填原文。
+     *
+     * 保存后置 `dirty = true` 并异步推送——`dirty` 是「新增或修改待上行」的唯一标记，
+     * 下次 `pushAnnotations` 会把它 PUT 上去。
+     */
+    private fun editAnnotationRow(row: AnnotationRow) {
+        val target = annotationsForRow(row).firstOrNull() ?: return
+        val input = EditText(this).apply {
+            setText(target.text)
+            hint = getString(R.string.pdf_annotation_hint)
+        }
+        AlertDialog.Builder(this)
+            .setTitle("编辑批注")
+            .setView(input)
+            .setPositiveButton(android.R.string.ok) { _, _ ->
+                val text = input.text?.toString()?.trim().orEmpty()
+                // 空备注不保存：服务端 kind=note 时 text 必填
+                if (text.isEmpty()) return@setPositiveButton
+                annotationStore.update(
+                    target.copy(text = text, updatedAt = System.currentTimeMillis(), dirty = true),
+                )
+                enqueuePushAnnotations()
+                refreshAnnotationDrawer()
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    /**
+     * 删除一条批注。
+     *
+     * **不要重复移除**：装配了 [syncManager] 时，本地移除与 `pendingDeletes` 入队都由
+     * `SyncManager.deleteAnnotation` 完成（`serverId == null` 的记录不入队、不发 DELETE）。
+     * 未装配同步（服务端未配置）时才由 [removeAnnotationRecord] 直接删本地，
+     * 并把 `serverId` 落进队列等下次 flush。
+     */
+    private fun deleteAnnotationRow(row: AnnotationRow) {
+        val target = annotationsForRow(row).firstOrNull() ?: return
+        removeAnnotationRecord(target)
+        // 在线时立刻补发 DELETE；离线/失败时队列仍在，下次 onStop 再 flush
+        if (syncManager != null) enqueuePushDeletes()
+        refreshAnnotationDrawer()
+    }
+
+    /**
+     * 删除路径的**唯一执行点**：本地移除 + 判定是否要上行（抽屉、撤销/清空笔迹都走这里）。
+     *
+     * 有 [syncManager] 时交给 `SyncManager.deleteAnnotation`（它统一处理「入待删队列 vs 仅本地」）；
+     * 没有时手工复现同一语义——`serverId == null` 的记录服务端不认识，不发 DELETE、不入队。
+     */
+    private fun removeAnnotationRecord(target: PdfAnnotation) {
+        val manager = syncManager
+        if (manager != null) {
+            manager.deleteAnnotation(docId, target)
+            return
+        }
+        annotationStore.remove(docId, target.id)
+        val serverId = target.serverId
+        val identity = uid
+        if (serverId != null && !identity.isNullOrBlank()) {
+            pendingDeletes.add(identity, serverId)
+        }
+    }
+
+    /** 异步 flush 待删队列（无同步管理器时直接返回，零网络行为）。 */
+    private fun enqueuePushDeletes() {
+        val manager = syncManager ?: return
+        val id = docId
+        val executor = syncExecutor ?: return
+        // 同 [enqueuePushProgress]：shutdown() 之后提交会被拒绝，异常一并兜住。
+        runCatching {
+            executor.execute {
+                runCatching { manager.pushDeletes(id) }
+                    .onFailure { Log.w(TAG, "推送批注删除失败（已忽略）", it) }
+            }
+        }.onFailure { Log.w(TAG, "同步任务提交失败（已忽略）", it) }
+    }
+
     // ---- 书签（M10.10）----
 
     /** 当前页有书签则取消，否则添加（标题固定为「第 N 页」，1-based）。 */
@@ -863,13 +1218,74 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
 
     override fun inkStrokes(page: Int): List<InkStroke> = inkStore.strokes(docId, page)
 
+    /**
+     * 一笔完成：**先**落盘到 [inkStore]（渲染真相），**再**登记一条 `kind=ink` 的同步镜像（M10.3 T6）。
+     *
+     * 顺序不可换：镜像只是同步载体，即使登记失败（页面尺寸取不到、store 异常）笔迹也必须已落盘，
+     * 否则用户会「写完就消失」。
+     */
     override fun onInkStrokeFinished(page: Int, stroke: InkStroke) {
         inkStore.appendStroke(docId, page, stroke)
         adapter?.refreshInk(page)
         updateInkChrome()
+        registerInkMirror(page, stroke)
     }
 
     override fun isInkEnabled(): Boolean = inkEnabled
+
+    /**
+     * 把刚完成的一笔登记为一条 `kind=ink` 批注（同步镜像，不参与绘制）。
+     *
+     * **零网络 × 三重失败退化**：
+     * - 页面尺寸取不到（渲染器已关闭 / 尺寸未算出）→ 直接跳过，不伪造坐标；
+     * - 编码不出 location（点序列为空）→ 跳过；
+     * - 本地已有同 `(kind, location, text)` 的批注 → 跳过（同一笔被重复回调时不会翻倍）。
+     * 未装配同步（[syncManager] 为 `null`，即无 uid 或服务端未配置）时
+     * [enqueuePushAnnotations] 直接返回，**零网络请求**；镜像仍在本地，下次打开带 uid 的书由补登推上去。
+     *
+     * @param page 页面索引，0-based（[PdfPageAdapter] 的 position）
+     */
+    private fun registerInkMirror(page: Int, stroke: InkStroke) {
+        if (!::annotationStore.isInitialized) return
+        val size = pageSizePt(page) ?: return
+        val location = InkAnnotationMapper.inkLocation(page, stroke, size.first, size.second) ?: return
+        val existing = annotationStore.list(docId)
+        if (InkAnnotationMapper.isRegistered(existing, location)) return
+        val stored = annotationStore.add(InkAnnotationMapper.inkAnnotation(docId, location))
+        // 在线即上传；服务端按 (uid, kind, location, text) 幂等，重复 POST 不会产生重复批注
+        enqueuePushAnnotations()
+        // 抽屉开着时立即多出一行手写（否则要等下次打开抽屉）
+        refreshAnnotationDrawer()
+        Log.d(TAG, "登记手写批注 #${stored.id} ${stored.location}")
+    }
+
+    /**
+     * 页索引（0-based）→ `(宽 pt, 高 pt)`；取不到返回 `null`。
+     *
+     * `PdfRenderer.Page.width/height` 即 PDF **point**（72 dpi 下 1:1），与渲染位图尺寸无关——
+     * 适配器把位图缩放到 `renderWidth` 像素只是显示缩放，归一化坐标已消除该缩放。
+     *
+     * 两个注意点：
+     * 1. **必须与适配器同一把锁**（`synchronized(renderer)`）：[PdfRenderer] 同一时刻只允许打开
+     *    一个 Page，适配器在渲染线程里也是用同一把锁打开的，否则会抛 `IllegalStateException`；
+     * 2. **结果缓存**：每落一笔 openPage 一次是纯浪费（同一页会写很多笔），故按页缓存；
+     *    缓存随 Activity 生命周期，而 [renderer] 在同一生命周期内不变，故无失效问题。
+     */
+    private fun pageSizePt(page: Int): Pair<Double, Double>? {
+        pageSizesPt[page]?.let { return it }
+        val pdf = renderer ?: return null
+        return try {
+            val size = synchronized(pdf) {
+                pdf.openPage(page).use { it.width.toDouble() to it.height.toDouble() }
+            }
+            pageSizesPt[page] = size
+            size
+        } catch (e: Exception) {
+            // 渲染器已关闭 / 页索引越界：手写镜像登记降级为「跳过」，不影响笔迹本身
+            Log.w(TAG, "读取第 $page 页尺寸失败（跳过手写镜像登记）", e)
+            null
+        }
+    }
 
     // ---- 手写按钮 ----
 
@@ -910,24 +1326,64 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
         toast(getString(if (inkEnabled) R.string.pdf_ink_toggle_on else R.string.pdf_ink_toggle))
     }
 
-    /** 撤销当前页最后一笔。 */
+    /**
+     * 撤销当前页最后一笔。
+     *
+     * 撤销后**镜像一并撤掉**（M10.3 T6）：[PdfInkStore] 是渲染真相，`kind=ink` 批注只是同步载体，
+     * 笔迹没了载体必须跟着走，否则抽屉/服务端会留下「一笔幽灵手写」。
+     * 被撤销的那一笔必须在 [PdfInkStore.undoLast] **之前**取出——撤销后它已不在 store 里，
+     * 无法再算出它的 location。
+     */
     private fun undoInk() {
         val page = firstVisiblePage()
+        val undone = inkStore.strokes(docId, page).lastOrNull()
         if (inkStore.undoLast(docId, page)) {
             adapter?.refreshInk(page)
+            if (undone != null) {
+                val location = pageSizePt(page)?.let { (width, height) ->
+                    InkAnnotationMapper.inkLocation(page, undone, width, height)
+                }
+                // 尺寸取不到时无法反算 location → 放弃撤镜像（笔迹本身已撤掉，不影响本地渲染）
+                if (location != null) dropInkMirrors(page, only = location)
+            }
         } else {
             toast(getString(R.string.pdf_ink_nothing_to_undo))
         }
         updateInkChrome()
     }
 
-    /** 清除当前页全部笔迹。 */
+    /** 清除当前页全部笔迹（整页的 ink 镜像一并移除，理由见 [undoInk]）。 */
     private fun clearInk() {
         val page = firstVisiblePage()
         inkStore.clearPage(docId, page)
         adapter?.refreshInk(page)
         updateInkChrome()
+        dropInkMirrors(page)
         toast(getString(R.string.pdf_ink_cleared))
+    }
+
+    /**
+     * 笔迹被撤销/清除后，移除对应的 `kind=ink` 镜像批注（M10.3 T6）。
+     *
+     * **这不是新增的删除入口**：T5b 的抽屉里 ink 汇总行仍然置灰不可删，本方法只承接
+     * 「用户已经通过手写工具栏明确删掉了笔迹」这一事实，把它同步到批注列表与服务端。
+     * 删除走 [removeAnnotationRecord]：`serverId != null` 时入待删队列并发 DELETE，
+     * 从未上传的只删本地；未装配同步时 [enqueuePushDeletes] 直接返回（零网络）。
+     *
+     * @param page 页面索引（0-based，与 [PdfInkStore] 同口径）
+     * @param only 只处理该 location（撤销单笔）；`null` 表示该页全部（清空整页）
+     */
+    private fun dropInkMirrors(page: Int, only: String? = null) {
+        if (!::annotationStore.isInitialized) return
+        val targets = annotationStore.list(docId).filter { annotation ->
+            annotation.kind == InkAnnotationMapper.KIND_INK &&
+                pageOf(annotation) == page + 1 &&
+                (only == null || annotation.location == only)
+        }
+        if (targets.isEmpty()) return
+        targets.forEach { removeAnnotationRecord(it) }
+        enqueuePushDeletes()
+        refreshAnnotationDrawer()
     }
 
     /** 刷新手写相关控件的可见性与文案。 */
@@ -1337,6 +1793,7 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
         bottomChrome.post { applyContentPadding() }
         // 浮层收起时抽屉若开着也一并收起，避免「没有工具栏却浮着目录」的悬空态
         if (::tocDrawer.isInitialized && tocDrawer.isShowing) tocDrawer.hide()
+        if (::annotationDrawer.isInitialized && annotationDrawer.isShowing) annotationDrawer.hide()
     }
 
     /**

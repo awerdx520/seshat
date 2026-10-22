@@ -1,5 +1,7 @@
 package com.seshat.app.sync
 
+import com.seshat.app.reader.PendingDeletes
+
 /**
  * 阅读器同步的装配守卫：只有「有 uid」且「服务端配置齐全」时才返回可用的 [SyncManager]。
  *
@@ -15,6 +17,8 @@ package com.seshat.app.sync
  * @param restFactory 由配置构造 REST 客户端；**仅在两个守卫都通过后**才会被调用一次。
  * @param store 本地进度/批注存储（epub / pdf 各自的适配实现）。
  * @param mapper 本地模型与服务端 DTO 的字段映射。
+ * @param pendingDeletes 待删队列（`pending_deletes_<uid>`）；`null` 时 [SyncManager.pushDeletes]
+ *   为零请求空操作（进度专用装配 / 单测可用）。
  * @return 装配好的同步管理器；守卫不通过时为 `null`。
  */
 internal fun <P, A> createReaderSync(
@@ -23,8 +27,9 @@ internal fun <P, A> createReaderSync(
     restFactory: (SeshatConfig) -> RestSyncApi,
     store: LocalSyncStore<P, A>,
     mapper: SyncMapper<P, A>,
+    pendingDeletes: PendingDeletes? = null,
 ): SyncManager<P, A>? {
     if (uid.isNullOrBlank()) return null
     if (config == null) return null
-    return SyncManager(restFactory(config), store, mapper)
+    return SyncManager(restFactory(config), store, mapper, pendingDeletes)
 }
