@@ -104,7 +104,14 @@
   :type 'number)
 
 (defcustom seshat-reader-default-fit 'seshat-reader-fit-to-height
-  "The default fitting for documents."
+  "The default fitting for documents.
+
+This option only affects the explicit `H' / `W' commands.  Since
+2026-10-23 the automatic fit performed on opening a document or after a
+window resize uses `seshat-reader--contain-scale' instead: the page is
+always shrunk until it fits both dimensions, so a narrow window (for
+example with the outline or an information panel open) no longer clips
+the page.  See `openspec/decisions.md' entry for 2026-10-23."
   :group 'seshat-reader
   :type '(radio (function-item seshat-reader-fit-to-height)
 		(function-item seshat-reader-fit-to-width)))
@@ -400,11 +407,13 @@ Optionally scale it by the SCALING-FACTOR.  Scales on selected window."
 (defun seshat-reader--contain-scale (&optional window)
   "Return the scale at which the current page fits WINDOW completely.
 
-WINDOW defaults to the selected one.  The result is the smaller of the
-height-fitting and the width-fitting scale, so the page never overflows
-either dimension.  `seshat-reader-default-fit' still decides which
-dimension is filled when both fit; when they conflict the page is shrunk
-until it is fully visible instead of being clipped."
+WINDOW defaults to the selected one.  The result is the smaller of the two
+scales, so whichever dimension binds is the one that ends up filled; the
+page is never enlarged beyond it.  This deliberately ignores
+`seshat-reader-default-fit', which only affects the explicit `H' / `W'
+commands (`seshat-reader-fit-to-height' / `seshat-reader-fit-to-width')
+and no longer influences the automatic fit performed when a document is
+opened or a window is resized."
   (let* ((window (or window (selected-window)))
          (size (seshat-reader--get-current-doc-image-size window))
          (image-width (car-safe size))
