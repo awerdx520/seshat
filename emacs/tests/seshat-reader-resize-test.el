@@ -86,9 +86,12 @@ SOURCE is the `scale-source' window parameter: `fit', `manual' or nil for
   "Call `seshat-reader--refit-window' on WINDOW in BUFFER and count its effects.
 
 LIVE nil stubs `window-live-p' to nil, OTHER-BUFFER stubs `window-buffer'
-to return it.  The three refit steps are stubbed: the fit step also writes
-`scale'/`scale-source' on the selected window, so a missed `manual' branch
-shows up as a changed scale, not only as a count.  Returns (FIT CLAMP CENTER).
+to return it.  The fit step is counted where the refit actually rescales:
+`seshat-reader--contain-scale' returns the new scale and
+`seshat-reader-doc-scale-page' applies it, so both are stubbed and the
+counter increments on the apply call.  An implementation that went back to
+`(funcall seshat-reader-default-fit)' would rescale through neither stub
+and the counter would stay 0.
 
 `window-live-p' is left alone in the LIVE case: stubbing it breaks the
 `with-selected-window' expansion used by the fit branch.  The windows passed
@@ -99,21 +102,23 @@ here are real batch-frame windows, hence live."
         (target buffer))
     (cl-letf* (((symbol-function 'window-buffer)
                 (lambda (&optional _window) (or other-buffer target)))
+               ((symbol-function 'seshat-reader--contain-scale)
+                (lambda (&optional _window) 1.0))
+               ((symbol-function 'seshat-reader-doc-scale-page)
+                (lambda (factor &optional _source)
+                  (cl-incf fit)
+                  (set-window-parameter nil 'scale factor)
+                  (set-window-parameter nil 'scale-source 'fit)))
                ((symbol-function 'seshat-reader--clamp-window-vscroll)
                 (lambda (&optional _window) (cl-incf clamp)))
                ((symbol-function 'seshat-reader--center-page)
                 (lambda (&optional _window) (cl-incf center))))
-      (let ((seshat-reader-default-fit
-             (lambda ()
-               (cl-incf fit)
-               (set-window-parameter nil 'scale 1.0)
-               (set-window-parameter nil 'scale-source 'fit))))
-        (if live
-            (with-current-buffer target
-              (seshat-reader--refit-window window))
-          (cl-letf (((symbol-function 'window-live-p) (lambda (_window) nil)))
-            (with-current-buffer target
-              (seshat-reader--refit-window window))))))
+      (if live
+          (with-current-buffer target
+            (seshat-reader--refit-window window))
+        (cl-letf (((symbol-function 'window-live-p) (lambda (_window) nil)))
+          (with-current-buffer target
+            (seshat-reader--refit-window window)))))
     (list fit clamp center)))
 
 (cl-defun seshat-reader-resize-test--run-pending-counts (buffer &key windows)
@@ -129,12 +134,15 @@ WINDOWS is what `get-buffer-window-list' is stubbed to return.  Returns
     (cl-letf* (((symbol-function 'get-buffer-window-list) (lambda (&rest _) wins))
                ((symbol-function 'window-buffer)
                 (lambda (&optional _window) target))
+               ((symbol-function 'seshat-reader--contain-scale)
+                (lambda (&optional _window) 1.0))
+               ((symbol-function 'seshat-reader-doc-scale-page)
+                (lambda (_factor &optional _source) (cl-incf fit)))
                ((symbol-function 'seshat-reader--clamp-window-vscroll)
                 (lambda (&optional _window) (cl-incf clamp)))
                ((symbol-function 'seshat-reader--center-page)
                 (lambda (&optional _window) (cl-incf center))))
-      (let ((seshat-reader-default-fit (lambda () (cl-incf fit))))
-        (seshat-reader--run-pending-refit target)))
+      (seshat-reader--run-pending-refit target))
     (list fit clamp center)))
 
 ;;; 1. 去抖：连续调度只留一个 timer
@@ -221,10 +229,11 @@ the window identity set."
 ;;; 3. refit：fit 分支重算 scale 并夹紧+居中
 
 (ert-deftest seshat-reader-resize-test--refit-fit-branch ()
-  "A window whose scale source is `fit' is rescanned with the default fit.
+  "A window whose scale source is `fit' is rescaled to contain the page.
 
-The fit stub is called once, and both the clamp and the recentre run once
-after it."
+The contain stub supplies the new scale and the apply stub counts it once,
+followed by one clamp and one recentre.  Reverting the fit branch to
+`(funcall seshat-reader-default-fit)' produces (0 1 1)."
   (let* ((buffer (seshat-reader-resize-test--reader-buffer))
          (window (selected-window)))
     (unwind-protect
@@ -240,7 +249,7 @@ after it."
 (ert-deftest seshat-reader-resize-test--refit-manual-branch ()
   "A `manual' window keeps its scale and only gets clamped and recentred.
 
-The fit stub writes `scale' and `scale-source'; if the manual branch were
+The apply stub writes `scale' and `scale-source'; if the manual branch were
 removed, both would change and the counts would become (1 1 1)."
   (let* ((buffer (seshat-reader-resize-test--reader-buffer))
          (window (selected-window)))
@@ -412,7 +421,7 @@ cannot pass by accident: the 1-arg calls must have run."
 Only the dynamic module entry points are stubbed, so the recorded `fit'
 really comes from `seshat-reader-fit-to-height' passing it to
 `seshat-reader-doc-scale-page'.  The subsequent refit must take the fit
-branch."
+branch and rescale through `seshat-reader--contain-scale'."
   (let* ((buffer (seshat-reader-resize-test--reader-buffer))
          (window (selected-window)))
     (unwind-protect
@@ -438,14 +447,16 @@ branch."
               (should (eq 'fit (seshat-reader--window-scale-source window)))
               (should (eql 0.5 (window-parameter window 'scale)))
               (should (= 1 center))
-              ;; 关闭前再 refit 一次：来源是 fit，必须走 fit 分支
+              ;; 关闭前再 refit 一次：来源是 fit，必须走 contain 分支
               (cl-letf* (((symbol-function 'window-buffer)
                           (lambda (&optional _window) buffer))
+                         ((symbol-function 'seshat-reader--contain-scale)
+                          (lambda (&optional _window) (cl-incf fit) 0.5))
                          ((symbol-function 'seshat-reader--clamp-window-vscroll)
                           (lambda (&optional _window) nil)))
-                (let ((seshat-reader-default-fit (lambda () (cl-incf fit))))
-                  (seshat-reader--refit-window window)))
+                (seshat-reader--refit-window window))
               (should (= 1 fit))
+              (should (eql 0.5 (window-parameter window 'scale)))
               (seshat-reader-presentation-mode -1)
               (should mode-line-format)
               (should (eq 'fit (seshat-reader--window-scale-source window))))))
@@ -523,6 +534,135 @@ signal.  The second part checks that leaving the mode path
               (should (equal (list timer2 timer) cancelled)))))
       (when (timerp timer) (cancel-timer timer))
       (when (timerp timer2) (cancel-timer timer2))
+      (kill-buffer buffer))))
+
+;;; 14. contain：高度维胜出
+
+(ert-deftest seshat-reader-resize-test--contain-scale-height-limited ()
+  "The height-fitting scale wins when the page is proportionally taller.
+
+Page 1000x1400 at scale 1.0 in a 900x1000 window: the width allows 0.9 but
+the height only 1000/1400 = 0.714..., so the result must be the smaller
+one.  An implementation returning `max' instead of `min' would return 0.9
+and overflow the height."
+  (let ((window (selected-window)))
+    (cl-letf (((symbol-function 'seshat-reader--get-current-doc-image-size)
+               (lambda (&optional _window) (cons 1000 1400)))
+              ((symbol-function 'seshat-reader-current-doc-scale-value)
+               (lambda (&optional _window) 1.0))
+              ((symbol-function 'window-body-width)
+               (lambda (&optional _window pixels-p)
+                 (if pixels-p 900 90)))
+              ((symbol-function 'window-body-height)
+               (lambda (&optional _window pixels-p)
+                 (if pixels-p 1000 100))))
+      (let ((got (seshat-reader--contain-scale window))
+            (want (/ 1000.0 1400)))
+        (should (< (abs (- got want)) 1e-9))
+        ;; 必须严格小于按宽算出的 0.9，否则高度溢出
+        (should (< got 0.9))))))
+
+;;; 15. contain：宽度维胜出
+
+(ert-deftest seshat-reader-resize-test--contain-scale-width-limited ()
+  "The width-fitting scale wins when the window is narrow.
+
+Same page in a 400x1000 window: the height allows 1000/1400 = 0.714...
+but the width only 0.4, so 0.4 is the answer.  This is the regression the
+real-machine report is about: reading only the height would return 0.714
+and the rendered page would be about 1.8 times the window width."
+  (let ((window (selected-window)))
+    (cl-letf (((symbol-function 'seshat-reader--get-current-doc-image-size)
+               (lambda (&optional _window) (cons 1000 1400)))
+              ((symbol-function 'seshat-reader-current-doc-scale-value)
+               (lambda (&optional _window) 1.0))
+              ((symbol-function 'window-body-width)
+               (lambda (&optional _window pixels-p)
+                 (if pixels-p 400 40)))
+              ((symbol-function 'window-body-height)
+               (lambda (&optional _window pixels-p)
+                 (if pixels-p 1000 100))))
+      (let ((got (seshat-reader--contain-scale window)))
+        (should (< (abs (- got 0.4)) 1e-9))
+        ;; 必须严格小于按高算出的 0.714...，否则宽度溢出
+        (should (< got (/ 1000.0 1400)))))))
+
+;;; 16. contain：退化输入
+
+(ert-deftest seshat-reader-resize-test--contain-scale-degenerate ()
+  "Unknown page size or a non-positive scale yields 1.0 instead of an error.
+
+The size can be nil before the first render, and a width or height of 0 is
+reported by the module for an empty page.  A scale of nil (never set) or 0
+would divide by zero if it were used unguarded; both are treated as 1.0,
+which is checked by the 0.5 result of the last two cases: the 500px wide
+window against a 1000px wide page at scale 1.0."
+  (let ((window (selected-window))
+        (size (cons 1000 1400)))
+    (cl-letf (((symbol-function 'seshat-reader--get-current-doc-image-size)
+               (lambda (&optional _window) size))
+              ((symbol-function 'seshat-reader-current-doc-scale-value)
+               (lambda (&optional _window) 1.0))
+              ((symbol-function 'window-body-width)
+               (lambda (&optional _window pixels-p)
+                 (if pixels-p 500 50)))
+              ((symbol-function 'window-body-height)
+               (lambda (&optional _window pixels-p)
+                 (if pixels-p 2000 200))))
+      ;; ① 尺寸未知
+      (setq size nil)
+      (should (eql 1.0 (seshat-reader--contain-scale window)))
+      ;; ② 宽为 0
+      (setq size (cons 0 1400))
+      (should (eql 1.0 (seshat-reader--contain-scale window)))
+      ;; ③ 高为 0
+      (setq size (cons 1000 0))
+      (should (eql 1.0 (seshat-reader--contain-scale window)))
+      ;; ④ scale 为 nil → 按 1.0 处理
+      (setq size (cons 1000 1400))
+      (cl-letf (((symbol-function 'seshat-reader-current-doc-scale-value)
+                 (lambda (&optional _window) nil)))
+        (should (< (abs (- (seshat-reader--contain-scale window) 0.5)) 1e-9)))
+      ;; ⑤ scale 为 0 → 按 1.0 处理，不得除零
+      (cl-letf (((symbol-function 'seshat-reader-current-doc-scale-value)
+                 (lambda (&optional _window) 0.0)))
+        (should (< (abs (- (seshat-reader--contain-scale window) 0.5)) 1e-9))))))
+
+;;; 17. --center-page：超宽时负偏移夹到 0
+
+(ert-deftest seshat-reader-resize-test--center-page-clamps-negative-offset ()
+  "A page wider than the window is not scrolled by a negative amount.
+
+The page is 2000px wide while the batch window is narrower, so
+`doc-center-offset' is negative and the un-clamped offset would be
+negative; `seshat-reader--set-window-hscroll' must receive 0.  Before the
+clamp the recorded NCOL was negative, which scrolled the page left and cut
+it on both sides."
+  (let* ((buffer (seshat-reader-resize-test--reader-buffer))
+         (window (selected-window))
+         (sent nil))
+    (unwind-protect
+        (progn
+          (seshat-reader-resize-test--set-page-overlay window buffer 'fit)
+          (let ((center-overlay (with-current-buffer buffer
+                                 (make-overlay (point-min) (point-min)))))
+            (cl-letf (((symbol-function 'seshat-reader--get-current-doc-image-size)
+                       (lambda (&optional _window) (cons 2000 1000)))
+                      ((symbol-function 'seshat-reader--ensure-center-overlay)
+                       (lambda (&optional _window) center-overlay))
+                      ((symbol-function 'seshat-reader--set-window-hscroll)
+                       (lambda (target ncol &optional unconstrained)
+                         (push (list target ncol unconstrained) sent)
+                         ncol)))
+              ;; 前提：页面确实宽于窗口，否则该用例没有牙
+              (should (> 2000 (window-body-width window t)))
+              (seshat-reader--center-page window)
+              (should (= 1 (length sent)))
+              (let ((ncol (nth 1 (car sent))))
+                (should (numberp ncol))
+                (should (>= ncol 0))
+                (should (eql 0 ncol))))))
+      (seshat-reader-resize-test--clear-window window)
       (kill-buffer buffer))))
 
 (provide 'seshat-reader-resize-test)

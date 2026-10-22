@@ -397,6 +397,30 @@ Optionally scale it by the SCALING-FACTOR.  Scales on selected window."
     (seshat-reader--center-page)
     (seshat-reader--set-page-top-when-joined)))
 
+(defun seshat-reader--contain-scale (&optional window)
+  "Return the scale at which the current page fits WINDOW completely.
+
+WINDOW defaults to the selected one.  The result is the smaller of the
+height-fitting and the width-fitting scale, so the page never overflows
+either dimension.  `seshat-reader-default-fit' still decides which
+dimension is filled when both fit; when they conflict the page is shrunk
+until it is fully visible instead of being clipped."
+  (let* ((window (or window (selected-window)))
+         (size (seshat-reader--get-current-doc-image-size window))
+         (image-width (car-safe size))
+         (image-height (cdr-safe size)))
+    (if (and (numberp image-width) (numberp image-height)
+             (> image-width 0) (> image-height 0))
+        (let* ((scale (with-selected-window window
+                        (or (seshat-reader-current-doc-scale-value) 1.0)))
+               (scale (if (> scale 0) scale 1.0))
+               (width-factor (/ (window-body-width window t)
+                                (/ image-width scale)))
+               (height-factor (/ (window-body-height window t)
+                                 (/ image-height scale))))
+          (min width-factor height-factor))
+      1.0)))
+
 (defun seshat-reader--get-pixel-per-col (&optional window)
   "Get the no of pixels per column for WINDOW.
 
@@ -739,7 +763,11 @@ of the page image.  When one of them is missing the function does not
 return silently: it drops the `line-prefix' of both the page overlay and
 the buffer-wide centering overlay and resets the horizontal scroll, so
 that a stale offset left by an earlier centering cannot keep the page
-stuck to one side of the window."
+stuck to one side of the window.
+
+When the page image is wider than WINDOW the horizontal offset is
+clamped to zero, so the page stays aligned to the left edge instead of
+being clipped on both sides."
   (let ((window (or window (selected-window))))
     (let* ((overlay (seshat-reader-current-doc-overlay window))
            (window-width (window-body-width window t))
@@ -751,7 +779,8 @@ stuck to one side of the window."
                  (pixel-per-col (seshat-reader--get-pixel-per-col window))
                  (doc-left-offset (- window-width doc-image-width))
                  (doc-center-offset (/ doc-left-offset 2))
-                 (scroll-offset (round (/ doc-center-offset pixel-per-col))))
+                 ;; 页面比窗口宽时 doc-center-offset 为负；夹到 0 让页面左对齐，避免两侧裁切
+                 (scroll-offset (max 0 (round (/ doc-center-offset pixel-per-col)))))
             ;; Add prefix so that the page is at the leftmost point of the window.
             ;; The prefix is carried by a buffer-wide overlay instead of the page
             ;; overlay, so that the cross-page join strip line gets it as well.
@@ -826,8 +855,8 @@ state, and it refits every window of BUFFER, not just the selected one."
 
 A window whose scale source is `manual' keeps its scale and only gets its
 vertical scroll clamped and the page recentred.  Every other window,
-including one that never recorded a source, is rescaled with
-`seshat-reader-default-fit' first.
+including one that never recorded a source, is rescaled to contain the
+page (`seshat-reader--contain-scale') first.
 
 The window is skipped silently when it is no longer live, no longer shows
 the current buffer, has lost its page overlay, or shows a buffer that has
@@ -841,10 +870,9 @@ reported and does not prevent the other windows from being refitted."
         (condition-case err
             (progn
               (unless (eq (seshat-reader--window-scale-source window) 'manual)
-                ;; fit 内部读 (window-body-height nil t)，必须在目标窗口内求值，
-                ;; 否则同 buffer 多窗口时按当前选中窗口重算非选中窗口的 scale。
+                ;; contain：取按高与按宽的较小者，保证窗口变窄时页面不溢出、不被裁切。
                 (with-selected-window window
-                  (funcall seshat-reader-default-fit)))
+                  (seshat-reader-doc-scale-page (seshat-reader--contain-scale window) 'fit)))
               (seshat-reader--clamp-window-vscroll window)
               (seshat-reader--center-page window))
           (error
@@ -1358,7 +1386,8 @@ Keybindings:
   (setq mode-name "Seshat Reader")
   (run-hooks 'seshat-reader-mode-hook)
 
-  (funcall seshat-reader-default-fit)
+  ;; contain：打开文档时若窗口已很窄（目录/侧栏开着），不能让页面溢出
+  (seshat-reader-doc-scale-page (seshat-reader--contain-scale) 'fit)
   (add-hook 'window-size-change-functions #'seshat-reader--window-size-change nil t)
   (add-hook 'window-configuration-change-hook #'seshat-reader--manage-window-overlays nil t)
   (add-hook 'window-buffer-change-functions #'seshat-reader--handle-window-buffer-change nil t))
