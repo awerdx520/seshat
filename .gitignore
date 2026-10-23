@@ -31,3 +31,4 @@ files/objects/
 # 大体积个人参考 PDF（不入库）
 *.pdf
 .codegraph/
+.envrc
