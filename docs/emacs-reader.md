@@ -86,7 +86,11 @@ ETAF 渲染层是可选外部依赖：`Makefile` 先探测 `~/Workspace/emacs-ta
 - 打开的瞬间自动按 `contain` 适配（取 `min(按高, 按宽)`）——`seshat-reader-default-fit` **不再参与**这一步，只影响显式 `H` / `W` 命令，见第 12 节。
 - 模式行默认显示 `P<n>/<总页数>`（`seshat-reader-mode-line`）。
 
-> **窗口尺寸变化后自动重贴合**：开关目录（`o` / `C-c C-o`）或批注面板（`C-c C-l`）会改变阅读区宽度，阅读器会在同一次重绘内重新居中，并在 0.15 秒后按 `contain`（`min(按高, 按宽)`）重算缩放，使整页完整可见。用户手动缩放过的窗口（`+` / `-` / `=` / `0`）会保留缩放比例，只归位滚动位置。拖分割线期间不会逐帧重渲染，停手后只重算一次。
+> **窗口尺寸变化后自动重贴合**：开关目录（`o` / `C-c C-o`）或批注面板（`C-c C-l`）会改变阅读区宽度，阅读器会在同一次重绘内按当前的**适配模式**（`fit-mode`，见下段；未选择时为 `contain`）把页面缩放到目标几何，并由 idle 阶段补一次清晰化重渲染（几何不变，画面只从模糊变清晰）。用户手动缩放过的窗口（`+` / `-` / `=` / `0`）会保留缩放比例，只归位滚动位置。拖分割线期间不会逐帧重渲染，停手后只重算一次。
+>
+> **居中位置由 redisplay 在布局时计算**：页面能完整放下时，居中不是 Lisp 算出来的偏移量，而是页面 overlay 上一个 `before-string` 的 `(space :align-to (+ center (-0.5 . IMAGE)))`——`:align-to` 在布局阶段求值，因此窗口变宽变窄的那一帧页面就已经居中，不会出现「先跳到一侧、再居中」的中间帧（旧实现靠 `line-prefix` + `hscroll` 两段补偿，实测窗口变窄后首帧偏 −524px）。页面比窗口宽时改用 `line-prefix` + 横向滚动，左对齐。
+
+> **`W` / `H` 是持久适配模式，不是一次性缩放**：按 `W` 后该窗口的适配模式记为 `width`（载体是 window parameter `fit-mode`，取值 `contain` / `width` / `height`），此后窗口尺寸变化**仍按宽度填满**（纵向溢出靠滚动），不会再被 `contain` 覆盖成按高度；`H` 同理记为 `height`。未显式选择时默认 `contain`（整页可见，取 `min(按高, 按宽)`）——首次打开、书签恢复的窗口都属于这一档。手动缩放（`=` / `+` / `-` / `0`）会把该窗口标成 manual 且**优先于**适配模式，此后尺寸变化只归位滚动、不再自动适配；再按一次 `W` / `H` 便回到持久适配模式。适配模式按窗口记录、不跨会话保存，重开文档回到 `contain`。
 
 窗口变窄时页面会**缩小**以完整可见，而不是保持原尺寸被两侧裁切。自动 fit（首次打开与尺寸变化后）不再读 `seshat-reader-default-fit`——它在自动路径上已无调用点，仅 `H` / `W` 显式命令仍按其语义；是否保留该用户选项留待决定，详见 [`../openspec/tech-debt.md`](../openspec/tech-debt.md) 的「`seshat-reader-default-fit` 在自动 fit 路径上已成 no-op」条目。
 
@@ -101,7 +105,7 @@ ETAF 渲染层是可选外部依赖：`Makefile` 先探测 `~/Workspace/emacs-ta
 | 放大 / 缩小 | `=`、`+` / `-` | 倍率见 `seshat-reader-enlarge-factor`（1.25）/ `-shrink-factor`（0.75） |
 | 缩放滚轮 | `C-<wheel-up>` / `C-<wheel-down>` | |
 | 复位缩放 | `0` | |
-| 整页适配 / 整宽适配 | `H` / `W` | |
+| 整页适配 / 整宽适配 | `H` / `W` | 持久模式：写入窗口 `fit-mode`，之后尺寸变化仍按该维度适配 |
 | 旋转 | `r` / `R` | 顺时针 / 逆时针各 90° |
 | 重渲染当前页 | `g` | 用于外部修改或渲染异常 |
 | 关闭文档 | `Q` | |
@@ -430,9 +434,15 @@ M12 回归（strip 行破坏页面几何 + `--center-page` 在 `window-size-chan
 14. **EPUB 的 `location` 语义未定**：页码协议对 EPUB 只做到粗粒度定位。
 15. **队列写是无锁 read-modify-write**：多 Emacs 实例共享同一队列文件时存在丢更新风险。
 16. **页面比窗口宽时只能手动左右滚动**：手动放大到超出窗口（`+` / `=` / `W`）后不会自动跟随翻页，需 `S-<wheel>` 或 `scroll-left` / `scroll-right` 自己看；`unconstrained` 路径的下界夹紧也未实现（见 tech-debt 的「`--center-page` 以 `unconstrained` 设 hscroll」与「`--set-window-vscroll` 缺下界夹紧」两条）。
-17. **`seshat-reader-default-fit` 在自动 fit 路径上已不生效**：首次打开与尺寸变化后的 fit 一律走 `contain`（`min(按高, 按宽)`），该选项只对显式 `H` / `W` 有意义。想用它在两维冲突时「选一维填满」目前做不到（必然让另一维溢出），详见 tech-debt。
+17. **`seshat-reader-default-fit` 在自动 fit 路径上已不生效**：首次打开与尺寸变化后的 fit 一律取 `contain`（`min(按高, 按宽)`），该选项只对显式 `H` / `W` 有意义——而适配维度现在由 `W` / `H` 写入的 `fit-mode` 承载。想用它在两维冲突时「选一维填满」目前做不到（必然让另一维溢出），详见 tech-debt。
 18. **手动缩放的来源不随书签保存**：书签只存 `scale` 数值、不存 `fit` / `manual` 来源，恢复后按 `fit` 处理——一旦窗口尺寸变化就会重新贴合，上次手选的比例可能被重置。
 19. **同一文档重设到同一窗口时页面可能贴右边缘**：用 `set-window-buffer` 把**同一条文档**重新指给同一个窗口（而非新窗口 / 新 frame）时，Emacs 同样归零 hscroll 但不触发 `window-buffer-change-functions`，兜底 recentre 覆盖不到；需重开文档或触发一次尺寸变化（见 tech-debt）。
+20. **尺寸变化期间的画面是位图插值缩放，清晰化有延迟**：几何在同一帧内到位（改的是 image spec 的 `:width` / `:height`，不是位图），清晰度靠 idle 阶段重渲染一次补齐，因此缩放后约 0.15 秒内页面是「正确尺寸 + 略模糊」，拖分割线过程中始终是缩放位图。只读表格等细线条内容时观感差异明显（见 tech-debt「位图缩放与 `image-flush` 的交互未在真机长时间验证」）。
+21. **反复缩放会让旧尺寸的位图滞留在 image cache**：cache 以 spec 内容（含 `:width` / `:height`）为键，改写尺寸后旧键条目到 `image-cache-eviction-delay`（默认 300s）才回收；拖分割线可在数秒内造出几十个 A4 级条目。已在改写前 `image-flush` 缓解，长时间拖拽的峰值内存仍缺真机观测（见 tech-debt「image cache 条目累积」）。
+22. **manual 窗口在极端情形下会多一次重渲染**：`--refit-window` 的清晰度闸（比较已渲染分辨率 `render-scale` 与目标 `scale`）写在 `unless manual` 守卫之外；manual 窗口正常不改 `scale`、两者恒相等故不触发，但若将来 manual 路径写入不同值，会出现一次隐蔽的额外重渲染（见 tech-debt「image cache 条目累积」的附记）。
+23. **居中机制两套并存**：页面能完整放下时由 redisplay 求值居中（`before-string` + `:align-to`）；页面比窗口宽时仍走旧的 `line-prefix` + 横向滚动，只能**左对齐**、不居中。两套机制由 `--center-page` 的几何判定选择，`--centered-p` 与它各有判据（见 tech-debt）。
+24. **跨页衔接 strip 与新的居中方式未验证**：strip 行靠 center overlay 的 `line-prefix` 获得缩进，而「页面放得下」的分支会主动清空该 prefix；`page-join-lines` 默认 `0`（关闭）因此默认配置不受影响，一旦开启 strip 可能比页面左移半个余量（见 tech-debt）。
+25. **首次打开的首帧位图是显示层缩放**：`--first-fit` 先把 image spec 改到最终几何（不重渲染），在 idle 重渲染前位图是插值放大的旧分辨率——表现为「尺寸一开始就正确、但略模糊，约 0.15 秒后转清晰」，不再有原先的「先小后大」两次变化。
 
 ## 13. 开发者备注
 

@@ -472,6 +472,129 @@ image-width 读取补 `(or … 0)`。
 `window-buffer-change-functions`，D8 的 recentre 兜不住；根治需 advice
 `set-window-buffer`，会侵入所有调用方，暂不采用（记 tech-debt）。
 
+## 2026-10-23 · 显示层缩放替代同步重渲染以消除两帧
+
+**问题**：窗口尺寸变化时页面「先跳动一下、再重新绘制」。根因是结构性的——页面
+显示尺寸原先只能靠 C 侧 `doc-scale-page` 重渲染改变，而同步重渲染会拖死
+redisplay，只能排在 idle（0.15s 去抖）之后；于是「同步改位置」（`--recenter-window`
+按**旧**渲染尺寸夹 vscroll）与「异步改尺寸」（idle refit）之间必然出现两帧。
+
+**选项**：A = 尺寸变化 hook 内同步调用 `doc-scale-page`（一帧到位，但同步渲染阻塞
+redisplay，拖分割线时会逐帧重渲染卡死）；B = 在 elisp 层直接改写 image spec 的
+`:width` / `:height` 做显示层缩放（纯 elisp、微秒级），把 C 侧重渲染降级为 idle
+的「事后提升清晰度」。
+
+**选择 B。**
+
+**依据**：Emacs image spec 的 `:width` / `:height` 是**显示尺寸**而非图像数据尺寸
+——2026-10-23 在 pure 实例实测：spec 200×100 → 100×50 → 400×200，`image-size` 与
+`window-text-pixel-size`（真实布局像素）同步线性变化，原地改属性**立即生效且无需
+`image-flush`**。既有的 `--get-current-doc-image-size` 读的正是这两个属性，故
+`--center-page`、`--clamp-window-vscroll`、`--page-max-vscroll-pixels` 全部自动按新
+几何工作，无需改动。「spec 尺寸 / `scale` = native 尺寸」这一不变式由
+`--apply-display-scale` 同时更新 spec 与窗口 `scale` 维持，`--contain-scale` 与
+vscroll 上限因此不会算错。
+
+**代价**：① 位图放大是插值缩放，几何到位后画面在 idle 重渲染前偏模糊（用户可接受
+「模糊→清晰」替代「跳动→重绘」，真机观感待 T6 验收，假设 H5）；② image cache 以
+spec 内容（含 `:width` / `:height`）为键，原地改尺寸会让旧键条目滞留到
+`image-cache-eviction-delay`（默认 300s），拖分割线可在数秒内造出几十个 2 MB 级条目
+——已在改写前 `ignore-errors (image-flush spec)` 缓解，长时间真机内存观测仍缺（记
+tech-debt）；③ 改写属性必须用 `image-property` / `(setf (image-property …))`：spec
+是 `(image . PLIST)`，整表不是 plist，`plist-put` 会报 `wrong-type-argument plistp`（实测）。
+
+## 2026-10-23 · `fit-mode` 取代单一 `fit` 来源
+
+**问题**：按 `W`（按宽度适配）后按 `o` 打开目录，页面变成按高度适配。根因是**适配
+维度信息在写入时被丢弃**：`fit-to-width` 与 `fit-to-height` 都把 `scale-source` 记成
+同一个 `'fit`，而尺寸变化后的 refit 对任何非 `manual` 窗口一律用 `--contain-scale`
+重算 `min(按宽, 按高)`；按宽适配时页面通常纵向溢出（`scale_h < scale_w`），contain
+必然退化成按高度。
+
+**选择**：新增 window parameter `fit-mode`（`contain` / `width` / `height`，未设置按
+`contain`），由 `fit-to-width` / `fit-to-height` 末尾各写一行（`presentation-mode`
+因内部调 `fit-to-height` 自动得到 `height`）；`--fit-scale` 按模式求目标 scale，
+`contain` 分支转调 `--contain-scale`。`scale-source = manual`（`+` / `-` / `0`）
+**优先于** `fit-mode`——手动缩放过的窗口不因尺寸变化被自动适配改写。载体选 window
+parameter 而非全局变量：适配模式是「这一窗口的显示意图」，随窗口生灭，不跨窗口串味，
+也不新增 defcustom。
+
+**取舍**：**不改** `--contain-scale` 本体。它是纯计算函数、被既有 16+ 例测试直接锁定，
+新路径只需在 `contain` 分支复用它即可；保持其一字不动，既有断言零回归，语义上也让
+「contain 是三种模式之一」而非「唯一的适配算法」。代价是同一语义有了两个入口
+（`--fit-scale` 的 contain 分支与 `--contain-scale` 本体并存，记 tech-debt）；另外
+首次打开与书签恢复不写 `fit-mode`，故默认仍是 `contain`（与改造前行为一致），
+「跨会话记住 `W` / `H`」不在本次范围。
+
+## 2026-10-23 · 居中改为 redisplay 求值（`before-string` + `:align-to`）
+
+**问题**：窗口尺寸变化时页面「先跳到一侧、再居中」。旧实现用「buffer-wide
+overlay 的 `line-prefix` = 全余量 + `set-window-hscroll` 回滚半余量」两步拼出
+居中，两段数值都得在 Lisp 侧算完再写下去；而 `window-size-change-functions`
+在 redisplay **之后**才跑，命令内与 `pre-redisplay-functions` 里的重算同样赶不上
+正在进行的 redisplay，于是新宽度下的第一帧必然带着旧前缀（实测窗口变窄后首帧
+错位 −524px，要等下一次 redisplay 才归位）。
+
+**选项**：A = 继续在 Lisp 侧重算，只把时机提前（试过 `window-size-change-functions`
+内重算、命令内居中、`pre-redisplay-functions` 内重算，都只能把误差压到「一帧内的
+某处」，消不掉）；B = 把居中交给 redisplay——页面 overlay 加 `before-string`，其
+`display` 为 `(space :align-to (+ center (-0.5 . IMAGE)))`，位置在布局时求值；
+C = 半余量 `line-prefix`（`line-prefix` 本身改成半宽）——仍要先知道当前窗口宽度、
+仍是 Lisp 侧数值，尺寸变化的同一帧里算不出来。
+
+**选择 B。**
+
+**依据**：`:align-to` 的偏移量在 redisplay 布局阶段求值：`center` 是「窗口正文宽度
+的一半」，`(-0.5 . IMAGE)` 是「负半个图像宽」，两者相加即页面左边应处的像素位置，
+**Lisp 侧不需要知道窗口宽度**，所以窗口变窄的同一帧就已经正确。实测（隔离实例逐帧
+测量）：开关目录、`W` / `H` 之后、新窗口首次显示，首帧误差均 ≤0.5px。
+
+**关键坑**：IMAGE 位**必须传图像 spec 对象本身**，不能传数值。传数字时 Emacs 会把
+`(-0.5 . N)` 解释成「N 个字符宽」的倍数（实测前缀宽度算成 0、页面贴左）；写成
+`(cons -0.5 spec)`（即点对 `(-0.5 . SPEC)`）才是文档语义里的「图像宽度的 -0.5 倍」。
+
+**代价**：① 超宽页（页面比窗口宽）不能用 `:align-to` 居中——那种情形要左对齐 +
+横向滚动，所以 `line-prefix` 机制**不能删**，`--center-page` 变成「能放下走
+`before-string`、超宽走 `line-prefix`」两套机制并存（记 tech-debt）；② 重渲染会换掉
+image spec 对象，`before-string` 里存的是旧 spec（身份已过期），靠 `--centered-p`
+做 `eq` 身份比较发现并在下次 pre-redisplay 修复——多一次廉价检查，换来「不必在每个
+改动点都记得调居中」。
+
+## 2026-10-23 · 首次 fit 改用显示层缩放
+
+**问题**：打开文档时页面先按默认比例画一张小图并居中，随后 idle 的 refit 按
+`contain` 重渲染大图再重新居中——用户看到两次尺寸/位置变化（「先小后大」）。
+
+**方案**：新增 `--first-fit`，`seshat-reader-mode` 末尾用它取代
+`doc-scale-page (--contain-scale)`：先算目标 scale，再用 `--apply-display-scale` 只改
+image spec 的 `:width` / `:height`（纯 elisp、不重渲染）把页面放到最终几何，随后
+`--center-page` + `--schedule-refit`，由 idle 的重渲染把位图提升到该分辨率。
+`--apply-display-scale` 返回 nil（拿不到 spec）时回退同步 `doc-scale-page`，保证首次
+打开一定有正确几何。
+
+**代价**：① 首帧位图是**旧分辨率的插值缩放**，在 idle（0.15 秒去抖）重渲染前略模糊、
+随后转清晰——以「模糊→清晰」换「一次到位」，不再有「小→大」；②
+`--apply-display-scale` 返回 nil 的两种原因（无 spec / 已在目标尺寸）无法区分，边角
+会多一次重渲染（记 tech-debt）；③ batch 下 `window-body-width` 恒 80px，凡涉及
+「页面放得下」语义的 ERT 必须显式桩窗口宽度，否则红灯与实现无关（记 tech-debt）。
+
+## 2026-10-23 · 拖拽抑制（`--drag-threshold` 0.12 秒）
+
+**问题**：拖分割线时尺寸变化事件密集，每次都在 hook 内同步改 image spec 尺寸，
+redisplay 每帧都要重新缩放整页位图——真机拖一次卡 1–2 秒，手感完全丢失。
+
+**方案**：新增 `defvar` `seshat-reader--drag-threshold`（`0.12` 秒，内部开关、非
+defcustom）与 buffer-local `--last-size-change-time` / `--last-size-change-delta`；
+`--window-size-change` 每次记录时间戳与间隔，`--recenter-window` 见「间隔小于阈值」
+即视为拖拽：只做 vscroll clamp + 居中，**不改 spec 尺寸**；停手后 0.15 秒的 idle
+refit 按当前窗口尺寸做一次几何适配 + 重渲染，一次到位。
+
+**取舍**：拖动过程中页面尺寸**不跟手**（仍是上一次的几何，随窗口变窄被裁切或留白），
+换取拖动全程流畅；阈值取 0.12 秒是「人手连续拖动的事件间隔」与「一次性面板开关」
+之间的分界——面板开关只产生 1–2 次事件、间隔远大于阈值，所以仍走同步适配路径
+（首帧即正确）。阈值硬编码不进 defcustom：它调的是交互手感而非功能语义，暴露成
+用户选项只会被误调。
+
 
 
 

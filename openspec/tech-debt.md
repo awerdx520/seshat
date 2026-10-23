@@ -1001,6 +1001,56 @@
 - 影响：只在显式 `H` / `W` 命令路径触发（首次打开走 contain，不会走到这里），D8 未覆盖；命中时报 `wrong-type-argument`。
 - 建议：与 `--right-most-window-hscroll` 同口径加 `(numberp …)` / `(or … 0)` 守卫；注意 `(or … 0)` 会让未渲染时算出 0 缩放因子，须一并定「未渲染时直接 no-op」的语义，故本轮未随手改。
 
+## `--contain-scale` 与 `--fit-scale` 的 contain 分支并存（2026-10-23）
+
+- 现状：`--fit-scale` 的 `contain` 分支**直接转调** `--contain-scale`，两者语义等价——`--contain-scale` 是纯计算函数（取 `min(按高, 按宽)` 且刻意忽略 `seshat-reader-default-fit`），`--fit-scale` 在其外面包了一层「按 `fit-mode` 三值分支」。自适应改造**刻意未动** `--contain-scale` 本体（既有 16+ 例测试直接锁定它）。
+- 影响：同一语义有两个入口，若将来改 contain 的算法（例如引入「允许放大到填满」或 strip 高度参与计算），必须同时确认两条路径；读代码时要多跳一次才知道 `contain` 的权威实现在 `--contain-scale`。
+- 建议：保持现状即可（双入口换来零回归，收益大于整洁度）；若将来要合并，把 `--contain-scale` 收敛为 `--fit-scale` 的 `contain` 分支私有实现，并同时把锁定它的 16+ 例测试改指向 `--fit-scale`。
+
+## `seshat-reader-default-fit` 仍是 no-op（2026-10-23，`fit-mode` 落地后复核）
+
+- 现状：自动 fit 由 window parameter `fit-mode`（`contain` / `width` / `height`，未设置按 `contain`）决定，`seshat-reader-default-fit` 在整个仓库里仍只剩 defcustom 自身（`grep -n seshat-reader-default-fit emacs/seshat-reader/` 零调用点）——它既不参与首次打开、也不参与尺寸变化后的 refit，`W` / `H` 的语义已完全由 `fit-mode` 承载。
+- 关联：既有条目「`seshat-reader-default-fit` 在自动 fit 路径上已成 no-op（2026-10-23，D6 副作用）」记录的是同一事实的成因（contain 化），本条只记录 `fit-mode` 落地后的现状，不重复其分析。
+- 影响：设成 `fit-to-width` 与 `fit-to-height` 在自动路径下仍毫无差别；`fit-mode` 引入后该选项更易误导——用户想做的是「默认按宽度适配」，正确做法是打开文档后按 `W`（写入 `fit-mode`），而配置里改该选项没有任何效果。
+- 建议：二选一 —— ① 删除该 defcustom（破坏性变更，需在 CHANGELOG 记 BREAKING 并同步 `docs/configuration.md`）；② 重新定义为「首次打开时写入的 `fit-mode` 初值」（`fit-to-width` → `width`、`fit-to-height` → `height`，其余 → `contain`），这样它重新有意义且不新增选项。②更贴合「默认适配维度」诉求，但需与「`fit-mode` 是否跨会话记忆」一并定稿（当前不记忆）。
+
+## `image-flush` 已从 `--apply-display-scale` 移除，「C 侧下次重渲染即清旧缓存」未验证（2026-10-23）
+
+- 现状：`--apply-display-scale` 只改 image spec 的 `:width` / `:height`，实测（pure 实例）原地修改后无需 `image-flush` 即生效；早期版本在改写前调 `(ignore-errors (image-flush spec))` 主动丢弃旧缓存条目，但拖动分割线时每帧 flush 会强制 redisplay 重解码整页位图（真机实测拖一次卡 1–2 秒），**本轮已把 flush 整个移除**，改为依赖「C 侧下次重渲染替换 spec 时清掉旧缓存条目」。这条断言是读代码得出的推断，**未在真机验证**。
+- 影响：批量 ERT 全程在 batch 下跑（`image-property` / `image-flush` 可用，但**没有真实 GUI image cache**），因此「反复缩放数千次后的内存曲线」「不 flush 时旧位图是否真的被替换清掉」「image cache 峰值内存」这三件事只有真机能回答。若推断不成立，旧位图会滞留到 `image-cache-eviction-delay`（默认 300s，见下一条「image cache 条目累积」）。
+- 建议：T6 真机验收（拖分割线）时顺带观测——拖拽期间与停手后各取一次 `memory-info`，并在同一文档上反复开合面板 20 次以上，若与 image cache 相关的计数持续上涨则按 H6 降级（改为「只在 idle 做 apply，接受一帧中间态」）；如需定量，可在 GUI 下用 `(image-cache-size)` 前后对比。若确认必须 flush，则只能加在「停手后的那次 refit」里（每帧加不起）。
+
+## image cache 条目累积（原地改 spec 尺寸，2026-10-23）
+
+- 现状：image cache 以 spec 内容（含 `:width` / `:height`）为键。`--apply-display-scale` 原地改写这两个属性后，旧键条目不会立即消失，而会滞留到 `image-cache-eviction-delay`（默认 300s）。拖拽分割线时尺寸变化事件密集，数秒内即可造出几十个条目（A4 页面约 600×850 px，每条约 2 MB 量级），峰值内存随拖拽时长上涨。曾经用「改写前 `ignore-errors (image-flush spec)`」缓解，但逐帧 flush 会让拖动卡 1–2 秒，**本轮已把 flush 移除**——旧条目现在全靠 `image-cache-eviction-delay` 与 C 侧下次重渲染替换 spec 时回收，缺长时间真机内存观测。
+- 影响：长时间拖拽或频繁开关面板后，缓存里可能同时存在多份位图；`image-cache-eviction-delay` 到期前不会回收，属于「有界但不可控」的内存占用（上界与条目数、页面像素数成正比）。
+- 附记：`--refit-window` 的清晰度闸（`render-scale` 与 `scale` 比较）写在 `unless manual` 守卫**之外**，理论上 manual 窗口在两者不相等时也会重渲染一次。正常路径下 manual 不改 `scale`（`+` / `-` / `0` 走 `doc-scale-page` 且写回同值），两者恒相等，故不触发；但若将来 manual 路径开始写不同值（例如引入「手动缩放下仍提升清晰度」），这行会成为一处隐性重渲染入口，改动时需一并审视。
+- 建议：① 真机长观测（见上一条）；② 若确认峰值内存不可接受，改为「apply 只在几何变化超过阈值时执行」（合并连续小幅尺寸变化，减少键数量）或临时下调 `image-cache-eviction-delay`；③ 把清晰度闸移进 `unless manual` 分支（或显式加 `manual` 判据）以消除附记里的理论入口。
+
+## `page-join` strip 与 `before-string` 居中的交互未验证（2026-10-23）
+
+- 现状：居中改由页面 overlay 的 `before-string`（`:align-to`）承载后，页面行不再依赖 `line-prefix`；而跨页衔接 strip（`seshat-reader-page-join-lines` > 0）**依赖 center overlay 的 `line-prefix`** 才会跟着右移——fits 模式下 `--center-page` 现在会主动把 center overlay 的 `line-prefix` 清成 nil，strip 行因此只拿到页面 overlay 的 `before-string`（overlay 覆盖范围是页面行，strip 行是否在范围内取决于 `--ensure-center-overlay` / 页 overlay 的 `point-min`..`point-max` 覆盖）。
+- 影响：`page-join-lines` 默认 `0`（关闭），故默认配置不受影响；一旦用户开启，strip 行可能比页面左移半个余量（或反之），表现为「上一页底部残影偏左」。批量 ERT 用 `overlay-get … 'before-string` / `'line-prefix` 断言几何，**不产生真实 redisplay**，无法发现视觉错位。
+- 建议：真机验收时把 `seshat-reader-page-join-lines` 设为 `1` 单独过一遍（翻页后看 strip 与页面的左右边界是否对齐）；若错位，给 strip 行单独挂 `before-string`（与页面同一 `:align-to` 形态）或把 `before-string` 从页 overlay 移到 buffer 级 center overlay（两者权衡：后者要保证只在 fits 模式写、超宽模式清）。
+
+## `--centered-p` 与 `--center-page` 的超宽判据分别用 `<` 与 `>=`（2026-10-23）
+
+- 现状：`--center-page` 用 `(>= window-width doc-image-width)` 判定「页面放得下」并走 `before-string`；`--centered-p` 用 `(< window-width image-width)` 判定「页面比窗口宽」并检查 `line-prefix` 宽度。两者是同一判据的**互补写法**（`>=` 与 `<` 覆盖全部情形，恰好不重叠也不遗漏），但没有抽成同一个谓词。
+- 影响：当前等价、行为正确（`=` 边界时 `--center-page` 走 fits 分支、`--centered-p` 走第二个分支——注意它在 `=` 时**不进**超宽分支，而进「能放下」分支做 spec 身份比较，与 `--center-page` 一致）。风险在于将来若有人只改一处（例如把「放得下」改成允许 N px 容差），两处会立刻给出不同答案，表现为「居中判定永远为假、每次 pre-redisplay 都重居中」——性能问题而非功能问题，很难凭现象定位。
+- 建议：抽一个 `--page-fits-window-p (window)` 供两处共用；抽之前若必须改其中一处，务必同步另一处。
+
+## `--first-fit` 无法区分 `--apply-display-scale` 返回 nil 的两种原因（2026-10-23）
+
+- 现状：`--first-fit` 在 `(unless (--apply-display-scale …) (doc-scale-page …))` 里把 nil 一律当成「需要同步重渲染」。而 `--apply-display-scale` 在两种情况下返回 nil：① 拿不到页面 image spec（首次打开时页 overlay 的 `display` 还不是 image）；② spec 尺寸**已等于**目标尺寸（无需改动）。
+- 影响：情形 ② 会多走一次同步 `doc-scale-page`（重渲染一次整页位图），功能正确但首次打开白做一次 C 侧渲染；只在「打开时窗口尺寸恰好等于文档默认渲染尺寸」这类边角出现，常规使用碰不到。
+- 建议：让 `--apply-display-scale` 区分「已是最优」与「拿不到 spec」（例如返回 `'unchanged` / `nil` 两值），`--first-fit` 只在 `nil` 时才回退重渲染。改返回值会影响 resize 测试里对该函数的现有断言（多处按真/假判），需同批调整。
+
+## batch 下 `window-body-width` 恒 80px（2026-10-23）
+
+- 现状：ERT 在 batch 下没有真实 GUI frame，`(window-body-width)` 恒为默认 80 列、`window-body-height` 也是默认值，因此「页面放得下 / 放不下」这一分支的选择**完全由桩值决定**。本轮 resize 测试改成用桩 `window-body-width`（`cl-letf`）显式指定每例的窗口宽度，才能稳定命中 fits / 超宽两条分支。
+- 影响：凡新增涉及「页面是否放得下」「居中走 before-string 还是 line-prefix」的用例，若忘了桩窗口宽度，就会跑到与意图相反的 branch，红灯与实现无关、容易误判成回归；同理，`--contain-scale` / `--fit-scale` 的断言依赖 `window-body-width` / `-height` 的桩值，数值一变结论就变。
+- 建议：把「桩窗口几何」做成测试辅助宏（例如 `seshat-reader-test--with-window-geometry`），新增用例统一走它；已在 resize 测试内部用 `cl-letf` 实现，尚未提取为共享辅助函数。
+
 
 
 
