@@ -155,6 +155,23 @@ back as another size change.  Size-change events arriving while this flag
 is non-nil are dropped instead of being queued, so a single refit cannot
 trigger the next one.")
 
+(defvar-local seshat-reader--last-size-change-time nil
+  "Time of the last window size change handled for this buffer.")
+
+(defvar-local seshat-reader--last-size-change-delta nil
+  "Seconds between the last two window size changes of this buffer.
+
+Used to tell a one-off change (opening the outline panel) from a burst of
+changes (dragging a window divider): only the former adapts the page
+geometry synchronously, the latter leaves the geometry alone and lets the
+debounced refit do it once the drag stops.")
+
+(defvar seshat-reader--drag-threshold 0.12
+  "Maximum number of seconds between two size changes that counts as a drag.
+
+Internal switch, not a user option.  Values above this are treated as
+unrelated, one-off changes and get a synchronous geometry adaptation.")
+
 (defvar seshat-reader--resize-refit-delay 0.15
   "Idle delay, in seconds, before a pending refit is executed.")
 
@@ -350,10 +367,20 @@ When SOURCE is non-nil, it is also recorded as the scale source of the selected
 window.  The expected values are `fit' (the scale was derived from the window
 size) and `manual' (the user chose the scale).  A nil SOURCE leaves the
 recorded source unchanged, so restoring a window's previous scale does not
-pretend to be a new scaling command."
+pretend to be a new scaling command.
+
+It also records the clamped scale in the window parameter `render-scale',
+which is what `seshat-reader--refit-window' compares against to decide
+whether the bitmap needs re-rendering, and drops the `native-size' cache
+because the freshly rendered spec is the authoritative size.  The
+`render-scale' of a window is cleared by
+`seshat-reader--render-buffer'; rotating the page keeps it, since rotation
+does not change the rendering resolution."
   (when-let* ((factor-clamped (seshat-reader-dyn--scale-page factor)))
     (setq seshat-reader--recent-scale-fallback factor-clamped)
     (set-window-parameter nil 'scale factor-clamped)
+    (set-window-parameter nil 'render-scale factor-clamped)
+    (set-window-parameter nil 'native-size nil)
     (when source
       (set-window-parameter nil 'scale-source source))))
 
@@ -400,7 +427,8 @@ Optionally scale it by the SCALING-FACTOR.  Scales on selected window."
 	 (scaling-factor (/ pixel-window-height unscaled-height)))
     (seshat-reader-doc-scale-page scaling-factor 'fit)
     (seshat-reader--center-page)
-    (seshat-reader--set-page-top)))
+    (seshat-reader--set-page-top)
+    (set-window-parameter nil 'fit-mode 'height)))
 
 (defun seshat-reader-fit-to-width ()
   "Scale the current page in the selected window to fit its width."
@@ -411,7 +439,8 @@ Optionally scale it by the SCALING-FACTOR.  Scales on selected window."
 	 (scaling-factor (/ pixel-window-width unscaled-width)))
     (seshat-reader-doc-scale-page scaling-factor 'fit)
     (seshat-reader--center-page)
-    (seshat-reader--set-page-top-when-joined)))
+    (seshat-reader--set-page-top-when-joined)
+    (set-window-parameter nil 'fit-mode 'width)))
 
 (defun seshat-reader--contain-scale (&optional window)
   "Return the scale at which the current page fits WINDOW completely.
@@ -438,6 +467,111 @@ opened or a window is resized."
                                  (/ image-height scale))))
           (min width-factor height-factor))
       1.0)))
+
+(defun seshat-reader--first-fit ()
+  "Fit the page to the selected window the first time it is displayed.
+
+Uses a display-level rescale instead of a re-render, so the very first
+frame already shows the page at its final size; the bitmap is rendered at
+the new resolution by the debounced refit afterwards.  Falls back to a
+synchronous re-render when the page spec is not available yet."
+  (let ((target (seshat-reader--contain-scale)))
+    (unless (seshat-reader--apply-display-scale (selected-window) target)
+      (seshat-reader-doc-scale-page target 'fit))
+    (seshat-reader--center-page)
+    (seshat-reader--schedule-refit)))
+
+(defun seshat-reader--window-fit-mode (&optional window)
+  "Return WINDOW's fit mode: `contain', `width' or `height'.
+
+WINDOW defaults to the selected one.  A window that never recorded a mode
+\(opened before the option existed, restored from a bookmark, or simply
+never used `H' / `W') counts as `contain', which keeps the pre-existing
+behaviour of fitting the whole page into the window."
+  (or (window-parameter (or window (selected-window)) 'fit-mode) 'contain))
+
+(defun seshat-reader--fit-scale (&optional window)
+  "Return the scale WINDOW's page should have, according to its fit mode.
+
+WINDOW defaults to the selected one.  With the `contain' mode this is
+exactly `seshat-reader--contain-scale'; `width' and `height' use only one
+dimension, so an explicit `W' (\\[seshat-reader-fit-to-width]) keeps filling
+the width even when the page then overflows vertically, and `H'
+\(\\[seshat-reader-fit-to-height]) does the converse."
+  (let* ((window (or window (selected-window)))
+         (mode (seshat-reader--window-fit-mode window)))
+    (if (eq mode 'contain)
+        (seshat-reader--contain-scale window)
+      (let ((native (seshat-reader--native-page-size window)))
+        (if (and native (> (car native) 0) (> (cdr native) 0))
+            (if (eq mode 'width)
+                (/ (window-body-width window t) (float (car native)))
+              (/ (window-body-height window t) (float (cdr native))))
+          1.0)))))
+
+(defun seshat-reader--page-image-spec (window)
+  "Return WINDOW's page image spec, or nil if it is not an image yet."
+  (let ((overlay (seshat-reader-current-doc-overlay window)))
+    (when (overlayp overlay)
+      (let ((display (overlay-get overlay 'display)))
+        (when (and (consp display) (eq (car display) 'image))
+          display)))))
+
+(defun seshat-reader--native-page-size (window)
+  "Return the unscaled pixel size of WINDOW's page as (W . H), or nil.
+
+The value is cached in the window parameter `native-size' as
+\(PAGE . (W . H)), together with the page number it was measured on: two
+pages of the same document may have different sizes, so a cached size is
+reused only while the window still shows PAGE.  The cache is also dropped
+when the page is re-rendered at a new resolution
+\(`seshat-reader-doc-scale-page'), the document is reloaded
+\(`seshat-reader--render-buffer') or the page is rotated
+\(`seshat-reader-rotate-clockwise' / `-counter-clockwise')."
+  (let* ((page (seshat-reader-current-doc-pagenumber window))
+         (cached (window-parameter window 'native-size)))
+    (if (and (consp cached) (equal (car cached) page) (consp (cdr cached)))
+        (cdr cached)
+      (let* ((spec (seshat-reader--page-image-spec window))
+             (scale (seshat-reader-current-doc-scale-value window))
+             (w (and spec (image-property spec :width)))
+             (h (and spec (image-property spec :height))))
+        (when (and (integerp w) (integerp h) (> w 0) (> h 0)
+                   (numberp scale) (> scale 0))
+          (let ((native (cons (/ (float w) scale) (/ (float h) scale))))
+            (set-window-parameter window 'native-size (cons page native))
+            native))))))
+
+(defun seshat-reader--apply-display-scale (window scale)
+  "Resize WINDOW's page to SCALE by rewriting the image spec, without rendering.
+
+Return non-nil when the spec changed.  The window parameter `scale' and the
+buffer-local `seshat-reader--recent-scale-fallback' are updated together
+with the spec, so the invariant \"spec size / `scale' = native size\" keeps
+holding for `seshat-reader--contain-scale', `seshat-reader--fit-scale' and
+the vertical scroll upper bound.
+
+No `image-flush' is issued here: rewriting the spec in place is enough for
+the new geometry to take effect, and flushing on every size change would
+make the redisplay re-decode the whole page bitmap each time, which is
+what makes dragging a window divider stall.  Stale cache entries are
+dropped by the C side when it replaces the spec on the next re-render."
+  (when (and (windowp window) (numberp scale) (> scale 0))
+    (let* ((spec (seshat-reader--page-image-spec window))
+           (native (and spec (seshat-reader--native-page-size window)))
+           (w (and spec (image-property spec :width)))
+           (h (and spec (image-property spec :height)))
+           (new-w (and native (max 1 (round (* (car native) scale)))))
+           (new-h (and native (max 1 (round (* (cdr native) scale))))))
+      (when (and (integerp new-w) (integerp new-h))
+        (unless (and (equal w new-w) (equal h new-h))
+          ;; 不做 image-flush：拖动分割线时每帧 flush 会强制重解码整页位图（实测卡 1–2s）；
+          ;; 旧缓存由 C 侧下次重渲染替换 spec 时清掉。
+          (setf (image-property spec :width) new-w)
+          (setf (image-property spec :height) new-h)
+          (set-window-parameter window 'scale scale)
+          (setq seshat-reader--recent-scale-fallback scale)
+          t)))))
 
 (defun seshat-reader--get-pixel-per-col (&optional window)
   "Get the no of pixels per column for WINDOW.
@@ -774,62 +908,139 @@ not return the actual horizontal scroll value; for that, see
 	 (hscroll (round (- (/ line-prefix-width pixel-per-col) (window-hscroll window)))))
     hscroll))
 
+(defun seshat-reader--centered-p (window)
+  "Return non-nil if WINDOW's page is already positioned by the live prefix.
+
+Two different prefixes are used: pages that fit are centred by a
+`before-string' whose `:align-to' form references the displayed image spec,
+while pages wider than the window are left-aligned through the buffer-wide
+centring overlay's `line-prefix'.  Either one counts as centred only when
+it matches the current geometry, so that a re-render (new spec identity) or
+a resize (different leftover width) is detected and repaired once."
+  (let* ((overlay (window-parameter window 'overlay))
+         (spec (seshat-reader--page-image-spec window))
+         (image-width (and spec (image-property spec :width)))
+         (window-width (window-body-width window t)))
+    (cond
+     ;; 页面比窗口宽：center overlay 的 line-prefix 宽度必须等于剩余宽度
+     ((and (numberp image-width) (> image-width 0)
+           (numberp window-width) (< window-width image-width))
+      (let* ((center seshat-reader--center-overlay)
+             (prefix (and (overlayp center) (overlay-get center 'line-prefix)))
+             (width (and (consp prefix) (car (plist-get (cdr prefix) :width)))))
+        (and (numberp width)
+             (= width (max 0 (- window-width image-width)))
+             t)))
+     ;; 能放下：before-string 必须引用当前 spec（身份比较）
+     ((and (overlayp overlay) spec)
+      (let* ((before (overlay-get overlay 'before-string))
+             (display (and (stringp before) (> (length before) 0)
+                           (get-text-property 0 'display before)))
+             (align (and (consp display) (plist-get (cdr display) :align-to)))
+             (form (and (consp align) (eq (car align) '+)
+                        (nth 2 align))))
+        (and (consp form) (eq (cdr form) spec) t)))
+     (t nil))))
+
 ;; We need this hack involving line-prefix because Emacs' scrolling is
 ;; idiosyncratic, and doesn't allow arbitrary scrolling in every
 ;; direction.
+;; We need this hack involving line-prefix because Emacs' scrolling is
+;; idiosyncratic, and doesn't allow arbitrary scrolling in every
+;; direction.  It is only used while the page is wider than the window:
+;; a page that fits is centred by redisplay itself (see the docstring).
 (defun seshat-reader--center-page (&optional window)
   "Center the document with respect to WINDOW.
 
 WINDOW must be a valid window and defaults to the selected one.
 
-Centering needs a page overlay, the pixel width of WINDOW and the width
-of the page image.  When one of them is missing the function does not
-return silently: it drops the `line-prefix' of both the page overlay and
-the buffer-wide centering overlay and resets the horizontal scroll, so
-that a stale offset left by an earlier centering cannot keep the page
-stuck to one side of the window.
+When the page fits, centring is delegated to redisplay: the page overlay
+gets a `before-string' of one space whose `display' is
+\\(space :align-to (+ center (-0.5 . IMAGE))), where IMAGE is the very
+image spec being displayed.  Because the position is computed at layout
+time, a window resize is honoured in the same redisplay, with no hook and
+no stale prefix frame.
 
-When the page image is wider than WINDOW the horizontal offset is
-clamped to zero, so the page stays aligned to the left edge instead of
-being clipped on both sides."
+When the page is wider than WINDOW the horizontal scroll machinery is used
+instead: the page is left-aligned and scrolled with the width-based
+`line-prefix'.
+
+When the geometry is unknown everything is cleared, so a stale offset from
+an earlier centring cannot keep the page stuck to one side."
   (let ((window (or window (selected-window))))
     (let* ((overlay (seshat-reader-current-doc-overlay window))
            (window-width (window-body-width window t))
-           (doc-image-width
-            (car (seshat-reader--get-current-doc-image-size window))))
-      (if (and (overlayp overlay) window-width doc-image-width)
-          (let* ((max-left-offset (max 0 (- window-width doc-image-width)))
-                 (overlay-offset `(space :width (,max-left-offset)))
-                 (center-overlay (seshat-reader--ensure-center-overlay))
-                 (pixel-per-col (seshat-reader--get-pixel-per-col window))
-                 (doc-left-offset (- window-width doc-image-width))
-                 (doc-center-offset (/ doc-left-offset 2))
-                 ;; 页面比窗口宽时 doc-center-offset 为负；夹到 0 让页面左对齐，避免两侧裁切
-                 (scroll-offset (max 0 (round (/ doc-center-offset pixel-per-col)))))
-            ;; 居中由「line-prefix 右推 + hscroll 左滚」两步配合完成：只落下
-            ;; hscroll 会把页面推出窗口左侧（真机已复现），因此两者必须同成
-            ;; 同败——先确认 buffer-wide 的居中 overlay 可用，再同时写入。
-            (if (overlayp center-overlay)
-                (progn
-                  ;; Add prefix so that the page is at the leftmost point of the window.
-                  ;; The prefix is carried by a buffer-wide overlay instead of the page
-                  ;; overlay, so that the cross-page join strip line gets it as well.
-                  (overlay-put overlay 'line-prefix nil)
-                  (overlay-put center-overlay 'line-prefix overlay-offset)
-                  ;; scroll window back to the center of the doc
-                  (seshat-reader--set-window-hscroll window scroll-offset t))
-              ;; 居中 overlay 不可用：宁可回到左对齐，也不要只写下 hscroll 把页面推出窗口
-              (ignore-errors (seshat-reader--set-window-hscroll window 0 t))
-              (ignore-errors (set-window-hscroll window 0))))
-        ;; Fallback: the geometry is unknown, so clear any stale prefix and
-        ;; reset the horizontal scroll instead of leaving the page offset.
+           (spec (seshat-reader--page-image-spec window))
+           (doc-image-width (and spec (image-property spec :width))))
+      (cond
+       ;; 能完整放下：交给 redisplay 自己居中（before-string + align-to）
+       ((and (overlayp overlay) spec (numberp doc-image-width)
+             (> doc-image-width 0) (numberp window-width)
+             (>= window-width doc-image-width))
+        (when (overlayp seshat-reader--center-overlay)
+          (overlay-put seshat-reader--center-overlay 'line-prefix nil))
+        (overlay-put overlay 'line-prefix nil)
+        (overlay-put overlay 'before-string
+                     (propertize " " 'display
+                                 (list 'space :align-to
+                                       (list '+ 'center (cons -0.5 spec)))))
+        (set-window-hscroll window 0))
+       ;; 页面比窗口宽：左对齐 + 横向滚动（保留原 line-prefix 逻辑）
+       ((and (overlayp overlay) (numberp window-width) doc-image-width)
+        (overlay-put overlay 'before-string nil)
+        (let* ((max-left-offset (max 0 (- window-width doc-image-width)))
+               (overlay-offset `(space :width (,max-left-offset)))
+               (center-overlay (seshat-reader--ensure-center-overlay))
+               (pixel-per-col (seshat-reader--get-pixel-per-col window))
+               (doc-left-offset (- window-width doc-image-width))
+               (doc-center-offset (/ doc-left-offset 2))
+               (scroll-offset (max 0 (round (/ doc-center-offset pixel-per-col)))))
+          (if (overlayp center-overlay)
+              (progn
+                (overlay-put overlay 'line-prefix nil)
+                (overlay-put center-overlay 'line-prefix overlay-offset)
+                (seshat-reader--set-window-hscroll window scroll-offset t))
+            (ignore-errors (seshat-reader--set-window-hscroll window 0 t))
+            (ignore-errors (set-window-hscroll window 0)))))
+       ;; 几何未知：清干净
+       (t
+        (when (overlayp overlay)
+          (overlay-put overlay 'before-string nil))
         (dolist (ov (list overlay seshat-reader--center-overlay))
           (when (overlayp ov)
             (overlay-put ov 'line-prefix nil)))
-        (ignore-errors
-          (seshat-reader--set-window-hscroll window 0 t))
-        (ignore-errors
-          (set-window-hscroll window 0))))))
+        (ignore-errors (seshat-reader--set-window-hscroll window 0 t))
+        (ignore-errors (set-window-hscroll window 0)))))))
+
+(defun seshat-reader--ensure-centered (window)
+  "Re-centre WINDOW's page when its centring prefix is missing or stale.
+
+With the `before-string' centring the geometry itself needs no hook; this
+check only rebuilds the prefix after a re-render replaced the image spec
+\\(the stored `before-string' still references the previous spec) or after
+the prefix was cleared."
+  (when (and (window-live-p window)
+             (overlayp (window-parameter window 'overlay))
+             (not (seshat-reader--centered-p window)))
+    (seshat-reader--center-page window)
+    t))
+
+(defun seshat-reader--pre-redisplay-center (&optional _window)
+  "Re-centre the page of the current buffer right before it is redisplayed.
+
+Registered buffer-locally on `pre-redisplay-functions'.  Without it the
+first frames after a window resize are drawn with the previous
+`line-prefix', because `window-size-change-functions' runs after that
+redisplay; with it the frame that first shows the new window width is
+already centred.
+
+WINDOW is the window about to be redisplayed, as passed by
+`pre-redisplay-functions'; it is ignored, because every window showing
+this buffer has to be checked (the hook can run for one window while
+another one is resized)."
+  (when (derived-mode-p 'seshat-reader-mode)
+    (dolist (window (get-buffer-window-list nil nil t))
+      (seshat-reader--ensure-centered window))))
 
 (defun seshat-reader--window-size-change (window-or-frame)
   "Recentre and schedule a refit after a size change of WINDOW-OR-FRAME.
@@ -845,6 +1056,11 @@ Every matching window is recentred synchronously by
 redisplay is already centred; the re-render at the new scale is left to the
 debounced refit.  Scheduling is buffer-wide, so at most one refit is queued
 per event no matter how many windows match."
+  (let* ((now (float-time))
+         (delta (and seshat-reader--last-size-change-time
+                     (- now seshat-reader--last-size-change-time))))
+    (setq seshat-reader--last-size-change-time now
+          seshat-reader--last-size-change-delta delta))
   (cond
    ((windowp window-or-frame)
     (when (eq (window-buffer window-or-frame) (current-buffer))
@@ -878,7 +1094,16 @@ the new scale stays in the debounced refit
 WINDOW is skipped silently when it is no longer live, no longer shows the
 current buffer, has lost its page overlay, or shows a buffer that has left
 `seshat-reader-mode'.  An error while recentring one window is reported and
-does not prevent the other windows from being recentred."
+does not prevent the other windows from being recentred.
+
+The page geometry is adapted synchronously first, so the very frame that
+noticed the size change already shows the page at its final size; no
+re-rendering happens here.
+
+A burst of size changes (dragging a window divider) is detected by the
+interval between them: such events only recentre the page, so that no
+bitmap is rescaled per frame, and the geometry is adapted once by the
+debounced refit when the drag stops."
   (when (and (window-live-p window)
              (eq (window-buffer window) (current-buffer))
              (overlayp (window-parameter window 'overlay)))
@@ -886,6 +1111,16 @@ does not prevent the other windows from being recentred."
       (when (derived-mode-p 'seshat-reader-mode)
         (condition-case err
             (progn
+              ;; 拖拽中（两次 size-change 间隔小于阈值）只居中不缩放：改 spec 尺寸
+              ;; 会让 redisplay 重新缩放整页位图，拖动时每帧一次会卡 1–2 秒。
+              ;; 停手后由 idle 的 `--refit-window' 做一次几何适配 + 重渲染。
+              (let ((dragging (and seshat-reader--last-size-change-delta
+                                   (< seshat-reader--last-size-change-delta
+                                      seshat-reader--drag-threshold))))
+                (unless (or dragging
+                            (eq (seshat-reader--window-scale-source window) 'manual))
+                  (seshat-reader--apply-display-scale
+                   window (seshat-reader--fit-scale window))))
               (seshat-reader--clamp-window-vscroll window)
               (seshat-reader--center-page window))
           (error
@@ -936,12 +1171,12 @@ short span of an ongoing refit, where the `let' binding restores it."
   "Refit the page of WINDOW to its current size.
 
 A window whose scale source is `manual' keeps its scale and only gets its
-vertical scroll clamped and the page recentred.  Every other window,
-including one that never recorded a source, is rescaled to contain the
-page (`seshat-reader--contain-scale') first, but only when the new scale
-differs from the current one by more than one percent: re-rendering is
-synchronous and changes the window layout, so a sub-threshold difference
-only wastes work and feeds the resize callback it was called from.
+vertical scroll clamped and the page recentred.  Every other window is
+first adapted synchronously to its fit mode (`seshat-reader--fit-scale') by
+rewriting the image spec, which changes no pixels and needs no rendering;
+the page is then re-rendered once at that scale only when the scale the
+overlay was last rendered at (`render-scale') differs from the displayed
+scale, so the bitmap gets sharp again without the geometry moving.
 
 The window is skipped silently when it is no longer live, no longer shows
 the current buffer, has lost its page overlay, or shows a buffer that has
@@ -955,22 +1190,19 @@ reported and does not prevent the other windows from being refitted."
         (condition-case err
             (progn
               (unless (eq (seshat-reader--window-scale-source window) 'manual)
-                ;; contain：取按高与按宽的较小者，保证窗口变窄时页面不溢出、不被裁切。
-                ;; 偏差闸：目标 scale 与当前 scale 相对差不足 1% 时跳过重渲染——重渲染是
-                ;; 同步的（C 侧 wait_for_cached_page），而 line-prefix / vscroll 的变化可能
-                ;; 再次触发尺寸变化回调；没有这道闸时两者会互相引发，表现为画面持续抖动。
-                (with-selected-window window
-                  (let* ((target (seshat-reader--contain-scale window))
-                         (current (or (seshat-reader-current-doc-scale-value) 1.0))
-                         ;; 阈值取当前 scale 的 1%；current 非正或非数字时退回 1.0 / 1e-6，
-                         ;; 保证阈值恒为正（阈值为 0 会让任何浮点尾差都触发重渲染）。
-                         (threshold (* 0.01 (max (if (numberp current) current 1.0)
-                                                 1e-6)))
-                         (changed (and (numberp target) (> target 0)
-                                       (numberp current)
-                                       (> (abs (- target current)) threshold))))
-                    (when changed
-                      (seshat-reader-doc-scale-page target 'fit)))))
+                (seshat-reader--apply-display-scale
+                 window (seshat-reader--fit-scale window)))
+              ;; Geometry is already final after the synchronous apply above;
+              ;; re-rendering only upgrades the bitmap to the new resolution.
+              ;; It runs only when the displayed scale differs from the scale
+              ;; the overlay was last rendered at, so a refit never renders twice.
+              (let ((scale (seshat-reader-current-doc-scale-value window))
+                    (rendered (window-parameter window 'render-scale)))
+                (unless (and (numberp scale) (numberp rendered) (= scale rendered))
+                  (with-selected-window window
+                    ;; 不传 source：清晰化重渲染不得改动 scale-source，
+                    ;; 否则 manual 窗口会被静默转成 fit。
+                    (seshat-reader-doc-scale-page scale))))
               (seshat-reader--clamp-window-vscroll window)
               (seshat-reader--center-page window))
           (error
@@ -1189,6 +1421,7 @@ See also `seshat-reader-shrink-size'."
   "Rotate the current window's view by 90 degrees, clockwise."
   (interactive)
   (seshat-reader-dyn--rotate-page 90)
+  (set-window-parameter nil 'native-size nil)
   (seshat-reader--center-page)
   (seshat-reader--set-page-top-when-joined))
 
@@ -1196,6 +1429,7 @@ See also `seshat-reader-shrink-size'."
   "Rotate the current window's view by 90 degrees, counter-clockwise."
   (interactive)
   (seshat-reader-dyn--rotate-page -90)
+  (set-window-parameter nil 'native-size nil)
   (seshat-reader--center-page)
   (seshat-reader--set-page-top-when-joined))
 
@@ -1267,6 +1501,8 @@ Load the PAGE if provided."
 	  ;; seshat-reader-dyn--load-doc resets the window state, which also
 	  ;; needs to be reflected in the frontend.
 	  (set-window-parameter nil 'scale 1.0)
+	  (set-window-parameter nil 'render-scale nil)
+	  (set-window-parameter nil 'native-size nil)
 	  ;; The page images are rendered anew, so cached specs are stale.
 	  (setq seshat-reader--page-image-specs nil)
 	  (seshat-reader--update-join-strip)))
@@ -1497,10 +1733,13 @@ Keybindings:
   (run-hooks 'seshat-reader-mode-hook)
 
   ;; contain：打开文档时若窗口已很窄（目录/侧栏开着），不能让页面溢出
-  (seshat-reader-doc-scale-page (seshat-reader--contain-scale) 'fit)
+  ;; 首次 fit 用显示层缩放一步到位（不重渲染），避免「先按默认比例画一张小图
+  ;; 居中、再重渲染大图重新居中」的两帧；清晰位图由 idle 的 refit 补一次。
+  (seshat-reader--first-fit)
   (add-hook 'window-size-change-functions #'seshat-reader--window-size-change nil t)
   (add-hook 'window-configuration-change-hook #'seshat-reader--manage-window-overlays nil t)
-  (add-hook 'window-buffer-change-functions #'seshat-reader--handle-window-buffer-change nil t))
+  (add-hook 'window-buffer-change-functions #'seshat-reader--handle-window-buffer-change nil t)
+  (add-hook 'pre-redisplay-functions #'seshat-reader--pre-redisplay-center nil t))
 
 (defun seshat-reader-mode-line ()
   "Set custom mode-line interface when reading documents."

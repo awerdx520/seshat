@@ -295,15 +295,25 @@ pixel-per-col 多乘一次（50 × 25 = 1250），会先被夹到 1000，断言�
                 ((symbol-function 'window-hscroll)
                  (lambda (&optional _window) 0)))
         (seshat-reader--center-page)
-        (should (overlayp seshat-reader--center-overlay))
-        (should (eq (overlay-buffer seshat-reader--center-overlay)
-                    (current-buffer)))
-        (should (equal '(space :width (300))
-                       (overlay-get seshat-reader--center-overlay
-                                    'line-prefix)))
+        ;; 契约变更（2026-10-23）：页面能完整放下时居中改由 before-string 承担，
+        ;; 两个 overlay 都不再写 `line-prefix'（实测 line-prefix + hscroll 在窗口
+        ;; 变窄后的第一帧恒错位 −524px），因此也不再需要 buffer 级 center overlay。
+        ;; 这里钉住：before-string 挂在页面 overlay 上并引用正在显示的 image spec
+        ;; （`eq'），center overlay 缺失或 line-prefix 为 nil，`--get-prefix-width'
+        ;; 因此返回 0。
+        (should-not (and (overlayp seshat-reader--center-overlay)
+                         (overlay-get seshat-reader--center-overlay
+                                      'line-prefix)))
         (should-not (overlay-get overlay 'line-prefix))
-        ;; 前缀宽度优先从 center overlay 读取
-        (should (= 300 (seshat-reader--get-prefix-width)))))))
+        (let* ((before (overlay-get overlay 'before-string))
+               (display (and (stringp before)
+                             (get-text-property 0 'display before)))
+               (align (and (consp display) (plist-get (cdr display) :align-to)))
+               (form (and (consp align) (eq (car align) '+)
+                          (nth 2 align))))
+          (should (consp form))
+          (should (eq (cdr form) spec)))
+        (should (= 0 (seshat-reader--get-prefix-width)))))))
 
 ;;; 5b. 回归修复：默认关闭 strip、居中兜底、窗口尺寸钩子
 
