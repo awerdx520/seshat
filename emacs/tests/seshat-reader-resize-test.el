@@ -947,6 +947,137 @@ refit pin exactly that split."
       (seshat-reader-resize-test--clear-window window)
       (kill-buffer buffer))))
 
+;;; 26. 换 buffer 到同一个 reader buffer：已有 overlay 时补一次 recentre
+
+(ert-deftest seshat-reader-resize-test--window-buffer-change-recentres-existing-overlay ()
+  "A surviving page overlay gets recentred, and no second overlay is created.
+
+`set-window-buffer' zeroes the window's horizontal scroll by itself, so a
+window that shows an already-rendered reader buffer — the page overlay is
+still there, no size change fired — must be recentred here.  Before the
+recentre branch existed this test failed with zero recentres: the create
+branch was skipped because the overlay parameter was set, and nothing else
+re-aligned the page."
+  (let ((window (selected-window))
+        (orig-buffer (window-buffer (selected-window)))
+        (buffer (seshat-reader-resize-test--reader-buffer))
+        (recentres 0)
+        (creates 0))
+    (unwind-protect
+        (progn
+          (set-window-buffer window buffer)
+          (seshat-reader-resize-test--set-page-overlay window buffer 'fit)
+          (cl-letf (((symbol-function 'seshat-reader--recenter-window)
+                     (lambda (_window) (cl-incf recentres)))
+                    ((symbol-function 'seshat-reader--window-create-function)
+                     (lambda (_window) (cl-incf creates))))
+            (with-current-buffer buffer
+              (seshat-reader--handle-window-buffer-change window)))
+          (should (= 1 recentres))
+          (should (= 0 creates)))
+      (set-window-buffer window orig-buffer)
+      (seshat-reader-resize-test--clear-window window)
+      (kill-buffer buffer))))
+
+;;; 27. 换 buffer 到同一个 reader buffer：缺 overlay 时只创建，不 recentre
+
+(ert-deftest seshat-reader-resize-test--window-buffer-change-creates-overlay-when-missing ()
+  "Without a page overlay the create branch runs and the recentre does not.
+
+The two branches are mutually exclusive because `--window-create-function'
+centres the page itself; running both would do the alignment work twice.
+One create with zero recentres pins the exclusivity."
+  (let ((window (selected-window))
+        (orig-buffer (window-buffer (selected-window)))
+        (buffer (seshat-reader-resize-test--reader-buffer))
+        (recentres 0)
+        (creates 0))
+    (unwind-protect
+        (progn
+          (set-window-buffer window buffer)
+          (seshat-reader-resize-test--clear-window window)
+          (cl-letf (((symbol-function 'seshat-reader--recenter-window)
+                     (lambda (_window) (cl-incf recentres)))
+                    ((symbol-function 'seshat-reader--window-create-function)
+                     (lambda (_window) (cl-incf creates))))
+            (with-current-buffer buffer
+              (seshat-reader--handle-window-buffer-change window)))
+          (should (= 0 recentres))
+          (should (= 1 creates)))
+      (set-window-buffer window orig-buffer)
+      (seshat-reader-resize-test--clear-window window)
+      (kill-buffer buffer))))
+
+;;; 28. 换 buffer 到普通 buffer：两条分支都不走
+
+(ert-deftest seshat-reader-resize-test--window-buffer-change-skips-non-reader-buffer ()
+  "A window showing a non-reader buffer neither recentres nor creates an overlay.
+
+The `derived-mode-p' guard must gate both branches: a plain buffer has no
+page to align, and creating an overlay there would attach the reader's
+display machinery to an unrelated buffer."
+  (let ((window (selected-window))
+        (orig-buffer (window-buffer (selected-window)))
+        (buffer (generate-new-buffer " *seshat-reader-resize-test-plain*"))
+        (recentres 0)
+        (creates 0))
+    (unwind-protect
+        (progn
+          (set-window-buffer window buffer)
+          (should (eq (with-current-buffer buffer major-mode) 'fundamental-mode))
+          (cl-letf (((symbol-function 'seshat-reader--recenter-window)
+                     (lambda (_window) (cl-incf recentres)))
+                    ((symbol-function 'seshat-reader--window-create-function)
+                     (lambda (_window) (cl-incf creates))))
+            (with-current-buffer buffer
+              (seshat-reader--handle-window-buffer-change window)))
+          (should (= 0 recentres))
+          (should (= 0 creates)))
+      (set-window-buffer window orig-buffer)
+      (seshat-reader-resize-test--clear-window window)
+      (kill-buffer buffer))))
+
+;;; 29. image size 未知时 right-most-window-hscroll 返回 0 且不抛错
+
+(ert-deftest seshat-reader-resize-test--right-most-window-hscroll-nil-image-size ()
+  "An unrendered page yields 0 instead of a `wrong-type-argument' error.
+
+`--get-current-doc-image-size' returns (nil . nil) until the overlay display
+carries :width/:height, and this function runs during mode initialisation
+from `--set-window-hscroll'.  Subtracting nil from the pixel width used to
+signal; the nil guard turns that into a harmless 0."
+  (let ((window (selected-window))
+        (result 'unset))
+    (cl-letf (((symbol-function 'seshat-reader--get-current-doc-image-size)
+               (lambda (&optional _window) (cons nil nil)))
+              ((symbol-function 'seshat-reader--get-prefix-width)
+               (lambda (&optional _window) 0))
+              ((symbol-function 'seshat-reader--get-pixel-per-col)
+               (lambda (&optional _window) 9)))
+      (setq result (seshat-reader--right-most-window-hscroll window)))
+    (should (= 0 result))))
+
+;;; 30. image size 已知时公式不变
+
+(ert-deftest seshat-reader-resize-test--right-most-window-hscroll-formula-regression ()
+  "A known image size still goes through the original arithmetic.
+
+The nil guard must only short-circuit the unknown-size case: with a 2000px
+page, a 1000px window body and 10px per column the rightmost hscroll stays
+the old (2000 - 1000) / 10 = 100."
+  (let ((window (selected-window))
+        (result 'unset))
+    (cl-letf (((symbol-function 'seshat-reader--get-current-doc-image-size)
+               (lambda (&optional _window) (cons 2000 3000)))
+              ((symbol-function 'seshat-reader--get-prefix-width)
+               (lambda (&optional _window) 0))
+              ((symbol-function 'seshat-reader--get-pixel-per-col)
+               (lambda (&optional _window) 10))
+              ((symbol-function 'window-body-width)
+               (lambda (&optional _window _pixelwise) 1000)))
+      (setq result (seshat-reader--right-most-window-hscroll window)))
+    (should (= 100 result))))
+
 (provide 'seshat-reader-resize-test)
 
 ;;; seshat-reader-resize-test.el ends here

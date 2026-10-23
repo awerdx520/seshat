@@ -727,15 +727,21 @@ WINDOW must be a valid window and defaults to the selected one."
 (defun seshat-reader--right-most-window-hscroll (&optional window)
   "Get the maximum horizontal scroll value for WINDOW.
 
-This position is at the rightmost point.
+This position is at the rightmost point.  Returns 0 while the page has not
+been rendered yet: the image size is unknown then, and callers such as
+`seshat-reader--set-window-hscroll' run during mode initialisation and must
+not signal.
+
 WINDOW must be a valid window and defaults to the selected one."
   (let* ((image-width (car (seshat-reader--get-current-doc-image-size window)))
 	 (line-prefix-width (seshat-reader--get-prefix-width window))
 	 (pixel-window-width (window-body-width window t))
-	 (max-ncol (round (/ (max line-prefix-width
-				  (- image-width pixel-window-width))
-			     (seshat-reader--get-pixel-per-col window)))))
-    max-ncol))
+	 (pixel-per-col (seshat-reader--get-pixel-per-col window)))
+    (if (and (numberp image-width) (numberp pixel-per-col) (> pixel-per-col 0))
+	(round (/ (max line-prefix-width
+		       (- image-width pixel-window-width))
+		  pixel-per-col))
+      0)))
 
 (defun seshat-reader--set-window-hscroll (window ncol &optional unconstrained)
   "Set number of columns WINDOW is scrolled from left margin to NCOL.
@@ -1020,7 +1026,7 @@ AMOUNT defaults to 1.
 Only scrolls when the document page width is larger then the window width."
   (interactive "p")
   (or amount (setq amount 1))
-  (when-let* (((< (window-body-width nil t) (car (seshat-reader--get-current-doc-image-size))))
+  (when-let* (((< (window-body-width nil t) (or (car (seshat-reader--get-current-doc-image-size)) 0)))
 	      (prev-scroll (seshat-reader--window-hscroll))
 	      (hscroll (+ prev-scroll amount)))
     (- (seshat-reader--set-window-hscroll nil hscroll) prev-scroll)))
@@ -1031,7 +1037,7 @@ Only scrolls when the document page width is larger then the window width."
 Only scrolls when the document page width is larger then the window width."
   (interactive "p")
   (or amount (setq amount 1))
-  (when-let* (((< (window-body-width nil t) (car (seshat-reader--get-current-doc-image-size))))
+  (when-let* (((< (window-body-width nil t) (or (car (seshat-reader--get-current-doc-image-size)) 0)))
 	      (prev-scroll (seshat-reader--window-hscroll))
 	      (hscroll (- prev-scroll amount)))
     (- prev-scroll (seshat-reader--set-window-hscroll nil hscroll))))
@@ -1041,7 +1047,7 @@ Only scrolls when the document page width is larger then the window width."
 
 Only scrolls when the document page width is larger then the window width."
   (interactive)
-  (when (< (window-body-width nil t) (car (seshat-reader--get-current-doc-image-size)))
+  (when (< (window-body-width nil t) (or (car (seshat-reader--get-current-doc-image-size)) 0))
     (seshat-reader--set-window-hscroll nil 0)))
 
 (defun seshat-reader-scroll-right-most ()
@@ -1049,7 +1055,7 @@ Only scrolls when the document page width is larger then the window width."
 
 Only scrolls when the document page width is larger then the window width."
   (interactive)
-  (when (< (window-body-width nil t) (car (seshat-reader--get-current-doc-image-size)))
+  (when (< (window-body-width nil t) (or (car (seshat-reader--get-current-doc-image-size)) 0))
     ;; We use `set-window-hscroll' here because we need to go the right
     ;; most point directly, bypassing `'seshat-reader--set-window-hscroll' checks.
     (set-window-hscroll nil (seshat-reader--right-most-window-hscroll))))
@@ -1327,8 +1333,16 @@ It is hooked to `window-configuration-change-hook' to keep detecting."
 
 (defun seshat-reader--handle-window-buffer-change (window)
   "Handle overlay state when WINDOW's buffer changes.
+
 Cleans up stale overlays if the window switched to a different buffer,
-and ensures a valid overlay exists if the new buffer is a seshat-reader buffer."
+ensures a valid overlay exists if the new buffer is a seshat-reader buffer,
+and recentres a window whose page overlay survived the switch.
+
+`set-window-buffer' resets the window's horizontal scroll to zero on its
+own, and showing the same document in a new window or a new frame triggers
+neither `window-size-change-functions' nor the creation of a new overlay,
+so without this recentre the page stays glued to the right edge of the
+window and never recovers."
   (when (windowp window)
     (let ((overlay (window-parameter window 'overlay)))
       (when (and overlay (overlayp overlay))
@@ -1339,10 +1353,14 @@ and ensures a valid overlay exists if the new buffer is a seshat-reader buffer."
           ;; We intentionally preserve 'page and 'scale so they can be
           ;; restored if the user switches back to the original seshat-reader buffer.
           )))
-    ;; If the new buffer is a seshat-reader buffer and lacks an overlay, create one.
+    ;; If the new buffer is a seshat-reader buffer: recentre when the page
+    ;; overlay is already there, otherwise create it.  The two branches are
+    ;; mutually exclusive on purpose — `--window-create-function' already
+    ;; centres the page, so recentring again would only do the work twice.
     (when (with-current-buffer (window-buffer window)
             (derived-mode-p 'seshat-reader-mode))
-      (unless (window-parameter window 'overlay)
+      (if (window-parameter window 'overlay)
+          (seshat-reader--recenter-window window)
         (seshat-reader--window-create-function window)))))
 
 ;; We explicitly bind default keys because relying on the rebinding
