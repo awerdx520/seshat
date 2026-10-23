@@ -4,14 +4,15 @@
 
 ## 当前状态
 
-- 阶段：Phase 3（Implement）· T0–T3 完成，L1+L2 全绿
-- 已确认：方案 ✅（用户 2026-10-22 确认）、计划 ✅（用户 2026-10-22 确认）
-- 实施：T0–T3 ✅（commit `c47100c` / `0d5edbd` + 本批测试）；T4 真机、T5 文档、T6 归档待做
-- 验证：L1 警告集零新增（33 条）；L2 **329** 例 / 0 unexpected / 0 skipped
-- 下一步：**等用户在 GUI Emacs 上做 T4 的 8 条真机验收**（batch 无法自动化，`fit-to-height` 会报 `Window system frame should be used`）；通过后再做 T5 文档 + T6 归档
+- 阶段：Phase 3（Implement）· T0–T3 + D6 + 抖动闸 + **T7（居中同步化）** 完成，L1+L2 全绿
+- 已确认：方案 ✅（用户 2026-10-22 确认）、计划 ✅（用户 2026-10-22 确认）、T7 方案 A ✅（用户 2026-10-23 确认）
+- 实施：T0–T3 ✅（commit `c47100c` / `0d5edbd` + 本批测试）；**T7 ✅ 2026-10-23**（新增 `--recenter-window`，两形态均在 hook 内同步 recentre）；T4 真机、T5 文档、T6 归档待做
+- 验证：L1 警告集零新增（33 → 33 条，行号归一化后 diff 为空）；L2 **337** 例 / 337 passed / 0 unexpected / 0 skipped
+- 下一步：**等用户在 GUI Emacs 上做 T4 的 8 条真机验收**（batch 无法自动化，`fit-to-height` 会报 `Window system frame should be used`），其中必须含 **D7 抖动复验**：开关目录 / 面板时页面须始终居中、不出现偏左中间帧；通过后再做 T5 文档 + T6 归档
 - 2026-10-23 追加：真机验收发现窗口变窄时页面超宽裁切（主路径缺陷），按方案 C 修复（contain + 负偏移夹 0），详见 D6
 - 2026-10-23 真机第二次纠正：hook 实际传 window（非 frame），refit 链路此前从未运行；`--center-page` 的 prefix/hscroll 改为同成同败。见 D2 与「旧版计划的错误清单」第 7 条。
 - 2026-10-23 真机反馈：布局与居中已正常，但画面持续抖动；实现 D3 预留的偏差闸（1%）+ --refitting 防重入，阻断 refit 自我激发。
+- 2026-10-23 真机抖动第二轮（截图实测偏左约 175px）：refit 只排 idle timer，居中不在 hook 内同步执行 → 必然出现中间帧。按方案 A 新增 `--recenter-window`，在尺寸变化 hook 内同步 recentre，见 D7 / T7。
 
 ## 目标
 
@@ -230,6 +231,15 @@ SOURCE 非 nil 时，把它记为该窗口的缩放来源（`fit' 或 `manual'�
 - **取舍**：选择「页面变小但完整可见」而非「保持大小 + 横向滚动」，理由是真机默认场景（开目录）下后者等于看不全。
 - **待确认**：实施中发现 `seshat-reader-default-fit` 在自动 fit 路径上已无任何调用点（`grep` 只剩 defcustom 自身），即该 defcustom 事实上变为 no-op；任何「让它覆盖 contain」的写法都会导致另一维溢出，故无法在不溢出的前提下恢复其区分度。是否删除该用户选项属破坏性变更，留给用户决定（见 tech-debt / decisions）。
 
+### D7 居中同步化（2026-10-23 真机抖动第二轮，方案 A）
+
+- **现象**：开关目录后页面「整体向左移一下再居中」。截图实测页面中心与阅读区中心相差约 175px，用户看到的是中间帧。
+- **根因**：`--window-size-change` 只 `--schedule-refit`（idle 0.15s），`--center-page` 仅在 `--refit-window` 内被调；而 `--center-page` 写入的 `line-prefix` 与 hscroll 都是静态值，redisplay 不会随窗口宽窄重算 → 中间帧必然偏。
+- **参照**：上游 emacs-reader（Codeberg `MonadicSheep/emacs-reader` master，2026-10-21）在 hook 内**同步**调 `reader--center-page`（`(add-hook 'window-size-change-functions #'reader--center-page nil t)`），故无中间帧；Emacs 内置 `doc-view.el:1693-1699` 更进一步，用 `(space :align-to (+ center (-0.5 . W)))` 让 redisplay 自动求值（无 hook 依赖），但其可否用于 `line-prefix` 未验证（H5），且超宽页仍需条件分支，暂不采用。
+- **方案**：新增 `--recenter-window`（四道既有守卫 + `--clamp-window-vscroll` + `--center-page`，不重渲染）；`--window-size-change` 在两种参数形态下都先对**每个**匹配窗口同步 recentre，再排一次 idle refit。frame 分支由原来的 `throw` 提前退出改为 `matched` 汇总——否则多窗口只有第一个被居中。
+- **不改**：`--center-page` / `--set-window-vscroll` / `--page-max-vscroll-pixels` / `--refit-window` / `--schedule-refit` 函数体、三条 hook 注册行、零新增 defcustom。
+- **取舍**：位移型抖动消除；剩余的是「页面缩放到新尺寸」的一次变化，属 contain 需求本身（L3-1/L3-3 要求页面缩小到完整可见），不算抖动。
+
 ## 旧版计划的错误清单
 
 | # | 旧版说法 | 实测事实（HEAD `f56dcce`） |
@@ -327,6 +337,13 @@ SOURCE 非 nil 时，把它记为该窗口的缩放来源（`fit' 或 `manual'�
 - 动作：计划移入 `openspec/completed/`、`## 当前状态` 收尾更新、`memory_lesson_save` 沉淀可复用经验（按 `rules/workflow.md` 记忆归属规则：涉及 elisp MCP / Emacs 全局行为时省略 `project`）。
 - 依赖：T4、T5
 - 验收：`openspec/active/` 无本计划残留；`openspec/completed/` 有归档文件；沉淀记录可检索。
+
+### [x] T7 居中同步化（D7，2026-10-23 用户确认方案 A 后实施）
+
+- 动作：新增 `--recenter-window`；`--window-size-change` 两形态均先同步 recentre 再排 refit；frame 分支改 `matched` 汇总以居中全部匹配窗口。
+- 依赖：T3
+- 验收：新增 ERT 3 例（同步 recentre + 顺序、多窗口居中各 1 次且 refit 仅 1 次、overlay 缺失时只跳过同步段）；`resize-test` 全绿；11 个文件合计 `unexpected = 0`；`make all` 警告集零新增。
+- ✅ 2026-10-23 完成：`emacs/tests/seshat-reader-resize-test.el` **25/25 全绿**（原 22 例 + 新 3 例）；11 个文件合计 **337 例 / 337 passed / 0 unexpected / 0 skipped**；`make all` 退出码 0、警告集 **33 → 33**（行号归一化后 diff 为空）；变异自检（`/tmp` 副本删掉两处 `--recenter-window` 调用）→ 仅 `--size-change-recentres-synchronously` 与 `--size-change-recentres-every-window` 变红，其余 23 例仍绿。
 
 ## 依赖关系
 
@@ -448,11 +465,15 @@ git clean -fd -- emacs/tests/seshat-reader-resize-test.el
 | `seshat-reader-reference-test.el` | 50 | 50 | 0 | 0 |
 | `seshat-reader-select-flash-test.el` | 8 | 8 | 0 | 0 |
 | `seshat-reader-sidebar-test.el` | 56 | 56 | 0 | 0 |
-| `seshat-reader-translate-test.el` | 47 | 45 | 2 | 0 |
-| `seshat-reader-resize-test.el`（新增） | 17 | 17 | 0 | 0 |
-| **合计** | **329** | **329** | **0** | **0** |
+| `seshat-reader-translate-test.el` | 47 | 47 | 0 | 0 |
+| `seshat-reader-resize-test.el` | 25 | 25 | 0 | 0 |
+| **合计** | **337** | **337** | **0** | **0** |
 
-- 判据全部满足：合计 **329 ≥ 329**、`unexpected = 0`、`skipped = 0`（2026-10-22 实测时 translate 有 2 例跳过；2026-10-23 复跑为 0 跳过，该 2 例的跳过条件当日未触发）。
+- 判据全部满足：合计 **337 ≥ 329**、`unexpected = 0`、`skipped = 0`（2026-10-22 实测时 translate 有 2 例跳过；2026-10-23 复跑为 0 跳过，该 2 例的跳过条件当日未触发）。
+- **2026-10-23 抖动第二轮（D7）后的实测**（上表即此次实跑数字，逐文件与 `git diff` 同批）：`seshat-reader-resize-test.el` 由 17 例增至 **25 例**（22 例存量 + 3 例 D7 新增），合计 337。命令口径：`emacs --batch -Q -L emacs -L emacs/seshat-reader -L <straight build-31.1 中除 seshat-reader 外的全部包目录> -l <TEST-FILE> -f ert-run-tests-batch-and-exit`。
+  - **口径陷阱（本轮实测）**：`emacs -Q` 不加载用户配置，`etaf-ui` / `gt`（go-translate）/ `pdd` 均不在默认 `load-path`，`annotation-v8`（2 例）、`etaf`（15 例）、`sidebar`（3 例）、`translate`（整文件加载失败）会假失败 / 假跳过；补齐 `~/.local/straight/build-31.1/*` 后全部转绿且 0 skipped。
+  - **第二个陷阱**：该目录里存在 straight 自己的 `seshat-reader` 副本，若前置注入 `load-path` 会**遮蔽仓库版本**（`--recenter-window` 变成 void → 新用例红）。最终命令把 straight 目录**追加到末尾并排除名字含 `seshat` 的目录**，仓库版本始终优先。
+  - D7 变异自检：`/tmp/mut` 副本删掉 `--window-size-change` 里两处 `--recenter-window` 调用 → 仅 `--size-change-recentres-synchronously`（顺序断言）与 `--size-change-recentres-every-window`（多窗口各居中）变红，其余 23 例仍绿。
 - 2026-10-23 追加（D6）：`seshat-reader-resize-test.el` 由 13 例增至 17 例（新增 contain 三态 + `--center-page` 负偏移夹紧），合计 329；变异自检：①去掉 `scroll-offset` 的 `(max 0 …)` → 仅 `--center-page-clamps-negative-offset` 红；②自动 fit 回到 `(funcall seshat-reader-default-fit)` → `--refit-fit-branch` / `--refit-unset-source` / `--refit-multi-window` / `--presentation-mode-keeps-fit` 红；③`(min width-factor height-factor)` 改 `max` → 3 个 contain 用例红。
 - `seshat-reader-page-join-test.el` 24 例全绿，含 `--vscroll-max` / `--vscroll-max-not-negative` / `--page-max-vscroll-pixels` 等 5 个 vscroll 用例 → 上限公式与 `--set-window-vscroll` 未被改动。
 - 新测试文件的变异自检（在 `/tmp` 副本上改坏实现、不改仓库文件）：① 删 `--refit-window` 的 manual 分支 → 仅 `--refit-manual-branch` 红；② 去掉 `--clamp-window-vscroll` 的 `(max 0 …)` 下界 → 仅 `--clamp-window-vscroll` 红；③ 删 `--schedule-refit` 里的 `--cancel-pending-refit` → 仅 `--schedule-refit-debounce` 红；④ 删 `--clear-doc-memory` 里的 `--cancel-pending-refit` → 仅 `--run-pending-refit-dead-buffer` 红。未改动的副本 13/13 绿。

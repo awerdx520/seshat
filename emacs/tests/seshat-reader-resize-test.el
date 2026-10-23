@@ -837,6 +837,116 @@ back to nil, so the zero count cannot pass for a broken stub."
       (when (timerp timer) (cancel-timer timer))
       (kill-buffer buffer))))
 
+;;; 23. 尺寸变化：同步居中先于排 refit（D7，方案 A）
+
+(ert-deftest seshat-reader-resize-test--size-change-recentres-synchronously ()
+  "A size change recentres the window before the refit is queued.
+
+`seshat-reader--center-page' writes a static `line-prefix' and a static
+horizontal scroll, and redisplay recomputes neither, so a hook that only
+schedules the refit leaves the frame which noticed the size change
+off-centre until the idle timer fires (175px on the real machine).  The
+order assertion is the point of this test: centring must happen
+synchronously, inside the hook, before the debounced refit is armed."
+  (let ((window (selected-window))
+        (orig-buffer (window-buffer (selected-window)))
+        (buffer (seshat-reader-resize-test--reader-buffer))
+        (events nil))
+    (unwind-protect
+        (progn
+          (set-window-buffer window buffer)
+          (seshat-reader-resize-test--set-page-overlay window buffer 'fit)
+          (cl-letf (((symbol-function 'seshat-reader--clamp-window-vscroll)
+                     (lambda (&optional _window) (push 'clamp events)))
+                    ((symbol-function 'seshat-reader--center-page)
+                     (lambda (&optional _window) (push 'center events)))
+                    ((symbol-function 'seshat-reader--schedule-refit)
+                     (lambda () (push 'refit events) nil)))
+            (with-current-buffer buffer
+              (seshat-reader--window-size-change window)))
+          (should (equal '(clamp center refit) (nreverse events))))
+      (set-window-buffer window orig-buffer)
+      (seshat-reader-resize-test--clear-window window)
+      (kill-buffer buffer))))
+
+;;; 24. 尺寸变化：frame 形态居中每个匹配窗口，但只排一次 refit
+
+(ert-deftest seshat-reader-resize-test--size-change-recentres-every-window ()
+  "The frame shape recentres every matching window but queues one refit.
+
+Both windows show the reader buffer, so both must be recentred
+synchronously: a `throw' that stops at the first match leaves the second
+window showing a stale, off-centre page.  The refit is buffer-wide — it
+cancels and re-arms a single timer — so it is queued once, not once per
+window."
+  (let* ((window1 (selected-window))
+         (orig-buffer (window-buffer window1))
+         (buffer (seshat-reader-resize-test--reader-buffer))
+         (window2 nil)
+         (clamps 0)
+         (centers 0)
+         (refits 0))
+    (unwind-protect
+        (progn
+          (setq window2 (split-window window1))
+          (dolist (window (list window1 window2))
+            (set-window-buffer window buffer)
+            (seshat-reader-resize-test--set-page-overlay window buffer 'fit))
+          (cl-letf (((symbol-function 'seshat-reader--clamp-window-vscroll)
+                     (lambda (&optional _window) (cl-incf clamps)))
+                    ((symbol-function 'seshat-reader--center-page)
+                     (lambda (&optional _window) (cl-incf centers)))
+                    ((symbol-function 'seshat-reader--schedule-refit)
+                     (lambda () (cl-incf refits) nil)))
+            (with-current-buffer buffer
+              (seshat-reader--window-size-change (selected-frame))))
+          (should (= 2 clamps))
+          (should (= 2 centers))
+          (should (= 1 refits)))
+      (when (window-live-p window2)
+        (ignore-errors (delete-window window2)))
+      (dolist (window (list window1 window2))
+        (when (window-live-p window)
+          (set-window-buffer window orig-buffer)
+          (seshat-reader-resize-test--clear-window window)))
+      (kill-buffer buffer))))
+
+;;; 25. 守卫：overlay 缺失时只跳过同步段，refit 照排
+
+(ert-deftest seshat-reader-resize-test--recenter-skips-window-without-overlay ()
+  "A window without a page overlay is skipped by the recentre, not the refit.
+
+The overlay guard belongs to the synchronous recentre: a window whose
+`overlay' parameter is missing — or holds something that is not an overlay —
+must still get its refit queued, otherwise a page that lost its overlay for
+a moment would never be re-rendered.  Zero clamps and zero centres with one
+refit pin exactly that split."
+  (let ((window (selected-window))
+        (orig-buffer (window-buffer (selected-window)))
+        (buffer (seshat-reader-resize-test--reader-buffer))
+        (clamps 0)
+        (centers 0)
+        (refits 0))
+    (unwind-protect
+        (progn
+          (set-window-buffer window buffer)
+          ;; 非 overlay 的 'overlay 参数：守卫必须按 overlayp 判，而不是按存在性
+          (set-window-parameter window 'overlay "not-an-overlay")
+          (cl-letf (((symbol-function 'seshat-reader--clamp-window-vscroll)
+                     (lambda (&optional _window) (cl-incf clamps)))
+                    ((symbol-function 'seshat-reader--center-page)
+                     (lambda (&optional _window) (cl-incf centers)))
+                    ((symbol-function 'seshat-reader--schedule-refit)
+                     (lambda () (cl-incf refits) nil)))
+            (with-current-buffer buffer
+              (seshat-reader--window-size-change window)))
+          (should (= 0 clamps))
+          (should (= 0 centers))
+          (should (= 1 refits)))
+      (set-window-buffer window orig-buffer)
+      (seshat-reader-resize-test--clear-window window)
+      (kill-buffer buffer))))
+
 (provide 'seshat-reader-resize-test)
 
 ;;; seshat-reader-resize-test.el ends here

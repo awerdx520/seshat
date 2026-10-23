@@ -826,26 +826,65 @@ being clipped on both sides."
           (set-window-hscroll window 0))))))
 
 (defun seshat-reader--window-size-change (window-or-frame)
-  "Schedule a refit after a size change of WINDOW-OR-FRAME.
+  "Recentre and schedule a refit after a size change of WINDOW-OR-FRAME.
 
 `window-size-change-functions' passes a window when the hook entry is
 buffer-local (which is how this package registers it) and a frame when it
 is the global or default value.  Both shapes are accepted: a window is
 checked directly, a frame is walked for windows showing the current
-buffer.  Scheduling is buffer-wide, so at most one refit is queued per
-event."
+buffer.
+
+Every matching window is recentred synchronously by
+`seshat-reader--recenter-window', so that the frame produced by this very
+redisplay is already centred; the re-render at the new scale is left to the
+debounced refit.  Scheduling is buffer-wide, so at most one refit is queued
+per event no matter how many windows match."
   (cond
    ((windowp window-or-frame)
     (when (eq (window-buffer window-or-frame) (current-buffer))
+      (seshat-reader--recenter-window window-or-frame)
       (seshat-reader--schedule-refit)))
    ((frame-live-p window-or-frame)
-    ;; 同一 buffer 只排一次：调度本身就是 buffer 级的（取消并重排同一个
-    ;; timer），每个匹配窗口各排一次只会重复取消/重排。
-    (catch 'scheduled
+    ;; 每个匹配窗口都要同步居中，但 refit 是 buffer 级的（取消并重排同一个
+    ;; timer），多窗口各排一次只是重复取消/重排，故用 MATCHED 汇总后只排一次。
+    (let ((matched nil))
       (dolist (window (window-list window-or-frame))
         (when (eq (window-buffer window) (current-buffer))
-          (seshat-reader--schedule-refit)
-          (throw 'scheduled nil)))))))
+          (seshat-reader--recenter-window window)
+          (setq matched t)))
+      (when matched
+        (seshat-reader--schedule-refit))))))
+
+(defun seshat-reader--recenter-window (window)
+  "Recentre WINDOW synchronously, without re-rendering the page.
+
+Centring writes a static `line-prefix' and a static horizontal scroll, and
+redisplay recomputes neither when the window grows or shrinks.  Doing the
+work from the size-change hook is therefore what keeps the very frame that
+noticed the size change from showing a stale, off-centre page; the resize
+tests pin this behaviour.
+
+Only geometry is touched here: the page is not re-rendered, because the C
+side renders synchronously and redisplay cannot afford it.  Re-rendering at
+the new scale stays in the debounced refit
+\(`seshat-reader--schedule-refit').
+
+WINDOW is skipped silently when it is no longer live, no longer shows the
+current buffer, has lost its page overlay, or shows a buffer that has left
+`seshat-reader-mode'.  An error while recentring one window is reported and
+does not prevent the other windows from being recentred."
+  (when (and (window-live-p window)
+             (eq (window-buffer window) (current-buffer))
+             (overlayp (window-parameter window 'overlay)))
+    (with-current-buffer (window-buffer window)
+      (when (derived-mode-p 'seshat-reader-mode)
+        (condition-case err
+            (progn
+              (seshat-reader--clamp-window-vscroll window)
+              (seshat-reader--center-page window))
+          (error
+           (message "seshat-reader: resize recentre skipped in %s: %S"
+                    (buffer-name) err)))))))
 
 (defun seshat-reader--schedule-refit ()
   "Schedule a debounced refit of the windows showing the current buffer.
