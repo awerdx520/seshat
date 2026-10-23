@@ -2,13 +2,13 @@
 
 ## 当前状态
 
-- 阶段：Phase 4（Review & Document）· M7 已完成并归档
+- 阶段：Phase 4（Review & Document）· M12 及其后续（尺寸自适应重贴合、平滑适配 + `W`/`H` 持久模式）均已归档，`openspec/active/` 仅剩本路线图；下一个里程碑待定
 - 已确认：整体方案 ✅（用户 2026-10-12 确认）、路线图 ✅（用户 2026-10-12 确认）；M7 方案 ✅ 与计划 ✅（用户 2026-10-18 确认）
 - 加密：维持现有 TLS（反向代理终止）；**不做应用层加密**（用户已取消该需求）
 - 下一步：M8（Emacs 端接入）需另行方案确认与计划确认
 - 2026-10-19 进展：**M10.7 真机验收通过并归档**（七项全过；同步修 2 处缺陷：渲染页 toolbar 标题不随内容更新、笔记列表不读 `#+FILETAGS:`；新增 5 条 tech-debt，单测 562 → 566）；M9.1 / M9.2（设置项·连续滚动）/ M10.5（手写·点击翻页·横屏）/ M10.6-B1（服务端可选）已完成并归档；M10.6-B2（阅读器交互：浮层显隐·SeekBar·目录）、M10.6-B3（书架：封面网格·进度徽标·过滤排序·点击打开）、M10.6-B4（Notes：树列表·搜索·编辑页·GTD 并入 + `NotesSync` 抽取与数据源统一）代码/单测/文档完成（**真机验证通过**，2026-10-18/19，见 openspec/completed/2026-10-18-m10.6-reader-books-notes-alignment.md「B1~B4 全部完成（真机全通过）」）；M9.2 B 批（文件同步：接入 `ResourceIndex`/`SyncEngine`、服务端书架数据源、按需下载、本地导入上传（≤32 MiB）、元数据回填、`move` 跟随）代码/单测/文档完成（2026-10-19，真机验证通过，单测 566 → 641）；M7 服务端已完成（待提交）
 - 2026-10-20 进展：**M10.8（阅读器 UX 重排与手写增强，7 项需求）与 M10.9（目录树形左侧抽屉）均已实现并归档**（代码已提交 `e50a23a` / `8c14494` / `0361faf` / `bb759f1` / `9e7ffd8` / `cd55316` / `c4a76d3`；单测 649 → **721** → **754**，含 1 例 skipped），**✅ 真机验证通过（2026-10-20，设备 24091RPADC / Android 16，EPUB 与 PDF 两个阅读器）**；`c4a76d3` 追加两项：进入阅读默认沉浸、手写参数面板移到屏幕右侧竖排浮条；文档已同步 `docs/android.md` §6 / `CHANGELOG.md` / `openspec/decisions.md` / `openspec/tech-debt.md`（新增 4 条未通过项）；破例引入 `com.tom-roush:pdfbox-android:2.0.27.0`（用户 2026-10-20 授权的唯一例外，见 decisions.md）
-- 下一步：**M12 已完成并归档（openspec/completed/2026-10-22-m12-reader-ux-layout-and-highlight.md，残余视觉项待用户目视）；下一个里程碑待定；M10.3/M10.4 已归档，L3 真机待验；emacs-reader 尺寸自适应计划（`2026-10-22-emacs-reader-resize-refit.md`）待独立审查与用户确认**（M10.6 B2/B3/B4、M9.2 B 批、M10.8、M10.9 均已验收通过并归档）
+- 下一步：**M12 已完成并归档（openspec/completed/2026-10-22-m12-reader-ux-layout-and-highlight.md，残余视觉项待用户目视）；下一个里程碑待定；M10.3/M10.4 已归档，L3 真机待验；emacs-reader 尺寸自适应计划已归档（`openspec/completed/2026-10-22-emacs-reader-resize-refit.md`，2026-10-23；机制已由后续 `2026-10-23-emacs-reader-smooth-fit.md` 演进）**（M10.6 B2/B3/B4、M9.2 B 批、M10.8、M10.9 均已验收通过并归档）
 - 2026-10-23 进展：阅读器**尺寸变化即时适配 + `W` / `H` 适配模式持久化**实施完成并归档（`openspec/completed/2026-10-23-emacs-reader-smooth-fit.md`）：L1 `make all` EXIT=0、警告集 33 条零新增（逐条 diff）；L2 全仓 ERT **379** 例全绿 / 0 unexpected / 0 skipped（resize 测试 30 → **67** 例）；**真机验收通过**（开关目录第一帧即居中、`W` / `H` 后仍居中、打开文档无「先小后大」；隔离实例逐帧测量 Δ≤0.5px）；文档已同步（CHANGELOG / decisions ×5 / tech-debt / VENDORED 第 ⑧+⑨ 项 / `docs/emacs-reader.md` §3+§12）。
 - 未决问题（阻塞后续里程碑，不阻塞本文件）：收录目录清单、GTD 深度、Reader 功能清单、EPUB location 约定
 
@@ -167,10 +167,10 @@ M0–M6 已完成并归档，见 `openspec/completed/personal-notes-system.md`�
 
 ### M12 后续：阅读器窗口尺寸自适应
 
-计划与执行记录：`openspec/active/2026-10-22-emacs-reader-resize-refit.md`。
+计划与执行记录：`openspec/completed/2026-10-22-emacs-reader-resize-refit.md`（**已归档，2026-10-23**）。
 
 - 内容：窗口尺寸变化（开关目录/批注面板、拖分割线、新窗口）后重新贴合页面——`scale-source`（fit/manual）、`--contain-scale`（min 按高/按宽）、`--clamp-window-vscroll`、idle 去抖 + 1% 偏差闸 + `--refitting` 防重入、`--recenter-window` 同步居中；并修两处边界缺陷（换 buffer 后 hscroll 归零、首次打开抛 `wrong-type-argument`）。
-- 状态：代码 + 单测（`seshat-reader-resize-test.el` 30 例，全仓 ERT 342 例 0 unexpected）+ 文档已完成（2026-10-23）；实例几何实测证明开关面板路径 dev=0（无中间帧），**真机目视确认待用户**；确认后归档 `openspec/completed/`。
+- 状态：**✅ 已归档（2026-10-23）**——代码 + 单测 + 文档完成（归档时 `seshat-reader-resize-test.el` 30 例、全仓 ERT 342 例 0 unexpected；T5 文档六件套与 tech-debt 四条均已落地）；真机验收由后续 `2026-10-23-emacs-reader-smooth-fit.md` 覆盖，L3-6（短页 vscroll 非负）与 L3-8（daemon）两项记为待观察。**机制演进**：1% 偏差闸 → `render-scale` 清晰度闸；`line-prefix` + hscroll 居中 → `before-string` + `:align-to`（redisplay 求值）。
 
 ### M12 后续：阅读器尺寸变化即时适配 + `W` / `H` 适配模式持久化
 

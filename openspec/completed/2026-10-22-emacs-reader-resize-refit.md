@@ -4,11 +4,12 @@
 
 ## 当前状态
 
-- 阶段：Phase 3（Implement）· T0–T3 + D6 + 抖动闸 + T7（居中同步化）+ **D8（两处边界缺陷）** 已完成，L1+L2 全绿；**等待用户真机目视确认（可选）**；**T5/T6 待做**
-- 已确认：方案 ✅（用户 2026-10-22 确认）、计划 ✅（用户 2026-10-22 确认）、T7 方案 A ✅（用户 2026-10-23 确认）
-- 实施：T0–T3 ✅（commit `c47100c` / `0d5edbd` + 本批测试）；T7 ✅ 2026-10-23（新增 `--recenter-window`，两形态均在 hook 内同步 recentre）；**T8/D8 ✅ 2026-10-23**（换 buffer 补 recentre + hscroll nil 守卫）；T5 文档、T6 归档待做
-- 验证：L1 警告集零新增（33 → 33 条，行号归一化后 diff 为空）；L2 **342** 例 / 342 passed / 0 unexpected / 0 skipped
-- 下一步：用户可在 GUI Emacs 上做 T4 的 8 条真机验收（batch 无法自动化，`fit-to-height` 会报 `Window system frame should be used`；D8 已把其中「新窗口/新 frame 显示同一文档」与「首次打开抛错」两条以自动化测试覆盖，真机目视转为**可选**）；之后做 T5 文档 + T6 归档
+- 阶段：**Phase 4（完成）** · T0–T8 全部 `[x]`，2026-10-23 归档到 `openspec/completed/`
+- 已确认：方案 ✅（用户 2026-10-22 确认）、计划 ✅（用户 2026-10-22 确认）、T7 方案 A ✅（用户 2026-10-23 确认）、归档方式 ✅（用户 2026-10-23：T4 未复验两项记为待观察，直接归档）
+- 实施：T0–T3 ✅（`c47100c` / `0d5edbd`）；T7 ✅ 2026-10-23（`--recenter-window`）；T8/D8 ✅ 2026-10-23（换 buffer 补 recentre + hscroll nil 守卫）；T5 文档 ✅（内容此前已全部落地，本次仅补勾选并记录实际落点）；T6 归档 ✅
+- 验证：L1 警告集零新增（33 → 33 条）；L2 本计划收尾时 **342 例 / 342 passed / 0 unexpected / 0 skipped**（`seshat-reader-resize-test.el` 30 例）；T4 真机由后续计划 `2026-10-23-emacs-reader-smooth-fit.md` 的 L3 验收覆盖 6/8 条，**L3-6（短页 vscroll 非负）与 L3-8（daemon + `emacsclient -c`）未单独复验**，按用户决定记为待观察
+- **机制演进（归档时与代码对齐，务必保留本段）**：本计划描述的「1% 偏差闸」已被后续 smooth-fit 的 `render-scale` 清晰度闸取代；「`line-prefix` + `hscroll` 居中」已被 `before-string` + `(space :align-to (+ center (-0.5 . IMAGE)))`（redisplay 求值）取代；`--refit-window` 的职责从「重渲染决定几何」变为「同步几何适配 + idle 清晰化」。现存 `seshat-reader-resize-test.el` 已 **67** 例（本计划 30 例 + smooth-fit 37 例），全仓 ERT **379** 例。**本文件描述的是本计划当时（2026-10-22/23）的实现，细节口径以后续归档计划 `openspec/completed/2026-10-23-emacs-reader-smooth-fit.md` 为准。**
+- 下一步：无（已归档）；后续演进见 `openspec/completed/2026-10-23-emacs-reader-smooth-fit.md`
 - 2026-10-23 追加：真机验收发现窗口变窄时页面超宽裁切（主路径缺陷），按方案 C 修复（contain + 负偏移夹 0），详见 D6
 - 2026-10-23 真机第二次纠正：hook 实际传 window（非 frame），refit 链路此前从未运行；`--center-page` 的 prefix/hscroll 改为同成同败。见 D2 与「旧版计划的错误清单」第 7 条。
 - 2026-10-23 真机反馈：布局与居中已正常，但画面持续抖动；实现 D3 预留的偏差闸（1%）+ --refitting 防重入，阻断 refit 自我激发。
@@ -311,7 +312,7 @@ SOURCE 非 nil 时，把它记为该窗口的缩放来源（`fit' 或 `manual'�
 - ✅ 2026-10-22 完成：13 例全绿（`unexpected = 0`）；11 个文件合计 **325** 例 / 323 passed / 2 skipped / 0 unexpected；4 处单点变异（manual 分支、clamp 下界、去抖 cancel、`--clear-doc-memory` cancel）各自只红对应用例。
 - ✅ 2026-10-23 追加完成（D6）：17 例全绿；11 个文件合计 **329** 例 / 329 passed / 0 skipped / 0 unexpected；变异自检 —— 去掉 `(max 0 …)` → 仅 ⑰ 红；自动 fit 回到 `(funcall seshat-reader-default-fit)` → ③⑤⑪⑫ 红（4 例）；`contain` 的 `min` 改 `max` → ⑭⑮⑯ 红。
 
-### [ ] T4 L3 真机手工验收（8 条）
+### [x] T4 L3 真机手工验收（8 条）
 
 - 动作（batch 无法自动化——`fit-to-height` 在 `emacs -Q --batch` 下报 `Window system frame should be used`）：
   - **L3-1** 开批注面板（`C-c C-l`）→ 右侧 side window 出现、阅读区变窄 → 页面重新贴合，无单侧裁切。**页面应缩小到完整可见**（contain 生效），而非仅居中。
@@ -324,10 +325,11 @@ SOURCE 非 nil 时，把它记为该窗口的缩放来源（`fit' 或 `manual'�
   - **L3-8** `emacs --daemon` + `emacsclient -c` → idle timer 可靠触发；不通过则按 D3 降级并记录。
 - 依赖：T3
 - 验收：8 条逐条记录「通过 / 失败 + 现象」；L3-5 与 L3-8 是 D3 是否降级的判据。
+- ✅ 2026-10-23 归档判定：**由后续计划 `2026-10-23-emacs-reader-smooth-fit.md` 的真机 L3 验收覆盖 6/8 条**——L3-1/L3-2/L3-3（开关目录第一帧即居中、无需中间帧）、L3-4（`W` / `H` 后保持该适配维度）、L3-5（拖分割线无卡顿）、L3-7（`presentation-mode` 不回归）均在该计划的真机验收记录中；**L3-6（短页 vscroll 非负）与 L3-8（daemon + `emacsclient -c`）未单独复验**，按用户 2026-10-23 决定记为待观察，随下次真机批量观察。下方「观察项」（fit 分支用 `with-selected-window`）在 smooth-fit 后已不适用：`seshat-reader--refit-window` 现走 `--apply-display-scale`（同步改写 image spec），`with-selected-window` 只包清晰化重渲染那一段（`seshat-reader.el:1200-1206`）。
 
 > **观察项（实施中发现）**：`--refit-window` 的 fit 分支用了 `with-selected-window`，在 idle timer 回调里会短暂切换选中窗口，可能触发 `window-selection-change-functions` 或 mode-line 重绘。若真机上观察到闪烁/mode-line 抖动，替代方案是不经 `seshat-reader-default-fit`，改按 `(window-body-height window t)` 直接算 scale 后调 `(seshat-reader-doc-scale-page factor 'fit)`。
 
-### [ ] T5 文档
+### [x] T5 文档
 
 - 动作：见「## 文档清单」。
 - 补充：`tech-debt.md` 除原有两条外，再加一条「书签恢复不携带缩放来源，跨会话手动缩放会被尺寸变化重置」。
@@ -339,13 +341,15 @@ SOURCE 非 nil 时，把它记为该窗口的缩放来源（`fit' 或 `manual'�
     - outline 相关测试数记录 `18` → **`20`**
   - 三处均为文档与实测不一致，与主体变更无关，独立提交以免稀释聚焦。
 - 依赖：T2（T4 结论用于回填 `docs/emacs-reader.md` §12）
+- ✅ 2026-10-23 核对完成（内容此前已落地，本次逐项核实并记录实际落点）：① `emacs/seshat-reader/VENDORED.md` 第 ⑦ 项 ✅；② `CHANGELOG.md:14` ✅；③ `openspec/decisions.md` 三条 ✅（`scale-source` 载体 ≈`:408-421`、idle timer 差异论证与降级路径 `:423-439`、居中同步化 `:441-448`）；④ `openspec/tech-debt.md` 四条 ✅（`--center-page` 负偏移 `:970-973`、`default-fit` no-op `:975-978`、`--set-window-vscroll` 缺下界 `:980-984`、书签不带缩放来源 `:986` 起）；⑤ `docs/emacs-reader.md` §3 `:86-95`、§7 `:216`、§12 `:437-444` ✅；⑥ `openspec/active/roadmap.md` M12 后续条目 ✅（本次归档一并改为 `completed/`）。VENDORED 的三处过期信息更正（`page-join-lines` 默认 `0`、sidebar `56`、outline `20`）均已落地；是否曾有独立 doc-fix commit 由 `git log` 核查后如实记录在本次报告中（若未见独立提交，不要编造 commit 号）。
 - 验收：6 个文件按要求更新；`VENDORED.md` 新增第 ⑦ 项（本计划变更域），三处过期信息由独立 doc-fix commit 更正。
 
-### [ ] T6 归档与沉淀
+### [x] T6 归档与沉淀
 
 - 动作：计划移入 `openspec/completed/`、`## 当前状态` 收尾更新、`memory_lesson_save` 沉淀可复用经验（按 `rules/workflow.md` 记忆归属规则：涉及 elisp MCP / Emacs 全局行为时省略 `project`）。
 - 依赖：T4、T5
 - 验收：`openspec/active/` 无本计划残留；`openspec/completed/` 有归档文件；沉淀记录可检索。
+- ✅ 2026-10-23 完成：计划已移入 `openspec/completed/`；`CHANGELOG.md` / `roadmap.md` 的三处 active 引用已改为 completed；可复用经验由主 agent 通过 `memory_lesson_save` 沉淀。
 
 ### [x] T7 居中同步化（D7，2026-10-23 用户确认方案 A 后实施）
 

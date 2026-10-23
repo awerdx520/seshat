@@ -1051,6 +1051,13 @@
 - 影响：凡新增涉及「页面是否放得下」「居中走 before-string 还是 line-prefix」的用例，若忘了桩窗口宽度，就会跑到与意图相反的 branch，红灯与实现无关、容易误判成回归；同理，`--contain-scale` / `--fit-scale` 的断言依赖 `window-body-width` / `-height` 的桩值，数值一变结论就变。
 - 建议：把「桩窗口几何」做成测试辅助宏（例如 `seshat-reader-test--with-window-geometry`），新增用例统一走它；已在 resize 测试内部用 `cl-letf` 实现，尚未提取为共享辅助函数。
 
+## 阅读器尺寸自适应的两项 L3 验收未复验（2026-10-23，归档时转为待观察）
+
+- 现状：计划 `openspec/completed/2026-10-22-emacs-reader-resize-refit.md` 的 T4 列了 8 条真机验收（L3-1..L3-8）。归档时（2026-10-23）判定其中 6 条由后续计划 `openspec/completed/2026-10-23-emacs-reader-smooth-fit.md` 的真机 L3 验收覆盖，**L3-6（页面比窗口矮时滚到底 vscroll 不为负、图像不被下推）与 L3-8（`emacs --daemon` + `emacsclient -c` 下 idle timer 可靠触发）未单独复验**，按用户 2026-10-23 决定记为待观察，不阻塞归档。
+- 影响：L3-6 直接关系到本条目前的「`seshat-reader--set-window-vscroll` 缺下界夹紧」——尺寸变化路径已有 `seshat-reader--clamp-window-vscroll` 绕行，但**翻页落点与书签恢复的 vscroll 路径仍无下界保护**，只有真机能确认短页 + `fit-to-width` 组合是否真的产生负 vscroll。L3-8 是 `openspec/decisions.md` 2026-10-23「尺寸变化重贴合用 idle timer」决策的降级判据：若 daemon 下 idle timer 不触发，按该决策第 3 级降级为「只 clamp + center、不 refit」，页面可能被裁切。
+- 判据（下次真机批量验收照此执行）：L3-6 → 按 `W`（按宽适配）到短页后滚到底，`(window-vscroll nil t)` 应为 `0` 且页顶不被推出窗口；L3-8 → `emacs --daemon` + `emacsclient -c` 打开文档后开关目录（`o`），页面应在一次 redisplay 内归位（无「先偏一侧再居中」），并在停手后 0.15s 内清空 `seshat-reader--resize-refit-timer`。
+- 建议：与「`image-flush` 已从 `--apply-display-scale` 移除、旧缓存未验证」「image cache 条目累积」两条合并为**一次真机批量观测**（同一次 GUI 会话可全部做完），观测后把结论写回本文件并删除或降级对应条目。
+
 
 
 
