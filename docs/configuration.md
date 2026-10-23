@@ -192,7 +192,7 @@ Emacs 端通过 `seshat-reader-annotation` 采集 PDF 页面选区并同步为�
 
 说明：
 
-- **三栏版式（M12）**：`left` / `right` 下侧栏是 **side window**（`display-buffer-in-side-window` + 独立 slot），显示/收起不挤压阅读区；且侧栏是 **per-kind 独立窗口**——目录（默认 `left`）与批注/译文（默认 `right`）可同时存在，不再「后显示者接管」，`C-c C-o` 收起/展开左侧目录。底部模式（`below-selected` / `at-bottom`）仍是单窗口、后显示者接管（M11 语义，非缺陷）。
+- **三栏版式（M12）**：`left` / `right` 下侧栏是 **side window**（`display-buffer-in-side-window` + 独立 slot），显示/收起不挤压阅读区；且侧栏是 **per-kind 独立窗口**——目录（默认 `left`）与批注/译文（默认 `right`）可同时存在，不再「后显示者接管」，`o` 收起/展开左侧目录（只开合目录的命令 `seshat-reader-sidebar-toggle-outline` 不再绑键，仍可 `M-x` 调用）。底部模式（`below-selected` / `at-bottom`）仍是单窗口、后显示者接管（M11 语义，非缺陷）。
 - **破坏性变更与回退（M12）**：`seshat-reader-sidebar-position` 默认值由 `below-selected` 改为 `right`，升级后批注/译文面板出现在**右侧**而非底部。恢复旧观感：`(setq seshat-reader-sidebar-position 'below-selected)`；`left` / `right` 为 M12 新增取值，`below-selected` / `at-bottom` 仍然可用。
 - **译文/解释为 Markdown 文本 buffer**：面板正文是普通只读 buffer，用 `gfm-view-mode`（缺失时降级 `markdown-view-mode` / `text-mode`）渲染，`truncate-lines` 为 nil 且显式开 `word-wrap`；`header-line` 显示「Seshat 译文」/「Seshat 解释」；`q`（关面板）与 `C-c C-s`（存为批注）由 minor mode `seshat-reader-translate-panel-mode` 承载。**markdown-mode 为软依赖**：未安装时降级 `text-mode`（不折行美化、不隐藏标记），功能仍可用。正文按模板渲染——翻译面板用 `seshat-reader-translate-template`（默认「语言对 + 原文块 + 分隔线 + 正文」）、解释面板用 `seshat-reader-translate-explain-template`（默认「原文块 + 分隔线 + 正文」）；两者默认都**不含正文标题**，因为 `header-line` 已显示「Seshat 译文」/「Seshat 解释」，需要正文标题时自定义模板加 `%k`（或设模板为 `nil` 退回纯正文）。
 - **高度自适应**：译文/解释面板显示后按内容实际行数（`window-text-pixel-size` 换算）调整高度，夹紧 `seshat-reader-sidebar-min-height`（默认 0.25）到 `seshat-reader-sidebar-max-height`（默认 0.8），并把实测比例写入该 kind 的高度记忆；同帧内面板增高会压缩上方阅读窗口（预期行为）。单行像素高取首行 `line-pixel-height` 与 `frame-char-height` 的**较小值**（Markdown 标题行通常比正文行高，直接用首行会把内容行数低估），测量上限 120 行（超长内容按上限计，避免测量耗时）。
@@ -215,7 +215,7 @@ Emacs 端通过 `seshat-reader-annotation` 采集 PDF 页面选区并同步为�
 
 - **avy 是软依赖**：目录面板的 `f` 跳转由本包**零依赖自实现**（`seshat-reader-outline-avy-jump`），未安装 avy 时功能等价；标签字符表优先读 `avy-keys`（avy 已加载且其值为字符列表时），否则退回内置表。按本项目惯例（与 `markdown-mode` / `visual-fill-column` / `etaf-ui` 同类处理），**软依赖不写入 `Package-Requires`**，也不在加载期 `require`。
 - **`C-c C-h`**：批注高亮的手动刷新入口（重投当前文档的矩形并触发 C 侧 `--refresh-highlights`）；自动刷新发生在打开文档与批注列表增删之后。
-- **`C-c C-o`**：收起/展开左侧目录面板（目录不再 `pop-to-buffer` 抢窗口，改由承载层按 `seshat-reader-outline-sidebar-position` 显示）。
+- **`o`**：收起/展开左侧目录面板（目录不再 `pop-to-buffer` 抢窗口，改由承载层按 `seshat-reader-outline-sidebar-position` 显示）。只开合目录的命令 `seshat-reader-sidebar-toggle-outline` 不再绑键（与 `o` 功能重复），仍可 `M-x` 调用。
 
 ### 双向引用（M11.4）
 

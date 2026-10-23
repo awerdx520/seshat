@@ -811,7 +811,8 @@ opposite of what a cleanup needs."
           (seshat-reader-sidebar--capture-state targets)
           (dolist (win targets)
             (ignore-errors (delete-window win))))
-        ;; 记忆里的死面板必须一并清掉，否则 `C-c C-o' 会拿它复活。
+        ;; 记忆里的死面板必须一并清掉，否则
+        ;; `seshat-reader-sidebar-toggle-outline' 会拿它复活。
         (when (eq (cdr (assq kind seshat-reader-sidebar--last-buffers)) buffer)
           (setq seshat-reader-sidebar--last-buffers
                 (assq-delete-all kind seshat-reader-sidebar--last-buffers)))
@@ -899,20 +900,16 @@ KIND 为 nil 时保持**全部开合**语义（向后兼容）：有本包窗口
 (defun seshat-reader-sidebar-toggle-outline ()
   "收起或展开阅读器的**目录面板**（kind 为 `outline'）.
 等价于 `(seshat-reader-sidebar-toggle \\='outline)`：只开合目录面板，右侧批注
-/译文面板保持不变。绑定在 `seshat-reader-mode-map'：
-\\[seshat-reader-sidebar-toggle-outline]。"
+/译文面板保持不变。不再默认绑键（阅读 buffer 的 `o' 已覆盖目录开合），命令
+本身仍可经 \\[seshat-reader-sidebar-toggle-outline] 调用。"
   (interactive)
   (seshat-reader-sidebar-toggle 'outline))
 
 ;;; 键位
 
-;; 阅读器强依赖本模块（`seshat-reader-sidebar-show' 是面板显示的唯一入口）；
-;; 但本模块**不** require `seshat-reader'（模块零依赖），故用
-;; `with-eval-after-load' 在阅读器加载后注册键位——与其它自研扩展模块
-;; （annotation / reference / translate）的既有做法一致，避免循环依赖。
-(with-eval-after-load 'seshat-reader
-  (define-key (symbol-value 'seshat-reader-mode-map) (kbd "C-c C-o")
-    #'seshat-reader-sidebar-toggle-outline))
+;; `C-c C-o' 曾绑到 `seshat-reader-sidebar-toggle-outline'，与阅读 buffer 的
+;; `o'（`seshat-reader-outline-show'）功能重复，用户要求移除；命令本身仍可 M-x 调用。
+;; 本模块仍不 require `seshat-reader'（模块零依赖），本文件因此不再有键位注册代码。
 
 (provide 'seshat-reader-sidebar)
 ;;; seshat-reader-sidebar.el ends here

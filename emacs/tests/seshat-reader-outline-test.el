@@ -112,7 +112,13 @@ Section 1.2 5 / Chapter 2 7 / Part II 10.")
   (format "*Outline of %s*" doc-name))
 
 (defmacro seshat-reader-outline-test--with-stubs (&rest body)
-  "在 `body' 内桩替承载层与跳页入口，并收集调用记录."
+  "在 `body' 内桩替承载层与跳页入口，并收集调用记录.
+
+契约提示（T18 起 `show' 变成目录面板开关）：桩替
+`seshat-reader-sidebar-show' 只记录调用，**不会**创建真实的 outline 面板
+窗口，故这些用例里 `seshat-reader-outline-show' 恒走**打开**路径（重建内容
++ 显示），与改动前的行为一致；关闭路径由
+`seshat-reader-outline-test--show-toggles-off-when-visible' 单独覆盖."
   (declare (indent 0))
   `(let (seshat-reader-outline-test--show-calls
          seshat-reader-outline-test--jumped-pages)
@@ -158,8 +164,8 @@ Section 1.2 5 / Chapter 2 7 / Part II 10.")
                          (seshat-reader-outline-test--outline-buffer-name doc)))
           ;; ② kind 必须是 outline，否则会落到批注面板的方位/尺寸语义
           (should (eq (nth 1 call) 'outline))
-          ;; ③ T5 起 SELECT 传 t（与 `C-c C-o' 重开路径一致：按 `o' 打开目录
-          ;;    后光标进入目录面板）
+          ;; ③ T5 起 SELECT 传 t（与 `seshat-reader-sidebar-toggle-outline' 的
+          ;;    重开路径一致：按 `o' 打开目录后光标进入目录面板）
           (should (eq (nth 2 call) t)))))))
 
 ;;; 2. 切换文档后内容被重建（核心缺陷修复）
@@ -207,7 +213,13 @@ Section 1.2 5 / Chapter 2 7 / Part II 10.")
 ;;; 3. 同一文档重复 show 幂等（不重复追加）
 
 (ert-deftest seshat-reader-outline-test--show-idempotent-for-same-document ()
-  "同一文档连续 `show' 两次：条目与内容不变（重建而非追加），归属信息保持一致."
+  "同一文档连续 `show' 两次：条目与内容不变（重建而非追加），归属信息保持一致.
+
+契约变更说明（T18：`o' 改为目录面板开关）：真实环境下第二次 `show' 会**关闭**
+面板，因此本用例只在「无面板窗口 → 打开路径」下成立——batch 里承载层被桩替、
+不产生 outline 面板窗口，两次调用都走打开路径，断言的是**打开路径的重建幂等**
+（不重复追加）。关闭路径见
+`seshat-reader-outline-test--show-toggles-off-when-visible'."
   (let* ((doc "seshat-outline-test-doc-c.pdf")
          (reader (seshat-reader-outline-test--make-reader-buffer
                   doc seshat-reader-outline-test--outline-a))
@@ -289,6 +301,179 @@ Section 1.2 5 / Chapter 2 7 / Part II 10.")
             (should second)
             (seshat-reader-outline-goto-entry second)))
         (should (equal seshat-reader-outline-test--jumped-pages '(2 1)))))))
+
+;;; 5b. `show' 是目录面板开关（T18：已显示则关闭，未显示则重建并显示）
+
+(ert-deftest seshat-reader-outline-test--show-toggles-off-when-visible ()
+  "已显示目录面板时 `show' 走关闭路径：窗口被删、内容不重建、不调用承载层."
+  (let* ((doc "seshat-outline-test-doc-toggle-off.pdf")
+         (reader (seshat-reader-outline-test--make-reader-buffer
+                  doc seshat-reader-outline-test--outline-a))
+         (bufname (seshat-reader-outline-test--outline-buffer-name doc))
+         (win (selected-window))
+         (orig-buffer (window-buffer win))
+         ;; 全局状态一律动态绑定：关闭路径会写尺寸记忆与「上次 buffer」记忆
+         (seshat-reader-sidebar--state nil)
+         (seshat-reader-sidebar--last-buffers nil)
+         (seshat-reader-sidebar--last-buffer nil)
+         (seshat-reader-sidebar--last-kind nil)
+         (deleted nil)
+         (erases 0)
+         (shown nil))
+    (unwind-protect
+        (progn
+          ;; 预置面板窗口：带 `seshat-reader-sidebar' 参数 + kind 为 outline，
+          ;; 正是 `seshat-reader-sidebar--window-for-kind' 的判据（沿用
+          ;; `seshat-reader-sidebar-test--toggle-closes-package-windows' 的
+          ;; 「直接给 `selected-window' 设参数」做法，batch 下无真实 GUI 侧窗）。
+          (set-window-parameter win 'seshat-reader-sidebar t)
+          (set-window-parameter win 'seshat-reader-sidebar-kind 'outline)
+          ;; 预置面板内容（渲染层直插，不经 `show'，避免依赖真实窗口显示）
+          (with-current-buffer (get-buffer-create bufname)
+            (seshat-reader-outline-mode)
+            (let ((inhibit-read-only t))
+              (seshat-reader--outline-insert-outline
+               (seshat-reader-outline--rows
+                seshat-reader-outline-test--outline-a nil nil))
+              (goto-char (point-min))))
+          ;; 面板窗口必须真的显示该面板 buffer：关闭路径用 `window-buffer' 记
+          ;; 「上次 buffer」，窗口显示别的 buffer 会记错（真实环境恒一致）
+          (set-window-buffer win (get-buffer bufname))
+          (let ((before (seshat-reader-outline-test--buttons bufname)))
+            (should (= 4 (length before)))
+            (cl-letf (((symbol-function 'erase-buffer)
+                       (lambda (&rest _) (cl-incf erases)))
+                      ((symbol-function 'delete-window)
+                       (lambda (w &optional _) (push w deleted)))
+                      ((symbol-function 'seshat-reader-sidebar-show)
+                       (lambda (&rest args) (push args shown) 'fake-panel-window))
+                      ((symbol-function 'message) (lambda (&rest _) nil)))
+              (with-current-buffer reader
+                (seshat-reader-outline-show)))
+            ;; ① 窗口被删（经 `seshat-reader-sidebar--toggle-kind' 的
+            ;;    `delete-window'，不是本命令自己删）
+            (should (= 1 (length deleted)))
+            (should (eq (car deleted) win))
+            ;; ② 内容**没有**被重建：`erase-buffer' 未被调用，条目逐字不变
+            (should (zerop erases))
+            (should (equal before (seshat-reader-outline-test--buttons bufname)))
+            ;; ③ 关闭路径不调用承载层的显示入口
+            (should-not shown)
+            ;; ④ 关闭时把面板 buffer 记入「上次 buffer」记忆，供下次重开恢复
+            (should (eq (cdr (assq 'outline seshat-reader-sidebar--last-buffers))
+                        (get-buffer bufname)))))
+      (set-window-parameter win 'seshat-reader-sidebar nil)
+      (set-window-parameter win 'seshat-reader-sidebar-kind nil)
+      (set-window-buffer win orig-buffer)
+      (let ((panel (get-buffer bufname)))
+        (when (buffer-live-p panel) (kill-buffer panel))))))
+
+(ert-deftest seshat-reader-outline-test--show-rebuilds-and-displays-when-hidden ()
+  "无目录面板窗口时 `show' 重建内容（覆盖旧条目）并经承载层显示，kind 为 outline."
+  (let* ((doc "seshat-outline-test-doc-toggle-on.pdf")
+         (reader (seshat-reader-outline-test--make-reader-buffer
+                  doc seshat-reader-outline-test--outline-b))
+         (bufname (seshat-reader-outline-test--outline-buffer-name doc))
+         (erases 0))
+    (seshat-reader-outline-test--with-cleanup (list reader bufname)
+      ;; 预置：面板 buffer 里是**旧**内容，且不存在 outline 面板窗口
+      (with-current-buffer (get-buffer-create bufname)
+        (seshat-reader-outline-mode)
+        (let ((inhibit-read-only t))
+          (insert "* stale entry\n")))
+      (should-not (seshat-reader-sidebar--window-for-kind 'outline))
+      (seshat-reader-outline-test--with-stubs
+        (cl-letf (((symbol-function 'erase-buffer)
+                   (lambda (&rest _)
+                     (cl-incf erases)
+                     (delete-region (point-min) (point-max)))))
+          (with-current-buffer reader
+            (seshat-reader-outline-show)))
+        ;; ① 承载层被调用：目录 buffer 名 + kind `outline' + SELECT 非 nil
+        (should (= 1 (length seshat-reader-outline-test--show-calls)))
+        (let ((call (car seshat-reader-outline-test--show-calls)))
+          (should (equal (nth 0 call) bufname))
+          (should (eq (nth 1 call) 'outline))
+          (should (eq (nth 2 call) t))))
+      ;; ② 内容被重建（`erase-buffer' 被调用一次，旧条目不在，行数 > 0）
+      (should (= 1 erases))
+      (with-current-buffer bufname
+        (should-not (string-match-p "stale entry" (buffer-string)))
+        (should (> (line-number-at-pos (point-max)) 1)))
+      (should (equal (mapcar #'car (seshat-reader-outline-test--buttons bufname))
+                     '("Preface" "Chapter A" "Section A.1"))))))
+
+;;; 5c. 目录面板内按 `o' 一次即关（T18b：不再先切回阅读窗口再按第二次）
+
+(ert-deftest seshat-reader-outline-test--show-in-outline-buffer-closes-panel ()
+  "光标在目录面板里时 `show' 直接关闭：只调 per-kind toggle，不重建、不报错."
+  (let ((panel (get-buffer-create "*seshat-outline-test-panel-body*"))
+        (toggles nil)
+        (shows nil)
+        (erases 0)
+        (err nil))
+    (unwind-protect
+        (progn
+          (with-current-buffer panel
+            (seshat-reader-outline-mode)
+            (let ((inhibit-read-only t))
+              (insert "* Chapter 1  1\n"))
+            (goto-char (point-min))
+            ;; 面板 buffer 不是 `seshat-reader-mode'——正是旧实现的报错点
+            (should-not (derived-mode-p 'seshat-reader-mode))
+            (should (derived-mode-p 'seshat-reader-outline-mode))
+            ;; 面板里也没有目录数据：关闭路径不该需要它
+            (should-not (bound-and-true-p seshat-reader-current-doc-outline)))
+          (cl-letf (((symbol-function 'seshat-reader-sidebar--toggle-kind)
+                     (lambda (kind) (push kind toggles)))
+                    ((symbol-function 'seshat-reader-sidebar-show)
+                     (lambda (&rest args) (push args shows) 'fake-panel-window))
+                    ((symbol-function 'erase-buffer)
+                     (lambda (&rest _) (cl-incf erases))))
+            (with-current-buffer panel
+              (setq err (condition-case e
+                            (progn (seshat-reader-outline-show) nil)
+                          (error e)))))
+          ;; ① 不报错（未加面板分支时会因「不在 `seshat-reader-mode'」抛
+          ;;    `user-error'，用户也就得先按一次切回阅读窗口）
+          (should-not err)
+          ;; ② 关闭只经 per-kind toggle，参数为 `outline'，且只调一次（一次即关）
+          (should (equal toggles '(outline)))
+          ;; ③ 没走重建 / 显示路径：`erase-buffer' 零调用，承载层未被调用
+          (should (zerop erases))
+          (should-not shows))
+      (when (buffer-live-p panel) (kill-buffer panel)))))
+
+(ert-deftest seshat-reader-outline-test--o-is-bound-to-show-in-both-keymaps ()
+  "`o' 在原生 keymap 与 evil normal state 两条注册路径上都指向 `show'.
+`s' 则在两条路径上都指向 `seshat-reader-outline-select-doc-window'（切回阅读
+窗口；`o' 改为面板开合后它不再占 `o'）。"
+  ;; ① 原生 keymap（`seshat-reader-outline-mode-map'）
+  (should (eq (keymap-lookup seshat-reader-outline-mode-map "o")
+              #'seshat-reader-outline-show))
+  (should (eq (keymap-lookup seshat-reader-outline-mode-map "s")
+              #'seshat-reader-outline-select-doc-window))
+  ;; ② evil normal state：batch -Q 下 evil 未加载，故桩替 `evil-define-key*'
+  ;;    捕获注册内容。本套件 skipped 必须恒为 0，所以用「桩替 + 条件段」而不是
+  ;;    `skip-unless'；`o' 必须与原生 keymap 一致（都指向 `show'）。
+  (let (pairs)
+    (cl-letf (((symbol-function 'evil-define-key*)
+               (lambda (&rest args)
+                 (setq pairs (cl-loop for (key def) on (cddr args) by #'cddr
+                                      collect (cons key def))))))
+      (seshat-reader-outline--install-evil-bindings))
+    (should (equal (assoc "o" pairs) '("o" . seshat-reader-outline-show)))
+    (should (equal (assoc "s" pairs)
+                   '("s" . seshat-reader-outline-select-doc-window))))
+  ;; ③ 若本会话真的加载了 evil（手工加载 evil 的调试会话），按真实注册再验一
+  ;;    次：normal state 的 auxiliary keymap 里 `o' 解析到 `show'。evil 不在时
+  ;;    整段不执行，不计入 skipped。
+  (when (fboundp 'evil-define-key*)
+    (seshat-reader-outline--install-evil-bindings)
+    (should (eq (lookup-key (evil-get-auxiliary-keymap
+                             seshat-reader-outline-mode-map 'normal)
+                            "o")
+                #'seshat-reader-outline-show))))
 
 ;;; 6. 行模型（纯函数）：DFS 前序 / depth / page 1-based
 
@@ -553,8 +738,10 @@ Section 1.2 5 / Chapter 2 7 / Part II 10.")
               #'seshat-reader-outline-avy-jump))
   (should (eq (lookup-key seshat-reader-outline-mode-map "p") #'previous-line))
   (should (eq (lookup-key seshat-reader-outline-mode-map "n") #'next-line))
+  ;; T18b：`o' 由 `seshat-reader-outline-select-doc-window' 改绑 `show'
+  ;; （面板内按一次即关，不再要求先切回阅读窗口）
   (should (eq (lookup-key seshat-reader-outline-mode-map "o")
-              #'seshat-reader-outline-select-doc-window))
+              #'seshat-reader-outline-show))
   (should (eq (lookup-key seshat-reader-outline-mode-map "q") #'quit-window))
   (should (eq (lookup-key seshat-reader-outline-mode-map (kbd "RET"))
               #'seshat-reader-outline-visit-page))
@@ -693,14 +880,14 @@ Emacs 31 的 `outline-hide-subtree' 用 **overlay**（`invisible' = `outline'）
 ;;; 17. evil 软依赖：包内补绑（不依赖用户配置）
 
 (ert-deftest seshat-reader-outline-test--evil-soft-dependency ()
-  "evil 缺失时静默跳过；evil 存在时把面板 7 个键（含 `f'）补绑到 normal state."
+  "evil 缺失时静默跳过；evil 存在时把面板 8 个键（含 `f'）补绑到 normal state."
   ;; ① evil 未加载（`evil-define-key*' 不可用）→ 静默跳过，不改 mode-map
   (cl-letf (((symbol-function 'evil-define-key*) nil))
     (should-not (fboundp 'evil-define-key*))
     (should-not (seshat-reader-outline--install-evil-bindings)))
   (should (eq (lookup-key seshat-reader-outline-mode-map "f")
               #'seshat-reader-outline-avy-jump))
-  ;; ② 桩替 `evil-define-key*'：断言实参是 (normal <本 mode 的 map> 7 对绑定)
+  ;; ② 桩替 `evil-define-key*'：断言实参是 (normal <本 mode 的 map> 8 对绑定)
   (let (calls)
     (cl-letf (((symbol-function 'evil-define-key*)
                (lambda (&rest args) (push args calls) nil)))
@@ -711,14 +898,16 @@ Emacs 31 的 `outline-hide-subtree' 用 **overlay**（`invisible' = `outline'）
                            collect (cons key def))))
       (should (eq (nth 0 args) 'normal))
       (should (eq (nth 1 args) seshat-reader-outline-mode-map))
-      (should (= 7 (length pairs)))
+      (should (= 8 (length pairs)))
       ;; `f' 必须补绑（evil 的 `evil-find-char' 会抢它）
       (should (equal (assoc "f" pairs)
                      '("f" . seshat-reader-outline-avy-jump)))
       (should (equal (assoc "p" pairs) '("p" . previous-line)))
       (should (equal (assoc "n" pairs) '("n" . next-line)))
       (should (equal (assoc "o" pairs)
-                     '("o" . seshat-reader-outline-select-doc-window)))
+                     '("o" . seshat-reader-outline-show)))
+      (should (equal (assoc "s" pairs)
+                     '("s" . seshat-reader-outline-select-doc-window)))
       (should (equal (assoc "q" pairs) '("q" . quit-window)))
       ;; 特殊键必须走 `kbd' 向量（`define-key' 不解析字符串 "RET"）
       (should (equal (assoc (kbd "RET") pairs)

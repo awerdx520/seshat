@@ -10,7 +10,7 @@ Emacs 端文档阅读器（`emacs/seshat-reader/`）：MuPDF 负责栅格化、C
 |---|---|---|
 | 打开文档 | `find-file` / `M-x seshat-reader-open-doc` | PDF/EPUB 等格式由 `auto-mode-alist` 关联到 `seshat-reader-mode` |
 | 逐页阅读 | `n` / `p` / `SPC` / `M-g g` | 翻页、滚动、跳页、缩放、旋转、适配、演示模式、暗色模式 |
-| 目录导航 | `o`（打开）、`C-c C-o`（开合） | 左侧目录面板：层级、页码、当前章高亮、TAB 折叠、`f` 单键跳转 |
+| 目录导航 | `o`（开合） | 左侧目录面板：层级、页码、当前章高亮、TAB 折叠、`f` 单键跳转 |
 | 框选取文 | 鼠标 `down-mouse-1` 拖拽 | 松手后取文本并闪现选区矩形 |
 | 批注 | `C-c C-a` / `C-c C-l` | 创建、列出、跳页、删除、页面高亮刷新 |
 | 翻译/解释 | `C-c C-t` / `C-c C-e` | 依赖 go-translate；结果显示在面板（或 posframe） |
@@ -86,7 +86,7 @@ ETAF 渲染层是可选外部依赖：`Makefile` 先探测 `~/Workspace/emacs-ta
 - 打开的瞬间自动按 `contain` 适配（取 `min(按高, 按宽)`）——`seshat-reader-default-fit` **不再参与**这一步，只影响显式 `H` / `W` 命令，见第 12 节。
 - 模式行默认显示 `P<n>/<总页数>`（`seshat-reader-mode-line`）。
 
-> **窗口尺寸变化后自动重贴合**：开关目录（`o` / `C-c C-o`）或批注面板（`C-c C-l`）会改变阅读区宽度，阅读器会在同一次重绘内按当前的**适配模式**（`fit-mode`，见下段；未选择时为 `contain`）把页面缩放到目标几何，并由 idle 阶段补一次清晰化重渲染（几何不变，画面只从模糊变清晰）。用户手动缩放过的窗口（`+` / `-` / `=` / `0`）会保留缩放比例，只归位滚动位置。拖分割线期间不会逐帧重渲染，停手后只重算一次。
+> **窗口尺寸变化后自动重贴合**：开关目录（`o`）或批注面板（`C-c C-l`）会改变阅读区宽度，阅读器会在同一次重绘内按当前的**适配模式**（`fit-mode`，见下段；未选择时为 `contain`）把页面缩放到目标几何，并由 idle 阶段补一次清晰化重渲染（几何不变，画面只从模糊变清晰）。用户手动缩放过的窗口（`+` / `-` / `=` / `0`）会保留缩放比例，只归位滚动位置。拖分割线期间不会逐帧重渲染，停手后只重算一次。
 >
 > **居中位置由 redisplay 在布局时计算**：页面能完整放下时，居中不是 Lisp 算出来的偏移量，而是页面 overlay 上一个 `before-string` 的 `(space :align-to (+ center (-0.5 . IMAGE)))`——`:align-to` 在布局阶段求值，因此窗口变宽变窄的那一帧页面就已经居中，不会出现「先跳到一侧、再居中」的中间帧（旧实现靠 `line-prefix` + `hscroll` 两段补偿，实测窗口变窄后首帧偏 −524px）。页面比窗口宽时改用 `line-prefix` + 横向滚动，左对齐。
 
@@ -126,9 +126,9 @@ ETAF 渲染层是可选外部依赖：`Makefile` 先探测 `~/Workspace/emacs-ta
 
 目录面板由 `seshat-reader-outline` 渲染，显示位置由 `seshat-reader-outline-sidebar-position`（默认 `left`）与 `seshat-reader-outline-sidebar-width`（默认 `0.20`）决定，与右侧信息面板分居两侧。
 
-- 打开：`o`（`seshat-reader-outline-show`，每次调用按当前文档大纲重建）；开合：`C-c C-o`（`seshat-reader-sidebar-toggle-outline`，只动目录，不动右侧批注/译文）。
+- 开合：`o`（`seshat-reader-outline-show`，**目录面板开关**——已显示则关闭，未显示则按当前文档大纲重建内容后打开）。`o` 与 `seshat-reader-sidebar-toggle-outline` 语义一致（关闭都走 `seshat-reader-sidebar--toggle-kind`，尺寸记忆与恢复行为相同），区别只在 `o` 会顺带刷新目录内容；后者**不再绑键**（与 `o` 功能重复，用户要求移除），仍可 `M-x seshat-reader-sidebar-toggle-outline` 调用，只动目录、不动右侧批注/译文面板。**光标在目录面板内时，`o` 同样关闭面板**（一次即关；此前绑的是「切回阅读窗口」，需按第二次才关）。
 - 行内容：缩进层级 + 折叠符号（`▾` / `▸`，无子节点用 2 空格占位）+ 标题按钮 + 右缘页码；当前章用 `line-prefix` 画竖线标记。
-- `p` / `n` 移动光标，`RET` / `M-RET` 跳到该标题所在页，`o` 把光标切回阅读窗口，`q` 关闭面板。
+- `p` / `n` 移动光标，`RET` / `M-RET` 跳到该标题所在页，`o` 关闭面板（面板内按一次即关，无需先切回阅读窗口），`q` 关闭面板。
 - `TAB` 折叠由 `outline-mode` 自身承载（`outline-hide-subtree`）；注意折叠符号**不随折叠状态刷新**，属已知限制（见 §12）。
 - `f` 触发 avy 风格单键跳转（`seshat-reader-outline-avy-jump`）：候选是当前可见区的目录按钮，标签由 overlay `before-string` 承载，`read-key` 逐键匹配。avy 未安装时功能等价——标签字符表退化为内置表（与 `avy-keys` 默认值一致）。
 - evil 用户：包内已用 `evil-define-key*` 为 normal state 补绑 `f` / `p` / `n` / `o` / `q` / `RET` / `M-RET`，否则这些键会被 `evil-find-char` / `evil-record-macro` / `evil-ret` 抢走。用的是 auxiliary keymap，只在本 major mode 生效，不污染全局。
@@ -264,9 +264,8 @@ ETAF 渲染层是可选外部依赖：`Makefile` 先探测 `~/Workspace/emacs-ta
 | `0` | `seshat-reader-reset-size` | 复位缩放 |
 | `H` / `W` | `seshat-reader-fit-to-height` / `-fit-to-width` | 整页 / 整宽适配 |
 | `r` / `R` | `seshat-reader-rotate-clockwise` / `-counter-clockwise` | 顺/逆时针 90° |
-| `o` | `seshat-reader-outline-show` | 打开目录面板 |
+| `o` | `seshat-reader-outline-show` | 开合目录面板（已显示则关闭，未显示则重建内容后打开） |
 | `Q` | `seshat-reader-close-doc` | 关闭文档 |
-| `C-c C-o` | `seshat-reader-sidebar-toggle-outline` | 开合目录面板 |
 | `C-c C-a` / `C-c C-l` | `seshat-reader-annotation-create` / `-list` | 建批注 / 批注列表 |
 | `C-c C-h` | `seshat-reader-annotation-refresh-highlights` | 刷新页面高亮 |
 | `C-c C-r` | `seshat-reader-reference-insert` | 插入选区摘录 |
@@ -281,11 +280,12 @@ ETAF 渲染层是可选外部依赖：`Makefile` 先探测 `~/Workspace/emacs-ta
 | `p` / `n` | `previous-line` / `next-line` | 上下移动 |
 | `RET`、`M-RET` | `seshat-reader-outline-visit-page` | 跳到该标题所在页 |
 | `f` | `seshat-reader-outline-avy-jump` | avy 风格单键跳转 |
-| `o` | `seshat-reader-outline-select-doc-window` | 光标切回阅读窗口 |
+| `o` | `seshat-reader-outline-show` | 关闭面板（面板内按一次即关）；`seshat-reader-outline-select-doc-window` 不再占 `o`，仅供 `RET` 跳页切回阅读窗口 |
+| `s` | `seshat-reader-outline-select-doc-window` | 切回阅读窗口（回跳当前文档；`o` 改为面板开合后它换绑到 `s`） |
 | `q` | `quit-window` | 关闭面板 |
 | `TAB` | `outline-mode` 自身 | 折叠 / 展开子树 |
 
-evil 用户同样可用上述单键（包内 `evil-define-key*` 补绑 normal state 的 `f` / `p` / `n` / `o` / `q` / `RET` / `M-RET`）。
+evil 用户同样可用上述单键（包内 `evil-define-key*` 补绑 normal state 的 `f` / `p` / `n` / `o` / `s` / `q` / `RET` / `M-RET`）。
 
 ### 9.3 批注列表（`seshat-reader-annotation-list-mode-map`）
 
@@ -377,7 +377,7 @@ evil 用户同样可用上述单键（包内 `evil-define-key*` 补绑 normal st
 
 **目录里的中文显示成 `\346\226\207` 这种转义**
 
-旧版本把大纲标题当 unibyte 字符串处理导致的乱码。确认是否已修：随便打开一本中文目录的 PDF，`o` 后看标题是否为正常汉字；或 `M-: (multibyte-string-p (plist-get (car seshat-reader-current-doc-outline) :title))` 应为 `t`（大纲是 `(:title STR :page N [:children ...])` 的 plist 列表，页号 0-based）。仍乱码说明加载的是旧 `.elc`——`make clean all` 后重启 Emacs。
+旧版本把大纲标题当 unibyte 字符串处理导致的乱码。确认是否已修：随便打开一本中文目录的 PDF，按 `o` 打开目录面板（已打开时再按一次为关闭）后看标题是否为正常汉字；或 `M-: (multibyte-string-p (plist-get (car seshat-reader-current-doc-outline) :title))` 应为 `t`（大纲是 `(:title STR :page N [:children ...])` 的 plist 列表，页号 0-based）。仍乱码说明加载的是旧 `.elc`——`make clean all` 后重启 Emacs。
 
 **页面不居中 / 只显示页面一部分**
 

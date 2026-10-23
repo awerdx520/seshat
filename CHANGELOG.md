@@ -74,6 +74,12 @@
 
 ### 变更
 
+- 移除 `C-c C-o` 绑定（M12 后续，2026-10-23）：`o` 已是目录面板开关（`seshat-reader-outline-show`），`C-c C-o`（`seshat-reader-sidebar-toggle-outline`）功能重复，用户要求去掉该绑定——`seshat-reader-mode-map` 不再注册 `C-c C-o`，`C-c C-l`（批注列表）等其它同前缀键不受影响。命令本身保留，仍可 `M-x seshat-reader-sidebar-toggle-outline` 调用（`seshat-reader-sidebar-toggle` 亦不变，批注/译文面板仍可用它开合）。新增 ERT 1 例断言 `C-c C-o` 无绑定且 `C-c C-l` 仍有绑定，全仓 **384** 例 0 unexpected / 0 skipped。
+
+- 目录面板新增 `s` 切回阅读窗口（M12 后续，2026-10-23）：`o` 改为面板开合后，`seshat-reader-outline-select-doc-window`（切回阅读窗口）不再占 `o`，换绑到 `s`——包内 `seshat-reader-outline-mode-map` 与 evil normal state（`--install-evil-bindings`）两处同步补 `s`，`o` 仍由 `seshat-reader-outline-show` 承担开合。测试同步断言 `s` 绑定（`--evil-soft-dependency` 的绑定对数 7 → 8），全仓 **383** 例 0 unexpected / 0 skipped。
+
+- 目录面板内按 `o` 一次即关（M12 后续，2026-10-23）：光标在目录面板里时 `o` 此前绑定 `seshat-reader-outline-select-doc-window`（先把光标切回阅读窗口，再按一次才关闭），现改绑 `seshat-reader-outline-show`——后者在面板内（`seshat-reader-outline-mode` buffer）直接走 `seshat-reader-sidebar--toggle-kind`，**一次按键即关闭**，尺寸记忆与 `C-c C-o` 一致；`seshat-reader-outline-mode-map` 与 evil normal state 两处 keymap 同步改绑。`seshat-reader-outline-select-doc-window` 保留（`RET` / `M-RET` 与单击标题的跳页路径 `goto-entry` 仍用它切回阅读窗口），只是不再占用 `o`。新增 ERT 2 例，全仓 **383** 例 0 unexpected / 0 skipped。
+- `o` 改为**目录面板开关**（M12 后续，2026-10-23）：`seshat-reader-outline-show` 在检测到已有 `outline` 面板窗口时改为关闭（复用 `seshat-reader-sidebar--toggle-kind`，尺寸记忆与 `C-c C-o` / `seshat-reader-sidebar-toggle-outline` 完全一致，不再有两条开合逻辑），未显示时仍按当前文档的大纲重建内容后打开。即 `o` 与 `C-c C-o` 语义统一为「开合目录」，区别只在 `o` 会顺带刷新目录内容。打开路径的行为（`user-error` 校验、面板方位/宽度、空目录不清空）不变；新增 ERT 2 例，全仓 **381** 例 0 unexpected / 0 skipped。
 - 阅读器自动 fit 改为 contain（M12 后续，2026-10-23）：首次打开与窗口尺寸变化后的自动 fit 由「只按高」改为 `min(按高, 按宽)`——窗口变窄时页面缩小以完整可见，不再被两侧裁切；`seshat-reader--center-page` 的横向偏移夹到 `>= 0`（超宽页左对齐而非两侧裁切）。副作用是 `seshat-reader-default-fit` 在自动 fit 路径上已无调用点（仅显式 `H` / `W` 命令仍按其语义，见 `openspec/tech-debt.md`）。
 - 状态端点改以 uid 为键（M7，B4）：`GET|PUT /api/progress/{uid}`、`GET /api/annotations?uid=`，批注写入按 uid 关联；`reading_progress` / `annotations` 在 v7 迁移中重建（`DROP` + 按 uid 新建，见「破坏性」）。
 - WebDAV 写路径接入登记钩子（M7.4）：写钩子链新增 registry 登记调用，第三方 PUT/MOVE 后同样进 `resources`；FTS 索引**仍只覆盖笔记根**（`roots[0]`），书库根不进全文索引。

@@ -1202,11 +1202,11 @@ KIND 为面板内容类型，CONTENT-LINES 为桩出的内容行数，INIT-HEIGH
           (should (nth 2 shown)))
       (kill-buffer buf))))
 
-(ert-deftest seshat-reader-sidebar-test--toggle-outline-command-and-binding ()
-  "`C-c C-o' 绑定目录开合命令，`o' 仍是 `seshat-reader-outline-show'."
+(ert-deftest seshat-reader-sidebar-test--toggle-outline-command-still-works ()
+  "目录开合命令保留（可 M-x 调用），`o' 仍是 `seshat-reader-outline-show'."
+  ;; 2026-10-23 起 `C-c C-o' 不再绑定（与 `o' 功能重复，用户要求移除），本用例
+  ;; 改为只验证「命令本体仍可用」；键位缺失由 `--c-c-c-o-unbound' 断言。
   (should (commandp 'seshat-reader-sidebar-toggle-outline))
-  (should (eq (lookup-key seshat-reader-mode-map (kbd "C-c C-o"))
-              'seshat-reader-sidebar-toggle-outline))
   (should (eq (lookup-key seshat-reader-mode-map (kbd "o"))
               'seshat-reader-outline-show))
   (let ((calls nil))
@@ -1214,6 +1214,14 @@ KIND 为面板内容类型，CONTENT-LINES 为桩出的内容行数，INIT-HEIGH
                (lambda (&optional kind) (push kind calls))))
       (seshat-reader-sidebar-toggle-outline))
     (should (equal calls '(outline)))))
+
+(ert-deftest seshat-reader-sidebar-test--c-c-c-o-unbound ()
+  "`C-c C-o' 已无绑定，且同前缀的 `C-c C-l' 仍有绑定（只删了目标键）."
+  (let ((binding (lookup-key seshat-reader-mode-map (kbd "C-c C-o"))))
+    (should (or (null binding) (eq binding 'undefined))))
+  ;; 同前缀的批注列表键必须原样保留，证明确实只删了目录开合那一个键
+  (should (eq (lookup-key seshat-reader-mode-map (kbd "C-c C-l"))
+              'seshat-reader-annotation-list)))
 
 ;;; 尺寸记忆的方向标签（M12 审查修复：方位切换后不得误用旧记忆值）
 
@@ -1344,7 +1352,7 @@ DELETE-VAR 收集 `delete-window' 收到的窗口名（三元列表的 `car'）�
           ;; ② 删除前先捕获尺寸（用户手动 resize 的记忆不丢）
           (should (equal (nth 2 (assq 'outline seshat-reader-sidebar--state))
                          0.5))
-          ;; ③ `C-c C-o' 的死面板记忆被清掉：outline 条目消失，annotations 保留
+          ;; ③ 目录开合命令的死面板记忆被清掉：outline 条目消失，annotations 保留
           (should-not (assq 'outline seshat-reader-sidebar--last-buffers))
           (should (eq (cdr (assq 'annotations
                                  seshat-reader-sidebar--last-buffers))

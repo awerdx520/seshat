@@ -122,23 +122,52 @@ Just wraps `seshat-reader-goto-page' for imenu compatibility."
 
 ;;;###autoload
 (defun seshat-reader-outline-show ()
-  "Show the document outline in a panel.
+  "Toggle the document outline panel.
+
+When the outline panel is already displayed (a panel window whose
+`seshat-reader-sidebar-kind' is `outline' exists), this command **closes**
+it through `seshat-reader-sidebar--toggle-kind', i.e. exactly the way
+`seshat-reader-sidebar-toggle-outline' does (that command is no longer
+key-bound, it is only reachable through
+\\[seshat-reader-sidebar-toggle-outline]): the measured dimensions are
+captured before the windows are deleted and the panel buffer is remembered
+for the next re-open, so the panel comes back with the size the user
+resized it to.  Neither `delete-window' nor the size/kind bookkeeping is
+re-implemented here — duplicating them would let this path drift apart from
+the sidebar's per-kind toggle.
+
+When the panel is not displayed, its content is **rebuilt** from
+`seshat-reader-current-doc-outline' for the current document and then
+shown.  Hence `o' and `seshat-reader-sidebar-toggle-outline' have the same
+semantics; `o' additionally refreshes the outline content of the document
+being read.
+
+Where point is decides the direction: from a document buffer in
+`seshat-reader-mode' the key both opens and closes the panel, while from
+inside the panel itself (a buffer in `seshat-reader-outline-mode') it only
+closes it.  The panel branch runs **before** the mode check below, so one
+press inside the panel is enough; without it the key would first move point
+back into the reading window and only the second press would close.  Both
+directions go through `seshat-reader-sidebar--toggle-kind' with kind
+`outline', so the key stays a plain toggle and the size bookkeeping never
+differs between the two sides.
 
 The outline is displayed through `seshat-reader-sidebar-show' with kind
 `outline' (and SELECT non-nil, so the panel follows the cursor like the
-`C-c C-o' toggle path), hence it obeys
+`seshat-reader-sidebar-toggle-outline' path), hence it obeys
 `seshat-reader-outline-sidebar-position' and
 `seshat-reader-outline-sidebar-width'; when
 `seshat-reader-sidebar-enabled' is nil that function itself falls back to
 `pop-to-buffer', so no separate fallback is needed here.
 
 The outline buffer is named after the document it was created from and is
-**rebuilt on every call** from `seshat-reader-current-doc-outline'.  The
-old code only filled an empty buffer, so re-opening a document (or
-switching the document shown in the same buffer) kept the stale entries.
-Rebuilding keeps the same buffer (the panel window therefore stays valid),
-reuses `seshat-reader-outline-mode', erases with `inhibit-read-only' bound
-and leaves point at the beginning of the buffer.  Both
+**rebuilt on every opening** (the closing path does not touch its content)
+from `seshat-reader-current-doc-outline'.  The old code only filled an
+empty buffer, so re-opening a document (or switching the document shown in
+the same buffer) kept the stale entries.  Rebuilding keeps the same buffer,
+so the panel window stays valid; it also reuses
+`seshat-reader-outline-mode', erases with `inhibit-read-only' bound and
+leaves point at the beginning of the buffer.  Both
 `seshat-reader-outline--doc-buffername' and
 `seshat-reader-outline--doc-window' are refreshed, so
 `seshat-reader-outline-goto-entry' still jumps back into the current
@@ -150,40 +179,60 @@ The buffer content is produced by the side-effect free
 `seshat-reader--outline-insert-outline'; the current page of the document
 window is passed in so the containing section can be highlighted.
 
-Signals `user-error' when the buffer is not in `seshat-reader-mode' or when
-the document has no outline; validation happens **before** rebuilding, so a
-document without outline never leaves the panel blanked."
+Signals `user-error' when the opening path runs in a buffer that is not in
+`seshat-reader-mode', or when the document has no outline; validation
+happens **before** rebuilding, so a document without outline never leaves
+the panel blanked.  Neither check applies to the closing paths (point in the
+panel, or a panel window already displayed) — closing never needs an
+outline."
   (interactive)
-  (unless (derived-mode-p 'seshat-reader-mode)
-    (user-error "Not in a seshat-reader-mode buffer"))
-  (let* ((outline-data seshat-reader-current-doc-outline)
-         (source-buffer (current-buffer))
-         (source-name (buffer-name source-buffer))
-         (bufname (format "*Outline of %s*" source-name)))
-    ;; 先校验再重建：文档无目录时不得把面板清成空白（否则拿不到旧内容）。
-    (unless outline-data
-      (user-error "This document has no outline"))
-    (with-current-buffer (get-buffer-create bufname)
-      (unless (derived-mode-p 'seshat-reader-outline-mode)
-        (seshat-reader-outline-mode))
-      ;; 每次 show 都同步归属信息（`goto-entry' 靠它找回阅读窗口）。
-      (setq seshat-reader-outline--doc-buffername source-name)
-      (setq seshat-reader-outline--doc-window (get-buffer-window source-buffer))
-      ;; 按当前文档重建内容：可读 buffer 须绑 `inhibit-read-only'；不 kill 也
-      ;; 不重建 buffer，否则承载该 buffer 的面板窗口会失效。
-      (let ((inhibit-read-only t)
-            ;; 折叠态集合暂恒为 nil（全部展开）：buffer 内的 TAB 折叠由
-            ;; `outline-mode' 自身的不可见性实现，不需要重建 buffer，也就不经
-            ;; 本集合（详见 `seshat-reader-outline--rows' 的 docstring）。
-            (collapsed nil)
-            (current-page (seshat-reader-outline--doc-current-page source-buffer)))
-        (erase-buffer)
-        (seshat-reader--outline-insert-outline
-         (seshat-reader-outline--rows outline-data collapsed current-page))
-        (goto-char (point-min))))
-    ;; 显示交给承载层（`outline' kind：左侧/底部由 sidebar 决定）；SELECT 非 nil
-    ;; 与 `C-c C-o' 的重开路径一致——按 `o' 打开目录后光标进入目录面板。
-    (seshat-reader-sidebar-show (get-buffer bufname) 'outline t)))
+  ;; 光标在目录面板里时，`o' 就是关闭（与阅读窗口里按 `o' 的 toggle 语义一致：
+  ;; 否则要先按一次切回阅读窗口、再按一次才关，用户得按两次）。这条分支必须在
+  ;; 「非阅读 buffer 报错」之前——面板 buffer 不是 `seshat-reader-mode'。关闭仍
+  ;; 走 sidebar 的 per-kind toggle，尺寸记忆与恢复行为与
+  ;; `seshat-reader-sidebar-toggle-outline' 一致。
+  (if (derived-mode-p 'seshat-reader-outline-mode)
+      (seshat-reader-sidebar--toggle-kind 'outline)
+    (unless (derived-mode-p 'seshat-reader-mode)
+      (user-error "Not in a seshat-reader-mode buffer"))
+    ;; 目录面板已显示时，再按一次就是关闭（与
+    ;; `seshat-reader-sidebar-toggle-outline' 的 toggle 语义一致）。
+    ;; 关闭走 sidebar 的 per-kind toggle：先捕获尺寸再 delete-window，并记住
+    ;; buffer 供下次重开；不在这里自己 delete-window，避免与 sidebar 的
+    ;; kind/slot/尺寸记忆逻辑分叉。
+    (if (seshat-reader-sidebar--window-for-kind 'outline)
+        (seshat-reader-sidebar--toggle-kind 'outline)
+      (let* ((outline-data seshat-reader-current-doc-outline)
+             (source-buffer (current-buffer))
+             (source-name (buffer-name source-buffer))
+             (bufname (format "*Outline of %s*" source-name)))
+        ;; 先校验再重建：文档无目录时不得把面板清成空白（否则拿不到旧内容）。
+        (unless outline-data
+          (user-error "This document has no outline"))
+        (with-current-buffer (get-buffer-create bufname)
+          (unless (derived-mode-p 'seshat-reader-outline-mode)
+            (seshat-reader-outline-mode))
+          ;; 每次打开都同步归属信息（`goto-entry' 靠它找回阅读窗口）。
+          (setq seshat-reader-outline--doc-buffername source-name)
+          (setq seshat-reader-outline--doc-window
+                (get-buffer-window source-buffer))
+          ;; 按当前文档重建内容：可读 buffer 须绑 `inhibit-read-only'；不 kill 也
+          ;; 不重建 buffer，否则承载该 buffer 的面板窗口会失效。
+          (let ((inhibit-read-only t)
+                ;; 折叠态集合暂恒为 nil（全部展开）：buffer 内的 TAB 折叠由
+                ;; `outline-mode' 自身的不可见性实现，不需要重建 buffer，也就不经
+                ;; 本集合（详见 `seshat-reader-outline--rows' 的 docstring）。
+                (collapsed nil)
+                (current-page (seshat-reader-outline--doc-current-page
+                               source-buffer)))
+            (erase-buffer)
+            (seshat-reader--outline-insert-outline
+             (seshat-reader-outline--rows outline-data collapsed current-page))
+            (goto-char (point-min))))
+        ;; 显示交给承载层（`outline' kind：左侧/底部由 sidebar 决定）；SELECT 非
+        ;; nil 与 `seshat-reader-sidebar-toggle-outline' 的重开路径一致——按 `o'
+        ;; 打开目录后光标进入目录面板。
+        (seshat-reader-sidebar-show (get-buffer bufname) 'outline t)))))
 
 ;;; 行模型（纯函数，无 buffer 副作用，可在 batch 下测试）
 
@@ -540,7 +589,16 @@ overlay 的 `before-string' 在其前面显示 1-2 个字符的标签（face 为
       (seshat-reader-outline-goto-entry (button-at (car target))))))
 
 (defun seshat-reader-outline-select-doc-window ()
-  "Display and switch to the original document's window."
+  "Display and switch to the original document's window.
+
+Bound to `s' in `seshat-reader-outline-mode-map', and (for evil users) in
+the normal state bindings installed by
+`seshat-reader-outline--install-evil-bindings'.  The `o' key does not reach
+this command any more: it is carried by `seshat-reader-outline-show', which
+toggles the panel open/closed and closes it when point is inside the panel
+\(pressing this command there would instead move point back into the reading
+window, so the user had to press twice).  This command remains the
+jump-back primitive used by `seshat-reader-outline-goto-entry'."
   (interactive)
   (let ((buf (get-buffer seshat-reader-outline--doc-buffername)))
     (unless (buffer-live-p buf)
@@ -559,7 +617,8 @@ overlay 的 `before-string' 在其前面显示 1-2 个字符的标签（face 为
   "p"        #'previous-line
   "n"        #'next-line
   "f"        #'seshat-reader-outline-avy-jump
-  "o"        #'seshat-reader-outline-select-doc-window
+  "o"        #'seshat-reader-outline-show
+  "s"        #'seshat-reader-outline-select-doc-window
   "q"        #'quit-window
   "RET"      #'seshat-reader-outline-visit-page
   "M-RET"    #'seshat-reader-outline-visit-page)
@@ -607,7 +666,7 @@ The panel of that document, `*Outline of NAME*', is closed through
 window of that kind showing that very panel is removed, other panels are
 untouched.  The panel buffer is then emptied (`inhibit-read-only' bound)
 and `seshat-reader-outline--doc-buffername' reset to nil, so the entries of
-a dead document cannot survive and the outline toggle key
+a dead document cannot survive and the outline toggle command
 \(\\[seshat-reader-sidebar-toggle-outline]) cannot resurrect them.  The
 panel buffer itself is **not** killed: keeping it empty lets the next
 `seshat-reader-outline-show' rebuild into the same buffer.
@@ -665,7 +724,8 @@ loading this library never requires evil.  Extracted from the
       "f"           #'seshat-reader-outline-avy-jump
       "p"           #'previous-line
       "n"           #'next-line
-      "o"           #'seshat-reader-outline-select-doc-window
+      "o"           #'seshat-reader-outline-show
+      "s"           #'seshat-reader-outline-select-doc-window
       "q"           #'quit-window
       (kbd "RET")   #'seshat-reader-outline-visit-page
       (kbd "M-RET") #'seshat-reader-outline-visit-page)))
