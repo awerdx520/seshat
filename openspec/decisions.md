@@ -595,6 +595,12 @@ refit 按当前窗口尺寸做一次几何适配 + 重渲染，一次到位。
 （首帧即正确）。阈值硬编码不进 defcustom：它调的是交互手感而非功能语义，暴露成
 用户选项只会被误调。
 
+## 2026-10-23 · 阅读器适配默认值：defcustom 作新窗口初值，不做 W/H 自动持久
 
+**问题**：`seshat-reader-default-fit` 在自动 fit 路径上已无调用点（首次打开与尺寸变化后的 fit 一律走 `--contain-scale` / `--fit-scale` 的 contain 分支），成为「可配置但无效」的选项；同时 `fit-mode` 是 window parameter，`W` / `H` 的选择随窗口销毁丢失，与文档里「持久适配模式」的措辞不符。
 
+**方案空间与取舍**：① **M1（选定）**——把该 defcustom 重定义为「新窗口的初始适配模式」，`W` / `H` 只改窗口；不改用户 init、不新增状态文件，代价是「按一次 `W`，下次开新窗口仍回初值」。② M2——新增 `~/.local/share/seshat/reader-state.eld`（仿 `annotation-queue.eld`）记 `W`/`H` 选择，真跨会话，但引入新持久化面与容错/迁移成本。③ M3——`W`/`H` 时 `customize-save-variable` 写用户 init，违反最小惊奇，否决。用户 2026-10-23 明确选 M1。
 
+**旧值映射（契约）**：`fit-to-width` → `width`；`fit-to-height`（旧默认）→ `contain`；其它任意值 → `contain`。旧默认映射为 `contain` 而非 `height` 的理由：绝大多数配置从未改过该项，映射为 `height` 会让所有人打开文档后纵向溢出；「显式想要按高」与「沿用旧默认」在值上不可区分，只能保现状，并在 CHANGELOG 给出绕法（显式设 `height`）。
+
+**代价与边界**：`W`/`H` 仍不跨会话；书签仍不携带 `fit-mode`（与既有技术债「书签恢复不携带缩放来源」同族，不在本次扩大范围）；新窗口首帧可能沿用恢复的 scale，0.15s 后由 idle refit 按 mode 校正（不做创建时同步重算，避免 `native` 尺寸不可得时把页面设成 1.0）。

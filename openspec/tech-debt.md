@@ -972,10 +972,11 @@
 - 缓解（2026-10-23）：`scroll-offset` 计算加 `(max 0 …)`，超宽时页面左对齐而不是两侧裁切；自动 fit（首次 + 尺寸变化后）改为 `seshat-reader--contain-scale`（`min(按高, 按宽)`），默认路径不再产生超宽页。仍未实现「横向滚动跟随翻页」（超宽页只能用 `scroll-left` / `scroll-right` 手动左右看），`unconstrained = t` 本身也未收紧。
 - 建议：若要根治，给 `unconstrained` 路径补「页面至少留 N 列可见」的下界夹紧，并在翻页 / vscroll 变化时把水平偏移按阅读位置（左/中/右三段）跟随；须与 `seshat-reader-page-join-test.el` 的 5 个 vscroll 用例同步。
 
-## `seshat-reader-default-fit` 在自动 fit 路径上已成 no-op（2026-10-23，D6 副作用）
+## `seshat-reader-default-fit` 在自动 fit 路径上已成 no-op（2026-10-23，D6 副作用）——已解决（重定义为新窗口初值，2026-10-23）
 - 现状：自动 fit（`seshat-reader-mode` 首次 fit 与 `--refit-window` 的 fit 分支）改走 `seshat-reader--contain-scale`（`min(按高, 按宽)`）后，`seshat-reader-default-fit` 在整个仓库里只剩 defcustom 自身，没有任何调用点（`grep -n seshat-reader-default-fit emacs/seshat-reader/` 仅命中定义与一条 docstring 引用）。它不是缺陷的成因，但会让用户误以为可配置。
 - 影响：设成 `seshat-reader-fit-to-width` 与 `seshat-reader-fit-to-height` 在自动 fit 下行为完全一样；任何「用该选项覆盖 contain」的实现都会让另一维溢出，因此**无法**在不溢出的前提下恢复区分度。
 - 建议：二选一 —— ① 删除该 defcustom（破坏性变更，需在 CHANGELOG 记 BREAKING 并同步 `docs/configuration.md`）；② 重新定义为「手动 `H`/`W` 之外的默认命令」或彻底改语义（例如「是否允许放大到填满」）。在定稿前保留原样，并在 docstring 注明「自动 fit 不再使用本选项」。
+- 已解决（2026-10-23）：该选项被重定义为「新窗口 / 新文档的初始适配模式」（`contain` / `width` / `height`，默认 `contain`），由 `--first-fit` 与 `--window-create-function` 读取；旧函数符号值经 `--normalize-default-fit` 兼容映射。见 `openspec/active/2026-10-23-reader-default-fit-mode.md`。
 
 ## `seshat-reader--set-window-vscroll` 缺下界夹紧（2026-10-23）
 
@@ -1007,12 +1008,13 @@
 - 影响：同一语义有两个入口，若将来改 contain 的算法（例如引入「允许放大到填满」或 strip 高度参与计算），必须同时确认两条路径；读代码时要多跳一次才知道 `contain` 的权威实现在 `--contain-scale`。
 - 建议：保持现状即可（双入口换来零回归，收益大于整洁度）；若将来要合并，把 `--contain-scale` 收敛为 `--fit-scale` 的 `contain` 分支私有实现，并同时把锁定它的 16+ 例测试改指向 `--fit-scale`。
 
-## `seshat-reader-default-fit` 仍是 no-op（2026-10-23，`fit-mode` 落地后复核）
+## `seshat-reader-default-fit` 仍是 no-op（2026-10-23，`fit-mode` 落地后复核）——已解决（2026-10-23）
 
 - 现状：自动 fit 由 window parameter `fit-mode`（`contain` / `width` / `height`，未设置按 `contain`）决定，`seshat-reader-default-fit` 在整个仓库里仍只剩 defcustom 自身（`grep -n seshat-reader-default-fit emacs/seshat-reader/` 零调用点）——它既不参与首次打开、也不参与尺寸变化后的 refit，`W` / `H` 的语义已完全由 `fit-mode` 承载。
 - 关联：既有条目「`seshat-reader-default-fit` 在自动 fit 路径上已成 no-op（2026-10-23，D6 副作用）」记录的是同一事实的成因（contain 化），本条只记录 `fit-mode` 落地后的现状，不重复其分析。
 - 影响：设成 `fit-to-width` 与 `fit-to-height` 在自动路径下仍毫无差别；`fit-mode` 引入后该选项更易误导——用户想做的是「默认按宽度适配」，正确做法是打开文档后按 `W`（写入 `fit-mode`），而配置里改该选项没有任何效果。
 - 建议：二选一 —— ① 删除该 defcustom（破坏性变更，需在 CHANGELOG 记 BREAKING 并同步 `docs/configuration.md`）；② 重新定义为「首次打开时写入的 `fit-mode` 初值」（`fit-to-width` → `width`、`fit-to-height` → `height`，其余 → `contain`），这样它重新有意义且不新增选项。②更贴合「默认适配维度」诉求，但需与「`fit-mode` 是否跨会话记忆」一并定稿（当前不记忆）。
+- 已解决（2026-10-23）：同上条；`fit-mode` 与 defcustom 现已分工明确（前者管窗口、后者管起点），该选项重新具备可观察效果。
 
 ## `image-flush` 已从 `--apply-display-scale` 移除，「C 侧下次重渲染即清旧缓存」未验证（2026-10-23）
 

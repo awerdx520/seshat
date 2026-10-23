@@ -179,6 +179,13 @@ M0–M6 已完成并归档，见 `openspec/completed/personal-notes-system.md`�
 - 内容：① `W` / `H` 升级为**持久适配模式**（window parameter `fit-mode` 取 `contain` / `width` / `height`，`--fit-scale` 按模式求目标 scale）——修「按 `W` 后开关目录变回按高度」（适配维度在写入时被丢弃）；② 尺寸变化的几何适配改为**同步**——hook 内直接改写页面 image spec 的 `:width` / `:height`（`--apply-display-scale`，纯 elisp、不重渲染），第一帧即最终几何；C 侧重渲染降级为 idle 的「一次清晰化」（`--refit-window` 按 `render-scale` 是否等于 `scale` 决定，替换旧的 1% 偏差闸），消除「先跳动一下、再重新绘制」的两帧；③ **居中改由 redisplay 求值**（页面 overlay 的 `before-string` = `(space :align-to (+ center (-0.5 . IMAGE)))`，配合 `--centered-p` / `--ensure-centered` 与 buffer-local `pre-redisplay-functions`），彻底消除窗口尺寸变化时的中间帧（旧实现靠 `line-prefix` + `hscroll` 两段补偿，实测首帧偏 −524px）；超宽页仍走 `line-prefix` + 横向滚动；④ 首次打开改走 `--first-fit`（显示层缩放一步到位，不再「先画小图再重渲染大图」）；⑤ 拖拽抑制 `--drag-threshold`（0.12 秒）：连续尺寸变化只居中不缩放，避免逐帧重缩放位图；⑥ 新增 `--native-page-size`（按页号缓存的未缩放像素尺寸）与 `render-scale`（清晰度闸）；⑦ 契约变更：resize 测试中原「1% 偏差闸」两例改为「`render-scale` 相等则不重渲染」，另有多例按新的居中机制调整断言（未删用例、未弱化断言）。
 - 状态：**已完成（2026-10-23），真机验收通过**：L1 `make all` EXIT=0、警告集 33 条零新增（逐条 diff）；L2 全量 11 个测试文件 **379 例全绿 / 0 unexpected / 0 skipped**（resize 测试 30 → **67** 例，新增 37 例），变异自检 3 处；隔离实例逐帧测量开关目录 / `W` / `H` / 新窗口的首帧误差 ≤0.5px；真机验收六项全过（`o` 开关目录第一帧居中、`W` / `H` 居中、打开文档无「先小后大」）。文档已同步 `CHANGELOG.md` / `openspec/decisions.md`（五条）/ `openspec/tech-debt.md` / `emacs/seshat-reader/VENDORED.md`（第 ⑧ + ⑨ 项）/ `docs/emacs-reader.md`（§3、§12）。保留残余项（超宽页左对齐、join strip 与居中未验证、image cache 峰值未观测）已记 tech-debt；**零新增 defcustom**（`docs/configuration.md` 不改）。
 
+### M12 后续：阅读器适配默认值（`seshat-reader-default-fit` 重定义）
+
+计划与执行记录：`openspec/active/2026-10-23-reader-default-fit-mode.md`。
+
+- 内容：把 `seshat-reader-default-fit` 从「自动 fit 路径零调用点的 no-op」重定义为**新窗口/新文档的初始适配模式**（`contain` / `width` / `height`，默认 `contain`），旧函数符号值兼容映射；新增 `--normalize-default-fit` / `--initial-fit-mode`，接入 `--first-fit` 与 `--window-create-function`；`W` / `H` 仍只作用于当前窗口、不跨会话。附带一次真机批量观测，清 L3-6 / L3-8 / `image-flush` 移除后回收 / image cache 峰值 / strip 与 `before-string` 居中交互等技术债。
+- 状态：**代码 + 单测完成（2026-10-23）**——`seshat-reader-resize-test.el` 67 → **80** 例，全仓 ERT 384 → **397**（0 unexpected / 0 skipped）；L1 警告集 33 → 33 零新增；文档（`docs/configuration.md` 新增小节、`docs/emacs-reader.md` 三处、`CHANGELOG.md`、`VENDORED.md` ⑩、`decisions.md`）同步中；**T4 真机批量观测待用户执行**，观测完成后归档 `openspec/completed/`。
+
 ## 风险登记
 
 | # | 风险 | 影响 | 缓解 |
