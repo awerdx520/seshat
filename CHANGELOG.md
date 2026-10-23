@@ -9,6 +9,7 @@
 
 ### 新增
 
+- 阅读器窗口尺寸变化自适应（M12 后续，2026-10-23）：`seshat-reader` 在窗口尺寸变化后重新贴合页面——新增 `scale-source`（`fit` / `manual`）window parameter 区分「按窗口算的缩放」与「用户手选缩放」，新增 `seshat-reader--contain-scale`（取 `min(按高, 按宽)`，页面完整可见）、`seshat-reader--refit-window` / `seshat-reader--clamp-window-vscroll` / `seshat-reader--recenter-window`；重贴合走 idle 去抖（`seshat-reader--resize-refit-delay` 默认 `0.15` 秒）+ 1% 偏差闸 + `seshat-reader--refitting` 防重入，拖分割线期间不逐帧重渲染；**零新增 defcustom**。新增 ERT 测试 `emacs/tests/seshat-reader-resize-test.el`（30 例）。详见 `openspec/active/2026-10-22-emacs-reader-resize-refit.md`。
 - 服务端文件身份（M7）：新增 `resources` 表与 26 位 Crockford Base32 `uid`（`crypto/rand` 16 字节，零新增依赖），路径降级为可变属性——改名/移动后 `uid` 不变，三端身份收敛到同一个 uid。详见 `docs/adr/0003-uid-identity-model.md`。
 - 服务端变更流（M7）：新增 `changes` 表与全局单调 `seq`，`GET /api/changes?since=<seq>` 增量拉取；删除写墓碑并保留 `delete` 事件，客户端可感知删除。详见 `docs/adr/0004-incremental-change-log.md`。
 - 服务端引用图（M7）：新增 `refs` 表记录 `seshat:` 引用（`tag:path` 与 uid 双形态），`GET /api/refs?uid=&direction=in|out` 双向查询引用关系。
@@ -71,6 +72,7 @@
 
 ### 变更
 
+- 阅读器自动 fit 改为 contain（M12 后续，2026-10-23）：首次打开与窗口尺寸变化后的自动 fit 由「只按高」改为 `min(按高, 按宽)`——窗口变窄时页面缩小以完整可见，不再被两侧裁切；`seshat-reader--center-page` 的横向偏移夹到 `>= 0`（超宽页左对齐而非两侧裁切）。副作用是 `seshat-reader-default-fit` 在自动 fit 路径上已无调用点（仅显式 `H` / `W` 命令仍按其语义，见 `openspec/tech-debt.md`）。
 - 状态端点改以 uid 为键（M7，B4）：`GET|PUT /api/progress/{uid}`、`GET /api/annotations?uid=`，批注写入按 uid 关联；`reading_progress` / `annotations` 在 v7 迁移中重建（`DROP` + 按 uid 新建，见「破坏性」）。
 - WebDAV 写路径接入登记钩子（M7.4）：写钩子链新增 registry 登记调用，第三方 PUT/MOVE 后同样进 `resources`；FTS 索引**仍只覆盖笔记根**（`roots[0]`），书库根不进全文索引。
 - `emacs/seshat-reader`：完成自研化改名（`reader` → `seshat-reader`），feature / 符号 / 文件名 / C 模块可见名统一为 `seshat-reader-*` 与 `seshat-render-core`；构建产物改为 `seshat-render-core.so` + `seshat-reader-autoloads.el`。
@@ -110,6 +112,7 @@
 
 ### 修复
 
+- 修复阅读器三处边界缺陷（M12 后续，2026-10-23）：① 开关目录 / 批注面板时页面「先偏一下再居中」的中间帧——居中改为在尺寸变化 hook 内同步执行，只有需要重渲染的 refit 仍异步去抖；② 新窗口 / 新 frame 显示同一文档时页面贴右边缘（实测偏 261 px）且不自愈——`set-window-buffer` 会把窗口 hscroll 归零（Emacs 固有行为），改由 `seshat-reader--handle-window-buffer-change` 在页 overlay 已存在时补一次 recentre；③ 首次打开 PDF 抛 `(wrong-type-argument number-or-marker-p nil)`——`seshat-reader--right-most-window-hscroll` 加 `numberp` 守卫，未见渲染时返回 0。
 - **安全边界收紧（M7 修复轮）**：`.git` 与点路径（任一以 `.` 开头的段）在 **REST 与 WebDAV 两侧**一律拒绝（REST `400 invalid_argument`，WebDAV `403 Forbidden`，两侧判定同口径），堵住 `.git/config` 泄露 remote URL 与「写穿版本库」的路径；**符号链接不跟随**——登记/重扫只收普通文件，REST 读端点对软链返回 `404`、写端点返回 `400`，父目录经软链越出根同样 `400`；`PUT` 的 `If-Match` 改为**原子条件写**（读 ETag/比较/落盘/commit 在同一临界区，并发同 ETag 只有一个成功）；**空 ETag 永不匹配**（不再退化为无条件写）；`If-None-Match: *` 的「已存在」判据改为「登记表存活 ∨ 磁盘存在」，覆盖登记与磁盘不一致的两种状态。
 - 修复 rescan 把「处理失败」误判为「已删除」（M7 修复轮）：`registry.scanRoot` 的 `seen` 集合改为「磁盘上确认存在即计入」，与后续读元数据/登记是否成功解耦——修复前一次读取失败会让 Rescan 为该文件写墓碑并产生 `delete` 事件，把可重试的失败放大成客户端可见的「文件被删除」；失败只计入 `failed` 计数，由下一轮幂等补齐。
 - 修复目录删除误伤同前缀资源（M7 修复轮）：子树收敛从 LIKE 前缀改为**路径段边界**判定（`path` 等于目标，或其前缀恰为「目标 + `/`」），删除 `a/b` 不再命中 `a/bc`、`a/b-备份`。同时 `GET /api/resources?prefix=` 的 `ListResources` 一并改为大小写敏感的精确段边界匹配，`%`/`_` 不再作为通配符生效（客户端无需再二次过滤）。

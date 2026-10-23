@@ -4,15 +4,16 @@
 
 ## 当前状态
 
-- 阶段：Phase 3（Implement）· T0–T3 + D6 + 抖动闸 + **T7（居中同步化）** 完成，L1+L2 全绿
+- 阶段：Phase 3（Implement）· T0–T3 + D6 + 抖动闸 + T7（居中同步化）+ **D8（两处边界缺陷）** 已完成，L1+L2 全绿；**等待用户真机目视确认（可选）**；**T5/T6 待做**
 - 已确认：方案 ✅（用户 2026-10-22 确认）、计划 ✅（用户 2026-10-22 确认）、T7 方案 A ✅（用户 2026-10-23 确认）
-- 实施：T0–T3 ✅（commit `c47100c` / `0d5edbd` + 本批测试）；**T7 ✅ 2026-10-23**（新增 `--recenter-window`，两形态均在 hook 内同步 recentre）；T4 真机、T5 文档、T6 归档待做
-- 验证：L1 警告集零新增（33 → 33 条，行号归一化后 diff 为空）；L2 **337** 例 / 337 passed / 0 unexpected / 0 skipped
-- 下一步：**等用户在 GUI Emacs 上做 T4 的 8 条真机验收**（batch 无法自动化，`fit-to-height` 会报 `Window system frame should be used`），其中必须含 **D7 抖动复验**：开关目录 / 面板时页面须始终居中、不出现偏左中间帧；通过后再做 T5 文档 + T6 归档
+- 实施：T0–T3 ✅（commit `c47100c` / `0d5edbd` + 本批测试）；T7 ✅ 2026-10-23（新增 `--recenter-window`，两形态均在 hook 内同步 recentre）；**T8/D8 ✅ 2026-10-23**（换 buffer 补 recentre + hscroll nil 守卫）；T5 文档、T6 归档待做
+- 验证：L1 警告集零新增（33 → 33 条，行号归一化后 diff 为空）；L2 **342** 例 / 342 passed / 0 unexpected / 0 skipped
+- 下一步：用户可在 GUI Emacs 上做 T4 的 8 条真机验收（batch 无法自动化，`fit-to-height` 会报 `Window system frame should be used`；D8 已把其中「新窗口/新 frame 显示同一文档」与「首次打开抛错」两条以自动化测试覆盖，真机目视转为**可选**）；之后做 T5 文档 + T6 归档
 - 2026-10-23 追加：真机验收发现窗口变窄时页面超宽裁切（主路径缺陷），按方案 C 修复（contain + 负偏移夹 0），详见 D6
 - 2026-10-23 真机第二次纠正：hook 实际传 window（非 frame），refit 链路此前从未运行；`--center-page` 的 prefix/hscroll 改为同成同败。见 D2 与「旧版计划的错误清单」第 7 条。
 - 2026-10-23 真机反馈：布局与居中已正常，但画面持续抖动；实现 D3 预留的偏差闸（1%）+ --refitting 防重入，阻断 refit 自我激发。
 - 2026-10-23 真机抖动第二轮（截图实测偏左约 175px）：refit 只排 idle timer，居中不在 hook 内同步执行 → 必然出现中间帧。按方案 A 新增 `--recenter-window`，在尺寸变化 hook 内同步 recentre，见 D7 / T7。
+- 2026-10-23 实例实测定位两处边界缺陷（页面贴右边缘 +261px 且不自愈；首次打开 PDF 抛 `wrong-type-argument`），见 D8 / T8，已修复并补 5 例 ERT。
 
 ## 目标
 
@@ -240,6 +241,14 @@ SOURCE 非 nil 时，把它记为该窗口的缩放来源（`fit' 或 `manual'�
 - **不改**：`--center-page` / `--set-window-vscroll` / `--page-max-vscroll-pixels` / `--refit-window` / `--schedule-refit` 函数体、三条 hook 注册行、零新增 defcustom。
 - **取舍**：位移型抖动消除；剩余的是「页面缩放到新尺寸」的一次变化，属 contain 需求本身（L3-1/L3-3 要求页面缩小到完整可见），不算抖动。
 
+### D8 两处边界缺陷修复（2026-10-23 实例实测定位）
+
+- **缺陷 1（页面偏右、不自愈）**：`set-window-buffer` 会把 `window-hscroll` 同步归零——这是 Emacs 自身行为，已用「零 seshat 代码的普通 buffer」反证（设 hscroll 5 → 同 buffer 重设窗口 → 变 0）。而「新窗口/新 frame 显示同一个 reader buffer」既不触发 `window-size-change-functions`（无尺寸变化），也不重建 overlay（`'overlay` 窗口参数仍在），于是没有任何路径重新居中：实测基线 `page-left 261 / dev 0` → 重设后 `hs-raw 0 / page-left 522 / dev +261`，`redisplay` 与 `sit-for 1s` 都不自愈。
+  修法：`--handle-window-buffer-change` 在「新 buffer 是 reader 且已有 overlay」时补 `--recenter-window`；缺 overlay 时仍走 `--window-create-function`（两分支互斥，create 内部已居中，不重复）。
+- **缺陷 2（首次打开抛错）**：`--right-most-window-hscroll` 在 `--get-current-doc-image-size` 返回 `(nil . nil)`（overlay display 尚无 :width/:height）时执行 `(- nil pixel-window-width)` → `(wrong-type-argument number-or-marker-p nil)`，被 `ignore-errors` 吞掉。修法：加 `(numberp image-width)` 守卫，未知尺寸时返回 0；顺带把 4 个横向滚动命令的 image-width 读取改为 `(or (car …) 0)`。
+- **边界**：`fit-to-height` / `fit-to-width` 的 image-size 读取仍是裸 `cdr`/`car`（显式命令触发，首次打开不会走到），本轮不动，记 tech-debt。
+- **未覆盖**：同一 buffer 重设窗口（`set-window-buffer win (current-buffer)`）不触发 `window-buffer-change-functions`，该情形仍需 advice `set-window-buffer` 才能兜住，侵入性大，不采用，记 tech-debt。
+
 ## 旧版计划的错误清单
 
 | # | 旧版说法 | 实测事实（HEAD `f56dcce`） |
@@ -345,6 +354,13 @@ SOURCE 非 nil 时，把它记为该窗口的缩放来源（`fit' 或 `manual'�
 - 验收：新增 ERT 3 例（同步 recentre + 顺序、多窗口居中各 1 次且 refit 仅 1 次、overlay 缺失时只跳过同步段）；`resize-test` 全绿；11 个文件合计 `unexpected = 0`；`make all` 警告集零新增。
 - ✅ 2026-10-23 完成：`emacs/tests/seshat-reader-resize-test.el` **25/25 全绿**（原 22 例 + 新 3 例）；11 个文件合计 **337 例 / 337 passed / 0 unexpected / 0 skipped**；`make all` 退出码 0、警告集 **33 → 33**（行号归一化后 diff 为空）；变异自检（`/tmp` 副本删掉两处 `--recenter-window` 调用）→ 仅 `--size-change-recentres-synchronously` 与 `--size-change-recentres-every-window` 变红，其余 23 例仍绿。
 
+### [x] T8 边界缺陷修复（D8，2026-10-23）
+
+- 动作：`--handle-window-buffer-change` 对已带 overlay 的窗口补 recentre；`--right-most-window-hscroll` 加 nil 守卫；4 个横向滚动命令的 image-width 读取补 `(or … 0)`。
+- 依赖：T7
+- 验收：新增 ERT 5 例（recentre 分支 / create 分支互斥 / 非 reader 跳过 / nil image size 不抛错 / 公式回归）；`resize-test` 全绿；11 个文件 `unexpected = 0`；`make all` 警告集零新增。
+- ✅ 2026-10-23 完成：`resize-test` **30/30 全绿**（原 25 例 + 新 5 例）；11 个文件合计 **342 例 / 342 passed / 0 unexpected / 0 skipped**；`make all` 退出码 0、警告集 **33 → 33**（行号归一化后 diff 为空）；变异自检（`/tmp` 副本）：① recentre 分支改回 `nil` → 仅 `--window-buffer-change-recentres-existing-overlay` 红；② 去掉 `(numberp image-width)` → 仅 `--right-most-window-hscroll-nil-image-size` 红。
+
 ## 依赖关系
 
 ```
@@ -443,6 +459,7 @@ git clean -fd -- emacs/tests/seshat-reader-resize-test.el
 - 分支 `master`；本轮工作起点 HEAD `0d5edbd`（T0 实测时为 `ca01af6`；中间 `c47100c` = D1–D4 实现，`0d5edbd` = 计划修正）。
 - 安全点 tag：`pre-reader-resize` → **`ca01af6`**（`git tag -l pre-reader-resize` 有输出，`git rev-parse --short pre-reader-resize` = `ca01af6`）。
 - 回滚方式见「### 回滚」；新测试文件是未跟踪文件，`git checkout` 不删它，须 `git clean -fd -- emacs/tests/seshat-reader-resize-test.el` 一并清理。
+- **D8 安全点（2026-10-23）**：先提交 D7 残留改动为 `9af97fc feat(reader): 尺寸变化时同步居中，消除中间帧抖动`，再打 tag `pre-window-buffer-recenter` → **`9af97fc`**；D8 改动尚未提交，回滚用 `git checkout -- emacs/seshat-reader/seshat-reader.el emacs/tests/seshat-reader-resize-test.el`。
 
 ### S2 L1
 
@@ -466,11 +483,14 @@ git clean -fd -- emacs/tests/seshat-reader-resize-test.el
 | `seshat-reader-select-flash-test.el` | 8 | 8 | 0 | 0 |
 | `seshat-reader-sidebar-test.el` | 56 | 56 | 0 | 0 |
 | `seshat-reader-translate-test.el` | 47 | 47 | 0 | 0 |
-| `seshat-reader-resize-test.el` | 25 | 25 | 0 | 0 |
-| **合计** | **337** | **337** | **0** | **0** |
+| `seshat-reader-resize-test.el` | 30 | 30 | 0 | 0 |
+| **合计** | **342** | **342** | **0** | **0** |
 
-- 判据全部满足：合计 **337 ≥ 329**、`unexpected = 0`、`skipped = 0`（2026-10-22 实测时 translate 有 2 例跳过；2026-10-23 复跑为 0 跳过，该 2 例的跳过条件当日未触发）。
-- **2026-10-23 抖动第二轮（D7）后的实测**（上表即此次实跑数字，逐文件与 `git diff` 同批）：`seshat-reader-resize-test.el` 由 17 例增至 **25 例**（22 例存量 + 3 例 D7 新增），合计 337。命令口径：`emacs --batch -Q -L emacs -L emacs/seshat-reader -L <straight build-31.1 中除 seshat-reader 外的全部包目录> -l <TEST-FILE> -f ert-run-tests-batch-and-exit`。
+- 判据全部满足：合计 **342 ≥ 329**、`unexpected = 0`、`skipped = 0`（2026-10-22 实测时 translate 有 2 例跳过；2026-10-23 复跑为 0 跳过，该 2 例的跳过条件当日未触发）。
+- **2026-10-23 D8 后的实测**（上表即此次实跑数字）：`seshat-reader-resize-test.el` 由 25 例增至 **30 例**（25 例存量 + 5 例 D8 新增：`--window-buffer-change-recentres-existing-overlay`、`--window-buffer-change-creates-overlay-when-missing`、`--window-buffer-change-skips-non-reader-buffer`、`--right-most-window-hscroll-nil-image-size`、`--right-most-window-hscroll-formula-regression`），合计 342，逐文件 `unexpected = 0`、`skipped = 0`。
+  - **路径修正（本轮实测）**：straight 构建目录在本机是 `/home/thomas/thomas-emacs/.local/straight/build-31.1`，`~/.local/straight/build-31.1` **不存在**（`directory-files` 直接 `file-missing` 让 11 个文件全部 exit 255）；命令里的追加路径必须写全 `thomas-emacs` 前缀。
+  - D8 变异自检：① 把 `--handle-window-buffer-change` 的 `(seshat-reader--recenter-window window)` 改回 `nil`（恢复 create-only）→ 仅 `--window-buffer-change-recentres-existing-overlay` 红；② 去掉 `--right-most-window-hscroll` 的 `(numberp image-width)` 条件 → 仅 `--right-most-window-hscroll-nil-image-size` 红（`wrong-type-argument number-or-marker-p nil`）。注意副本必须 `rm -f *.elc`，否则旧 `.elc` 会遮蔽变异后的 `.el`（本轮实测踩到：首次变异全绿）。
+- **2026-10-23 抖动第二轮（D7）后的实测**：`seshat-reader-resize-test.el` 由 17 例增至 **25 例**（22 例存量 + 3 例 D7 新增），合计 337。命令口径：`emacs --batch -Q -L emacs -L emacs/seshat-reader -L <straight build-31.1 中除 seshat-reader 外的全部包目录> -l <TEST-FILE> -f ert-run-tests-batch-and-exit`。
   - **口径陷阱（本轮实测）**：`emacs -Q` 不加载用户配置，`etaf-ui` / `gt`（go-translate）/ `pdd` 均不在默认 `load-path`，`annotation-v8`（2 例）、`etaf`（15 例）、`sidebar`（3 例）、`translate`（整文件加载失败）会假失败 / 假跳过；补齐 `~/.local/straight/build-31.1/*` 后全部转绿且 0 skipped。
   - **第二个陷阱**：该目录里存在 straight 自己的 `seshat-reader` 副本，若前置注入 `load-path` 会**遮蔽仓库版本**（`--recenter-window` 变成 void → 新用例红）。最终命令把 straight 目录**追加到末尾并排除名字含 `seshat` 的目录**，仓库版本始终优先。
   - D7 变异自检：`/tmp/mut` 副本删掉 `--window-size-change` 里两处 `--recenter-window` 调用 → 仅 `--size-change-recentres-synchronously`（顺序断言）与 `--size-change-recentres-every-window`（多窗口各居中）变红，其余 23 例仍绿。

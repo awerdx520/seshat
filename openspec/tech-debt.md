@@ -977,6 +977,31 @@
 - 影响：设成 `seshat-reader-fit-to-width` 与 `seshat-reader-fit-to-height` 在自动 fit 下行为完全一样；任何「用该选项覆盖 contain」的实现都会让另一维溢出，因此**无法**在不溢出的前提下恢复区分度。
 - 建议：二选一 —— ① 删除该 defcustom（破坏性变更，需在 CHANGELOG 记 BREAKING 并同步 `docs/configuration.md`）；② 重新定义为「手动 `H`/`W` 之外的默认命令」或彻底改语义（例如「是否允许放大到填满」）。在定稿前保留原样，并在 docstring 注明「自动 fit 不再使用本选项」。
 
+## `seshat-reader--set-window-vscroll` 缺下界夹紧（2026-10-23）
+
+- 现状：`seshat-reader.el:607-610` 的 `(max 0 …)` 只作用于**上限值**（`max-pixel-vscroll`），`corrected-pixel-vscroll` 只做 `(min pixel-vscroll max-pixel-vscroll)`，负值原样下发给 `set-window-vscroll`。本轮仅在尺寸变化路径用 `seshat-reader--clamp-window-vscroll` 绕行（先按 `--page-max-vscroll-pixels` 夹到 `[0, max]` 再下发），函数本身未修。
+- 影响：其他调用点（翻页落点、书签恢复的 vscroll）若传入负值，页面仍可能被推出窗口顶部；`seshat-reader-page-join-test.el` 的 5 个 vscroll 用例锁定的是当前（含该缺口）行为，动函数会牵动这些断言。
+- 建议：根治须同时补下界夹紧（`(max 0 (min pixel-vscroll max-pixel-vscroll))`）并更新上述 5 个用例，且与本计划（尺寸变化自适应）同批推进，避免两处夹紧口径不一致。
+
+## 书签恢复不携带缩放来源（2026-10-23）
+
+- 现状：`seshat-reader-bookmark.el:29` 只写 `(cons 'scale (seshat-reader-current-doc-scale-value))`，`:39` 读出后交给 `seshat-reader-doc-scale-page`（1 参调用，不带 source）。书签里没有「这个比例是手选的还是自动 fit 的」这层信息。
+- 影响：跨会话恢复后 `scale-source` 为 nil（`seshat-reader--window-scale-source` 按 `fit` 处理），此后窗口尺寸一变就走 contain 重新贴合，把用户上次手选的比例重置。
+- 建议：扩展书签存储格式（`'scale` 的值改为 `(scale . source)`，或新增独立键），并对旧标签兼容（缺 source 按 `fit`，与当前行为一致）。属存储格式演进，须与 `docs/` 中书签说明同步。
+
+## 同一 buffer 重设窗口不触发 `window-buffer-change-functions`（2026-10-23）
+
+- 现状：`(set-window-buffer win (current-buffer))` 同样会让 Emacs 归零该窗口的 hscroll（与换 buffer 同一机制），但 `window-buffer-change-functions` 只在**缓冲区发生变化**时运行，同 buffer 重设不触发；D8 在 `seshat-reader--handle-window-buffer-change` 里的 recentre 因此兜不住这一情形。
+- 影响：用户或第三方包对同一个阅读窗口重复 `set-window-buffer` 后，页面可能贴右边缘，只能重开文档或触发一次尺寸变化自愈。
+- 建议：覆盖需 advice `set-window-buffer`，会侵入所有调用方并可能与其他包的 advice 交互，暂不采用；若将来出现实际投诉再评估。
+
+## `fit-to-height` / `fit-to-width` 仍裸读 image size（2026-10-23）
+
+- 现状：`seshat-reader.el:397` 的 `(cdr (seshat-reader--get-current-doc-image-size))` 与 `:408` 的 `(car …)` 均未做 nil 守卫，页面尚未渲染时得到 nil 并直接进除法。
+- 影响：只在显式 `H` / `W` 命令路径触发（首次打开走 contain，不会走到这里），D8 未覆盖；命中时报 `wrong-type-argument`。
+- 建议：与 `--right-most-window-hscroll` 同口径加 `(numberp …)` / `(or … 0)` 守卫；注意 `(or … 0)` 会让未渲染时算出 0 缩放因子，须一并定「未渲染时直接 no-op」的语义，故本轮未随手改。
+
+
 
 
 

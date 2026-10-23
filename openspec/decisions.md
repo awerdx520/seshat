@@ -402,5 +402,76 @@ fit 路径上已无任何调用点（`grep` 只剩 defcustom 自身）——想�
 contain 就必然让另一维溢出，故其区分度实际为零。是否删除该用户选项属破坏
 性变更，留待用户决定（记 tech-debt / D6「待确认」）。
 
+## 2026-10-23 · 阅读器缩放来源用 window parameter 区分 fit/manual
+
+真机验收暴露的观感问题之一是「用户手动调过的缩放，会在窗口尺寸一变时被自动
+refit 覆盖」。自动 fit 与显式缩放命令走同一个 `seshat-reader-doc-scale-page`，
+函数本身无从区分调用者意图。
+
+决定：载体选 window parameter `'scale-source`（取值 `fit` / `manual`，未设置时
+按 `fit` 处理）；写入面收窄为 `seshat-reader-doc-scale-page` 的可选 `source`
+参数——只有 5 个缩放命令传值（`enlarge-size` / `shrink-size` / `reset-size` 传
+`manual`，`fit-to-height` / `fit-to-width` 传 `fit`），4 个恢复路径（退出恢复
+`--restore-display-on-quit`、revert 的 reload、`--window-create-function`、书签
+恢复）保持 1 参调用，不覆盖已记录的来源、也不凭空记成 `manual`。不新增
+defcustom，参数随窗口走，不进入全局状态。
+
+取舍：恢复路径不写来源意味着跨会话一律视为 `fit`——宁可重新贴合（可能改变用户
+上次的手选比例），也不保留一个在当前窗口尺寸下可能已不合适的旧缩放。代价是
+「手动缩放 + 书签/会话恢复」这一组合的比例不跨会话保持（记 tech-debt）。
+
+## 2026-10-23 · 尺寸变化重贴合用 idle timer，并附差异论证与降级路径
+
+`seshat-reader-annotation-queue.el:437-438` 留有「daemon 下 idle timer 不可靠」的
+告诫。若照抄该条而放弃 idle timer，重贴合只能退化为「只居中、不重算缩放」，
+窗口变窄时页面依然被裁切。
+
+差异论证：该告诫针对**无人交互的后台同步**——进程可能长期停在非 idle 状态，
+idle timer 永不到期；本场景是**前台用户动作之后的 UI 重排**（开关面板、拖分割
+线、新建窗口），动作结束必然伴随「从非 idle 回到 idle」，idle timer 恰是合适的
+触发点。延迟仅 `0.15` 秒，最坏情形是「用户持续操作期间不重贴合」，这正是期望
+行为。
+
+决定：refit 走 `run-with-idle-timer`（`seshat-reader--resize-refit-delay`），并在
+其上叠 1% 偏差闸与 `--refitting` 防重入。降级路径（按优先级）：① 偏差闸——
+已实现为默认，缩放差异不足 1% 时只 clamp + 居中、不重渲染；② 若 idle timer 在
+某环境（含 daemon）下确实不触发，可整体退化为「只 `--clamp-window-vscroll` +
+居中、不 refit」（记 tech-debt），视觉上页面仍在，但可能被裁切。
+
+## 2026-10-23 · 居中同步化：hook 内先 recentre 再排 refit
+
+上游 emacs-reader（Codeberg `MonadicSheep/emacs-reader` master）在尺寸变化 hook
+内**同步**调用 `reader--center-page`，因而不存在中间帧；本项目在
+`--window-size-change` 里只排了一个 timer，开关目录/批注面板后会先出现 0.15 秒
+「页面偏向一侧」的中间帧（实例几何实测可复现）。
+
+决定：拆成两步——**同步 recentre（几何）+ 异步 refit（重渲染）**。hook 内对每个
+受影响窗口立即 `--recenter-window`，重渲染仍去抖，以免拖分割线时逐帧重渲染。
+
+代价：页面尺寸确实变化的那一次缩放仍然保留（0.15 秒后才发生），这是 contain 需求
+的固有代价——不重渲染就无法让变窄窗口里的整页完整可见。
+
+## 2026-10-23 · 边界修复：换 buffer 补居中 + hscroll nil 守卫
+
+两处缺陷均由真机验收暴露，且都不在「尺寸变化」路径上，故在 D8 单独修复。
+
+① `set-window-buffer` 归零 hscroll：已用「零 seshat 代码的普通 buffer」反证为
+Emacs 固有行为（hscroll 5 → 同 buffer 重设窗口 → 0）。新窗口 / 新 frame 显示同一
+文档时既不触发 `window-size-change-functions`（无尺寸变化），也不重建页 overlay
+（`'overlay` 窗口参数仍在），于是没有任何路径重新居中：实测基线 `page-left 261 /
+dev 0`，重设后 `hs-raw 0 / page-left 522 / dev +261`，`redisplay` 与 `sit-for 1s`
+都不自愈。改在 `--handle-window-buffer-change` 末尾按互斥双分支处理。
+
+② `--right-most-window-hscroll` 在页面尚未渲染时 `image-width` /
+`pixel-per-col` 均为 nil，首次打开 PDF 抛 `(wrong-type-argument
+number-or-marker-p nil)`；加 `numberp` 守卫、未见渲染时返回 0，4 个横向滚动命令的
+image-width 读取补 `(or … 0)`。
+
+代价：把**同一条文档**重新指给**同一个窗口**（`(set-window-buffer win
+(current-buffer))`）同样会让 Emacs 归零 hscroll，但不触发
+`window-buffer-change-functions`，D8 的 recentre 兜不住；根治需 advice
+`set-window-buffer`，会侵入所有调用方，暂不采用（记 tech-debt）。
+
+
 
 

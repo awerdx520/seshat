@@ -83,8 +83,12 @@ ETAF 渲染层是可选外部依赖：`Makefile` 先探测 `~/Workspace/emacs-ta
 
 - `find-file` 打开即进 `seshat-reader-mode`：`seshat-reader.el` 加载时按 `seshat-reader-supported-formats` 注册 `auto-mode-alist`（小写扩展名）；`init-reader.el` 另补一套大小写不敏感关联，故 `.PDF` / `.Pdf` 也能直接进阅读器。
 - `M-x seshat-reader-open-doc` 交互式读文件名，候选只含 `seshat-reader-supported-formats` 中的扩展名。
-- 打开的瞬间执行 `seshat-reader-default-fit`（默认 `seshat-reader-fit-to-height`）。
+- 打开的瞬间自动按 `contain` 适配（取 `min(按高, 按宽)`）——`seshat-reader-default-fit` **不再参与**这一步，只影响显式 `H` / `W` 命令，见第 12 节。
 - 模式行默认显示 `P<n>/<总页数>`（`seshat-reader-mode-line`）。
+
+> **窗口尺寸变化后自动重贴合**：开关目录（`o` / `C-c C-o`）或批注面板（`C-c C-l`）会改变阅读区宽度，阅读器会在同一次重绘内重新居中，并在 0.15 秒后按 `contain`（`min(按高, 按宽)`）重算缩放，使整页完整可见。用户手动缩放过的窗口（`+` / `-` / `=` / `0`）会保留缩放比例，只归位滚动位置。拖分割线期间不会逐帧重渲染，停手后只重算一次。
+
+窗口变窄时页面会**缩小**以完整可见，而不是保持原尺寸被两侧裁切。自动 fit（首次打开与尺寸变化后）不再读 `seshat-reader-default-fit`——它在自动路径上已无调用点，仅 `H` / `W` 显式命令仍按其语义；是否保留该用户选项留待决定，详见 [`../openspec/tech-debt.md`](../openspec/tech-debt.md) 的「`seshat-reader-default-fit` 在自动 fit 路径上已成 no-op」条目。
 
 | 操作 | 键位 | 备注 |
 |---|---|---|
@@ -204,6 +208,8 @@ ETAF 渲染层是可选外部依赖：`Makefile` 先探测 `~/Workspace/emacs-ta
 | `1` 或小数 | 插入对应高度的衔接条；改动在**下次翻页**生效 |
 
 默认关闭的原因不是懒得开：strip 行插在 `point-min` 之前，破坏了页面 overlay 的几何假设（`--set-window-vscroll` 的上限与落点按「strip 高 + 图高」算，而页面 image 并不含 strip），`fit-to-height` 下任何正 vscroll 都会把页顶挤出窗口、造成裁切；缩放/旋转后缓存的上一页 spec 仍是旧尺寸，衔接条比例也会不匹配。详见 §12 与 [`../openspec/tech-debt.md`](../openspec/tech-debt.md)。
+
+衔接条高度还参与垂直滚动上限的计算：`seshat-reader--page-max-vscroll-pixels` 按「图高 + strip 高 − 窗口像素高」夹紧，而窗口尺寸变化时的 `seshat-reader--clamp-window-vscroll` 也走同一上限。因此 strip 开着时缩放或改变窗口尺寸不会把上一页条带挤出窗口（配合默认的 `seshat-reader-page-join-lines` = `0`，默认配置下这条路径不涉及 strip）。
 
 ## 8. 引用闭环
 
@@ -423,6 +429,10 @@ M12 回归（strip 行破坏页面几何 + `--center-page` 在 `window-size-chan
 13. **`doc-id` 含 `#` 或 `%` 的文件无法引用**：生成链接直接 `user-error`，需重命名文件。
 14. **EPUB 的 `location` 语义未定**：页码协议对 EPUB 只做到粗粒度定位。
 15. **队列写是无锁 read-modify-write**：多 Emacs 实例共享同一队列文件时存在丢更新风险。
+16. **页面比窗口宽时只能手动左右滚动**：手动放大到超出窗口（`+` / `=` / `W`）后不会自动跟随翻页，需 `S-<wheel>` 或 `scroll-left` / `scroll-right` 自己看；`unconstrained` 路径的下界夹紧也未实现（见 tech-debt 的「`--center-page` 以 `unconstrained` 设 hscroll」与「`--set-window-vscroll` 缺下界夹紧」两条）。
+17. **`seshat-reader-default-fit` 在自动 fit 路径上已不生效**：首次打开与尺寸变化后的 fit 一律走 `contain`（`min(按高, 按宽)`），该选项只对显式 `H` / `W` 有意义。想用它在两维冲突时「选一维填满」目前做不到（必然让另一维溢出），详见 tech-debt。
+18. **手动缩放的来源不随书签保存**：书签只存 `scale` 数值、不存 `fit` / `manual` 来源，恢复后按 `fit` 处理——一旦窗口尺寸变化就会重新贴合，上次手选的比例可能被重置。
+19. **同一文档重设到同一窗口时页面可能贴右边缘**：用 `set-window-buffer` 把**同一条文档**重新指给同一个窗口（而非新窗口 / 新 frame）时，Emacs 同样归零 hscroll 但不触发 `window-buffer-change-functions`，兜底 recentre 覆盖不到；需重开文档或触发一次尺寸变化（见 tech-debt）。
 
 ## 13. 开发者备注
 

@@ -164,6 +164,13 @@ M0–M6 已完成并归档，见 `openspec/completed/personal-notes-system.md`�
 
 **状态：✅ 已完成并归档（2026-10-22）**；L1/L2 全绿（271 用例 0 unexpected / 0 skipped），L3 功能级经隔离实例验证 46 条断言全过；残余视觉项（高亮绘制观感、三栏布局、配色）待用户目视，不阻塞归档
 
+### M12 后续：阅读器窗口尺寸自适应
+
+计划与执行记录：`openspec/active/2026-10-22-emacs-reader-resize-refit.md`。
+
+- 内容：窗口尺寸变化（开关目录/批注面板、拖分割线、新窗口）后重新贴合页面——`scale-source`（fit/manual）、`--contain-scale`（min 按高/按宽）、`--clamp-window-vscroll`、idle 去抖 + 1% 偏差闸 + `--refitting` 防重入、`--recenter-window` 同步居中；并修两处边界缺陷（换 buffer 后 hscroll 归零、首次打开抛 `wrong-type-argument`）。
+- 状态：代码 + 单测（`seshat-reader-resize-test.el` 30 例，全仓 ERT 342 例 0 unexpected）+ 文档已完成（2026-10-23）；实例几何实测证明开关面板路径 dev=0（无中间帧），**真机目视确认待用户**；确认后归档 `openspec/completed/`。
+
 ## 风险登记
 
 | # | 风险 | 影响 | 缓解 |
