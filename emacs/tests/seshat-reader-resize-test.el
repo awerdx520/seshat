@@ -36,6 +36,20 @@
 ;; 2026-10-23（首帧两帧修复）追加第 58~59 节：`--first-fit' 的显示层缩放快
 ;; 路径（不重渲染，首帧即最终尺寸）与 spec 尚不可用时的同步重渲染回退。
 ;;
+;; 2026-10-23（默认 fit 模式）追加第 68~75 节：`--normalize-default-fit' 把
+;; `seshat-reader-default-fit' 的取值（含两个旧函数值与未知值的降级）规整为
+;; `contain' / `width' / `height'，以及 `--initial-fit-mode' 的「已有
+;; `fit-mode' 参数优先、否则取归一化默认值」语义。
+;;
+;; 2026-10-23（默认 fit 模式 T2）追加第 76~78 节：`--first-fit' 改按窗口的
+;; 初始适配模式求 scale（先记录 `fit-mode'，再调 `--fit-scale'），`contain'
+;; 默认路径仍等价于旧行为（转调 `--contain-scale'），spec 不可用时回退重渲染
+;; 也用模式相关的 scale。
+;;
+;; 2026-10-23（默认 fit 模式 T3）追加第 79~80 节：`--window-create-function'
+;; 为新窗口写入归一化后的初始 `fit-mode'，且已有 `fit-mode' 的窗口不被
+;; `seshat-reader-default-fit' 覆盖。
+;;
 ;; **契约变更（2026-10-23）**：`--refit-window' 原先用「目标 scale 与当前
 ;; scale 相对差 ≤1% 则不重渲染」的偏差闸；改为「窗口的 `render-scale' 窗口
 ;; 参数（overlay 上次渲染所用的分辨率）与当前 `scale' 相等则不重渲染，不等
@@ -2340,5 +2354,264 @@ rewrote the horizontal scroll."
           (should (= 0 centers)))
       (seshat-reader-resize-test--clear-window window)
       (kill-buffer buffer))))
+
+;;; 68. --normalize-default-fit：`contain' 原样返回
+
+(ert-deftest seshat-reader-resize-test--normalize-default-fit-contain ()
+  "A `contain' default stays `contain'."
+  (should (eq 'contain (seshat-reader--normalize-default-fit 'contain))))
+
+;;; 69. --normalize-default-fit：`width' 原样返回
+
+(ert-deftest seshat-reader-resize-test--normalize-default-fit-width ()
+  "A `width' default stays `width'."
+  (should (eq 'width (seshat-reader--normalize-default-fit 'width))))
+
+;;; 70. --normalize-default-fit：`height' 原样返回
+
+(ert-deftest seshat-reader-resize-test--normalize-default-fit-height ()
+  "A `height' default stays `height'."
+  (should (eq 'height (seshat-reader--normalize-default-fit 'height))))
+
+;;; 71. --normalize-default-fit：旧函数值 `fit-to-width' → width
+
+(ert-deftest seshat-reader-resize-test--normalize-default-fit-legacy-width ()
+  "The legacy `seshat-reader-fit-to-width' value means `width'."
+  (should (eq 'width
+              (seshat-reader--normalize-default-fit
+               'seshat-reader-fit-to-width))))
+
+;;; 72. --normalize-default-fit：旧默认 `fit-to-height' → contain
+
+(ert-deftest seshat-reader-resize-test--normalize-default-fit-legacy-height ()
+  "The legacy `seshat-reader-fit-to-height' value means `contain'.
+
+That function was the default until 2026-10-23 and the automatic fit it
+triggered already behaved like `contain', so an untouched configuration
+must keep starting windows in whole-page mode."
+  (should (eq 'contain
+              (seshat-reader--normalize-default-fit
+               'seshat-reader-fit-to-height))))
+
+;;; 73. --normalize-default-fit：未知值降级为 contain，不报错
+
+(ert-deftest seshat-reader-resize-test--normalize-default-fit-unknown ()
+  "Unknown values degrade to `contain' instead of signalling.
+
+A `defcustom' set before the `:type' changed, a hand-written `setq' or a
+string from a customization file must not break opening a document."
+  (dolist (value (list 'foo nil "width" 42))
+    (should (eq 'contain (seshat-reader--normalize-default-fit value)))))
+
+;;; 74. --initial-fit-mode：无 fit-mode 窗口取 `seshat-reader-default-fit'
+
+(ert-deftest seshat-reader-resize-test--initial-fit-mode-uses-default ()
+  "A window without a recorded mode starts from the normalized default.
+
+`seshat-reader-default-fit' is bound with `let' (it is an option, not a
+window parameter) so the test is independent of the user's value."
+  (let ((window (selected-window))
+        (seshat-reader-default-fit 'width))
+    (unwind-protect
+        (progn
+          (set-window-parameter window 'fit-mode nil)
+          (should (eq 'width (seshat-reader--initial-fit-mode window))))
+      (seshat-reader-resize-test--clear-window window))))
+
+;;; 75. --initial-fit-mode：已记录的 fit-mode 不被默认值覆盖
+
+(ert-deftest seshat-reader-resize-test--initial-fit-mode-keeps-existing ()
+  "A window that already recorded a mode keeps it.
+
+Resizing a window (or refitting it) must not reset the user's explicit
+`W' / `H' choice back to `seshat-reader-default-fit'."
+  (let ((window (selected-window))
+        (seshat-reader-default-fit 'width))
+    (unwind-protect
+        (progn
+          (set-window-parameter window 'fit-mode 'height)
+          (should (eq 'height (seshat-reader--initial-fit-mode window))))
+      (seshat-reader-resize-test--clear-window window))))
+
+;;; 76. --first-fit：按默认适配模式（width）求 scale 并记录 fit-mode
+
+(ert-deftest seshat-reader-resize-test--first-fit-records-and-uses-width-mode ()
+  "The first fit asks `--fit-scale' for the mode the window starts with.
+
+A document opened in a window whose initial mode is `width' must be scaled
+to fill the width even on the very first frame; the mode is recorded as the
+window's `fit-mode' first so the debounced refit and later resizes keep it
+instead of falling back to `contain'.  `--contain-scale' is not consulted at
+all here: the target comes from `--fit-scale', which dispatches on the mode."
+  (let ((window (selected-window))
+        (seshat-reader-default-fit 'width)
+        (fit-calls 0)
+        (applied nil)
+        (centers 0)
+        (refits 0)
+        (renders 0))
+    (unwind-protect
+        (progn
+          (set-window-parameter window 'fit-mode nil)
+          (cl-letf* (((symbol-function 'seshat-reader--fit-scale)
+                      (lambda (&optional _window) (cl-incf fit-calls) 0.5))
+                     ((symbol-function 'seshat-reader--apply-display-scale)
+                      (lambda (win scale) (setq applied (list win scale)) t))
+                     ((symbol-function 'seshat-reader--center-page)
+                      (lambda (&optional _window) (cl-incf centers) nil))
+                     ((symbol-function 'seshat-reader--schedule-refit)
+                      (lambda () (cl-incf refits) nil))
+                     ((symbol-function 'seshat-reader-doc-scale-page)
+                      (lambda (&rest _) (cl-incf renders) nil)))
+            (seshat-reader--first-fit))
+          (should (= 1 fit-calls))
+          (should (eq 'width (window-parameter window 'fit-mode)))
+          (should (equal (list window 0.5) applied))
+          (should (= 0 renders))
+          (should (= 1 centers))
+          (should (= 1 refits)))
+      (seshat-reader-resize-test--clear-window window))))
+
+;;; 77. --first-fit：默认 contain 模式行为不变（转调 --contain-scale）
+
+(ert-deftest seshat-reader-resize-test--first-fit-default-contain-unchanged ()
+  "With the default `contain' mode the first fit still delegates the maths.
+
+`--fit-scale' is deliberately left un-stubbed: the real implementation must
+reach `seshat-reader--contain-scale' through its `contain' branch, so the
+scale handed to `--apply-display-scale' is exactly the one that function
+returns.  This is the no-behaviour-change guarantee for users who never set
+`seshat-reader-default-fit'."
+  (let ((window (selected-window))
+        (seshat-reader-default-fit 'contain)
+        (contain-calls 0)
+        (applied nil)
+        (centers 0)
+        (refits 0)
+        (renders 0))
+    (unwind-protect
+        (progn
+          (set-window-parameter window 'fit-mode nil)
+          (cl-letf* (((symbol-function 'seshat-reader--contain-scale)
+                      (lambda (&optional _window)
+                        (cl-incf contain-calls)
+                        0.25))
+                     ((symbol-function 'seshat-reader--apply-display-scale)
+                      (lambda (win scale) (setq applied (list win scale)) t))
+                     ((symbol-function 'seshat-reader--center-page)
+                      (lambda (&optional _window) (cl-incf centers) nil))
+                     ((symbol-function 'seshat-reader--schedule-refit)
+                      (lambda () (cl-incf refits) nil))
+                     ((symbol-function 'seshat-reader-doc-scale-page)
+                      (lambda (&rest _) (cl-incf renders) nil)))
+            (seshat-reader--first-fit))
+          (should (= 1 contain-calls))
+          (should (eq 'contain (window-parameter window 'fit-mode)))
+          (should (equal (list window 0.25) applied))
+          (should (= 0 renders))
+          (should (= 1 centers))
+          (should (= 1 refits)))
+      (seshat-reader-resize-test--clear-window window))))
+
+;;; 78. --first-fit：height 模式下回退仍按 --fit-scale 重渲染
+
+(ert-deftest seshat-reader-resize-test--first-fit-height-mode-falls-back-to-render ()
+  "The fallback renders at the mode-specific scale, not at `contain'.
+
+When no page spec is available yet `--apply-display-scale' returns nil and
+the synchronous re-render takes over; it must use the `--fit-scale' value so
+the very first bitmap is already the right size for a `height' window."
+  (let ((window (selected-window))
+        (seshat-reader-default-fit 'height)
+        (applied 0)
+        (renders 0)
+        (render-args nil)
+        (centers 0)
+        (refits 0))
+    (unwind-protect
+        (progn
+          (set-window-parameter window 'fit-mode nil)
+          (cl-letf* (((symbol-function 'seshat-reader--fit-scale)
+                      (lambda (&optional _window) 0.75))
+                     ((symbol-function 'seshat-reader--apply-display-scale)
+                      (lambda (_win _scale) (cl-incf applied) nil))
+                     ((symbol-function 'seshat-reader--center-page)
+                      (lambda (&optional _window) (cl-incf centers) nil))
+                     ((symbol-function 'seshat-reader--schedule-refit)
+                      (lambda () (cl-incf refits) nil))
+                     ((symbol-function 'seshat-reader-doc-scale-page)
+                      (lambda (factor &optional source)
+                        (cl-incf renders)
+                        (setq render-args (list factor source))
+                        nil)))
+            (seshat-reader--first-fit))
+          (should (= 1 applied))
+          (should (eq 'height (window-parameter window 'fit-mode)))
+          (should (= 1 renders))
+          (should (equal '(0.75 fit) render-args))
+          (should (= 1 centers))
+          (should (= 1 refits)))
+      (seshat-reader-resize-test--clear-window window))))
+
+;;; 79. --window-create-function：新窗口写入归一化后的初始 fit-mode
+
+(ert-deftest seshat-reader-resize-test--window-create-writes-initial-fit-mode ()
+  "A freshly created window records the normalized default fit mode.
+
+`seshat-reader-default-fit' is only a starting point: the window's own
+`fit-mode' parameter is what the resize refit reads, so the create path has
+to seed it.  Without that seed a window opened with a `width' default would
+fall back to the `contain' maths on the first resize."
+  (let ((window (selected-window))
+        (seshat-reader-default-fit 'width)
+        (created 0))
+    (unwind-protect
+        (progn
+          (dolist (parameter '(overlay fit-mode page scale))
+            (set-window-parameter window parameter nil))
+          (cl-letf* (((symbol-function 'seshat-reader-dyn--window-create)
+                      (lambda (_window) (cl-incf created) nil))
+                     ((symbol-function 'seshat-reader-goto-page)
+                      (lambda (&rest _) nil))
+                     ((symbol-function 'seshat-reader-doc-scale-page)
+                      (lambda (&rest _) nil))
+                     ((symbol-function 'seshat-reader--center-page)
+                      (lambda (&optional _window) nil)))
+            (seshat-reader--window-create-function window))
+          (should (= 1 created))
+          (should (eq 'width (window-parameter window 'fit-mode))))
+      (seshat-reader-resize-test--clear-window window))))
+
+;;; 80. --window-create-function：已有 fit-mode 的窗口不被默认值覆盖
+
+(ert-deftest seshat-reader-resize-test--window-create-keeps-existing-fit-mode ()
+  "An existing `fit-mode' survives window creation.
+
+The create path runs again whenever a window's overlays are rebuilt, so an
+unconditional write would silently reset the user's explicit `H' choice back
+to `seshat-reader-default-fit'.  With a `width' default the recorded
+`height' must still win, so this test guards against a naive
+\"always seed\" implementation rather than being red before green."
+  (let ((window (selected-window))
+        (seshat-reader-default-fit 'width)
+        (created 0))
+    (unwind-protect
+        (progn
+          (dolist (parameter '(overlay fit-mode page scale))
+            (set-window-parameter window parameter nil))
+          (set-window-parameter window 'fit-mode 'height)
+          (cl-letf* (((symbol-function 'seshat-reader-dyn--window-create)
+                      (lambda (_window) (cl-incf created) nil))
+                     ((symbol-function 'seshat-reader-goto-page)
+                      (lambda (&rest _) nil))
+                     ((symbol-function 'seshat-reader-doc-scale-page)
+                      (lambda (&rest _) nil))
+                     ((symbol-function 'seshat-reader--center-page)
+                      (lambda (&optional _window) nil)))
+            (seshat-reader--window-create-function window))
+          (should (= 1 created))
+          (should (eq 'height (window-parameter window 'fit-mode)))
+          (should-not (eq 'width (window-parameter window 'fit-mode))))
+      (seshat-reader-resize-test--clear-window window))))
 
 ;;; seshat-reader-resize-test.el ends here

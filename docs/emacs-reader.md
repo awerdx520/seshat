@@ -83,16 +83,16 @@ ETAF 渲染层是可选外部依赖：`Makefile` 先探测 `~/Workspace/emacs-ta
 
 - `find-file` 打开即进 `seshat-reader-mode`：`seshat-reader.el` 加载时按 `seshat-reader-supported-formats` 注册 `auto-mode-alist`（小写扩展名）；`init-reader.el` 另补一套大小写不敏感关联，故 `.PDF` / `.Pdf` 也能直接进阅读器。
 - `M-x seshat-reader-open-doc` 交互式读文件名，候选只含 `seshat-reader-supported-formats` 中的扩展名。
-- 打开的瞬间自动按 `contain` 适配（取 `min(按高, 按宽)`）——`seshat-reader-default-fit` **不再参与**这一步，只影响显式 `H` / `W` 命令，见第 12 节。
+- 打开的瞬间按 `seshat-reader-default-fit` 的初值适配——默认 `contain`（取 `min(按高, 按宽)`，整页可见），可设为 `width` / `height` 让新窗口一开始就按该维度填满；`W` / `H` 在会话内覆盖它，见第 12 节。
 - 模式行默认显示 `P<n>/<总页数>`（`seshat-reader-mode-line`）。
 
 > **窗口尺寸变化后自动重贴合**：开关目录（`o`）或批注面板（`C-c C-l`）会改变阅读区宽度，阅读器会在同一次重绘内按当前的**适配模式**（`fit-mode`，见下段；未选择时为 `contain`）把页面缩放到目标几何，并由 idle 阶段补一次清晰化重渲染（几何不变，画面只从模糊变清晰）。用户手动缩放过的窗口（`+` / `-` / `=` / `0`）会保留缩放比例，只归位滚动位置。拖分割线期间不会逐帧重渲染，停手后只重算一次。
 >
 > **居中位置由 redisplay 在布局时计算**：页面能完整放下时，居中不是 Lisp 算出来的偏移量，而是页面 overlay 上一个 `before-string` 的 `(space :align-to (+ center (-0.5 . IMAGE)))`——`:align-to` 在布局阶段求值，因此窗口变宽变窄的那一帧页面就已经居中，不会出现「先跳到一侧、再居中」的中间帧（旧实现靠 `line-prefix` + `hscroll` 两段补偿，实测窗口变窄后首帧偏 −524px）。页面比窗口宽时改用 `line-prefix` + 横向滚动，左对齐。
 
-> **`W` / `H` 是持久适配模式，不是一次性缩放**：按 `W` 后该窗口的适配模式记为 `width`（载体是 window parameter `fit-mode`，取值 `contain` / `width` / `height`），此后窗口尺寸变化**仍按宽度填满**（纵向溢出靠滚动），不会再被 `contain` 覆盖成按高度；`H` 同理记为 `height`。未显式选择时默认 `contain`（整页可见，取 `min(按高, 按宽)`）——首次打开、书签恢复的窗口都属于这一档。手动缩放（`=` / `+` / `-` / `0`）会把该窗口标成 manual 且**优先于**适配模式，此后尺寸变化只归位滚动、不再自动适配；再按一次 `W` / `H` 便回到持久适配模式。适配模式按窗口记录、不跨会话保存，重开文档回到 `contain`。
+> **`W` / `H` 是持久适配模式，不是一次性缩放**：按 `W` 后该窗口的适配模式记为 `width`（载体是 window parameter `fit-mode`，取值 `contain` / `width` / `height`），此后窗口尺寸变化**仍按宽度填满**（纵向溢出靠滚动），不会再被 `contain` 覆盖成按高度；`H` 同理记为 `height`。未显式选择时取 `seshat-reader-default-fit` 的初值 `contain`（整页可见，取 `min(按高, 按宽)`）——首次打开、书签恢复的窗口都按这一初值起步。手动缩放（`=` / `+` / `-` / `0`）会把该窗口标成 manual 且**优先于**适配模式，此后尺寸变化只归位滚动、不再自动适配；再按一次 `W` / `H` 便回到持久适配模式。适配模式按窗口记录、不跨会话保存，重开文档回到 `seshat-reader-default-fit` 的初值（默认 `contain`）。新窗口（含新 frame、书签恢复打开的窗口）的起点由 `seshat-reader-default-fit` 决定——默认 `contain`，可设为 `width` / `height` 让每个新窗口一开始就按该维度适配；该选项不改变已打开窗口，也不改变 `W` / `H` 的会话内语义。
 
-窗口变窄时页面会**缩小**以完整可见，而不是保持原尺寸被两侧裁切。自动 fit（首次打开与尺寸变化后）不再读 `seshat-reader-default-fit`——它在自动路径上已无调用点，仅 `H` / `W` 显式命令仍按其语义；是否保留该用户选项留待决定，详见 [`../openspec/tech-debt.md`](../openspec/tech-debt.md) 的「`seshat-reader-default-fit` 在自动 fit 路径上已成 no-op」条目。
+窗口变窄时页面会**缩小**以完整可见，而不是保持原尺寸被两侧裁切。自动 fit 分两段：**首次打开**取 `seshat-reader-default-fit` 的归一化初值（默认 `contain`）；**尺寸变化后**沿用窗口已记录的 `fit-mode`（由首次打开或 `W` / `H` 写入），因此改该选项不影响已打开窗口，只影响此后新开的窗口。旧值 `seshat-reader-fit-to-width` / `-fit-to-height` 仍被接受（分别归一为 `width` / `contain`）。
 
 | 操作 | 键位 | 备注 |
 |---|---|---|
@@ -327,7 +327,7 @@ evil 用户同样可用上述单键（包内 `evil-define-key*` 补绑 normal st
 |---|---|---|
 | `seshat-reader-enlarge-factor` | `1.25` | 放大倍率 |
 | `seshat-reader-shrink-factor` | `0.75` | 缩小倍率 |
-| `seshat-reader-default-fit` | `seshat-reader-fit-to-height` | 打开文档时的初始适配（另一选择 `seshat-reader-fit-to-width`） |
+| `seshat-reader-default-fit` | `contain` | 新窗口 / 新文档的**初始适配模式**：`contain`（整页可见）/ `width`（填满宽度）/ `height`（填满高度）；`W` / `H` 只覆盖当前窗口且不跨会话；旧值 `seshat-reader-fit-to-width` / `-fit-to-height` 仍被接受（分别归一为 `width` / `contain`） |
 | `seshat-reader-page-join-lines` | `0` | 跨页衔接条高度（页面文本行高倍数），`0` 关闭 |
 
 ### 批注 / 选区
@@ -434,7 +434,7 @@ M12 回归（strip 行破坏页面几何 + `--center-page` 在 `window-size-chan
 14. **EPUB 的 `location` 语义未定**：页码协议对 EPUB 只做到粗粒度定位。
 15. **队列写是无锁 read-modify-write**：多 Emacs 实例共享同一队列文件时存在丢更新风险。
 16. **页面比窗口宽时只能手动左右滚动**：手动放大到超出窗口（`+` / `=` / `W`）后不会自动跟随翻页，需 `S-<wheel>` 或 `scroll-left` / `scroll-right` 自己看；`unconstrained` 路径的下界夹紧也未实现（见 tech-debt 的「`--center-page` 以 `unconstrained` 设 hscroll」与「`--set-window-vscroll` 缺下界夹紧」两条）。
-17. **`seshat-reader-default-fit` 在自动 fit 路径上已不生效**：首次打开与尺寸变化后的 fit 一律取 `contain`（`min(按高, 按宽)`），该选项只对显式 `H` / `W` 有意义——而适配维度现在由 `W` / `H` 写入的 `fit-mode` 承载。想用它在两维冲突时「选一维填满」目前做不到（必然让另一维溢出），详见 tech-debt。
+17. **`W` / `H` 的选择不跨会话**：该选择记在窗口参数 `fit-mode` 上，窗口关闭或重开 Emacs 后新窗口回到 `seshat-reader-default-fit` 的初值（默认 `contain`）。要让新窗口默认按宽 / 按高，把该选项设为 `width` / `height`；在这两种模式下页面必然在另一维溢出、需滚动查看——这是「填满一维」的固有代价，不是缺陷。旧值 `seshat-reader-fit-to-width` / `-fit-to-height` 仍被接受（分别归一为 `width` / `contain`）。
 18. **手动缩放的来源不随书签保存**：书签只存 `scale` 数值、不存 `fit` / `manual` 来源，恢复后按 `fit` 处理——一旦窗口尺寸变化就会重新贴合，上次手选的比例可能被重置。
 19. **同一文档重设到同一窗口时页面可能贴右边缘**：用 `set-window-buffer` 把**同一条文档**重新指给同一个窗口（而非新窗口 / 新 frame）时，Emacs 同样归零 hscroll 但不触发 `window-buffer-change-functions`，兜底 recentre 覆盖不到；需重开文档或触发一次尺寸变化（见 tech-debt）。
 20. **尺寸变化期间的画面是位图插值缩放，清晰化有延迟**：几何在同一帧内到位（改的是 image spec 的 `:width` / `:height`，不是位图），清晰度靠 idle 阶段重渲染一次补齐，因此缩放后约 0.15 秒内页面是「正确尺寸 + 略模糊」，拖分割线过程中始终是缩放位图。只读表格等细线条内容时观感差异明显（见 tech-debt「位图缩放与 `image-flush` 的交互未在真机长时间验证」）。

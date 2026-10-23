@@ -278,6 +278,47 @@ done
 - **终端 frame 可能不可用**：pty / `emacs -nw` 下 `etaf-mount` 可能挂起（真机 GUI frame 正常），建议在 GUI frame 使用。
 - **gt 中转 buffer 已隐藏**：`" *Seshat gt*"` 由本包直接以 `:window-config` = `(display-buffer-no-window)` + `(allow-no-window . t)` 隐藏（缺 `allow-no-window` 时 `display-buffer` 会回退默认动作而弹窗），用户无需自行配置 `display-buffer-alist`。
 
+## Emacs 客户端配置（阅读器适配模式）
+
+> 客户端侧配置（由 `seshat-reader` 读取），与服务端无关。该选项只决定**新窗口 / 新文档的起点**，不影响服务端行为，也不改变已打开窗口。
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `seshat-reader-default-fit` | `contain` | 新窗口 / 新文档打开时的初始适配模式：`contain` 整页可见（取按宽与按高的较小缩放）、`width` 填满窗口宽度（纵向滚动）、`height` 填满窗口高度（横向滚动） |
+
+旧值兼容（取值经 `seshat-reader--normalize-default-fit` 归一化，无需手工改写配置）：
+
+| 配置值 | 归一化结果 | 说明 |
+|---|---|---|
+| `contain` | `contain` | 整页可见（默认） |
+| `width` | `width` | 填满窗口宽度，纵向溢出靠滚动 |
+| `height` | `height` | 填满窗口高度，横向溢出靠滚动 |
+| `seshat-reader-fit-to-width` | `width` | 旧函数符号，保留其显式意图（按宽） |
+| `seshat-reader-fit-to-height` | `contain` | 旧默认值，保持改造前现状 |
+| 其它任意值 | `contain` | 兜底为整页可见，不报错 |
+
+说明：
+
+- 该选项**只决定起点**：`W` / `H` 覆盖当前窗口的适配模式（写入窗口参数 `fit-mode`），且**不跨会话**——窗口关闭或重开 Emacs 后，新窗口回到该初值。
+- 手动缩放（`+` / `-` / `=` / `0`）会把窗口标为 manual，**优先于**适配模式；此后尺寸变化只归位滚动、不再自动适配。再按一次 `W` / `H` 即回到适配模式。
+- `width` / `height` 模式下页面必然在另一维溢出（需滚动查看），这是「填满一维」的固有代价，不是缺陷。
+
+配置示例：
+
+```elisp
+;; 默认：整页可见（取按宽与按高的较小缩放，与改造前行为一致）
+(setq seshat-reader-default-fit 'contain)
+
+;; 新窗口默认填满宽度，纵向滚动
+(setq seshat-reader-default-fit 'width)
+
+;; 新窗口默认填满高度，横向滚动
+(setq seshat-reader-default-fit 'height)
+
+;; 旧写法，仍可用：等价于 'width
+(setq seshat-reader-default-fit 'seshat-reader-fit-to-width)
+```
+
 ## 相关文件
 
 - 示例配置：[`config.example.yaml`](../config.example.yaml)

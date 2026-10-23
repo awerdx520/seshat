@@ -103,18 +103,25 @@
   :group 'seshat-reader
   :type 'number)
 
-(defcustom seshat-reader-default-fit 'seshat-reader-fit-to-height
-  "The default fitting for documents.
+(defcustom seshat-reader-default-fit 'contain
+  "The fit mode a reader window starts with.
 
-This option only affects the explicit `H' / `W' commands.  Since
-2026-10-23 the automatic fit performed on opening a document or after a
-window resize uses `seshat-reader--contain-scale' instead: the page is
-always shrunk until it fits both dimensions, so a narrow window (for
-example with the outline or an information panel open) no longer clips
-the page.  See `openspec/decisions.md' entry for 2026-10-23."
+One of `contain' (the whole page is visible: the smaller of the width
+fit and the height fit wins), `width' (fill the window width, scroll
+vertically) or `height' (fill the window height, scroll horizontally).
+
+This is only the starting point.  `W' and `H' override it for the
+window they are used in, and that choice is not remembered across
+sessions: a new window starts from this value again.
+
+Legacy function values are still accepted: `seshat-reader-fit-to-width'
+means `width', while `seshat-reader-fit-to-height' (the former default)
+means `contain', which keeps the behaviour of unmodified
+configurations."
   :group 'seshat-reader
-  :type '(radio (function-item seshat-reader-fit-to-height)
-		(function-item seshat-reader-fit-to-width)))
+  :type '(choice (const :tag "Whole page (contain)" contain)
+                 (const :tag "Fill width" width)
+                 (const :tag "Fill height" height)))
 
 (defcustom seshat-reader-page-join-lines 0
   "Height of the cross-page join strip, measured in page text lines.
@@ -447,11 +454,11 @@ Optionally scale it by the SCALING-FACTOR.  Scales on selected window."
 
 WINDOW defaults to the selected one.  The result is the smaller of the two
 scales, so whichever dimension binds is the one that ends up filled; the
-page is never enlarged beyond it.  This deliberately ignores
-`seshat-reader-default-fit', which only affects the explicit `H' / `W'
-commands (`seshat-reader-fit-to-height' / `seshat-reader-fit-to-width')
-and no longer influences the automatic fit performed when a document is
-opened or a window is resized."
+page is never enlarged beyond it.  This function provides the `contain'
+geometry itself and does not read `seshat-reader-default-fit': that option
+only decides which fit mode a window starts with (see
+`seshat-reader--initial-fit-mode'), and its `contain' value ends up calling
+this function through `seshat-reader--fit-scale'."
   (let* ((window (or window (selected-window)))
          (size (seshat-reader--get-current-doc-image-size window))
          (image-width (car-safe size))
@@ -468,18 +475,47 @@ opened or a window is resized."
           (min width-factor height-factor))
       1.0)))
 
+(defun seshat-reader--normalize-default-fit (value)
+  "Return VALUE as a fit mode symbol: `contain', `width' or `height'.
+
+VALUE is normally the symbol stored in `seshat-reader-default-fit', but
+the two function symbols used before 2026-10-23 are still understood:
+`seshat-reader-fit-to-width' means `width' while
+`seshat-reader-fit-to-height' (the former default) means `contain', so
+that a configuration that never touched the option keeps behaving as
+before.  Anything else degrades to `contain'."
+  (pcase value
+    ((or 'contain 'width 'height) value)
+    ('seshat-reader-fit-to-width 'width)
+    ('seshat-reader-fit-to-height 'contain)
+    (_ 'contain)))
+
+(defun seshat-reader--initial-fit-mode (&optional window)
+  "Return the fit mode WINDOW should start with.
+
+WINDOW defaults to the selected one.  A window that already recorded a
+mode keeps it; otherwise WINDOW starts from `seshat-reader-default-fit',
+normalised through `seshat-reader--normalize-default-fit'."
+  (or (window-parameter (or window (selected-window)) 'fit-mode)
+      (seshat-reader--normalize-default-fit seshat-reader-default-fit)))
+
 (defun seshat-reader--first-fit ()
   "Fit the page to the selected window the first time it is displayed.
 
-Uses a display-level rescale instead of a re-render, so the very first
-frame already shows the page at its final size; the bitmap is rendered at
-the new resolution by the debounced refit afterwards.  Falls back to a
+The target scale follows the window's initial fit mode
+\(`seshat-reader--initial-fit-mode'), which is recorded as the window's
+`fit-mode' first so that later resizes keep using it.  Uses a
+display-level rescale instead of a re-render, so the very first frame
+already shows the page at its final size; the bitmap is rendered at the
+new resolution by the debounced refit afterwards.  Falls back to a
 synchronous re-render when the page spec is not available yet."
-  (let ((target (seshat-reader--contain-scale)))
-    (unless (seshat-reader--apply-display-scale (selected-window) target)
-      (seshat-reader-doc-scale-page target 'fit))
-    (seshat-reader--center-page)
-    (seshat-reader--schedule-refit)))
+  (let ((mode (seshat-reader--initial-fit-mode)))
+    (set-window-parameter nil 'fit-mode mode)
+    (let ((target (seshat-reader--fit-scale)))
+      (unless (seshat-reader--apply-display-scale (selected-window) target)
+        (seshat-reader-doc-scale-page target 'fit))))
+  (seshat-reader--center-page)
+  (seshat-reader--schedule-refit))
 
 (defun seshat-reader--window-fit-mode (&optional window)
   "Return WINDOW's fit mode: `contain', `width' or `height'.
@@ -1554,6 +1590,12 @@ It is hooked to `window-configuration-change-hook' to keep detecting."
            (scale (or (window-parameter window 'scale)
                       seshat-reader--recent-scale-fallback
                       1.0)))
+      ;; 新窗口的适配模式起点。已有 fit-mode 的窗口（用户按过 W/H，或
+      ;; --first-fit 已记录）不被覆盖，因此只在参数缺失时写入。
+      (unless (window-parameter window 'fit-mode)
+        (set-window-parameter window 'fit-mode
+                              (seshat-reader--normalize-default-fit
+                               seshat-reader-default-fit)))
       (seshat-reader-dyn--window-create window)
       (set-window-parameter window 'page page)
       (with-selected-window window
@@ -1735,6 +1777,7 @@ Keybindings:
   ;; contain：打开文档时若窗口已很窄（目录/侧栏开着），不能让页面溢出
   ;; 首次 fit 用显示层缩放一步到位（不重渲染），避免「先按默认比例画一张小图
   ;; 居中、再重渲染大图重新居中」的两帧；清晰位图由 idle 的 refit 补一次。
+  ;; 起点由 `seshat-reader-default-fit' 的 `fit-mode' 决定（默认含 contain）。
   (seshat-reader--first-fit)
   (add-hook 'window-size-change-functions #'seshat-reader--window-size-change nil t)
   (add-hook 'window-configuration-change-hook #'seshat-reader--manage-window-overlays nil t)
