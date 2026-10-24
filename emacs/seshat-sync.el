@@ -165,7 +165,7 @@ unwind-protect 保证即使子进程调用出错也会删除。
 ;; 本节开始是 M8-B 的新引擎（增量游标 + uid 身份 + REST 条件写），与上面那批
 ;; WebDAV 函数**互不影响**：旧函数保留不动（灰度期仍可能需要，且
 ;; `seshat-conflict.el' 在编译期依赖它们），新引擎一律走 `seshat-rest' 的
-;; REST 端点。参见 openspec/active/2026-10-24-m8b-incremental-engine.md。
+;; REST 端点。参见 openspec/completed/2026-10-24-m8b-incremental-engine.md。
 
 ;;; 根映射初始化（`seshat-sync-roots' → `seshat-state-roots'）
 ;;

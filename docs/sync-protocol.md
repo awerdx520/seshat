@@ -455,6 +455,15 @@ GET /api/refs?uid=<uid>&direction=in    # 谁引用了我
 - **`move` 只限 mirror 根**：`POST /api/resources/{uid}/move` 对 `ondemand` 根返回 `403 root_read_only`，客户端不应为它准备重命名逻辑——`ondemand` 根也不会有 `rename` 事件。mirror 根内的 rename 事件可用来跟随本地文件名，但**仅当目标不存在时**才能移动（同名不同目录会冲突，跳过不覆盖）。
 - Emacs 客户端已完成 REST 封装与状态库地基（M8-A，2026-10-24），`Range` / `If-None-Match` 的实际接入随增量引擎在 M8 计划 B 落地。
 
+### Emacs 客户端实现要点（M8-B）
+
+- **首同步两阶段**：先用 `/api/resources` 分页建索引（尽力而为：`since` 是 `mtime >= since`，同秒内超过一页的记录会被跳过），再用 `changes?since=0` 循环追平取游标。**权威全集是 changes**，索引缺失由它补齐；反过来不成立。
+- **增量循环**：`changes?since=cursor` → 逐事件应用 → 推进并落盘游标；`has_more` 为真时立即再拉，不 sleep；游标未前进（畸形响应）时停止以免无限重拉。
+- **事件应用**：`create`/`update` 按 `blob` 与本地基线比对决定是否下载；`rename` 本地改名 + 状态重映射；`delete` 删本地副本并写墓碑。服务端下发的 `path` 一律做越界校验（拒绝 `..`、绝对路径、`~`、盘符、符号链接逃逸）。
+- **push**：无基线用 `If-None-Match: *`（仅创建），有基线用 `If-Match: "<blob>"`（条件覆盖）；`412` 取远端 + 祖先做三方合并，无冲突带新基线重发一次、有冲突写回标记并保留待推送；`409` 与 `403` 不重试。
+- **本地改动发现**：`size`/`mtime` 快照比对 → 待推送标记，不做 inotify（最坏延迟一个同步周期）。
+- **rename**：双向——服务端 `rename` 事件驱动本地改名；本地快照比对（`size` + `mtime` 都相同）驱动 `POST /api/resources/{uid}/move`。`409`（墓碑占用）不重试，先 `rescan`。
+
 ## 10. 已知限制
 
 以下均从当前实现的事实提取（不是规划），客户端需据此设计降级路径。

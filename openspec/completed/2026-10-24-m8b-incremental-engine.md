@@ -2,10 +2,11 @@
 
 ## 当前状态
 
-- 阶段：Phase 2（Plan）· **独立审查意见已落实，待用户确认计划**
-- 已确认：M8 整体方案 ✅（用户 2026-10-24）；计划 A（地基）已完成并归档 ✅（`openspec/completed/2026-10-24-m8a-emacs-sync-foundation.md`）；本计划 4 个决策 ✅（用户 2026-10-24：`/api/resources` 建索引 + changes 追平 / rename 双向 / 直接替换旧引擎 / 冲突整合并入本计划）
-- 审查记录：首轮 plan-reviewer 判「不通过」（2 blocking：`resources` 分页 `since+1` 会丢同秒记录且兜底方向颠倒；push 缺「本地内容修改 → mark-dirty」的发现机制），已全部修订；另落实 3 major + 9 minor，并新增 D8「计划 A 的实际 API」表与 T1 四段拆分；第二轮复审指出 T1b/T1c 边界潜在循环、T3 验收缺「同路径内容修改 → mark-dirty」、编排重接线无任务归属——已重排 T1b/T1c/T1d 为「事件应用 → 首同步追平 → 增量循环」、补 T3 用例、把编排并入 T4。
-- 下一步：用户确认计划 → Phase 3（T0 → T1a → T1b → T1c → T1d，之后 T2，T2 完成后 T3 与 T4 并行）
+- 阶段：Phase 4（Review & Document）· **已完成并归档（2026-10-24）**
+- 已确认：M8 整体方案 ✅（用户 2026-10-24）；计划 A 已归档 ✅；本计划 4 个决策 ✅（用户 2026-10-24）
+- 执行结果：T0、T1a–T1d、T2、T3、T4a–T4d、T5 全部完成；新增文件 `seshat-merge.el` + 4 个测试文件，改动 `seshat-sync.el` / `seshat-state.el` / `seshat-conflict.el` / `seshat-sync-cmd.el`；全仓 ERT 517 → **637**（18 个测试文件，0 unexpected / 0 skipped）；4 个提交（`6f08828` / `f8918f8` / `203d2c3` / `9c7292f`）
+- 审查记录：首轮 plan-reviewer 判不通过（2 blocking：`resources` 分页兜底方向颠倒、缺「本地内容修改 → mark-dirty」；已修）；复审指出 T1 任务边界循环（已重排为 T1a 索引 → T1b 事件应用 → T1c 追平 → T1d 增量）；执行期额外发现并修正 3 个计划外缺口：diff3 参数顺序 bug、根映射无人填充、roots 变更不生效
+- 下一步：计划 C（多根分流 / `seshat:` link follow / 透明性验证）；真机 L3 联调需服务端
 
 ## 目标
 
@@ -176,20 +177,20 @@ seshat-sync.el       引擎：seshat-sync-pull / -push / -detect-renames / -now
 
 ## 任务
 
-### [ ] T0 `seshat-state` 批量写入
+### [x] T0 `seshat-state` 批量写入
 
 - 动作：按 D2 实现 `seshat-state-batch`；把 `--rebuild-paths` 的触发改为受 `--batch-depth` 控制。
 - 依赖：无
 - 验收：新增 ERT ≥5 例——批量 N 次写入后 `--rebuild-paths` **只被调用 1 次**（桩计数）；批量结果与逐条写入**完全一致**（同组操作对照）；批内异常（`unwind-protect`）仍重建一次且状态可用；嵌套批量（depth 2）只重建一次；批量期间 `:paths` **不更新**，`uid-for-path` / `path-for-uid` **不保证**命中本批新写入的条目；批量结束后状态（含 `:paths`）与逐条写入完全一致
 - **内部可拆 2 步**：先加 `--batch-depth` 与守卫，再补测试。
 
-### [ ] T1a 首同步：预建索引
+### [x] T1a 首同步：预建索引
 
 - 动作：按 D3 第 1.a 步实现 `seshat-rest-list-resources` 分页建索引（每页 `state-save`）。
 - 依赖：T0
 - 验收：新增 ERT ≥6 例——分页按 `:has-more` 循环至结束；`since-mtime` 取本页最后一项 mtime；同秒时不前进会死循环、`+1` 后能前进（用例显式断言「同秒超过 `limit` 时索引可能不完整，这是已知代价，由 T1c 补齐」）；每页结束调用一次 `state-save`（桩计数）；`403` 根跳过不报错；零网络（全桩 transport）；且必须断言**按根分别发起**（每根**至少发起一次**，根之间互不干扰：某个根返回 `403` 时其余根仍继续；单页场景下总请求次数 = 根数，需要翻页时按 `:has-more` 递增）
 
-### [ ] T1b 事件应用（四类事件的唯一实现）
+### [x] T1b 事件应用（四类事件的唯一实现）
 
 - 动作：实现 `seshat-sync--apply-event`（单事件 → 更新 `state` + 落盘），供首同步与增量循环**共用一个实现**：
   - `create` / `update`：mirror 根按 `blob` 与 `state` 的 `:base-blob` 比较，不同则 `seshat-rest-download-file`（内部硬编码 `:binary t`）落盘，随后 `(seshat-state-set-base-blob uid blob size mtime)`；`ondemand` 根只在本地缺文件时下载；
@@ -199,43 +200,48 @@ seshat-sync.el       引擎：seshat-sync-pull / -push / -detect-renames / -now
 - 依赖：T1a
 - 验收：新增 ERT ≥8 例——四类事件各 1 例（断言 state 与本地文件的最终状态）；`blob` 与 base 相同时**不**调用下载（桩断言调用次数 0）；`ondemand` 根不主动下载；下载后 base-blob 的 `blob`/`size`/`mtime` 三个字段都正确写入；`403` 不重试且不影响其它根；`rename` 事件的 remap 三参正确。
 
-### [ ] T1c 首同步：changes 追平取游标（复用 T1b 的事件应用）
+### [x] T1c 首同步：changes 追平取游标（复用 T1b 的事件应用）
 
 - 动作：`changes?since=0&limit=2000` 循环，每个事件交给 T1b 的 `--apply-event`；每批 apply 完成后 `(seshat-state-set-cursor (plist-get resp :next-cursor))` 并 `state-save`；循环至 `:has-more` 为 nil。
 - 依赖：T1b
 - 验收：新增 ERT ≥6 例——循环至 `:has-more` nil（构造两批，断言调用 2 次）；每批 `set-cursor` 取 `:next-cursor`；**幂等重放**（同一批事件连续应用两次，`state` 结果相同、无重复 uid 条目）；索引缺失的条目被事件补齐（构造索引少一条 + 事件含该条，断言补齐）；每批结束调用一次 `state-save`（桩计数）；`limit=2000` 的实际传参。
 
-### [ ] T1d 增量循环（复用 T1b 的事件应用）
+### [x] T1d 增量循环（复用 T1b 的事件应用）
 
 - 动作：`changes?since=cursor` 循环，复用 `--apply-event`；`:has-more` 为真时**立即再拉**（不 sleep）；**游标最后写**。
 - 依赖：T1c
 - 验收：新增 ERT ≥5 例——只拉 `seq > cursor` 的事件；`:has-more` 为真时立即再拉（断言 transport 调用次数为 2）；带 `since=cursor` 的实际传参；**中断重放**（模拟首批后中断，再从最后落盘 cursor 继续，结果与一次跑完相同）；**游标后写**（模拟 apply 中途抛错，断言 cursor 未被推进）。
 
-### [ ] T2 push 条件写
+### [x] T2 push 条件写
 
 - 动作：按 D4 实现 `seshat-sync-push`。
 - 依赖：T1d
 - 验收：新增 ERT ≥12 例，覆盖——无 base 时发 `if-none-match "*"`、有 base 时发 `if-match <blob>`；成功写 base-blob；`412` 触发合并后重发一次（断言重发时带**新** base）；重发仍 `412` 则放弃且不无限循环；`409` 不重试；`403` 标记根只读并跳过同根其余条目；状态上传失败只 warning 不中断内容同步；并固定冲突判定口径：**用正则扫描合并结果中的 `^<<<<<<<` / `^>>>>>>>` 标记**判定「有冲突」，不用 `smerge-mode`（后者依赖 buffer 交互状态，在 batch 与定时器路径不可靠）；该判定抽成纯函数并单独测
 - **内部可拆 2 步**：条件写主路径 → 412/409/403 分支。
 
-### [ ] T3 move/rename 检测
+### [x] T3 move/rename 检测
 
 - 动作：按 D5 实现 `seshat-sync-detect-renames`。
 - 依赖：T2
 - 验收：新增 ERT ≥10 例，覆盖——「同路径内容修改」1 例（**push 的主要输入来源**）：已登记 uid 的本地文件内容变化导致 `(size, mtime)` 与 state 基线不同 → 该 uid 出现在 `dirty-uids`（且**不**被判为 rename）；随后「本地改名被识别并调 `move-resource`（断言 uid 与 to 路径）；`size+mtime` 不同则**不**判 rename（判为删+建）；`move` 返回 `409` 时不重试且记 warning；服务端 `rename` 事件触发本地改名 + `state-remap`；快照遍历只覆盖 `mode = mirror` 的根」
 - **内部可拆 2 步**：快照与比对 → 上报与 409 分支。
 
-### [ ] T4 冲突整合 + status 修复
+### [x] T4 冲突整合 + 入口重接线（实际拆为 T4a–T4d）
 
 - 动作：按 D6 改 `seshat-conflict.el` 与 `seshat-sync-status`；并完成入口重接线——`seshat-sync-now`（`seshat-sync-cmd.el`）的编排改为 `pull → detect-renames → push`，`seshat-sync-pull-all` / `seshat-sync-push-all` 改为调用新引擎函数（保持命令名与签名不变）。
 - 依赖：T2
 - 验收：新增 ERT ≥8 例——`--remote-head` 走 `versions`；三方合并的远端内容走 `download-file`、祖先走 `versions`（桩断言 URL）；head 读写走 state 的 per-uid base-blob；`seshat-conflict-local-head-file` 被标 obsolete 但**仍可绑定不报错**；`seshat-sync-status` 用 uid 而非路径（桩断言 `GET /api/progress/{uid}` 的 uid 正确）；并断言**编排顺序**：桩记录 `seshat-sync-now` 的调用序列必须是 `pull → detect-renames → push`（否则本地改名产生的 dirty 与 uid 变更会漏推）；`seshat-sync-pull-all` / `-push-all` 仍可被原有键位与定时器调用（签名不变）。
+- ✅ T4a（2026-10-24）：conflict 整合到 REST + 修复 diff3 参数顺序 bug（-m MINE OLDER YOURS，祖先须第二位；旧实现会把干净合并误报为冲突，已用「7 行夹具 + 旧顺序」验证必红）+ per-uid head 带旧文件回退；新增 10 例。
+- ✅ T4b（2026-10-24）：seshat-sync-now 改为 pull → detect-renames → push → status 四步；pull-all/push-all 转调新引擎；status 改用 uid；删除 PROPFIND XML 死代码；新增 8 例。
+- ✅ T4c（2026-10-24）：新增 seshat-sync-roots 与 --ensure-roots——**修正计划漏洞**：state 的根映射此前无任何生产代码填充，新引擎在真实环境实际不工作；新增 7 例。
+- ✅ T4d（2026-10-24）：未配置 roots 时短路并明确提示；新增 seshat-sync-reset-roots 命令；新增 6 例。
 
-### [ ] T5 文档与归档
+### [x] T5 文档与归档
 
 - 动作：见「## 文档清单」。
 - 依赖：T0、T1a–T1d、T2–T4
 - 验收：8 个文档按要求更新；`tech-debt.md` 的 O(n²) 条目关闭；计划归档。
+- ✅ T5（2026-10-24）：`docs/architecture.md` 补增量引擎层与三条不变量；`docs/sync-protocol.md` 新增「Emacs 客户端实现要点（M8-B）」；`docs/configuration.md` 补 `seshat-sync-roots` / `seshat-merge-diff3-program` 与 `seshat-sync-reset-roots` 纪律；`CHANGELOG.md` 记新增与四项行为变更；`openspec/decisions.md` 追加 4 条决策；`openspec/tech-debt.md` 关闭 `:paths` O(n²) 条目并新增 6 条残余；`openspec/active/roadmap.md` 更新计划 B 状态与 M8 剩余项；`docs/emacs-reader.md` 套件清单与总数（14 → 18 文件 / 517 → 637 例）。本计划已归档至 `openspec/completed/`。
 
 ## 依赖关系
 
@@ -307,10 +313,10 @@ T0、T1a–T1d、T2–T5 执行后逐条回填。结论取值：成立 ✓ / 被
 
 | # | 假设 | 结论 | 证据 |
 |---|---|---|---|
-| H1 | 首同步两阶段（索引 + 追平）更稳 | 待验 | |
-| H2 | rename 需双向 | 待验 | |
-| H3 | push 只遍历 dirty | 待验 | |
-| H4 | 状态上传失败不阻塞 | 待验 | |
-| H5 | 冲突合并可复用 | 待验 | |
-| H6 | 命令名不变 | 待验 | |
-| H7 | 需先做批量写入 | 待验 | |
+| H1 | 首同步两阶段（索引 + 追平）更稳 | 成立 ✓，但需补充：索引不完整是**必然**（同秒超页），全集完全依赖 changes 追平 | T1a 用例显式断言「同秒超过 `limit` 时索引不完整」，并由 T1c 用例断言「索引缺失的条目被事件补齐」 |
+| H2 | rename 需双向 | 成立 ✓（双向均实现） | T3 用例：服务端 `rename` 事件 → 本地改名 + `state-remap`；本地快照比对 → `POST move`（断言 uid 与目标路径） |
+| H3 | push 只遍历 dirty | **部分成立 ⚠️**：push 只遍历 dirty 成立，但 dirty 的产生依赖 T3 第 2 步（本地快照比对）；「只遍历 dirty」若不配「产生 dirty」的机制就是死路，首轮审查的 B2 正是这个缺口 | T3 用例「同路径内容修改 → 出现在 `dirty-uids`」（首轮审查据此补入 T3 验收） |
+| H4 | 状态上传失败不阻塞 | 成立 ✓ | T2 用例：状态上传失败只记 warning，内容同步继续完成 |
+| H5 | 冲突合并可复用 | **成立但有 bug** ✗→✓：三方合并逻辑可复用，但既有实现把 diff3 的祖先位置放错，已修 | T4a 用例：「7 行夹具 + 旧顺序」验证必红，改为 `-m MINE OLDER YOURS` 后通过 |
+| H6 | 命令名不变 | 成立 ✓ | T4b 用例：`pull-all` / `push-all` 签名不变，定时器与键位仍可调用 |
+| H7 | 需先做批量写入 | 成立 ✓ | T0 用例：批量 N 次写入后 `--rebuild-paths` 只被调用 1 次 |

@@ -87,7 +87,28 @@ M8 把 Emacs 端同步器从 WebDAV 传输迁到 REST，分三层落地，本节
 | API 层 | `emacs/seshat-rest.el` | 服务端端点封装（roots / resources / changes / files / move / versions）与统一状态码解释；`seshat-rest--request` 保留为**薄包装**（旧 `(status . body)` 契约 + 抛错语义不变，保护既有 4 处调用方） |
 | 状态层 | `emacs/seshat-state.el` | 单一 `.eld` 原子写：全局 `cursor`、per-uid `base-blob`（取代旧的单文件 head）、`uid ↔ (root . path)` 双索引、`dirty` 集合、墓碑 |
 
-**分层约束**：传输层抛错责任在 API 层，不得上提；二进制下载必须传 `:binary t`（否则 `url.el` 后端会按 UTF-8 解码破坏字节）。**尚未接入**：增量循环、条件写、move 检测、多根分流与 `seshat:` link follow 属计划 B / C。
+**分层约束**：传输层抛错责任在 API 层，不得上提；二进制下载必须传 `:binary t`（否则 `url.el` 后端会按 UTF-8 解码破坏字节）。**接入进度**：M8-B 已接入增量循环、条件写、move 检测与冲突合并（见下一节）；多根分流与 `seshat:` link follow 仍属计划 C。
+
+## Emacs 增量同步引擎（M8-B）
+
+M8-B 把同步从「全量遍历 + 路径身份 + WebDAV 弱乐观锁」切到「增量游标 + uid 身份 + REST 条件写」。执行顺序固定：
+
+```
+seshat-sync-now
+  ├─ seshat-sync-pull          首同步：预建索引 → changes 追平取游标
+  │                            增量：从状态库游标继续
+  ├─ seshat-sync-detect-renames 本地 size/mtime 快照比对 → mark-dirty；rename 配对 → POST move
+  ├─ seshat-sync-push          遍历 dirty → If-Match / If-None-Match 条件写 → 412 走三方合并
+  └─ seshat-sync-status        逐 uid 拉阅读进度（失败不阻塞前三步）
+```
+
+**三条不变量**：
+
+1. **游标最后写**：每批「apply → 批量块退出重建索引 → 推进游标 → 落盘」，中断后从落盘游标重放是幂等的；
+2. **首同步职责分离**：`changes?since=0` 是权威全集，`/api/resources` 分页只是尽力而为的预建（同秒超一页会丢记录，由 changes 补齐）；
+3. **零交互**：push 的 412 分支与 rename 检测都可能由定时器触发，任何分支都不得询问用户或用 smerge 进入文件；冲突标记写回本地后提示用户手动处理。
+
+**根映射**：`seshat-sync-roots`（`(TAG DIR MODE)`）是唯一配置入口，`seshat-sync--ensure-roots` 在首次 pull 时把它写入状态库（`MODE` 为 nil 时向 `GET /api/roots` 取权威值）；改配置后需 `M-x seshat-sync-reset-roots`。
 
 ## `seshat:` 引用协议（M11.4）
 

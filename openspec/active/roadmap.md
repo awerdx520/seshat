@@ -85,7 +85,9 @@ M0–M6 已完成并归档，见 `openspec/completed/personal-notes-system.md`�
 
 ### M8 Emacs 端接入
 
-**计划 A（地基）已完成并归档（2026-10-24）**，见 `openspec/completed/2026-10-24-m8a-emacs-sync-foundation.md`：新增 `seshat-transport.el`（统一 `(:status :headers :body)` 契约，后端 `rest`/`webdav` 可换，transport 层永不抛错）、扩展 `seshat-rest.el`（9 个端点封装 + 统一状态码解释，`seshat-rest--request` 降为薄包装以保护既有 4 处调用方）、新增 `seshat-state.el`（单 `.eld` 原子写，承载全局游标 / per-uid base blob / uid↔路径双索引 / dirty / 墓碑）。新增 3 个测试文件、118 例，全仓 ERT 399 → **517**（0 unexpected / 0 skipped）。**尚未接入**：增量循环、条件写、move 检测（M8.3）、多根（M8.4）、`seshat:` link（M8.5）、透明性验证（M8.6）——属计划 B / C。
+**计划 A（地基）已完成并归档（2026-10-24）**，见 `openspec/completed/2026-10-24-m8a-emacs-sync-foundation.md`：新增 `seshat-transport.el`（统一 `(:status :headers :body)` 契约，后端 `rest`/`webdav` 可换，transport 层永不抛错）、扩展 `seshat-rest.el`（9 个端点封装 + 统一状态码解释，`seshat-rest--request` 降为薄包装以保护既有 4 处调用方）、新增 `seshat-state.el`（单 `.eld` 原子写，承载全局游标 / per-uid base blob / uid↔路径双索引 / dirty / 墓碑）。新增 3 个测试文件、118 例，全仓 ERT 399 → **517**（0 unexpected / 0 skipped）。**接入进度**：计划 B 已完成增量循环、条件写、move 检测与冲突合并；剩余 M8.4 多根分流、M8.5 `seshat:` link、M8.6 透明性验证归计划 C。
+
+**计划 B（增量引擎）已完成并归档（2026-10-24）**，见 `openspec/completed/2026-10-24-m8b-incremental-engine.md`：同步切到 REST 增量（`changes` 游标、代价与变更数成正比），push 改条件写（`If-Match`/`If-None-Match`），新增本地 `size`/`mtime` 快照比对发现编辑与改名、`diff3` 三方合并（并修复既有参数顺序 bug）、根映射初始化（`seshat-sync-roots`）与 `seshat-sync-reset-roots` 命令。新增 120 例用例，全仓 ERT 517 → **637**（0 unexpected / 0 skipped）。**M8 剩余**：M8.4 多根分流（`/api/roots` 已消费，但 `ondemand` 的按需下载入口与 UI 未做）、M8.5 `seshat:` org-link follow、M8.6 透明性验证（denote/dired/org-agenda 零变化）——归计划 C。
 
 | 子项 | 内容 | 风险 |
 |---|---|---|

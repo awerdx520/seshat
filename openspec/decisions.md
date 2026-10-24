@@ -616,3 +616,27 @@ refit 按当前窗口尺寸做一次几何适配 + 重渲染，一次到位。
 **决策**：新增 `seshat-state.el`，用单个 `~/.local/share/seshat/sync-state.eld`（`prin1` 序列化、同目录临时文件 + `rename-file` 原子写）承载：全局 `cursor`、`:uids`（per-uid 的 `:root/:path/:base-blob/:size/:mtime/:dirty/:deleted-at/:orphan`）、`:paths` 派生索引、`:roots`（`(tag dir mode)`）。旧的单文件 head `~/.emacs.d/seshat-head` **不迁移**。
 
 **理由**：旧 head 是全局单值，多文件同步互相覆盖（写入点不按 path 分键），且没有 cursor / uid 映射 / dirty / 墓碑，无法承载 M7 的 uid 模型与增量协议。选单 `.eld` 而非 SQLite：与既有 `annotation-queue.eld` 同风格、零新依赖、原子写模式已验证。**不迁移旧 head** 是因为单值无法无损散到多文件，强行迁移会把同一 hash 当成所有文件的 base，导致误判冲突；代价是首次同步可能触发一次冲突（有 `diff3` 兜底）。
+
+## 2026-10-24 · Emacs 增量同步：首同步两阶段且职责分离
+
+**决策**：首同步先用 `/api/resources` 分页预建索引，再用 `changes?since=0` 追平并取游标。**权威全集是 changes**；索引只是尽力而为的预建。
+
+**理由**：`/api/resources` 的分页参数 `since` 语义是 `mtime >= since` 且无 offset，同秒内超过一页的记录会被跳过（`since+1` 才能前进，否则死循环），因此索引本身就**不保证完整**。而 `changes` 的 `seq` 是全局单调游标，分页无损且事件应用幂等，可安全重放。若反过来声称「索引兜底 changes」，会在「事件因钩子失败缺失 + 索引丢同秒」叠加时静默丢资源。
+
+## 2026-10-24 · Emacs 增量同步：rename 双向检测与 size+mtime 判据
+
+**决策**：rename 双向处理——服务端 `rename` 事件驱动本地改名；本地快照比对（同根下 `size` 与 `mtime` **都相同**的「消失 + 新增」配对）驱动 `POST /api/resources/{uid}/move`。不做 inotify。
+
+**理由**：单侧不够——服务端改名不会自动反映到本地磁盘，本地 `mv` 也不会被服务端感知。用 `size + mtime` 而非内容 hash 是为避免全量读盘；代价是「rename 后立即编辑」会被判为删+建（uid 不稳定），以及「同尺寸同 mtime 的不同文件」会被误配——两者都记入 tech-debt，精化留后续。
+
+## 2026-10-24 · 直接替换旧同步引擎，不做双引擎开关
+
+**决策**：`seshat-sync-pull-all` / `seshat-sync-push-all` 改为调用新引擎（保持命令名与签名为兼容入口）；旧的 WebDAV 全量实现与 PROPFIND XML 解析删除（`seshat-sync.el` 的底层 WebDAV 函数保留，灰度期作传输后端仍可能需要）。
+
+**理由**：双引擎意味着两套状态模型（单文件 head vs 状态库）、两套冲突语义（WebDAV 静默忽略条件头 vs REST 真乐观锁）长期并存，必然漂移。回滚靠 git 而非运行时开关更干净。
+
+## 2026-10-24 · 抽出 seshat-merge.el 承载合并原语
+
+**决策**：新增 `seshat-merge.el`（diff3 三方合并 + 冲突标记正则判定），依赖方向固定为 `seshat-conflict → seshat-sync → seshat-merge`。
+
+**理由**：`seshat-conflict.el` 已 `require 'seshat-sync`，而 push 的 412 分支需要 diff3——若 `seshat-sync` 反向 require conflict 就成环（`require` 环在字节编译期不报错，运行期拿到未定义函数，故障难定位）。同时借此修掉既有 bug：`diff3` 的位置语义是 `-m MINE OLDER YOURS`，旧实现把共同祖先放在第一位，两侧独立改动被误报为冲突。冲突判定用正则扫 `<<<<<<<`/`>>>>>>>` 而非 `smerge-mode`，因为自动流程可能由定时器触发，不能依赖交互状态。

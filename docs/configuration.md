@@ -142,6 +142,27 @@ Emacs 端通过 `seshat-reader-annotation` 采集 PDF 页面选区并同步为�
 
 **迁移说明**：旧的单文件 head（`~/.emacs.d/seshat-head`）**不再使用、不会自动迁移**。新状态库在首次同步时以服务端为准重建 base blob；若本地有离线改动，可能触发一次三方合并（有 `diff3` 兜底）。
 
+### 同步根映射（M8-B）
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `seshat-sync-roots` | `nil` | **同步必配**（否则同步无事可做）：每项为 `(TAG DIR MODE)`。`TAG` 必须与服务端 `GET /api/roots` 的 `tag` 一致；`DIR` 是本地目录；`MODE` 为 `mirror`（笔记根，可写）或 `ondemand`（书库根，只读），填 `nil` 表示由服务端自动补齐。 |
+| `seshat-merge-diff3-program` | `"diff3"` | 三方合并所用的 `diff3` 可执行文件。找不到时合并降级为「保留待推送 + 提示手动处理」，不会报错。 |
+
+配置示例：
+
+```elisp
+(setq seshat-sync-roots
+      '(("notes" "~/seshat/notes" mirror)      ; 笔记根：全量镜像、可写
+        ("books" "~/seshat/books" ondemand)))  ; 书库根：按需下载、只读
+```
+
+**改配置后必须运行 `M-x seshat-sync-reset-roots`**：根映射在首次同步时会写入状态库，之后不再读取配置；不重置则新配置不生效。
+
+**首次同步**：会为 `mirror` 根建一次全库索引（耗时与库规模成正比），之后每次同步的代价与变更数成正比。
+
+**迁移**：旧的单文件 head `~/.emacs.d/seshat-head` 不再使用，无需迁移。
+
 ### 阅读器翻译 / 解释（go-translate 预设）
 
 > 与批注侧车同属**客户端侧**配置（由 `seshat-reader-translate` 模块读取），与服务端无关。

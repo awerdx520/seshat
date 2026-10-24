@@ -1091,11 +1091,12 @@
 - 影响：若后续调用方按形参名手写 `blob=` 查询，服务端会忽略并退化成「取当前版本」，表现为「历史内容与 head 相同」的静默错误。
 - 建议：计划 B 接入 `seshat-conflict.el` 时统一口径（要么服务端支持 `blob` 别名，要么形参改名为 `hash`）。
 
-## `seshat-state.el` 的单条目写入会全量重建 `:paths` 索引（M8-A 审查，2026-10-24）
+## `seshat-state.el` 的单条目写入会全量重建 `:paths` 索引（M8-A 审查，2026-10-24）——已解决（M8-B T0，`seshat-state-batch`）
 
 - 现状：`--put-entry` / `--update-entry` 每次条目变更都调用 `--rebuild-paths`（O(n)），而 `--paths-equal` 的比较是 O(n²)。单个 `set-base-blob` 调用即触发一次全量重建。
 - 影响：计划 B 的批量同步（逐资源写 base blob、逐事件应用 changes）会退化为 O(n²)；书库规模上千后每次同步可能明显变慢。
 - 建议：在计划 B 动工前提供批量入口（如 `seshat-state-batch` 宏或在 `let` 绑定下暂缓重建、退出时统一重建一次），或改为对单条目增量维护 `:paths`。当前单进程、小规模场景无感知。
+- 已解决（2026-10-24，M8-B T0）：新增 `seshat-state-batch` 宏与 `--batch-depth` 守卫——批量期间跳过 `:paths` 重建、退出时统一重建一次（嵌套只在最外层重建）。**接口约束**：块内 `:paths` 陈旧，`uid-for-path` / `path-for-uid` 不保证命中本批新条目，且块内**不得** `state-save`（会写出与 `:uids` 不一致的索引）。新增 6 例用例锁定该语义。
 
 ## `--encode-path` 在 `seshat-rest.el` 与 `seshat-conflict.el` 各有一份（M8-A 审查，2026-10-24）
 
@@ -1108,6 +1109,42 @@
 - 现状：`emacs/seshat-reader/seshat-reader.el:82-83` 的 `(with-demoted-errors (require 'seshat-render-core))` 未传 FORMAT 首参。`with-demoted-errors` 的首个参数是格式串，缺省时会用宏的默认消息，但字节编译/log 每轮都报 `Warning: Missing format argument in 'with-demoted-errors'`（14 个测试文件加载 reader 时各报一次）。
 - 影响：功能无影响（该 `require` 失败仍被静默降级），但会污染编译输出、掩盖真正的新警告；且该 `require` 失败后，后续 `seshat-render-core-*` 调用会以 `void-function` 在运行期才暴露，定位成本高。
 - 建议：改为 `(with-demoted-errors "seshat-reader: %S" (require 'seshat-render-core))`，与仓库其它 `with-demoted-errors` 用法对齐；属一行修复，可随下次阅读器改动顺带处理。
+
+## rename 判据 `size + mtime` 的两个盲区（M8-B，2026-10-24）
+
+- 现状：`seshat-sync-detect-renames` 用「同根下 `size` 与 `mtime` 都相同的消失 + 新增」配对判定 rename，不读内容 hash。
+- 影响：① **rename 后立即编辑**（size/mtime 随之变化）会被判为「删 + 建」，uid 因此不稳定；② 同尺寸且同 mtime 的两个不同文件会被误判为一对 rename（概率低，但移动后服务端与本地会指向错误内容）。
+- 建议：精化判据时改用 `blob`（服务端 `resources.blob` 与本地内容 hash 比对），代价是每次候选配对都要读文件；可对候选集先按 size 过滤再算 hash，成本可控。
+
+## 无 inotify：本地改动最坏延迟一个同步周期（M8-B，2026-10-24）
+
+- 现状：本地编辑靠 `seshat-sync-detect-renames` 的 `size`/`mtime` 快照比对发现，只在 `seshat-sync-now`（含定时器，默认间隔 300 秒）时触发。
+- 影响：用户保存后要等下一次同步才会推送到服务端；跨端协作时另一端的可见延迟因此有 5 分钟量级的上限。
+- 建议：若需要近实时，可加 `after-save-hook`（仅对根目录内的文件）直接标脏并触发一次 debounce 同步；当前未做以避免与大量第三方包的文件保存钩子抢时序。
+
+## 被跳过的事件静默丢失，用户不可见（M8-B，2026-10-24）
+
+- 现状：`seshat-sync--apply-event` 因「未知 op / 根未配置 / 路径越界 / 下载失败」跳过事件时只发 warning，同时游标照常前进（否则会无限重放同一批）。统计里的 `cool < events` 就是这个差集，但**没有任何用户可见的呈现**。
+- 影响：服务端有变更、本地没落地时，用户只能从 `*Messages*` 的 warning 里翻找；长期运行后可能积累不一致。
+- 建议：在 `seshat-sync-status` 或 `seshat-sync-now` 的摘要里输出「本轮跳过 N 个事件（含原因分布）」，并在跳过数连续非零时提示 `M-x seshat-sync-reset-roots` 或检查根配置。
+
+## 先运行 `seshat-sync-status` 会得到「未登记」误报（M8-B，2026-10-24）
+
+- 现状：`seshat-sync-status` 的 uid 解析依赖 `seshat-state-roots`，而根映射只在 `seshat-sync-pull`（即 `seshat-sync-now` 的第一步）里初始化。从未同步过就直接看状态，会逐文件报「未登记，先运行 `seshat-sync-now`」。
+- 影响：首次使用的用户容易误以为配置错了；实际只需先跑一次同步。
+- 建议：在 `seshat-sync-cmd--root-relative` 的调用处判断 `(null (seshat-state-roots))` 时只读地提示「尚未初始化根映射」，而不是逐文件刷同一句话（属 `seshat-sync-cmd.el` 的小改动）。
+
+## 全仓 ERT 的 `-L` 清单未固化进仓库（M8-B，2026-10-24）
+
+- 现状：跑全仓 ERT 需要 3 个仓库目录（`emacs`、`emacs/seshat-reader`、`emacs/tests`）+ straight `build-31.1` 下的包目录，其中 **`etaf` 的包文件在 `build-31.1/etaf/lisp/`**（只加 `build-31.1/etaf` 不够）。该清单只存在于计划与 `docs/emacs-reader.md` 的示例里，没有可执行脚本。
+- 影响：每轮开发都要重新推导命令；漏一个目录就出现 `annotation-v8` 2 例 `etaf-ui` 缺失、`translate` 整文件加载失败、`etaf` 用例 skipped 等**假失败**，容易被误判为回归。
+- 建议：固化 `scripts/test-emacs.sh`（或 Makefile 的 `test-emacs` 目标），用通配拼 `EMACSLOADPATH`，并在 CI/文档里统一引用。
+
+## 首同步的落盘次数与状态库规模（M8-B，2026-10-24）
+
+- 现状：`seshat-state-save` 是整体序列化（O(n)），而首同步每页索引、每批 changes 都落盘一次。大书库首同步的写盘成本因此呈 O(n²) 级（页数 × 状态大小）。
+- 影响：书库上千后首次同步可能明显变慢；日常增量不受影响（批数与状态大小都小）。
+- 建议：若要优化，可改为「每 N 页/批落盘一次 + 退出时强制落盘」，或换增量落盘格式；当前优先保证崩溃恢复语义（每页落盘意味着中断损失最小）。
 
 
 
