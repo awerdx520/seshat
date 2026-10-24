@@ -640,3 +640,9 @@ refit 按当前窗口尺寸做一次几何适配 + 重渲染，一次到位。
 **决策**：新增 `seshat-merge.el`（diff3 三方合并 + 冲突标记正则判定），依赖方向固定为 `seshat-conflict → seshat-sync → seshat-merge`。
 
 **理由**：`seshat-conflict.el` 已 `require 'seshat-sync`，而 push 的 412 分支需要 diff3——若 `seshat-sync` 反向 require conflict 就成环（`require` 环在字节编译期不报错，运行期拿到未定义函数，故障难定位）。同时借此修掉既有 bug：`diff3` 的位置语义是 `-m MINE OLDER YOURS`，旧实现把共同祖先放在第一位，两侧独立改动被误报为冲突。冲突判定用正则扫 `<<<<<<<`/`>>>>>>>` 而非 `smerge-mode`，因为自动流程可能由定时器触发，不能依赖交互状态。
+
+## 2026-10-24 · 阅读能力与库身份解耦：派生 major mode + 显式入库
+
+**决策**：新增 `seshat-reading-mode`（`define-derived-mode` 自 `seshat-reader-mode`），由它接管 `auto-mode-alist`；库身份解析**只读本地状态（零网络）**，唯一触网入口是显式 `seshat-reading-refresh`；入库由显式命令 `seshat-library-add` 完成（**复制上传、保留原件**）。
+
+**理由**：改造前「能否同步」由文件位置隐式决定（`seshat-reader-annotation--doc-id` 命中根即可同步），用户既无法把库外文档加进来，又会在通用阅读时被「降级为 local:」反复警告。派生而非叠加 minor mode，是为了让「打开即阅读」只有一个入口、且 mode-line 能直接表达库身份；`auto-mode-alist` 接管是「入库后再打开自动显示 `[库]`」的前提，代价是第三方依赖 `(eq major-mode 'seshat-reader-mode)` 的代码会失效（本仓已全部改为 `derived-mode-p`，仓库外未知，故在文档给出回退写法）。**零网络**是硬约束：`seshat-rest-resolve-uid` 是同步 HTTP，若在 mode 体里调用会在服务端不可达时阻塞打开，直接毁掉「打开即阅读」。入库用「复制」而非「移动」，是不动用户的文件布局（代价是本地可能有两份）。

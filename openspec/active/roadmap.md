@@ -190,6 +190,14 @@ M0–M6 已完成并归档，见 `openspec/completed/personal-notes-system.md`�
 - 内容：把 `seshat-reader-default-fit` 从「自动 fit 路径零调用点的 no-op」重定义为**新窗口/新文档的初始适配模式**（`contain` / `width` / `height`，默认 `contain`），旧函数符号值兼容映射；新增 `--normalize-default-fit` / `--initial-fit-mode`，接入 `--first-fit` 与 `--window-create-function`；`W` / `H` 仍只作用于当前窗口、不跨会话。附带一次真机批量观测，清 L3-6 / L3-8 / `image-flush` 移除后回收 / image cache 峰值 / strip 与 `before-string` 居中交互等技术债。
 - 状态：**✅ 已完成并归档（2026-10-23，`openspec/completed/2026-10-23-reader-default-fit-mode.md`）**——代码 + 单测（`seshat-reader-resize-test.el` 67 → **80** 例，全仓 ERT 384 → **397**，0 unexpected / 0 skipped；L1 警告集 33 → 33）；文档 8 项全部落地；真机观测 4/5 项完成：T4-1（L3-6 短页 vscroll 非负）✅ 通过、T4-2（idle timer）⚠️ 非 daemon 通过而 daemon 场景未验证、T4-3（`image-flush` 移除后回收）✅ 通过（20 次开合 +1.79 MB）、T4-4（拖拽期间 cache 零增长）✅ 通过（`--drag-threshold` 生效）、T4-5（strip 与 `before-string` 交互）按用户决定不执行。观测中发现的**新缺陷**（`revert-buffer` 后 buffer 保持 modified，与 `super-save` 冲突、解除只读后有写坏 PDF 风险）已记 `openspec/tech-debt.md`，并**已于 2026-10-23 修复**——`seshat-reader--render-buffer` 与 `--update-join-strip` 各补 `(set-buffer-modified-p nil)`，新增 ERT 2 例（`seshat-reader-page-join-test.el` 24 → 26，全仓 **397 → 399**，0 unexpected / 0 skipped）。
 
+### 阅读模式：通用阅读 vs Seshat 阅读（已完成）
+
+计划与执行记录：`openspec/completed/2026-10-24-reading-mode-library-decoupling.md`（**已归档，2026-10-24**）。
+
+- 内容：新增 `seshat-reading-mode`（派生自 `seshat-reader-mode`，接管 `auto-mode-alist`），在 mode-line 显示库身份四态，身份解析零网络；新增 `seshat-library-add`（复制上传、保留原件）与 `seshat-reading-refresh`（唯一显式触网入口）；库外文档的降级警告静音；reader 中 3 处 `eq major-mode` 改为 `derived-mode-p`。
+- 状态：**已完成并归档（2026-10-24）**——全仓 ERT 637 → **669**（19 个文件，0 unexpected / 0 skipped）；L3 真机 5 项待人工（`find-file` 进 reading-mode、四态显示、入库后自动 `[库]`、库内批注可见、纯 reader 仍可批注）。
+- 关系：本计划**不替代** M8.4 多根分流与书籍列表 UI；「库外批注 + 入库迁移」记 tech-debt。
+
 ## 风险登记
 
 | # | 风险 | 影响 | 缓解 |

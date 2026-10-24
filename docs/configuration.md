@@ -349,6 +349,8 @@ done
 (setq seshat-reader-default-fit 'seshat-reader-fit-to-width)
 ```
 
+> 阅读模式（`seshat-reading-mode`）不引入新的用户配置项：库根由 `seshat-sync-roots` 决定，状态由 `seshat-state-file` 承载。详见 `docs/emacs-reader.md` 的「阅读模式」节。
+
 ## 相关文件
 
 - 示例配置：[`config.example.yaml`](../config.example.yaml)

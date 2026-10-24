@@ -81,7 +81,7 @@ ETAF 渲染层是可选外部依赖：`Makefile` 先探测 `~/Workspace/emacs-ta
 
 ## 3. 打开与基本阅读
 
-- `find-file` 打开即进 `seshat-reader-mode`：`seshat-reader.el` 加载时按 `seshat-reader-supported-formats` 注册 `auto-mode-alist`（小写扩展名）；`init-reader.el` 另补一套大小写不敏感关联，故 `.PDF` / `.Pdf` 也能直接进阅读器。
+- `find-file` 打开即进 `seshat-reader-mode`：`seshat-reader.el` 加载时按 `seshat-reader-supported-formats` 注册 `auto-mode-alist`（小写扩展名）；`init-reader.el` 另补一套大小写不敏感关联，故 `.PDF` / `.Pdf` 也能直接进阅读器。**注意**：加载项目层 `emacs/seshat-reading.el` 后 `auto-mode-alist` 被 `seshat-reading-mode` 接管（渲染仍 100% 来自 reader），见下节「阅读模式」。
 - `M-x seshat-reader-open-doc` 交互式读文件名，候选只含 `seshat-reader-supported-formats` 中的扩展名。
 - 打开的瞬间按 `seshat-reader-default-fit` 的初值适配——默认 `contain`（取 `min(按高, 按宽)`，整页可见），可设为 `width` / `height` 让新窗口一开始就按该维度填满；`W` / `H` 在会话内覆盖它，见第 12 节。
 - 模式行默认显示 `P<n>/<总页数>`（`seshat-reader-mode-line`）。
@@ -121,6 +121,42 @@ ETAF 渲染层是可选外部依赖：`Makefile` 先探测 `~/Workspace/emacs-ta
 | 微软系（不推荐，仅够查文字） | DOCX、PPTX、XLSX |
 
 上游对 Office 文档的定位是「快速查看文本内容」，不能编辑，排版也不要期望过高。
+
+## 阅读模式：通用阅读 vs Seshat 阅读
+
+`seshat-reader-mode` 是渲染与交互的实现（翻页、目录、缩放、暗色、演示模式，全部由本地动态模块提供），本身**不认识 Seshat 服务端**。`seshat-reading-mode` 派生自它，只叠加「库身份」这一层：
+
+| mode | 用途 | 库身份 | 网络 |
+|---|---|---|---|
+| `seshat-reading-mode`（默认） | 打开即阅读；库外文档就是通用阅读器 | mode-line 显示 `[库]` / `[未入库]` / `[库外]` / `[状态异常]` | 打开时**零请求**；只有 `M-x seshat-reading-refresh` 会向服务端确认 |
+| `seshat-reader-mode`（仍可用） | 纯渲染，无任何 Seshat 痕迹 | 无 | 无 |
+
+`seshat-reading.el` 加载后接管 `auto-mode-alist`（遍历把指向 `seshat-reader-mode` 的项就地改为本 mode），因此**所有受支持格式默认进 `seshat-reading-mode`**。想回到纯 reader：`(add-to-list 'auto-mode-alist '("\\.pdf\\'" . seshat-reader-mode))`（后加载者优先）。
+
+### 库身份四态
+
+| 状态 | 含义 | 显示 |
+|---|---|---|
+| `library` | 在库根下且状态库有 uid | ` [库]` |
+| `unregistered` | 在库根下但本地状态无 uid（服务端可能也没有） | ` [未入库]` |
+| `external` | 不在任何 `seshat-sync-roots` 根下 | ` [库外]` |
+| `broken` | 状态库损坏（`.bak` 存在且 roots 为空） | ` [状态异常]` |
+
+### 显式入库
+
+库外文档不会自动入库。`M-x seshat-library-add` 会：
+
+1. 让你选目标 `mirror` 根与库内相对路径；
+2. **复制**文件到该根（**保留原件**）；
+3. 上传（`If-None-Match: *`，仅创建）；同名已存在时询问是否覆盖；
+4. 登记 uid 与基线（`base blob` 的 size/mtime 取自**复制后的目标文件**，避免下轮同步误判为本地修改）；
+5. mode-line 变为 ` [库]`。
+
+`M-x seshat-reading-refresh` 用于「在根下但本地状态没有 uid」的情况——它是**唯一**会向服务端发请求的阅读路径；服务端确认存在则转 `[库]`。
+
+### 库外文档的批注
+
+**不支持**：`seshat-reader-annotation--uid` 对不在任何根下的文件抛 `user-error`（这是既有行为，本计划未改）。库外文档只会**不再反复打印「降级为 local:」的警告**（`--doc-id` 的可选 QUIET 参数）。「库外本地批注 + 入库后迁移」记在 `openspec/tech-debt.md`。
 
 ## 4. 目录与跳转
 
@@ -495,9 +531,9 @@ GTROOT=$(dirname "$(find "$HOME" -maxdepth 6 -type d \
 echo "$GTROOT"
 ```
 
-现有套件：`seshat-reader-page-join-test.el`、`seshat-reader-sidebar-test.el`、`seshat-reader-outline-test.el`、`seshat-reader-annotation-test.el`、`seshat-reader-annotation-queue-test.el`、`seshat-reader-annotation-v8-test.el`、`seshat-reader-select-flash-test.el`、`seshat-reader-translate-test.el`、`seshat-reader-reference-test.el`、`seshat-reader-resize-test.el`、`seshat-reader-etaf-test.el`、`seshat-rest-test.el`、`seshat-state-test.el`、`seshat-transport-test.el`、`seshat-conflict-test.el`（10 例）、`seshat-merge-test.el`（13 例）、`seshat-sync-cmd-test.el`（14 例）、`seshat-sync-test.el`（77 例）。**前置**：`seshat-render-core.so` 已构建，否则加载 `seshat-reader` 会触发交互式构建询问并阻塞 batch 运行。
+现有套件：`seshat-reader-page-join-test.el`、`seshat-reader-sidebar-test.el`、`seshat-reader-outline-test.el`、`seshat-reader-annotation-test.el`、`seshat-reader-annotation-queue-test.el`、`seshat-reader-annotation-v8-test.el`、`seshat-reader-select-flash-test.el`、`seshat-reader-translate-test.el`、`seshat-reader-reference-test.el`、`seshat-reader-resize-test.el`、`seshat-reader-etaf-test.el`、`seshat-rest-test.el`、`seshat-state-test.el`、`seshat-transport-test.el`、`seshat-conflict-test.el`（10 例）、`seshat-merge-test.el`（13 例）、`seshat-sync-cmd-test.el`（14 例）、`seshat-sync-test.el`（77 例）、`seshat-reading-test.el`（32 例）。**前置**：`seshat-render-core.so` 已构建，否则加载 `seshat-reader` 会触发交互式构建询问并阻塞 batch 运行。
 
-**必须逐文件运行**：一次 `emacs --batch` 加载全部测试文件时，`seshat-reader-annotation-test.el` 与 `seshat-reader-annotation-queue-test.el` 各有 3 个列表渲染用例会失败——同时加载 `etaf` 测试后 `etaf-ui` 变为可用，批注列表改走 EBOX/ETAF 渲染，而那两个用例断言的是纯文本（如 `"没有批注"`）。这是**既有基线特性、不是回归**：全仓用例总数按逐文件求和计（当前 18 个文件合计 **637** 例，0 unexpected / 0 skipped）。跑全仓脚本见下（`for` 循环逐文件执行，任一文件非零退出即整体失败）：
+**必须逐文件运行**：一次 `emacs --batch` 加载全部测试文件时，`seshat-reader-annotation-test.el` 与 `seshat-reader-annotation-queue-test.el` 各有 3 个列表渲染用例会失败——同时加载 `etaf` 测试后 `etaf-ui` 变为可用，批注列表改走 EBOX/ETAF 渲染，而那两个用例断言的是纯文本（如 `"没有批注"`）。这是**既有基线特性、不是回归**：全仓用例总数按逐文件求和计（当前 19 个文件合计 **669** 例，0 unexpected / 0 skipped）。跑全仓脚本见下（`for` 循环逐文件执行，任一文件非零退出即整体失败）：
 
 ```bash
 cd /home/thomas/Workspace/seshat && rm -f emacs/seshat-reader/*.elc && \
