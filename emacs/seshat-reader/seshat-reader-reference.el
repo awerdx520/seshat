@@ -215,7 +215,8 @@ location 与「无 location」语义相同，两种写法解析结果一致。"
           (when (and (file-directory-p dir) (file-readable-p dir))
             (dolist (file (ignore-errors
                             (directory-files-recursively dir regexp nil t)))
-              (let ((id (seshat-reader-annotation--doc-id file)))
+              (let ((id (seshat-reader-annotation--doc-id
+                         file (seshat-reader-annotation--quiet-p file))))
                 (when (and (stringp id)
                            (not (string-empty-p id))
                            (not (string-match-p "[#%]" id)))
@@ -224,7 +225,9 @@ location 与「无 location」语义相同，两种写法解析结果一致。"
            (current (and (derived-mode-p 'seshat-reader-mode)
                          (buffer-file-name)
                          (seshat-reader-annotation--doc-id
-                          (buffer-file-name)))))
+                          (buffer-file-name)
+                          (seshat-reader-annotation--quiet-p
+                           (buffer-file-name))))))
       (if (and current (member current sorted))
           (cons current (delete current sorted))
         sorted))))
@@ -404,7 +407,8 @@ location 优先取最近一次选区（`seshat-reader-select-last'，其 `:file'
   (unless (derived-mode-p 'seshat-reader-mode)
     (user-error "Seshat Reader reference: `org-store-link' 仅在 seshat-reader 阅读缓冲区中可用"))
   (let* ((file (buffer-file-name))
-         (doc-id (seshat-reader-annotation--doc-id file))
+         (doc-id (seshat-reader-annotation--doc-id
+                  file (seshat-reader-annotation--quiet-p file)))
          (selection seshat-reader-select-last)
          (location (if (and selection
                             (plist-get selection :file)
@@ -503,12 +507,15 @@ PATH 无法解析（非字符串、空串、剥掉 `#' 后 doc-id 为空）时**
 (defun seshat-reader-reference--current-doc-id ()
   "(internal) 返回当前缓冲区所关联文件的文档标识.
 variable `buffer-file-name' 为 nil 时 `user-error'，否则交给
-`seshat-reader-annotation--doc-id' 派生；供下面的交互命令与 T6 的批注引用
-复用。"
+`seshat-reader-annotation--doc-id' 派生（QUIET 取自
+`seshat-reader-annotation--quiet-p'，软依赖 `seshat-reading'：在
+`seshat-reading-mode' 的 buffer 里不再刷库外降级警告）；供下面的交互命令与
+T6 的批注引用复用。"
   (let ((file (buffer-file-name)))
     (unless file
       (user-error "Seshat Reader reference: 当前缓冲区没有关联文件，无法派生文档标识"))
-    (seshat-reader-annotation--doc-id file)))
+    (seshat-reader-annotation--doc-id
+     file (seshat-reader-annotation--quiet-p file))))
 
 (defun seshat-reader-reference--current-location ()
   "(internal) 返回当前阅读位置的 `location' 字符串.

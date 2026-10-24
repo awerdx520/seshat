@@ -147,13 +147,31 @@ TRUENAME 须为已归一的绝对真实路径（`file-truename'）。命中时�
                 best-length length))))
     best))
 
-(defun seshat-reader-annotation--doc-id (file)
+(defun seshat-reader-annotation--quiet-p (file)
+  "返回是否应对 FILE 的 doc-id 降级警告静音（**软依赖** `seshat-reading'）.
+`seshat-reading'（项目层模块，负责「阅读模式 = 库身份 + 显式入库」）定义了
+`seshat-reading-quiet-p'：它在 `seshat-reading-mode' 的 buffer 里返回 t，
+让库外文档**不再每次**派生 doc-id 都 `message' 一条降级警告。
+
+本模块对它是软依赖——`seshat-reading' 反向 `require' 了 `seshat-reader'，
+硬依赖会成环；因此用 `fboundp' 探测 + `funcall'（不经字节编译器直接引用，
+避免编译出「函数未定义」告警）。未加载 `seshat-reading' 时恒返回 nil，
+即既有行为完全不变。"
+  (and (fboundp 'seshat-reading-quiet-p)
+       (funcall 'seshat-reading-quiet-p file)))
+
+(defun seshat-reader-annotation--doc-id (file &optional quiet)
   "由文件路径 FILE 派生**显示用**的文档标识（doc-id）.
 先把 FILE 归一化为绝对真实路径（`file-truename' 展开 `~'、相对路径与
 符号链接），再依次与 `seshat-reader-annotation-roots' 中的每个根比较：
 命中时返回 \"<标签>:<相对路径>\"，多个根命中时取**最长（最具体）的根**。
 未命中任何根时把结果降级为 \"local:<绝对路径>\"，并 `message' 一条警告
 提示该标识不跨端共享。
+
+QUIET 非 nil 时**不**发那条降级警告（返回值不变，仍是 \"local:<绝对路径>\"）。
+默认 nil 即保持既有行为；静音判定的来源见
+`seshat-reader-annotation--quiet-p'（`seshat-reading-mode' 的 buffer 里
+显式入库前的文档只靠 mode-line 标识，不刷回显区）。
 
 FILE 为文档文件路径，可以是相对路径。返回值**只用于**列表/面板显示与
 `seshat:' 链接文本；发给服务端的身份必须是 uid（见
@@ -163,8 +181,9 @@ FILE 为文档文件路径，可以是相对路径。返回值**只用于**列�
     (if match
         (concat (car match) ":" (file-relative-name truename (cdr match)))
       (let ((fallback (concat "local:" truename)))
-        (message "Seshat Reader annotation: %s 不在任何已配置的文档根内，降级为 %s（不跨端共享）"
-                 truename fallback)
+        (unless quiet
+          (message "Seshat Reader annotation: %s 不在任何已配置的文档根内，降级为 %s（不跨端共享）"
+                   truename fallback))
         fallback))))
 
 (defun seshat-reader-annotation--uid (file)
@@ -290,7 +309,8 @@ BODY 为批注正文；为 nil 或去掉空白后为空串时退回使用最近�
              (text (if (and (stringp body) (not (string-empty-p (string-trim body))))
                        body
                      selection-text))
-             (document-id (seshat-reader-annotation--doc-id file))
+             (document-id (seshat-reader-annotation--doc-id
+                           file (seshat-reader-annotation--quiet-p file)))
              (location (seshat-reader-annotation--location page rect)))
         (when (or (null text) (string-empty-p (string-trim text)))
           (user-error "Seshat Reader annotation: 选区没有文本，可先用 C-u 输入批注正文"))
@@ -847,7 +867,7 @@ DOCUMENT-ID 比较。不满足时返回 nil，调用方据此**跳过**高亮同
 A 文档的批注画到 B 文档上（动态模块的高亮表是文档级的）。"
   (and (buffer-live-p source)
        (with-current-buffer source
-         (and (eq major-mode 'seshat-reader-mode)
+         (and (derived-mode-p 'seshat-reader-mode)
               (equal document-id
                      (seshat-reader-annotation--quiet-doc-id buffer-file-name))))))
 
@@ -1286,7 +1306,8 @@ evil；在 evil 环境下它们可能被 evil 接管（evil 会覆盖 `special-m
     (if file
         ;; 双值：doc-id 供显示与 `seshat:' 链接，uid 供 API（拉取/删除/刷新）
         (seshat-reader-annotation--refresh-list
-         (seshat-reader-annotation--doc-id file)
+         (seshat-reader-annotation--doc-id
+          file (seshat-reader-annotation--quiet-p file))
          (current-buffer)
          (seshat-reader-annotation--uid file))
       (message "Seshat Reader annotation: 当前缓冲区没有关联文件，无法确定文档标识。"))))

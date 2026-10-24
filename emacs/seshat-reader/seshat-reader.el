@@ -1810,14 +1810,14 @@ Keybindings:
 (define-minor-mode seshat-reader-dark-mode
   "Toggle dark-mode for current seshat-reader document."
   :lighter " Dark"
-  (when (eq major-mode 'seshat-reader-mode)
+  (when (derived-mode-p 'seshat-reader-mode)
     (seshat-reader-dyn--doc-invert (if seshat-reader-dark-mode 1 0))
     (seshat-reader--redisplay-all-windows)))
 
 (define-minor-mode seshat-reader-presentation-mode
   "Toggle presentation view for current seshat-reader document."
   :lighter ""
-  (when (eq major-mode 'seshat-reader-mode)
+  (when (derived-mode-p 'seshat-reader-mode)
     (cond (seshat-reader-presentation-mode
 	   (setq-local mode-line-format nil)
 	   (seshat-reader-fit-to-height))

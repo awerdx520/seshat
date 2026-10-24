@@ -760,7 +760,9 @@ buffer（不再弹 posframe），面板可用 `q' 或 `seshat-reader-sidebar-tog
 （`seshat-reader-select-last' 的 :page/:rect）派生；服务端身份由
 `seshat-reader-annotation--uid' 从选区的 :file 解析（uid 是发给服务端的
 唯一身份；显示用 doc-id 仍由 `seshat-reader-annotation--doc-id' 派生，
-只用于提示文案）。
+只用于提示文案；该派生按**源文件所属 buffer** 的静音标记决定是否 `message'
+降级警告（`seshat-reader-annotation--quiet-p'，软依赖），因此本命令即使从
+翻译面板 buffer 触发，也不会在 `seshat-reading-mode' 下刷库外警告）。
 
 正文取 `seshat-reader-translate-last-result'（最近一次翻译或解释的纯
 译文）；尚无译文、或译文去掉空白后为空时以 `user-error' 提示先翻译或
@@ -782,7 +784,8 @@ buffer（不再弹 posframe），面板可用 `q' 或 `seshat-reader-sidebar-tog
           (user-error "Seshat Reader translate: 选区未记录文档文件，无法派生文档标识"))
         (let* ((page (plist-get selection :page))
                (rect (plist-get selection :rect))
-               (document-id (seshat-reader-annotation--doc-id file))
+               (document-id (seshat-reader-annotation--doc-id
+                             file (seshat-reader-annotation--quiet-p file)))
                (uid (seshat-reader-annotation--uid file))
                (location (seshat-reader-annotation--location page rect)))
           (condition-case err
