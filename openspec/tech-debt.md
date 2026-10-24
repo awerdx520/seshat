@@ -976,7 +976,7 @@
 - 现状：自动 fit（`seshat-reader-mode` 首次 fit 与 `--refit-window` 的 fit 分支）改走 `seshat-reader--contain-scale`（`min(按高, 按宽)`）后，`seshat-reader-default-fit` 在整个仓库里只剩 defcustom 自身，没有任何调用点（`grep -n seshat-reader-default-fit emacs/seshat-reader/` 仅命中定义与一条 docstring 引用）。它不是缺陷的成因，但会让用户误以为可配置。
 - 影响：设成 `seshat-reader-fit-to-width` 与 `seshat-reader-fit-to-height` 在自动 fit 下行为完全一样；任何「用该选项覆盖 contain」的实现都会让另一维溢出，因此**无法**在不溢出的前提下恢复区分度。
 - 建议：二选一 —— ① 删除该 defcustom（破坏性变更，需在 CHANGELOG 记 BREAKING 并同步 `docs/configuration.md`）；② 重新定义为「手动 `H`/`W` 之外的默认命令」或彻底改语义（例如「是否允许放大到填满」）。在定稿前保留原样，并在 docstring 注明「自动 fit 不再使用本选项」。
-- 已解决（2026-10-23）：该选项被重定义为「新窗口 / 新文档的初始适配模式」（`contain` / `width` / `height`，默认 `contain`），由 `--first-fit` 与 `--window-create-function` 读取；旧函数符号值经 `--normalize-default-fit` 兼容映射。见 `openspec/active/2026-10-23-reader-default-fit-mode.md`。
+- 已解决（2026-10-23）：该选项被重定义为「新窗口 / 新文档的初始适配模式」（`contain` / `width` / `height`，默认 `contain`），由 `--first-fit` 与 `--window-create-function` 读取；旧函数符号值经 `--normalize-default-fit` 兼容映射。见 `openspec/completed/2026-10-23-reader-default-fit-mode.md`。
 
 ## `seshat-reader--set-window-vscroll` 缺下界夹紧（2026-10-23）
 
@@ -1016,24 +1016,27 @@
 - 建议：二选一 —— ① 删除该 defcustom（破坏性变更，需在 CHANGELOG 记 BREAKING 并同步 `docs/configuration.md`）；② 重新定义为「首次打开时写入的 `fit-mode` 初值」（`fit-to-width` → `width`、`fit-to-height` → `height`，其余 → `contain`），这样它重新有意义且不新增选项。②更贴合「默认适配维度」诉求，但需与「`fit-mode` 是否跨会话记忆」一并定稿（当前不记忆）。
 - 已解决（2026-10-23）：同上条；`fit-mode` 与 defcustom 现已分工明确（前者管窗口、后者管起点），该选项重新具备可观察效果。
 
-## `image-flush` 已从 `--apply-display-scale` 移除，「C 侧下次重渲染即清旧缓存」未验证（2026-10-23）
+## `image-flush` 已从 `--apply-display-scale` 移除，「C 侧下次重渲染即清旧缓存」已观测：无线性泄漏（2026-10-23 真机 T4-3）
 
-- 现状：`--apply-display-scale` 只改 image spec 的 `:width` / `:height`，实测（pure 实例）原地修改后无需 `image-flush` 即生效；早期版本在改写前调 `(ignore-errors (image-flush spec))` 主动丢弃旧缓存条目，但拖动分割线时每帧 flush 会强制 redisplay 重解码整页位图（真机实测拖一次卡 1–2 秒），**本轮已把 flush 整个移除**，改为依赖「C 侧下次重渲染替换 spec 时清掉旧缓存条目」。这条断言是读代码得出的推断，**未在真机验证**。
+- 现状：`--apply-display-scale` 只改 image spec 的 `:width` / `:height`，实测（pure 实例）原地修改后无需 `image-flush` 即生效；早期版本在改写前调 `(ignore-errors (image-flush spec))` 主动丢弃旧缓存条目，但拖动分割线时每帧 flush 会强制 redisplay 重解码整页位图（真机实测拖一次卡 1–2 秒），**本轮已把 flush 整个移除**，改为依赖「C 侧下次重渲染替换 spec 时清掉旧缓存条目」。这条断言是读代码得出的推断，**该断言已于 2026-10-23 真机观测（T4-3），见下方「已观测」。**
 - 影响：批量 ERT 全程在 batch 下跑（`image-property` / `image-flush` 可用，但**没有真实 GUI image cache**），因此「反复缩放数千次后的内存曲线」「不 flush 时旧位图是否真的被替换清掉」「image cache 峰值内存」这三件事只有真机能回答。若推断不成立，旧位图会滞留到 `image-cache-eviction-delay`（默认 300s，见下一条「image cache 条目累积」）。
 - 建议：T6 真机验收（拖分割线）时顺带观测——拖拽期间与停手后各取一次 `memory-info`，并在同一文档上反复开合面板 20 次以上，若与 image cache 相关的计数持续上涨则按 H6 降级（改为「只在 idle 做 apply，接受一帧中间态」）；如需定量，可在 GUI 下用 `(image-cache-size)` 前后对比。若确认必须 flush，则只能加在「停手后的那次 refit」里（每帧加不起）。
+- 已观测（2026-10-23 真机 T4-3，GUI Emacs 31.1 / pgtk）：同一文档开合目录 20 次，`(image-cache-size)` 59,985,948 → 61,860,828 B（+1,874,880 B ≈ +1.79 MB，≈90 KB/次），`(nth 1 (memory-info))` 22,090,868 → 22,010,188 kB。若无回收，20 次应至少涨一个数量级（整页位图约 2 MB/张），实测为常数级增量 → **「C 侧下次重渲染替换 spec 时旧缓存被回收」成立**，未见线性泄漏。剩余风险：长时间（数小时）曲线仍未观测，`image-cache-eviction-delay` 到期前的滞留量未定量。
 
-## image cache 条目累积（原地改 spec 尺寸，2026-10-23）
+## image cache 条目累积（原地改 spec 尺寸，2026-10-23）——已部分观测：拖拽期间零增长（真机 T4-4）
 
-- 现状：image cache 以 spec 内容（含 `:width` / `:height`）为键。`--apply-display-scale` 原地改写这两个属性后，旧键条目不会立即消失，而会滞留到 `image-cache-eviction-delay`（默认 300s）。拖拽分割线时尺寸变化事件密集，数秒内即可造出几十个条目（A4 页面约 600×850 px，每条约 2 MB 量级），峰值内存随拖拽时长上涨。曾经用「改写前 `ignore-errors (image-flush spec)`」缓解，但逐帧 flush 会让拖动卡 1–2 秒，**本轮已把 flush 移除**——旧条目现在全靠 `image-cache-eviction-delay` 与 C 侧下次重渲染替换 spec 时回收，缺长时间真机内存观测。
+- 现状：image cache 以 spec 内容（含 `:width` / `:height`）为键。`--apply-display-scale` 原地改写这两个属性后，旧键条目不会立即消失，而会滞留到 `image-cache-eviction-delay`（默认 300s）。拖拽分割线时尺寸变化事件密集，数秒内即可造出几十个条目（A4 页面约 600×850 px，每条约 2 MB 量级），峰值内存随拖拽时长上涨。曾经用「改写前 `ignore-errors (image-flush spec)`」缓解，但逐帧 flush 会让拖动卡 1–2 秒，**本轮已把 flush 移除**——旧条目现在全靠 `image-cache-eviction-delay` 与 C 侧下次重渲染替换 spec 时回收，长时间真机内存曲线仍未观测，但 10 秒拖拽窗口已观测（T4-4），见下方「已观测」。
 - 影响：长时间拖拽或频繁开关面板后，缓存里可能同时存在多份位图；`image-cache-eviction-delay` 到期前不会回收，属于「有界但不可控」的内存占用（上界与条目数、页面像素数成正比）。
 - 附记：`--refit-window` 的清晰度闸（`render-scale` 与 `scale` 比较）写在 `unless manual` 守卫**之外**，理论上 manual 窗口在两者不相等时也会重渲染一次。正常路径下 manual 不改 `scale`（`+` / `-` / `0` 走 `doc-scale-page` 且写回同值），两者恒相等，故不触发；但若将来 manual 路径开始写不同值（例如引入「手动缩放下仍提升清晰度」），这行会成为一处隐性重渲染入口，改动时需一并审视。
 - 建议：① 真机长观测（见上一条）；② 若确认峰值内存不可接受，改为「apply 只在几何变化超过阈值时执行」（合并连续小幅尺寸变化，减少键数量）或临时下调 `image-cache-eviction-delay`；③ 把清晰度闸移进 `unless manual` 分支（或显式加 `manual` 判据）以消除附记里的理论入口。
+- 已观测（2026-10-23 真机 T4-4）：拖右侧分割线 10 秒，0.2 秒/次共 51 个采样点。拖拽期间 `(image-cache-size)` 的最大值 82,581,352 B **正是起始值**，末次采样 82,037,816 B（零增长、略降）；停手后一次采样 88,059,084 B（+6 MB ≈ 3 张位图，由 `image-cache-eviction-delay` 回收）；`(nth 1 (memory-info))` 21,864,632–21,892,992 kB，波动 <0.2%。结论：`seshat-reader--drag-threshold`（0.12 秒）**确认生效**，拖拽期间不产生新 cache 条目；条目累积风险由「密集增长」降级为「停手后一次性 +数张位图」。附记（清晰度闸写在 `unless manual` 守卫之外）仍然成立，未改。
 
 ## `page-join` strip 与 `before-string` 居中的交互未验证（2026-10-23）
 
 - 现状：居中改由页面 overlay 的 `before-string`（`:align-to`）承载后，页面行不再依赖 `line-prefix`；而跨页衔接 strip（`seshat-reader-page-join-lines` > 0）**依赖 center overlay 的 `line-prefix`** 才会跟着右移——fits 模式下 `--center-page` 现在会主动把 center overlay 的 `line-prefix` 清成 nil，strip 行因此只拿到页面 overlay 的 `before-string`（overlay 覆盖范围是页面行，strip 行是否在范围内取决于 `--ensure-center-overlay` / 页 overlay 的 `point-min`..`point-max` 覆盖）。
 - 影响：`page-join-lines` 默认 `0`（关闭），故默认配置不受影响；一旦用户开启，strip 行可能比页面左移半个余量（或反之），表现为「上一页底部残影偏左」。批量 ERT 用 `overlay-get … 'before-string` / `'line-prefix` 断言几何，**不产生真实 redisplay**，无法发现视觉错位。
 - 建议：真机验收时把 `seshat-reader-page-join-lines` 设为 `1` 单独过一遍（翻页后看 strip 与页面的左右边界是否对齐）；若错位，给 strip 行单独挂 `before-string`（与页面同一 `:align-to` 形态）或把 `before-string` 从页 overlay 移到 buffer 级 center overlay（两者权衡：后者要保证只在 fits 模式写、超宽模式清）。
+- 更新（2026-10-23）：观测脚本已备（设置 `seshat-reader-page-join-lines` 为 1 后**用翻页**触发 `--update-join-strip`——调用点 seshat-reader.el:310/322/334/344/354——而不用 `revert-buffer`，后者会撞上本文件新增的「`revert-buffer` 后 buffer 保持 modified」条目），但按用户 2026-10-23 决定本轮不做，仍待真机目视。
 
 ## `--centered-p` 与 `--center-page` 的超宽判据分别用 `<` 与 `>=`（2026-10-23）
 
@@ -1053,12 +1056,22 @@
 - 影响：凡新增涉及「页面是否放得下」「居中走 before-string 还是 line-prefix」的用例，若忘了桩窗口宽度，就会跑到与意图相反的 branch，红灯与实现无关、容易误判成回归；同理，`--contain-scale` / `--fit-scale` 的断言依赖 `window-body-width` / `-height` 的桩值，数值一变结论就变。
 - 建议：把「桩窗口几何」做成测试辅助宏（例如 `seshat-reader-test--with-window-geometry`），新增用例统一走它；已在 resize 测试内部用 `cl-letf` 实现，尚未提取为共享辅助函数。
 
-## 阅读器尺寸自适应的两项 L3 验收未复验（2026-10-23，归档时转为待观察）
+## 阅读器尺寸自适应的两项 L3 验收：L3-6 已通过、L3-8 部分验证（2026-10-23 真机 T4-1 / T4-2）
 
 - 现状：计划 `openspec/completed/2026-10-22-emacs-reader-resize-refit.md` 的 T4 列了 8 条真机验收（L3-1..L3-8）。归档时（2026-10-23）判定其中 6 条由后续计划 `openspec/completed/2026-10-23-emacs-reader-smooth-fit.md` 的真机 L3 验收覆盖，**L3-6（页面比窗口矮时滚到底 vscroll 不为负、图像不被下推）与 L3-8（`emacs --daemon` + `emacsclient -c` 下 idle timer 可靠触发）未单独复验**，按用户 2026-10-23 决定记为待观察，不阻塞归档。
 - 影响：L3-6 直接关系到本条目前的「`seshat-reader--set-window-vscroll` 缺下界夹紧」——尺寸变化路径已有 `seshat-reader--clamp-window-vscroll` 绕行，但**翻页落点与书签恢复的 vscroll 路径仍无下界保护**，只有真机能确认短页 + `fit-to-width` 组合是否真的产生负 vscroll。L3-8 是 `openspec/decisions.md` 2026-10-23「尺寸变化重贴合用 idle timer」决策的降级判据：若 daemon 下 idle timer 不触发，按该决策第 3 级降级为「只 clamp + center、不 refit」，页面可能被裁切。
 - 判据（下次真机批量验收照此执行）：L3-6 → 按 `W`（按宽适配）到短页后滚到底，`(window-vscroll nil t)` 应为 `0` 且页顶不被推出窗口；L3-8 → `emacs --daemon` + `emacsclient -c` 打开文档后开关目录（`o`），页面应在一次 redisplay 内归位（无「先偏一侧再居中」），并在停手后 0.15s 内清空 `seshat-reader--resize-refit-timer`。
-- 建议：与「`image-flush` 已从 `--apply-display-scale` 移除、旧缓存未验证」「image cache 条目累积」两条合并为**一次真机批量观测**（同一次 GUI 会话可全部做完），观测后把结论写回本文件并删除或降级对应条目。
+- 建议：与「`image-flush` 已从 `--apply-display-scale` 移除、旧缓存未验证」「image cache 条目累积」两条合并为**一次真机批量观测**（同一次 GUI 会话可全部做完），观测后把结论写回本文件并删除或降级对应条目。（**2026-10-23 已执行**：T4-1 / T4-3 / T4-4 完成并回填，`image-flush` 与 image cache 两条已降级；仅 T4-5「strip 与 `before-string` 交互」未执行。）
+- 复验结论（2026-10-23 真机）：
+  - **L3-6 通过**：contain 模式下页面显示 608×771、窗口 1904×986（页面比窗口矮），`(seshat-reader--page-max-vscroll-pixels)` = 0，连按 `seshat-reader-scroll-down-screen` 到底后 `(window-vscroll nil t)` = 0（**非负**）、`--centered-p` = t，页顶未被推出窗口。附加数据：`W`（fit-mode = width）下页面 1904×2413、`page-max` = 1427、`vscroll` = 936 ∈ [0,1427]。
+  - **L3-8 部分通过**：当前实例 `(daemonp)` = nil（直接启动的 pgtk GUI）。**观测方法教训**：`sit-for` 不能用来等 idle timer——按 `(elisp)Idle Timers`，Emacs 在「带超时等待输入」（`sit-for` 正是如此）时**不算 idle**，idle timer 不运行；必须真实空闲（手离开键盘鼠标）≥1 秒后再求值。改造后实测 `--resize-refit-timer` = nil、`--centered-p` = t，即 idle refit 正常执行并清空 timer。**daemon 场景（`emacs --daemon` + `emacsclient -c`）仍未验证**，该条降级保留。
+
+## `revert-buffer` 后 buffer 保持 modified，与自动保存类包冲突（2026-10-23 真机观测发现，高优先）——已解决（2026-10-23）
+
+- 现状：`set-buffer-modified-p nil` 只在 `seshat-reader-mode` 启用时执行一次（`seshat-reader.el:1751`）；`revert-buffer` 走的 `--non-queue-refresh-doc-buffer`（`:1507`）→ `--render-buffer`（`:1531`）会重写 buffer（`--update-join-strip` 等插入/删除内容），**之后没有再清 modified 标志**。
+- 影响：① `g` / `M-x revert-buffer` 之后 modeline 显示 `**`，误导用户「文档有未保存改动」；② 与自动保存类包冲突——真机实测连续两条 `super-save-delete-trailing-whitespace-maybe: Buffer is read-only: #<buffer ….pdf>`（由 `super-save` 的 timer 在 modified buffer 上触发），并伴随 `Error running timer: (buffer-read-only …)`；③ **潜在数据损坏**：若用户解除只读（`C-x C-q`）后自动保存被触发，渲染占位内容会被写回原始 PDF 文件。
+- 建议：在 `--render-buffer` 或 `--non-queue-refresh-doc-buffer` 的收尾处（`--update-join-strip` 之后）补 `(set-buffer-modified-p nil)`；同时复核 `auto-revert-mode 1`（`:1752`）与自定义 `revert-buffer-function` 的组合是否需要 `inhibit-read-only` 保护。须补一条 ERT（revert 后 `buffer-modified-p` 为 nil）并做一次真机复验（`g` 后 modeline 无 `**`、*Messages* 无 super-save 报错）。
+- 已解决（2026-10-23）：`seshat-reader--render-buffer` 与 `seshat-reader--update-join-strip` 各自在改完 buffer 文本后补 `(set-buffer-modified-p nil)`——两处独立保证，不依赖调用顺序（真实链路上 `--render-buffer` 末尾会调 `--update-join-strip`，但用例里桩掉后者仍能判别前者，变异自检 A/B 分别打红对应用例）。新增 ERT 2 例（`seshat-reader-page-join-test.el` 24 → **26**；全仓 397 → **399**，0 unexpected / 0 skipped）；L1 `make all` EXIT=0、警告集 33 → 33 零新增。**残留**：`--insert-join-strip` / `--remove-join-strip` 自身仍可改文本（`inhibit-read-only t`），若将来新增调用方绕过 `--update-join-strip` 会重新标脏——这两处不宜单独加清除行（会在同一路径上重复清且掩盖调用链），保持现状并在此记录。
 
 
 

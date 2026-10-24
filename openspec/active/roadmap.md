@@ -181,10 +181,10 @@ M0–M6 已完成并归档，见 `openspec/completed/personal-notes-system.md`�
 
 ### M12 后续：阅读器适配默认值（`seshat-reader-default-fit` 重定义）
 
-计划与执行记录：`openspec/active/2026-10-23-reader-default-fit-mode.md`。
+计划与执行记录：`openspec/completed/2026-10-23-reader-default-fit-mode.md`（**已归档，2026-10-23**）。
 
 - 内容：把 `seshat-reader-default-fit` 从「自动 fit 路径零调用点的 no-op」重定义为**新窗口/新文档的初始适配模式**（`contain` / `width` / `height`，默认 `contain`），旧函数符号值兼容映射；新增 `--normalize-default-fit` / `--initial-fit-mode`，接入 `--first-fit` 与 `--window-create-function`；`W` / `H` 仍只作用于当前窗口、不跨会话。附带一次真机批量观测，清 L3-6 / L3-8 / `image-flush` 移除后回收 / image cache 峰值 / strip 与 `before-string` 居中交互等技术债。
-- 状态：**代码 + 单测完成（2026-10-23）**——`seshat-reader-resize-test.el` 67 → **80** 例，全仓 ERT 384 → **397**（0 unexpected / 0 skipped）；L1 警告集 33 → 33 零新增；文档（`docs/configuration.md` 新增小节、`docs/emacs-reader.md` 三处、`CHANGELOG.md`、`VENDORED.md` ⑩、`decisions.md`）同步中；**T4 真机批量观测待用户执行**，观测完成后归档 `openspec/completed/`。
+- 状态：**✅ 已完成并归档（2026-10-23，`openspec/completed/2026-10-23-reader-default-fit-mode.md`）**——代码 + 单测（`seshat-reader-resize-test.el` 67 → **80** 例，全仓 ERT 384 → **397**，0 unexpected / 0 skipped；L1 警告集 33 → 33）；文档 8 项全部落地；真机观测 4/5 项完成：T4-1（L3-6 短页 vscroll 非负）✅ 通过、T4-2（idle timer）⚠️ 非 daemon 通过而 daemon 场景未验证、T4-3（`image-flush` 移除后回收）✅ 通过（20 次开合 +1.79 MB）、T4-4（拖拽期间 cache 零增长）✅ 通过（`--drag-threshold` 生效）、T4-5（strip 与 `before-string` 交互）按用户决定不执行。观测中发现的**新缺陷**（`revert-buffer` 后 buffer 保持 modified，与 `super-save` 冲突、解除只读后有写坏 PDF 风险）已记 `openspec/tech-debt.md`，并**已于 2026-10-23 修复**——`seshat-reader--render-buffer` 与 `--update-join-strip` 各补 `(set-buffer-modified-p nil)`，新增 ERT 2 例（`seshat-reader-page-join-test.el` 24 → 26，全仓 **397 → 399**，0 unexpected / 0 skipped）。
 
 ## 风险登记
 

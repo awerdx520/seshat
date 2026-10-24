@@ -572,5 +572,60 @@ VSCROLL-CELL 是承载当前 vscroll（像素）的 cons cell。返回值为三�
           (should (seshat-reader--non-queue-previous-page))
           (should (equal '((420 t)) calls)))))))
 
+;;; 7. 只读程序生成 buffer 的 modified 标志
+
+;; reader buffer 是程序生成的只读 buffer：重写全文与增删 strip 都是显示行为，
+;; 不应让 buffer 带上 modified 标志（否则 modeline 显示 **，super-save 等
+;; 自动保存包会尝试把重生成内容写回原始 PDF）。
+
+(ert-deftest seshat-reader-page-join-test--join-strip-not-modified ()
+  "插入 strip 之后 buffer 不得被标为已修改。"
+  (with-temp-buffer
+    (seshat-reader-page-join-test--reset)
+    (let ((spec (seshat-reader-page-join-test--spec 300 400))
+          (seshat-reader-page-join-lines 1))
+      (setq seshat-reader--page-image-specs (list (cons 1 spec)))
+      (cl-letf (((symbol-function 'frame-char-height)
+                 (lambda (&optional _frame) 20))
+                ((symbol-function 'seshat-reader-current-doc-pagenumber)
+                 (lambda (&optional _window) 2)))
+        ;; 从「干净」初态出发，modified 若出现只可能来自 strip 的插入
+        (set-buffer-modified-p nil)
+        (seshat-reader--update-join-strip)
+        ;; 防空转：strip 确实插入了
+        (should (= 2 (buffer-size)))
+        (should (= 20 seshat-reader--join-strip-height))
+        (should-not (buffer-modified-p))))))
+
+(ert-deftest seshat-reader-page-join-test--render-buffer-not-modified ()
+  "重写全文之后 buffer 不得被标为已修改。"
+  ;; 用真实临时文件承载 `buffer-file-name'（`fset' 桩替该 subr 会触发
+  ;; native-comp 的 trampoline 缺失报错），`file-exists-p' 因而自然为真。
+  (let ((file (make-temp-file "seshat-render-" nil ".pdf"))
+        content modified)
+    (unwind-protect
+        (with-temp-buffer
+          (seshat-reader-page-join-test--reset)
+          (setq buffer-file-name file)
+          (cl-letf (((symbol-function 'seshat-reader-dyn--load-doc)
+                     ;; 桩替原生加载：写一小段文本，模拟重写全文
+                     (lambda (_file _page) (insert "stub")))
+                    ;; 桩掉 strip 更新，隔离出 `--render-buffer' 自身的清除行为
+                    ;; （真实实现末尾也会清 modified，否则两处互相掩盖）
+                    ((symbol-function 'seshat-reader--update-join-strip)
+                     #'ignore)
+                    ((symbol-function 'seshat-reader-current-doc-pagenumber)
+                     (lambda (&optional _window) 1)))
+            (set-buffer-modified-p nil)
+            (seshat-reader--render-buffer 0)
+            (setq content (buffer-string)
+                  modified (buffer-modified-p))
+            ;; 收尾：buffer 关联了文件，清掉 dirty 以免 kill 时提问
+            (set-buffer-modified-p nil)))
+      (delete-file file))
+    ;; 防空转：确有文本被写入（否则 modified 恒为 nil，用例无判别力）
+    (should (equal "stub" content))
+    (should-not modified)))
+
 (provide 'seshat-reader-page-join-test)
 ;;; seshat-reader-page-join-test.el ends here.

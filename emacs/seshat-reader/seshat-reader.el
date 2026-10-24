@@ -754,7 +754,9 @@ inserted."
 	 (spec (and (integerp page) (> page 1)
 		    (alist-get (1- page) seshat-reader--page-image-specs))))
     (when (and spec (> height 0))
-      (seshat-reader--insert-join-strip spec height))))
+      (seshat-reader--insert-join-strip spec height)))
+  ;; strip 纯属显示产物：翻页时增删它不应让 buffer 变成「已修改」。
+  (set-buffer-modified-p nil))
 
 ;; We need to do this because scrolling is possible in one direction
 ;; (downwards) indefinitely.
@@ -1541,7 +1543,11 @@ Load the PAGE if provided."
 	  (set-window-parameter nil 'native-size nil)
 	  ;; The page images are rendered anew, so cached specs are stale.
 	  (setq seshat-reader--page-image-specs nil)
-	  (seshat-reader--update-join-strip)))
+	  (seshat-reader--update-join-strip)
+	  ;; 文档文本由原生模块生成，buffer 永远不是用户意义上的「已编辑」。
+	  ;; `seshat-reader-dyn--load-doc' 重写全文后留下的 modified 标志必须清掉，
+	  ;; 否则 revert 后 modeline 显示 **，super-save 等包会把重生成内容写回 PDF。
+	  (set-buffer-modified-p nil)))
     (message "No file associated with buffer.")))
 
 ;; We have an overlay per window, since we (naturally) need to be able

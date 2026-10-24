@@ -4,9 +4,10 @@
 
 ## 当前状态
 
-- 阶段：Phase 3（Implement）· 进行中（T0–T3 完成，代码与单测全绿；T4 待用户真机观测）
+- 阶段：Phase 4（Review & Document）· **已完成并归档（2026-10-23）**
 - 已确认：方案 ✅（用户 2026-10-23 确认，选定 M1 档）、计划 ✅（用户 2026-10-23 确认）
-- 下一步：T4 真机批量观测（5 项，用户执行）→ T5 文档（需 T4 结论）→ T6 归档
+- 执行结果：T0–T3 代码与单测完成（全仓 ERT 384 → 397 例，0 unexpected / 0 skipped；L1 警告集 33 → 33）；T5 文档 8 项完成；T4 真机观测 4/5 项完成（T4-5 按用户 2026-10-23 决定不执行）；T6 归档完成
+- 后续：观测中发现一个**新缺陷**（`revert-buffer` 后 buffer 保持 modified，与自动保存类包冲突）已记入 `openspec/tech-debt.md`，为下一个计划候选
 
 ## 目标
 
@@ -179,7 +180,7 @@ synchronous re-render when the page spec is not available yet."
 - 验收：新增 ERT ≥2 例 —— ① 无 `fit-mode` 的新窗口被写入归一化初值；② 已有 `fit-mode` 的窗口不被覆盖。
 - ✅ 2026-10-23 完成：`--window-create-function` 的 `(unless (window-parameter window 'overlay)` 分支内、`dyn--window-create` 之前插入 6 行（2 行中文注释 + `(unless (window-parameter window 'fit-mode)` 守卫 + `set-window-parameter` 及其 2 行续行，代码 4 行），不重算几何（D4-A 保守版）；新增 ERT 2 例（`resize` 78 → 80，第 79 / 80 节）。**第 80 节在实现前即为绿**（无写入时必然保留原值），故其判别力由变异自检给出：M1（删整块写入）→ 仅第 79 节红、第 80 节绿；M2（`unless` 守卫改无条件写）→ 第 80 节红（`(eq height width)` 失败）、第 79 节绿。L1 `make all` EXIT=0、警告集 **33 → 33**（归一化 diff 为空）、两文件 `check_parens` ok；L2 全仓 **397** 例 / 397 expected / 0 unexpected / 0 skipped（`resize` 80，其余 10 文件 27/48/14/18/24/24/50/8/57/47 不变）。坑同上：每次变异前 `rm -f seshat-reader.elc`。
 
-### [ ] T4 真机批量观测（5 项，用户执行）
+### [x] T4 真机批量观测（4/5 项执行，用户执行；T4-5 按用户决定不执行）
 
 - 动作：按下列脚本在 GUI Emacs 中逐项观测并记录数值（**不改代码**；结论回填 T5 的 tech-debt）：
   - **T4-1（L3-6 短页 vscroll 非负）**：按 `W` 适配 → 翻到短页 → `M-x seshat-reader-scroll-down-screen` 数次到底 → `M-:` 求值：
@@ -221,18 +222,27 @@ synchronous re-render when the page spec is not available yet."
 
 - 依赖：T3
 - 验收：5 项逐条「通过 / 失败 + 数值 + 现象」记录写回本计划；T4 结论决定 `tech-debt.md` 哪几条删除、哪几条降级、哪几条保留。
+- 实测（2026-10-23，GUI Emacs 31.1 / pgtk，`(daemonp)` = nil）：
+  - **T4-1 通过（L3-6）**：contain 模式页面显示 608×771、窗口 1904×986（页面比窗口矮），`--page-max-vscroll-pixels` = 0，滚到底 `(window-vscroll nil t)` = 0（非负），`--centered-p` = t。附加：`W`（fit-mode = width）下页面 1904×2413、`page-max` = 1427、`vscroll` = 936（∈ [0,1427]）、scale = render-scale = 2.9795。
+  - **T4-2 部分通过（L3-8）**：「用 `sit-for` 等待」是错误方法——按 `(elisp)Idle Timers`，Emacs 在「带超时等待输入」时不算 idle，idle timer 不运行；改用「真实空闲 ≥1 秒后再求值」后 `--resize-refit-timer` = nil、`--centered-p` = t。**daemon 场景（`emacs --daemon` + `emacsclient -c`）未验证**（当前实例非 daemon）。
+  - **T4-3 通过**：开合目录 20 次，`image-cache-size` 59,985,948 → 61,860,828 B（+1.79 MB，≈90 KB/次）；free-ram 22,090,868 → 22,010,188 kB。无线性增长，说明 C 侧替换 spec 时旧位图确实被回收。
+  - **T4-4 通过**：拖分割线 10 秒、51 个采样点；拖拽期间 cache 最大值 82,581,352 B 即起始值、末次采样 82,037,816 B（零增长、略降）；停手后 88,059,084 B（+6 MB ≈ 3 张位图）；free-ram 波动 <0.2%。`--drag-threshold` 0.12 秒确认生效。
+  - **T4-5 未执行**：用户 2026-10-23 决定不做。观测时 `M-x revert-buffer` 触发 `super-save-delete-trailing-whitespace-maybe: Buffer is read-only: #<buffer …pdf>` 连续报错（成因见 tech-debt 新增条目）；替代方法（翻页触发 `--update-join-strip`，调用点 seshat-reader.el:310/322/334/344/354，避开 revert）已备但未执行。
+  - 附带发现：`revert-buffer` 走的 `--non-queue-refresh-doc-buffer`（seshat-reader.el:1507）→ `--render-buffer`（:1531）重写 buffer 后**未清除 modified 标志**（`set-buffer-modified-p nil` 只在 mode 启用时执行一次，:1751），与 `super-save` 类自动保存包冲突；已记入 `openspec/tech-debt.md`。
 
-### [ ] T5 文档
+### [x] T5 文档
 
 - 动作：见「## 文档清单」。
 - 依赖：T4（tech-debt 与 `docs/emacs-reader.md` §12 的结论需 T4 数据）
-- 验收：8 个文件按要求更新；`docs/configuration.md` 新增小节含值域表与旧值兼容说明；`tech-debt.md` 的两条 `default-fit` no-op 条目已删除，另三条按 T4 结论处理（删除/降级/保留并注明观测值）。
+- 验收：8 个文件按要求更新；`docs/configuration.md` 新增小节含值域表与旧值兼容说明；`tech-debt.md` 的两条 `default-fit` no-op 条目**保留并标注「——已解决」**（**实施口径变更**：计划原文写「删除」，实际按仓库既有惯例保留标注以便追溯，与 `tech-debt.md:973` 的 hscroll 条、2026-10-22 进度 409 条同口径）；另三条按 T4 结论处置——`image-flush` 移除与 image cache 累积两条降级并附观测值，strip 与 `before-string` 交互条保留待观测（T4-5 未执行）。
+- ✅ 2026-10-23 完成：8 项文档全部落地——`docs/configuration.md` 新增「Emacs 客户端配置（阅读器适配模式）」小节（:281 起，含值域表、旧值兼容映射表、`W`/`H` 与 `contain`/`width`/`height` 关系、4 段配置示例）；`docs/emacs-reader.md` §3（:86/:93/:95）、配置变量表行（:330）、§12 第 17 条（:437）；`CHANGELOG.md` 新条目（:12）；`VENDORED.md` 第 ⑩ 项（:43 末尾）；`openspec/decisions.md` 2026-10-23 M1 取舍条目（:600-602）；`openspec/active/roadmap.md` M12 后续条目。`tech-debt.md` 中两条 `default-fit` no-op 条目按仓库惯例**保留并标注「——已解决」**（不删除，与 `:973`、2026-10-22 进度 409 等既有条目同口径）；三条观测类条目与 L3-6/L3-8 条目按 T4 结论处置。`docs/api.md` / `docs/errors.md` / `NEWS` 确认不改。
 
-### [ ] T6 归档与沉淀
+### [x] T6 归档与沉淀
 
 - 动作：计划移入 `openspec/completed/`、`## 当前状态` 收尾、`memory_lesson_save` 沉淀。
 - 依赖：T5
 - 验收：`openspec/active/` 无本计划残留；归档文件零未勾选任务；沉淀可检索。
+- ✅ 2026-10-23 完成：计划移入 `openspec/completed/`；`roadmap.md` 状态更新；lessons 沉淀（`sit-for` 不触发 idle timer；`revert-buffer` 后 modified 未清）。
 
 ## 依赖关系
 
@@ -303,4 +313,4 @@ Phase 3 执行中与 Phase 4 收尾时逐条回填；结论取值：成立 ✓ /
 | H5 | `--first-fit` 执行时 `--native-page-size` 可得 | 成立 ✓ | T0 ⑥ 实测：`verify` 实例打开 `placement.pdf`，`--first-fit` :before 处 `--page-image-spec` 非 nil、`--native-page-size` = `(536.0 . 363.0)`；代码顺序 `--render-buffer`（`:1723-1724`）先于 `--first-fit`（`:1738`） |
 | H6 | 首次 fit 之外无其它路径读 `default-fit` | 成立 ✓ | 计划期 grep + 独立审查逐条追踪 `revert-buffer` / `--restore-display-on-quit` / 书签 / `--handle-window-buffer-change` |
 | H7 | `--window-create-function` 是新窗口建 overlay 的唯一入口 | 成立 ✓ | `--manage-window-overlays`（定义 `:1526`）+ `--handle-window-buffer-change` |
-| H8 | 5 项真机观测可一次 GUI 会话完成 | 待验 | T4 执行后回填（L3-8 需 `--daemon` + `emacsclient -c`） |
+| H8 | 5 项真机观测可一次 GUI 会话完成 | 部分成立 ⚠️ | 2026-10-23 实测：T4-1~T4-4 同一次 GUI 会话完成；T4-5 因 `revert-buffer` 撞 `super-save`（buffer modified 未清）失败，且用户决定不再补做，故 4/5 完成 |
