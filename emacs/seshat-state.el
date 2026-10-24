@@ -207,6 +207,55 @@ plist 的元素丢弃，其余条目逐字段归一化；`:roots' 中非三元�
                    (equal (cdr (assoc (car cell) b #'equal)) (cdr cell)))
                  a)))
 
+;;; 批量写入
+
+(defvar seshat-state--batch-depth 0
+  "`seshat-state-batch' 的当前嵌套深度；0 表示不在批量块内.
+深度大于 0 时 `seshat-state--put-entry' 跳过 `:paths' 重建（索引保持批前
+形状），改由最外层批量块退出时统一重建一次。批量同步逐 uid 写 base blob
+时靠它把每次写入的 O(n) 重建压成整批一次。")
+
+(defun seshat-state--rebuild-paths-now ()
+  "把内存状态的 `:paths' 依 `:uids' 就地重建一次，返回重建后的状态.
+与纯函数 `seshat-state--rebuild-paths' 的区别只在副作用：本函数把重建结果
+写回 `seshat-state--state'。批量写入块退出时调用它把索引一次性补齐。"
+  (setq seshat-state--state
+        (seshat-state--rebuild-paths (seshat-state--ensure)))
+  seshat-state--state)
+
+(defmacro seshat-state-batch (&rest body)
+  "在批量写入块内执行 BODY，退出时只重建一次 `:paths'；返回 BODY 最后一个表达式的值.
+
+批量期间 `seshat-state--batch-depth' 递增，`seshat-state--put-entry' 因此
+**跳过** `:paths' 重建；`unwind-protect' 保证退出时（正常返回或出错）递减
+深度，减到 0 时用 `seshat-state--rebuild-paths-now' 统一重建一次。嵌套使用时
+只有最外层退出才重建（深度 2 → 1 不重建），所以嵌套块的写入同样只付出一次
+O(n) 重建。
+
+语义保证：
+
+- **批量期间 `:paths' 不更新**：`seshat-state-uid-for-path' 与
+  `seshat-state-path-for-uid' 读的是批前索引，**不保证**命中本批新写入的
+  条目（已存在条目的旧映射仍能命中，本批新建或改名的路径查不到）。块内不要
+  依赖这两个函数判断「本批写入是否可见」。
+- **批量结束后状态与逐条写入完全一致**：退出时的那次重建按 `:uids' 顺序生成
+  索引，与「每次写入都重建」的最终结果逐字段相同（含 `:paths'）。
+- BODY 抛错时仍重建一次，因此不会留下「`:uids' 已更新、`:paths' 停留在批前
+  形状」的半残索引；错误继续向调用方传播。
+- `seshat-state-remap' **不受**本块影响：它靠实时索引做同路径冲突检测，仍然
+  每次都重建索引（因此也保证 remap 的冲突语义在批量块内依然成立）。
+- 块内**不要**调用 `seshat-state-save'：此时 `:paths' 还是批前形状，落盘会写出
+  与 `:uids' 不一致的索引（下次 `seshat-state-load' 会按 `:uids' 重建并告警）。
+  请在批量块退出后保存。"
+  (declare (indent 0) (debug t))
+  `(progn
+     (setq seshat-state--batch-depth (1+ seshat-state--batch-depth))
+     (unwind-protect
+         (progn ,@body)
+       (setq seshat-state--batch-depth (1- seshat-state--batch-depth))
+       (when (= seshat-state--batch-depth 0)
+         (seshat-state--rebuild-paths-now)))))
+
 ;;; 加载与保存
 
 (defun seshat-state--warn (message &rest args)
@@ -316,24 +365,33 @@ MESSAGE 与 ARGS 交给 `format'。抽成函数只为让测试能统一桩替
   (alist-get uid (plist-get (seshat-state--ensure) :uids) nil nil #'equal))
 
 (defun seshat-state--put-entry (state uid entry)
-  "返回把 UID 的条目设为 ENTRY 并重建索引后的新状态."
-  (seshat-state--rebuild-paths
-   (seshat-state--put
-    state :uids
-    (seshat-state--alist-put (plist-get state :uids) uid entry))))
+  "返回把 UID 的条目设为 ENTRY 后的新状态.
+`:paths' 的更新受 `seshat-state--batch-depth' 控制：在
+`seshat-state-batch' 块内跳过重建（索引保持批前形状，由块退出时统一补一次），
+不在批量块内则立即重建。"
+  (let ((state (seshat-state--put
+                state :uids
+                (seshat-state--alist-put (plist-get state :uids) uid entry))))
+    (if (> seshat-state--batch-depth 0)
+        state
+      (seshat-state--rebuild-paths state))))
 
 (defun seshat-state-set (uid entry)
-  "把 UID 的条目整体设为 ENTRY（plist）并重建路径索引；返回归一化后的条目.
+  "把 UID 的条目整体设为 ENTRY（plist）并同步路径索引；返回归一化后的条目.
 UID 未登记时新建条目；ENTRY 缺字段时按 nil 补齐（见
-`seshat-state--normalize-entry'），因此调用方只需写关心的字段。"
+`seshat-state--normalize-entry'），因此调用方只需写关心的字段。索引重建经
+`seshat-state--put-entry' 完成：在 `seshat-state-batch' 块内跳过，由块退出时
+统一重建一次。"
   (let ((entry (seshat-state--normalize-entry entry)))
     (setq seshat-state--state
           (seshat-state--put-entry (seshat-state--ensure) uid entry))
     (seshat-state-get uid)))
 
 (defun seshat-state--update-entry (uid function)
-  "以 FUNCTION 变换 UID 的条目、重建索引并写回内存状态；返回新条目.
-UID 未登记时以空条目为起点（不 `error'：调用方常先记 base-blob 再补路径）。"
+  "以 FUNCTION 变换 UID 的条目、写回内存状态并返回新条目.
+UID 未登记时以空条目为起点（不 `error'：调用方常先记 base-blob 再补路径）。
+索引重建经 `seshat-state--put-entry' 完成，因此同样受
+`seshat-state--batch-depth' 控制：在 `seshat-state-batch' 块内跳过重建。"
   (let* ((state (seshat-state--ensure))
          (entry (or (seshat-state-get uid) (seshat-state--empty-entry)))
          (new (seshat-state--normalize-entry (funcall function entry))))

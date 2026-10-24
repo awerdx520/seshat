@@ -97,6 +97,22 @@ WARNINGS 是消息字符串列表（调用顺序），用于断言「确实发�
           (print-level nil))
       (prin1 state (current-buffer)))))
 
+(defun seshat-state-test--count-rebuilds (function)
+  "在调用 FUNCTION 期间统计 `seshat-state--rebuild-paths' 的调用次数.
+返回 `(RESULT . COUNT)'：RESULT 是 FUNCTION 的返回值，COUNT 是纯函数
+`seshat-state--rebuild-paths' 被调用的次数（`cl-letf' 替换 symbol-function，
+因此 `seshat-state--rebuild-paths-now' 与 `seshat-state--put-entry' 的调用都会
+被数到）。用它是为了断言批量块把 O(n) 重建压成整批一次。"
+  (let ((original (symbol-function 'seshat-state--rebuild-paths))
+        (count 0))
+    (let ((result
+           (cl-letf (((symbol-function 'seshat-state--rebuild-paths)
+                      (lambda (state)
+                        (setq count (1+ count))
+                        (funcall original state))))
+             (funcall function))))
+      (cons result count))))
+
 ;;; 默认值与空状态
 
 (ert-deftest seshat-state-test-default-file-location ()
@@ -519,6 +535,150 @@ WARNINGS 是消息字符串列表（调用顺序），用于断言「确实发�
     (should-error (seshat-state-set-roots '(("notes" "/tmp/notes"))))
     (should-error (seshat-state-set-roots '("notes")))
     (should (equal (seshat-state-roots) '(("notes" "/tmp/notes" "mirror"))))))
+
+;;; 批量写入（seshat-state-batch）
+
+(ert-deftest seshat-state-test-batch-rebuilds-paths-once ()
+  "批量块内 N 次写入后 `--rebuild-paths' 只被调用 1 次（逐条写入则 N 次）。"
+  (seshat-state-test--with-temp-state
+    (seshat-state-load)                 ; 预热：后续 ensure 不再触发 load
+    (let ((uids '("uid-1" "uid-2" "uid-3" "uid-4" "uid-5")))
+      ;; 批量：5 次写入 → 1 次重建
+      (let* ((captured
+              (seshat-state-test--count-rebuilds
+               (lambda ()
+                 (seshat-state-batch
+                   (dolist (uid uids)
+                     (seshat-state-set
+                      uid (list :root "notes" :path (concat uid ".org"))))))))
+             (count (cdr captured)))
+        (should (= 1 count))
+        ;; 索引确实按 5 条写入重建过（不是「跳过重建导致索引为空」）
+        (should (= 5 (length (plist-get seshat-state--state :paths))))
+        (should (equal (seshat-state-uid-for-path "notes" "uid-3.org") "uid-3")))
+      ;; 对照：同样的 5 次写入逐条执行（不在批量块内）→ 5 次重建
+      (setq seshat-state--state (seshat-state--empty))
+      (should (= 5 (cdr (seshat-state-test--count-rebuilds
+                         (lambda ()
+                           (dolist (uid uids)
+                             (seshat-state-set
+                              uid (list :root "notes"
+                                        :path (concat uid ".org"))))))))))))
+
+(ert-deftest seshat-state-test-batch-matches-sequential-writes ()
+  "批量写入的最终状态与逐条写入完全一致（含 `:paths' / 墓碑 / dirty / 游标）。"
+  (let (batched sequential)
+    ;; 固定时钟：墓碑的 `:deleted-at' 取 `(truncate (float-time))'，
+    ;; 两次运行跨秒边界会不等，与本用例要验证的东西无关。
+    (cl-letf (((symbol-function 'float-time) (lambda () 2000000000.0)))
+      (seshat-state-test--with-temp-state
+        (seshat-state-batch
+          (seshat-state-set "uid-a" (list :root "notes" :path "a.org"))
+          (seshat-state-set "uid-b" (list :root "notes" :path "b.org"))
+          (seshat-state-set-base-blob "uid-b" "sha1:b" 11 1111)
+          (seshat-state-mark-dirty "uid-a")
+          (seshat-state-set "uid-c" (list :root "work" :path "c.org"))
+          (seshat-state-mark-deleted "uid-c")
+          (seshat-state-set-base-blob "uid-d" "sha1:d" 22 2222))
+        (seshat-state-set-cursor 7)
+        (setq batched seshat-state--state))
+      (seshat-state-test--with-temp-state
+        (seshat-state-set "uid-a" (list :root "notes" :path "a.org"))
+        (seshat-state-set "uid-b" (list :root "notes" :path "b.org"))
+        (seshat-state-set-base-blob "uid-b" "sha1:b" 11 1111)
+        (seshat-state-mark-dirty "uid-a")
+        (seshat-state-set "uid-c" (list :root "work" :path "c.org"))
+        (seshat-state-mark-deleted "uid-c")
+        (seshat-state-set-base-blob "uid-d" "sha1:d" 22 2222)
+        (seshat-state-set-cursor 7)
+        (setq sequential seshat-state--state)
+        ;; 派生查询必须在绑定内做（块外 `seshat-state-file' 已恢复为真实路径）
+        (should (equal (seshat-state-dirty-uids) '("uid-a")))
+        (should (equal (seshat-state-deleted-uids) '("uid-c")))
+        (should (= 7 (seshat-state-cursor)))))
+    (should (equal batched sequential))
+    ;; 索引内容逐项核对（墓碑与无路径条目都不进索引）
+    (should (equal (plist-get batched :paths)
+                   (list (cons (cons "notes" "a.org") "uid-a")
+                         (cons (cons "notes" "b.org") "uid-b"))))
+    (should (equal (plist-get batched :paths)
+                   (plist-get sequential :paths)))))
+
+(ert-deftest seshat-state-test-batch-nested-rebuilds-once ()
+  "嵌套批量（深度 2）只在最外层退出时重建一次索引。"
+  (seshat-state-test--with-temp-state
+    (seshat-state-load)
+    (let* ((captured
+            (seshat-state-test--count-rebuilds
+             (lambda ()
+               (seshat-state-batch
+                 (seshat-state-set "uid-a" (list :root "notes" :path "a.org"))
+                 (seshat-state-batch
+                   (should (= 2 seshat-state--batch-depth))
+                   (seshat-state-set "uid-b" (list :root "notes" :path "b.org")))
+                 ;; 内层退出后深度回到 1：索引仍未重建
+                 (should (= 1 seshat-state--batch-depth))
+                 (should-not (seshat-state-uid-for-path "notes" "b.org"))
+                 (seshat-state-set "uid-c" (list :root "notes" :path "c.org"))))))
+           (count (cdr captured)))
+      (should (= 1 count))
+      (should (= 0 seshat-state--batch-depth))
+      (should (equal (plist-get seshat-state--state :paths)
+                     (list (cons (cons "notes" "a.org") "uid-a")
+                           (cons (cons "notes" "b.org") "uid-b")
+                           (cons (cons "notes" "c.org") "uid-c")))))))
+
+(ert-deftest seshat-state-test-batch-error-still-rebuilds-once ()
+  "body 抛错时仍重建一次索引（`unwind-protect'），深度归零，状态不半残。"
+  (seshat-state-test--with-temp-state
+    (seshat-state-load)
+    (let* ((captured
+            (seshat-state-test--count-rebuilds
+             (lambda ()
+               (should-error
+                (seshat-state-batch
+                  (seshat-state-set "uid-a" (list :root "notes" :path "a.org"))
+                  (seshat-state-set "uid-b" (list :root "notes" :path "b.org"))
+                  (error "批内失败"))))))
+           (count (cdr captured)))
+      (should (= 1 count))
+      (should (= 0 seshat-state--batch-depth))
+      ;; 批内已写入的条目退出后可查到（索引被补齐，不是半残）
+      (should (equal (seshat-state-uid-for-path "notes" "a.org") "uid-a"))
+      (should (equal (seshat-state-uid-for-path "notes" "b.org") "uid-b"))
+      (should (= 2 (length (plist-get seshat-state--state :paths)))))))
+
+(ert-deftest seshat-state-test-batch-paths-stale-during-block ()
+  "批量期间 `:paths' 不更新：本批新写入的条目 `uid-for-path' 返回 nil，退出后可见。"
+  (seshat-state-test--with-temp-state
+    (seshat-state-set "uid-old" (list :root "notes" :path "old.org"))
+    (should (equal (seshat-state-uid-for-path "notes" "old.org") "uid-old"))
+    (let (inside-new inside-old inside-paths)
+      (seshat-state-batch
+        (seshat-state-set "uid-new" (list :root "notes" :path "new.org"))
+        (setq inside-paths (plist-get seshat-state--state :paths))
+        (setq inside-new (seshat-state-uid-for-path "notes" "new.org"))
+        (setq inside-old (seshat-state-uid-for-path "notes" "old.org")))
+      ;; 批内：新路径查不到；旧映射仍在（索引只是「没更新」，不是被清空）
+      (should-not inside-new)
+      (should (equal inside-old "uid-old"))
+      (should (equal inside-paths
+                     (list (cons (cons "notes" "old.org") "uid-old"))))
+      ;; 批后：新路径可见，索引含两条
+      (should (equal (seshat-state-uid-for-path "notes" "new.org") "uid-new"))
+      (should (equal (plist-get seshat-state--state :paths)
+                     (list (cons (cons "notes" "old.org") "uid-old")
+                           (cons (cons "notes" "new.org") "uid-new")))))))
+
+(ert-deftest seshat-state-test-batch-returns-last-body-value ()
+  "宏返回 BODY 最后一个表达式的值，且退出后深度恒为 0（含空 body）。"
+  (seshat-state-test--with-temp-state
+    (should (equal (seshat-state-batch "first" 'second) 'second))
+    (should (= 0 seshat-state--batch-depth))
+    (should (equal (seshat-state-batch 1 2 3) 3))
+    (should (= 0 seshat-state--batch-depth))
+    (should-not (seshat-state-batch))
+    (should (= 0 seshat-state--batch-depth))))
 
 (provide 'seshat-state-test)
 
