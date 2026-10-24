@@ -257,10 +257,10 @@ RESPONSE 是桩返回的 `(STATUS . BODY)'。用途：断言「零请求」以�
       (should (null (cdr result))))))
 
 (ert-deftest seshat-reading-test-resolve-broken-state ()
-  "状态库损坏（roots 空 + .bak 存在）→ `broken'。"
+  "状态库损坏（根为空 + 本次加载因损坏回退）→ `broken'。"
   (seshat-reading-test--with-env
-    (with-temp-file (concat seshat-state-file ".bak")
-      (insert "corrupt"))
+    (with-temp-file seshat-state-file
+      (insert "(这不是合法的状态 plist"))
     (let* ((file (seshat-reading-test--touch seshat-reading-test--root
                                              "book.pdf"))
            (identity (seshat-reading-test--resolve file)))
@@ -270,15 +270,50 @@ RESPONSE 是桩返回的 `(STATUS . BODY)'。用途：断言「零请求」以�
 (ert-deftest seshat-reading-test-resolve-broken-beats-external ()
   "`broken' 优先于 `external'：库外文件在状态库损坏时仍是 `broken'."
   (seshat-reading-test--with-env
-    ;; 故意不登记任何根（模拟损坏后的空状态），并留下 .bak
-    (with-temp-file (concat seshat-state-file ".bak")
-      (insert "corrupt"))
+    ;; 状态文件损坏 → 加载回退为空状态（roots 为空）且置位损坏标记
+    (with-temp-file seshat-state-file
+      (insert "(这不是合法的状态 plist"))
     (let* ((outside (seshat-reading-test--touch seshat-reading-test--dir
                                                 "outside.pdf"))
            (identity (seshat-reading-test--resolve outside)))
       (should (null (seshat-state-roots)))
       (should (eq (plist-get identity :state) 'broken))
       (should-not (eq (plist-get identity :state) 'external)))))
+
+(ert-deftest seshat-reading-test-resolve-stale-backup-is-not-broken ()
+  "旧损坏残留的 .bak + 合法空 roots → **不是** `broken'（长期误报的回归用例）.
+`.bak' 由 `seshat-state--backup-corrupt' 生成后从不清理，而「roots 为空」本身
+是合法状态（用户没配根）；用 `.bak' 是否存在做判据会让每个文件永久显示
+「状态异常」。判据必须是「本次加载确实因损坏回退过」。"
+  (seshat-reading-test--with-env
+    ;; 只有旧备份残留，状态文件本身不存在 → 本次加载是「文件不存在 → 空状态」
+    (with-temp-file (concat seshat-state-file ".bak")
+      (insert "corrupt"))
+    (let* ((outside (seshat-reading-test--touch seshat-reading-test--dir
+                                                "outside.pdf"))
+           (identity (seshat-reading-test--resolve outside)))
+      (should (null (seshat-state-roots)))
+      (should-not seshat-state--load-was-corrupt)
+      (should (eq (plist-get identity :state) 'external))
+      (should-not (eq (plist-get identity :state) 'broken)))))
+
+(ert-deftest seshat-reading-test-resolve-broken-flag-reset-by-next-load ()
+  "损坏标记由下一次 `seshat-state-load' 清零：修好状态文件后不再报 `broken'."
+  (seshat-reading-test--with-env
+    (let ((file (seshat-reading-test--touch seshat-reading-test--root
+                                            "book.pdf")))
+      ;; 第一次：坏文件 → broken
+      (with-temp-file seshat-state-file
+        (insert "(这不是合法的状态 plist"))
+      (should (eq (plist-get (seshat-reading--resolve file) :state) 'broken))
+      ;; 第二次：重新写一份合法状态（含根）→ 不再是 broken
+      (seshat-state-set-roots
+       (list (list "lib" seshat-reading-test--root "mirror")))
+      (seshat-state-save)
+      (setq seshat-state--state nil)
+      (let ((identity (seshat-reading--resolve file)))
+        (should-not seshat-state--load-was-corrupt)
+        (should (eq (plist-get identity :state) 'unregistered))))))
 
 (ert-deftest seshat-reading-test-resolve-error-degrades-to-external ()
   "`--resolve' 内部抛错 → 降级为 `external'，不向外抛错，警告只发一次."
@@ -318,10 +353,10 @@ RESPONSE 是桩返回的 `(STATUS . BODY)'。用途：断言「零请求」以�
         (should (equal (seshat-reading-test--mode-line other) " [未入库]")))
       ;; external
       (should (equal (seshat-reading-test--mode-line outside) " [库外]"))
-      ;; broken：清空状态 + 留下 .bak
-      (setq seshat-state--state (seshat-state--empty))
-      (with-temp-file (concat seshat-state-file ".bak")
-        (insert "corrupt"))
+      ;; broken：状态文件损坏 → 本次加载回退为空状态
+      (setq seshat-state--state nil)
+      (with-temp-file seshat-state-file
+        (insert "(这不是合法的状态 plist"))
       (should (equal (seshat-reading-test--mode-line outside) " [状态异常]")))))
 
 (ert-deftest seshat-reading-test-mode-line-entry-is-idempotent ()
@@ -718,50 +753,79 @@ BODY 之内）。"
             (should (= 0 (length seshat-reading-test--uploads)))))))))
 
 (ert-deftest seshat-reading-test-library-add-conflict-then-overwrite ()
-  "412 → 用户同意覆盖 → 用 `:if-match' 带远端版本号重发并成功."
+  "412 → 用户同意覆盖 → 取远端**内容 ETag** 作 `:if-match' 重发并成功."
   (seshat-reading-test--with-env
     (seshat-reading-test--register-root)
     (let ((source (seshat-reading-test--touch seshat-reading-test--dir
                                               "outside.pdf")))
-      (seshat-reading-test--with-upload-stub
-          (list (list :status 412 :conflict 'etag-mismatch)
-                (list :status 200 :uid "UID-2" :etag "E2"))
-        (cl-letf (((symbol-function 'seshat-rest-versions)
-                   (lambda (_path &optional _blob)
-                     (list :status 200 :head "HEAD-ONE" :content nil)))
-                  ((symbol-function 'y-or-n-p) (lambda (&rest _args) t)))
-          (seshat-reading-test--with-reading-buffer source
-            (should (equal (plist-get (seshat-library-add source "lib" "book.pdf")
-                                      :uid)
-                           "UID-2"))))
-        (should (= 2 (length seshat-reading-test--uploads)))
-        (let ((first (nth 0 seshat-reading-test--uploads))
-              (second (nth 1 seshat-reading-test--uploads)))
-          (should (equal (plist-get (plist-get first :args) :if-none-match) "*"))
-          (should (equal (plist-get (plist-get second :args) :if-match)
-                         "HEAD-ONE")))
+      (let ((downloads 0))
+        (seshat-reading-test--with-upload-stub
+            (list (list :status 412 :conflict 'etag-mismatch)
+                  (list :status 200 :uid "UID-2" :etag "E2"))
+          (cl-letf (((symbol-function 'seshat-rest-download-file)
+                     (lambda (_path target &rest _args)
+                       (setq downloads (1+ downloads))
+                       (with-temp-file target (insert "%PDF-remote\n"))
+                       (list :status 200 :etag "\"ETAG-REMOTE\"")))
+                    ((symbol-function 'y-or-n-p) (lambda (&rest _args) t)))
+            (seshat-reading-test--with-reading-buffer source
+              (should (equal (plist-get (seshat-library-add source "lib"
+                                                            "book.pdf")
+                                        :uid)
+                             "UID-2"))))
+          (should (= 1 downloads))
+          (should (= 2 (length seshat-reading-test--uploads)))
+          (let ((first (nth 0 seshat-reading-test--uploads))
+                (second (nth 1 seshat-reading-test--uploads)))
+            (should (equal (plist-get (plist-get first :args) :if-none-match) "*"))
+            ;; 条件写令牌必须是**内容 ETag**，不是 `seshat-rest-versions' 的
+            ;; `:head'（提交 hash，用它做 If-Match 会永远 412）。
+            (should (equal (plist-get (plist-get second :args) :if-match)
+                           "\"ETAG-REMOTE\""))))
         (should (equal (seshat-state-uid-for-path "lib" "book.pdf") "UID-2"))
         (should (equal (plist-get (seshat-state-get "UID-2") :base-blob)
                        "E2"))))))
 
 (ert-deftest seshat-reading-test-library-add-conflict-declined-keeps-state ()
-  "412 → 用户拒绝覆盖 → 中止且不写 state，也不重发上传."
+  "412 → 用户拒绝覆盖 → 中止、不取 ETag、不重发上传、不写 state."
+  (seshat-reading-test--with-env
+    (seshat-reading-test--register-root)
+    (let ((source (seshat-reading-test--touch seshat-reading-test--dir
+                                              "outside.pdf")))
+      (let ((downloads 0))
+        (seshat-reading-test--with-upload-stub
+            (list (list :status 412 :conflict 'etag-mismatch))
+          (cl-letf (((symbol-function 'seshat-rest-download-file)
+                     (lambda (&rest _args) (setq downloads (1+ downloads)) nil))
+                    ((symbol-function 'y-or-n-p) (lambda (&rest _args) nil)))
+            (seshat-reading-test--with-reading-buffer source
+              (should-error (seshat-library-add source "lib" "book.pdf")
+                            :type 'user-error)))
+          (should (= 0 downloads))
+          (should (= 1 (length seshat-reading-test--uploads))))
+        (should (null (seshat-state-uid-for-path "lib" "book.pdf")))
+        (should-not (file-exists-p seshat-state-file))))))
+
+(ert-deftest seshat-reading-test-library-add-conflict-without-etag-aborts ()
+  "412 → 同意覆盖但远端未返回 ETag → `user-error'，绝不用猜测值重发."
   (seshat-reading-test--with-env
     (seshat-reading-test--register-root)
     (let ((source (seshat-reading-test--touch seshat-reading-test--dir
                                               "outside.pdf")))
       (seshat-reading-test--with-upload-stub
           (list (list :status 412 :conflict 'etag-mismatch))
-        (cl-letf (((symbol-function 'seshat-rest-versions)
-                   (lambda (_path &optional _blob)
-                     (list :status 200 :head "HEAD-ONE" :content nil)))
-                  ((symbol-function 'y-or-n-p) (lambda (&rest _args) nil)))
+        (cl-letf (((symbol-function 'seshat-rest-download-file)
+                   (lambda (_path target &rest _args)
+                     (with-temp-file target (insert "remote"))
+                     (list :status 200 :etag nil)))
+                  ((symbol-function 'y-or-n-p) (lambda (&rest _args) t)))
           (seshat-reading-test--with-reading-buffer source
-            (should-error (seshat-library-add source "lib" "book.pdf")
-                          :type 'user-error)))
+            (let ((err (should-error (seshat-library-add source "lib"
+                                                         "book.pdf")
+                                     :type 'user-error)))
+              (should (string-match-p "ETag" (error-message-string err))))))
         (should (= 1 (length seshat-reading-test--uploads)))
-        (should (null (seshat-state-uid-for-path "lib" "book.pdf")))
-        (should-not (file-exists-p seshat-state-file))))))
+        (should (null (seshat-state-uid-for-path "lib" "book.pdf")))))))
 
 (ert-deftest seshat-reading-test-library-add-upload-failure-keeps-copy ()
   "上传失败（500）→ `user-error'，副本按用户选择保留，state 未登记."
@@ -849,6 +913,248 @@ BODY 之内）。"
               (should (string-match-p "seshat-reader-mode"
                                       (error-message-string err))))
             (should (= 0 (length seshat-reading-test--uploads)))))))))
+
+;;; 写入路径：临时文件 + `rename-file'（不穿透软链）
+
+(ert-deftest seshat-reading-test-library-add-overwrites-existing-target-via-rename ()
+  "目标已存在且用户同意覆盖 → `rename-file' 替换旧内容，不留临时文件."
+  (seshat-reading-test--with-env
+    (seshat-reading-test--register-root)
+    (let* ((source (seshat-reading-test--touch seshat-reading-test--dir
+                                               "outside.pdf"))
+           (target (expand-file-name "book.pdf" seshat-reading-test--root)))
+      (with-temp-file target (insert "OLD-CONTENT"))
+      (seshat-reading-test--with-upload-stub
+          (list (list :status 201 :uid "UID-OW" :etag "E-OW"))
+        (seshat-reading-test--with-reading-buffer source
+          (seshat-reading-test--with-y-or-n t
+            (should (equal (plist-get (seshat-library-add source "lib"
+                                                          "book.pdf")
+                                      :uid)
+                           "UID-OW"))))
+        (should (equal (seshat-reading-test--contents target)
+                       (seshat-reading-test--contents source)))
+        ;; 同目录临时文件必须被清干净（只剩目标文件本身）
+        (should (equal (directory-files seshat-reading-test--root nil
+                                        "\\`seshat-add-")
+                       nil))))))
+
+;;; T5：真实 mode 体（父 mode 先跑、`setq-local'、渲染状态守卫）
+
+;; 父 mode 用原生模块渲染文档，batch 下不可用；测试把它桩替掉，但**让派生
+;; mode 的生成体照常运行**（既有的 `--with-reading-buffer' 直接 `setq
+;; major-mode'，mode 体零覆盖）。
+(defvar seshat-reader-current-doc-render-status)
+
+(defmacro seshat-reading-test--with-stubbed-reader-mode (render-status &rest body)
+  "把父 mode `seshat-reader-mode' 桩替为 no-op 并预设渲染状态，再执行 BODY.
+RENDER-STATUS 是桩替的父 mode 为当前 buffer 设置的
+`seshat-reader-current-doc-render-status' 值：t 表示父 mode 渲染成功（真实
+reader 只有成功渲染后才置位），nil 表示失败/未渲染。"
+  (declare (indent 1) (debug t))
+  `(cl-letf (((symbol-function 'seshat-reader-mode)
+              (lambda (&rest _args)
+                (setq-local seshat-reader-current-doc-render-status
+                            ,render-status))))
+     ,@body))
+
+(ert-deftest seshat-reading-test-mode-body-applies-identity-after-render ()
+  "真实调用 `seshat-reading-mode'（父 mode 渲染成功）→ major-mode / 静音标记 / 身份都就位."
+  (seshat-reading-test--with-env
+    (seshat-reading-test--register-root)
+    (let ((file (seshat-reading-test--touch seshat-reading-test--root
+                                            "book.pdf")))
+      (let (mode quiet identity)
+        (seshat-reading-test--with-stubbed-reader-mode t
+          (with-temp-buffer
+            (setq buffer-file-name file)
+            (seshat-reading-mode)
+            (setq mode major-mode
+                  quiet seshat-reading--quiet-fallback
+                  identity seshat-reading--identity)))
+        (should (eq mode 'seshat-reading-mode))
+        (should (eq quiet t))
+        (should identity)
+        (should (eq (plist-get identity :state) 'unregistered))
+        (should (equal (plist-get identity :root) "lib"))))))
+
+(ert-deftest seshat-reading-test-mode-body-installs-mode-line-entry ()
+  "真实调用 `seshat-reading-mode' 后 mode-line 条目已装入 `mode-line-misc-info'."
+  (seshat-reading-test--with-env
+    (seshat-reading-test--register-root)
+    (let ((file (seshat-reading-test--touch seshat-reading-test--root
+                                            "book.pdf")))
+      (let (misc text)
+        (seshat-reading-test--with-stubbed-reader-mode t
+          (with-temp-buffer
+            (setq buffer-file-name file)
+            (seshat-reading-mode)
+            (setq misc mode-line-misc-info)
+            (setq text (eval (nth 1 seshat-reading--mode-line-entry) t))))
+        (should (member seshat-reading--mode-line-entry misc))
+        (should (equal text " [未入库]"))))))
+
+(ert-deftest seshat-reading-test-mode-body-skips-when-parent-did-not-render ()
+  "父 mode 未渲染（render-status 为 nil）→ 不设静音标记、不解析身份."
+  (seshat-reading-test--with-env
+    (seshat-reading-test--register-root)
+    (let ((file (seshat-reading-test--touch seshat-reading-test--root
+                                            "book.pdf")))
+      (seshat-reading-test--with-stubbed-reader-mode nil
+        (with-temp-buffer
+          (setq buffer-file-name file)
+          (seshat-reading-mode)
+          (should (eq major-mode 'seshat-reading-mode))
+          (should-not (bound-and-true-p seshat-reading--quiet-fallback))
+          (should-not (bound-and-true-p seshat-reading--identity))
+          (should-not (member seshat-reading--mode-line-entry
+                              mode-line-misc-info)))))))
+
+(ert-deftest seshat-reading-test-mode-body-does-not-pollute-buffer-after-kill ()
+  "父 mode 在文件非法时 `kill-buffer' → mode 体不得污染**切换后**的 buffer.
+这是「不污染」的核心用例：`kill-buffer' 之后 `current-buffer' 已是另一个
+buffer，`(buffer-live-p (current-buffer))' 恒为真，旧守卫因此完全失效。"
+  (seshat-reading-test--with-env
+    (seshat-reading-test--register-root)
+    (let ((file (seshat-reading-test--touch seshat-reading-test--root
+                                            "book.pdf"))
+          (victim (generate-new-buffer " *seshat-reading-victim*"))
+          active)
+      (unwind-protect
+          (progn
+            (with-current-buffer victim
+              (setq buffer-file-name file)
+              (cl-letf (((symbol-function 'seshat-reader-mode)
+                         (lambda (&rest _args)
+                           ;; 真实父 mode 的行为：kill 掉自己，current-buffer
+                           ;; 随后变成别的 buffer。
+                           (kill-buffer (current-buffer))
+                           (setq active (current-buffer)))))
+                (seshat-reading-mode)))
+            (should (buffer-live-p active))
+            (should-not (eq active victim))
+            (with-current-buffer active
+              (should-not (bound-and-true-p seshat-reading--quiet-fallback))
+              (should-not (bound-and-true-p seshat-reading--identity))
+              (should-not (member seshat-reading--mode-line-entry
+                                  mode-line-misc-info))))
+        (when (buffer-live-p victim) (kill-buffer victim))))))
+
+;;; T6：符号链接对抗（`--target-path' 的 truename 复核）
+
+(ert-deftest seshat-reading-test-library-add-rejects-symlink-to-outside-file ()
+  "根内软链指向**根外已存在文件** → 拒绝，且根外文件内容未被改写."
+  (seshat-reading-test--with-env
+    (seshat-reading-test--register-root)
+    (let* ((source (seshat-reading-test--touch seshat-reading-test--dir
+                                               "outside.pdf"))
+           (outside (expand-file-name "secret.txt" seshat-reading-test--dir))
+           (link (expand-file-name "evil.pdf" seshat-reading-test--root)))
+      (with-temp-file outside (insert "ORIGINAL"))
+      (make-symbolic-link outside link)
+      (unwind-protect
+          (progn
+            (seshat-reading-test--with-upload-stub nil
+              (seshat-reading-test--with-reading-buffer source
+                (seshat-reading-test--with-y-or-n t
+                  (let ((err (should-error (seshat-library-add source "lib"
+                                                               "evil.pdf")
+                                           :type 'user-error)))
+                    (should (string-match-p "越出根目录"
+                                            (error-message-string err))))
+                  (should (= 0 (length seshat-reading-test--uploads))))))
+            (should (equal (seshat-reading-test--contents outside) "ORIGINAL")))
+        (ignore-errors (delete-file link))))))
+
+(ert-deftest seshat-reading-test-library-add-rejects-symlink-to-outside-dir ()
+  "根内软链指向**根外目录** → 拒绝，且根外目录里未新建文件."
+  (seshat-reading-test--with-env
+    (seshat-reading-test--register-root)
+    (let* ((source (seshat-reading-test--touch seshat-reading-test--dir
+                                               "outside.pdf"))
+           (outside-dir (file-name-as-directory
+                         (expand-file-name "external" seshat-reading-test--dir)))
+           (link (expand-file-name "books" seshat-reading-test--root)))
+      (make-directory outside-dir t)
+      (make-symbolic-link outside-dir link)
+      (unwind-protect
+          (progn
+            (seshat-reading-test--with-upload-stub nil
+              (seshat-reading-test--with-reading-buffer source
+                (seshat-reading-test--with-y-or-n t
+                  (should-error (seshat-library-add source "lib"
+                                                    "books/book.pdf")
+                                :type 'user-error)
+                  (should (= 0 (length seshat-reading-test--uploads))))))
+            (should-not (file-exists-p (expand-file-name "book.pdf"
+                                                         outside-dir)))
+            (should (null (directory-files outside-dir nil "\\`[^.]"))))
+        (ignore-errors (delete-file link))))))
+
+(ert-deftest seshat-reading-test-library-add-rejects-dangling-symlink ()
+  "根内**悬空**软链（指向不存在的根外路径）→ 拒绝，且根外路径未被创建."
+  (seshat-reading-test--with-env
+    (seshat-reading-test--register-root)
+    (let* ((source (seshat-reading-test--touch seshat-reading-test--dir
+                                               "outside.pdf"))
+           (phantom (expand-file-name "phantom.pdf" seshat-reading-test--dir))
+           (link (expand-file-name "dangling.pdf" seshat-reading-test--root)))
+      (should-not (file-exists-p phantom))
+      (make-symbolic-link phantom link)
+      (unwind-protect
+          (progn
+            (seshat-reading-test--with-upload-stub nil
+              (seshat-reading-test--with-reading-buffer source
+                (seshat-reading-test--with-y-or-n t
+                  (should-error (seshat-library-add source "lib"
+                                                    "dangling.pdf")
+                                :type 'user-error)
+                  (should (= 0 (length seshat-reading-test--uploads))))))
+            (should-not (file-exists-p phantom))
+            ;; 悬空链本身也必须还在（说明是「拒绝」而不是「就地覆盖软链」）
+            (should (file-symlink-p link)))
+        (ignore-errors (delete-file link))))))
+
+(ert-deftest seshat-reading-test-library-add-accepts-real-subdirectory ()
+  "正常的根内**实体**子目录 → 仍能入库（防过度收紧的回归）."
+  (seshat-reading-test--with-env
+    (seshat-reading-test--register-root)
+    (let* ((source (seshat-reading-test--touch seshat-reading-test--dir
+                                               "outside.pdf"))
+           (sub (file-name-as-directory
+                 (expand-file-name "sub" seshat-reading-test--root))))
+      (make-directory sub t)
+      (seshat-reading-test--with-upload-stub
+          (list (list :status 201 :uid "UID-SUB" :etag "E-SUB"))
+        (seshat-reading-test--with-reading-buffer source
+          (seshat-reading-test--with-y-or-n t
+            (should (equal (plist-get (seshat-library-add source "lib"
+                                                          "sub/book.pdf")
+                                      :uid)
+                           "UID-SUB"))))
+        (should (file-exists-p (expand-file-name "book.pdf" sub)))
+        (should (equal (seshat-state-uid-for-path "lib" "sub/book.pdf")
+                       "UID-SUB"))))))
+
+(ert-deftest seshat-reading-test-library-add-rejects-malformed-rel ()
+  "末尾斜杠 / 连续斜杠 / 归一后等于 `.` 的 REL 一律拒绝."
+  (seshat-reading-test--with-env
+    (seshat-reading-test--register-root)
+    (let ((source (seshat-reading-test--touch seshat-reading-test--dir
+                                              "outside.pdf")))
+      (dolist (rel '("books/" "." "a//b"))
+        (seshat-reading-test--with-upload-stub nil
+          (seshat-reading-test--with-reading-buffer source
+            (seshat-reading-test--with-y-or-n t
+              (let ((err (should-error (seshat-library-add source "lib" rel)
+                                       :type 'user-error)))
+                (should (string-match-p "越出根目录"
+                                        (error-message-string err))))
+              (should (= 0 (length seshat-reading-test--uploads)))))))
+      (should-not (file-exists-p (expand-file-name "books"
+                                                   seshat-reading-test--root)))
+      (should-not (file-exists-p (expand-file-name "a"
+                                                   seshat-reading-test--root))))))
 
 (provide 'seshat-reading-test)
 ;;; seshat-reading-test.el ends here

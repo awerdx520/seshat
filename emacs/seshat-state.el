@@ -258,6 +258,9 @@ O(n) 重建。
 
 ;;; 加载与保存
 
+(defvar seshat-state--load-was-corrupt nil
+  "最近一次 `seshat-state-load' 是否因文件损坏而回退为空状态.")
+
 (defun seshat-state--warn (message &rest args)
   "以 `seshat-state' 类型发出一级警告.
 MESSAGE 与 ARGS 交给 `format'。抽成函数只为让测试能统一桩替
@@ -312,6 +315,7 @@ MESSAGE 与 ARGS 交给 `format'。抽成函数只为让测试能统一桩替
 - 内容无法读取或解析（含顶层值不是 plist）→ 空状态 + 警告，并把坏文件
   **改名**为 \"<FILE>.bak\"（不静默删除，便于事后排查）；
 - `:paths' 与 `:uids' 不一致 → 以 `seshat-state--rebuild-paths' 重建 + 警告。"
+  (setq seshat-state--load-was-corrupt nil)
   (let* ((file seshat-state-file)
          (state (if (not (file-exists-p file))
                     (seshat-state--empty)
@@ -319,6 +323,7 @@ MESSAGE 与 ARGS 交给 `format'。抽成函数只为让测试能统一桩替
                       (seshat-state--load-file file)
                     (error
                      (seshat-state--backup-corrupt file)
+                     (setq seshat-state--load-was-corrupt t)
                      (seshat-state--warn "状态文件 %s 无法解析（%s），已改名为 %s.bak，按空状态继续"
                                          file (error-message-string err) file)
                      (seshat-state--empty))))))

@@ -145,14 +145,18 @@ FILE 先经 `expand-file-name' 与 `file-truename' 归一；根目录取自
 
 (defun seshat-reading--state-broken-p ()
   "判断同步状态库是否处于「损坏后的空状态」.
-判据是 `(seshat-state-roots)' 为空**且**状态文件旁存在 \"<FILE>.bak\"——
-`seshat-state-load' 只在坏文件无法解析（或索引校验失败）时把文件改名为
-.bak，因此这是可靠信号。
+判据是 `(seshat-state-roots)' 为空**且** `seshat-state--load-was-corrupt'
+为 t（最近一次 `seshat-state-load' 因文件损坏回退到了空状态）。
+
+**不看 \"<FILE>.bak\" 是否残留**：`.bak` 由 `seshat-state--backup-corrupt'
+生成后从不清理，而「roots 为空」本身是合法状态（用户没配根），两者相与会
+让一份旧损坏残留永久污染判定——每个文件都显示「状态异常」。
 
 调用本函数会经 `seshat-state-roots' 触发一次惰性加载（磁盘读，通常几十
-毫秒；坏文件在此被改名成 .bak），此后都是内存查表。"
-  (and (null (seshat-state-roots))
-       (file-exists-p (concat seshat-state-file ".bak"))))
+毫秒；坏文件在此被改名成 .bak 并置位 `seshat-state--load-was-corrupt'），
+此后都是内存查表。"
+  (seshat-state-roots)                 ; 触发惰性加载（若尚未加载）
+  (and (null (seshat-state-roots)) seshat-state--load-was-corrupt))
 
 (defun seshat-reading--resolve (file)
   "解析 FILE 的库身份，返回 `(:state SYM :uid UID :root TAG :rel PATH)'.
@@ -254,6 +258,13 @@ FILE 先经 `expand-file-name' 与 `file-truename' 归一；根目录取自
 
 ;;; 入库（显式动作：复制上传，保留原件）
 
+(defcustom seshat-library-add-max-bytes (* 32 1024 1024)
+  "`seshat-library-add' 允许入库的单个文件上限（字节）。
+默认与服务端 `PUT /api/files' 的 32 MiB 上限对齐——超过这个值上传必然失败，
+提前拒绝可避免无谓的复制与内存峰值。"
+  :type 'integer
+  :group 'seshat-reading)
+
 (defun seshat-reading--file-buffer (file)
   "返回访问 FILE 的 buffer；没有时返回 nil.
 先看当前 buffer 是否正访问 FILE（`file-equal-p'，避免临时 buffer 与
@@ -297,24 +308,57 @@ FILE 先经 `expand-file-name' 与 `file-truename' 归一；根目录取自
 
 (defun seshat-reading--target-path (dir rel)
   "把库内相对路径 REL 拼到根目录 DIR 下并做越界校验，返回绝对路径或 nil.
-拒绝绝对路径、以 \"~\" 开头（`expand-file-name' 会展开成家目录）、Windows
-盘符前缀，以及任何含 `..' 路径段的 REL。校验优先复用
-`seshat-sync--local-path'（软依赖：本模块不 `require' `seshat-sync'，那是
-同步引擎的上层，且加载它只为这一次校验并不划算），不可用时退回本函数自行
-做的 `expand-file-name' + 前缀比较。"
+拒绝：绝对路径、以 \"~\" 开头（`expand-file-name' 会展开成家目录）、Windows
+盘符前缀、含 `..' 路径段的 REL、以 \"/\" 结尾（`directory-name-p'）、含连续
+斜杠、归一后等于 \".\" 的 REL，以及解析后落在 DIR 之外（含**符号链接逃逸**）
+或指向 DIR 内已存在目录的目标。
+
+越界校验在本模块**内联实现**，不软依赖 `seshat-sync--local-path'：本文件
+顶层只 require reader/state/rest，默认不加载 `seshat-sync'，`fboundp' 分支
+会让典型路径（新会话 → `find-file' PDF → 入库）走到**没有 `file-truename'
+复核**的回退分支上，于是根内软链（`evil -> ~/.ssh/authorized_keys'、
+`books -> /home/u/Documents'、悬空链）就能让复制写穿到根外；悬空链时
+`file-exists-p' 还返回 nil，连覆盖确认都不会弹。两套口径并存也必然漂移，
+故统一走内联实现。
+
+`file-truename' 对不存在的路径同样有效（解析已存在的祖先、其余原样保留）；
+它出错时按「不安全」处理，失败方向安全。"
   (when (and (stringp rel)
              (not (string-empty-p rel))
              (not (string-prefix-p "/" rel))
              (not (string-prefix-p "~" rel))
              (not (string-match-p "\\`[A-Za-z]:" rel))
-             (not (string-match-p "\\(?:\\`\\|/\\)\\.\\.\\(?:/\\|\\'\\)" rel)))
-    (let ((path (if (fboundp 'seshat-sync--local-path)
-                    (funcall 'seshat-sync--local-path dir rel)
-                  (expand-file-name rel dir))))
-      (when (and (stringp path) (not (string-empty-p path)))
-        (let ((prefix (file-name-as-directory (expand-file-name dir))))
-          (when (string-prefix-p prefix (expand-file-name path))
-            path))))))
+             (not (string-match-p "\\(?:\\`\\|/\\)\\.\\.\\(?:/\\|\\'\\)" rel))
+             (not (directory-name-p rel))
+             (not (string-match-p "/\\{2,\\}" rel))
+             (not (equal "." (file-name-nondirectory
+                              (directory-file-name rel)))))
+    (let* ((dir* (file-name-as-directory (expand-file-name dir)))
+           (expanded (expand-file-name rel dir*))
+           (true-dir (ignore-errors
+                       (file-name-as-directory (file-truename dir*))))
+           (true-file (ignore-errors (file-truename expanded))))
+      (when (and (string-prefix-p dir* expanded)
+                 true-dir true-file
+                 (string-prefix-p true-dir true-file)
+                 (not (file-directory-p expanded)))
+        expanded))))
+
+(defun seshat-reading--write-copy (source target)
+  "把 SOURCE 的字节复制到 TARGET（同目录临时文件 + `rename-file' 替换）.
+**不做 `copy-file' 直写 TARGET**：`rename(2)' 替换的是 TARGET 这个目录项
+本身，因此 TARGET 若是指向根外的符号链接（含悬空链，此时 `file-exists-p'
+为 nil）只会被替换掉，不会穿透到链接目标去覆盖根外文件。临时文件建在
+TARGET 同目录，保证 `rename-file' 是同一文件系统内的原子替换；中途出错时
+临时文件被删除。"
+  (let* ((temporary-file-directory (file-name-directory target))
+         (tmp (make-temp-file "seshat-add-" nil ".tmp")))
+    (unwind-protect
+        (progn
+          (copy-file source tmp t)
+          (rename-file tmp target t))
+      (when (file-exists-p tmp)
+        (ignore-errors (delete-file tmp))))))
 
 (defun seshat-reading--file-contents (file)
   "读取 FILE 的全部内容并返回字符串（**二进制安全**）.
@@ -362,10 +406,32 @@ BUFFER 不存活时什么也不做，返回解析出的身份 plist（或 nil）
         (message "Seshat: 已删除副本 %s" target))
     (message "Seshat: 已保留副本 %s（原件未被改动）" target)))
 
+(defun seshat-reading--remote-etag (tag rel)
+  "取远端 `TAG:REL' 当前内容 blob 的 ETag（**条件写令牌**），取不到就 `user-error'.
+做法是一次 `seshat-rest-download-file' 到系统临时目录，只读响应头 `:etag'，
+读完立刻删除临时文件（不解析内容、不碰任何本地文件）。
+
+**不能用 `seshat-rest-versions' 的 `:head'**：`:head' 是最近一次 commit 的
+hash，而 `If-Match' 比对的是**内容 blob hash**——用提交 hash 做条件写会永远
+412（见 `seshat-sync.el' 对 `:rev' / `:etag' 的说明）。"
+  (let ((probe-file (make-temp-file "seshat-probe-" nil ".tmp")))
+    (unwind-protect
+        (let ((probe (seshat-rest-download-file rel probe-file :root tag)))
+          (unless (seshat-rest--2xx-p (plist-get probe :status))
+            (user-error "Seshat: 取远端 %s 的 ETag 失败（HTTP %s）"
+                        rel (plist-get probe :status)))
+          (let ((etag (plist-get probe :etag)))
+            (unless (and (stringp etag) (not (string-empty-p etag)))
+              (user-error "Seshat: 远端未返回 ETag，未覆盖 %s" rel))
+            etag))
+      (when (file-exists-p probe-file)
+        (ignore-errors (delete-file probe-file))))))
+
 (defun seshat-reading--upload-new-entry (tag rel target)
   "把 TARGET 的内容按 REL 上传到根 TAG（仅允许创建），返回登记的 uid.
 条件写用 `:if-none-match' \"*\"（远端已有同名文件 → 412）；412 时询问是否
-用远端版本号覆盖（`seshat-rest-versions' 取 `:head' 作 `:if-match' 重发）。
+覆盖，同意后先用 `seshat-reading--remote-etag' 取**内容 ETag** 再以
+`:if-match' 重发（取不到 ETag 就中止，不猜测）。
 403（只读根）、其它非 2xx、以及上传后缺 uid 的情形都 `user-error'，并把
 「副本去留」交给 `seshat-reading--drop-copy-maybe'（由调用方统一处理）。
 成功返回 `(UID . ETAG)'。"
@@ -375,14 +441,11 @@ BUFFER 不存活时什么也不做，返回解析出的身份 plist（或 nil）
                     rel content :root tag :if-none-match "*"))
     (when (eq (plist-get response :status) 412)
       (if (not (y-or-n-p
-                "Seshat: 服务端已有同名文件，是否用远端版本号覆盖？"))
+                "Seshat: 服务端已有同名文件，是否用远端内容版本覆盖？"))
           (user-error "Seshat: 已取消入库（远端已有同名文件，未覆盖）")
-        (let* ((versions (seshat-rest-versions rel))
-               (head (plist-get versions :head)))
-          (unless (and (stringp head) (not (string-empty-p head)))
-            (user-error "Seshat: 取远端版本号失败，未覆盖 %s" rel))
+        (let ((etag (seshat-reading--remote-etag tag rel)))
           (setq response (seshat-rest-upload-file
-                          rel content :root tag :if-match head)))))
+                          rel content :root tag :if-match etag)))))
     (let ((status (plist-get response :status)))
       (cond
        ((memq status '(200 201))
@@ -407,13 +470,16 @@ BUFFER 不存活时什么也不做，返回解析出的身份 plist（或 nil）
 1. FILE 必须是受支持格式，且正被 `seshat-reader-mode' / `seshat-reading-mode'
    的 buffer 访问；否则 `user-error'；
 2. 已在库中（本地状态解析为 `library'）→ `user-error'（含 uid）；
-3. 校验 REL 未越出根目录 → `make-directory' 递归建父目录；
+3. 校验 REL 未越出根目录（含符号链接逃逸、末尾斜杠、连续斜杠、`.`）→
+   `make-directory' 递归建父目录；
 4. 目标已存在时 `y-or-n-p' 确认覆盖，拒绝则中止（不写任何状态）；
-5. `copy-file' 复制到目标（**保留原件**，用户自行管理）；
+5. `seshat-reading--write-copy' 把原件复制到目标（同目录临时文件 +
+   `rename-file'，**保留原件**、不穿透目标处的软链）；
 6. 读取目标内容（二进制安全）后 `seshat-rest-upload-file'
    `:if-none-match' \"*\"：2xx → 登记 uid + base blob（size/mtime **取自
    复制后的目标文件**）+ 落盘 → 刷新 mode-line 为 ` [库]'；412 → 询问是否
-   用远端版本号覆盖，同意则 `:if-match' 重发；403 / 其它 → `user-error'；
+   覆盖，同意则取远端**内容 ETag** 以 `:if-match' 重发；403 / 其它 →
+   `user-error'；
 7. 上传失败时询问是否删除已复制的副本（默认保留并给出路径）。
 
 返回新登记的 `(:uid UID :root TAG :rel REL :target PATH)'；中止或失败按上述
@@ -423,6 +489,12 @@ BUFFER 不存活时什么也不做，返回解析出的身份 plist（或 nil）
   (let ((file-buffer (seshat-reading--file-buffer file)))
     (unless (and (stringp file) (file-exists-p file))
       (user-error "Seshat: 找不到文件 %s" file))
+    (unless (file-regular-p file)
+      (user-error "Seshat: %s 不是常规文件" file))
+    (let ((size (nth 7 (file-attributes file))))
+      (when (and (numberp size) (> size seshat-library-add-max-bytes))
+        (user-error "Seshat: %s 超过入库上限（%d 字节）"
+                    file seshat-library-add-max-bytes)))
     (unless (member (downcase (or (file-name-extension file) ""))
                     seshat-reader-supported-formats)
       (user-error "Seshat: %s 不是受支持的文档格式" file))
@@ -457,7 +529,7 @@ BUFFER 不存活时什么也不做，返回解析出的身份 plist（或 nil）
         (unless (y-or-n-p (format "Seshat: %s 已存在，是否覆盖？" target))
           (user-error "Seshat: 已取消（目标已存在）")))
       (make-directory (file-name-directory target) t)
-      (copy-file file target t)
+      (seshat-reading--write-copy file target)
       (let ((registered
              (condition-case err
                  (seshat-reading--upload-new-entry tag rel* target)
@@ -489,11 +561,20 @@ BUFFER 不存活时什么也不做，返回解析出的身份 plist（或 nil）
 mode 体不做任何 I/O 循环与网络请求：首次 `seshat-state-load' 是唯一一次
 磁盘读（通常几十毫秒），此后都是内存查表。
 
+mode 体只在**父 mode 正常渲染完成**后才动手（判据是父 mode 设的
+`seshat-reader-current-doc-render-status'）：文件非法时父 mode 会
+`kill-buffer'，此后 `current-buffer' 已切到另一个 buffer，用
+`buffer-live-p' 检查恒为真，会把 `mode-line-misc-info' 与静音标记污染到
+无关 buffer 上。
+
 Keybindings:
 \\{seshat-reading-mode-map}"
   :group 'seshat-reading
-  (setq-local seshat-reading--quiet-fallback t)
-  (when (buffer-live-p (current-buffer))
+  ;; 父 mode 在文件非法时会 kill-buffer，此时 current-buffer 已切换，
+  ;; `buffer-live-p' 检查无效。改用它是否成功渲染作判据：只有正常完成
+  ;; 的 reader buffer 才有 render-status。
+  (when (bound-and-true-p seshat-reader-current-doc-render-status)
+    (setq-local seshat-reading--quiet-fallback t)
     (seshat-reading--apply-identity)))
 
 ;;;###autoload

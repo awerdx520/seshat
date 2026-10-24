@@ -1158,6 +1158,24 @@
 - 影响：同一本书有两份本地文件，用户需自行管理原件（删除或移走），否则容易在原件上继续批注/修改而不同步。
 - 建议：可考虑入库后提示原件的处置（或在 `seshat-library-add` 末尾询问是否打开副本 / 删除原件）；若要「移动」语义，需另加选项。当前按用户 2026-10-24 的决定（复制）保持。
 
+## 阅读模式的身份标识无法关闭，且每个文档都会显示（2026-10-24 阅读模式审查）
+
+- 现状：`seshat-reading-mode` 接管 `auto-mode-alist` 后，每个打开的 PDF/EPUB 都会在 mode-line 显示 `[库]` / `[未入库]` / `[库外]` / `[状态异常]` 之一，且没有 `defcustom` 可关闭。
+- 影响：把 Emacs 当纯通用阅读器用、从不使用 Seshat 库的用户，也会在每个文档的 mode-line 上多看到一段与己无关的标识。
+- 建议：加一个 `seshat-reading-mode-line-indicator`（默认 t），关闭后不安装 `mode-line-misc-info` 条目；身份解析仍可保留（供 `seshat-reading-refresh` / `seshat-library-add` 使用）。
+
+## 状态库的 `.bak` 备份从不清除（2026-10-24 阅读模式审查）
+
+- 现状：`seshat-state--backup-corrupt` 在状态文件损坏时把它改名为 `<FILE>.bak`，此后从不删除（下一次损坏会覆盖同名 `.bak`，最多保留一份）。`broken` 判定已改为读「本次加载是否命中损坏」标记，不再依赖 `.bak` 是否存在。
+- 影响：磁盘上会长期留一份可能含旧游标/uid 映射的 `.bak`（自身是合法 `.eld`，不含敏感信息）；用户看到它可能困惑。
+- 建议：在状态库成功保存后提示一次「旧的损坏备份仍在 <路径>，可手动删除」，或加一个 `seshat-state-clean-backup` 命令；不要在加载时自动删除（备份是最后的恢复手段）。
+
+## 「相对根路径」的安全校验有三份实现（2026-10-24 阅读模式审查）
+
+- 现状：`seshat-sync--local-path`（`emacs/seshat-sync.el`）、`seshat-sync-cmd--safe-local-path`（`emacs/seshat-sync-cmd.el`）、`seshat-reading--target-path`（`emacs/seshat-reading.el`）各有一份「把服务端/用户给的相对路径拼到根目录并校验不越界」的实现。三者细节不同：reading 侧内联了 `file-truename` 复核、拒绝已存在的目录、并规范化 REL（末尾斜杠/单点/连续斜杠）；sync 侧没有 REL 规范化；cmd 侧是纯字符串规范化。
+- 影响：口径漂移会导致「同一条路径在三处得到不同结论」，其中任何一处松懈都是路径逃逸的入口（安全隐患）。三份 docstring 已互相引用说明，但依赖人工同步。
+- 建议：抽一个共享函数（如 `seshat-path-safe-join`，放在 `seshat-state` 或新模块 `seshat-path.el`），三处统一调用；抽之前若必须改其中一处，务必同步另两处并各补一条软链用例。
+
 
 
 
