@@ -604,3 +604,15 @@ refit 按当前窗口尺寸做一次几何适配 + 重渲染，一次到位。
 **旧值映射（契约）**：`fit-to-width` → `width`；`fit-to-height`（旧默认）→ `contain`；其它任意值 → `contain`。旧默认映射为 `contain` 而非 `height` 的理由：绝大多数配置从未改过该项，映射为 `height` 会让所有人打开文档后纵向溢出；「显式想要按高」与「沿用旧默认」在值上不可区分，只能保现状，并在 CHANGELOG 给出绕法（显式设 `height`）。
 
 **代价与边界**：`W`/`H` 仍不跨会话；书签仍不携带 `fit-mode`（与既有技术债「书签恢复不携带缩放来源」同族，不在本次扩大范围）；新窗口首帧可能沿用恢复的 scale，0.15s 后由 idle refit 按 mode 校正（不做创建时同步重算，避免 `native` 尺寸不可得时把页面设成 1.0）。
+
+## 2026-10-24 · Emacs 传输层分层与统一契约（M8-A）
+
+**决策**：新增 `seshat-transport.el`，把 HTTP 请求收敛为 `(:status N :headers ALIST :body STRING)` / 失败 `(:status nil :error SYM)`，后端可在 `rest`（`url.el` + Bearer）与 `webdav`（`curl` + Basic）间切换；**transport 层永不抛错**；`seshat-rest--request` 保留为薄包装，维持旧 `(status . body)` 契约与「网络失败抛 error」语义。
+
+**理由**：改造前两套传输契约互不兼容（curl 返回 `(exit-code . output)`、url.el 返回 `(status . body)`），且 `/dav` URL 拼接散落三处，改一处漏两处即静默失败。统一契约是 M8 引擎重写的前置条件。**薄包装不直接下沉**，因为 4 处生产调用方（`seshat-conflict--remote-head`、`--merge-three-way`、`seshat-reader-annotation--fetch`、`seshat-reader-annotation-queue--sync-delete`）与 4 个 reader 测试文件依赖它的抛错行为与桩点。抛错责任分层：transport 只回报、API 层决定是否抛。
+
+## 2026-10-24 · Emacs 同步状态库形态（M8-A）
+
+**决策**：新增 `seshat-state.el`，用单个 `~/.local/share/seshat/sync-state.eld`（`prin1` 序列化、同目录临时文件 + `rename-file` 原子写）承载：全局 `cursor`、`:uids`（per-uid 的 `:root/:path/:base-blob/:size/:mtime/:dirty/:deleted-at/:orphan`）、`:paths` 派生索引、`:roots`（`(tag dir mode)`）。旧的单文件 head `~/.emacs.d/seshat-head` **不迁移**。
+
+**理由**：旧 head 是全局单值，多文件同步互相覆盖（写入点不按 path 分键），且没有 cursor / uid 映射 / dirty / 墓碑，无法承载 M7 的 uid 模型与增量协议。选单 `.eld` 而非 SQLite：与既有 `annotation-queue.eld` 同风格、零新依赖、原子写模式已验证。**不迁移旧 head** 是因为单值无法无损散到多文件，强行迁移会把同一 hash 当成所有文件的 base，导致误判冲突；代价是首次同步可能触发一次冲突（有 `diff3` 兜底）。

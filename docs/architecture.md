@@ -77,6 +77,18 @@ Emacs 阅读器（`seshat-reader`）的批注同步在客户端侧叠加一层**
 - **失败即停**：任一条同步失败即停止本轮，该条及其后续项保留在队列中待下次同步（不丢弃、不报错）。
 - **服务端零改动**：队列与同步均为**客户端侧**行为，不改变服务端 REST 契约（端点行为与 `location`/`text` 语义不变；文档键 M7 起为 uid，队列条目相应携带 `:uid`，缺 `:uid` 的旧条目跳过并提示）。
 
+## Emacs 客户端同步分层（M8-A）
+
+M8 把 Emacs 端同步器从 WebDAV 传输迁到 REST，分三层落地，本节点只记录地基（计划 A）已完成的部分：
+
+| 层 | 文件 | 职责 |
+|---|---|---|
+| 传输层 | `emacs/seshat-transport.el` | 统一 HTTP 契约 `(:status :headers :body)`；**永不抛错**（失败只回报 `:status nil` + `:error`）；后端可换：`rest`（`url.el` + Bearer，默认）与 `webdav`（`curl` + Basic，灰度期保留） |
+| API 层 | `emacs/seshat-rest.el` | 服务端端点封装（roots / resources / changes / files / move / versions）与统一状态码解释；`seshat-rest--request` 保留为**薄包装**（旧 `(status . body)` 契约 + 抛错语义不变，保护既有 4 处调用方） |
+| 状态层 | `emacs/seshat-state.el` | 单一 `.eld` 原子写：全局 `cursor`、per-uid `base-blob`（取代旧的单文件 head）、`uid ↔ (root . path)` 双索引、`dirty` 集合、墓碑 |
+
+**分层约束**：传输层抛错责任在 API 层，不得上提；二进制下载必须传 `:binary t`（否则 `url.el` 后端会按 UTF-8 解码破坏字节）。**尚未接入**：增量循环、条件写、move 检测、多根分流与 `seshat:` link follow 属计划 B / C。
+
 ## `seshat:` 引用协议（M11.4）
 
 笔记与阅读器之间的双向引用通道，格式为 **`seshat:<target>[#<location>]`**，`<target>` 有两种形态（见下「双形态」）：

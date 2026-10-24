@@ -85,6 +85,8 @@ M0–M6 已完成并归档，见 `openspec/completed/personal-notes-system.md`�
 
 ### M8 Emacs 端接入
 
+**计划 A（地基）已完成并归档（2026-10-24）**，见 `openspec/completed/2026-10-24-m8a-emacs-sync-foundation.md`：新增 `seshat-transport.el`（统一 `(:status :headers :body)` 契约，后端 `rest`/`webdav` 可换，transport 层永不抛错）、扩展 `seshat-rest.el`（9 个端点封装 + 统一状态码解释，`seshat-rest--request` 降为薄包装以保护既有 4 处调用方）、新增 `seshat-state.el`（单 `.eld` 原子写，承载全局游标 / per-uid base blob / uid↔路径双索引 / dirty / 墓碑）。新增 3 个测试文件、118 例，全仓 ERT 399 → **517**（0 unexpected / 0 skipped）。**尚未接入**：增量循环、条件写、move 检测（M8.3）、多根（M8.4）、`seshat:` link（M8.5）、透明性验证（M8.6）——属计划 B / C。
+
 | 子项 | 内容 | 风险 |
 |---|---|---|
 | M8.1 | REST 同步器（替代 WebDAV 传输层） | 高：现有 `emacs/notes-sync.el` 返工 |

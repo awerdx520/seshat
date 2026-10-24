@@ -133,6 +133,15 @@ Emacs 端通过 `seshat-reader-annotation` 采集 PDF 页面选区并同步为�
       seshat-reader-annotation-roots '(("ebook" . "~/WorkSpace/e-book/")))
 ```
 
+### 同步地基（M8-A）
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `seshat-transport-backend` | `rest` | 传输后端：`rest`（`url.el` + Bearer，走 `/api/...`）或 `webdav`（`curl` + Basic，走 `/dav/...`）。灰度期保留 WebDAV 以便回滚；**WebDAV 通道会静默忽略 `If-Match`/`If-None-Match`，冲突检测能力弱于 REST**。 |
+| `seshat-state-file` | `~/.local/share/seshat/sync-state.eld` | 同步状态库（全局游标、uid↔路径索引、per-uid base blob、dirty 与墓碑）。原子写，单 Emacs 进程假设（多 daemon 同时同步会互相覆盖）。 |
+
+**迁移说明**：旧的单文件 head（`~/.emacs.d/seshat-head`）**不再使用、不会自动迁移**。新状态库在首次同步时以服务端为准重建 base blob；若本地有离线改动，可能触发一次三方合并（有 `diff3` 兜底）。
+
 ### 阅读器翻译 / 解释（go-translate 预设）
 
 > 与批注侧车同属**客户端侧**配置（由 `seshat-reader-translate` 模块读取），与服务端无关。

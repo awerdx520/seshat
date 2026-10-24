@@ -1073,6 +1073,42 @@
 - 建议：在 `--render-buffer` 或 `--non-queue-refresh-doc-buffer` 的收尾处（`--update-join-strip` 之后）补 `(set-buffer-modified-p nil)`；同时复核 `auto-revert-mode 1`（`:1752`）与自定义 `revert-buffer-function` 的组合是否需要 `inhibit-read-only` 保护。须补一条 ERT（revert 后 `buffer-modified-p` 为 nil）并做一次真机复验（`g` 后 modeline 无 `**`、*Messages* 无 super-save 报错）。
 - 已解决（2026-10-23）：`seshat-reader--render-buffer` 与 `seshat-reader--update-join-strip` 各自在改完 buffer 文本后补 `(set-buffer-modified-p nil)`——两处独立保证，不依赖调用顺序（真实链路上 `--render-buffer` 末尾会调 `--update-join-strip`，但用例里桩掉后者仍能判别前者，变异自检 A/B 分别打红对应用例）。新增 ERT 2 例（`seshat-reader-page-join-test.el` 24 → **26**；全仓 397 → **399**，0 unexpected / 0 skipped）；L1 `make all` EXIT=0、警告集 33 → 33 零新增。**残留**：`--insert-join-strip` / `--remove-join-strip` 自身仍可改文本（`inhibit-read-only t`），若将来新增调用方绕过 `--update-join-strip` 会重新标脏——这两处不宜单独加清除行（会在同一路径上重复清且掩盖调用链），保持现状并在此记录。
 
+## WebDAV 后端的条件头仍不生效（M8-A，2026-10-24）
+
+- 现状：`seshat-transport-backend` 可切到 `webdav`（`curl` + Basic），但服务端 `/dav` 通道（`x/net/webdav` v0.61.0）**静默忽略** `If-Match` / `If-None-Match`，行为退化为后写覆盖且无任何信号（`docs/api.md` 的 §8.2 已记录）。传输层只做契约归一，不修复此服务端限制。
+- 影响：灰度期若走 WebDAV 后端，乐观锁等于没加，冲突只能靠事后 diff3 发现；同一文件在两处并发写会静默丢一次修改。
+- 建议：灰度期只用于回滚兜底，不作长期通道；真正的冲突检测一律走 REST（`If-Match: "<blob>"`）。若要彻底消除，需服务端换支持条件请求的 WebDAV 实现。
+
+## 状态库无并发保护（M8-A，2026-10-24）
+
+- 现状：`seshat-state.el` 单文件原子写，但无文件锁；同一用户开两个 Emacs daemon 同时同步时，各自的 `save` 会互相覆盖（后写者胜），表现为 uid 映射或游标丢失。
+- 影响：多 daemon 或「daemon + 独立 emacs」并行使用时可能丢状态；单进程使用无影响。
+- 建议：若将来出现多实例需求，加 `lock-file` 或改用支持并发的后端；当前按「单 Emacs 进程假设」记录，不阻塞。
+
+## `/api/versions` 的线缆参数名与形参名不一致（M8-A，2026-10-24）
+
+- 现状：`seshat-rest-versions` 的形参叫 `blob`（与 `resources.blob` 语义对齐），但服务端读的查询参数名是 `hash`（`internal/api/server.go:566`）。实现里已做映射并在 docstring 注明，但两套命名并存。
+- 影响：若后续调用方按形参名手写 `blob=` 查询，服务端会忽略并退化成「取当前版本」，表现为「历史内容与 head 相同」的静默错误。
+- 建议：计划 B 接入 `seshat-conflict.el` 时统一口径（要么服务端支持 `blob` 别名，要么形参改名为 `hash`）。
+
+## `seshat-state.el` 的单条目写入会全量重建 `:paths` 索引（M8-A 审查，2026-10-24）
+
+- 现状：`--put-entry` / `--update-entry` 每次条目变更都调用 `--rebuild-paths`（O(n)），而 `--paths-equal` 的比较是 O(n²)。单个 `set-base-blob` 调用即触发一次全量重建。
+- 影响：计划 B 的批量同步（逐资源写 base blob、逐事件应用 changes）会退化为 O(n²)；书库规模上千后每次同步可能明显变慢。
+- 建议：在计划 B 动工前提供批量入口（如 `seshat-state-batch` 宏或在 `let` 绑定下暂缓重建、退出时统一重建一次），或改为对单条目增量维护 `:paths`。当前单进程、小规模场景无感知。
+
+## `--encode-path` 在 `seshat-rest.el` 与 `seshat-conflict.el` 各有一份（M8-A 审查，2026-10-24）
+
+- 现状：`seshat-rest--encode-path`（`emacs/seshat-rest.el`）与 `seshat-conflict--encode-path`（`emacs/seshat-conflict.el:52`）逐字重复——逐段 URL 编码并保留 `/`。计划 A 刻意不抽公共库（避免把 conflict 的依赖方向倒置）。
+- 影响：两处口径若将来出现漂移（例如一方开始处理 `%` 或前导斜杠），会出现「同一条路径生成不同 URL」的静默不一致。
+- 建议：计划 B 接入 `seshat-conflict.el` 到 REST 条件写时，一并把两处收敛到 `seshat-rest--encode-path`（conflict 已经有对 `seshat-rest` 的依赖，方向合法）。
+
+## `seshat-reader.el` 的 `with-demoted-errors` 缺少 FORMAT 参数（M8-A 收尾发现，2026-10-24）
+
+- 现状：`emacs/seshat-reader/seshat-reader.el:82-83` 的 `(with-demoted-errors (require 'seshat-render-core))` 未传 FORMAT 首参。`with-demoted-errors` 的首个参数是格式串，缺省时会用宏的默认消息，但字节编译/log 每轮都报 `Warning: Missing format argument in 'with-demoted-errors'`（14 个测试文件加载 reader 时各报一次）。
+- 影响：功能无影响（该 `require` 失败仍被静默降级），但会污染编译输出、掩盖真正的新警告；且该 `require` 失败后，后续 `seshat-render-core-*` 调用会以 `void-function` 在运行期才暴露，定位成本高。
+- 建议：改为 `(with-demoted-errors "seshat-reader: %S" (require 'seshat-render-core))`，与仓库其它 `with-demoted-errors` 用法对齐；属一行修复，可随下次阅读器改动顺带处理。
+
 
 
 
