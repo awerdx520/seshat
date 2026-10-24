@@ -23,12 +23,15 @@
 ;;; Commentary:
 
 ;; `seshat-sync' 的 M8-B 引擎测试，当前覆盖 T1a（首同步：预建索引）、
-;; T1b（事件应用：四类 changes 事件的唯一实现）、T1c（首同步追平取游标）与
-;; T1d（增量循环 + `seshat-sync-pull' 编排）：
-;; `/api/resources' 分页 → 每页写入状态库 → 每页落盘一次；
+;; T1b（事件应用：四类 changes 事件的唯一实现）、T1c（首同步追平取游标）、
+;; T1d（增量循环 + `seshat-sync-pull' 编排）与 T2（push 条件写）、T3（move /
+;; rename 检测）：`/api/resources' 分页 → 每页写入状态库 → 每页落盘一次；
 ;; `seshat-sync--apply-event' 对 create / update / rename / delete 的落盘与状态
 ;; 更新（含路径穿越防御与只读根 403）；`/api/changes' 逐批 apply → 批量块退出
-;; → 推进游标 → 落盘（游标后写因此可安全重放），以及首同步 / 增量的路径选择。
+;; → 推进游标 → 落盘（游标后写因此可安全重放），以及首同步 / 增量的路径选择；
+;; push 的条件头、412 三方合并与 409 / 403 处置；`seshat-sync-detect-renames'
+;; 的快照比对、本地内容改动标脏（push 的唯一输入来源）与 `size + mtime' 双匹配
+;; 的 rename 上报。
 ;;
 ;; 全部用例**零网络**：统一桩替 `seshat-transport-request'（`seshat-rest' 的
 ;; 唯一出口），由被测代码真实走 `seshat-rest-list-resources' /
@@ -79,6 +82,11 @@ push 的 412 分支用它取祖先内容（`:content'）。队列耗尽时回一
   "本次用例排队等待消费的 `/api/changes' 响应列表（先进先出）.
 队列耗尽时回一个「空批次、`has_more' 为 false」的 200，使循环必然终止；用例
 靠请求次数断言暴露「本该多拉一批」的问题，而不是挂死。")
+
+(defvar seshat-sync-test--moves nil
+  "本次用例排队等待消费的 `POST /api/resources/{uid}/move' 响应列表（先进先出）.
+队列耗尽时回一个空的 200——既能让用例收尾，也能在「本该上报 move 却没上报」时
+通过调用次数断言暴露问题（而不是让用例挂死）。")
 
 (defvar seshat-sync-test--calls nil
   "本次用例中 pull 编排各步骤的调用记录（反向累积的符号列表）.
@@ -160,6 +168,10 @@ nil（空状态起步），`seshat-sync--read-only-roots' 为空，传输层与
     (or seshat-sync-test--roots-response
         (list :status 200 :headers nil
               :body "{\"roots\":[]}")))
+   ((string-match-p "/move" url)
+    (or (pop seshat-sync-test--moves)
+        (list :status 200 :headers nil
+              :body "{\"uid\":\"uid-a\",\"from\":\"\",\"to\":\"\"}")))
    ((string-match-p "/api/resources" url)
     (or (pop seshat-sync-test--pages)
         (list :status 200 :headers nil
@@ -884,10 +896,11 @@ EVENTS 为事件列表（`seshat-sync-test--change' 的产物），NEXT-CURSOR �
 (defmacro seshat-sync-test--with-call-log (&rest body)
   "在记录 pull 编排各步骤调用顺序的环境下执行 BODY。
 BODY 期间 `seshat-sync-test--calls' 为反向累积的符号列表
-（`reset' / `build-index' / `catch-up' / `pull-changes'），每个桩都会继续调用
-真实实现，因此顺序与真实行为可以同时断言。"
+（`reset' / `ensure-roots' / `build-index' / `catch-up' / `pull-changes'），
+每个桩都会继续调用真实实现，因此顺序与真实行为可以同时断言。"
   (declare (indent 0) (debug t))
   `(let ((real-reset (symbol-function 'seshat-sync--reset-read-only-roots))
+         (real-ensure (symbol-function 'seshat-sync--ensure-roots))
          (real-index (symbol-function 'seshat-sync--build-index))
          (real-catch-up (symbol-function 'seshat-sync--catch-up))
          (real-pull-changes (symbol-function 'seshat-sync--pull-changes))
@@ -896,6 +909,10 @@ BODY 期间 `seshat-sync-test--calls' 为反向累积的符号列表
                 (lambda ()
                   (push 'reset seshat-sync-test--calls)
                   (funcall real-reset)))
+               ((symbol-function 'seshat-sync--ensure-roots)
+                (lambda ()
+                  (push 'ensure-roots seshat-sync-test--calls)
+                  (funcall real-ensure)))
                ((symbol-function 'seshat-sync--build-index)
                 (lambda ()
                   (push 'build-index seshat-sync-test--calls)
@@ -1271,7 +1288,8 @@ BODY 期间 `seshat-sync-test--calls' 为反向累积的符号列表
     (seshat-sync-test--with-call-log
       (let ((result (seshat-sync-pull)))
         (should (eq t (plist-get result :first-sync)))
-        (should (equal '(reset build-index catch-up)
+        (should (eq t (plist-get result :configured)))
+        (should (equal '(reset ensure-roots build-index catch-up)
                        (nreverse seshat-sync-test--calls)))
         ;; `:index' 是建索引的统计，`:changes' 是追平的统计
         (should (= 1 (plist-get (plist-get result :index) :items)))
@@ -1301,7 +1319,7 @@ BODY 期间 `seshat-sync-test--calls' 为反向累积的符号列表
       (let ((result (seshat-sync-pull)))
         (should-not (plist-get result :first-sync))
         (should-not (plist-get result :index))
-        (should (equal '(reset pull-changes)
+        (should (equal '(reset ensure-roots pull-changes)
                        (nreverse seshat-sync-test--calls)))
         (should-not (seshat-sync-test--resource-calls))
         (should (= 10 (seshat-state-cursor)))
@@ -1326,7 +1344,7 @@ BODY 期间 `seshat-sync-test--calls' 为反向累积的符号列表
     (setq seshat-sync--read-only-roots '("books"))
     (seshat-sync-test--with-call-log
       (seshat-sync-pull)
-      (should (equal '(reset build-index catch-up)
+      (should (equal '(reset ensure-roots build-index catch-up)
                      (nreverse seshat-sync-test--calls)))
       (should-not (seshat-sync--read-only-root-p "books")))))
 
@@ -1724,6 +1742,487 @@ dirty 保留、计入 `:conflicted'。"
       (should (= 1 (plist-get stats :skipped)))
       (should (equal '("uid-b") (seshat-state-dirty-uids)))
       (should (seshat-sync-test--warnings-matching "ondemand")))))
+
+;;; move / rename 检测（T3）用的辅助
+
+(defun seshat-sync-test--register-baseline (uid rel &optional base)
+  "把 UID 登记为根 \"notes\" 下的 REL，基线取该文件**当前**的 `(size, mtime)'.
+与 push 写基线同源同口径（`file-attributes' + Unix 秒整数），因此「内容没变」
+的条目在 move 检测里既不会被标脏、也具备 rename 配对所需的基线。"
+  (seshat-state-set uid (list :root "notes"
+                              :path rel
+                              :base-blob (or base "\"blob0\"")
+                              :size (seshat-sync-test--file-size rel)
+                              :mtime (seshat-sync-test--file-mtime rel)))
+  uid)
+
+(defun seshat-sync-test--move-calls ()
+  "按发生顺序返回 `POST /api/resources/{uid}/move' 的调用列表（实际入队的调用）."
+  (seshat-sync-test--calls-matching "POST" "/move"))
+
+(defun seshat-sync-test--move-uid (call)
+  "返回被桩的 move 调用 CALL 的 URL 里携带的 uid。"
+  (when (string-match "/api/resources/\\([^/]+\\)/move" (nth 1 call))
+    (match-string 1 (nth 1 call))))
+
+(defun seshat-sync-test--move-to (call)
+  "返回被桩的 move 调用 CALL 的请求体里的 `to' 路径（服务端收到的目标路径）。"
+  (let ((body (plist-get (nth 2 call) :body)))
+    (cdr (assoc 'to (json-read-from-string body)))))
+
+(defun seshat-sync-test--move-ok (from to)
+  "构造 `POST …/move' 的成功响应（200），`:from' / `:to' 为移动前后路径。"
+  (list :status 200
+        :headers nil
+        :body (json-encode (list (cons 'uid "uid-a")
+                                 (cons 'from from)
+                                 (cons 'to to)))))
+
+(defun seshat-sync-test--move-status (status)
+  "构造 `POST …/move' 的失败响应（STATUS 为 409 / 403 / 5xx 等）。"
+  (list :status status
+        :headers nil
+        :body "{\"error\":{\"code\":\"x\"}}"))
+
+(defun seshat-sync-test--rename (from to)
+  "把临时目录下的 FROM 物理改名为 TO（模拟用户的 `mv'），返回 TO 的绝对路径。"
+  (let ((target (seshat-sync-test--local to)))
+    (rename-file (seshat-sync-test--local from) target)
+    target))
+
+;;; move 检测：第 2 步（本地内容修改 → 标脏，push 的唯一输入来源）
+
+(ert-deftest seshat-sync-test-detect-edits-marks-dirty ()
+  "第 2 步：已登记 uid 的本地内容变化（`(size, mtime)' 与基线不同）→ 该 uid 出现在
+`dirty-uids'，且**不**被判为 rename（本地文件仍在原路径），全程零请求。"
+  (seshat-sync-test--with-state
+    (seshat-state-set-roots (list (list "notes" seshat-sync-test--dir "mirror")))
+    (seshat-sync-test--write-local "a.org" "原始\n")
+    (seshat-sync-test--register-baseline "uid-a" "a.org")
+    (should-not (seshat-state-dirty-uids))
+    ;; 本地编辑：内容变长（size 必然不同）——没有第 2 步就永远不会被推送
+    (seshat-sync-test--write-local "a.org" "被本地编辑过的更长的内容\n")
+    (let ((stats (seshat-sync-detect-renames)))
+      (should (= 1 (plist-get stats :scanned-roots)))
+      (should (= 1 (plist-get stats :dirty-marked)))
+      (should (= 0 (plist-get stats :renamed)))
+      (should (= 0 (plist-get stats :conflict)))
+      (should (= 0 (plist-get stats :skipped)))
+      (should (= 0 (plist-get stats :failed)))
+      (should (= 0 (plist-get stats :vanished)))
+      (should (= 0 (plist-get stats :appeared)))
+      (should (equal '("uid-a") (seshat-state-dirty-uids)))
+      ;; 路径未变（不是 rename）
+      (should (equal (cons "notes" "a.org")
+                     (seshat-state-path-for-uid "uid-a")))
+      ;; 标脏是纯本地动作：不碰网络、不上报
+      (should-not seshat-sync-test--requests))))
+
+(ert-deftest seshat-sync-test-detect-edits-same-stats-not-dirty ()
+  "第 2 步：`(size, mtime)' 与基线**相同** → 不标脏；已有 dirty 也**不被清除**
+（dirty 可能来自上次推送失败，清了就永远不会重推）。"
+  (seshat-sync-test--with-state
+    (seshat-state-set-roots (list (list "notes" seshat-sync-test--dir "mirror")))
+    (seshat-sync-test--write-local "clean.org" "干净\n")
+    (seshat-sync-test--register-baseline "uid-clean" "clean.org")
+    (seshat-sync-test--write-local "dirty.org" "待推送\n")
+    (seshat-sync-test--register-baseline "uid-dirty" "dirty.org")
+    (seshat-state-mark-dirty "uid-dirty")
+    (let ((stats (seshat-sync-detect-renames)))
+      (should (= 1 (plist-get stats :scanned-roots)))
+      (should (= 0 (plist-get stats :dirty-marked)))
+      (should (= 0 (plist-get stats :vanished)))
+      (should (= 0 (plist-get stats :appeared)))
+      (should (equal '("uid-dirty") (seshat-state-dirty-uids)))
+      (should-not seshat-sync-test--requests))))
+
+;;; move 检测：第 3 步（消失 / 新增 / rename 配对）
+
+(ert-deftest seshat-sync-test-detect-rename-paired-by-size-and-mtime ()
+  "本地改名（`size' 与 `mtime' 都相同）→ 上报 `move-resource (uid to)'、`state-remap'
+生效、该 uid 标脏、计入 `:renamed'；消失与新增都不再单独计数。"
+  (seshat-sync-test--with-state
+    (seshat-state-set-roots (list (list "notes" seshat-sync-test--dir "mirror")))
+    (seshat-sync-test--write-local "old.org" "同样的内容\n")
+    (seshat-sync-test--register-baseline "uid-a" "old.org")
+    ;; 用户用 mv 改名：内容不变 → size 与 mtime 都不变
+    (seshat-sync-test--rename "old.org" "new.org")
+    (setq seshat-sync-test--moves
+          (list (seshat-sync-test--move-ok "old.org" "new.org")))
+    (let ((stats (seshat-sync-detect-renames))
+          (calls (seshat-sync-test--move-calls)))
+      (should (= 1 (length calls)))
+      ;; 服务端收到的是「uid + 目标路径」，且是 POST …/move（两位置参数、非 cons）
+      (should (equal "uid-a" (seshat-sync-test--move-uid (car calls))))
+      (should (equal "new.org" (seshat-sync-test--move-to (car calls))))
+      (should (= 1 (plist-get stats :renamed)))
+      (should (= 0 (plist-get stats :conflict)))
+      (should (= 0 (plist-get stats :skipped)))
+      (should (= 0 (plist-get stats :failed)))
+      (should (= 0 (plist-get stats :vanished)))
+      (should (= 0 (plist-get stats :appeared)))
+      ;; state-remap 生效：uid 换到新路径，旧路径不再指向它
+      (should (equal (cons "notes" "new.org")
+                     (seshat-state-path-for-uid "uid-a")))
+      (should-not (seshat-state-uid-for-path "notes" "old.org"))
+      (should (equal "uid-a" (seshat-state-uid-for-path "notes" "new.org")))
+      ;; 新路径的内容仍需 push 确认一次 → 标脏（保守）
+      (should (equal '("uid-a") (seshat-state-dirty-uids))))))
+
+(ert-deftest seshat-sync-test-detect-rename-size-differs-not-paired ()
+  "本地改名但 **size** 不同 → 不判 rename（计入 `:vanished' + `:appeared'，无 move 请求）。"
+  (seshat-sync-test--with-state
+    (seshat-state-set-roots (list (list "notes" seshat-sync-test--dir "mirror")))
+    (seshat-sync-test--write-local "old.org" "短\n")
+    (seshat-sync-test--register-baseline "uid-a" "old.org")
+    (seshat-sync-test--rename "old.org" "new.org")
+    ;; 改名后又编辑：size 变了，判据不成立
+    (seshat-sync-test--write-local "new.org" "改名之后又被编辑得明显更长的内容\n")
+    (let ((stats (seshat-sync-detect-renames)))
+      (should (= 0 (plist-get stats :renamed)))
+      (should (= 1 (plist-get stats :vanished)))
+      (should (= 1 (plist-get stats :appeared)))
+      (should-not (seshat-sync-test--move-calls))
+      (should-not seshat-sync-test--requests)
+      ;; 既不 remap 也不新建登记
+      (should (equal (cons "notes" "old.org")
+                     (seshat-state-path-for-uid "uid-a")))
+      (should-not (seshat-state-uid-for-path "notes" "new.org"))
+      (should-not (seshat-state-dirty-uids)))))
+
+(ert-deftest seshat-sync-test-detect-rename-mtime-differs-not-paired ()
+  "本地改名但 **mtime** 不同（size 相同）→ 同样不判 rename。"
+  (seshat-sync-test--with-state
+    (seshat-state-set-roots (list (list "notes" seshat-sync-test--dir "mirror")))
+    (seshat-sync-test--write-local "old.org" "同样的长度\n")
+    (seshat-sync-test--register-baseline "uid-a" "old.org")
+    (let ((target (seshat-sync-test--rename "old.org" "new.org")))
+      ;; 只动 mtime，size 保持不变
+      (set-file-times target (seconds-to-time 1600000000)))
+    (let ((stats (seshat-sync-detect-renames)))
+      (should (= 0 (plist-get stats :renamed)))
+      (should (= 1 (plist-get stats :vanished)))
+      (should (= 1 (plist-get stats :appeared)))
+      (should-not (seshat-sync-test--move-calls))
+      (should (equal (cons "notes" "old.org")
+                     (seshat-state-path-for-uid "uid-a"))))))
+
+(ert-deftest seshat-sync-test-detect-two-renames-paired-independently ()
+  "两组 rename 同时发生 → 各自配对正确，不交叉错配（按 size 唯一区分）。"
+  (seshat-sync-test--with-state
+    (seshat-state-set-roots (list (list "notes" seshat-sync-test--dir "mirror")))
+    (seshat-sync-test--write-local "a1.org" "AAAA\n")          ; 5 字节
+    (seshat-sync-test--write-local "b1.org" "BBBBBBBBBBBB\n")  ; 13 字节
+    (seshat-sync-test--register-baseline "uid-a" "a1.org")
+    (seshat-sync-test--register-baseline "uid-b" "b1.org")
+    (seshat-sync-test--rename "a1.org" "a2.org")
+    (seshat-sync-test--rename "b1.org" "b2.org")
+    (setq seshat-sync-test--moves
+          (list (seshat-sync-test--move-ok "a1.org" "a2.org")
+                (seshat-sync-test--move-ok "b1.org" "b2.org")))
+    (let ((stats (seshat-sync-detect-renames))
+          (calls (seshat-sync-test--move-calls)))
+      (should (= 2 (length calls)))
+      (should (equal '(("uid-a" . "a2.org") ("uid-b" . "b2.org"))
+                     (mapcar (lambda (call)
+                               (cons (seshat-sync-test--move-uid call)
+                                     (seshat-sync-test--move-to call)))
+                             calls)))
+      (should (= 2 (plist-get stats :renamed)))
+      (should (= 0 (plist-get stats :vanished)))
+      (should (= 0 (plist-get stats :appeared)))
+      (should (equal '("uid-a" "uid-b") (seshat-state-dirty-uids)))
+      (should (equal (cons "notes" "a2.org")
+                     (seshat-state-path-for-uid "uid-a")))
+      (should (equal (cons "notes" "b2.org")
+                     (seshat-state-path-for-uid "uid-b"))))))
+
+(ert-deftest seshat-sync-test-detect-move-409-not-retried ()
+  "`move-resource' 返回 409 → **不重试**（只调用 1 次）、**不** remap、计入
+`:conflict'、有 warning（建议 rescan：物理移动可能已完成）。"
+  (seshat-sync-test--with-state
+    (seshat-state-set-roots (list (list "notes" seshat-sync-test--dir "mirror")))
+    (seshat-sync-test--write-local "old.org" "同样的内容\n")
+    (seshat-sync-test--register-baseline "uid-a" "old.org")
+    (seshat-sync-test--rename "old.org" "new.org")
+    (setq seshat-sync-test--moves (list (seshat-sync-test--move-status 409)))
+    (let ((stats (seshat-sync-detect-renames)))
+      (should (= 1 (length (seshat-sync-test--move-calls))))
+      (should (= 1 (plist-get stats :conflict)))
+      (should (= 0 (plist-get stats :renamed)))
+      (should (= 0 (plist-get stats :failed)))
+      ;; 不 remap：本地状态与服务端真实状态此刻不一致，贸然改会让下轮推错位置
+      (should (equal (cons "notes" "old.org")
+                     (seshat-state-path-for-uid "uid-a")))
+      (should-not (seshat-state-uid-for-path "notes" "new.org"))
+      ;; 也不标脏（本轮未确认改名成功）
+      (should-not (seshat-state-dirty-uids))
+      (should (seshat-sync-test--warnings-matching "409")))))
+
+(ert-deftest seshat-sync-test-detect-move-403-marks-root-read-only ()
+  "`move-resource' 返回 403（`root_read_only'）→ 标记只读根、计入 `:skipped'、不 remap。"
+  (seshat-sync-test--with-state
+    (seshat-state-set-roots (list (list "notes" seshat-sync-test--dir "mirror")))
+    (seshat-sync-test--write-local "old.org" "同样的内容\n")
+    (seshat-sync-test--register-baseline "uid-a" "old.org")
+    (seshat-sync-test--rename "old.org" "new.org")
+    (setq seshat-sync-test--moves (list (seshat-sync-test--move-status 403)))
+    (let ((stats (seshat-sync-detect-renames)))
+      (should (= 1 (plist-get stats :skipped)))
+      (should (= 0 (plist-get stats :renamed)))
+      (should (= 0 (plist-get stats :failed)))
+      (should (seshat-sync--read-only-root-p "notes"))
+      ;; 只读根只警告一次（与其他三处共用 `seshat-sync--mark-root-read-only'）
+      (should (= 1 (length (seshat-sync-test--warnings-matching "只读"))))
+      (should (equal (cons "notes" "old.org")
+                     (seshat-state-path-for-uid "uid-a"))))))
+
+(ert-deftest seshat-sync-test-detect-move-other-error-counts-failed ()
+  "其它失败（5xx）→ 计入 `:failed'、不重试、不 remap。"
+  (seshat-sync-test--with-state
+    (seshat-state-set-roots (list (list "notes" seshat-sync-test--dir "mirror")))
+    (seshat-sync-test--write-local "old.org" "同样的内容\n")
+    (seshat-sync-test--register-baseline "uid-a" "old.org")
+    (seshat-sync-test--rename "old.org" "new.org")
+    (setq seshat-sync-test--moves (list (seshat-sync-test--move-status 502)))
+    (let ((stats (seshat-sync-detect-renames)))
+      (should (= 1 (length (seshat-sync-test--move-calls))))
+      (should (= 1 (plist-get stats :failed)))
+      (should (= 0 (plist-get stats :renamed)))
+      (should (equal (cons "notes" "old.org")
+                     (seshat-state-path-for-uid "uid-a")))
+      (should (seshat-sync-test--warnings-matching "上报失败")))))
+
+(ert-deftest seshat-sync-test-detect-unpaired-vanish-keeps-files-silent ()
+  "未配对的消失 → 不删除本地任何文件、不产生任何请求、不标墓碑、计入 `:vanished'。"
+  (seshat-sync-test--with-state
+    (seshat-state-set-roots (list (list "notes" seshat-sync-test--dir "mirror")))
+    ;; 仍在本地且基线一致的条目（用来证明「消失」不会连带删除别的文件）
+    (seshat-sync-test--write-local "keep.org" "保留\n")
+    (seshat-sync-test--register-baseline "uid-keep" "keep.org")
+    ;; 已登记但本地文件消失（内容与某个新出现的文件并不相同 → 不配对）
+    (seshat-state-set "uid-gone" (list :root "notes" :path "gone.org"
+                                       :base-blob "\"blob0\""
+                                       :size 7 :mtime 1760785200))
+    (let ((stats (seshat-sync-detect-renames)))
+      (should (= 1 (plist-get stats :vanished)))
+      (should (= 0 (plist-get stats :appeared)))
+      (should (= 0 (plist-get stats :renamed)))
+      (should (= 0 (plist-get stats :dirty-marked)))
+      (should-not seshat-sync-test--requests)
+      ;; 本地文件一个不少
+      (should (equal "保留\n" (seshat-sync-test--read-local "keep.org")))
+      ;; 不上报删除、不标墓碑（删除只由服务端 `delete' 事件驱动，见 T1b）
+      (should-not (seshat-state-deleted-uids))
+      (should (equal (cons "notes" "gone.org")
+                     (seshat-state-path-for-uid "uid-gone"))))))
+
+(ert-deftest seshat-sync-test-detect-unpaired-appear-does-nothing ()
+  "未配对的新增 → 不创建、不上报、不标脏，只计入 `:appeared'；本地文件原样保留。"
+  (seshat-sync-test--with-state
+    (seshat-state-set-roots (list (list "notes" seshat-sync-test--dir "mirror")))
+    (seshat-sync-test--write-local "new.org" "用户新写的\n")
+    (let ((stats (seshat-sync-detect-renames)))
+      (should (= 1 (plist-get stats :appeared)))
+      (should (= 0 (plist-get stats :renamed)))
+      (should (= 0 (plist-get stats :vanished)))
+      (should (= 0 (plist-get stats :dirty-marked)))
+      (should-not seshat-sync-test--requests)
+      ;; 不建登记（新文件由用户保存时标脏 + push 建立），也不标脏
+      (should-not (seshat-state-uid-for-path "notes" "new.org"))
+      (should-not (seshat-state-dirty-uids))
+      ;; 本地文件集合不变（没有多出任何文件；状态文件本身不算）
+      (should (equal '("." ".." "new.org")
+                     (sort (cl-remove-if (lambda (file)
+                                           (string-prefix-p "sync-state" file))
+                                         (directory-files seshat-sync-test--dir))
+                           #'string<)))
+      (should (equal "用户新写的\n" (seshat-sync-test--read-local "new.org"))))))
+
+(ert-deftest seshat-sync-test-detect-only-scans-mirror-roots ()
+  "只扫 `mode' = `mirror' 的根：`ondemand' 根里的文件既不计入 `:appeared'，
+也不会把该根的已登记 uid 标脏（不 `stat'、不扫目录）。"
+  (seshat-sync-test--with-state
+    (let ((mirror-dir (expand-file-name "notes" seshat-sync-test--dir))
+          (books-dir (expand-file-name "books" seshat-sync-test--dir)))
+      (make-directory mirror-dir t)
+      (seshat-state-set-roots (list (list "notes" mirror-dir "mirror")
+                                    (list "books" books-dir "ondemand")))
+      ;; ondemand 根下：一个已登记的文件（基线故意给错，若被扫就会标脏）
+      (seshat-sync-test--write-local "books/b.epub" "bytes\n")
+      (seshat-state-set "uid-b" (list :root "books" :path "b.epub"
+                                      :base-blob "\"blob0\""
+                                      :size 0 :mtime 0))
+      ;; ondemand 根下：一个未登记的文件（若被扫就会计入 `:appeared'）
+      (seshat-sync-test--write-local "books/c.epub" "other bytes\n")
+      (let ((stats (seshat-sync-detect-renames)))
+        (should (= 1 (plist-get stats :scanned-roots)))
+        (should (= 0 (plist-get stats :appeared)))
+        (should (= 0 (plist-get stats :vanished)))
+        (should (= 0 (plist-get stats :dirty-marked)))
+        (should-not (seshat-state-dirty-uids))
+        (should-not seshat-sync-test--requests)
+        ;; ondemand 条目位置不变、也没被判为消失
+        (should (equal (cons "books" "b.epub")
+                       (seshat-state-path-for-uid "uid-b")))))))
+
+(ert-deftest seshat-sync-test-detect-skips-tombstones ()
+  "墓碑条目（`:deleted-at' 非 nil）不参与消失判定、不被标 dirty、不产生请求。"
+  (seshat-sync-test--with-state
+    (seshat-state-set-roots (list (list "notes" seshat-sync-test--dir "mirror")))
+    ;; 墓碑：本地文件已不存在，基线故意给错（若被 stat 就会标脏）
+    (seshat-state-set "uid-dead" (list :root "notes" :path "dead.org"
+                                       :base-blob "\"blob0\""
+                                       :size 100 :mtime 200))
+    (seshat-state-mark-deleted "uid-dead")
+    ;; 另一条墓碑：本地文件存在（路径已不占索引，但也不得标脏）
+    (seshat-sync-test--write-local "dead2.org" "残留\n")
+    (seshat-state-set "uid-dead2" (list :root "notes" :path "dead2.org"
+                                        :base-blob "\"blob0\""
+                                        :size 0 :mtime 0))
+    (seshat-state-mark-deleted "uid-dead2")
+    (let ((stats (seshat-sync-detect-renames)))
+      (should (= 0 (plist-get stats :vanished)))
+      (should (= 0 (plist-get stats :dirty-marked)))
+      ;; `dead2.org' 在本地但不占索引 → 只算「新增」，不产生请求
+      (should (= 1 (plist-get stats :appeared)))
+      (should (= 0 (plist-get stats :renamed)))
+      (should-not seshat-sync-test--requests)
+      (should (equal '("uid-dead" "uid-dead2") (seshat-state-deleted-uids)))
+      (should-not (plist-get (seshat-state-get "uid-dead") :dirty))
+      (should-not (plist-get (seshat-state-get "uid-dead2") :dirty)))))
+
+;;; 根映射初始化：`seshat-sync-roots' → `seshat-state-roots'
+;;
+;; 这一节覆盖「生产环境没有任何代码填充 `seshat-state-roots'」这个缺口：
+;; `seshat-sync--ensure-roots' 是唯一的生产填充路径，`seshat-sync-pull' 在
+;; 只读根重置之后、首同步判定之前调用它；未配置时 pull 必须提前返回而不是空转。
+
+(defun seshat-sync-test--roots-requests ()
+  "按发生顺序返回 `/api/roots' 的调用列表。"
+  (cl-remove-if-not (lambda (call)
+                      (string-match-p "/api/roots" (nth 1 call)))
+                    (reverse seshat-sync-test--requests)))
+
+(defun seshat-sync-test--expand (rel)
+  "返回临时目录下相对路径 REL 的 `expand-file-name' 结果（不补结尾斜杠）。"
+  (expand-file-name rel seshat-sync-test--dir))
+
+(ert-deftest seshat-sync-test-ensure-roots-returns-existing-without-request ()
+  "`state :roots' 已非空 → 直接返回，不请求 `/api/roots'、不落盘。
+每次 pull 都会调用本函数，重复请求既慢也会覆盖用户手设的映射。"
+  (seshat-sync-test--with-state
+    (seshat-state-set-roots (list (list "notes" "/tmp/notes" "mirror")))
+    (let ((result (seshat-sync--ensure-roots)))
+      (should (equal '(("notes" "/tmp/notes" "mirror")) result))
+      (should (equal '(("notes" "/tmp/notes" "mirror")) (seshat-state-roots)))
+      (should-not (seshat-sync-test--roots-requests))
+      (should (= 0 seshat-sync-test--saves)))))
+
+(ert-deftest seshat-sync-test-ensure-roots-uses-configured-modes ()
+  "`state' 空 + 两项都显式给出 MODE → 不请求 `/api/roots'，两项写入 state 并落盘。
+MODE 写入**字符串**（`seshat-state-roots' 的口径）：符号 `mirror' 必须归一，
+否则 `seshat-sync--mirror-roots' 会把该根整根过滤掉。"
+  (seshat-sync-test--with-state
+    (let ((seshat-sync-roots (list (list "notes" (seshat-sync-test--expand "notes") 'mirror)
+                                   (list "books" (seshat-sync-test--expand "books") 'ondemand))))
+      (let ((result (seshat-sync--ensure-roots)))
+        (should (equal (list (list "notes" (seshat-sync-test--expand "notes") "mirror")
+                             (list "books" (seshat-sync-test--expand "books") "ondemand"))
+                       result))
+        (should (equal result (seshat-state-roots)))
+        ;; 符号已归一为字符串：mirror 根能被子系统的口径认出来
+        (should (equal '(("notes" "mirror")
+                         ("books" "ondemand"))
+                       (mapcar (lambda (root) (list (nth 0 root) (nth 2 root)))
+                               result)))
+        (should (= 1 (length (seshat-sync--mirror-roots))))
+        (should-not (seshat-sync-test--roots-requests))
+        (should (= 1 seshat-sync-test--saves))))))
+
+(ert-deftest seshat-sync-test-ensure-roots-fills-mode-from-server-once ()
+  "MODE 为 nil → 请求 `/api/roots' **一次**（多个待补共用同一响应），按 tag 补齐后写入。"
+  (seshat-sync-test--with-state
+    (setq seshat-sync-test--roots-response
+          (seshat-sync-test--roots-body '(("notes" "mirror" t)
+                                          ("books" "ondemand" nil))))
+    (let ((seshat-sync-roots (list (list "notes" (seshat-sync-test--expand "notes") nil)
+                                   (list "books" (seshat-sync-test--expand "books") nil))))
+      (let ((result (seshat-sync--ensure-roots)))
+        (should (= 1 (length (seshat-sync-test--roots-requests))))
+        (should (equal (list (list "notes" (seshat-sync-test--expand "notes") "mirror")
+                             (list "books" (seshat-sync-test--expand "books") "ondemand"))
+                       result))
+        (should (equal result (seshat-state-roots)))
+        (should (= 1 seshat-sync-test--saves))))))
+
+(ert-deftest seshat-sync-test-ensure-roots-skips-tag-missing-on-server ()
+  "配置了服务端不存在的 tag → 该项跳过并警告，其余项照常写入。
+服务端没有该 tag 时没有权威 mode，猜一个（比如默认 mirror）会把只读书库当成
+可写根——宁可跳过并让用户看到警告。"
+  (seshat-sync-test--with-state
+    (setq seshat-sync-test--roots-response
+          (seshat-sync-test--roots-body '(("notes" "mirror" t))))
+    (let ((seshat-sync-roots (list (list "notes" (seshat-sync-test--expand "notes") 'mirror)
+                                   (list "ghost" (seshat-sync-test--expand "ghost") nil))))
+      (let ((result (seshat-sync--ensure-roots)))
+        (should (equal (list (list "notes" (seshat-sync-test--expand "notes") "mirror"))
+                       result))
+        (should (equal result (seshat-state-roots)))
+        ;; ghost 的 mode 待补 → 仍要问服务端一次（共用一次响应）
+        (should (= 1 (length (seshat-sync-test--roots-requests))))
+        (should (= 1 (length (seshat-sync-test--warnings-matching "ghost"))))
+        (should (= 1 seshat-sync-test--saves))))))
+
+(ert-deftest seshat-sync-test-ensure-roots-unconfigured-warns-and-writes-nothing ()
+  "`seshat-sync-roots' 为空 → 返回 nil + 一次警告，不写 state、不请求 `/api/roots'。
+「不猜目录」是硬约束：服务端根与本地目录的对应关系只有用户说得清。"
+  (seshat-sync-test--with-state
+    (let ((seshat-sync-roots nil))
+      (should-not (seshat-sync--ensure-roots))
+      (should-not (seshat-state-roots))
+      (should-not (seshat-sync-test--roots-requests))
+      (should (= 0 seshat-sync-test--saves))
+      (should (= 1 (length (seshat-sync-test--warnings-matching
+                            "未配置 `seshat-sync-roots'")))))))
+
+(ert-deftest seshat-sync-test-pull-returns-early-when-roots-unconfigured ()
+  "`--ensure-roots' 返回 nil 时 `seshat-sync-pull' 提前返回：不建索引、不追平、
+不拉变更（桩断言三个后续步骤都未被调用）。"
+  (seshat-sync-test--with-state
+    (let ((seshat-sync-roots nil))
+      (seshat-sync-test--with-call-log
+        (let ((result (seshat-sync-pull)))
+          (should-not (plist-get result :configured))
+          (should-not (plist-get result :first-sync))
+          (should-not (plist-get result :index))
+          (should-not (plist-get result :changes))
+          ;; 只发生了 reset 与（返回 nil 的）ensure-roots
+          (should (equal '(reset ensure-roots)
+                         (nreverse seshat-sync-test--calls)))
+          ;; 零请求：连建索引的 `/api/resources' 都没发
+          (should-not seshat-sync-test--requests)
+          (should (= 0 (seshat-state-cursor)))
+          (should (= 0 seshat-sync-test--saves)))))))
+
+(ert-deftest seshat-sync-test-pull-ensures-roots-between-reset-and-index ()
+  "成功路径：`--ensure-roots' 在 `--reset-read-only-roots' **之后**、
+`--build-index' **之前**被调用，且本次 pull 就把根映射落进 state。
+（顺序错误会让首同步在 roots 为空时建索引，或让只读根缓存跨轮残留。）"
+  (seshat-sync-test--with-state
+    (let ((seshat-sync-roots (list (list "notes" (seshat-sync-test--expand "notes") 'mirror))))
+      (seshat-sync-test--with-call-log
+        (let ((result (seshat-sync-pull)))
+          (should (eq t (plist-get result :configured)))
+          (should (eq t (plist-get result :first-sync)))
+          (should (equal '(reset ensure-roots build-index catch-up)
+                         (nreverse seshat-sync-test--calls)))
+          ;; roots 已落盘，后续 status 的根解析才有依据
+          (should (equal (list (list "notes" (seshat-sync-test--expand "notes") "mirror"))
+                         (seshat-state-roots)))
+          (should-not (seshat-sync-test--roots-requests))
+          ;; 建索引确实按该根发起了 `/api/resources' 请求
+          (should (= 1 (length (seshat-sync-test--resource-calls)))))))))
 
 (provide 'seshat-sync-test)
 
