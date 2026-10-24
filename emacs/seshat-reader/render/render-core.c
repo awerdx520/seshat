@@ -317,10 +317,22 @@ draw_page_thread(void *arg)
 										args->hl[i].y1);
 								}
 
+							/* 这里必须传 fz_identity，不能传 ctm。
+							 * device 已经在 fz_new_draw_device(ctx, ctm, pixmap)
+							 * 处持有了 user→device（页面空间→像素）的变换，
+							 * 这与 fz_new_pixmap_from_display_list 的惯例一致：
+							 * device 拿 ctm，往它上面绘制时方法自带 ctm 传 identity。
+							 *
+							 * 若此处再传 ctm，会被与 device 持有的变换复合两次，
+							 * 高亮坐标按 scale² 放大（当前 scale≈1.574 → 约 2.48 倍），
+							 * 矩形被画到页面外右下方，用户完全看不到。
+							 *
+							 * fz_rectto 传入的仍是 page space（页面空间）坐标，
+							 * 无需在 Lisp 侧做任何坐标变换。 */
 							fz_fill_path(
 								ctx, dev, path,
 								0 /* non-zero winding */,
-								ctm,
+								fz_identity,
 								fz_device_rgb(ctx),
 								highlight_color,
 								HIGHLIGHT_ALPHA,
@@ -335,8 +347,19 @@ draw_page_thread(void *arg)
 						}
 					fz_catch(ctx)
 						{
-							/* Highlights are decorative:
-							 * never fail the page for them. */
+							/* 高亮是装饰：绝不让它把整页
+							 * 渲染搞失败。但也别让失败彻底
+							 * 无声——同类变换错误（如 ctm
+							 * 被应用两次）曾让高亮整体偏移却
+							 * 毫无线索。用原子标志把告警限制
+							 * 为每进程一次，避免每帧刷屏。 */
+							static atomic_bool warned = false;
+
+							if (!atomic_exchange(&warned, true))
+								fz_warn(
+									ctx,
+									"highlight painting failed: %s",
+									fz_caught_message(ctx));
 						}
 				}
 

@@ -1176,6 +1176,18 @@
 - 影响：口径漂移会导致「同一条路径在三处得到不同结论」，其中任何一处松懈都是路径逃逸的入口（安全隐患）。三份 docstring 已互相引用说明，但依赖人工同步。
 - 建议：抽一个共享函数（如 `seshat-path-safe-join`，放在 `seshat-state` 或新模块 `seshat-path.el`），三处统一调用；抽之前若必须改其中一处，务必同步另两处并各补一条软链用例。
 
+## C 侧渲染像素路径无自动化回归（2026-10-24）
+
+- 现象：高亮矩形的绘制（`draw_page_thread` 的 `fz_fill_path`）完全在 C 层，ERT 只对 elisp 层的 `--add-highlight` 做 mock / 间接断言，全仓 682 例全绿也**不能**证明高亮落点正确。
+- 影响：2026-10-24 修复的「双重变换导致高亮按 scale² 放大」若无用户目视反馈不会被任何测试发现。
+- 待办：① 已做——`fz_catch` 里的高亮异常改为 `fz_warn` 且在每进程只告警一次，同类变换错误会留下日志；② 仍未做——为渲染路径补一条最小回归（headless 下渲染固定页面 + 在已知 rect 画高亮，导出 PNM 后断言该区域像素被着色）。
+
+## HiDPI 下渲染分辨率未含 frame scale（2026-10-24，假设?）
+
+- 现象：`emacs_doc_scale_page` 的 `resolution = scale × 72` 不含 `frame_scale`，而 `local_imgw = fz_pixmap_width / frame_scale` 交给 Emacs 作 `:width`；elisp 侧 `posn->page` 又乘一次 `frame_scale`。本机 `frame-scale-factor` 恒为 1.0（三个 frame 实测）时三者自洽，但 `> 1` 时位图分辨率相对显示尺寸偏低（画面被放大、偏糊），且乘/除方向不对称。
+- 状态：本机无法复现，未修改。
+- 待办：在 `frame-scale-factor > 1` 的环境（或临时构造该参数）下复测，再决定是否把 `frame_scale` 纳入 `resolution` 并同步调整 elisp 侧换算。
+
 
 
 
