@@ -370,6 +370,409 @@ schema 固定为八个字段，见 `seshat-state--normalize-entry'，第九个�
           :items items
           :skipped-roots skipped)))
 
+;;; 事件应用（T1b）：四类 changes 事件的唯一实现
+;;
+;; 首同步追平（T1c）与增量循环（T1d）**共用**本节这一个实现：事件应用只允许有
+;; 一处，否则两条路径对 `rename' / `ondemand' 的口径迟早漂移。本节只做「单事件
+;; → 本地文件 + 状态库」；批量块、`state-save' 与游标推进留给调用方。
+
+(defun seshat-sync--root-entry (root)
+  "返回根 tag ROOT 在 `seshat-state-roots' 里的三元组 `(TAG DIR MODE)'；未配置时返回 nil.
+ROOT 非字符串（nil / 数字等）时同样返回 nil：事件里的 `:root' 可能因服务端异常
+而缺失，不能让它落到 `assoc' 的比较上（`assoc' 用 `equal'，nil 会去匹配畸形
+元素）。"
+  (and (stringp root) (assoc root (seshat-state-roots))))
+
+(defun seshat-sync--root-dir (root)
+  "返回根 tag ROOT 对应的本地目录（`expand-file-name' 归一，带结尾斜杠）；未配置时返回 nil.
+查找依据是 `seshat-state-roots' 的元素 `(TAG DIR MODE)'；DIR 不是非空字符串时
+同样视为「未配置」。
+
+返回 nil 时调用方应**跳过落盘**并发一次警告，**不得**凭空构造路径（例如退化成
+其他本地目录或临时目录）：服务端的根与本地目录的对应关系只有用户配置说得清，
+自动兜底只会把文件写到意料之外的地方。"
+  (let ((dir (nth 1 (seshat-sync--root-entry root))))
+    (when (and (stringp dir) (not (string-empty-p dir)))
+      (file-name-as-directory (expand-file-name dir)))))
+
+(defun seshat-sync--local-path (root-dir path)
+  "把服务端下发的相对路径 PATH 拼到 ROOT-DIR 下，并校验结果仍在 ROOT-DIR 之内.
+返回归一化后的绝对路径；下列任一情形返回 nil（调用方据此**不落盘、不删除**）：
+
+- PATH 不是非空字符串；
+- PATH 是绝对路径（以 \"/\" 开头）；
+- PATH 以 \"~\" 开头（`expand-file-name' 会把它展开成家目录）；
+- PATH 带 Windows 盘符前缀（如 \"C:\"）；
+- PATH 经 `expand-file-name' 归一后仍在 ROOT-DIR **之外**，即含 `..' 穿越
+  （例如 \"../../etc/passwd\"、\"a/../../b.org\"）。
+
+二次确认：先做字符串前缀比较（快且可读），再用 `file-truename' 比对规范化后的
+真实路径，覆盖符号链接逃逸（例如根目录是 `/tmp/link' → `/etc'，则
+`/tmp/link/x' 的真实路径在 `/etc' 下）。不用 `file-in-directory-p'：该函数要求
+DIR **已存在**，否则一律返回 nil——而首次下载时镜像根目录可能尚未创建，用它会把
+合法路径全部误判为越界；`file-truename' 对不存在的路径同样有效（解析已存在的
+祖先、其余原样保留）。`file-truename' 出错（父目录不可访问等）按「不安全」处理，
+失败方向安全。
+
+**与 `seshat-sync-cmd--safe-local-path' 的关系**：口径一致（那一个只做纯字符串
+规范化，由 `seshat-sync-pull-all' 再配 `file-in-directory-p' 二次校验；本函数把
+两步合成一处并直接返回绝对路径）。本文件**不能** require `seshat-sync-cmd'
+（它是本文件的上层，反向依赖会成环），故此处自行实现；改口径时两处必须同步。
+
+这是**安全底线**：服务端（或中间人）下发的路径不可信，任何越界都必须拒绝，
+否则一条 `delete' 事件就能删掉根目录之外的任意文件。"
+  (when (and (stringp root-dir) (not (string-empty-p root-dir))
+             (stringp path) (not (string-empty-p path))
+             (not (string-prefix-p "/" path))
+             (not (string-prefix-p "~" path))
+             (not (string-match-p "\\`[A-Za-z]:" path)))
+    (let* ((dir (file-name-as-directory (expand-file-name root-dir)))
+           (expanded (expand-file-name path dir))
+           (true-dir (ignore-errors (file-name-as-directory (file-truename dir))))
+           (true-file (ignore-errors (file-truename expanded))))
+      (when (and (string-prefix-p dir expanded)
+                 true-dir true-file
+                 (string-prefix-p true-dir true-file))
+        expanded))))
+
+(defun seshat-sync--event-set-location (uid root path)
+  "把 UID 在状态库里的位置改成 `(ROOT . PATH)'，返回新条目.
+**merge 而非整体覆盖**：只改 `:root' / `:path'，其余字段（`:base-blob'
+`:size' `:mtime' `:dirty' `:deleted-at' `:orphan'）保持原值。用
+`seshat-state-set' 整体覆盖会清掉 `:base-blob'，下一轮 push 就会把服务端早已
+存在的文件误判为新建（连发 `If-None-Match: *' 并撞 412）——见计划 D8 的
+「状态条目 schema」。
+
+不走 `seshat-state-remap'：remap 会顺带清 `:orphan'、并把占据同路径的旧属主标为
+孤儿，那是**改名语义**（一个 uid 让位）；create / update 只是重申服务端的位置，
+不该改动其它 uid。"
+  (seshat-state--update-entry
+   uid
+   (lambda (entry)
+     (setq entry (seshat-state--entry-put entry :root root))
+     (seshat-state--entry-put entry :path path))))
+
+(defun seshat-sync--apply-event (event)
+  "应用一条 `changes' 事件 EVENT：更新本地文件与状态库，成功返回 t.
+
+EVENT 是 `seshat-rest-changes' 解出的事件 plist（`:seq' `:uid' `:op' `:root'
+`:path' `:old-path' `:blob' `:rev' `:changed-at'）。`:op' 是**字符串**（JSON 原值
+\"create\" / \"update\" / \"rename\" / \"delete\"），故比较一律用 `equal'，不要用
+`eq'（字符串 `eq' 依赖实现）或 `intern'（凭空造符号）。
+
+四类事件的动作（对应计划 D3 第 3 步）：
+
+- \"create\" / \"update\"：`mirror' 根按事件的 `:blob' 与状态库的 `:base-blob'
+  比较——相同**且**本地文件存在时不下载（只把状态里的 `:root' / `:path' 对齐），
+  否则用 `seshat-rest-download-file' 落盘（该函数内部已硬编码 `:binary t'，
+  **不要**再传 `:binary' 关键字），落盘成功后 `seshat-state-set-base-blob' 写入
+  BLOB（取事件的 `:blob'）、SIZE 与 MTIME（取**落盘后**本地 `file-attributes'，
+  mtime 换算成 Unix 秒整数，D5 的基线依赖它）。`ondemand' 根**只在本地缺文件
+  时**下载（书库按需）。
+- \"rename\"：本地文件从 `:old-path' 搬到 `:path'，随后 `seshat-state-remap'
+  （三参：UID、事件 `:root'、事件 `:path'）。旧文件不存在则跳过搬运；搬运失败
+  （目标已存在等）只告警**仍 remap**——uid ↔ path 以服务端为准，本地搬运只是
+  尽力而为。
+- \"delete\"：删除本地文件（不存在则忽略），随后 `seshat-state-mark-deleted'
+  （墓碑保留 `:base-blob'，见该函数 docstring）。
+
+前置校验（任一不满足即整条事件跳过：不改状态、不落盘、不删除）：
+
+1. 事件缺 uid；
+2. `:op' 未知（例如 \"rescan\"）；
+3. 根 `:root' 未在 `seshat-state-roots' 里配置（`seshat-sync--root-dir' 返回
+   nil）——不凭空造路径；
+4. 服务端路径经 `seshat-sync--local-path' 判定越界（安全底线）。
+
+返回值：应用成功 t；跳过（上述四种，以及下载遇只读根 / 远端已不存在 / 其它
+失败）nil。**除编程错误外不抛错**——单条事件失败不应中断整轮同步，下载失败、
+删除失败、改名失败一律降级为 `display-warning' + nil（改名失败例外：仍 remap
+并返回 t，因为状态已对齐服务端）。
+
+批量语义：本函数**自身不进入** `seshat-state-batch'——下载是 I/O，且批量块应由
+调用方包住**整批**事件（T1c 首同步追平 / T1d 增量循环）；调用方应在
+`seshat-state-batch' 块内调用本函数，以减少 `:paths' 重建次数，并在每批结束后
+`seshat-state-save' 一次、**最后**才推进游标。"
+  (let* ((uid (plist-get event :uid))
+         (op (plist-get event :op))
+         (root (plist-get event :root))
+         (path (plist-get event :path))
+         (old-path (plist-get event :old-path))
+         (seq (plist-get event :seq))
+         (root-dir (seshat-sync--root-dir root))
+         (ondemand (equal "ondemand" (nth 2 (seshat-sync--root-entry root)))))
+    (cond
+     ;; ---- 前置校验 ----
+     ((not (and (stringp uid) (not (string-empty-p uid))))
+      (display-warning 'seshat-sync
+                       (format "事件 #%s %S：缺少 uid，跳过" seq op) :warning)
+      nil)
+     ((not (member op '("create" "update" "rename" "delete")))
+      (display-warning 'seshat-sync
+                       (format "事件 #%s：未知 op %S（uid %s），跳过" seq op uid)
+                       :warning)
+      nil)
+     ((null root-dir)
+      (display-warning 'seshat-sync
+                       (format "事件 #%s %s：根 %S 未配置本地目录（uid %s），跳过"
+                               seq op root uid)
+                       :warning)
+      nil)
+     ;; ---- create / update ----
+     ((member op '("create" "update"))
+      (let ((local (seshat-sync--local-path root-dir path)))
+        (if (null local)
+            (progn
+              (display-warning 'seshat-sync
+                               (format "事件 #%s %s：服务端路径 %S 越界（uid %s），跳过"
+                                       seq op path uid)
+                               :warning)
+              nil)
+          (let* ((blob (plist-get event :blob))
+                 (base-blob (plist-get (seshat-state-get uid) :base-blob))
+                 (exists (file-exists-p local))
+                 (need-download (if ondemand
+                                    (not exists)
+                                  (not (and exists (equal blob base-blob))))))
+            (if (not need-download)
+                ;; 内容未变（或 ondemand 根已有本地副本）：只对齐位置
+                (progn (seshat-sync--event-set-location uid root path) t)
+              (let* ((result (seshat-rest-download-file path local :root root))
+                     (status (plist-get result :status)))
+                (cond
+                 ((plist-get result :read-only-root)
+                  (seshat-sync--mark-root-read-only root)
+                  nil)
+                 ((plist-get result :not-found)
+                  (display-warning 'seshat-sync
+                                   (format "事件 #%s %s：远端 %S 已不存在（uid %s），跳过"
+                                           seq op path uid)
+                                   :warning)
+                  nil)
+                 ((not (and (integerp status) (>= status 200) (< status 300)))
+                  (display-warning 'seshat-sync
+                                   (format "事件 #%s %s：下载 %S 失败（状态 %S，%S），跳过"
+                                           seq op path status
+                                           (plist-get result :error))
+                                   :warning)
+                  nil)
+                 (t
+                  (seshat-sync--event-set-location uid root path)
+                  (let* ((attrs (file-attributes local))
+                         (mtime (nth 5 attrs)))
+                    (seshat-state-set-base-blob
+                     uid blob (nth 7 attrs)
+                     (and mtime (truncate (float-time mtime)))))
+                  t))))))))
+     ;; ---- rename ----
+     ((equal op "rename")
+      (let ((new-local (seshat-sync--local-path root-dir path))
+            (old-local (seshat-sync--local-path root-dir old-path)))
+        (if (null new-local)
+            (progn
+              (display-warning 'seshat-sync
+                               (format "事件 #%s rename：目标路径 %S 越界（uid %s），跳过"
+                                       seq path uid)
+                               :warning)
+              nil)
+          (when (and old-local (file-exists-p old-local))
+            (condition-case err
+                (progn
+                  (make-directory (file-name-directory new-local) t)
+                  (rename-file old-local new-local))
+              (error
+               (display-warning 'seshat-sync
+                                (format "事件 #%s rename：本地改名 %S → %S 失败（%s），仍按服务端更新状态"
+                                        seq old-path path
+                                        (error-message-string err))
+                                :warning))))
+          (seshat-state-remap uid root path)
+          t)))
+     ;; ---- delete（前面已排除未知 op，这里即 delete）----
+     (t
+      (let ((local (seshat-sync--local-path root-dir path)))
+        (if (null local)
+            (progn
+              (display-warning 'seshat-sync
+                               (format "事件 #%s delete：服务端路径 %S 越界（uid %s），跳过"
+                                       seq path uid)
+                               :warning)
+              nil)
+          (when (file-exists-p local)
+            (condition-case err
+                (delete-file local)
+              (error
+               (display-warning 'seshat-sync
+                                (format "事件 #%s delete：删除本地 %S 失败（%s），仍标记墓碑"
+                                        seq local (error-message-string err))
+                                :warning))))
+          (seshat-state-mark-deleted uid)
+          t))))))
+
+;;; 首同步追平与增量循环（T1c / T1d）：游标推进的唯一实现
+;;
+;; 首同步追平（`seshat-sync--catch-up'）与增量循环（`seshat-sync--pull-changes'）
+;; 的差别**只有起点游标**：前者固定从 0 追平（`changes?since=0' 是权威全集，见
+;; 计划 H1），后者从状态库里的游标继续。循环体、批大小、批量块的位置、游标推进
+;; 与落盘顺序必须完全一致，因此两条路径共用 `seshat-sync--pull-batches' 一个
+;; 实现——否则「先写游标再 apply」这类顺序错误迟早只出现在其中一条路径上。
+
+(defconst seshat-sync--changes-batch-limit 2000
+  "每批 `changes' 请求的事件条数.
+服务端把 `limit' 夹紧到 [1, 2000]，取上限以减少往返次数：首同步追平一个大
+书库时，往返次数是主要成本（计划 D3 第 1.b 步）。")
+
+(defun seshat-sync--apply-changes-batch (changes)
+  "在一整块 `seshat-state-batch' 内应用事件列表 CHANGES，返回实际应用的条数.
+返回值为 `seshat-sync--apply-event' 返回 t 的事件数（被跳过的事件——未知 op、
+根未配置、路径越界、下载失败——不计入）。
+
+顺序上的不变量有两处，都靠本函数的位置保证：
+
+1. **一个批量块包住整批事件**：块内 `:paths' 不重建，块退出时由宏统一重建
+   一次（否则每个事件都要付一次 O(n) 重建，见 `seshat-state-batch'）；
+2. 本函数**只做 apply**——游标推进与 `state-save' 一律留给调用方，且必须在
+   本函数返回（批量块已退出）之后：块内 `:paths' 还是批前形状，此时落盘会写出
+   与 `:uids' 不一致的索引。"
+  (let ((cool 0))
+    (seshat-state-batch
+      (dolist (event changes)
+        (when (seshat-sync--apply-event event)
+          (setq cool (1+ cool)))))
+    cool))
+
+(defun seshat-sync--pull-batches (since-seq)
+  "从 SINCE-SEQ 起循环拉取 `changes' 并逐批应用，返回统计 plist.
+首同步追平与增量循环共用本实现（调用方见 `seshat-sync--catch-up' /
+`seshat-sync--pull-changes'）。
+
+每一批的固定顺序（顺序本身是不变量，不得调整）：
+
+1. 在 `seshat-state-batch' 块内应用该批全部事件（`seshat-sync--apply-changes-batch'）；
+2. 批量块退出——由宏统一重建一次 `:paths'；
+3. `(seshat-state-set-cursor (plist-get resp :next-cursor))'；
+4. `seshat-state-save'。
+
+**游标最后写**：中途 `C-g' 或下载报错时游标停在上一批，重放该批是幂等的
+（事件应用按 uid upsert，`seshat-sync--event-set-location' 走 merge），既不会漏
+事件、也不会产生重复条目。**第 3、4 步必须在批量块之外**：块内 `:paths' 陈旧，
+这时落盘会写出「`:uids' 已更新、`:paths' 停留在批前形状」的不一致索引。
+
+`:has-more' 为真时**立即**用本批的 `:next-cursor' 再拉一轮，不 `sleep-for'：
+服务端游标单调递增，人为延迟只会把追平时间按批数放大。
+
+非 2xx / 传输失败：发一条警告后**停止**本轮（不重试、不退避），返回已经完成的
+统计。调用方（定时器或用户命令）下一轮会从状态库里的游标继续，本身就是一次
+天然的重试，在函数内自旋只会刷屏。
+
+返回 plist `(:batches N :events N :cool N)'：成功处理的批数、收到的事件数、
+被实际应用的事件数。`cool' 小于 `events' 是正常的——被跳过的事件仍然消耗了
+服务端的游标，游标照样要前进（否则同一批会被反复重放）。"
+  (let ((since since-seq)
+        (batches 0)
+        (events 0)
+        (cool 0)
+        (done nil))
+    (while (not done)
+      (let* ((response (seshat-rest-changes
+                        :since-seq since
+                        :limit seshat-sync--changes-batch-limit))
+             (status (plist-get response :status)))
+        (if (not (and (integerp status) (>= status 200) (< status 300)))
+            (progn
+              (display-warning 'seshat-sync
+                               (format "拉取变更：请求失败（状态 %S，since %s），停止本轮"
+                                       status since)
+                               :warning)
+              (setq done t))
+          (let* ((changes (plist-get response :changes))
+                 (next (plist-get response :next-cursor))
+                 ;; 畸形响应（成功但缺 next_cursor）时保持原游标，绝不前进到 nil
+                 ;; （`seshat-state-set-cursor' 会因非整数直接报错）
+                 (cursor (if (and (integerp next) (>= next 0)) next since)))
+            (setq batches (1+ batches))
+            (setq events (+ events (length changes)))
+            (setq cool (+ cool (seshat-sync--apply-changes-batch changes)))
+            ;; ① apply 已完成、② 批量块已退出 → ③ 推进游标 → ④ 落盘
+            (seshat-state-set-cursor cursor)
+            (seshat-state-save)
+            (cond
+             ;; 正常结束：服务端说没有更多了
+             ((not (plist-get response :has-more))
+              (setq done t))
+             ;; 前进性守卫：`:has-more' 为真但游标没有前进（畸形响应：成功却缺
+             ;; `next_cursor'，或回传的 next_cursor 不大于 since）→ 停止。没有这条
+             ;; 守卫就会用同一个 since 无限重拉同一批（计划「不得无限重试」）。
+             ((<= cursor since)
+              (display-warning 'seshat-sync
+                               (format "拉取变更：还有更多但游标未前进（%s），停止本轮以免重复拉取"
+                                       cursor)
+                               :warning)
+              (setq done t))
+             (t (setq since cursor)))))))
+    (list :batches batches :events events :cool cool)))
+
+(defun seshat-sync--catch-up ()
+  "首同步第二步：`changes?since=0' 追平并取游标（计划 D3 第 1.b 步 / T1c）.
+这是**权威全集**：`seq' 单调、按游标分页无损、事件应用幂等，因此可安全重放。
+预建索引（`seshat-sync--build-index'）只是尽力而为的预建，索引缺失的条目由本步
+补齐（兜底方向是「索引缺 → changes 补」，见计划 H1）。
+
+固定从 0 起——首同步不信任状态库里的任何残留游标。其余语义（批量块、游标后写、
+`:has-more' 立即再拉、非 2xx 停止）全部见 `seshat-sync--pull-batches'。"
+  (seshat-sync--pull-batches 0))
+
+(defun seshat-sync--pull-changes ()
+  "增量：从状态库游标起拉取 `changes' 并逐批应用（计划 D3 第 2 步 / T1d）.
+起点是 `(seshat-state-cursor)'，即上轮最后落盘的游标；语义为「只返回
+`seq > cursor' 的事件」（服务端 `changes' 的 `since' 是 seq，不是 mtime，见
+计划 D8）。`:has-more' 为真时立即再拉，不 sleep；游标与落盘顺序与首同步追平
+完全一致（同一实现 `seshat-sync--pull-batches'）。"
+  (seshat-sync--pull-batches (seshat-state-cursor)))
+
+;;; 编排入口（T1d）
+
+(defun seshat-sync--first-sync-p ()
+  "判断本次 pull 是否属首同步.
+判据：游标为 0 **且** 状态库没有任何 uid 登记。
+
+两者都要看：只看游标会把「服务端变更流为空但索引已建好」的书库反复当首同步
+（每次都重跑一遍全库索引）；只看 `:uids' 则会把「已有登记但从未追平过变更流」
+的半成品当成增量。
+
+`:uids' 没有公开访问器（`seshat-state' 只暴露 `-dirty-uids' / `-deleted-uids'
+这类筛选过的视图），这里按计划 D8 的等价手段直接读内存状态——用 `--ensure'
+而非 `plist-get' 裸取，保证首次调用前状态已从磁盘加载。"
+  (and (= 0 (seshat-state-cursor))
+       (null (plist-get (seshat-state--ensure) :uids))))
+
+(defun seshat-sync-pull ()
+  "同步引擎的 pull 入口：按首同步 / 增量两条路径把服务端变更拉到本地.
+编排（计划 D3 第 1、2 步）：
+
+- 开头 `seshat-sync--reset-read-only-roots'：只读根缓存跨轮必须清空，否则上一轮
+  被判只读的根（服务端配置可能已经改回 `mirror'）会静默跳过整轮；
+- **首同步**（`seshat-sync--first-sync-p'）：先 `seshat-sync--build-index' 预建
+  索引，再 `seshat-sync--catch-up' 追平取游标；
+- **增量**：只调 `seshat-sync--pull-changes'。
+
+本函数**不做 push、不做 rename 检测**：那两步由 `seshat-sync-now' 的编排
+（T4）串在 pull 之后。返回值 plist：
+
+- `:first-sync' — 是否走了首同步路径；
+- `:index' — 首同步时的建索引统计（`seshat-sync--build-index' 的返回值）；
+  增量路径为 nil（本轮没有建索引）；
+- `:changes' — 追平 / 增量循环的统计 `(:batches N :events N :cool N)'。"
+  (seshat-sync--reset-read-only-roots)
+  (if (seshat-sync--first-sync-p)
+      (let ((index (seshat-sync--build-index)))
+        (list :first-sync t
+              :index index
+              :changes (seshat-sync--catch-up)))
+    (list :first-sync nil
+          :index nil
+          :changes (seshat-sync--pull-changes))))
+
 (provide 'seshat-sync)
 
 ;;; seshat-sync.el ends here
