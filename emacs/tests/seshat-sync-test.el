@@ -69,6 +69,12 @@
 队列耗尽时回一个空的 200——既能让用例收尾，也能在「本该下载却没下载」时通过
 调用次数断言暴露问题（而不是让用例挂死）。")
 
+(defvar seshat-sync-test--versions nil
+  "本次用例排队等待消费的 `/api/versions' 响应列表（先进先出）.
+push 的 412 分支用它取祖先内容（`:content'）。队列耗尽时回一个 `content' 为空
+串的 200，使「本该取祖先却没取」同样能靠调用次数断言暴露，而不是抛「未预期的
+请求」把用例打断。")
+
 (defvar seshat-sync-test--changes nil
   "本次用例排队等待消费的 `/api/changes' 响应列表（先进先出）.
 队列耗尽时回一个「空批次、`has_more' 为 false」的 200，使循环必然终止；用例
@@ -108,6 +114,7 @@ nil（空状态起步），`seshat-sync--read-only-roots' 为空，传输层与
           (seshat-sync-test--requests nil)
           (seshat-sync-test--pages nil)
           (seshat-sync-test--downloads nil)
+          (seshat-sync-test--versions nil)
           (seshat-sync-test--changes nil)
           (seshat-sync-test--roots-response nil)
           (seshat-sync-test--saves 0)
@@ -161,6 +168,10 @@ nil（空状态起步），`seshat-sync--read-only-roots' 为空，传输层与
     (or (pop seshat-sync-test--changes)
         (list :status 200 :headers nil
               :body "{\"changes\":[],\"next_cursor\":0,\"has_more\":false}")))
+   ((string-match-p "/api/versions/" url)
+    (or (pop seshat-sync-test--versions)
+        (list :status 200 :headers nil
+              :body (json-encode '((head . "") (content . ""))))))
    ((string-match-p "/api/files/" url)
     (or (pop seshat-sync-test--downloads)
         (list :status 200 :headers nil :body "")))
@@ -1318,6 +1329,401 @@ BODY 期间 `seshat-sync-test--calls' 为反向累积的符号列表
       (should (equal '(reset build-index catch-up)
                      (nreverse seshat-sync-test--calls)))
       (should-not (seshat-sync--read-only-root-p "books")))))
+
+;;; push（T2）用的辅助
+
+(defun seshat-sync-test--register (uid rel &optional base)
+  "把 UID 登记为根 \"notes\" 下的 REL（可选 BASE 为 `:base-blob'），返回 UID.
+只登记**位置与基线**，不标脏——是否待推送由用例显式决定。"
+  (seshat-state-set uid (list :root "notes" :path rel :base-blob base))
+  uid)
+
+(defun seshat-sync-test--register-dirty (uid rel &optional base)
+  "登记 UID → REL（可选 BASE 基线）并标记为 dirty，返回 UID."
+  (seshat-sync-test--register uid rel base)
+  (seshat-state-mark-dirty uid)
+  uid)
+
+(defun seshat-sync-test--calls-matching (method regexp)
+  "按发生顺序返回 METHOD 与 URL 同时匹配的调用列表（REGEXP 匹配 URL）。"
+  (cl-remove-if-not (lambda (call)
+                      (and (equal method (nth 0 call))
+                           (string-match-p regexp (nth 1 call))))
+                    (reverse seshat-sync-test--requests)))
+
+(defun seshat-sync-test--uploads ()
+  "按发生顺序返回 `PUT /api/files' 的调用列表（推送请求）。"
+  (seshat-sync-test--calls-matching "PUT" "/api/files/"))
+
+(defun seshat-sync-test--version-calls ()
+  "按发生顺序返回 `/api/versions' 的调用列表（取祖先）。"
+  (seshat-sync-test--calls-matching "GET" "/api/versions/"))
+
+(defun seshat-sync-test--header (call name)
+  "返回被桩调用 CALL 的请求头 NAME 的值（字符串）；无该头时返回 nil.
+NAME 用服务端写法（如 \"If-Match\"），比较时大小写不敏感。"
+  (let ((headers (plist-get (nth 2 call) :headers)))
+    (cdr (assoc name headers
+                (lambda (a b) (equal (downcase a) (downcase b)))))))
+
+(defun seshat-sync-test--upload-ok (etag)
+  "构造 `PUT /api/files' 的成功响应，JSON 里带 ETAG 与一个提交 hash `rev'.
+`rev' 故意与 ETAG 不同：用例断言 base blob 取的是 `:etag' 而**不是** `:rev'。"
+  (list :status 200
+        :headers nil
+        :body (json-encode (list (cons 'uid "uid-a")
+                                 (cons 'etag etag)
+                                 (cons 'rev "deadbeefrev")))))
+
+(defun seshat-sync-test--upload-status (status)
+  "构造 `PUT /api/files' 的失败响应（STATUS 为 409 / 412 / 5xx 等）。"
+  (list :status status
+        :headers nil
+        :body "{\"error\":{\"code\":\"x\"}}"))
+
+(defun seshat-sync-test--download-ok (content etag)
+  "构造 `GET /api/files' 的成功响应：远端内 CONTENT、响应头 ETag 为 ETAG."
+  (list :status 200
+        :headers (list (cons "ETag" etag))
+        :body content))
+
+(defun seshat-sync-test--versions-ok (content)
+  "构造 `/api/versions' 的成功响应，`:content' 为 CONTENT（祖先版本内容）。"
+  (list :status 200
+        :headers nil
+        :body (json-encode (list (cons 'head "") (cons 'content content)))))
+
+(defun seshat-sync-test--file-size (rel)
+  "返回临时目录下 REL 的字节数（`file-attributes' 第八项）。"
+  (nth 7 (file-attributes (seshat-sync-test--local rel))))
+
+(defun seshat-sync-test--file-mtime (rel)
+  "返回临时目录下 REL 的 mtime（Unix 秒整数，与 push 写基线同口径）。"
+  (truncate (float-time (nth 5 (file-attributes (seshat-sync-test--local rel))))))
+
+;;; push：条件头
+
+(ert-deftest seshat-sync-test-push-new-file-uses-if-none-match ()
+  "无 `:base-blob' 时只发 `If-None-Match: *'（仅创建），不发 `If-Match'。
+两个条件头并存会让服务端**恒回 412**（docs/api.md §8.2）。"
+  (seshat-sync-test--with-state
+    (seshat-state-set-roots (list (list "notes" seshat-sync-test--dir "mirror")))
+    (seshat-sync-test--write-local "a.org" "本地内容\n")
+    (seshat-sync-test--register-dirty "uid-a" "a.org")
+    (setq seshat-sync-test--downloads
+          (list (seshat-sync-test--upload-ok "\"blob-new\"")))
+    (let ((stats (seshat-sync-push))
+          (uploads (seshat-sync-test--uploads)))
+      (should (= 1 (length uploads)))
+      (should (equal "*" (seshat-sync-test--header (car uploads) "If-None-Match")))
+      (should-not (seshat-sync-test--header (car uploads) "If-Match"))
+      (should (= 1 (plist-get stats :pushed))))))
+
+(ert-deftest seshat-sync-test-push-existing-file-uses-if-match ()
+  "有 `:base-blob' 时发 `If-Match: \"<blob>\"'（条件覆盖），不发 `If-None-Match'。"
+  (seshat-sync-test--with-state
+    (seshat-state-set-roots (list (list "notes" seshat-sync-test--dir "mirror")))
+    (seshat-sync-test--write-local "a.org" "改过的内容\n")
+    (seshat-sync-test--register-dirty "uid-a" "a.org" "\"blob0\"")
+    (setq seshat-sync-test--downloads
+          (list (seshat-sync-test--upload-ok "\"blob1\"")))
+    (let ((stats (seshat-sync-push))
+          (uploads (seshat-sync-test--uploads)))
+      (should (= 1 (length uploads)))
+      ;; `seshat-rest--etag-value' 对已带双引号的 blob 原样发送
+      (should (equal "\"blob0\"" (seshat-sync-test--header (car uploads) "If-Match")))
+      (should-not (seshat-sync-test--header (car uploads) "If-None-Match"))
+      (should (= 1 (plist-get stats :pushed))))))
+
+;;; push：成功路径
+
+(ert-deftest seshat-sync-test-push-success-records-etag-as-base ()
+  "2xx：base blob 取响应 `:etag'（**不是** `:rev'），size/mtime 取本地
+`file-attributes'，dirty 清除，且基线落盘（重载状态仍在）。"
+  (seshat-sync-test--with-state
+    (seshat-state-set-roots (list (list "notes" seshat-sync-test--dir "mirror")))
+    (seshat-sync-test--write-local "a.org" "本地内容\n")
+    (seshat-sync-test--register-dirty "uid-a" "a.org")
+    (setq seshat-sync-test--downloads
+          (list (seshat-sync-test--upload-ok "\"blob-new\"")))
+    (let ((stats (seshat-sync-push)))
+      (should (= 1 (plist-get stats :pushed)))
+      (let ((entry (seshat-state-get "uid-a")))
+        (should (equal "\"blob-new\"" (plist-get entry :base-blob)))
+        (should-not (equal "deadbeefrev" (plist-get entry :base-blob)))
+        (should (equal (seshat-sync-test--file-size "a.org")
+                       (plist-get entry :size)))
+        (should (equal (seshat-sync-test--file-mtime "a.org")
+                       (plist-get entry :mtime)))
+        (should-not (plist-get entry :dirty)))
+      (should-not (seshat-state-dirty-uids))
+      ;; 基线已落盘：清空内存后重新加载仍是新 etag
+      (setq seshat-state--state nil)
+      (seshat-state-load)
+      (should (equal "\"blob-new\""
+                     (plist-get (seshat-state-get "uid-a") :base-blob)))
+      (should-not (seshat-state-dirty-uids)))))
+
+;;; push：412 → 合并 → 重发一次
+
+;; 三方合并用的固定夹具：7 行文本，两侧改动各在一行、且**中间隔了两行未改动
+;; 的内容**（L2 与 L5）。这不是凑数——`diff3' 对**相邻行**的改动会判为重叠
+;; hunk 而报冲突，只有中间留出未改动的上下文才能得到干净合并（实测：3 行文本
+;; 改第 2、3 行必冲突）。
+(defconst seshat-sync-test--merge-base
+  "l1\nl2\nl3\nl4\nl5\nl6\nl7\n"
+  "412 合并用例的共同祖先内容。")
+
+(defconst seshat-sync-test--merge-local
+  "l1\nL2\nl3\nl4\nl5\nl6\nl7\n"
+  "412 合并用例的本地（我方）内容：只改了第 2 行。")
+
+(defconst seshat-sync-test--merge-remote
+  "l1\nl2\nl3\nl4\nL5\nl6\nl7\n"
+  "412 合并用例的远端（服务端）内容：只改了第 5 行。")
+
+(defconst seshat-sync-test--merge-merged
+  "l1\nL2\nl3\nl4\nL5\nl6\nl7\n"
+  "上面三段内容的干净合并结果（两侧改动都在、无冲突标记）。")
+
+(ert-deftest seshat-sync-test-push-412-clean-merge-retries-with-new-base ()
+  "412 → 三方合并无冲突 → 本地被更新为合并结果 → 带**新 base** 重发一次.
+队列顺序即请求顺序：PUT(412) → GET 远端 → PUT(成功)；祖先走 `versions'，
+线缆参数名 `hash' 取**当前** base。"
+  (seshat-sync-test--with-state
+    (seshat-state-set-roots (list (list "notes" seshat-sync-test--dir "mirror")))
+    (let ((temporary-file-directory
+           (file-name-as-directory
+            (expand-file-name "tmproot" seshat-sync-test--dir))))
+      (make-directory temporary-file-directory t)
+      (seshat-sync-test--write-local "a.org" seshat-sync-test--merge-local)
+      (seshat-sync-test--register-dirty "uid-a" "a.org" "\"blob0\"")
+      (setq seshat-sync-test--downloads
+            (list (seshat-sync-test--upload-status 412)
+                  (seshat-sync-test--download-ok seshat-sync-test--merge-remote "\"blob-remote\"")
+                  (seshat-sync-test--upload-ok "\"blob-new\"")))
+      (setq seshat-sync-test--versions
+            (list (seshat-sync-test--versions-ok seshat-sync-test--merge-base)))
+      (let ((stats (seshat-sync-push))
+            (uploads (seshat-sync-test--uploads))
+            (versions (seshat-sync-test--version-calls)))
+        (should (= 1 (plist-get stats :pushed)))
+        (should (= 0 (plist-get stats :conflicted)))
+        ;; 重发只发生一次，且带的是**远端** etag（新 base），不是旧 base
+        (should (= 2 (length uploads)))
+        (should (equal "\"blob0\"" (seshat-sync-test--header (nth 0 uploads) "If-Match")))
+        (should (equal "\"blob-remote\""
+                       (seshat-sync-test--header (nth 1 uploads) "If-Match")))
+        ;; 祖先用当前 base 作为 hash 查询
+        (should (= 1 (length versions)))
+        (should (equal "\"blob0\"" (seshat-sync-test--param (car versions) "hash")))
+        ;; 本地文件被替换为合并结果（两侧改动都在）
+        (should (equal seshat-sync-test--merge-merged
+                       (seshat-sync-test--read-local "a.org")))
+        ;; 基线更新、dirty 清除
+        (let ((entry (seshat-state-get "uid-a")))
+          (should (equal "\"blob-new\"" (plist-get entry :base-blob)))
+          (should-not (plist-get entry :dirty)))
+        ;; 临时目录（下载远端内容用）无残留
+        (should (equal '("." "..")
+                       (directory-files temporary-file-directory)))))))
+
+(ert-deftest seshat-sync-test-push-412-retry-conflict-gives-up ()
+  "412 → 合并无冲突 → 重发**仍** 412 → 放弃：不无限重试（PUT 次数 = 2）、
+dirty 保留、计入 `:conflicted'。"
+  (seshat-sync-test--with-state
+    (seshat-state-set-roots (list (list "notes" seshat-sync-test--dir "mirror")))
+    (seshat-sync-test--write-local "a.org" seshat-sync-test--merge-local)
+    (seshat-sync-test--register-dirty "uid-a" "a.org" "\"blob0\"")
+    (setq seshat-sync-test--downloads
+          (list (seshat-sync-test--upload-status 412)
+                (seshat-sync-test--download-ok seshat-sync-test--merge-remote "\"blob-remote\"")
+                (seshat-sync-test--upload-status 412)))
+    (setq seshat-sync-test--versions
+          (list (seshat-sync-test--versions-ok seshat-sync-test--merge-base)))
+    (let ((stats (seshat-sync-push)))
+      (should (= 2 (length (seshat-sync-test--uploads))))
+      (should (= 1 (plist-get stats :conflicted)))
+      (should (= 0 (plist-get stats :pushed)))
+      ;; dirty 必须保留，否则下一轮不再重试
+      (should (equal '("uid-a") (seshat-state-dirty-uids)))
+      ;; base 仍是旧值（没被误写成远端 etag）
+      (should (equal "\"blob0\""
+                     (plist-get (seshat-state-get "uid-a") :base-blob))))))
+
+(ert-deftest seshat-sync-test-push-412-marks-written-back-keeps-dirty ()
+  "412 → 合并**有冲突标记** → 把带标记的结果写回本地、保留 dirty、
+计入 `:conflicted'，且全程**不调用任何交互函数**（可能由定时器触发）。"
+  (seshat-sync-test--with-state
+    (seshat-state-set-roots (list (list "notes" seshat-sync-test--dir "mirror")))
+    (seshat-sync-test--write-local "a.org" "本地改动\n")
+    (seshat-sync-test--register-dirty "uid-a" "a.org" "\"blob0\"")
+    (setq seshat-sync-test--downloads
+          (list (seshat-sync-test--upload-status 412)
+                (seshat-sync-test--download-ok "远端改动\n" "\"blob-remote\"")))
+    (setq seshat-sync-test--versions
+          (list (seshat-sync-test--versions-ok "原始内容\n")))
+    (let ((asked nil))
+      (cl-letf (((symbol-function 'yes-or-no-p)
+                 (lambda (&rest _) (setq asked t) t))
+                ((symbol-function 'y-or-n-p)
+                 (lambda (&rest _) (setq asked t) t))
+                ((symbol-function 'smerge-mode)
+                 (lambda (&rest _) (setq asked t)))
+                ((symbol-function 'pop-to-buffer)
+                 (lambda (&rest _) (setq asked t))))
+        (let ((stats (seshat-sync-push)))
+          (should (= 1 (plist-get stats :conflicted)))
+          ;; 只有一次 PUT：有冲突时不重发
+          (should (= 1 (length (seshat-sync-test--uploads))))
+          ;; 冲突标记已写回本地，用户下次打开即可 smerge
+          (let ((content (seshat-sync-test--read-local "a.org")))
+            (should (string-match-p "^<<<<<<<" content))
+            (should (string-match-p "=======" content))
+            (should (string-match-p "^>>>>>>>" content))
+            (should (seshat-merge-conflicted-p content))
+            (should (string-match-p "本地改动" content))
+            (should (string-match-p "远端改动" content)))
+          (should (equal '("uid-a") (seshat-state-dirty-uids)))
+          (should (seshat-sync-test--warnings-matching "存在冲突"))))
+      (should-not asked))))
+
+(ert-deftest seshat-sync-test-push-412-download-failure-keeps-dirty ()
+  "412 后拉远端内容失败 → 保留 dirty、计入 `:failed'，且不再去取祖先。"
+  (seshat-sync-test--with-state
+    (seshat-state-set-roots (list (list "notes" seshat-sync-test--dir "mirror")))
+    (seshat-sync-test--write-local "a.org" "本地改动\n")
+    (seshat-sync-test--register-dirty "uid-a" "a.org" "\"blob0\"")
+    (setq seshat-sync-test--downloads
+          (list (seshat-sync-test--upload-status 412)
+                (seshat-sync-test--file-status 500)))
+    (let ((stats (seshat-sync-push)))
+      (should (= 1 (plist-get stats :failed)))
+      (should (= 0 (plist-get stats :pushed)))
+      (should (equal '("uid-a") (seshat-state-dirty-uids)))
+      (should-not (seshat-sync-test--version-calls))
+      ;; 本地内容不被改动（合并都没开始）
+      (should (equal "本地改动\n" (seshat-sync-test--read-local "a.org"))))))
+
+(ert-deftest seshat-sync-test-push-412-merge-failure-keeps-dirty ()
+  "diff3 不可用（`seshat-merge--diff3' 返回 nil）→ 保留 dirty、计入 `:failed'，
+且**不**写回本地（没有合并结果可写）。"
+  (seshat-sync-test--with-state
+    (seshat-state-set-roots (list (list "notes" seshat-sync-test--dir "mirror")))
+    (seshat-sync-test--write-local "a.org" seshat-sync-test--merge-local)
+    (seshat-sync-test--register-dirty "uid-a" "a.org" "\"blob0\"")
+    (setq seshat-sync-test--downloads
+          (list (seshat-sync-test--upload-status 412)
+                (seshat-sync-test--download-ok seshat-sync-test--merge-remote "\"blob-remote\"")))
+    (setq seshat-sync-test--versions
+          (list (seshat-sync-test--versions-ok seshat-sync-test--merge-base)))
+    (cl-letf (((symbol-function 'seshat-merge--diff3) (lambda (&rest _) nil)))
+      (let ((stats (seshat-sync-push)))
+        (should (= 1 (plist-get stats :failed)))
+        (should (equal '("uid-a") (seshat-state-dirty-uids)))
+        (should (equal seshat-sync-test--merge-local
+                       (seshat-sync-test--read-local "a.org")))
+        (should (seshat-sync-test--warnings-matching "合并失败"))))))
+
+;;; push：409 / 403 / 其它失败
+
+(ert-deftest seshat-sync-test-push-409-not-retried ()
+  "409（`state-conflict'）：**不重试**（PUT 次数 = 1）、保留 dirty、计入 `:failed'。"
+  (seshat-sync-test--with-state
+    (seshat-state-set-roots (list (list "notes" seshat-sync-test--dir "mirror")))
+    (seshat-sync-test--write-local "a.org" "内容\n")
+    (seshat-sync-test--register-dirty "uid-a" "a.org" "\"blob0\"")
+    (setq seshat-sync-test--downloads (list (seshat-sync-test--upload-status 409)))
+    (let ((stats (seshat-sync-push)))
+      (should (= 1 (length (seshat-sync-test--uploads))))
+      (should (= 1 (plist-get stats :failed)))
+      (should (equal '("uid-a") (seshat-state-dirty-uids)))
+      (should (seshat-sync-test--warnings-matching "409")))))
+
+(ert-deftest seshat-sync-test-push-403-marks-root-read-only ()
+  "403（`root_read_only'）→ 根被标为只读，**同根其余条目被跳过**（只发 1 次
+请求），两条 dirty 都保留。"
+  (seshat-sync-test--with-state
+    (seshat-state-set-roots (list (list "notes" seshat-sync-test--dir "mirror")))
+    (seshat-sync-test--write-local "a.org" "a\n")
+    (seshat-sync-test--write-local "b.org" "b\n")
+    (seshat-sync-test--register-dirty "uid-a" "a.org" "\"blob0\"")
+    (seshat-sync-test--register-dirty "uid-b" "b.org" "\"blob0\"")
+    (setq seshat-sync-test--downloads (list (seshat-sync-test--file-status 403)))
+    (let ((stats (seshat-sync-push)))
+      (should (= 1 (length (seshat-sync-test--uploads))))
+      (should (seshat-sync--read-only-root-p "notes"))
+      (should (= 2 (plist-get stats :skipped)))
+      (should (equal '("uid-a" "uid-b") (seshat-state-dirty-uids)))
+      ;; 只读根只警告一次，不刷屏
+      (should (= 1 (length (seshat-sync-test--warnings-matching "只读")))))))
+
+(ert-deftest seshat-sync-test-push-server-error-keeps-dirty ()
+  "其它失败（5xx）→ 保留 dirty、计入 `:failed'，不重试。"
+  (seshat-sync-test--with-state
+    (seshat-state-set-roots (list (list "notes" seshat-sync-test--dir "mirror")))
+    (seshat-sync-test--write-local "a.org" "内容\n")
+    (seshat-sync-test--register-dirty "uid-a" "a.org" "\"blob0\"")
+    (setq seshat-sync-test--downloads (list (seshat-sync-test--upload-status 502)))
+    (let ((stats (seshat-sync-push)))
+      (should (= 1 (length (seshat-sync-test--uploads))))
+      (should (= 1 (plist-get stats :failed)))
+      (should (equal '("uid-a") (seshat-state-dirty-uids))))))
+
+;;; push：只遍历 dirty、前置跳过
+
+(ert-deftest seshat-sync-test-push-only-iterates-dirty-uids ()
+  "只遍历 `dirty-uids'：未标脏的已登记 uid 不产生任何请求。"
+  (seshat-sync-test--with-state
+    (seshat-state-set-roots (list (list "notes" seshat-sync-test--dir "mirror")))
+    (seshat-sync-test--write-local "clean.org" "clean\n")
+    (seshat-sync-test--write-local "dirty.org" "dirty\n")
+    (seshat-sync-test--register "uid-clean" "clean.org" "\"blob0\"")
+    (seshat-sync-test--register-dirty "uid-dirty" "dirty.org" "\"blob0\"")
+    (setq seshat-sync-test--downloads
+          (list (seshat-sync-test--upload-ok "\"blob1\"")))
+    (let ((stats (seshat-sync-push))
+          (uploads (seshat-sync-test--uploads)))
+      (should (= 1 (length uploads)))
+      (should (string-match-p "dirty\\.org" (nth 1 (car uploads))))
+      (should (= 1 (plist-get stats :pushed)))
+      (should (= 1 (length seshat-sync-test--requests))))))
+
+(ert-deftest seshat-sync-test-push-skips-missing-local-file ()
+  "已登记但本地文件被外部删除 → 跳过并 warning，不产生请求。"
+  (seshat-sync-test--with-state
+    (seshat-state-set-roots (list (list "notes" seshat-sync-test--dir "mirror")))
+    (seshat-sync-test--register-dirty "uid-a" "gone.org" "\"blob0\"")
+    (let ((stats (seshat-sync-push)))
+      (should-not (seshat-sync-test--uploads))
+      (should (= 1 (plist-get stats :skipped)))
+      (should (equal '("uid-a") (seshat-state-dirty-uids)))
+      (should (seshat-sync-test--warnings-matching "不存在")))))
+
+(ert-deftest seshat-sync-test-push-skips-escaping-path ()
+  "路径越界（`../'）→ 跳过、不产生请求、不读写根外文件（安全底线）。"
+  (seshat-sync-test--with-state
+    (seshat-state-set-roots (list (list "notes" seshat-sync-test--dir "mirror")))
+    (seshat-sync-test--register-dirty "uid-a" "../escape.org" "\"blob0\"")
+    (let ((stats (seshat-sync-push)))
+      (should-not (seshat-sync-test--uploads))
+      (should (= 1 (plist-get stats :skipped)))
+      (should (equal '("uid-a") (seshat-state-dirty-uids)))
+      (should (seshat-sync-test--warnings-matching "越界")))))
+
+(ert-deftest seshat-sync-test-push-skips-ondemand-root ()
+  "`ondemand' 根**绝不主动写**（计划 D7）：dirty 条目被跳过、不发请求。"
+  (seshat-sync-test--with-state
+    (seshat-state-set-roots (list (list "books" seshat-sync-test--dir "ondemand")))
+    (seshat-sync-test--write-local "b.epub" "bytes\n")
+    (seshat-state-set "uid-b" (list :root "books" :path "b.epub"
+                                    :base-blob "\"blob0\""))
+    (seshat-state-mark-dirty "uid-b")
+    (let ((stats (seshat-sync-push)))
+      (should-not (seshat-sync-test--uploads))
+      (should (= 1 (plist-get stats :skipped)))
+      (should (equal '("uid-b") (seshat-state-dirty-uids)))
+      (should (seshat-sync-test--warnings-matching "ondemand")))))
 
 (provide 'seshat-sync-test)
 

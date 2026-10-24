@@ -27,6 +27,10 @@
 (require 'cl-lib)
 (require 'seshat-rest)
 (require 'seshat-state)
+;; 只依赖纯合并原语（diff3 + 冲突标记判定）。**不得** require
+;; `seshat-conflict'：它已 require 本文件，反向依赖会成环（见
+;; `seshat-merge.el' 的 Commentary）。
+(require 'seshat-merge)
 
 (defgroup seshat-sync nil
   "笔记 WebDAV 文件同步。"
@@ -772,6 +776,355 @@ EVENT 是 `seshat-rest-changes' 解出的事件 plist（`:seq' `:uid' `:op' `:ro
     (list :first-sync nil
           :index nil
           :changes (seshat-sync--pull-changes))))
+
+;;; push（T2）：条件写 + 412 三方合并
+;;
+;; push 只遍历 `seshat-state-dirty-uids'（H3：不做全量扫描），逐 uid 做**条件
+;; 写**——无 `:base-blob' 时发 `If-None-Match: *'（仅创建），有 `:base-blob'
+;; 时发 `If-Match: \"<blob>\"'（条件覆盖）。两条条件头不能并存：服务端两者都
+;; 校验，任一不成立即 412（`docs/api.md' §8.2）。
+;;
+;; 本节的**不变量**（改动时必须保持）：
+;;
+;; 1. `dirty' 只在「真的推送成功」时清除（`seshat-state-set-base-blob' 顺带清
+;;    dirty）；任何失败、放弃、冲突一律**保留 dirty**，否则下次不再重试。
+;; 2. 412 的重发**只能一次**；409 / 403 **一律不重试**（403 还要把整根标只读）。
+;; 3. 全程**零交互**：可能由定时器触发，不得 `yes-or-no-p' / `smerge-mode' /
+;;    `pop-to-buffer'；冲突只写回带标记的内容并提示用户手动解决。
+;; 4. base blob 取响应里的 `:etag'（服务端 etag 与 blob 同值，可直接作下次
+;;    `If-Match' 的取值）；`:rev' 是提交 hash，**不得**用作条件写。
+
+(defun seshat-sync--read-binary (file)
+  "以二进制安全方式读取 FILE 的全部内容，返回 unibyte 字节串.
+用 `insert-file-contents-literally'（完全不做编码嗅探与 EOL 转换），因此
+EPUB / PDF 等非 UTF-8 内容和 CRLF 换行都能原样拿到、原样上传。
+读不到时把错误交给调用方（push 的调用点已确认文件存在）。"
+  (with-temp-buffer
+    (set-buffer-multibyte nil)
+    (insert-file-contents-literally file)
+    (buffer-string)))
+
+(defun seshat-sync--write-binary (file content)
+  "把 CONTENT 以二进制安全方式**原子**写回 FILE，返回写入的绝对路径.
+先写同目录临时文件再 `rename-file' ——中途失败不会留下半截笔记；失败时删除
+临时文件并把错误抛给调用方（调用方降级为 warning 并保留 dirty）。
+
+为什么不用 `write-region' 直接覆盖：合并结果写回的是**用户正在编辑的笔记**，
+半截内容比不写更糟；原子替换让「读到的永远是完整内容」成为不变量。"
+  (let* ((target (expand-file-name file))
+         (dir (file-name-directory target))
+         (temp nil))
+    (make-directory dir t)
+    (setq temp (make-temp-file (expand-file-name "seshat-merge-out-" dir)))
+    (condition-case err
+        (progn
+          (with-temp-buffer
+            (set-buffer-multibyte nil)
+            (insert (seshat-rest--binary-string content))
+            (let ((coding-system-for-write 'no-conversion))
+              (write-region (point-min) (point-max) temp nil 'silent)))
+          (rename-file temp target t)
+          (setq temp nil)
+          target)
+      (error
+       (when (and temp (file-exists-p temp))
+         (ignore-errors (delete-file temp)))
+       (signal (car err) (cdr err))))))
+
+(defun seshat-sync--local-stats (file)
+  "返回 FILE 的 `(SIZE . MTIME)'：字节数与 Unix 秒整数；取不到时返回 nil.
+SIZE 即 `file-attributes' 的第八项（字节数），MTIME 由第六项换算成整数秒——
+D5 的基线比对用的就是这个 `(size, mtime)' 对，push 写基线时必须同源同口径。"
+  (let ((attrs (file-attributes file)))
+    (when attrs
+      (let ((mtime (nth 5 attrs)))
+        (cons (nth 7 attrs)
+              (and mtime (truncate (float-time mtime))))))))
+
+(defun seshat-sync--record-pushed (uid file etag)
+  "记录 UID 推送成功：把基线写成 ETAG 与 FILE 的当前 `(size, mtime)'，返回条目.
+ETAG 取上传响应里的 `:etag'（**不是** `:rev'）：服务端的 etag 与 blob 同值，
+可直接作为下一次 `If-Match' 的取值；`:rev' 是提交 hash，用它做条件写会永远
+412。`seshat-state-set-base-blob' 顺带清除 `:dirty'——这是 dirty 唯一的正常
+清除点。
+
+ETAG 缺失（畸形响应）时仍写 nil 并发一次警告：此时条目退化为「无 base」，
+下轮会以 `If-None-Match: *' 重试并撞 412 进入合并流程，比留着旧 base 更安全
+（旧 base 已被服务端拒绝，说明它已过期）。"
+  (let* ((stats (seshat-sync--local-stats file))
+         (size (car-safe stats))
+         (mtime (cdr-safe stats))
+         (blob (and (stringp etag) (not (string-empty-p etag)) etag)))
+    (unless blob
+      (display-warning 'seshat-sync
+                       (format "push：上传 %s 成功但响应缺少 etag，基线未记录" file)
+                       :warning))
+    (seshat-state-set-base-blob uid blob size mtime)))
+
+(defun seshat-sync--push-upload (uid path root base local)
+  "对 UID 做一次条件写，返回 `pushed' / `conflicted' / `skipped' / `failed'.
+PATH 为根内相对路径，ROOT 为根 tag，BASE 为 `:base-blob'（nil 表示服务端尚无
+此文件），LOCAL 为本地绝对路径。
+
+条件头（二选一，**不得并存**）：
+
+- BASE 为 nil → `:if-none-match \"*\"'（仅创建；带 `If-Match: \"\"' 的语义是
+  「永不匹配」，不能拿来表达「首次写入」）；
+- BASE 非 nil → `:if-match BASE'（条件覆盖）。
+
+响应分支见 `seshat-sync--push-outcome'。"
+  (let ((content (seshat-sync--read-binary local)))
+    (seshat-sync--push-outcome
+     uid path root base local
+     (if (and (stringp base) (not (string-empty-p base)))
+         (seshat-rest-upload-file path content :root root :if-match base)
+       (seshat-rest-upload-file path content :root root :if-none-match "*")))))
+
+(defun seshat-sync--push-outcome (uid path root base local response)
+  "解释一次上传响应 RESPONSE 并执行对应动作，返回四态符号.
+分支（计划 D4 第 3 步）：
+
+- 2xx → 记录基线（blob 取 `:etag'、size/mtime 取本地 `file-attributes'），
+  返回 `pushed'（`set-base-blob' 顺带清 dirty）；
+- 412（`:conflict' 为 `etag-mismatch'）→ 交给
+  `seshat-sync--push-merge' 做三方合并；
+- 403（`:read-only-root'）→ 把整根标为只读（`ondemand' 根写被拒），**跳过该
+  根其余条目**、保留 dirty，返回 `skipped'；
+- 409（`:conflict' 为 `state-conflict'）→ **不重试**（墓碑占路径时物理移动可能
+  已完成，重试只会再得 409），warning + 保留 dirty，返回 `failed'；
+- 其它（含传输失败、5xx、404）→ warning + 保留 dirty，返回 `failed'。
+
+`409' / `403' 与 412 的处理差别是本函数的核心：只有 412 蕴含「内容可合并」，
+其余状态码重试都不会得到不同结果。"
+  (let ((status (plist-get response :status))
+        (conflict (plist-get response :conflict)))
+    (cond
+     ((seshat-rest--2xx-p status)
+      (seshat-sync--record-pushed uid local (plist-get response :etag))
+      'pushed)
+     ((eq conflict 'etag-mismatch)
+      (seshat-sync--push-merge uid path root base local))
+     ((plist-get response :read-only-root)
+      (seshat-sync--mark-root-read-only root)
+      'skipped)
+     ((eq conflict 'state-conflict)
+      (display-warning 'seshat-sync
+                       (format "push：%s 与服务端状态冲突（409），不重试，保留待推送标记"
+                               path)
+                       :warning)
+      'failed)
+     (t
+      (display-warning 'seshat-sync
+                       (format "push：上传 %s 失败（状态 %S，%S），保留待推送标记"
+                               path status (plist-get response :error))
+                       :warning)
+      'failed))))
+
+(defun seshat-sync--push-merge (uid path root base local)
+  "412 分支：拉远端 + 取祖先 + diff3 三方合并，返回四态符号.
+固定步骤（顺序本身是不变量，计划 D4 的 412 流程）：
+
+1. `seshat-rest-download-file' 把远端内容落到临时文件（该函数内部已硬编码
+   `:binary t'，**不要**再传 `:binary'）——失败则 warning + 保留 dirty +
+   `failed'；
+2. `seshat-rest-versions' 用**当前 base** 取祖先版本的 `:content'——取不到
+   （非 2xx / 404 / content 不是字符串）则 warning + 保留 dirty + `failed'；
+3. `seshat-merge--diff3' 合并（祖先 / 本地 / 远端）——返回 nil（diff3 不可用或
+   执行失败）则 warning + 保留 dirty + `failed'；
+4. 按 `seshat-merge-conflicted-p' 分流，见 `seshat-sync--push-merge-continue'。
+
+临时目录一律 `unwind-protect' 递归清理；任何异常都降级为 `failed'（保留
+dirty），绝不把错误抛给调用方——push 是批量循环，单条失败不能中断整轮。"
+  (let ((temp-dir nil))
+    (unwind-protect
+        (condition-case err
+            (progn
+              (setq temp-dir (file-name-as-directory
+                              (make-temp-file "seshat-push-" t)))
+              (let* ((temp (expand-file-name "remote" temp-dir))
+                     (response (seshat-rest-download-file path temp :root root)))
+                (cond
+                 ((plist-get response :read-only-root)
+                  (seshat-sync--mark-root-read-only root)
+                  'skipped)
+                 ((not (seshat-rest--2xx-p (plist-get response :status)))
+                  (display-warning 'seshat-sync
+                                   (format "push：412 后拉取 %s 的远端内容失败（状态 %S），保留待推送标记"
+                                           path (plist-get response :status))
+                                   :warning)
+                  'failed)
+                 (t
+                  (seshat-sync--push-merge-continue
+                   uid path root base local temp (plist-get response :etag))))))
+          (error
+           (display-warning 'seshat-sync
+                            (format "push：合并 %s 时出错（%s），保留待推送标记"
+                                    path (error-message-string err))
+                            :warning)
+           'failed))
+      (when (and temp-dir (file-directory-p temp-dir))
+        (ignore-errors (delete-directory temp-dir t))))))
+
+(defun seshat-sync--push-merge-continue (uid path root base local remote-file remote-etag)
+  "412 合并流程的第 2–4 步（`seshat-sync--push-merge' 的下半段）.
+REMOTE-FILE 为已落盘的远端内容，REMOTE-ETAG 为下载响应里的 `:etag'（**新
+base**）。返回四态符号。
+
+- **无冲突标记** → 把合并结果写回本地，带**新 base**（REMOTE-ETAG）重发
+  上传**一次**：成功 → `pushed'；再次 412 → 放弃（保留 dirty）→ `conflicted'；
+  其它失败 → `failed'。
+- **有冲突标记** → **仍把含标记的合并结果写回本地**（用户下次打开文件即可用
+  `smerge' 处理），保留 dirty，warning 提示手动解决，返回 `conflicted'。
+  本分支**绝不进入任何交互**。
+
+新 base 缺失（下载响应没带 ETag）时不做无条件重发：那会**静默覆盖**别人刚写
+的内容，违反乐观锁的初衷 → warning + 保留 dirty + `failed'。"
+  (let ((ancestor (seshat-rest-versions path base)))
+    (if (not (seshat-rest--2xx-p (plist-get ancestor :status)))
+        (progn
+          (display-warning 'seshat-sync
+                           (format "push：取 %s 的祖先版本（%s）失败（状态 %S），保留待推送标记"
+                                   path base (plist-get ancestor :status))
+                           :warning)
+          'failed)
+      (let* ((ancestor-content (plist-get ancestor :content))
+             (merged (seshat-merge--diff3
+                      (if (stringp ancestor-content) ancestor-content "")
+                      (seshat-sync--read-binary local)
+                      (seshat-sync--read-binary remote-file))))
+        (cond
+         ((null merged)
+          (display-warning 'seshat-sync
+                           (format "push：%s 三方合并失败（diff3 不可用或执行出错），保留待推送标记"
+                                   path)
+                           :warning)
+          'failed)
+         ((seshat-merge-conflicted-p merged)
+          (seshat-sync--write-binary local merged)
+          (display-warning 'seshat-sync
+                           (format "%s 存在冲突，已写入冲突标记，请手动解决后重新同步"
+                                   path)
+                           :warning)
+          'conflicted)
+         ((not (and (stringp remote-etag) (not (string-empty-p remote-etag))))
+          (display-warning 'seshat-sync
+                           (format "push：%s 合并成功但远端未返回 etag，无法条件重发，保留待推送标记"
+                                   path)
+                           :warning)
+          'failed)
+         (t
+          (seshat-sync--write-binary local merged)
+          (let ((retry (seshat-rest-upload-file
+                        path merged :root root :if-match remote-etag)))
+            (cond
+             ((seshat-rest--2xx-p (plist-get retry :status))
+              (seshat-sync--record-pushed uid local (plist-get retry :etag))
+              'pushed)
+             ((eq (plist-get retry :conflict) 'etag-mismatch)
+              (display-warning 'seshat-sync
+                               (format "push：%s 合并后重发仍被拒（412），已放弃本次推送，保留待推送标记"
+                                       path)
+                               :warning)
+              'conflicted)
+             ((plist-get retry :read-only-root)
+              (seshat-sync--mark-root-read-only root)
+              'skipped)
+             (t
+              (display-warning 'seshat-sync
+                               (format "push：%s 合并后重发失败（状态 %S），保留待推送标记"
+                                       path (plist-get retry :status))
+                               :warning)
+              'failed)))))))))
+
+(defun seshat-sync--push-entry (uid)
+  "推送单个 UID，返回 `pushed' / `conflicted' / `skipped' / `failed'.
+前置跳过（不改状态、不发请求）：条目缺失、根未配置本地目录、根已被判定只读
+（本轮更早的 403）、根是 `ondemand'（**绝不主动写**，计划 D7）、条目无本地
+路径（墓碑 / 孤儿）、服务端路径越界（安全底线，与 pull 共用
+`seshat-sync--local-path'）、本地文件不存在（已被外部删除）。"
+  (let* ((entry (seshat-state-get uid))
+         (root (plist-get entry :root))
+         (path (plist-get entry :path))
+         (base (plist-get entry :base-blob))
+         (root-dir (seshat-sync--root-dir root))
+         (mode (nth 2 (seshat-sync--root-entry root))))
+    (cond
+     ((null entry)
+      (display-warning 'seshat-sync
+                       (format "push：uid %s 无状态条目，跳过" uid) :warning)
+      'skipped)
+     ((null root-dir)
+      (display-warning 'seshat-sync
+                       (format "push：根 %S 未配置本地目录（uid %s），跳过" root uid)
+                       :warning)
+      'skipped)
+     ((seshat-sync--read-only-root-p root) 'skipped)
+     ((equal "ondemand" mode)
+      (display-warning 'seshat-sync
+                       (format "push：根 %s 是 ondemand（只读），跳过 uid %s"
+                               root uid)
+                       :warning)
+      'skipped)
+     ((not (and (stringp path) (not (string-empty-p path))))
+      (display-warning 'seshat-sync
+                       (format "push：uid %s 没有本地路径（墓碑或孤儿条目），跳过" uid)
+                       :warning)
+      'skipped)
+     (t
+      (let ((local (seshat-sync--local-path root-dir path)))
+        (cond
+         ((null local)
+          (display-warning 'seshat-sync
+                           (format "push：服务端路径 %S 越界（uid %s），跳过" path uid)
+                           :warning)
+          'skipped)
+         ((not (file-exists-p local))
+          (display-warning 'seshat-sync
+                           (format "push：本地文件 %s 不存在（可能被外部删除），跳过"
+                                   local)
+                           :warning)
+          'skipped)
+         (t (seshat-sync--push-upload uid path root base local))))))))
+
+(defun seshat-sync-push ()
+  "同步引擎的 push 入口：把本地脏条目按条件写推给服务端（计划 D4 / T2）.
+遍历 `seshat-state-dirty-uids'（H3：只推脏条目，不做全量扫描），逐 uid 走
+`seshat-sync--push-entry'。
+
+返回统计 plist `(:pushed N :conflicted N :skipped N :failed N)'：
+
+- `:pushed' — 真的推送成功（基线已更新、dirty 已清）；
+- `:conflicted' — 因冲突放弃（含冲突标记已写回、或 412 重发仍被拒）；
+- `:skipped' — 被前置条件跳过（根未配置 / 只读 / ondemand / 越界 /
+  本地文件不存在）；
+- `:failed' — 其它失败（5xx、传输失败、409、合并取不到远端或祖先、diff3 不可
+  用）。**除 `:pushed' 之外，dirty 一律保留**，下一轮同步会重试。
+
+批量语义：整个循环包在一个 `seshat-state-batch' 块里（逐 uid 写 base blob 时
+`:paths' 只重建一次），块退出后 `seshat-state-save' 一次——基线不落盘等于下轮
+重推，故必须保存。
+
+**只读根缓存不在本函数重置**：`seshat-sync-pull' 开头已清空，pull → push 的
+同轮编排（T4）希望整轮共享「本轮哪些根只读」的判定（计划 D7）。单独调用本
+函数（无 pull）时缓存为空，403 仍会在本轮内被标记并跳过同根其余条目。"
+  (let ((pushed 0)
+        (conflicted 0)
+        (skipped 0)
+        (failed 0)
+        (uids (seshat-state-dirty-uids)))
+    (seshat-state-batch
+      (dolist (uid uids)
+        (let ((result (seshat-sync--push-entry uid)))
+          (cond
+           ((eq result 'pushed) (setq pushed (1+ pushed)))
+           ((eq result 'conflicted) (setq conflicted (1+ conflicted)))
+           ((eq result 'skipped) (setq skipped (1+ skipped)))
+           (t (setq failed (1+ failed)))))))
+    (seshat-state-save)
+    (list :pushed pushed
+          :conflicted conflicted
+          :skipped skipped
+          :failed failed)))
 
 (provide 'seshat-sync)
 
