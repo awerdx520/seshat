@@ -2,10 +2,13 @@
 
 ## 当前状态
 
-- 阶段：Phase 2（Plan）· 进行中
-- 已确认：方案 ✅（用户 2026-10-24 确认）、计划 ⏳（待确认）
-- 独立审查：需修订（2 major / 8 minor）→ **已按审查意见修订**（M1 popper 功能处理、M2 H3 前置 T2a spike，及 m1–m8 全部吸收）
-- 下一步：用户确认计划 → Phase 3 按 T0 → T1 → T2a → T2 → T3 → T4 → T5 → T6 → T7 → T8 实施
+- 阶段：已归档（2026-10-25）
+- 方案/计划：✅ 均经用户确认（2026-10-24）
+- 代码：T0–T7 全部落地（`00ed3c5`…`8fdf434`），独立代码审查发现的 blocking 缺陷已修复（`afa150a`，面板生命周期改用 `post-command-hook`）
+- 验证：全仓 ERT 25 文件 / 884 例 / 0 unexpected / 0 skipped；L1（check-parens + byte-compile + checkdoc）零新增告警
+- 文档：CHANGELOG / docs/emacs-reader.md / docs/configuration.md / decisions.md / ADR-0005 / VENDORED / tech-debt / roadmap / 两个 .el 的 Commentary 均已更新
+- 跨仓：thomas-emacs（popper 名单移除 `*Seshat Sidebar*`、init-reader.el 注释、AGENTS.md 不变量）同批完成
+- 未执行：真机 L3 视觉验收（用户决定先归档，留待使用中观察）；`--follow-up` 首轮未完成时追问的并发守卫、gt 内部约定的运行时探测记为 tech-debt
 
 ## 目标
 
