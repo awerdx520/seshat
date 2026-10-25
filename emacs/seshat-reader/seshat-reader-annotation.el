@@ -63,9 +63,11 @@
 ;;     带前缀参数（`C-u'）时在迷你缓冲区读取正文。创建成功后**不清除**
 ;;     选区，因此可对同一选区连续创建多条批注。
 ;;
-;;   `C-c C-l'  `seshat-reader-annotation-list'
-;;     列出当前文档的批注，渲染到 `*Seshat Annotations*'（页码 + 正文
-;;     摘要）；列表缓冲区中 `RET' 跳页、`d' 删除。
+;;   `C-c C-l'  `seshat-reader-annotation-toggle'
+;;     批注列表面板开合：面板已显示则关闭，否则调
+;;     `seshat-reader-annotation-list' 列出当前文档的批注，渲染到
+;;     `*Seshat Annotations*'（页码 + 正文摘要）；列表缓冲区中 `RET' 跳页、
+;;     `d' 删除、`q' 关面板。
 ;;
 ;; 列表缓冲区使用 `special-mode' 派生的内部 mode
 ;; `seshat-reader-annotation-list-mode'，`RET' 与 `d' 经其 local keymap
@@ -1888,6 +1890,11 @@ Keybindings:
             #'seshat-reader-annotation-list-goto)
 (define-key seshat-reader-annotation-list-mode-map (kbd "d")
             #'seshat-reader-annotation-list-delete)
+;; 面板内 `q' 统一走 `seshat-reader-sidebar-quit'（只关本面板所在 kind），与目录
+;; 面板、译文面板的 `q' 一致。`special-mode' 自带的 `q'（`quit-window'）只删窗口，
+;; 不走 sidebar 的 per-kind 尺寸记忆与 buffer 记忆，三面板行为会不一致。
+(define-key seshat-reader-annotation-list-mode-map (kbd "q")
+            #'seshat-reader-sidebar-quit)
 
 (defun seshat-reader-annotation-list ()
   "列出当前文档的全部批注.
@@ -1924,9 +1931,26 @@ evil；在 evil 环境下它们可能被 evil 接管（evil 会覆盖 `special-m
          (seshat-reader-annotation--uid file))
       (message "Seshat Reader annotation: 当前缓冲区没有关联文件，无法确定文档标识。"))))
 
+(defun seshat-reader-annotation-toggle ()
+  "批注列表面板开合：已显示则关闭，否则打开列表.
+「已显示」由 `seshat-reader-sidebar-panel-visible-p' 判定（**承载无关**：窗口
+与 child frame 都算），关闭走 `seshat-reader-sidebar--toggle-kind'——只关
+`annotations' 这一 kind，目录与译文/解释面板不受影响，且关闭前捕获尺寸、记住
+buffer 供 `M-o' 重开。未显示时原样调用 `seshat-reader-annotation-list'（拉取并
+渲染列表，行为、错误提示与离线降级完全不变）。
+
+批注列表每次「打开」都会重新拉取渲染（`seshat-reader-annotation-list' 的语义，
+delete/refresh 后需要重绘），所以本命令**不是**用记忆 buffer 重开的轻量路径：
+这与 `seshat-reader-sidebar--toggle-kind' 的「重开上次 buffer」分支不同，后者
+只在 `M-o' 全部开合时才用到。"
+  (interactive)
+  (if (seshat-reader-sidebar-panel-visible-p 'annotations)
+      (seshat-reader-sidebar--toggle-kind 'annotations)
+    (seshat-reader-annotation-list)))
+
 (with-eval-after-load 'seshat-reader
   (define-key seshat-reader-mode-map (kbd "C-c C-a") #'seshat-reader-annotation-create)
-  (define-key seshat-reader-mode-map (kbd "C-c C-l") #'seshat-reader-annotation-list)
+  (define-key seshat-reader-mode-map (kbd "C-c C-l") #'seshat-reader-annotation-toggle)
   ;; C-c C-h 在 `seshat-reader-mode-map' 中未被占用（已占用：C-a / C-l /
   ;; C-r / C-o / C-t / C-e），用于按缓存重投页面高亮。
   (define-key seshat-reader-mode-map (kbd "C-c C-h")

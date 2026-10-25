@@ -140,9 +140,15 @@ the sidebar's per-kind toggle.
 
 When the panel is not displayed, its content is **rebuilt** from
 `seshat-reader-current-doc-outline' for the current document and then
-shown.  Hence `o' and `seshat-reader-sidebar-toggle-outline' have the same
-semantics; `o' additionally refreshes the outline content of the document
-being read.
+shown.  Key binding note: `o' is bound to `seshat-reader-outline-toggle',
+which first asks `seshat-reader-sidebar-panel-visible-p' (carrier agnostic)
+and closes the panel through `seshat-reader-sidebar--toggle-kind' when it is
+already displayed, so only the not-displayed case reaches this command.
+`o' and `seshat-reader-sidebar-toggle-outline' therefore have the same
+semantics and `o' additionally refreshes the outline content of the
+document being read.  The closing branches below are kept because
+`M-x seshat-reader-outline-show' (and re-loading the library) must not
+create a second panel.
 
 Where point is decides the direction: from a document buffer in
 `seshat-reader-mode' the key both opens and closes the panel, while from
@@ -239,6 +245,26 @@ outline."
         ;; nil 与 `seshat-reader-sidebar-toggle-outline' 的重开路径一致——按 `o'
         ;; 打开目录后光标进入目录面板。
         (seshat-reader-sidebar-show (get-buffer bufname) 'outline t)))))
+
+;;;###autoload
+(defun seshat-reader-outline-toggle ()
+  "目录面板开合：已显示则关闭，否则构建并显示目录.
+「已显示」由 `seshat-reader-sidebar-panel-visible-p' 判定（**承载无关**：side
+window / 底部窗口 / child frame 都算已显示），关闭走
+`seshat-reader-sidebar--toggle-kind'——只关 `outline' 这一 kind，右侧批注/译文
+面板不受影响，且关闭前捕获尺寸、记住 buffer 供重开。未显示时原样调用
+`seshat-reader-outline-show'（校验 + 按当前文档重建内容 + 显示）。
+
+与 `seshat-reader-outline-show' 的关系：`show' 自面板 per-kind 化以来**自身**
+也含关闭分支（「已显示」判据 + 在面板 buffer 内按 `o' 的快捷关闭），故两者的
+**可观察行为等价**；本命令存在的意义是把「已显示」的判据提到统一入口
+（`seshat-reader-sidebar-panel-visible-p'），使四个开合命令形状一致（目录、批注
+列表、译文、解释都是同一个 if），且键位统一指向 `-toggle' 名字，不依赖某个
+`show' 命令内部恰好实现了 toggle。"
+  (interactive)
+  (if (seshat-reader-sidebar-panel-visible-p 'outline)
+      (seshat-reader-sidebar--toggle-kind 'outline)
+    (seshat-reader-outline-show)))
 
 ;;; 行模型（纯函数，无 buffer 副作用，可在 batch 下测试）
 
@@ -641,7 +667,7 @@ annotation panels are left alone, and a childframe carrier is removed with
   "p"        #'previous-line
   "n"        #'next-line
   "f"        #'seshat-reader-outline-avy-jump
-  "o"        #'seshat-reader-outline-show
+  "o"        #'seshat-reader-outline-toggle
   "s"        #'seshat-reader-outline-select-doc-window
   "q"        #'seshat-reader-sidebar-quit
   "RET"      #'seshat-reader-outline-visit-page
@@ -757,7 +783,7 @@ loading this library never requires evil.  Extracted from the
       "f"           #'seshat-reader-outline-avy-jump
       "p"           #'previous-line
       "n"           #'next-line
-      "o"           #'seshat-reader-outline-show
+      "o"           #'seshat-reader-outline-toggle
       "s"           #'seshat-reader-outline-select-doc-window
       "q"           #'seshat-reader-sidebar-quit
       (kbd "RET")   #'seshat-reader-outline-visit-page

@@ -315,11 +315,12 @@ nil 时回落到 `seshat-reader-panel-height' 的比例。"
 中途抢光标）；本变量为 nil 时无论调用方是否请求都不追加，光标留在原窗口。
 
 调用方按语义决定是否请求 SELECT（`seshat-reader-sidebar-show' 的第三个
-参数）：**批注列表与译文面板都请求**——
+参数）：**批注列表请求，译文/解释面板不请求**——
 - 批注列表由 `seshat-reader-annotation--render-list' 在本命令内渲染完成后
   请求，此时内容已就绪；
-- 译文/解释面板由 `seshat-reader-translate--render-panel' 请求：该函数在
-  写入 Markdown 正文之后才调 `show'，内容已就绪。
+- 译文/解释面板由 `seshat-reader-translate--render-panel' **不**请求
+  （2026-10-25 起）：用户在阅读窗口选中文字后只是想「看一眼译文」，把光标挪进
+  面板会让接下来的滚动/翻页键落到面板上；点进面板即可编辑或复制。
 
 渲染层（ETAF 批注卡片或 translate 的 Markdown 文本 buffer）把内容写进面板
 buffer 后再调 `show'，同样满足「内容就绪」前提。"
@@ -1188,6 +1189,29 @@ PANELS 省略时取 `seshat-reader-sidebar--panels'；KIND 为 nil 时匹配 kin
       (setq rest (cdr rest)))
     found))
 
+(defun seshat-reader-sidebar-panel-visible-p (kind)
+  "判断 KIND 面板当前是否**已显示**，与承载方式无关.
+判据是「`seshat-reader-sidebar--toggle-kind' 能否找到该 KIND 的承载单元」：
+遍历 `seshat-reader-sidebar--panels'（窗口在前、child frame 在后）并用
+`seshat-reader-sidebar--unit-kind' 比对 kind，故 side window / 底部窗口 /
+child frame / 窗口替身（测试桩）四种情形口径完全一致。KIND 为 nil 或没有任何
+承载单元时返回 nil。
+
+本函数是各 kind 的 toggle 命令（`seshat-reader-outline-toggle' /
+`seshat-reader-annotation-toggle' / `seshat-reader-translate-toggle' /
+`seshat-reader-translate-explain-toggle'）判断「已显示就关闭、否则打开」的
+**统一判据**。**不能**改用只看窗口的
+`seshat-reader-sidebar--window-for-kind'：childframe 承载时面板是 frame 而不是
+窗口，那个函数恒返回 nil，toggle 会退化成「总是打开」（每次都重新翻译/重建）。
+`--cf-frame-for-kind' 单用也有同样的问题，只是镜像地漏掉窗口承载；两者都用则
+要调用方自己「或」起来，容易漏。故统一收在本函数里。"
+  (and kind
+       (let (found)
+         (dolist (panel (seshat-reader-sidebar--panels))
+           (when (eq (seshat-reader-sidebar--unit-kind panel) kind)
+             (setq found t)))
+         found)))
+
 (defun seshat-reader-sidebar--panel-close (panel)
   "关闭承载单元 PANEL，忽略关闭过程中的错误.
 frame 承载走 `delete-frame'（父 frame 被删除时其 child frame 由 Emacs 自动清
@@ -1243,8 +1267,8 @@ buffer 改用 `(display-buffer-no-window)'，不再共用本 action list）。
 `seshat-reader-sidebar-select-window' 亦非 nil，在 action list 末尾追加
 `(post-command-select-window . t)'；两者任一为 nil 则不追加（光标留在原窗口）。
 SELECT 由调用方按语义决定（见 `seshat-reader-sidebar-show' 的第三个参数）：
-批注列表与译文面板都在内容就绪后请求它，故 `seshat-reader-sidebar--display'
-与本函数都把 SELECT 原样透传，不再按 KIND 猜。"
+批注列表请求、译文/解释面板不请求（阅读场景不抢光标），故
+`seshat-reader-sidebar--display' 与本函数都把 SELECT 原样透传，不再按 KIND 猜。"
   (append (pcase (seshat-reader-sidebar--position-for-kind kind)
             ('at-bottom '((display-buffer-at-bottom)))
             ((or 'left 'right)
@@ -1454,10 +1478,11 @@ KIND 决定三件事：① 面板窗口的 kind 标记；② **该 kind 的方�
 `seshat-reader-sidebar-enabled' 为真时走 `seshat-reader-sidebar--display'；
 否则退回 `pop-to-buffer'（保证禁用时行为可回退）。
 
-SELECT 非 nil 表示「面板内容已就绪，可以跟随光标」：批注列表与译文/解释面板
-都在**内容写入 buffer 之后**调用本函数，故都传非 nil（是否真正跟随仍受
-`seshat-reader-sidebar-select-window' 约束）。T10 首轮反馈前这里按 KIND 硬编码
-（只对批注面板传非 nil），导致译文面板永远不跟随光标。"
+SELECT 非 nil 表示「面板内容已就绪，可以跟随光标」：**批注列表传非 nil**
+（内容写入 buffer 之后调用，跟随有依据），**译文/解释面板传 nil**（阅读场景
+不抢光标，光标留在阅读窗口）；是否真正跟随仍受
+`seshat-reader-sidebar-select-window' 约束。T10 首轮反馈曾要求译文面板也跟随，
+2026-10-25 按真机使用感受改回「不抢光标」。"
   (if seshat-reader-sidebar-enabled
       (seshat-reader-sidebar--display buffer kind select)
     (pop-to-buffer buffer)))
@@ -1673,15 +1698,24 @@ redisplay 之外的安全阶段，`selected-window' / `selected-frame' 语义明
 
 ;;; 键位
 
-;; `C-c C-o' 曾绑到 `seshat-reader-sidebar-toggle-outline'，与阅读 buffer 的
-;; `o'（`seshat-reader-outline-show'）功能重复，2026-10-23 被移除；真机反馈后按
-;; 用户要求恢复该键，但改绑**无参**的 `seshat-reader-sidebar-toggle`：面板开着
-;; 就全部关闭，关了就重开最近一个面板——比「只开合目录」更贴近「快捷关闭」的直
-;; 觉。面板内 `q'（`seshat-reader-translate-panel-map'）保持原样。
+;; 「全部面板」开合现绑 `M-o'，`C-c C-o' 已**解绑**：单 kind 的开合由各自的键
+;; 承担（目录 `o' → `seshat-reader-outline-toggle'、批注列表 `C-c C-l' →
+;; `seshat-reader-annotation-toggle'、译文/解释 `C-c C-t' / `C-c C-e' → 两个
+;; `-toggle' 包装），`C-c C-o' 因此让给 outline 语境（org / outline-minor-mode
+;; 里它是 `outline-promote' 一类的结构操作，被本包占用会让用户在 note buffer
+;; 里误触发面板开关）。本键只保留**全部**语义：有面板就全部关闭，没有就重开最近
+;; 一个（无参 `seshat-reader-sidebar-toggle'）。
+;;
+;; 选 `M-o' 的理由：单键（不用前缀、不用按 shift 就比其他候选顺手）、右手拇指可
+;; 直接够到，与 `M-x' / `M-g' 等高频单键前缀处于同一「易按」档。`M-o' 在
+;; `global-map' 里是 `facemenu-keymap' 前缀（`M-o o' 等），但那只是全局兜底：
+;; `define-key' 写进 `seshat-reader-mode-map' 后，该键在阅读器 buffer 内由本
+;; mode-map 优先解析，**不会**落到 `facemenu-keymap'；同时也不改 `global-map'，
+;; 其它 buffer 的 `M-o' 行为原样保留。
 ;; 本模块仍不 require `seshat-reader'（模块零依赖），故键位用
 ;; `with-eval-after-load' 在阅读器加载后注册，与 translate 模块的写法一致。
 (with-eval-after-load 'seshat-reader
-  (define-key seshat-reader-mode-map (kbd "C-c C-o")
+  (define-key seshat-reader-mode-map (kbd "M-o")
     #'seshat-reader-sidebar-toggle))
 
 ;; 挂到**全局**的 `post-command-hook'（不传 LOCAL）：判定对象是「命令结束后选中

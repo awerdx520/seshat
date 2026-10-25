@@ -148,9 +148,9 @@ T10 第 1 轮反馈的验收：用户要求译文面板也跟随光标。分两�
 ① **管线**：`seshat-reader-sidebar-show'（两种 KIND）与 popper 重开走的
 `seshat-reader-sidebar-display-buffer'（两种 buffer 名）都把该项放进
 `display-buffer-overriding-action'；
-  ② **调用点**：批注渲染（`seshat-reader-annotation--render-list'）与译文渲染
-（`seshat-reader-translate--render-panel'）都实际传了 SELECT=t，故管道
-两侧闭合——任一侧漏传都会让译文面板不跟随光标。"
+  ② **调用点**：批注渲染（`seshat-reader-annotation--render-list'）传 SELECT=t，
+译文渲染（`seshat-reader-translate--render-panel'）传 SELECT=nil——阅读场景不
+抢光标，光标留在阅读窗口；是否真正追加该项仍由调用方决定，管道不猜。"
   (let ((seshat-reader-sidebar-enabled t)
         (seshat-reader-sidebar-position 'below-selected)
         (seshat-reader-sidebar-select-window t)
@@ -210,10 +210,11 @@ T10 第 1 轮反馈的验收：用户要求译文面板也跟随光标。分两�
                nil)
               ;; 译文：面板缓冲写入 + `show'，不依赖 gt
               (seshat-reader-translate--render-panel "一句译文" "Seshat 译文"))
+            ;; 批注列表仍在内容就绪后请求跟随光标；译文/解释面板自 2026-10-26
+            ;; 起**不**抢光标（SELECT=nil，光标留在阅读窗口），见
+            ;; `seshat-reader-translate--render-panel' 的 docstring。
             (should (equal (list 'annotations t) (assq 'annotations calls)))
-            (should (equal (list 'translate t) (assq 'translate calls)))
-            (dolist (call calls)
-              (should (cadr call)))))
+            (should (equal (list 'translate nil) (assq 'translate calls)))))
       (dolist (b (list buf tbuf
                        (get-buffer seshat-reader-annotation-list-buffer-name)))
         (when (buffer-live-p b) (kill-buffer b))))))
@@ -1203,29 +1204,62 @@ KIND 为面板内容类型，CONTENT-LINES 为桩出的内容行数，INIT-HEIGH
       (kill-buffer buf))))
 
 (ert-deftest seshat-reader-sidebar-test--toggle-outline-command-still-works ()
-  "目录开合命令保留（可 M-x 调用），`o' 仍是 `seshat-reader-outline-show'."
-  ;; 2026-10-25 起 `C-c C-o' 改绑**无参** `seshat-reader-sidebar-toggle'（真机反馈
-  ;; 的快捷关闭）；目录专用命令仍保留，可 M-x 调用。键位绑定由
-  ;; `--c-c-c-o-toggles-panel' 断言。
+  "目录开合命令保留（可 M-x 调用），`o' 绑到 per-kind 的 `seshat-reader-outline-toggle'."
+  ;; 2026-10-26 起 `o' 由 `seshat-reader-outline-show' 改绑 per-kind toggle 命令
+  ;; （三 kind 键位统一为「已显示则关、否则开」）；目录专用命令仍保留，可 M-x 调用。
+  ;; `M-o'（全部面板）由 `--meta-o-toggles-all-panels' 断言。
   (should (commandp 'seshat-reader-sidebar-toggle-outline))
   (should (eq (lookup-key seshat-reader-mode-map (kbd "o"))
-              'seshat-reader-outline-show))
+              'seshat-reader-outline-toggle))
   (let ((calls nil))
     (cl-letf (((symbol-function 'seshat-reader-sidebar-toggle)
                (lambda (&optional kind) (push kind calls))))
       (seshat-reader-sidebar-toggle-outline))
     (should (equal calls '(outline)))))
 
-(ert-deftest seshat-reader-sidebar-test--c-c-c-o-toggles-panel ()
-  "`C-c C-o' 绑到无参的 `seshat-reader-sidebar-toggle'，且同前缀键不受影响.
-真机反馈的第三项修复：阅读器侧需要「快捷关闭」——面板开着就全部关闭，关了就
-重开最近一个（无参语义），而非只开合目录；面板内 `q' 仍保留（见
-`seshat-reader-translate-panel-map'）。"
-  (should (eq (lookup-key seshat-reader-mode-map (kbd "C-c C-o"))
+(ert-deftest seshat-reader-sidebar-test--meta-o-toggles-all-panels ()
+  "`M-o' 绑到无参的 `seshat-reader-sidebar-toggle'，`C-c C-o' 已解绑.
+2026-10-26 起「全部面板」开合由 `C-c C-o' 换绑 `M-o'：单 kind 的开合改由各自的
+键承担（`o' / `C-c C-l' / `C-c C-t' / `C-c C-e'），`C-c C-o' 让给 outline 语境
+（org / outline-minor-mode 的结构操作），必须**未绑定**。"
+  (should (eq (lookup-key seshat-reader-mode-map (kbd "M-o"))
               'seshat-reader-sidebar-toggle))
-  ;; 同前缀的批注列表键必须原样保留（新增绑定不得吞掉同前缀其它键）
+  (should-not (lookup-key seshat-reader-mode-map (kbd "C-c C-o")))
+  ;; 同前缀的批注列表键必须指向 per-kind toggle（新增绑定不得吞掉同前缀其它键）
   (should (eq (lookup-key seshat-reader-mode-map (kbd "C-c C-l"))
-              'seshat-reader-annotation-list)))
+              'seshat-reader-annotation-toggle)))
+
+(ert-deftest seshat-reader-sidebar-test--panel-visible-p-detects-window ()
+  "`panel-visible-p' 对**窗口**承载判已显示，参数清掉后判未显示.
+用真实窗口 + `seshat-reader-sidebar-kind' window parameter（不桩替），验证判据
+走的是承载单元抽象而不是某个只看窗口/只看 frame 的函数。"
+  (let ((win (selected-window)))
+    (unwind-protect
+        (progn
+          (set-window-parameter win 'seshat-reader-sidebar t)
+          (set-window-parameter win 'seshat-reader-sidebar-kind 'translate)
+          (should (eq t (seshat-reader-sidebar-panel-visible-p 'translate)))
+          ;; 其它 kind 不受影响
+          (should-not (seshat-reader-sidebar-panel-visible-p 'outline)))
+      (set-window-parameter win 'seshat-reader-sidebar nil)
+      (set-window-parameter win 'seshat-reader-sidebar-kind nil))
+    ;; 参数清掉后无任何承载单元 → 未显示
+    (should-not (seshat-reader-sidebar-panel-visible-p 'translate))))
+
+(ert-deftest seshat-reader-sidebar-test--panel-visible-p-detects-childframe ()
+  "`panel-visible-p' 对 **child frame** 承载同样判已显示（承载无关判据）.
+桩替 `--panels' 返回一个 frame 单元、`--unit-kind' 按单元给出 kind，模拟
+childframe 承载下「面板是 frame 而不是窗口」的情形——只看窗口的
+`--window-for-kind' 在此恒为 nil，本判据不能退化成它。"
+  (let ((cf (list 'fake-child-frame)))
+    (cl-letf (((symbol-function 'seshat-reader-sidebar--panels)
+               (lambda () (list cf)))
+              ((symbol-function 'seshat-reader-sidebar--unit-kind)
+               (lambda (panel) (and (eq panel cf) 'annotations))))
+      (should (eq t (seshat-reader-sidebar-panel-visible-p 'annotations)))
+      (should-not (seshat-reader-sidebar-panel-visible-p 'translate)))
+    ;; KIND 为 nil（无 kind 语义的面板）永不算「已显示」
+    (should-not (seshat-reader-sidebar-panel-visible-p nil))))
 
 ;;; 尺寸记忆的方向标签（M12 审查修复：方位切换后不得误用旧记忆值）
 

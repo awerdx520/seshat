@@ -1112,7 +1112,7 @@ CELL 是一个 (LIST) 形态的 cons 表达式，`(car CELL)' 收集按调用顺
     (should (eq (lookup-key seshat-reader-mode-map (kbd "C-c C-h"))
                 #'seshat-reader-annotation-refresh-highlights))
     (should (eq (lookup-key seshat-reader-mode-map (kbd "C-c C-l"))
-                #'seshat-reader-annotation-list))
+                #'seshat-reader-annotation-toggle))
     (should (eq (lookup-key seshat-reader-mode-map (kbd "C-c C-a"))
                 #'seshat-reader-annotation-create))))
 
@@ -1231,6 +1231,46 @@ CELL 是一个 (LIST) 形态的 cons 表达式，`(car CELL)' 收集按调用顺
             (should-not (seshat-reader-annotation--cached-annotation-rects)))
         (when (get-buffer seshat-reader-annotation-list-buffer-name)
           (kill-buffer seshat-reader-annotation-list-buffer-name))))))
+
+;;; per-kind 开合（2026-10-26）：C-c C-l 改为 toggle
+
+(ert-deftest seshat-reader-annotation-test--list-key-toggles-panel ()
+  "`C-c C-l' 绑到 `seshat-reader-annotation-toggle'，原列表命令仍保留.
+面板内 `q' 统一绑 `seshat-reader-sidebar-quit'（只关当前面板），与目录 / 译文
+面板一致。"
+  (should (eq (lookup-key seshat-reader-mode-map (kbd "C-c C-l"))
+              'seshat-reader-annotation-toggle))
+  (should (commandp 'seshat-reader-annotation-list))
+  (should (eq (lookup-key seshat-reader-annotation-list-mode-map (kbd "q"))
+              'seshat-reader-sidebar-quit)))
+
+(ert-deftest seshat-reader-annotation-test--toggle-closes-when-visible ()
+  "批注列表已显示时 toggle 只关该 kind 面板，不再拉取渲染列表."
+  (let ((toggles nil)
+        (listed nil))
+    (cl-letf (((symbol-function 'seshat-reader-sidebar-panel-visible-p)
+               (lambda (kind) (eq kind 'annotations)))
+              ((symbol-function 'seshat-reader-sidebar--toggle-kind)
+               (lambda (kind) (push kind toggles)))
+              ((symbol-function 'seshat-reader-annotation-list)
+               (lambda () (push 'listed listed))))
+      (seshat-reader-annotation-toggle))
+    (should (equal toggles '(annotations)))
+    (should-not listed)))
+
+(ert-deftest seshat-reader-annotation-test--toggle-lists-when-hidden ()
+  "批注列表未显示时 toggle 委托 `seshat-reader-annotation-list'（打开列表）."
+  (let ((toggles nil)
+        (listed nil))
+    (cl-letf (((symbol-function 'seshat-reader-sidebar-panel-visible-p)
+               (lambda (_kind) nil))
+              ((symbol-function 'seshat-reader-sidebar--toggle-kind)
+               (lambda (kind) (push kind toggles)))
+              ((symbol-function 'seshat-reader-annotation-list)
+               (lambda () (push 'listed listed))))
+      (seshat-reader-annotation-toggle))
+    (should-not toggles)
+    (should (equal listed '(listed)))))
 
 (provide 'seshat-reader-annotation-test)
 ;;; seshat-reader-annotation-test.el ends here

@@ -655,11 +655,17 @@ KEY 省略时取当前选中项的 key。面板未挂载、无 runtime 或 key �
   (seshat-reader-etaf--move-selection -1))
 
 (defun seshat-reader-etaf-quit ()
-  "关闭本包信息面板（保存 per-kind 高度记忆）.
-复用 `seshat-reader-sidebar-toggle'：关闭前捕获各面板窗口的实测高度，
-下次打开同类型面板时按记忆恢复。"
+  "关闭**当前**（批注列表）面板，保存 per-kind 尺寸记忆.
+委托 `seshat-reader-sidebar-quit'：按当前 buffer 名推断 kind
+（`*Seshat Annotations*' → `annotations'）后只关该 kind 的承载单元，故与目录
+面板、译文/解释面板的 `q' 行为一致——只关自己，不连带关掉其它面板。关闭前由
+`seshat-reader-sidebar--toggle-kind' 捕获实测尺寸、记住 buffer，
+`M-o' 可原样重开。
+
+此前委托的是 `seshat-reader-sidebar-toggle'（无参 = 全部开合），在 ETAF 渲染
+下按 `q' 会把目录与译文面板一并关掉，与另外两个面板的 `q' 语义相反。"
   (interactive)
-  (seshat-reader-sidebar-toggle))
+  (seshat-reader-sidebar-quit))
 
 (provide 'seshat-reader-etaf)
 

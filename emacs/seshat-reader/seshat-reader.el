@@ -1713,7 +1713,7 @@ window and never recovers."
   "r"       #'seshat-reader-rotate-clockwise
   "R"       #'seshat-reader-rotate-counter-clockwise
 
-  "o"       #'seshat-reader-outline-show
+  "o"       #'seshat-reader-outline-toggle
 
   "Q"       #'seshat-reader-close-doc
 

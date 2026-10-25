@@ -514,10 +514,11 @@ ENTRIES 是 `(TEXT FAILED SOURCE)' 列表。gt 的 `gt-buffer-render-init' 把�
             (should (equal header-line-format "Seshat 译文"))
             (should seshat-reader-translate-panel-mode)
             (should (= (point) (point-min))))
-          ;; 经统一显示入口、以 translate 类型显示、请求跟随光标
+          ;; 经统一显示入口、以 translate 类型显示、**不**请求跟随光标——
+          ;; 阅读场景下译文面板显示后光标留在阅读窗口（2026-10-26 起 SELECT 为 nil）
           (should (eq (car shown) buf))
           (should (eq (nth 1 shown) 'translate))
-          (should (nth 2 shown)))
+          (should-not (nth 2 shown)))
       (when (buffer-live-p buf) (kill-buffer buf)))))
 
 (ert-deftest seshat-reader-translate-test--render-panel-show-source ()
@@ -1112,9 +1113,9 @@ M 为链路上 `message' 的文本。
           ;; ④ 译文同步写入 last-result（供存为批注使用）
           (should (equal seshat-reader-translate-last-result
                          seshat-reader-translate-test--translated-text))
-          ;; ⑤ 经统一显示入口、以 translate 类型显示、请求跟随光标
+          ;; ⑤ 经统一显示入口、以 translate 类型显示、不抢光标（SELECT 为 nil）
           (should (equal (plist-get chain :shown)
-                         (list (list panel 'translate t))))
+                         (list (list panel 'translate nil))))
           ;; ⑥ 链路上没有失败提示
           (should-not (cl-some (lambda (msg) (string-match-p "失败" msg))
                                (plist-get chain :messages))))
@@ -2550,6 +2551,78 @@ STATE 为 plist（可含 `:source' `:answer' `:langs' `:kind' `:round' `:turns'
                    "某段译文"))
     (should (stringp seshat-reader-translate-last-result))
     (should (equal seshat-reader-translate-last-result "某段译文"))))
+
+;;; per-kind 开合（2026-10-26）：C-c C-t / C-c C-e 改为 toggle
+
+(ert-deftest seshat-reader-translate-test--toggles-are-key-bound ()
+  "`C-c C-t' / `C-c C-e' 分别绑到译文 toggle 与解释 toggle.
+原命令仍保留（API 兼容），键位只指向 toggle 包装。"
+  (should (eq (lookup-key seshat-reader-mode-map (kbd "C-c C-t"))
+              'seshat-reader-translate-toggle))
+  (should (eq (lookup-key seshat-reader-mode-map (kbd "C-c C-e"))
+              'seshat-reader-translate-explain-toggle))
+  ;; 原命令仍是命令（M-x / 用户配置里仍可用），只是不再绑键
+  (should (commandp 'seshat-reader-translate-selection))
+  (should (commandp 'seshat-reader-translate-explain-selection)))
+
+(ert-deftest seshat-reader-translate-test--toggle-closes-when-visible ()
+  "译文面板已显示时 `translate-toggle' 只关该 kind，不再发起翻译."
+  (let ((toggles nil)
+        (translated nil))
+    (cl-letf (((symbol-function 'seshat-reader-sidebar-panel-visible-p)
+               (lambda (kind) (eq kind 'translate)))
+              ((symbol-function 'seshat-reader-sidebar--toggle-kind)
+               (lambda (kind) (push kind toggles)))
+              ((symbol-function 'seshat-reader-translate-selection)
+               (lambda (&optional _lang) (push 'translated translated))))
+      (seshat-reader-translate-toggle))
+    (should (equal toggles '(translate)))
+    (should-not translated)))
+
+(ert-deftest seshat-reader-translate-test--toggle-translates-when-hidden ()
+  "译文面板未显示时 `translate-toggle' 原样翻译，并把 TARGET-LANG 透传下去."
+  (let ((toggles nil)
+        (langs nil))
+    (cl-letf (((symbol-function 'seshat-reader-sidebar-panel-visible-p)
+               (lambda (_kind) nil))
+              ((symbol-function 'seshat-reader-sidebar--toggle-kind)
+               (lambda (kind) (push kind toggles)))
+              ((symbol-function 'seshat-reader-translate-selection)
+               (lambda (&optional lang) (push lang langs))))
+      (seshat-reader-translate-toggle "ja"))
+    (should-not toggles)
+    (should (equal langs '("ja")))))
+
+(ert-deftest seshat-reader-translate-test--explain-toggle-behaviour ()
+  "解释 toggle 与译文 toggle 同构：已显示则关该 kind，否则解释选区."
+  ;; ① 已显示 → 关闭同一个 translate kind 面板，不发起解释
+  (let ((toggles nil)
+        (explained nil))
+    (cl-letf (((symbol-function 'seshat-reader-sidebar-panel-visible-p)
+               (lambda (kind) (eq kind 'translate)))
+              ((symbol-function 'seshat-reader-sidebar--toggle-kind)
+               (lambda (kind) (push kind toggles)))
+              ((symbol-function 'seshat-reader-translate-explain-selection)
+               (lambda (&optional _lang) (push 'explained explained))))
+      (seshat-reader-translate-explain-toggle))
+    (should (equal toggles '(translate)))
+    (should-not explained))
+  ;; ② 未显示 → 调解释命令（不是纯翻译），TARGET-LANG 透传
+  (let ((toggles nil)
+        (explained nil)
+        (translated nil))
+    (cl-letf (((symbol-function 'seshat-reader-sidebar-panel-visible-p)
+               (lambda (_kind) nil))
+              ((symbol-function 'seshat-reader-sidebar--toggle-kind)
+               (lambda (kind) (push kind toggles)))
+              ((symbol-function 'seshat-reader-translate-explain-selection)
+               (lambda (&optional lang) (push lang explained)))
+              ((symbol-function 'seshat-reader-translate-selection)
+               (lambda (&optional _lang) (push 'translated translated))))
+      (seshat-reader-translate-explain-toggle "ja"))
+    (should-not toggles)
+    (should (equal explained '("ja")))
+    (should-not translated)))
 
 (provide 'seshat-reader-translate-test)
 ;;; seshat-reader-translate-test.el ends here

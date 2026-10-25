@@ -548,5 +548,18 @@
     (should (member '(allow-no-window . t) window-config))
     (should (slot-value obj 'then))))
 
+(ert-deftest seshat-reader-etaf-test--quit-closes-only-current-panel ()
+  "`seshat-reader-etaf-quit' 委托 `seshat-reader-sidebar-quit'（只关当前面板）.
+此前它委托无参 `seshat-reader-sidebar-toggle'（全部开合），在 ETAF 渲染的批注
+列表面板里按 `q' 会把目录与译文面板一并关掉；三面板的 `q' 语义必须一致。"
+  (let ((quits 0) (toggles 0))
+    (cl-letf (((symbol-function 'seshat-reader-sidebar-quit)
+               (lambda () (cl-incf quits)))
+              ((symbol-function 'seshat-reader-sidebar-toggle)
+               (lambda (&optional _kind) (cl-incf toggles))))
+      (seshat-reader-etaf-quit))
+    (should (= 1 quits))
+    (should (= 0 toggles))))
+
 (provide 'seshat-reader-etaf-test)
 ;;; seshat-reader-etaf-test.el ends here

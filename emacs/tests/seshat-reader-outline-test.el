@@ -445,36 +445,90 @@ Section 1.2 5 / Chapter 2 7 / Part II 10.")
           (should-not shows))
       (when (buffer-live-p panel) (kill-buffer panel)))))
 
-(ert-deftest seshat-reader-outline-test--o-is-bound-to-show-in-both-keymaps ()
-  "`o' 在原生 keymap 与 evil normal state 两条注册路径上都指向 `show'.
+(ert-deftest seshat-reader-outline-test--o-is-bound-to-toggle-in-both-keymaps ()
+  "`o' 在原生 keymap 与 evil normal state 两条注册路径上都指向 per-kind toggle.
 `s' 则在两条路径上都指向 `seshat-reader-outline-select-doc-window'（切回阅读
-窗口；`o' 改为面板开合后它不再占 `o'）。"
+窗口）。2026-10-26 起 `o' 由 `seshat-reader-outline-show' 改绑
+`seshat-reader-outline-toggle'：面板已显示则关闭、否则构建并显示，与批注列表 /
+译文 / 解释的键语义统一。"
   ;; ① 原生 keymap（`seshat-reader-outline-mode-map'）
   (should (eq (keymap-lookup seshat-reader-outline-mode-map "o")
-              #'seshat-reader-outline-show))
+              #'seshat-reader-outline-toggle))
   (should (eq (keymap-lookup seshat-reader-outline-mode-map "s")
               #'seshat-reader-outline-select-doc-window))
   ;; ② evil normal state：batch -Q 下 evil 未加载，故桩替 `evil-define-key*'
   ;;    捕获注册内容。本套件 skipped 必须恒为 0，所以用「桩替 + 条件段」而不是
-  ;;    `skip-unless'；`o' 必须与原生 keymap 一致（都指向 `show'）。
+  ;;    `skip-unless'；`o' 必须与原生 keymap 一致（都指向 `toggle'）。
   (let (pairs)
     (cl-letf (((symbol-function 'evil-define-key*)
                (lambda (&rest args)
                  (setq pairs (cl-loop for (key def) on (cddr args) by #'cddr
                                       collect (cons key def))))))
       (seshat-reader-outline--install-evil-bindings))
-    (should (equal (assoc "o" pairs) '("o" . seshat-reader-outline-show)))
+    (should (equal (assoc "o" pairs) '("o" . seshat-reader-outline-toggle)))
     (should (equal (assoc "s" pairs)
                    '("s" . seshat-reader-outline-select-doc-window))))
   ;; ③ 若本会话真的加载了 evil（手工加载 evil 的调试会话），按真实注册再验一
-  ;;    次：normal state 的 auxiliary keymap 里 `o' 解析到 `show'。evil 不在时
+  ;;    次：normal state 的 auxiliary keymap 里 `o' 解析到 `toggle'。evil 不在时
   ;;    整段不执行，不计入 skipped。
   (when (fboundp 'evil-define-key*)
     (seshat-reader-outline--install-evil-bindings)
     (should (eq (lookup-key (evil-get-auxiliary-keymap
                              seshat-reader-outline-mode-map 'normal)
                             "o")
-                #'seshat-reader-outline-show))))
+                #'seshat-reader-outline-toggle))))
+
+(ert-deftest seshat-reader-outline-test--toggle-closes-when-visible ()
+  "`outline-toggle' 在面板已显示时只走 per-kind 关闭，不重建内容.
+判据经 `seshat-reader-sidebar-panel-visible-p'（承载无关：childframe 下也能
+判出「已显示」），关闭只经 `seshat-reader-sidebar--toggle-kind'，`show' 的重建
+路径（`erase-buffer' / 承载层显示）一次都不该被触发。"
+  (let* ((doc "seshat-outline-test-doc-toggle-visible.pdf")
+         (reader (seshat-reader-outline-test--make-reader-buffer
+                  doc seshat-reader-outline-test--outline-a))
+         (toggles nil)
+         (erases 0)
+         (shows nil))
+    (seshat-reader-outline-test--with-cleanup (list reader)
+      (cl-letf (((symbol-function 'seshat-reader-sidebar-panel-visible-p)
+                 (lambda (kind) (eq kind 'outline)))
+                ((symbol-function 'seshat-reader-sidebar--toggle-kind)
+                 (lambda (kind) (push kind toggles)))
+                ((symbol-function 'seshat-reader-sidebar-show)
+                 (lambda (&rest args) (push args shows) 'fake-panel-window))
+                ((symbol-function 'erase-buffer)
+                 (lambda (&rest _) (cl-incf erases))))
+        (with-current-buffer reader
+          (seshat-reader-outline-toggle)))
+      ;; ① 关闭走 per-kind toggle，且只调一次（一次即关）
+      (should (equal toggles '(outline)))
+      ;; ② 没有重建、没有重新显示
+      (should (zerop erases))
+      (should-not shows))))
+
+(ert-deftest seshat-reader-outline-test--toggle-rebuilds-when-hidden ()
+  "`outline-toggle' 在面板未显示时委托 `seshat-reader-outline-show'（重建 + 显示）."
+  (let* ((doc "seshat-outline-test-doc-toggle-hidden.pdf")
+         (reader (seshat-reader-outline-test--make-reader-buffer
+                  doc seshat-reader-outline-test--outline-a))
+         (toggles nil)
+         (shown nil))
+    (seshat-reader-outline-test--with-cleanup (list reader)
+      (cl-letf (((symbol-function 'seshat-reader-sidebar-panel-visible-p)
+                 (lambda (_kind) nil))
+                ((symbol-function 'seshat-reader-sidebar--toggle-kind)
+                 (lambda (kind) (push kind toggles)))
+                ((symbol-function 'seshat-reader-sidebar-show)
+                 (lambda (buffer kind &optional select)
+                   (setq shown (list buffer kind select))
+                   'fake-panel-window)))
+        (with-current-buffer reader
+          (seshat-reader-outline-toggle)))
+      ;; ① 未显示 → 不关闭
+      (should-not toggles)
+      ;; ② 委托 show：重建后按 outline kind 显示
+      (should (eq (cadr shown) 'outline))
+      (should (string-match-p "\\`\\*Outline of .*\\*\\'" (buffer-name (car shown)))))))
 
 ;;; 6. 行模型（纯函数）：DFS 前序 / depth / page 1-based
 
@@ -739,10 +793,10 @@ Section 1.2 5 / Chapter 2 7 / Part II 10.")
               #'seshat-reader-outline-avy-jump))
   (should (eq (lookup-key seshat-reader-outline-mode-map "p") #'previous-line))
   (should (eq (lookup-key seshat-reader-outline-mode-map "n") #'next-line))
-  ;; T18b：`o' 由 `seshat-reader-outline-select-doc-window' 改绑 `show'
-  ;; （面板内按一次即关，不再要求先切回阅读窗口）
+  ;; 2026-10-26：`o' 由 `seshat-reader-outline-show' 改绑 per-kind toggle
+  ;; （面板已显示则关、否则构建并显示；三 kind 键语义统一）
   (should (eq (lookup-key seshat-reader-outline-mode-map "o")
-              #'seshat-reader-outline-show))
+              #'seshat-reader-outline-toggle))
   (should (eq (lookup-key seshat-reader-outline-mode-map "q")
               #'seshat-reader-sidebar-quit))
   (should (eq (lookup-key seshat-reader-outline-mode-map (kbd "RET"))
@@ -907,7 +961,7 @@ Emacs 31 的 `outline-hide-subtree' 用 **overlay**（`invisible' = `outline'）
       (should (equal (assoc "p" pairs) '("p" . previous-line)))
       (should (equal (assoc "n" pairs) '("n" . next-line)))
       (should (equal (assoc "o" pairs)
-                     '("o" . seshat-reader-outline-show)))
+                     '("o" . seshat-reader-outline-toggle)))
       (should (equal (assoc "s" pairs)
                      '("s" . seshat-reader-outline-select-doc-window)))
       (should (equal (assoc "q" pairs) '("q" . seshat-reader-sidebar-quit)))

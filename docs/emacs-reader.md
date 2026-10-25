@@ -10,12 +10,12 @@ Emacs 端文档阅读器（`emacs/seshat-reader/`）：MuPDF 负责栅格化、C
 |---|---|---|
 | 打开文档 | `find-file` / `M-x seshat-reader-open-doc` | PDF/EPUB 等格式由 `auto-mode-alist` 关联到 `seshat-reader-mode` |
 | 逐页阅读 | `n` / `p` / `SPC` / `M-g g` | 翻页、滚动、跳页、缩放、旋转、适配、演示模式、暗色模式 |
-| 目录导航 | `o`（开合） | 左侧目录面板：层级、页码、当前章高亮、TAB 折叠、`f` 单键跳转 |
+| 目录导航 | `o`（开合） | 左侧目录面板：层级、页码、当前章高亮、TAB 折叠、`f` 单键跳转；再按一次 `o` 关闭 |
 | 框选取文 | 鼠标 `down-mouse-1` 拖拽 | 松手后取文本并闪现选区矩形 |
-| 批注 | `C-c C-a` / `C-c C-l` | 创建、列出、跳页、删除、页面高亮刷新 |
+| 批注 | `C-c C-a` / `C-c C-l` | 创建、列表开合（已显示则关）、跳页、删除、页面高亮刷新 |
 | 跨页文本搜索 | `C-s`（会话内 `n` / `p` / `RET` / `C-g`） | 整本扫描、跨页跳转与回绕、命中以橙色装饰投喂 |
 | 手写轨迹显示 | 自动（`seshat-reader-annotation-ink-enabled`） | 把 Android 手写批注的 `ink:` 段渲染为页面笔迹（只显示，不输入） |
-| 翻译/解释 | `C-c C-t` / `C-c C-e` | 依赖 go-translate；结果显示在面板（或 posframe） |
+| 翻译/解释 | `C-c C-t` / `C-c C-e` | 依赖 go-translate；结果显示在面板（或 posframe）。同一组键是**开合**：面板已显示则关闭，否则翻译/解释并弹出（不抢光标） |
 | 跨页衔接 | `seshat-reader-page-join-lines` | 默认关闭的 opt-in 特性 |
 | 引用闭环 | `C-c C-r` / `M-x org-store-link` | `seshat:` 链接、摘录写入、`:complete` 补全、`:export` 导出 |
 | 离线队列 | 自动 | 服务端不可用时本地暂存批注，恢复后自动同步 |
@@ -302,6 +302,7 @@ Emacs 端**只显示**手写（无笔事件、无压感，输入永远在 Androi
 - 正文按模板渲染：翻译用 `seshat-reader-translate-template`（默认 `"%l\n\n%q\n\n---\n\n%t\n"`），解释用 `seshat-reader-translate-explain-template`（默认 `"%q\n\n---\n\n%t\n"`）。占位符 `%k` 标题、`%l` 语言对、`%q` 原文引用块、`%t` 正文；模板非法时回退纯正文并 `message` 警告；设 `nil` 表示不套模板。
 - `seshat-reader-translate-show-source`（默认 `t`）控制是否在正文前插入选中原文的引用块（不截断）。
 - `seshat-reader-translate-visual-fill-column`（默认 `t`）在面板启用 `visual-fill-column-mode`（软依赖，未安装静默跳过）。
+- **不抢光标**：显示译文/解释面板时不移动光标，光标留在阅读窗口（SELECT 传 `nil`），可以接着翻页/滚动；要编辑或复制译文时点进面板即可。批注列表面板不受影响（仍在内容就绪后跟随光标）。
 - 语言对由 `seshat-reader-translate-fallback-langs`（默认 `(en zh)`）推导，可用命令前缀参数覆盖。
 - **多引擎结果**：`seshat-reader-translate-engines-pick`（默认 `all`）——`all` 展示**全部**成功结果，每条前标注 `【引擎名】`、段间用 Markdown 分隔线 `---` 隔开（多引擎预设本就是为了一眼比对各家译文）；`first` / `last` 只展示第一个 / 最后一个**成功**结果，且**不带**来源标签。带 `gt-buffer-render-error-face` 的片段视为失败并跳过；来源取不到（单引擎不写前缀行）时退化为纯译文，不加标签也不加分隔线。旧的「拼接后不可区分」行为已不存在——想要单条输出请显式设为 `first`。
 - **流式增量**：`seshat-reader-translate-stream`（默认 `t`）边生成边显示，骨架只写一次、正文区替换、完成不重写；细节见下文「译文流式渲染」。
@@ -323,9 +324,12 @@ Emacs 端**只显示**手写（无笔事件、无压感，输入永远在 Androi
   - 多个 child frame 面板同时存在时由 `--cf-position` **纵向堆叠**（已有面板逐个下移），互不重叠。
 - **跟随底部**：`seshat-reader-panel-follow-bottom`（默认 `t`）——流式输出期间面板自动滚到最底显示最新内容；用户**向上滚动后停止跟随**，自己滚回底部时恢复。想全程手动滚动设 `nil`。
 - **去 mode-line**：child frame 的面板窗口设 window parameter `mode-line-format` 为 `none`，省掉一行无信息量的 modeline；`header-line` **保留**（仍显示「Seshat 译文」/「Seshat 解释」）。
-- **面板内 `q`**：统一走 `seshat-reader-sidebar-quit`——按 buffer 名推断当前面板 kind，再按**承载单元**分派 `delete-window`（窗口）或 `delete-frame`（child frame）；当前 buffer 不是面板时退回 `seshat-reader-sidebar-toggle`。译文面板与目录面板的 `q` 已改绑到它，批注列表仍是 `quit-window`（批注走窗口承载，`quit-window` 本来就对）。
-- **阅读器侧 `C-c C-o`**：`seshat-reader-sidebar-toggle`（无参）——**面板开着就全部关闭，关了重开最近一个面板**。只开合目录的 `seshat-reader-sidebar-toggle-outline` 不绑键（与 `o` 重复），仍可 `M-x` 调用；目录面板自己的 `o`（`seshat-reader-outline-show`）语义不变。
-- **切走即隐藏**：`seshat-reader-panel-hide-on-buffer-change`（默认 `t`）挂在全局 `window-buffer-change-functions` 上——当前 buffer 不再派生自 `seshat-reader-mode` 时关闭本包 child frame 面板（覆盖浮层不属于任何窗口树，放任不管会在回邮件 / 看终端时一直悬在右上角）。面板内容仍留在 buffer 里，`C-c C-o` 可重开；设 `nil` 则常驻。
+- **面板内 `q`（三面板统一）**：一律走 `seshat-reader-sidebar-quit`——按 buffer 名推断当前面板 kind，再按**承载单元**分派 `delete-window`（窗口）或 `delete-frame`（child frame），**只关当前这一个面板**，不连带关闭其它 kind 的面板；当前 buffer 不是面板时退回 `seshat-reader-sidebar-toggle`。目录面板与译文/解释面板直接绑该命令，批注列表（含 ETAF 渲染路径）也绑到它（`seshat-reader-etaf-quit` 委托同一命令）。
+- **per-kind 开合键（阅读窗口里）**：每个 kind 一个 toggle——`o` 目录（`seshat-reader-outline-toggle`）、`C-c C-l` 批注列表（`seshat-reader-annotation-toggle`）、`C-c C-t` / `C-c C-e` 译文与解释（`seshat-reader-translate-toggle` / `-explain-toggle`）。语义统一：**面板已显示则关闭，否则打开/生成**。「已显示」由 `seshat-reader-sidebar-panel-visible-p` 判定，与承载方式无关（side window / 底部窗口 / child frame 都算），因此 childframe 承载下同样能一键关闭。原命令（`-outline-show` / `-annotation-list` / `-translate-selection` / `-explain-selection`）保留不变，`M-x` 调用语义如旧。
+- **`M-o` 全部面板开合**：`seshat-reader-sidebar-toggle`（无参）——**面板开着就全部关闭，关了重开最近一个面板**。`C-c C-o` 已**解绑**，让给 org / `outline-minor-mode` 的结构操作。选 `M-o` 是因为单键、右手拇指可直接够到；它虽是 `global-map` 里 `facemenu-keymap` 的前缀，但本包把绑定写进 `seshat-reader-mode-map`（mode-map 优先），阅读器 buffer 内的 `M-o` 因此归本包，其它 buffer 的 `M-o` 行为不受影响。
+- **位置与复用**：每个 kind 的 side 由「kind → 位置」解析决定（目录默认左、译文/批注默认右），slot 按 kind 固定分配，故同一 kind 重开时**复用同一 side window**（不新建、不改侧）；运行中改方位才会重建该 kind 的窗口。
+- **译文/解释面板不抢光标**：面板显示后光标留在阅读窗口（`seshat-reader-translate--render-panel` / `--stream-init` 的 SELECT 传 `nil`）。需要时点进面板，或把 `seshat-reader-sidebar-select-window` 与调用点改回非 nil。批注列表面板保持原行为（内容就绪后跟随光标）。
+- **切走即隐藏**：`seshat-reader-panel-hide-on-buffer-change`（默认 `t`）挂在全局 `window-buffer-change-functions` 上——当前 buffer 不再派生自 `seshat-reader-mode` 时关闭本包 child frame 面板（覆盖浮层不属于任何窗口树，放任不管会在回邮件 / 看终端时一直悬在右上角）。面板内容仍留在 buffer 里，`M-o` 可重开；设 `nil` 则常驻。
 - **与 popper 的关系**：popper 分流函数 `seshat-reader-sidebar-display-buffer` 仍只服务 `window` 承载的面板；child frame 面板**不经过** `display-buffer`，popper 的 `C-'` 开关因此不影响它（面板里那份 buffer 仍可照常用 popper 打开成普通窗口）。
 
 ## 译文流式渲染
@@ -415,15 +419,19 @@ Emacs 端**只显示**手写（无笔事件、无压感，输入永远在 Androi
 | `0` | `seshat-reader-reset-size` | 复位缩放 |
 | `H` / `W` | `seshat-reader-fit-to-height` / `-fit-to-width` | 整页 / 整宽适配 |
 | `r` / `R` | `seshat-reader-rotate-clockwise` / `-counter-clockwise` | 顺/逆时针 90° |
-| `o` | `seshat-reader-outline-show` | 开合目录面板（已显示则关闭，未显示则重建内容后打开） |
+| `o` | `seshat-reader-outline-toggle` | 开合目录面板（已显示则关闭，未显示则重建内容后打开） |
 | `Q` | `seshat-reader-close-doc` | 关闭文档 |
-| `C-c C-a` / `C-c C-l` | `seshat-reader-annotation-create` / `-list` | 建批注 / 批注列表 |
+| `C-c C-a` / `C-c C-l` | `seshat-reader-annotation-create` / `-toggle` | 建批注 / 批注列表面板开合（已显示则关，否则拉取渲染） |
 | `C-c C-h` | `seshat-reader-annotation-refresh-highlights` | 刷新页面高亮 |
 | `C-s` | `seshat-reader-search` | 跨页文本搜索（会话内 `n` / `p` / `RET` / `C-g`；`n` / `p` 只在会话期间接管翻页键） |
 | `C-c C-r` | `seshat-reader-reference-insert` | 插入选区摘录 |
-| `C-c C-t` / `C-c C-e` | `seshat-reader-translate-selection` / `-explain-selection` | 翻译 / 解释 |
+| `C-c C-t` / `C-c C-e` | `seshat-reader-translate-toggle` / `-explain-toggle` | 译文 / 解释面板开合（已显示则关，否则翻译 / 解释选区并弹出） |
 | `C-c C-q` | `seshat-reader-translate-follow-up` | 对译文 / 解释继续追问（多轮上下文） |
-| `C-c C-o` | `seshat-reader-sidebar-toggle` | 快捷关闭 / 重开面板（无参：开着即全部关闭，关了重开最近一个） |
+| `M-o` | `seshat-reader-sidebar-toggle` | **全部面板**开合：有面板就全部关闭，没有就重开最近一个 |
+
+`C-c C-o` **已解绑**（让给 org / `outline-minor-mode` 的结构操作）：单个 kind 的开合改由各自
+的键承担（`o` 目录、`C-c C-l` 批注列表、`C-c C-t` / `C-c C-e` 译文与解释），全部开合统一走
+`M-o`。
 
 另有 `next-line` / `previous-line` / `next` / `prior` / `scroll-up-command` / `scroll-down-command` / `forward-char` / `backward-char` / `beginning-of-buffer` / `end-of-buffer` / `goto-line` / `move-end-of-line` / `move-beginning-of-line` 的 remap，及 6 个鼠标命令 remap 到 `ignore`（防止误移 point 破坏页面边框绘制）。
 
@@ -434,9 +442,9 @@ Emacs 端**只显示**手写（无笔事件、无压感，输入永远在 Androi
 | `p` / `n` | `previous-line` / `next-line` | 上下移动 |
 | `RET`、`M-RET` | `seshat-reader-outline-visit-page` | 跳到该标题所在页 |
 | `f` | `seshat-reader-outline-avy-jump` | avy 风格单键跳转 |
-| `o` | `seshat-reader-outline-show` | 关闭面板（面板内按一次即关）；`seshat-reader-outline-select-doc-window` 不再占 `o`，仅供 `RET` 跳页切回阅读窗口 |
+| `o` | `seshat-reader-outline-toggle` | 开合面板：已显示则关闭，未显示则重建内容后打开；`seshat-reader-outline-select-doc-window` 不再占 `o`，仅供 `RET` 跳页切回阅读窗口 |
 | `s` | `seshat-reader-outline-select-doc-window` | 切回阅读窗口（回跳当前文档；`o` 改为面板开合后它换绑到 `s`） |
-| `q` | `seshat-reader-sidebar-quit` | 关闭面板（child frame 承载时走 `delete-frame`，窗口承载走 `delete-window`） |
+| `q` | `seshat-reader-sidebar-quit` | **只关当前面板**（child frame 承载时走 `delete-frame`，窗口承载走 `delete-window`；不连带关闭译文/批注面板） |
 | `TAB` | `outline-mode` 自身 | 折叠 / 展开子树 |
 
 evil 用户同样可用上述单键（包内 `evil-define-key*` 补绑 normal state 的 `f` / `p` / `n` / `o` / `s` / `q` / `RET` / `M-RET`）。
@@ -448,7 +456,7 @@ evil 用户同样可用上述单键（包内 `evil-define-key*` 补绑 normal st
 | `RET` | `seshat-reader-annotation-list-goto` | 跳到该条批注所在页 |
 | `d` | `seshat-reader-annotation-list-delete` | 删除该条批注 |
 | `C-c C-r` | `seshat-reader-reference-insert-annotation` | 插入该条批注的引用 |
-| `q` | `quit-window` | 关闭面板 |
+| `q` | `seshat-reader-sidebar-quit` | 只关当前（批注列表）面板，与目录 / 译文面板一致（ETAF 渲染路径同一语义，键由 `seshat-reader-etaf--annotation-keys` 绑到 `seshat-reader-etaf-quit`，后者委托 `sidebar-quit`） |
 
 ### 9.4 译文/解释面板（`seshat-reader-translate-panel-mode-map`）
 
@@ -481,7 +489,7 @@ evil 用户同样可用上述单键（包内 `evil-define-key*` 补绑 normal st
 | `seshat-reader-panel-height` | `0.45` | child frame 高度 = 父 frame 像素高 × 本值；**打开即固定、全程不 resize**，内容超出在面板内滚动 | 仅 `childframe` 生效 |
 | `seshat-reader-panel-margin` | `16` | child frame 距父 frame **右 / 上**边缘的像素间距 | 仅 `childframe` 生效 |
 | `seshat-reader-panel-follow-bottom` | `t` | 流式输出期间是否自动跟随底部（显示最新内容）；用户向上滚动后停止跟随、回到底部时恢复 | 仅 `childframe` 生效 |
-| `seshat-reader-panel-hide-on-buffer-change` | `t` | 当前 buffer 不再是阅读器 buffer 时关闭本包 child frame 面板；面板内容留在 buffer 里可 `C-c C-o` 重开 | `nil` = 面板常驻 |
+| `seshat-reader-panel-hide-on-buffer-change` | `t` | 当前 buffer 不再是阅读器 buffer 时关闭本包 child frame 面板；面板内容留在 buffer 里可 `M-o` 重开 | `nil` = 面板常驻 |
 
 ### 阅读
 
