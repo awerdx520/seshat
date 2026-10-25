@@ -613,13 +613,18 @@ jump-back primitive used by `seshat-reader-outline-goto-entry'."
       (setq seshat-reader-outline--doc-window (selected-window)))))
 
 (defvar-keymap seshat-reader-outline-mode-map
-  :doc "Keymap for `seshat-reader-outline-mode'"
+  :doc "Keymap for `seshat-reader-outline-mode'.
+
+`q' closes the panel this buffer is displayed in
+\(`seshat-reader-sidebar-quit'): kind `outline' only, so the translate /
+annotation panels are left alone, and a childframe carrier is removed with
+`delete-frame' instead of leaving an empty frame behind."
   "p"        #'previous-line
   "n"        #'next-line
   "f"        #'seshat-reader-outline-avy-jump
   "o"        #'seshat-reader-outline-show
   "s"        #'seshat-reader-outline-select-doc-window
-  "q"        #'quit-window
+  "q"        #'seshat-reader-sidebar-quit
   "RET"      #'seshat-reader-outline-visit-page
   "M-RET"    #'seshat-reader-outline-visit-page)
 
@@ -726,7 +731,7 @@ loading this library never requires evil.  Extracted from the
       "n"           #'next-line
       "o"           #'seshat-reader-outline-show
       "s"           #'seshat-reader-outline-select-doc-window
-      "q"           #'quit-window
+      "q"           #'seshat-reader-sidebar-quit
       (kbd "RET")   #'seshat-reader-outline-visit-page
       (kbd "M-RET") #'seshat-reader-outline-visit-page)))
 

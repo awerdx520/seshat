@@ -2102,5 +2102,76 @@ child frame 的尺寸由父 frame 像素 × 比例固定决定，用户无法 re
       (should (equal closed '(cf-2 cf-1)))
       (should (= (length messages) 1)))))
 
+;;; 面板内 `q'：`seshat-reader-sidebar-quit' 的四条分支
+
+(ert-deftest seshat-reader-sidebar-test--quit-closes-translate-panel ()
+  "译文面板内按 `q' → 只关 `translate' 面板，不走全部开合.
+kind 由 buffer 名推断；命令必须把 kind 交给 `--toggle-kind'（它按承载单元分派
+`delete-window' / `delete-frame'），而不是无参 `seshat-reader-sidebar-toggle'
+（那会连带关掉其它 kind）。"
+  (let (kind-calls toggle-calls)
+    (cl-letf (((symbol-function 'buffer-name)
+               (lambda (&optional _buffer)
+                 seshat-reader-sidebar-translate-buffer-name))
+              ((symbol-function 'seshat-reader-sidebar--toggle-kind)
+               (lambda (kind) (push kind kind-calls)))
+              ((symbol-function 'seshat-reader-sidebar-toggle)
+               (lambda (&optional kind) (push kind toggle-calls))))
+      (seshat-reader-sidebar-quit))
+    (should (equal kind-calls '(translate)))
+    (should-not toggle-calls)))
+
+(ert-deftest seshat-reader-sidebar-test--quit-closes-outline-panel ()
+  "目录面板内按 `q' → kind 推断为 `outline'（名字是动态格式）."
+  (let (kind-calls toggle-calls)
+    (cl-letf (((symbol-function 'buffer-name)
+               (lambda (&optional _buffer) "*Outline of paper.pdf*"))
+              ((symbol-function 'seshat-reader-sidebar--toggle-kind)
+               (lambda (kind) (push kind kind-calls)))
+              ((symbol-function 'seshat-reader-sidebar-toggle)
+               (lambda (&optional kind) (push kind toggle-calls))))
+      (seshat-reader-sidebar-quit))
+    (should (equal kind-calls '(outline)))
+    (should-not toggle-calls)))
+
+(ert-deftest seshat-reader-sidebar-test--quit-falls-back-to-toggle ()
+  "非面板 buffer 里按 `q' → 退回「全部开合」旧语义（无参 toggle）."
+  (let (toggle-calls kind-calls)
+    (cl-letf (((symbol-function 'buffer-name)
+               (lambda (&optional _buffer) "*scratch*"))
+              ((symbol-function 'seshat-reader-sidebar-toggle)
+               (lambda (&optional kind) (push kind toggle-calls)))
+              ((symbol-function 'seshat-reader-sidebar--toggle-kind)
+               (lambda (kind) (push kind kind-calls))))
+      (seshat-reader-sidebar-quit))
+    (should (equal toggle-calls '(nil)))
+    (should-not kind-calls)))
+
+(ert-deftest seshat-reader-sidebar-test--quit-deletes-frame-for-childframe ()
+  "child frame 承载时按 `q' 走 `delete-frame'，不留下空 frame.
+`quit-window' 对 child frame 只能删窗口、frame 会剩成空壳——这正是本命令存在的
+理由，故断言 `delete-window' **没有**被调用。"
+  (let (delete-frame-calls delete-window-calls captured)
+    (cl-letf (((symbol-function 'buffer-name)
+               (lambda (&optional _buffer)
+                 seshat-reader-sidebar-translate-buffer-name))
+              ((symbol-function 'seshat-reader-sidebar--panels)
+               (lambda () (list 'fake-frame)))
+              ((symbol-function 'framep)
+               (lambda (obj) (eq obj 'fake-frame)))
+              ((symbol-function 'seshat-reader-sidebar--unit-kind)
+               (lambda (_panel) 'translate))
+              ((symbol-function 'seshat-reader-sidebar--capture-state)
+               (lambda (panels) (setq captured panels)))
+              ((symbol-function 'delete-frame)
+               (lambda (frame &optional _force)
+                 (push frame delete-frame-calls)))
+              ((symbol-function 'delete-window)
+               (lambda (window) (push window delete-window-calls))))
+      (seshat-reader-sidebar-quit))
+    (should (equal delete-frame-calls '(fake-frame)))
+    (should-not delete-window-calls)
+    (should (equal captured '(fake-frame)))))
+
 (provide 'seshat-reader-sidebar-test)
 ;;; seshat-reader-sidebar-test.el ends here

@@ -1424,6 +1424,21 @@ side 窗口），frame 走 `delete-frame'。关闭后提示「已关闭 %d 个�
           (message
            "Seshat Reader sidebar: 先打开批注列表（C-c C-l）或译文再切换"))))))
 
+(defun seshat-reader-sidebar-quit ()
+  "关闭当前缓冲所在的面板；当前缓冲不是面板时退回 `seshat-reader-sidebar-toggle'.
+kind 由 `seshat-reader-sidebar-buffer-p' 与
+`seshat-reader-sidebar--kind-for-buffer-name' 按 buffer 名推断，因此本命令既能
+从面板内部（`q'）调用，也能被阅读器 buffer 的键位复用。面板可能是窗口，也可能是
+child frame：关闭统一经 `seshat-reader-sidebar--toggle-kind'（它按承载单元分派
+`delete-window' / `delete-frame'）。"
+  (interactive)
+  (let* ((name (buffer-name (current-buffer)))
+         (kind (and (seshat-reader-sidebar-buffer-p name)
+                    (seshat-reader-sidebar--kind-for-buffer-name name))))
+    (if kind
+        (seshat-reader-sidebar--toggle-kind kind)
+      (seshat-reader-sidebar-toggle))))
+
 (defun seshat-reader-sidebar-toggle-outline ()
   "收起或展开阅读器的**目录面板**（kind 为 `outline'）.
 等价于 `(seshat-reader-sidebar-toggle \\='outline)`：只开合目录面板，右侧批注

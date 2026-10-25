@@ -42,7 +42,8 @@
 ;;   与 isearch 全部可用，不再受 ETAF 固定画布高度限制。面板位置与高度由
 ;;   `seshat-reader-sidebar-position' / `seshat-reader-sidebar-height' 决定，
 ;;   且显示后按内容自适应（上限 `seshat-reader-sidebar-max-height'）；
-;;   面板内 `q'（由 minor mode `seshat-reader-translate-panel-mode' 承载）或
+;;   面板内 `q'（`seshat-reader-sidebar-quit'，由 minor mode
+;;   `seshat-reader-translate-panel-mode' 承载）或
 ;;   `seshat-reader-sidebar-toggle' 可关闭。
 ;; - `pop'/`pin'：回退 posframe（`gt-posframe-pop-render' 弹出、失焦即消失 /
 ;;   `gt-posframe-pin-render' 常驻），可在配置侧切回。
@@ -174,8 +175,8 @@ Markdown 只读视图显示：gt 只负责把纯译文渲染到隐藏中转 buff
 `seshat-reader-translate--render-panel'）写入面板；面板位置与初始高度由
 `seshat-reader-sidebar-position' 与 `seshat-reader-sidebar-height' 决定，
 显示后按内容自适应（上限 `seshat-reader-sidebar-max-height'），面板内 `q'
-（minor mode `seshat-reader-translate-panel-mode'）或
-`seshat-reader-sidebar-toggle' 可关闭，**不再弹 posframe**。
+（`seshat-reader-sidebar-quit'，minor mode `seshat-reader-translate-panel-mode'
+承载）或 `seshat-reader-sidebar-toggle' 可关闭，**不再弹 posframe**。
 `pop' 表示弹出式 posframe（gt function `gt-posframe-pop-render'，失焦即消失）；
 `pin' 表示常驻的固定 posframe（gt function `gt-posframe-pin-render'）。
 
@@ -307,11 +308,12 @@ go-translate function `gt-buffer-render' 是该库中定义的**类名**（不�
 
 (defvar seshat-reader-translate-panel-map
   (let ((map (make-sparse-keymap)))
-    (define-key map (kbd "q") #'seshat-reader-sidebar-toggle)
+    (define-key map (kbd "q") #'seshat-reader-sidebar-quit)
     (define-key map (kbd "C-c C-s") 'seshat-reader-translate-save-as-annotation)
     map)
   "面板 buffer 的键位.
-`q' 关闭面板（`seshat-reader-sidebar-toggle'）；
+`q' 关闭面板（`seshat-reader-sidebar-quit'：只关本面板所在 kind，child frame
+承载时走 `delete-frame'，不会连带关掉其它 kind）；
 `seshat-reader-translate-save-as-annotation' 把最近一次译文存为批注。用
 minor mode 承载而非 `local-set-key'，以免污染 Markdown 视图 mode 的键位表
 （同名 mode 的 map 是共享对象）。")
@@ -700,8 +702,9 @@ TARGET-LANG 为 nil 时直接使用 `seshat-reader-translate-fallback-langs'
 使用预设 `seshat-reader-translate-preset'；预设缺失时回退到内置的
 youdao/google 翻译器。呈现方式见 `seshat-reader-translate-render'：默认
 `sidebar' 让 gt 渲染到隐藏中转 buffer，再由 `:then' 回调把纯译文写进
-**底部信息面板**的 Markdown 只读 buffer（不再弹 posframe），面板可用 `q' 或
-`seshat-reader-sidebar-toggle' 关闭；取 `pop'/`pin' 时恢复 posframe。译文在
+**底部信息面板**的 Markdown 只读 buffer（不再弹 posframe），面板可用 `q'
+（`seshat-reader-sidebar-quit'）或 `seshat-reader-sidebar-toggle' 关闭；取
+`pop'/`pin' 时恢复 posframe。译文在
 面板路径由 `seshat-reader-translate--panel-result' 在 `:then' 回调内写入
 `seshat-reader-translate-last-result'，posframe 路径由
 `seshat-reader-translate--capture-result' 写入，都可用
@@ -748,8 +751,9 @@ TARGET-LANG 的语义与 `seshat-reader-translate-selection' 完全相同：非�
 
 呈现方式见 `seshat-reader-translate-render'：默认 `sidebar' 让 gt 渲染到隐藏
 中转 buffer，再由 `:then' 回调把纯文本写进**底部信息面板**的 Markdown 只读
-buffer（不再弹 posframe），面板可用 `q' 或 `seshat-reader-sidebar-toggle'
-关闭；取 `pop'/`pin' 时恢复 posframe。译文写入方式同
+buffer（不再弹 posframe），面板可用 `q'
+（`seshat-reader-sidebar-quit'）或 `seshat-reader-sidebar-toggle' 关闭；取
+`pop'/`pin' 时恢复 posframe。译文写入方式同
 `seshat-reader-translate-selection'（面板路径在 `:then' 回调内写入），可用
 `seshat-reader-translate-save-as-annotation' 把结果存为批注。错误处理与
 `seshat-reader-translate-selection' 一致：`user-error' 冒泡，其余一般

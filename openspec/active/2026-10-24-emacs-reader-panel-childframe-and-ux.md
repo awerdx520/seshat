@@ -139,6 +139,19 @@
 验收：ERT 覆盖三项（去重三取值、失败顺延、window parameter/modeline、键位绑定）；既有
 translate/sidebar/outline/etaf 套件全绿。
 
+### T3.6 面板内 `q` 关闭 childframe（依赖：T3.5）
+
+用户要求「在弹出的界面中按 q 退出」。现状 `q` 的三种绑定不一致：translate 走无参
+`seshat-reader-sidebar-toggle`（会连带关掉其它 kind）、outline 走 `quit-window`（对 child
+frame 只删窗口、可能留下空 frame）、etaf 走 `seshat-reader-etaf-quit`（批注仍是窗口承载，
+不动）。修复：新增统一命令 `seshat-reader-sidebar-quit` —— 按当前 buffer 名推断 kind，关闭
+**该 kind** 的面板（frame → `delete-frame`、window → `delete-window`）；当前 buffer 不是面板
+buffer 时退回「全部开合」旧语义。outline 的两处 `q`（mode-map 与 evil bindings）与 translate
+面板的 `q` 改绑该命令；批注面板 `q` 保持不变。
+
+验收：ERT 覆盖四分支（translate/outline 面板内关闭、非面板回退、frame 走 delete-frame）；
+verify 实例 GUI 实测 childframe 内按 `q` 能真正关闭 frame。
+
 ### T4 流式渲染（依赖：T3）
 
 - 文件：`emacs/seshat-reader/seshat-reader-translate.el`

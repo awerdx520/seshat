@@ -742,7 +742,8 @@ Section 1.2 5 / Chapter 2 7 / Part II 10.")
   ;; （面板内按一次即关，不再要求先切回阅读窗口）
   (should (eq (lookup-key seshat-reader-outline-mode-map "o")
               #'seshat-reader-outline-show))
-  (should (eq (lookup-key seshat-reader-outline-mode-map "q") #'quit-window))
+  (should (eq (lookup-key seshat-reader-outline-mode-map "q")
+              #'seshat-reader-sidebar-quit))
   (should (eq (lookup-key seshat-reader-outline-mode-map (kbd "RET"))
               #'seshat-reader-outline-visit-page))
   (should (eq (lookup-key seshat-reader-outline-mode-map (kbd "M-RET"))
@@ -908,7 +909,7 @@ Emacs 31 的 `outline-hide-subtree' 用 **overlay**（`invisible' = `outline'）
                      '("o" . seshat-reader-outline-show)))
       (should (equal (assoc "s" pairs)
                      '("s" . seshat-reader-outline-select-doc-window)))
-      (should (equal (assoc "q" pairs) '("q" . quit-window)))
+      (should (equal (assoc "q" pairs) '("q" . seshat-reader-sidebar-quit)))
       ;; 特殊键必须走 `kbd' 向量（`define-key' 不解析字符串 "RET"）
       (should (equal (assoc (kbd "RET") pairs)
                      (cons (kbd "RET") 'seshat-reader-outline-visit-page)))
