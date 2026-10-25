@@ -64,6 +64,17 @@
 ;;     and overlay `display' properties do not compose.  A persistent
 ;;     highlight comes from creating an annotation (`C-c C-a'), which feeds
 ;;     the same C table through `seshat-reader-annotation'.
+;;   - The flashed (and annotated) geometry is a set of rectangles hugging
+;;     the selected characters, merged per line: the module reports one
+;;     rectangle per hit character and they are run together until the
+;;     horizontal gap exceeds
+;;     `seshat-reader-select-highlight-gap-ratio' times the line height (see
+;;     `seshat-reader-select--merge-char-rects'), which keeps two-column
+;;     text from being bridged by a single bar.  Set
+;;     `seshat-reader-select-highlight-granularity' to `character' for one
+;;     rectangle per character instead.  It is still not a text-shaping
+;;     highlight: rotated pages remain unsupported, as they are for the
+;;     selection itself.
 ;;   - Only pages carrying a text layer can be read; scanned images
 ;;     produce no text.
 ;;   - The frame scale used here is sampled from the frame displaying
@@ -115,6 +126,64 @@ completely; there is no second on/off switch."
   :type 'number
   :group 'seshat-reader-select)
 
+(defcustom seshat-reader-select-highlight-granularity 'line
+  "How the per-character rectangles of a selection are merged.
+The C module reports one rectangle per character hit by the selection
+drag, which is far too many to feed back as highlights.  With the
+default `line' the rectangles are clustered into text lines and run
+together inside a line until the horizontal gap gets too wide (see
+`seshat-reader-select-highlight-gap-ratio'), so a selection spanning
+three lines flashes three bars that hug the text.
+
+With `character' no merging happens at all: every character keeps its
+own rectangle, which is the most faithful and the most expensive
+choice (it also pushes the multi-segment `rect:' limit of an
+annotation location, see `seshat-reader-annotation--rect-max-segments').
+Both values sort the rectangles by position; the ordering is what the
+C renderer relies on for a stable result."
+  :type '(choice (const :tag "Merge into lines" line)
+                 (const :tag "One rect per character" character))
+  :group 'seshat-reader-select)
+
+(defcustom seshat-reader-select-highlight-gap-ratio 0.8
+  "Horizontal gap, relative to the line height, that splits a line run.
+Two neighbouring characters are merged into the same rectangle as long
+as the gap between them does not exceed this ratio times the line
+height (the line height is the median height of the characters in that
+line).  The default 0.8 bridges the inter-word spaces of normal text
+while still keeping the two columns of a two-column layout apart: the
+gap between columns is far wider than a line height.
+
+0 splits at every positive gap (touching characters still merge); a
+very large value merges everything that shares a line."
+  :type 'number
+  :group 'seshat-reader-select)
+
+(defcustom seshat-reader-select-highlight-shrink-ratio 0.8
+  "Vertical height of a highlight rectangle, relative to its glyph box.
+The character quads reported by the module are taller than the leading
+of the text, so the per-line bars of two adjacent lines touch (or even
+overlap) vertically and a multi-line selection looks like one solid
+block.  Every rectangle returned by
+`seshat-reader-select--merge-char-rects' is therefore shrunk around its
+own vertical centre by this ratio, which restores a white gap between
+the lines: with a glyph height of about 11pt and a leading of about
+10.3pt the default 0.8 leaves roughly a 1pt gap.
+
+Only the **height** is affected: the vertical centre is kept, and
+neither the horizontal range (X0 / X1), nor the overall bounding box
+of the drag (`:rect' of `seshat-reader-select-last'), nor the number of
+merged segments and their x ranges written into an annotation
+`location' change.  Both `seshat-reader-select-highlight-granularity'
+values are shrunk.
+
+1.0 disables the shrink (the raw merged geometry, i.e. the behaviour
+before this option existed).  The useful range is 0.3 to 1.0; a value
+outside of it is clamped into that range, and a non-number (nil, a
+string) falls back to the default 0.8 instead of raising an error."
+  :type 'number
+  :group 'seshat-reader-select)
+
 (defvar seshat-reader-select--flash-rects nil
   "Rectangles currently flashed, as a list of (PAGE X0 Y0 X1 Y1).
 PAGE is 1-based, the four coordinates are page coordinates (the same
@@ -143,6 +212,8 @@ pending clear, leaving its flash rectangle on the page forever.")
 ;; 闪现静默跳过（取文本功能不受影响）。
 (declare-function seshat-reader-dyn--add-highlight "seshat-render-core"
                   (page x0 y0 x1 y1))
+(declare-function seshat-reader-dyn--rects-in-rect "seshat-render-core"
+                  (page x0 y0 x1 y1))
 (declare-function seshat-reader-dyn--clear-highlights "seshat-render-core" ())
 (declare-function seshat-reader-dyn--refresh-highlights "seshat-render-core" ())
 (declare-function seshat-reader-annotation--redraw-highlights
@@ -164,6 +235,240 @@ positive width and height; a degenerate rectangle has nothing to draw."
          (and (numberp x0) (numberp y0) (numberp x1) (numberp y1)
               (> (- x1 x0) 0)
               (> (- y1 y0) 0)))))
+
+(defun seshat-reader-select--normalize-flash-rects (page rects)
+  "Return RECTS as a list of (PAGE X0 Y0 X1 Y1) tuples.
+RECTS is either a single rectangle (X0 Y0 X1 Y1) or a list of such
+rectangles — both call shapes are accepted so that a caller holding an
+unmerged bounding box does not have to wrap it.  PAGE is prepended to
+every rectangle and rectangles rejected by
+`seshat-reader-select--rect-valid-p' are dropped, so an unusable
+selection yields nil instead of a half-broken flash."
+  (let ((items (cond ((null rects) nil)
+                     ((numberp (car-safe rects)) (list rects))
+                     ((listp rects) rects)
+                     (t nil))))
+    (let (tuples)
+      (dolist (rect items)
+        (when (seshat-reader-select--rect-valid-p page rect)
+          (push (cons page rect) tuples)))
+      (nreverse tuples))))
+
+(defun seshat-reader-select--normalize-rect (rect)
+  "Return RECT as (X0 Y0 X1 Y1) with X0<=X1 and Y0<=Y1, or nil.
+RECT must be a list of exactly four numbers; anything else (nil, a
+shorter or longer list, a non-number element) yields nil so that the
+merge step can simply drop it.  Values are compared with `min' /
+`max', which keeps integers integral and floats floating."
+  (when (and (listp rect)
+             (= 4 (length rect))
+             (numberp (nth 0 rect))
+             (numberp (nth 1 rect))
+             (numberp (nth 2 rect))
+             (numberp (nth 3 rect)))
+    (list (min (nth 0 rect) (nth 2 rect))
+          (min (nth 1 rect) (nth 3 rect))
+          (max (nth 0 rect) (nth 2 rect))
+          (max (nth 1 rect) (nth 3 rect)))))
+
+(defun seshat-reader-select--rect-height (rect)
+  "Return the height of RECT, a (X0 Y0 X1 Y1) list."
+  (- (nth 3 rect) (nth 1 rect)))
+
+(defun seshat-reader-select--rect-y-center (rect)
+  "Return the vertical centre of RECT as a float."
+  (/ (+ (float (nth 1 rect)) (float (nth 3 rect))) 2.0))
+
+(defconst seshat-reader-select--highlight-shrink-min 0.3
+  "Lower bound the shrink ratio is clamped to.")
+
+(defconst seshat-reader-select--highlight-shrink-max 1.0
+  "Upper bound the shrink ratio is clamped to.")
+
+(defconst seshat-reader-select--highlight-shrink-default 0.8
+  "Shrink ratio used when the option holds a non-number.")
+
+(defun seshat-reader-select--highlight-shrink-ratio ()
+  "Return the effective vertical shrink ratio, clamped and defaulted.
+The value of `seshat-reader-select-highlight-shrink-ratio' is read and
+returned as a float within 0.3 and 1.0.  A non-number (nil, a string,
+a symbol) yields 0.8, the option's default, so a misset variable can
+never break a selection."
+  (let ((value seshat-reader-select-highlight-shrink-ratio))
+    (if (numberp value)
+        (max seshat-reader-select--highlight-shrink-min
+             (min seshat-reader-select--highlight-shrink-max (float value)))
+      seshat-reader-select--highlight-shrink-default)))
+
+(defun seshat-reader-select--shrink-rect-vertically (rect ratio)
+  "Return RECT shrunk vertically to RATIO of its height, centre kept.
+RECT is a (X0 Y0 X1 Y1) list and RATIO a number.  X0 and X1 are
+returned unchanged; the vertical centre stays put and the height
+becomes RATIO times the old height, so Y0 rises and Y1 falls by the
+same amount.  RECT is returned as-is when its height is not positive
+\(a degenerate rectangle has nothing to shrink, matching
+`seshat-reader-select--normalize-rect'), and also when RATIO is not a
+number or is 1.0 or more — the last case on purpose, so that turning
+the shrink off yields the very same integers instead of floats that
+merely compare equal."
+  (let ((height (seshat-reader-select--rect-height rect)))
+    (if (or (not (numberp ratio))
+            (>= ratio 1.0)
+            (not (> height 0)))
+        rect
+      (let* ((center (seshat-reader-select--rect-y-center rect))
+             (half (/ (* (float height) ratio) 2.0)))
+        (list (nth 0 rect)
+              (- center half)
+              (nth 2 rect)
+              (+ center half))))))
+
+(defun seshat-reader-select--shrink-rects-vertically (rects ratio)
+  "Return RECTS with every rectangle shrunk vertically by RATIO.
+RATIO of 1.0 or more (or a non-number) returns RECTS itself, so the
+caller gets its input back untouched when the shrink is disabled."
+  (if (or (not (numberp ratio)) (>= ratio 1.0))
+      rects
+    (mapcar (lambda (rect)
+              (seshat-reader-select--shrink-rect-vertically rect ratio))
+            rects)))
+
+(defun seshat-reader-select--line-height (rects)
+  "Return the median height of RECTS, or the mean when that is unusable.
+The median is used on purpose: one tall character in a line (a
+bracket, a capital with an accent) must not inflate the gap threshold
+for the whole line, whereas the mean would be dragged upwards by it.
+A median that is not positive (degenerate, zero-height rectangles)
+falls back to the mean, and the mean in turn falls back to 0.0."
+  (let* ((heights (sort (mapcar #'seshat-reader-select--rect-height rects) #'<))
+         (count (length heights)))
+    (cond
+     ((zerop count) 0.0)
+     (t
+      (let ((median (if (= 1 (% count 2))
+                        (float (nth (/ count 2) heights))
+                      (/ (+ (float (nth (1- (/ count 2)) heights))
+                            (float (nth (/ count 2) heights)))
+                         2.0))))
+        (if (> median 0)
+            median
+          (let ((mean (/ (float (apply #'+ heights)) count)))
+            (if (> mean 0) mean 0.0))))))))
+
+(defun seshat-reader-select--group-rects-into-lines (rects)
+  "Cluster RECTS into text lines and return a list of rect lists.
+RECTS are (X0 Y0 X1 Y1) lists in any order.  A rectangle joins an
+existing line when its vertical centre is within half the line height
+of that line's centre (the larger of the two heights is used), which
+is the tolerance for the usual jitter of character boxes on one
+baseline while still separating consecutive lines.  Lines are built in
+ascending centre order, so the result is roughly top to bottom."
+  (let ((sorted (sort (copy-sequence rects)
+                      (lambda (a b)
+                        (< (seshat-reader-select--rect-y-center a)
+                           (seshat-reader-select--rect-y-center b)))))
+        (lines nil))
+    (dolist (rect sorted)
+      (let* ((center (seshat-reader-select--rect-y-center rect))
+             (height (seshat-reader-select--rect-height rect))
+             (line (catch 'found
+                     (dolist (line lines)
+                       ;; line 是 [锚点中心 锚点高度 矩形表] 向量
+                       (when (<= (abs (- center (aref line 0)))
+                                 (* 0.5 (max height (aref line 1))))
+                         (throw 'found line)))
+                     nil)))
+        (if line
+            (progn
+              ;; 锚点取组内已有中心的均值，避免被单个离群矩形带偏
+              (aset line 0 (/ (+ (aref line 0) center) 2.0))
+              (aset line 1 (max (aref line 1) height))
+              (aset line 2 (cons rect (aref line 2))))
+          (push (vector center height (list rect)) lines))))
+    (mapcar (lambda (line) (nreverse (aref line 2))) (nreverse lines))))
+
+(defun seshat-reader-select--merge-line-rects (rects threshold)
+  "Merge the RECTS of one line into runs, breaking at gaps > THRESHOLD.
+RECTS are (X0 Y0 X1 Y1) lists belonging to a single text line and are
+sorted here by X0.  Each run grows to cover every rectangle whose left
+edge is at most THRESHOLD to the right of the run's current right
+edge; a wider gap starts a new run, which is what keeps the columns of
+a two-column layout apart.  The returned runs are (MIN-X0 MIN-Y0 MAX-X1
+MAX-Y1) lists in left to right order."
+  (let ((sorted (sort (copy-sequence rects)
+                      (lambda (a b) (< (nth 0 a) (nth 0 b)))))
+        (runs nil)
+        (run nil))
+    (dolist (rect sorted)
+      (cond
+       ((null run) (setq run (copy-sequence rect)))
+       ((<= (- (nth 0 rect) (nth 2 run)) threshold)
+        (setq run (list (min (nth 0 run) (nth 0 rect))
+                        (min (nth 1 run) (nth 1 rect))
+                        (max (nth 2 run) (nth 2 rect))
+                        (max (nth 3 run) (nth 3 rect)))))
+       (t
+        (push run runs)
+        (setq run (copy-sequence rect)))))
+    (when run (push run runs))
+    (nreverse runs)))
+
+(defun seshat-reader-select--sort-rects (rects)
+  "Return RECTS sorted by Y0 and then X0."
+  (sort rects
+        (lambda (a b)
+          (let ((ya (nth 1 a))
+                (yb (nth 1 b)))
+            (cond ((/= ya yb) (< ya yb))
+                  ((/= (nth 0 a) (nth 0 b)) (< (nth 0 a) (nth 0 b)))
+                  (t (< (nth 3 a) (nth 3 b))))))))
+
+(defun seshat-reader-select--merge-char-rects (rects)
+  "Merge per-character RECTS into the rectangles that are drawn.
+RECTS is a list of (X0 Y0 X1 Y1) page-coordinate rectangles as
+returned by `seshat-reader-dyn--rects-in-rect', in any order; nil or
+an empty list yields nil, as do inputs made only of malformed
+elements (those are dropped individually).
+
+The rectangles are first clustered into text lines (see
+`seshat-reader-select--group-rects-into-lines'), then each line is
+sorted by X0 and run together until the horizontal gap exceeds
+`seshat-reader-select-highlight-gap-ratio' times the line height (see
+`seshat-reader-select--merge-line-rects').  Every run is reported as
+one (MIN-X0 MIN-Y0 MAX-X1 MAX-Y1) rectangle, so a selection spanning
+N lines yields about N rectangles rather than one per character.
+
+When `seshat-reader-select-highlight-granularity' is `character' no
+merging happens: the rectangles are only sorted by position and
+returned unchanged.
+
+Whatever the granularity, the result is finally shrunk vertically
+around each rectangle's centre by
+`seshat-reader-select-highlight-shrink-ratio' (see
+`seshat-reader-select--shrink-rects-vertically'): the merged bars of
+two adjacent lines never touch, so a multi-line selection shows white
+gaps between the lines.  Only the height changes — the horizontal
+range, the overall bounding box of the drag (`:rect' of
+`seshat-reader-select-last') and the number of segments are unaffected.
+A ratio of 1.0 returns the merged geometry unchanged.
+
+This is a pure function — no buffer, no module, no document — so it
+can be unit tested directly."
+  (let ((normalized (delq nil (mapcar #'seshat-reader-select--normalize-rect rects))))
+    (when normalized
+      (let ((shrink (seshat-reader-select--highlight-shrink-ratio)))
+        (seshat-reader-select--shrink-rects-vertically
+         (if (eq seshat-reader-select-highlight-granularity 'character)
+             (seshat-reader-select--sort-rects normalized)
+           (let ((gap-ratio (let ((value seshat-reader-select-highlight-gap-ratio))
+                              (if (numberp value) (max 0 (float value)) 0.8)))
+                 (runs nil))
+             (dolist (line (seshat-reader-select--group-rects-into-lines normalized))
+               (setq runs (append (seshat-reader-select--merge-line-rects
+                                   line (* gap-ratio (seshat-reader-select--line-height line)))
+                                  runs)))
+             (seshat-reader-select--sort-rects runs)))
+         shrink)))))
 
 (defun seshat-reader-select--redraw-highlights ()
   "Redraw the page highlights, feeding the flash rectangles.
@@ -205,19 +510,23 @@ done.  Called from the timer armed by
       (setq-local seshat-reader-select--flash-rects nil)
       (seshat-reader-select--redraw-highlights))))
 
-(defun seshat-reader-select--flash-selection (page rect)
-  "Flash the selection rectangle RECT on PAGE for a moment.
-PAGE is the 1-based page number and RECT the selection rectangle as
-a list (X0 Y0 X1 Y1) in page coordinates — exactly what
-`seshat-reader-select-last' stores under :rect, so the flash and the
-annotation create path (`seshat-reader-annotation-create') use the same
-units.
+(defun seshat-reader-select--flash-selection (page rects)
+  "Flash the selection geometry RECTS on PAGE for a moment.
+PAGE is the 1-based page number and RECTS is the geometry of the
+selection in page coordinates: either a single rectangle
+\(X0 Y0 X1 Y1) — the unmerged bounding box, useful to a caller that
+has no per-character data — or a list of such rectangles, such as the
+per-line rectangles produced by
+`seshat-reader-select--merge-char-rects'.  Both shapes are normalized
+by `seshat-reader-select--normalize-flash-rects', which also drops
+unusable rectangles (degenerate ones have nothing to draw).
 
-The rectangle is stored in the buffer-local
-`seshat-reader-select--flash-rects' and fed to the C renderer; a timer
-clears it again after `seshat-reader-select-flash-duration' seconds.
-The flash is skipped when the duration is not positive or when PAGE /
-RECT are unusable (a degenerate rectangle cannot be drawn).
+The rectangles are stored in the buffer-local
+`seshat-reader-select--flash-rects' and fed to the C renderer, which
+draws all of them; a timer clears them again after
+`seshat-reader-select-flash-duration' seconds.  The flash is skipped
+when the duration is not positive or when no rectangle survives
+validation.
 
 Repeated selections in the **same buffer** cancel the previous timer, so
 that an old clear cannot wipe a fresh flash; selections in different
@@ -225,15 +534,13 @@ buffers keep independent timers (both
 `seshat-reader-select--flash-timer' and `seshat-reader-select--flash-rects'
 are buffer-local).  Everything is wrapped in `ignore-errors': a missing
 module or an unusable C call must never break text extraction."
-  (let ((duration seshat-reader-select-flash-duration))
-    (when (and (numberp duration) (> duration 0)
-               (seshat-reader-select--rect-valid-p page rect))
+  (let ((duration seshat-reader-select-flash-duration)
+        (tuples (seshat-reader-select--normalize-flash-rects page rects)))
+    (when (and (numberp duration) (> duration 0) tuples)
       (ignore-errors
         (when (timerp seshat-reader-select--flash-timer)
           (cancel-timer seshat-reader-select--flash-timer))
-        (setq-local seshat-reader-select--flash-rects
-                    (list (list page (nth 0 rect) (nth 1 rect)
-                                (nth 2 rect) (nth 3 rect))))
+        (setq-local seshat-reader-select--flash-rects tuples)
         (seshat-reader-select--redraw-highlights)
         (let ((buffer (current-buffer)))
           (setq-local seshat-reader-select--flash-timer
@@ -251,7 +558,15 @@ The plist holds the keys
          returned by `seshat-reader-current-doc-pagenumber';
   :rect  the selection rectangle as a list (X0 Y0 X1 Y1) in page
          coordinates (floats, as accepted by
-         `seshat-reader-dyn--text-in-rect');
+         `seshat-reader-dyn--text-in-rect'), i.e. the bounding box of
+         the drag — kept for the consumers that only need a position
+         (translate, reference) and for the annotation path of older
+         versions;
+  :rects the per-line rectangles hugging the selected characters, as a
+         list of (X0 Y0 X1 Y1) lists, or nil when the module could not
+         report them (`seshat-reader-dyn--rects-in-rect' unavailable)
+         or the region held no text.  Consumers that draw geometry
+         should prefer this and fall back to :rect when it is nil;
   :file  the file name of the selected document, taken from the
          variable `buffer-file-name' (nil for a buffer without a file).
 
@@ -343,6 +658,23 @@ also pushed onto the kill ring with `kill-new'."
                (format " [%d chars]" (length str))
                " [C-c C-a 建批注]"))))
 
+(defun seshat-reader-select--rects-in-rect (page x0 y0 x1 y1)
+  "Return the selection geometry for the characters in a region.
+PAGE is the 0-based page number the module expects, X0, Y0, X1 and Y1
+are page coordinates — exactly the arguments given to
+`seshat-reader-dyn--text-in-rect' for the same rectangle, so the
+geometry matches the extracted text.
+
+The module reports one rectangle per hit character; they are merged by
+`seshat-reader-select--merge-char-rects' into per-line rectangles.
+Return nil when the module does not provide the function (an older
+build) or when the region holds no character: a region without text is
+a normal outcome, not an error, and must not produce a message."
+  (when (fboundp 'seshat-reader-dyn--rects-in-rect)
+    (seshat-reader-select--merge-char-rects
+     (ignore-errors
+       (seshat-reader-dyn--rects-in-rect page x0 y0 x1 y1)))))
+
 (defun seshat-reader-select-extract (start end)
   "Extract the text between the mouse positions START and END.
 START and END are position lists, as produced by `event-start' and
@@ -351,7 +683,14 @@ page.
 
 Return the extracted text, or nil when the two positions are not in
 the same window, when either of them cannot be converted to page
-coordinates, or when the corresponding rectangle contains no text."
+coordinates, or when the corresponding rectangle contains no text.
+
+Besides reporting the text, the selection is recorded in
+`seshat-reader-select-last': the drag's bounding box under :rect and
+the per-line rectangles hugging the selected characters under :rects
+\(nil when the module cannot report them).  The flash that confirms the
+selection uses those per-line rectangles, falling back to the bounding
+box when there are none."
   (let ((window (posn-window start)))
     (cond
      ((not (eq window (posn-window end)))
@@ -370,23 +709,28 @@ coordinates, or when the corresponding rectangle contains no text."
                  ;; (max ...) applied to float coordinates, so they are
                  ;; floats; the module function `seshat-reader-dyn--text-in-rect'
                  ;; does not accept integers.
-                 (text (seshat-reader-dyn--text-in-rect page x0 y0 x1 y1)))
+                 (text (seshat-reader-dyn--text-in-rect page x0 y0 x1 y1))
+                 ;; 逐字符矩形 → 按行合并（纯函数）；模块缺失或无命中时为 nil
+                 (rects (seshat-reader-select--rects-in-rect page x0 y0 x1 y1))
+                 (bbox (list x0 y0 x1 y1)))
             (setq seshat-reader-select-last
                   (list :text text
                         ;; :page must be the 1-based page number reported by
                         ;; seshat-reader; the local `page' above is 0-based (for
                         ;; the module) and therefore must not be reused here.
                         :page (seshat-reader-current-doc-pagenumber window)
-                        :rect (list x0 y0 x1 y1)
+                        :rect bbox
+                        :rects rects
                         :file (buffer-file-name (window-buffer window))))
             (seshat-reader-select--report text)
             ;; 选区已确定（不论矩形内是否有文本）就用高亮闪一下，让用户看到自己
             ;; 选中的区域；闪现落在发起拖拽的 buffer 上（`--flash-selection' 读写
             ;; 的 `seshat-reader-select--flash-rects' 是 buffer-local 的）。
+            ;; 有字级矩形的就闪字级（贴合文字），否则回落整体 bbox。
             (with-current-buffer (window-buffer window)
               (seshat-reader-select--flash-selection
                (seshat-reader-current-doc-pagenumber window)
-               (list x0 y0 x1 y1)))
+               (or rects (list bbox))))
             text)))))))
 
 (defun seshat-reader-select-drag (start-event)

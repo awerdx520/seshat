@@ -336,7 +336,7 @@ loop:
 
 | 载体 | 形态 | 说明 |
 |---|---|---|
-| PDF 文本批注（Android：顶栏「添加批注」/ 长按「高亮标注」） | `page:<n>` | 1-based 页码；内容在 `text` / `selected_text`，位置只定页（Android 侧本轮**不产** `rect:`；Emacs 建的文本批注恒带 `rect:`，见下一行） |
+| PDF 文本批注（Android：顶栏「添加批注」/ 长按「添加本页备注」） | `page:<n>` | 1-based 页码；内容在 `text` / `selected_text`，位置只定页（Android 侧本轮**不产** `rect:`；Emacs 建的文本批注恒带 `rect:`，见下一行） |
 | PDF 高亮（带矩形） | `page:<n>;rect:<x0>,<y0>,<x1>,<y1>` | PDF point 空间、两位小数、不含缩放；不支持旋转页面；Emacs M12 高亮的数据来源 |
 | PDF 手写 | `page:<n>;ink:<color>,<widthPt>,<x0>,<y0>,...` | **一笔一条**；Android 落笔即登记并随批注队列上行，打开带 uid 的书时把本地既有笔迹一次性补登（服务端幂等去重） |
 | EPUB | `chapter:<spineIndex>@<startOffset>-<endOffset>` | spine **0-based**，章内字符偏移 **半开区间** `[start, end)`，单位 UTF-16 code unit；退化形态 `chapter-<n>`（只记章） |

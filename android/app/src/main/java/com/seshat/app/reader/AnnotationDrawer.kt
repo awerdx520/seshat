@@ -44,7 +44,7 @@ import kotlin.math.min
  *
  * @param root 抽屉挂载的容器（Activity 的内容容器，是个 `FrameLayout`）
  * @param onItemClick 点击条目行（需要跳转）时回调
- * @param onItemEdit 菜单选「编辑备注」时回调（`note` / `highlight` 行）
+ * @param onItemEdit 菜单选「编辑便签」时回调（`note` / `highlight` 行）
  * @param onItemDelete 菜单选「删除」并确认后回调
  * @param onClose 抽屉关闭时回调（供 Activity 做状态联动）
  */
@@ -243,7 +243,7 @@ internal class AnnotationDrawer(
             return
         }
         AlertDialog.Builder(root.context)
-            .setItems(arrayOf("编辑备注", "删除")) { _, which ->
+            .setItems(arrayOf("编辑便签", "删除")) { _, which ->
                 when (which) {
                     0 -> onItemEdit(row)
                     else -> confirmDelete(row)

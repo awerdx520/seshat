@@ -755,8 +755,8 @@ buffer（不再弹 posframe），面板可用 `q' 或 `seshat-reader-sidebar-tog
 (defun seshat-reader-translate-save-as-annotation ()
   "把最近一次译文存为服务端批注（**侧车**，不写回文档）.
 批注存储在服务端（经 `seshat-rest-create-annotation'），**不会**写回用户
-正在阅读的原文档，因此不会改动文件内容。位置由
-`seshat-reader-annotation--location' 从最近一次选区
+正在阅读的原文档，因此不会改动文件内容。位置（引用锚，页锚 + 几何尾段）由
+`seshat-reader-annotation--anchor' 从最近一次选区
 （`seshat-reader-select-last' 的 :page/:rect）派生；服务端身份由
 `seshat-reader-annotation--uid' 从选区的 :file 解析（uid 是发给服务端的
 唯一身份；显示用 doc-id 仍由 `seshat-reader-annotation--doc-id' 派生，
@@ -787,7 +787,7 @@ buffer（不再弹 posframe），面板可用 `q' 或 `seshat-reader-sidebar-tog
                (document-id (seshat-reader-annotation--doc-id
                              file (seshat-reader-annotation--quiet-p file)))
                (uid (seshat-reader-annotation--uid file))
-               (location (seshat-reader-annotation--location page rect)))
+               (location (seshat-reader-annotation--anchor page rect)))
           (condition-case err
               (let ((response (seshat-rest-create-annotation
                                uid location text)))

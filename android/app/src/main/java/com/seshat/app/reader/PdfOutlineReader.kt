@@ -13,7 +13,7 @@ import java.io.InputStream
 import java.util.IdentityHashMap
 
 /**
- * PDF 书签（outline）读取。
+ * PDF 大纲（outline）读取。
  *
  * `PdfRenderer`（系统内置）**不提供** outline API，故引入 `pdfbox-android` 解析。
  * 该依赖体积约 +10 MB，是用户明确授权的唯一新增依赖，**只允许在 [com.seshat.app.reader]
@@ -25,7 +25,7 @@ import java.util.IdentityHashMap
  * 设计要点：
  * - [read] 是阻塞 + 高内存操作，**调用方必须放到后台线程**；
  * - 大文件（超过 [MAX_OUTLINE_BYTES]）直接跳过解析，返回空表（避免 96 MB 级 PDF OOM）；
- * - 节点总数超过 [MAX_NODES] 即截断（防海量兄弟书签撑爆内存），递归深度超 [MAX_DEPTH] 即截断
+ * - 节点总数超过 [MAX_NODES] 即截断（防海量兄弟节点撑爆内存），递归深度超 [MAX_DEPTH] 即截断
  *   （防栈溢出）；
  * - 加密/损坏/无 outline 一律返回空表，**不抛异常**（调用方回退页码目录）；
  * - [flatten] / [pageDirectory] 是纯函数，与 Android 运行时无关，可纯 JVM 单测；
@@ -33,7 +33,7 @@ import java.util.IdentityHashMap
  *   调用即抛），需要日志由调用方打。
  */
 internal object PdfOutlineReader {
-    /** 单个书签节点。 */
+    /** 单个大纲节点。 */
     data class PdfOutlineItem(
         val title: String,
         val pageIndex: Int,
@@ -56,7 +56,7 @@ internal object PdfOutlineReader {
     /** 无法解析出目标页时的页码占位值（调用方应保持当前页）。 */
     const val UNKNOWN_PAGE_INDEX: Int = -1
 
-    /** 书签树递归深度上限：防畸形 PDF 造成栈溢出（`StackOverflowError` 不属于 `RuntimeException`）。 */
+    /** 大纲树递归深度上限：防畸形 PDF 造成栈溢出（`StackOverflowError` 不属于 `RuntimeException`）。 */
     private const val MAX_DEPTH: Int = 64
 
     /** 命名目标（`PDNamedDestination`）链式解析深度上限：防「A 指向 B、B 指向 A」的命名环。 */
@@ -65,7 +65,7 @@ internal object PdfOutlineReader {
     /**
      * 节点预算：一次 [read] 内所有分支共享的可变计数（DFS 顺序扣减）。
      *
-     * 只限深度不够——50 MiB 内的 PDF 可以塞进数十万个**兄弟**书签（层级为 0，深度上限管不到），
+     * 只限深度不够——50 MiB 内的 PDF 可以塞进数十万个**兄弟**节点（层级为 0，深度上限管不到），
      * 转成数据类树后会撑爆内存，并把单线程 `ioExecutor` 长时间占死（后续目录/复制全部排队）。
      *
      * 已知残余风险：`/Next` 环由 PdfBox 内部 `PDOutlineItem.children()` 遍历，应用层无法中断
@@ -76,11 +76,11 @@ internal object PdfOutlineReader {
     /**
      * 读取 PDF outline。
      *
-     * 复杂度：一次 [PDDocument.getPages] 遍历建「页字典 → 页索引」身份表 O(n)，之后每本书签
+     * 复杂度：一次 [PDDocument.getPages] 遍历建「页字典 → 页索引」身份表 O(n)，之后每个大纲项
      * O(1) 查表；仅当身份查表未命中时才回退 `PDPageDestination.retrievePageNumber()`（其内部
      * 遍历页表为 O(n)），正常 PDF 不会走到该分支。
      *
-     * @return 书签树；无 outline / 文件过大 / 加密 / 解析失败 → **空表**（调用方回退页码目录）
+     * @return 大纲树；无 outline / 文件过大 / 加密 / 解析失败 → **空表**（调用方回退页码目录）
      */
     fun read(file: File): List<PdfOutlineItem> {
         // 必须放在最前面：不存在 / 超大文件不触达任何 PdfBox 类（避免 OOM，也便于纯 JVM 单测覆盖）
@@ -101,7 +101,7 @@ internal object PdfOutlineReader {
      *
      * @param sizeHint 预估字节数；`> [MAX_OUTLINE_BYTES]` 直接返回空表（**不读流**，防 OOM）；
      *   未知时传 `-1` 表示不做大小预检
-     * @return 书签树；无 outline / 过大 / 加密 / 解析失败 → **空表**（调用方回退页码目录）
+     * @return 大纲树；无 outline / 过大 / 加密 / 解析失败 → **空表**（调用方回退页码目录）
      *
      * 注意：[sizeHint] 来自 `openAssetFileDescriptor().length`，即 **provider 自报值**，可被谎报成
      * 0/-1 而绕过这里的预检。真正的上限由调用方用 [BoundedInputStream] 包住流传入来保证——
@@ -161,7 +161,7 @@ internal object PdfOutlineReader {
     // ---------------------------------------------------------------- 内部实现
 
     /**
-     * 从已打开的文档读出书签树——[read] 两个入口（[File] / [InputStream]）共用的唯一转换段。
+     * 从已打开的文档读出大纲树——[read] 两个入口（[File] / [InputStream]）共用的唯一转换段。
      *
      * 异常不在此处收敛（由各入口的 try/catch 负责），故仅做转换。
      */
@@ -187,7 +187,7 @@ internal object PdfOutlineReader {
     }
 
     /**
-     * 把 PDF 书签节点递归转换为 [PdfOutlineItem]。
+     * 把 PDF 大纲节点递归转换为 [PdfOutlineItem]。
      *
      * @param document 用于解析命名目标（`PDNamedDestination`）——命名目标只在文档 catalog 里查得到
      * @param budget 全局节点预算（深度优先顺序扣减）；耗尽后返回 `null`（父项保留，子树被截断）
@@ -201,7 +201,7 @@ internal object PdfOutlineReader {
     ): PdfOutlineItem? {
         // 超深层级直接截断（父项仍保留），避免栈溢出
         if (depth > MAX_DEPTH) return null
-        // 节点预算耗尽：截断剩余子树，避免海量书签撑爆内存
+        // 节点预算耗尽：截断剩余子树，避免海量节点撑爆内存
         if (budget.remaining <= 0) return null
         budget.remaining--
         val children = item.children().mapNotNull {
@@ -210,7 +210,7 @@ internal object PdfOutlineReader {
         return PdfOutlineItem(
             title = item.title ?: "",
             // `PDOutlineItem.getDestination()` 声明 throws IOException（目标可能是命名目标），
-            // 单个书签失败不应毁掉整棵树，故在调用点收敛
+            // 单个节点失败不应毁掉整棵树，故在调用点收敛
             pageIndex = runCatching {
                 resolvePage(outlineDestination(item), document, pageIndex)
             }.getOrDefault(UNKNOWN_PAGE_INDEX),
@@ -219,13 +219,13 @@ internal object PdfOutlineReader {
     }
 
     /**
-     * 取书签声明的目标（两种写法都要看）。
+     * 取大纲项声明的目标（两种写法都要看）。
      *
-     * 书签的目标有两种等价写法，规范里都合法，真实 PDF 各有大量使用：
+     * 大纲项的目标有两种等价写法，规范里都合法，真实 PDF 各有大量使用：
      * - `/Dest <目标>` —— 直接页引用或命名目标；
      * - `/A << /S /GoTo /D <目标> >>` —— 「跳转动作」，Word / LaTeX(hyperref) 导出普遍是这种。
      *
-     * [PDOutlineItem.getDestination] **只读 `/Dest`**，对这种书签恒为 `null`（实测：本文档
+     * [PDOutlineItem.getDestination] **只读 `/Dest`**，对这种大纲项恒为 `null`（实测：本文档
      * 《The Art of Linear Algebra》6 条章节全部是 `/A /S /GoTo /D (section.N)`，无 `/Dest`），
      * 所以必须再回退到 [PDOutlineItem.getAction] 里的 [PDActionGoTo]。
      *
@@ -239,9 +239,9 @@ internal object PdfOutlineReader {
     }
 
     /**
-     * 解析书签目标页。
+     * 解析大纲项目标页。
      *
-     * 书签目标可能是**直接页引用**（[PDPageDestination]），也可能是**命名目标**
+     * 大纲项目标可能是**直接页引用**（[PDPageDestination]），也可能是**命名目标**
      * （[PDNamedDestination]，例如 `/Dest /chapter3`）——后者要先在文档 catalog 的名称树
      * （`/Names /Dests`，老 PDF 还可能是 `/Dests`）里把名字解析成目标，再取页。
      * 命名目标还可能再次指向另一个命名目标，故递归解析并限制深度防环。

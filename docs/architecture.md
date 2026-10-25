@@ -127,7 +127,7 @@ seshat-sync-now
 - **不做任何百分号转义**：不使用 `url-hexify-string`（它会把 `:`、`/` 一并转义，破坏 doc-id 可读性并切断与批注文档键（M7 起为 uid，展示与链接仍用 doc-id 文本）的复用），也不自造 `%23` 链路（org 自身会对 `%` 二次转义，双重转义无法自洽）；
 - 因此 **doc-id 不得包含 `#` 与 `%`**：构造链接时检测到这两个字符即 `user-error` 并提示重命名文件；非法链接解析返回 nil。
 
-**与批注 `location` 的同构关系**：批注的 `location` 形如 `page:<n>;rect:<x0>,<y0>,<x1>,<y1>`（页码 1-based、页面坐标），链接片段**直接复用同一字符串**，不新增解析器。批注列表的行携带该字符串（文本属性），故「批注 → 引用」取值不触网；`page:` 段直接传给 `seshat-reader-goto-page`，`rect:` 段在 M11 只做数据保留，自 M12 起在 Emacs 客户端渲染为页面半透明高亮（见「Emacs 阅读器：展示层与渲染层（M12）」节）；`ink:` 段仍不渲染。
+**与批注 `location` 的同构关系**：批注的 `location` 是**页锚 + 可选几何尾段**——形如 `page:<n>;rect:<x0>,<y0>,<x1>,<y1>`（页锚 `page:<n>` 1-based、唯一导航真值；`rect:` 段是可选几何、页面坐标、只供渲染），链接片段**直接复用同一字符串**（引用锚复用，不新增解析器）。批注侧唯一的构造点是 `seshat-reader-annotation--anchor`（2026-10-25 由 `--location` 改名，语义收窄为「页锚 + 可选几何尾段」；守 `location` 长度上限的 defconst `seshat-reader-annotation--location-max-length` 保留原名，它守的是 API 字段）。批注列表的行携带该字符串（文本属性），故「批注 → 引用」取值不触网；`page:` 段直接传给 `seshat-reader-goto-page`，`rect:` 段在 M11 只做数据保留，自 M12 起在 Emacs 客户端渲染为页面半透明高亮，`ink:` 段自 2026-10-25 起同样渲染为页面手写笔迹（见「Emacs 阅读器：展示层与渲染层（M12）」节与「搜索与 ink 渲染流程」节）。
 
 **双形态（M7 起）**：`<target>` 可以是 **uid**（服务端权威身份，如 `seshat:01J8ZK4Q7M2X9VYB3TR6NDW5PC#page:3`）或 **doc-id 文本**（`tag:path` 或纯 path，人可读、可手写）。服务端解析优先级为 **uid → `tag:path` → 纯 path（默认根）**（`registry.Resolve`）：uid 形态跨改名稳定，doc-id 形态在改名后失效，需重新构造。含 `#`/`%` 的非法 target 仍按上述规则拒绝。
 
@@ -191,13 +191,21 @@ M12 把 M11 的「单个底部面板」升级为「左目录 / 右信息 / 中�
 - **渲染规则**：行首保留 outline 星号（去掉会令 `outline-regexp` 失配、TAB 折叠失效），但把星号区间设为**零宽显示**（`display ""` 只改显示、不改 buffer 文本，故 `outline-regexp` 照常匹配、`outline-hide-subtree` 仍可用）→ 每级 1 列缩进（`seshat-reader-outline--indent-width`）+ 折叠符号的 2 列，标题落在第 3/4/5 列 → `▾`/`▸` 折叠符号（无子节点用 2 空格占位对齐）→ 标题按钮 → 弹性空白 `display` 属性把页码推向右缘 → 按深度取三级 face；当前章另用 `line-prefix` 画竖线（`line-prefix` 只是显示属性、不进 buffer 文本，故不破坏 outline 结构）。
 - **avy 风格跳转**：`f` 触发 `seshat-reader-outline-avy-jump`，候选为可见区带页号属性的按钮，标签由 overlay `before-string` 承载（不写 buffer 文本），`read-key` 逐键匹配，`unwind-protect` 清理标签。**零新增依赖**：不 `require` avy，只在 `avy-keys` 已绑定时复用自己的字符表，未加载时用内置表。
 
-**批注高亮（渲染层）**：
+**装饰表（Decoration，渲染层）**：
 
-- **为何必须改 C**：elisp 层无法在已有页面 image 上叠加半透明矩形——同一区域的 `display` 属性**互斥**（一处只有一份 `display` 规格生效），image 规格里也没有「第二个矩形」这一层。既有两个证据：M11.2b 计划记录（`openspec/completed/2026-10-12-m11.2b-reader-selection.md:25`）与 `seshat-reader-select.el` 的选区实现注释（只做文本属性、不做矩形绘制）。因此高亮在 `draw_page_thread` 内绘制。
-- **绘制点**：在 `fz_invert_pixmap_luminance` / `fz_gamma_pixmap` **之后**、写 PNM **之前**。反色与 gamma 是整页像素变换，若在高亮之后做会连高亮一起反色；写 PNM 之后再画则进不了缓存位图，翻页回来高亮消失。
-- **`ctm` 复用**：直接复用该页 rasterize 用的同一个 `fz_transform_page(dp->bbox, resolution, rotate)`，因此缩放与旋转自动对齐，不必另算变换；`rect_to_page_space` 是「Emacs rect → MuPDF 页面空间」的**唯一**换算点（被 `--text-in-rect` 与绘制共用）。
-- **线程安全**：高亮表在派发时**快照**进 `DrawThreadArgs`（容量倍增表，每条退出路径释放），渲染线程不碰 `DocState`；elisp 侧只改表并置 `highlights_dirty` 标志。
-- **`--refresh-highlights` 的重绘序列**：非 dirty 直接返回 `t`；dirty 时 `wait_for_win_jobs` → `nullify_window_cache` → `build_cache_window` → `wait_for_cached_page` → `display_cached_page`（与 `seshat-reader-dyn-redisplay-doc` 同形），故不另建渲染管线、也不与既有缓存失效逻辑分叉。
+- **数据结构**：一张 `Decoration` 表取代原来的单色 `Highlight` 表，每条带 `kind`（`DECORATION_KIND_RECT` 填充矩形 / `DECORATION_KIND_STROKE` 折线）、几何（rect 四角，或 `fz_point *pts` + `pt_count`）、`color`（RGB ∈ [0,1]）与 `alpha`。rect 与 stroke **共用一张表**，因此渲染线程只遍历一次；`width` 只对 stroke 有意义，rect 恒为 0。上限：`DECORATION_MAX_COUNT`（100000 条）、`DECORATION_MAX_ABS_COORD`（±1e6 点）、`DECORATION_MAX_POINTS`（每笔 1024 点，超出**截断而非拒绝**）、`DECORATION_MAX_STYLE_GROUPS`（64 个样式分组）。
+- **为何必须改 C**：elisp 层无法在已有页面 image 上叠加半透明矩形——同一区域的 `display` 属性**互斥**（一处只有一份 `display` 规格生效），image 规格里也没有「第二个矩形」这一层。既有两个证据：M11.2b 计划记录（`openspec/completed/2026-10-12-m11.2b-reader-selection.md:25`）与 `seshat-reader-select.el` 的选区实现注释（只做文本属性、不做矩形绘制）。因此装饰在 `draw_page_thread` 内绘制。
+- **绘制顺序（不变）**：在 `fz_invert_pixmap_luminance` / `fz_gamma_pixmap` **之后**、写 PNM **之前**。反色与 gamma 是整页像素变换，若在装饰之后做会连装饰一起反色；写 PNM 之后再画则进不了缓存位图，翻页回来装饰消失。
+- **颜色分组与「重叠不叠深」**：rect 先扫一遍收集至多 64 组不同的 `(R,G,B,A)`，再**每组一条 `fz_path` + 一次 `fz_fill_path`**（`fz_identity` 下传，device 已持 ctm）；同组内重叠区域只被填充一次，因此多段高亮叠在一起仍是同一个透明度。越过组上限的 rect 各自单独填充（只是多几次 fill，语义不变）。
+- **`ctm` 复用**：直接复用该页 rasterize 用的同一个 `fz_transform_page(dp->bbox, resolution, rotate)`，因此缩放与旋转自动对齐，不必另算变换；`rect_to_page_space` 是「Emacs rect → MuPDF 页面空间」的**唯一**换算点（被 `--text-in-rect` / `--rects-in-rect` 与绘制共用）。
+- **快照深拷贝与所有权**：装饰表在派发时**快照**进 `DrawThreadArgs`（`deco` + `deco_count`），渲染线程不碰 `DocState`；快照归 job 所有，由 `free_draw_thread_args`（`draw_page_thread` 全部 7 条退出路径的唯一漏斗）经 `free_decoration_table` 释放。stroke 的点列是**堆分配**，struct 浅拷贝会让渲染线程与 `DocState` 共享 `pts`——因此快照对每条 stroke **逐条深拷贝 `pts`**；所有权规则写进 `Decoration` 结构体注释（「谁持有结构体谁释放 `pts`，且只有一份所有权」），`free_decoration_table` 是**唯一**释放路径（`--clear-highlights`、`free_doc_state`、`free_draw_thread_args` 共用），从机制上排除双 free。浅拷贝时代的 `args->hl` 裸 `free` 已替换，否则会漏掉每笔 stroke 的 `pts`。
+- **elisp 侧只改表**：三个入口改表并置 `decorations_dirty`，渲染线程不参与；`--refresh-highlights` 的重绘序列不变——非 dirty 直接返回 `t`；dirty 时 `wait_for_win_jobs` → `nullify_window_cache` → `build_cache_window` → `wait_for_cached_page` → `display_cached_page`（与 `seshat-reader-dyn-redisplay-doc` 同形），故不另建渲染管线、也不与既有缓存失效逻辑分叉。
+- **三个入口**（C 函数 / 注册 arity）：
+  1. `--add-highlight`（`5,5`，`page x0 y0 x1 y1`）——历史入口，名字与 arity **均不变**，内部映射为「rect + 默认黄 1.0/0.85/0.0 + α 0.35」，是默认配色下的**像素级等价路径**。
+  2. `--add-decoration`（`9,9`，`page x0 y0 x1 y1 r g b alpha`）——带颜色的 rect 入口；非有限颜色分量回退默认色、其余夹到 `[0,1]`。Lisp 侧在 `kind` 为 underline/strikeout 或用户改了高亮配色时走这条。
+  3. `--add-stroke`（`7,7`，`page r g b alpha width points`）——折线入口，`points` 是**扁平**列表 `(x0 y0 x1 y1 …)`（逐对 `car`/`cdr` 读取并 `numberp` 守卫，超过 1024 点截断，少于 2 个点返回 nil），点数组由 C 侧 `malloc`+`memcpy` 自持。自 2026-10-25 起由 ink 轨迹渲染调用（`seshat-reader-annotation--ink-strokes-from-location` 的解析结果）。
+  4. `--search-page`（`3,3`，`page needle limit`）——只读，返回该页命中矩形的列表（`fz_search_page` → `fz_rect_from_quad`，与 `--text-in-rect` 同一条 `rect_to_page_space` 换算，故命中矩形喂给装饰入口落在文字原处）。**页号 1-based**（与三个装饰入口同口径）。
+  另加只读入口 `--rects-in-rect`（`5,5`，`page x0 y0 x1 y1`）——返回矩形内每个命中字符的 quad 矩形列表，与 `--text-in-rect` 共享同一份 stext 遍历（`stext_query_in_rect`），空结果返回 nil 且**不发消息**（矩形内无文本是正常答案）。这两个只读入口的页号是**历史 0-based**（服务于选区代码），与装饰/搜索入口的 1-based 并存——基数见各函数注释首段。
 
 **框选闪现（M12 补）**：
 
@@ -216,10 +224,36 @@ M12 把 M11 的「单个底部面板」升级为「左目录 / 右信息 / 中�
 
 | 对象 | 上限 | 越界行为 |
 |---|---|---|
-| 高亮条数 | 100000（`HIGHLIGHT_MAX_COUNT`） | 静默返回 nil，不覆盖已有条目 |
-| 高亮坐标 | ±1e6 点（`HIGHLIGHT_MAX_ABS_COORD`） | 判非法、不进表（`--text-in-rect` 同受此限） |
+| 装饰条数 | 100000（`DECORATION_MAX_COUNT`） | 静默返回 nil，不覆盖已有条目 |
+| 装饰坐标 | ±1e6 点（`DECORATION_MAX_ABS_COORD`） | 判非法、不进表（`--text-in-rect` / `--rects-in-rect` 同受此限） |
+| 每笔 stroke 点数 | 1024（`DECORATION_MAX_POINTS`） | **截断**（保存前 1024 点），不拒绝整笔 |
+| 装饰样式分组 | 64（`DECORATION_MAX_STYLE_GROUPS`） | 越过组上限的 rect 各自单独填充（多几次 fill，语义不变） |
 | outline 标题 | 8192 字节（`OUTLINE_TITLE_MAX`） | 截断，不中断开书 |
-| 批注 `location` | 64 KB、至多 2000 段 `rect:` | 超限不解析，不影响列表渲染 |
+| 批注 `location` | 64 KB、至多 2000 段 `rect:`（写入端 500 段） | 超限不解析，不影响列表渲染 |
+| 搜索单页命中 | 1024（`SEARCH_PAGE_MAX_QUADS`；`limit` 另被夹到 1..10000） | 截断为前 1024 条，状态行提示「仅显示前 1024 条」 |
+| 搜索整次命中 | 20000（`seshat-reader-search-max-matches`） | 达到即停止扫描并提示「命中过多」 |
+
+## 搜索与 ink 渲染流程（2026-10-25）
+
+两条能力的共同点：**装饰只有一个出口**——文档级装饰表 + `seshat-reader-annotation--redraw-highlights` 的全量重投。因此新增能力不新建渲染管线，只往同一次投喂里加一路几何。
+
+### 跨页文本搜索
+
+- **为什么整本扫描**：状态行要显示「第 i/N 个命中」，N 必须先知道；MuPDF 只给按页的 `fz_search_page`，没有文档级搜索 API。不重建文本索引是选它的理由——797 页文档整本扫描约 **1.1 秒**（`seshat-reader-search--scan` 逐页走，边界由 `seshat-reader-current-doc-pagecount` 约束）。
+- **按页缓存**：`seshat-reader-search--page-results`（buffer-local 哈希，page → rect 列表）+ `seshat-reader-search--matches`（摊平后的 `(page . rect)` 序列，页号升序、页内保持 MuPDF 命中顺序，故序列确定）。跳转只移动 `--index`，不重新搜索；缓冲随 buffer 消失，无全局状态。
+- **双上限**：单页由 C 侧 `SEARCH_PAGE_MAX_QUADS`（1024）硬夹紧，Lisp 侧 `--truncated-p` 判定后在状态行显式提示「仅显示前 1024 条」；总量由 `seshat-reader-search-max-matches`（默认 20000）控制，达到即停止扫描并置 `--capped`，否则一条 `.` 能扫出几十万条命中、几十 MB 常驻内存。
+- **装饰共存钩子**：搜索命中不做自己的 `--clear-highlights`，而是注册 buffer-local 的 `seshat-reader-annotation-extra-decorations-function`——由 `seshat-reader-annotation--redraw-highlights` 在投喂「批注 rect → 框选闪现」之后再取当前页命中。搜索、跳转、退出都走同一次全量重投，因此三路装饰（批注 / 闪现 / 命中）永远同步，不会互相擦除。批注模块未加载时搜索降级为自投（clear → add → refresh）。
+- **临时键表而非改 mode-map**：`set-transient-map` + keep 谓词（会话 active 且同一 buffer）让 `n` / `p` 只在会话存续期间表示下一个/上一个命中，退出即恢复翻页语义；把 `n` / `p` 写进 `seshat-reader-mode-map` 会永久抢掉翻页。
+- **页号基数**：`--search-page` 与三个装饰入口同为 **1-based**（`resolve_page_arg` 统一校验并做唯一一次 `-1`），Lisp 侧不做换算；`--text-in-rect` / `--rects-in-rect` 保留历史 **0-based**（服务于已在页索引空间工作的选区代码）。见 `openspec/decisions.md` 的「C 侧页号基数约定」。
+
+### ink 渲染流程（解析 → 缓存 → 投喂 stroke）
+
+1. **解析**（纯 Lisp，零 C 依赖，可单测）：`seshat-reader-annotation--ink-strokes-from-location` 把 `location` 的每个 `ink:` 段解为 `(PAGE R G B ALPHA WIDTH POINTS TRUNCATED)`。颜色只认恰好 8 位 `#AARRGGBB`；缺颜色/宽度、非有限数、坐标个数为奇数、点数为 0 均**整笔跳过**（画歪一笔比不画更误导）；超过 1024 点截断为前 1024 点并标记 `TRUNCATED`（整笔丢弃等于用户笔迹凭空消失）。解析有界：`location` 先按 64 KB 截断。
+2. **过滤与缓存**：重绘只投**当前文档**的批注（`--cached-entries` 做跨文档过滤），每页笔迹集合按 buffer 缓存（`--annotation-strokes`），避免每次重绘都重新解析整本文档。
+3. **投喂**：`--add-stroke`（`page r g b alpha width points`，页号 **1-based**，`points` 为扁平 `(x0 y0 x1 y1 …)`）→ C 侧 `Decoration` 表追加 `DECORATION_KIND_STROKE` 条目（`pts` 堆分配、派发快照时逐条深拷贝）→ 渲染线程在反色/gamma **之后**、写 PNM **之前**绘制（圆头圆角），因此缩放后与页面同变换对齐。
+4. **投喂顺序（唯一约定）**：`clear` → 批注 rect → 框选闪现 → 搜索命中 → **ink 笔迹** → `refresh`。ink 放在最后是因为它是唯一带 alpha 且可能很长的折线，先画不会被后画的半透明矩形叠加影响判断；顺序写进 `seshat-reader-annotation--redraw-highlights`，新增装饰路必须插进这条链而不是另起一条。
+5. **失败隔离**：缺 stroke 入口（旧 `.so`）或 ink 解析失败时只跳过 ink，rect 装饰照常投喂；返回值仍只统计批注 rect 条数（ink 不进这个计数）。
+6. **坐标**：ink 点与 `rect:` 同 page space（页面 pt、原点左上、y 向下），**不翻转**（数值证据见 `docs/emacs-reader.md` §5「手写轨迹显示」）。
 
 ## 数据流
 

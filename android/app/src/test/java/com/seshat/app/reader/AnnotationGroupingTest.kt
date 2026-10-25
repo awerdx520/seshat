@@ -201,7 +201,7 @@ class AnnotationGroupingTest {
         val groups = AnnotationGrouping.group(
             listOf(
                 note(id = "n1"),
-                AnnotationItem(id = "x1", kind = "bookmark", note = "书签一"),
+                AnnotationItem(id = "x1", kind = "underline", note = "下划线一"),
                 ink("i1", page = 1),
                 AnnotationItem(id = "x2", kind = "audio", selectedText = "待念的一段"),
             ),
@@ -220,9 +220,9 @@ class AnnotationGroupingTest {
         assertEquals(AnnotationGrouping.TITLE_OTHER, other.title)
         assertEquals("两条未知 kind 各占一行，一条都不能丢", listOf("x1", "x2"), other.rows.map { it.id })
         // 行内保留原始 kind，调用方仍能据此分派跳转/删除
-        assertEquals(listOf("bookmark", "audio"), other.rows.map { it.kind })
+        assertEquals(listOf("underline", "audio"), other.rows.map { it.kind })
         // 未知 kind 的文案仍按「备注优先、无备注退回原文」的同一规则生成
-        assertEquals("书签一", other.rows[0].title)
+        assertEquals("下划线一", other.rows[0].title)
         assertEquals("待念的一段", other.rows[1].title)
     }
 
@@ -355,5 +355,36 @@ class AnnotationGroupingTest {
 
         assertEquals("", row.title)
         assertEquals("", row.subtitle)
+    }
+
+    // ---- ⑨ 分组标题字面量（取值契约，UI 直接展示给用户）----
+
+    @Test
+    fun groupTitleConstantsUseFinalWording() {
+        // 标题是取值契约：候选词定稿为「便签 / 高亮 / 手写 / 其它」，禁止再漂移回「备注/标注」
+        assertEquals("便签", AnnotationGrouping.TITLE_NOTE)
+        assertEquals("高亮", AnnotationGrouping.TITLE_HIGHLIGHT)
+        assertEquals("手写", AnnotationGrouping.TITLE_INK)
+        assertEquals("其它", AnnotationGrouping.TITLE_OTHER)
+    }
+
+    // ---- ⑩ 选中即 highlight：备注不参与 kind ----
+
+    @Test
+    fun selectionIsHighlightRegardlessOfNote() {
+        // kind 只表类型：写了备注也仍是 highlight（备注由 text 表达），与 PDF 侧行为一致
+        assertEquals(
+            AnnotationGrouping.KIND_HIGHLIGHT,
+            AnnotationGrouping.kindForSelection(hasSelectedText = true, hasNote = true),
+        )
+        assertEquals(
+            AnnotationGrouping.KIND_HIGHLIGHT,
+            AnnotationGrouping.kindForSelection(hasSelectedText = true, hasNote = false),
+        )
+        // 页级纯备注（没有选中原文）才是 note
+        assertEquals(
+            AnnotationGrouping.KIND_NOTE,
+            AnnotationGrouping.kindForSelection(hasSelectedText = false, hasNote = true),
+        )
     }
 }

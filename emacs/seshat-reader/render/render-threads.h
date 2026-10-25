@@ -52,13 +52,17 @@ typedef struct
 	CachedPage *cp;
 	DocPage *dp;
 
-	/* Snapshot of the highlight rectangles that belong to this page.
+	/* Snapshot of the decorations that belong to this page.
 	 * Copied out of DocState at submission time (see submit_render_job)
 	 * because DocState must not be read concurrently by the render
 	 * thread.  Owned by the job: freed together with the argument block
-	 * by free_draw_thread_args() in draw_page_thread(). */
-	Highlight *hl;
-	int hl_count;
+	 * by free_draw_thread_args() in draw_page_thread().
+	 *
+	 * Each DECORATION_KIND_STROKE entry here owns its OWN copy of the
+	 * point array (deep copy at snapshot time), never a pointer into
+	 * DocState's table — see the ownership note in render-core.h. */
+	Decoration *deco;
+	int deco_count;
 } DrawThreadArgs;
 
 extern ThreadPool g_thread_pool;

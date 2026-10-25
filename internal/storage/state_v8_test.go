@@ -184,7 +184,7 @@ func TestCreateAnnotationNonNoteAllowsEmptyText(t *testing.T) {
 	}{
 		{kindHighlight, "chapter:0@1-9", "选中的原文"},
 		{kindInk, "page:3;ink:pen,1.50,10,20", ""},
-		{"bookmark", "page:1", ""}, // 未知 kind：服务端不校验枚举
+		{"underline", "page:1", ""}, // 尚未纳入的 kind：服务端不校验枚举
 	}
 	for _, tc := range cases {
 		created, isNew, err := db.CreateAnnotation(testUID1, tc.location, tc.kind, "", tc.selectedText)

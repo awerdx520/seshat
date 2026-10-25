@@ -75,7 +75,7 @@ func TestAnnotationCreateNonNoteAllowsEmptyText(t *testing.T) {
 	}{
 		{"高亮", "highlight", "chapter:1@0-8"},
 		{"笔迹", "ink", "page:3;ink:pen,1.50,10,20"},
-		{"未知 kind", "bookmark", "page:1"},
+		{"未知 kind", "underline", "page:1"},
 	}
 	for _, tc := range cases {
 		rec := do(t, h, http.MethodPost, "/api/annotations", testToken, map[string]string{

@@ -168,19 +168,32 @@ UID 为服务端权威的文件身份（26 位 Crockford Base32），会先做 U
 
 ;;; 批注
 
-(defun seshat-rest-create-annotation (uid location text)
+(defun seshat-rest-create-annotation (uid location text &optional kind selected-text)
   "为文档 UID 在位置 LOCATION 创建内容为 TEXT 的批注。
 LOCATION 与 TEXT 均不可为空。UID 作为 JSON 请求体的 `uid' 字段原样发送
 （JSON 请求体无需 URL 编码）。
-成功（201）返回服务端创建的完整批注对象（alist，含 id 与时间戳）；
-非 2xx 响应返回 nil。"
+
+KIND 为批注**类型**（`highlight' / `underline' / `strikeout' / `note' /
+`ink'），与「有无备注」正交：`note' 之外的类型允许 TEXT 为空串。KIND 为
+nil 或空串时**不写入请求体**，由服务端兜底为 `note'（保持老调用方语义不变）。
+SELECTED-TEXT 为选中原文（标记类批注的原文），nil 或空串时不写入请求体。
+
+请求体字段名按 API 契约用下划线（`selected_text'）；kebab 形态只用于
+响应解析，不要混进请求体。成功（201）返回服务端创建的完整批注对象（alist，
+含 id 与时间戳）；非 2xx 响应返回 nil。"
   (seshat-rest--json
    (seshat-rest--request
     "POST"
     "/api/annotations"
-    (json-encode `((uid . ,uid)
-                   (location . ,location)
-                   (text . ,text))))))
+    (json-encode
+     (append `((uid . ,uid)
+               (location . ,location)
+               (text . ,text))
+             (when (and (stringp kind) (not (string-empty-p kind)))
+               `((kind . ,kind)))
+             (when (and (stringp selected-text)
+                        (not (string-empty-p selected-text)))
+               `((selected_text . ,selected-text))))))))
 
 (defun seshat-rest-update-annotation (id location text)
   "更新编号为 ID 的批注的 LOCATION 与 TEXT。

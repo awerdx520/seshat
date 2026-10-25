@@ -254,47 +254,103 @@ submit_render_job(DocState *doc_state,
 	args->cp        = cp;
 	args->dp        = dp;
 
-	/* Snapshot the highlights of this page into the job.
+	/* Snapshot the decorations of this page into the job.
 	 *
 	 * DocState is documented as being usable by one thread at a time, and
 	 * the render threads run on a cloned ctx, so they must never walk
-	 * doc_state->highlights.  Taking a private copy here keeps the table
+	 * doc_state->decorations.  Taking a private copy here keeps the table
 	 * free to be mutated by the Emacs main thread while pages render.
+	 *
+	 * DECORATION_KIND_STROKE entries own a heap block (`pts').  A plain
+	 * struct copy would alias it with the DocState table, and then
+	 * emacs_clear_highlights() (or free_doc_state()) would free the
+	 * points while the render thread still reads them — a
+	 * use-after-free — while free_draw_thread_args() would free them a
+	 * second time.  So every stroke's point array is DEEP COPIED here:
+	 * the snapshot owns its own block and the two owners can never
+	 * release the same pointer.  RECT entries have pts == NULL and need
+	 * no copy.
+	 *
 	 * A failed allocation is not fatal: the page simply renders without
-	 * highlights. */
-	Highlight *hl = NULL;
-	int hl_count = 0;
+	 * that decoration, and the partially built snapshot is still fully
+	 * owned and releasable because every not-yet-filled slot is zeroed
+	 * up front. */
+	Decoration *deco = NULL;
+	int deco_count = 0;
 
-	if (doc_state->highlights && doc_state->highlight_count > 0)
+	if (doc_state->decorations && doc_state->decoration_count > 0)
 		{
 			int page = dp->page_num;
 
-			for (int i = 0; i < doc_state->highlight_count; ++i)
-				if (doc_state->highlights[i].page == page)
-					++hl_count;
+			for (int i = 0; i < doc_state->decoration_count; ++i)
+				if (doc_state->decorations[i].page == page)
+					++deco_count;
 
-			if (hl_count > 0)
+			if (deco_count > 0)
 				{
-					hl = malloc((size_t)hl_count * sizeof(Highlight));
-					if (hl)
+					deco = calloc((size_t)deco_count,
+						      sizeof(Decoration));
+					if (deco)
 						{
 							int j = 0;
 							for (int i = 0;
-							     i < doc_state->highlight_count;
+							     i
+							     < doc_state->decoration_count;
 							     ++i)
-								if (doc_state->highlights[i].page
-								    == page)
-									hl[j++] =
-										doc_state
-											->highlights[i];
+								{
+									const Decoration *src
+										= &doc_state
+											   ->decorations[i];
+
+									if (src->page != page)
+										continue;
+
+									deco[j] = *src;
+									deco[j].pts = NULL;
+									deco[j].pt_count = 0;
+
+									if (src->kind
+										    == DECORATION_KIND_STROKE
+									    && src->pts
+									    && src->pt_count > 0)
+										{
+											fz_point *copy
+												= malloc(
+													(size_t)src
+														->pt_count
+													* sizeof(
+														fz_point));
+											if (copy)
+												{
+													memcpy(
+														copy,
+														src->pts,
+														(size_t)src
+															->pt_count
+														* sizeof(
+															fz_point));
+													deco[j].pts = copy;
+													deco[j].pt_count
+														= src->pt_count;
+												}
+											/* else: leave pts
+											 * NULL — this stroke is
+											 * skipped, nothing to
+											 * free. */
+										}
+
+									++j;
+								}
+
+							deco_count = j;
 						}
 					else
-						hl_count = 0;
+						deco_count = 0;
 				}
 		}
 
-	args->hl = hl;
-	args->hl_count = hl_count;
+	args->deco = deco;
+	args->deco_count = deco_count;
 
 	pthread_mutex_lock(&cp->mutex);
 	cp->status = PAGE_STATUS_RENDERING;

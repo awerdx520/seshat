@@ -1091,10 +1091,11 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
     }
 
     /**
-     * 编辑备注：复用「添加批注」的对话框写法，预填原文。
+     * 编辑便签：复用「添加批注」的对话框写法，预填原文。
      *
      * 保存后置 `dirty = true` 并异步推送——`dirty` 是「新增或修改待上行」的唯一标记，
-     * 下次 `pushAnnotations` 会把它 PUT 上去。
+     * 下次 `pushAnnotations` 会把它 PUT 上去。**编辑不改 `kind`**：备注是 `text` 维度，
+     * 与「这条记录是什么类型」正交（与 EPUB 侧一致）。
      */
     private fun editAnnotationRow(row: AnnotationRow) {
         val target = annotationsForRow(row).firstOrNull() ?: return
@@ -1107,7 +1108,7 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
             .setView(input)
             .setPositiveButton(android.R.string.ok) { _, _ ->
                 val text = input.text?.toString()?.trim().orEmpty()
-                // 空备注不保存：服务端 kind=note 时 text 必填
+                // 空备注不保存：编辑路径只改 text，不写空串（否则等于把已有备注清掉）
                 if (text.isEmpty()) return@setPositiveButton
                 annotationStore.update(
                     target.copy(text = text, updatedAt = System.currentTimeMillis(), dirty = true),
@@ -1529,7 +1530,7 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
      * 三手势分工（M10.8）：
      * - 单击 → [scheduleTap] 延迟派发 [handleTap]（延迟是为了让双击的第一击可被撤销）；
      * - 双击 → [toggleInk] 进入/退出手写模式；
-     * - 长按 → [showLongPressMenu]（复制本页文字 / 高亮标注 / 进入手写）；
+     * - 长按 → [showLongPressMenu]（复制本页文字 / 添加本页备注 / 进入手写）；
      * 手写模式下三者都让位给落笔。
      */
     private fun installTapPaging() {
@@ -1584,7 +1585,7 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
     }
 
     /**
-     * 长按菜单（M10.8）：复制本页文字 / 高亮标注 / 进入手写。
+     * 长按菜单（M10.8）：复制本页文字 / 添加本页备注 / 进入手写 / 导出手写副本（T6）。
      *
      * PDF 用 `PdfRenderer` 逐页渲染成位图，**没有文本选择层**，所以「复制」不能像 EPUB 那样
      * 复制选中文本，改为用 PdfBox 提取当前页文本（扫描版 PDF 没有文本层 → 提示无文字）。
@@ -1594,6 +1595,7 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
             getString(R.string.pdf_menu_copy_text),
             getString(R.string.pdf_menu_highlight),
             getString(R.string.pdf_menu_handwrite),
+            getString(R.string.pdf_menu_export_ink),
         )
         AlertDialog.Builder(this)
             .setItems(items) { _, which ->
@@ -1601,9 +1603,57 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
                     0 -> copyCurrentPageText()
                     1 -> promptAnnotation()
                     2 -> toggleInk()
+                    3 -> exportInkCopy()
                 }
             }
             .show()
+    }
+
+    /**
+     * 导出手写副本（T6）：把本文档的笔迹与高亮写成**新 PDF 副本** `xxx.seshat.pdf`。
+     *
+     * **原文件只读不动**（WebDAV 同步与签名 PDF 的风险，见 [PdfInkExporter] 的类注释）：
+     * 源只以只读方式 `PDDocument.load`，结果写到同目录新文件；已存在同名副本时自动加 `-1`/`-2`。
+     *
+     * 只支持 `file://` 源：`content://`（SAF 等）拿不到可写的同目录路径，直接给出可读提示，
+     * 而不是把副本悄悄写到别处（用户找不到，也会与书库扫描结果不一致）。
+     *
+     * 笔迹与批注在**主线程**取出（prefs 读取很轻），PDF 解析 + 写盘交给 [ioExecutor]——
+     * 与目录解析/复制文字同样的理由：阻塞 + 高内存操作不能占主线程。
+     */
+    private fun exportInkCopy() {
+        val uri = pdfUri
+        val path = uri?.path
+        if (uri?.scheme != "file" || path.isNullOrBlank()) {
+            toast(getString(R.string.pdf_export_unavailable))
+            return
+        }
+        val source = File(path)
+        val pages = inkStore.document(docId).pages
+        val annotations = annotationStore.list(docId)
+        toast(getString(R.string.pdf_export_started))
+        ioExecutor.execute {
+            val result = PdfInkExporter.export(source, pages, annotations)
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                when (result) {
+                    is PdfInkExporter.Result.Success ->
+                        if (result.skippedPages.isEmpty()) {
+                            toast(getString(R.string.pdf_export_done, result.file.name))
+                        } else {
+                            toast(
+                                getString(
+                                    R.string.pdf_export_done_partial,
+                                    result.file.name,
+                                    result.skippedPages.size,
+                                ),
+                            )
+                        }
+                    is PdfInkExporter.Result.Failure -> toast(result.reason)
+                    PdfInkExporter.Result.Empty -> toast(getString(R.string.pdf_export_nothing))
+                }
+            }
+        }
     }
 
     /** 后台提取当前页文本并写入剪贴板；无文本层 / 失败时提示。 */
@@ -1847,11 +1897,13 @@ class PdfReaderActivity : AppCompatActivity(), PdfInkHost {
                     tocDrawer.show(
                         allRows = rows,
                         currentTarget = currentPage,
-                        statusLine = getString(
-                            R.string.pdf_toc_status,
-                            currentPage + 1, pageCount, bookmarks.size,
-                        ),
+                        // 两段拼接（页号 + 书签数）：TocDrawer 不引用资源 id，故拼接在调用方做
+                        statusLine = getString(R.string.pdf_toc_status, currentPage + 1, pageCount) +
+                            TocDrawerText.STATUS_SEPARATOR +
+                            getString(R.string.pdf_bookmark_count, bookmarks.size),
                         bookmarks = bookmarks,
+                        // PDF 有顶栏书签入口，空态可以给出「点顶栏书签图标」的指引
+                        bookmarksSupported = true,
                         onBookmarkAdd = { onAddBookmarkFromDrawer() },
                         onBookmarkDelete = { bookmark ->
                             bookmarkStore.remove(docId, bookmark.page)

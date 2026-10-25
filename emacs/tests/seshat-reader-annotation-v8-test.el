@@ -255,7 +255,9 @@ alist（服务端，键 `selected_text'）与 plist（渲染层，键 `:selected
     (cl-letf (((symbol-function 'seshat-reader-annotation--fetch)
                (lambda (_uid) (list ann)))
               ((symbol-function 'seshat-rest-create-annotation)
-               (lambda (_uid location text)
+               ;; create 自 v8 起有 5 个实参（新增 kind / selected-text），
+               ;; 桩点用 &optional 兜住，避免 wrong-number-of-arguments。
+               (lambda (_uid location text &optional _kind _selected)
                  (setq created (list location text))
                  (list (cons 'id 61)))))
       (should (eq (seshat-reader-annotation-queue--sync-create entry) 'ok)))

@@ -1,6 +1,6 @@
 # Emacs 阅读器使用手册
 
-> 本文对应 M12 版本（2026-10-22）。适用 Emacs 29.1 及以上，本仓库在 Emacs 31.1 实测。
+> 本文对应 M12 版本（2026-10-22），并在 2026-10-25 补入跨页文本搜索（`C-s`）与手写轨迹（`ink:`）显示。适用 Emacs 29.1 及以上，本仓库在 Emacs 31.1 实测。
 
 Emacs 端文档阅读器（`emacs/seshat-reader/`）：MuPDF 负责栅格化、C 动态模块出图、elisp 负责版式与交互，并把**批注 / 译文 / 引用**接到 seshat 服务端。侧车（sidecar）性质——批注不写回 PDF 文件。上游来源、改名映射与本地改动见包内 [`VENDORED.md`](../emacs/seshat-reader/VENDORED.md)，展示层设计见 [`architecture.md`](architecture.md) 的「Emacs 阅读器：展示层与渲染层（M12）」节。
 
@@ -13,6 +13,8 @@ Emacs 端文档阅读器（`emacs/seshat-reader/`）：MuPDF 负责栅格化、C
 | 目录导航 | `o`（开合） | 左侧目录面板：层级、页码、当前章高亮、TAB 折叠、`f` 单键跳转 |
 | 框选取文 | 鼠标 `down-mouse-1` 拖拽 | 松手后取文本并闪现选区矩形 |
 | 批注 | `C-c C-a` / `C-c C-l` | 创建、列出、跳页、删除、页面高亮刷新 |
+| 跨页文本搜索 | `C-s`（会话内 `n` / `p` / `RET` / `C-g`） | 整本扫描、跨页跳转与回绕、命中以橙色装饰投喂 |
+| 手写轨迹显示 | 自动（`seshat-reader-annotation-ink-enabled`） | 把 Android 手写批注的 `ink:` 段渲染为页面笔迹（只显示，不输入） |
 | 翻译/解释 | `C-c C-t` / `C-c C-e` | 依赖 go-translate；结果显示在面板（或 posframe） |
 | 跨页衔接 | `seshat-reader-page-join-lines` | 默认关闭的 opt-in 特性 |
 | 引用闭环 | `C-c C-r` / `M-x org-store-link` | `seshat:` 链接、摘录写入、`:complete` 补全、`:export` 导出 |
@@ -187,21 +189,79 @@ ETAF 渲染层是可选外部依赖：`Makefile` 先探测 `~/Workspace/emacs-ta
 - 把选区矩形投给 C 渲染层闪现高亮，时长 `seshat-reader-select-flash-duration`（默认 `2.0` 秒，`<= 0` 关闭）；
 - `seshat-reader-select-copy-to-kill-ring` 默认 `nil`；设 `t` 才把文本 `kill-new` 进 kill ring。
 
+**字级高亮（框选贴合文字，而不是一个大方块）**：C 模块的 `--rects-in-rect` 返回矩形内**每个命中字符**的 quad，elisp 侧的纯函数把它们合并成行条：
+
+- `seshat-reader-select-highlight-granularity`（默认 `line`）：`line` = 按行合并（y 重叠聚成行 → 行内按 x 排序 → 相邻字符水平间隙小于阈值才连成一条）；`character` = 逐字符矩形，不合并。
+- `seshat-reader-select-highlight-gap-ratio`（默认 `0.8`）：把「水平间隙 / 行高」的比值作断点，超过就断开，双栏排版因此不会被一条横条横穿。中文正文实测约 **3.4 段/行**（字间空隙比西文大）；想让高亮更连贯可上调（如 `1.2`），想更贴字可下调。
+- `seshat-reader-select-highlight-shrink-ratio`（默认 `0.8`，`1.0` = 关闭）：字符 quad 的高度（实测 ≈11.7pt）大于行距（≈10.3pt），不收缩时相邻两行的横条垂直重叠（重叠量 = quad 高 − 行距，实测 ≈1.4pt），8 条拼起来视觉上仍是一整块。该比值在合并之后**围绕每条矩形自己的垂直中心**把高度乘以它（实测 `0.8` 留出 ≈0.94pt 白缝），只影响**垂直高度**：水平范围、`seshat-reader-select-last` 的 `:rect`（整体拖拽 bbox）、写入 `location` 的段数与 x 范围都不变，`line` / `character` 两种粒度都生效。有效范围 `0.3`–`1.0`，越界夹紧（`0.1`→`0.3`、`2.0`→`1.0`），非数字回落 `0.8`。
+- 选区结果写进 `seshat-reader-select-last`：`:rects` 是合并后的**多段**矩形（字级高亮与批注锚的几何真值），`:rect` 保留整体 bbox 以兼容既有消费方。
+- 多段矩形经 `seshat-reader-annotation--anchor` 写成**多段 location**（`page:<n>;rect:…;rect:…`），写入端上限 **500 段**（`seshat-reader-annotation--anchor-max-segments`）；解析端上限 2000 段（`seshat-reader-annotation--rect-max-segments`）。`character` 粒度下逐字符矩形可达数千条，会撞 500 段上限——此时**只写前 500 段**（页面下部因此没有高亮）并提示一次，见 §12。
+- 闪现与批注高亮共用一套投喂（一次 clear → 逐条 add → 一次 refresh），短语义见下节。
+
 闪现不受 `seshat-reader-annotation-highlight-enabled` 约束（它是框选反馈，不是批注）。**旋转页上的选区不受支持**：`location` 协议无法表达页面旋转状态，坐标会静默错误。
 
 ### 建批注（`C-c C-a`）
 
-- `C-c C-a` = `seshat-reader-annotation-create`：默认用最近一次选区文本；带前缀 `C-u` 时在迷你缓冲区手输正文。
+- `C-c C-a` = `seshat-reader-annotation-create`：默认用最近一次选区文本建**标记类**批注；带前缀 `C-u` 时先在迷你缓冲区读备注、再建**便签**。
 - 运行前置：必须先有鼠标选区，否则 `user-error` 提示先拖选。选中的文本不会被清除，可对同一选区连续建多条批注（有意语义）。
+- **两个正交维度**：`kind` 只表**类型**，「有无备注」由 `text` 空 / 非空表达，「选中的是哪段原文」由 `selected_text` 表达——**加备注不改 `kind`**。
+
+| 调用方式 | `kind` | `text` | `selected_text` |
+|---|---|---|---|
+| `C-c C-a`（无前缀） | `highlight` | `""`（空串 = 无备注） | 选区原文 |
+| `C-u C-c C-a` + 输入备注 | `note` | 备注正文 | 选区原文 |
+| 选区无文本且未输入备注 | —（`user-error`，不建批注） | — | — |
+
+- **列表标题的回退链不变**：`seshat-reader-annotation--display-text` 仍是 `text → selected_text → ink 聚合`。`highlight` 条目 `text` 为空，标题因此直接显示选区原文（不是空白行）。
+- **离线队列**：create 条目携带 `:kind` 与 `:selected-text`，重放时原样带上；客户端去重键仍是 `(kind, location, text)`（`selected_text` 不参与），未改。
+- **本端没有编辑批注的路径**：`seshat-rest-update-annotation` 的唯一调用者是测试，Emacs 不能修改已有批注的正文或类型（只能删除后重建）。将来接入编辑时必须显式带上原 `kind`——`UpdateAnnotationAt` 会把空 `kind` 兜底成 `note`，不带原 `kind` 的「高亮加备注」会被降级成便签。
 - `document_id`：由 `seshat-reader-annotation-roots`（`("<标签>" . "<根目录>")` alist）决定，形如 `<标签>:<相对路径>`；多根命中取最长匹配；不在任何根下时降级为 `local:<绝对路径>`，并在提示里说明该批注**不跨端共享**。
-- `location`：形如 `page:<n>;rect:<x0>,<y0>,<x1>,<y1>`，页码 1-based、坐标是**未旋转页面坐标**；`ink:`（手写笔迹）段在本端不解析不渲染。
+- `location`：由 `seshat-reader-annotation--anchor`（**页锚 + 可选几何尾段**）构造，形如 `page:<n>;rect:<x0>,<y0>,<x1>,<y1>`——**页锚** `page:<n>` 是唯一的跳转真值（1-based 页码），`;rect:` 是**可选几何尾段**、只供渲染，坐标是**未旋转页面坐标**；`ink:`（手写笔迹）段**本端只解析不产出**（Android 才有笔事件），显示见 §5「手写轨迹显示」。函数名 2026-10-25 由 `--location` 改为 `--anchor`：它返回的是「锚」而非「location 串的通用构造器」，语义更窄也更准确（守 `location` 长度上限的 defconst `seshat-reader-annotation--location-max-length` **刻意保留原名**，它守的是 API 字段 `location`）。
 
-### 页面高亮
+### 页面高亮与装饰
 
-- 高亮由 C 渲染层绘制（`render/render-core.c`），与页面共用同一 `ctm`，因此缩放/旋转自动对齐（旋转页的坐标本身有误，见上）。
-- `seshat-reader-annotation-highlight-enabled`（默认 `t`）控制是否绘制；`nil` 时只清空已有矩形并重绘。
+高亮/下划线/删除线都由 C 渲染层的**装饰表**（`render/render-core.c`）绘制，与页面共用同一 `ctm`，因此缩放/旋转自动对齐（旋转页的坐标本身有误，见上）。
+
+- `seshat-reader-annotation-highlight-enabled`（默认 `t`）控制是否绘制批注装饰；`nil` 时只清空已有装饰并重绘。
 - `C-c C-h` = `seshat-reader-annotation-refresh-highlights`：手动刷新（重投当前文档矩形并触发 C 侧 `--refresh-highlights`）。自动刷新只发生在**批注列表拉取/刷新之后**——新建成功后的增量追加、删除后的列表重建都走这条路；**打开文档本身不拉批注，因此不会自动重绘**，需先 `C-c C-l` 一次。
-- 高亮颜色与透明度是 C 侧编译期常量（`HIGHLIGHT_COLOR_R/G/B` = 1.0/0.85/0.0、`HIGHLIGHT_ALPHA` = 0.35），elisp 侧不暴露（见 §12）。
+- **装饰表两类几何**：`rect`（填充矩形，用于高亮与下划线/删除线细条）与 `stroke`（折线，预留给手写轨迹，elisp 侧尚未使用）。每条装饰带 RGB + alpha；rect 按颜色**分组**进同一 path 一次性填充，因此「同色重叠**不叠深**」（多段高亮叠在一起仍是一个透明度）。
+- **装饰只是增强**：模块缺失（或加载的是缺 `--add-decoration` 的旧版）时提示一次即跳过，不抛错；提示措辞是「装饰模块不可用（模块未加载或缺少装饰入口）」。
+
+**按 `kind` 选择几何与配色**（Lisp 侧纯函数 `seshat-reader-annotation--decoration-for`，C 侧不认识 `kind`）：
+
+| `kind` | 几何 | 颜色 / 透明度 | defcustom |
+|---|---|---|---|
+| `highlight` | 行矩形**原样**（多段 location 一段一条） | 默认黄 `1.0 0.85 0.0` / α `0.35`（C 侧历史默认值，默认配置下改走 5 参 `--add-highlight`，像素与改造前逐字节一致） | `seshat-reader-annotation-highlight-color` / `-highlight-alpha` |
+| `underline` | 行矩形**底边**细条：`(X0, Y1-1.5, X1, Y1)`，行高小于粗细时夹到上沿不产生负面积 | 蓝 `0.0 0.45 0.85` / α `1.0`（不透明细条，与半透明黄高亮可区分） | `-underline-color` / `-underline-alpha` / `-underline-thickness`（默认 `1.5` pt） |
+| `strikeout` | 行矩形**垂直中线**细条：`(X0, MID-0.75, X1, MID+0.75)`，`MID = (Y0+Y1)/2` | 红 `0.85 0.1 0.1` / α `1.0` | `-strikeout-color` / `-strikeout-alpha` / `-strikeout-thickness`（默认 `1.5` pt） |
+
+颜色/alpha/粗细全部可在 defcustom 里调；改配色后 Lisp 侧改走 9 参 `--add-decoration`（C 的 5 参 `--add-highlight` 只认默认黄）。未知 `kind`（含 `note` / `ink` / nil）按 `highlight` 处理，保持向后兼容。
+
+### 跨页文本搜索（`C-s`）
+
+模块 `seshat-reader-search`（自研扩展，不属上游 vendored 代码）。`C-s` 在 `seshat-reader-mode-map` 里原本未被占用；绑定后**该 buffer 内的全局 `isearch-forward` 被有意覆盖**——页面是图片，isearch 搜不到正文，只会命中 buffer 里那几个换行符。
+
+- **交互**：`C-s` → 迷你缓冲区读搜索串 → 整本扫描后落到「当前页及其后的第一个命中」。会话期间进入 `set-transient-map` 武装的临时键表：`n` 下一个命中 / `p` 上一个命中 / `RET` 结束会话并停在当前命中页 / `C-g` 取消并回到搜索起始页。**翻页键位未变**——`n` / `p` 只在会话存续期间接管，按任何其它键即退出临时键表，立刻恢复翻页语义（`n` / `p` 不写进 `seshat-reader-mode-map` 正是为了这个）。
+- **跨页与回绕**：命中序列按「页号升序 + 页内 MuPDF 命中顺序」排列；`n` 到文末回绕到第一个命中、`p` 到文首回绕到最后一个，各提示一次。
+- **状态行**：`第 i/N 个命中 · 第 p 页`；`C-g` 后回到起始页并清空命中装饰。
+- **整本扫描耗时**：797 页文档实测约 **1.1 秒**。扫描用 `fz_search_page` 逐页取命中，不重建文本索引；结果按页缓存在 buffer-local 哈希里，跳转不重扫。
+- **双上限**（两者都不是缺陷，是防御）：
+  - 单页 `seshat-reader-search-limit`（默认 `1024`）：C 侧把入参夹到 1..10000，但**实际收集**硬上限也是 1024（`SEARCH_PAGE_MAX_QUADS`）。某页返回条数达到 `min(limit, 1024)` 时状态行显式追加「（本页命中已达上限 1024，仅显示前 1024 条）」——否则用户会以为这页只有这么多命中（常见于目录页搜 `.`）。
+  - 总量 `seshat-reader-search-max-matches`（默认 `20000`）：达到即**停止扫描**并提示「命中过多」。每条命中是一个五元素浮点列表，几十万条就是几十 MB，且每次跳转都要遍历一遍，故必须设总量闸。
+- **与批注装饰共存**：搜索命中走批注模块的扩展点 `seshat-reader-annotation-extra-decorations-function`，与批注 rect、框选闪现共用 C 侧**同一张**文档级装饰表，任何一方都不独占 `--clear-highlights`。批注模块未加载时降级为自投（`--clear-highlights` → `--add-decoration` → `--refresh-highlights`）。
+- **无文本层**的扫描页优雅退化为「本页无结果」，不报错；模块缺 `--search-page` 时提示「搜索不可用」。
+
+### 手写轨迹显示（`ink:`）
+
+Emacs 端**只显示**手写（无笔事件、无压感，输入永远在 Android）。开关 `seshat-reader-annotation-ink-enabled`（默认 `t`）；关闭时一条笔迹都不投，rect 类装饰（highlight / underline / strikeout）仍由 `seshat-reader-annotation-highlight-enabled` 独立控制，两者互不影响。
+
+- **解析**：`seshat-reader-annotation--ink-strokes-from-location` 把 `page:<n>;ink:<color>,<widthPt>,<x0>,<y0>,…` 按 `;` 切段，逐个 `ink:` 段解析为 `(PAGE R G B ALPHA WIDTH POINTS TRUNCATED)`。
+  - 颜色只接受**恰好 8 位** `#AARRGGBB`（alpha 在最高位）；`#RGB` / `#RRGGBB` / 缺 `#` 一律丢弃整笔——其它位宽的 alpha 归属无从判断，猜错会把整笔颜色（含透明度）画错。
+  - **整笔跳过**的判据：不是 `ink:` 段、缺颜色或宽度、宽/坐标非有限数（`NaN` / `inf` / 指数溢出）、坐标个数为奇数、点数为 0（契约里的降级形态，只有颜色与宽度）。任一条不满足即丢**整笔**而不是丢坏点：坐标错一个点会把整笔画歪，画一条歪线比不画更误导。
+  - 点数上限 `seshat-reader-annotation--ink-max-points`（**1024**，与 C 侧 `DECORATION_MAX_POINTS` 一致）：超出则**截断为前 1024 点**并标记 `TRUNCATED`，而不是丢整笔（整笔丢弃等于用户的手写凭空消失）。正常一笔只有几十到几百点，不受影响。
+- **投喂**：解析结果经 `--add-stroke`（**1-based** 页号、扁平点列表 `(x0 y0 x1 y1 …)`、圆头圆角）交给 C 侧装饰表。统一投喂顺序是 **clear → 批注 rect → 框选闪现 → 搜索命中 → ink 笔迹 → refresh**（`seshat-reader-annotation--redraw-highlights` 做单次全量重投，因此不存在第二套共存逻辑）。ink 解析失败只影响 ink，不影响 rect。
+- **坐标口径**：ink 笔迹与 `rect:` **同一个 page space**（页面 pt、原点左上、y 向下），**无需 y 翻转**——数值证据：同页同一形状的 ink 线差异行中心 `80.0` 与 highlight 行中心 `80.0` 一致（PNM `612×792`，该分辨率下 1px = 1pt）。解析层按契约逐字对应、不做任何翻转。**Android 真机上的肉眼对照仍待确认**（见 §12 第 2 条）。
+- 线宽与点数都按页面 pt 解释，因此缩放后与页面同变换对齐；旋转页上的坐标本身有误（见 §12 第 1 条），与 rect 高亮同一限制。
 
 ### 批注列表（`C-c C-l`）
 
@@ -304,6 +364,7 @@ ETAF 渲染层是可选外部依赖：`Makefile` 先探测 `~/Workspace/emacs-ta
 | `Q` | `seshat-reader-close-doc` | 关闭文档 |
 | `C-c C-a` / `C-c C-l` | `seshat-reader-annotation-create` / `-list` | 建批注 / 批注列表 |
 | `C-c C-h` | `seshat-reader-annotation-refresh-highlights` | 刷新页面高亮 |
+| `C-s` | `seshat-reader-search` | 跨页文本搜索（会话内 `n` / `p` / `RET` / `C-g`；`n` / `p` 只在会话期间接管翻页键） |
 | `C-c C-r` | `seshat-reader-reference-insert` | 插入选区摘录 |
 | `C-c C-t` / `C-c C-e` | `seshat-reader-translate-selection` / `-explain-selection` | 翻译 / 解释 |
 
@@ -371,9 +432,26 @@ evil 用户同样可用上述单键（包内 `evil-define-key*` 补绑 normal st
 | 变量 | 默认值 | 作用 |
 |---|---|---|
 | `seshat-reader-annotation-roots` | `nil` | 书库根映射 alist，决定 `document_id` |
-| `seshat-reader-annotation-highlight-enabled` | `t` | 是否绘制批注矩形高亮 |
+| `seshat-reader-annotation-highlight-enabled` | `t` | 是否绘制批注装饰（高亮 / 下划线 / 删除线） |
+| `seshat-reader-annotation-ink-enabled` | `t` | 是否把批注 `ink:` 段绘制为页面手写笔迹（只控 ink，不影响 rect 类装饰） |
+| `seshat-reader-annotation-highlight-color` | `(1.0 0.85 0.0)` | 高亮填充色 RGB（各 0.0–1.0），与 C 侧默认黄逐字一致 |
+| `seshat-reader-annotation-highlight-alpha` | `0.35` | 高亮填充透明度 |
+| `seshat-reader-annotation-underline-color` / `-underline-alpha` / `-underline-thickness` | `(0.0 0.45 0.85)` / `1.0` / `1.5` | 下划线颜色、透明度与细条高度（pt） |
+| `seshat-reader-annotation-strikeout-color` / `-strikeout-alpha` / `-strikeout-thickness` | `(0.85 0.1 0.1)` / `1.0` / `1.5` | 删除线颜色、透明度与细条高度（pt） |
+| `seshat-reader-select-highlight-granularity` | `line` | 字级高亮粒度：`line`（按行合并）/ `character`（逐字符） |
+| `seshat-reader-select-highlight-gap-ratio` | `0.8` | 行内水平间隙断点（行高倍数）；中文正文实测约 3.4 段/行，想更连贯可上调 |
+| `seshat-reader-select-highlight-shrink-ratio` | `0.8` | 高亮矩形垂直高度收缩比（围绕各自中心，只改高度、不改 x 与 `:rect`）；`1.0` 关闭收缩，有效 `0.3`–`1.0` 越界夹紧 |
 | `seshat-reader-select-flash-duration` | `2.0` | 框选后闪现选区高亮的秒数，`<= 0` 关闭 |
 | `seshat-reader-select-copy-to-kill-ring` | `nil` | 选区文本是否同时进 kill ring |
+
+### 搜索
+
+| 变量 | 默认值 | 作用 |
+|---|---|---|
+| `seshat-reader-search-limit` | `1024` | 单页向动态模块请求的命中上限（C 侧夹到 1..10000，**实际收集**硬上限也是 1024；达上限时状态行提示「仅显示前 1024 条」） |
+| `seshat-reader-search-max-matches` | `20000` | 整次搜索保留的命中总数上限，达到即停止扫描并提示「命中过多」；`nil` 表示不限制（不推荐） |
+| `seshat-reader-search-color` | `(1.0 0.45 0.0)` | 命中填充色 RGB（默认橙，与批注黄 / 下划线蓝可区分） |
+| `seshat-reader-search-alpha` | `0.55` | 命中填充透明度（比批注 highlight 的 `0.35` 更实，便于在已有高亮之上辨认） |
 
 ### 翻译 / 解释
 
@@ -424,7 +502,7 @@ M12 回归（strip 行破坏页面几何 + `--center-page` 在 `window-size-chan
 按顺序排查：
 
 1. `(key-binding [down-mouse-1])` 应为 `seshat-reader-select-drag`；若为 nil，说明 `seshat-reader-select` 未加载（`(featurep 'seshat-reader-select)`）。
-2. 高亮链路是否需要重启：`(fboundp 'seshat-reader-dyn--add-highlight)` 应为 `t`——为 nil 表示加载的 `.so` 太旧，重新 `make all` 并**重启 Emacs**。
+2. 高亮链路是否需要重启：`(fboundp 'seshat-reader-dyn--add-highlight)` 与 `(fboundp 'seshat-reader-dyn--add-decoration)` 都应为 `t`——任一为 nil 表示加载的 `.so` 太旧（后者缺失时 underline / strikeout 与自定义配色都画不出来），重新 `make all` 并**重启 Emacs**。
 3. `seshat-reader-annotation-highlight-enabled` 是否为 `t`。
 4. 批注数据是否真的拉到过：`C-c C-l` 打开列表，看目标批注是否在列表里（矩形是从列表项投给 C 层的）。
 5. 仍无高亮就 `C-c C-h` 手动刷新；再不行 `g` 重渲染当前页。
@@ -455,8 +533,8 @@ M12 回归（strip 行破坏页面几何 + `--center-page` 在 `window-size-chan
 以下条目全部出自 [`../openspec/tech-debt.md`](../openspec/tech-debt.md)，如实列出，未做美化。
 
 1. **旋转页的高亮可能错位**：选区采集明确不支持旋转页，`rect` 是未旋转页面坐标而 C 侧按含 `rotate` 的 `ctm` 绘制，两者对同一 `rect` 解释不一致。
-2. **`ink:` 段不显示**：手写笔迹只解析 `rect:`，移动端用笔标注的批注在桌面只看到列表摘要。
-3. **高亮颜色与透明度不可配**：颜色/alpha 是 C 侧编译期常量，只有总开关。
+2. **ink 笔迹只做了数值级坐标对照，未做真机肉眼确认**：ink 与 `rect:` 同为页面 pt、原点左上、y 向下，实测同一形状的差异行中心 `80.0` vs `80.0`，因此实现**不做 y 翻转**；但「同一形状在 Android 与 Emacs 上看起来一致」仍需真机对照（见 tech-debt）。另外单笔超过 1024 点会被截断为前 1024 点（不丢整笔），超长笔迹在页面上显示不完整。
+3. **颜色与 alpha 可配但只在 Lisp 侧**：颜色/透明度/细条粗细是 defcustom（见 §10），改配色后走 9 参 `--add-decoration`；C 侧编译期常量仅作默认值，不读用户配置。
 4. **多窗口下高亮刷新与 strip 缓存有局限**：`C-c C-h` 只重建当前窗口的 ±5 页缓存；strip 的上一页 spec 缓存是 buffer 级、按当前选中窗口记录页号。
 5. **目录折叠符号不与 `TAB` 联动**：行模型的 `collapsed` 集合恒传 `nil`，`TAB` 折叠后符号仍停在 `▾`（折叠本身有效，只是符号不刷新）。
 6. **大纲页号乱序时当前章标记可能错**：`--current-path` 隐含「页号单调不减」的假设，乱序目录下标记会指错节点（跳转本身正确）。
@@ -479,6 +557,8 @@ M12 回归（strip 行破坏页面几何 + `--center-page` 在 `window-size-chan
 23. **居中机制两套并存**：页面能完整放下时由 redisplay 求值居中（`before-string` + `:align-to`）；页面比窗口宽时仍走旧的 `line-prefix` + 横向滚动，只能**左对齐**、不居中。两套机制由 `--center-page` 的几何判定选择，`--centered-p` 与它各有判据（见 tech-debt）。
 24. **跨页衔接 strip 与新的居中方式未验证**：strip 行靠 center overlay 的 `line-prefix` 获得缩进，而「页面放得下」的分支会主动清空该 prefix；`page-join-lines` 默认 `0`（关闭）因此默认配置不受影响，一旦开启 strip 可能比页面左移半个余量（见 tech-debt）。
 25. **首次打开的首帧位图是显示层缩放**：`--first-fit` 先把 image spec 改到最终几何（不重渲染），在 idle 重渲染前位图是插值放大的旧分辨率——表现为「尺寸一开始就正确、但略模糊，约 0.15 秒后转清晰」，不再有原先的「先小后大」两次变化。
+26. **`character` 粒度会撞 500 段锚上限**：逐字符矩形可达数千条，`--anchor` 按写入端上限只写前 500 段（并提示一次），页面下部因此**没有高亮**；批注本身仍可创建。`line` 粒度（默认）每页通常几十段，不受影响。解除条件见 tech-debt（先按行合并再写入，或提高上限并重估 64 KB location 长度）。
+27. **同一处多段高亮不会叠深**：装饰按颜色分组进同一 path 一次填充，因此多段重叠仍是一个透明度——这是有意的（避免出现深浅不匀的色块），不是渲染缺陷。
 
 ## 13. 开发者备注
 
@@ -490,6 +570,7 @@ M12 回归（strip 行破坏页面几何 + `--center-page` 在 `window-size-chan
 | `seshat-reader-select.el` | 鼠标框选取文 + 选区闪现 |
 | `seshat-reader-annotation.el` | 批注 CRUD、`document_id` / `location` 解析、页面高亮投喂、批注列表 |
 | `seshat-reader-annotation-queue.el` | 离线队列（读写、原子写、定时同步） |
+| `seshat-reader-search.el` | 跨页文本搜索：整本扫描、按页缓存、`n` / `p` 临时键表、命中装饰投喂 |
 | `seshat-reader-sidebar.el` | 面板承载层（零依赖：位置、宽度/高度、slot、per-kind 尺寸记忆） |
 | `seshat-reader-outline.el` | 目录面板：行模型、渲染、avy 跳转、evil 补绑、关文档清理 |
 | `seshat-reader-translate.el` | 翻译/解释：gt 预设取用、面板 Markdown 渲染、存为批注 |
@@ -531,9 +612,9 @@ GTROOT=$(dirname "$(find "$HOME" -maxdepth 6 -type d \
 echo "$GTROOT"
 ```
 
-现有套件：`seshat-reader-page-join-test.el`、`seshat-reader-sidebar-test.el`、`seshat-reader-outline-test.el`、`seshat-reader-annotation-test.el`、`seshat-reader-annotation-queue-test.el`、`seshat-reader-annotation-v8-test.el`、`seshat-reader-select-flash-test.el`、`seshat-reader-translate-test.el`、`seshat-reader-reference-test.el`、`seshat-reader-resize-test.el`、`seshat-reader-etaf-test.el`、`seshat-rest-test.el`、`seshat-state-test.el`、`seshat-transport-test.el`、`seshat-conflict-test.el`（10 例）、`seshat-merge-test.el`（13 例）、`seshat-sync-cmd-test.el`（14 例）、`seshat-sync-test.el`（77 例）、`seshat-reading-test.el`（**45 例**）。**前置**：`seshat-render-core.so` 已构建，否则加载 `seshat-reader` 会触发交互式构建询问并阻塞 batch 运行。
+现有套件：`seshat-reader-page-join-test.el`、`seshat-reader-sidebar-test.el`、`seshat-reader-outline-test.el`、`seshat-reader-annotation-test.el`、`seshat-reader-annotation-queue-test.el`、`seshat-reader-annotation-v8-test.el`、`seshat-reader-annotation-decoration-test.el`（21 例）、`seshat-reader-annotation-ink-test.el`（24 例）、`seshat-reader-search-test.el`（17 例）、`seshat-reader-select-flash-test.el`、`seshat-reader-select-merge-test.el`（18 例）、`seshat-reader-translate-test.el`、`seshat-reader-reference-test.el`、`seshat-reader-resize-test.el`、`seshat-reader-etaf-test.el`、`seshat-rest-test.el`、`seshat-state-test.el`、`seshat-transport-test.el`、`seshat-conflict-test.el`（10 例）、`seshat-merge-test.el`（13 例）、`seshat-sync-cmd-test.el`（14 例）、`seshat-sync-test.el`（77 例）、`seshat-reading-test.el`（**45 例**）。**前置**：`seshat-render-core.so` 已构建，否则加载 `seshat-reader` 会触发交互式构建询问并阻塞 batch 运行。
 
-**必须逐文件运行**：一次 `emacs --batch` 加载全部测试文件时，`seshat-reader-annotation-test.el` 与 `seshat-reader-annotation-queue-test.el` 各有 3 个列表渲染用例会失败——同时加载 `etaf` 测试后 `etaf-ui` 变为可用，批注列表改走 EBOX/ETAF 渲染，而那两个用例断言的是纯文本（如 `"没有批注"`）。这是**既有基线特性、不是回归**：全仓用例总数按逐文件求和计（当前 19 个文件合计 **682** 例，0 unexpected / 0 skipped）。跑全仓脚本见下（`for` 循环逐文件执行，任一文件非零退出即整体失败）：
+**必须逐文件运行**：一次 `emacs --batch` 加载全部测试文件时，`seshat-reader-annotation-test.el` 与 `seshat-reader-annotation-queue-test.el` 各有 3 个列表渲染用例会失败——同时加载 `etaf` 测试后 `etaf-ui` 变为可用，批注列表改走 EBOX/ETAF 渲染，而那两个用例断言的是纯文本（如 `"没有批注"`）。这是**既有基线特性、不是回归**：全仓用例总数按逐文件求和计（当前 23 个文件合计 **773** 例，0 unexpected / 0 skipped）。跑全仓脚本见下（`for` 循环逐文件执行，任一文件非零退出即整体失败）：
 
 ```bash
 cd /home/thomas/Workspace/seshat && rm -f emacs/seshat-reader/*.elc && \
@@ -548,5 +629,5 @@ for f in emacs/tests/*-test.el; do \
 ### 改 C 的纪律
 
 - 本目录是 vendored + 自研化改名的代码：任何 C 侧改动都必须在该文件「按文件的本地改动清单」中登记，否则下次对照上游时改动会丢失依据。
-- 渲染层的不变量（高亮在反色/gamma **之后**、写 PNM **之前**绘制；`rect_to_page_space` 是唯一坐标换算点；高亮表在派发时快照进 `DrawThreadArgs`）改动前先读 [`architecture.md`](architecture.md) 对应小节。
-- 高亮条数 100000、坐标 ±1e6 点、outline 标题 8192 字节、批注 `location` 64 KB / 2000 段 `rect:` 是防御上限，不要随手放宽。
+- 渲染层的不变量（装饰在反色/gamma **之后**、写 PNM **之前**绘制；`rect_to_page_space` 是唯一坐标换算点；装饰表在派发时快照进 `DrawThreadArgs`，stroke 点列**逐条深拷贝**）改动前先读 [`architecture.md`](architecture.md) 对应小节。
+- 装饰条数 100000、坐标 ±1e6 点、每笔 stroke 1024 点、outline 标题 8192 字节、批注 `location` 64 KB / 2000 段 `rect:`（写入端 500 段）是防御上限，不要随手放宽。

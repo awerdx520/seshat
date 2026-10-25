@@ -206,7 +206,9 @@
     <!-- PDF 书签（M10.10 Q3）：添加/取消提示 + 目录抽屉底部状态行 -->
     <string name="pdf_bookmark_added">已添加书签</string>
     <string name="pdf_bookmark_removed">已取消书签</string>
-    <string name="pdf_toc_status">第 %1$d/%2$d 页 · %3$d 个书签</string>
+    <!-- 状态行 =「第 x/y 页」+「 · 」+「n 个书签」两段拼成（书签数单独成键，便于 EPUB 侧只显示第一段） -->
+    <string name="pdf_toc_status">第 %1$d/%2$d 页</string>
+    <string name="pdf_bookmark_count">%1$d 个书签</string>
 
     <!-- 手写参数面板（M10.8 B-T2）：粗细 3 档 + 笔型 3 种 -->
     <string name="pdf_ink_width_thin">细</string>
@@ -241,10 +243,18 @@
 
     <!-- 长按菜单与复制本页文字（M10.8） -->
     <string name="pdf_menu_copy_text">复制本页文字</string>
-    <string name="pdf_menu_highlight">高亮标注</string>
+    <string name="pdf_menu_highlight">添加本页备注</string>
     <string name="pdf_menu_handwrite">进入手写</string>
     <string name="pdf_copy_done">已复制本页文字</string>
     <string name="pdf_copy_truncated">本页文字过长，已复制前 10 万字符</string>
     <string name="pdf_copy_no_text">本页没有可复制的文字</string>
     <string name="pdf_copy_label">PDF 文字</string>
+
+    <!-- 导出手写副本（T6）：新 PDF `xxx.seshat.pdf`，原文件只读 -->
+    <string name="pdf_menu_export_ink">导出手写副本</string>
+    <string name="pdf_export_started">正在导出副本…</string>
+    <string name="pdf_export_done">已导出 %1$s</string>
+    <string name="pdf_export_done_partial">已导出 %1$s（%2$d 页未导出）</string>
+    <string name="pdf_export_nothing">没有手写或高亮，无需导出</string>
+    <string name="pdf_export_unavailable">仅本地文件可导出副本</string>
 </resources>

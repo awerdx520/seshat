@@ -43,13 +43,16 @@ reset_doc_state(DocState *state)
 		.frame_scale = 1,
 		.outline = NULL,
 		.invert = 0,
-		/* A reset drops the highlight table: it belongs to the document
-		 * that was just replaced.  `highlights' is owned by DocState and
-		 * allocated lazily, so it starts out empty. */
-		.highlights = NULL,
-		.highlight_count = 0,
-		.highlight_cap = 0,
-		.highlights_dirty = false,
+		/* A reset drops the decoration table: it belongs to the
+		 * document that was just replaced.  `decorations' is owned
+		 * by DocState and allocated lazily, so it starts out
+		 * empty.  Nothing is freed here — this is a positional
+		 * re-initialisation of a freshly allocated state, not a
+		 * teardown (free_doc_state() is the teardown). */
+		.decorations = NULL,
+		.decoration_count = 0,
+		.decoration_cap = 0,
+		.decorations_dirty = false,
 		.active_jobs = current_active_jobs,
 		.is_reloading = current_is_reloading
 	};
@@ -337,14 +340,16 @@ free_doc_state(DocState *state)
 		state->path = NULL;
 	}
 
-	// Free the document-level highlight table
-	if (state->highlights)
+	// Free the document-level decoration table.  Every stroke owns its point
+	// array, so this must go through the shared release path rather than a
+	// bare free(): otherwise each stroke leaks its `pts' block.
+	if (state->decorations)
 	{
-		free(state->highlights);
-		state->highlights = NULL;
+		free_decoration_table(state->decorations, state->decoration_count);
+		state->decorations = NULL;
 	}
-	state->highlight_count = 0;
-	state->highlight_cap = 0;
+	state->decoration_count = 0;
+	state->decoration_cap = 0;
 
 	// Free the state struct itself
 	free(state);

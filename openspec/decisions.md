@@ -362,7 +362,7 @@
 
 **决策**：`annotations` 表新增两列——`kind`（批注形态，约定 `note` / `highlight` / `ink`，**服务端不做枚举校验**）与 `selected_text`（选中原文），迁移为**纯 `ALTER TABLE ... ADD COLUMN`**（`DEFAULT 'note'` / `DEFAULT ''` 回填存量行）。`text` 语义保持不变（备注正文 / 显示摘要），但校验改为**按 `kind` 分支**：`kind=note` 时必填非空，`highlight` / `ink` 以及任何未知 `kind` 允许空串；`kind` 缺省（空串或全空白）由**存储层**在**校验之前**兜底为 `note`。同时 `CreateAnnotation` 增加**内容幂等**：按 `(uid, kind, location, text)` 查既有记录（`selected_text` **不参与**键），命中则原样返回、不插新行、不刷新 `updated_at`，API 层据此把新建映射 `201`、幂等命中映射 `200`。
 
-**理由**：① 单列 `text` 无法表达「只选中原文、没写备注」（高亮）与「一笔手写」（ink）——前者需要把选中原文与备注分开存，后者两者都为空；新增两列比复用 `location` 塞文本语义更干净，也与 Emacs/Android 两端已有的本地模型（`BookAnnotation.selectedText` / `PdfAnnotation.kind`）一一对应。② **不做枚举校验**是刻意的：`kind` 的取值集合会随阅读形态演进（未来可能有 `bookmark` / `underline`），服务端强校验会把「新增形态」变成「服务端发版」，而服务端的职责只是保存与回传不透明串——未知 `kind` 由客户端归入「其它」分组（Android）或按 `note` 兜底（Emacs）。③ 兜底必须在下层且先于校验：请求体反序列化后 `kind` 是空串，显式 `INSERT` 时 SQL 的 `DEFAULT 'note'` **不生效**；若兜底在校验之后，缺省 `kind` 的请求会被当成「未知 kind」，从而错误地允许 `text` 为空。④ 幂等键不带 `selected_text`：同一处选中原文的多次补登（Android 打开书时补登历史笔迹、Emacs 离线队列重放）应命中同一条记录，否则「补登」会变成「复制批注」；键带 `kind` 则保证同 `location` 上的一条 `highlight` 与一条 `note` 是两条独立批注。⑤ 两张迁移都只用 `ADD COLUMN`（可逆、无数据重写），故 `preMigrationChecks` **不登记 v8**——该钩子只服务不可逆迁移（v7 的 DROP + 重建）。
+**理由**：① 单列 `text` 无法表达「只选中原文、没写备注」（高亮）与「一笔手写」（ink）——前者需要把选中原文与备注分开存，后者两者都为空；新增两列比复用 `location` 塞文本语义更干净，也与 Emacs/Android 两端已有的本地模型（`BookAnnotation.selectedText` / `PdfAnnotation.kind`）一一对应。② **不做枚举校验**是刻意的：`kind` 的取值集合会随阅读形态演进（未来可能有 `underline` / `strikeout`——**bookmark 是位置而非标注，永不进入 annotations**），服务端强校验会把「新增形态」变成「服务端发版」，而服务端的职责只是保存与回传不透明串——未知 `kind` 由客户端归入「其它」分组（Android）或按 `note` 兜底（Emacs）。③ 兜底必须在下层且先于校验：请求体反序列化后 `kind` 是空串，显式 `INSERT` 时 SQL 的 `DEFAULT 'note'` **不生效**；若兜底在校验之后，缺省 `kind` 的请求会被当成「未知 kind」，从而错误地允许 `text` 为空。④ 幂等键不带 `selected_text`：同一处选中原文的多次补登（Android 打开书时补登历史笔迹、Emacs 离线队列重放）应命中同一条记录，否则「补登」会变成「复制批注」；键带 `kind` 则保证同 `location` 上的一条 `highlight` 与一条 `note` 是两条独立批注。⑤ 两张迁移都只用 `ADD COLUMN`（可逆、无数据重写），故 `preMigrationChecks` **不登记 v8**——该钩子只服务不可逆迁移（v7 的 DROP + 重建）。
 
 **影响**：① `schemaVersion` 8 必须恒等于 `len(migrations)`（`TestMigrationsLengthMatchesVersion` 守卫）；② `UpdateAnnotationAt` 与 `CreateAnnotation` 同口径（`kind` 兜底 + 按 kind 校验），故「note → highlight」「highlight → note」的形态改造由调用方显式给出 `kind` 与 `text`；③ `selected_text` 在更新上是**整体替换**语义（不传即清空），客户端必须每次带上；④ 未知 `kind` 由三端各自兜底（服务端原样存、Android 归「其它」组、Emacs 当 `note`），因此**新增形态无需服务端改动**，但需要三端同时确认显示回退链。
 
@@ -646,3 +646,43 @@ refit 按当前窗口尺寸做一次几何适配 + 重渲染，一次到位。
 **决策**：新增 `seshat-reading-mode`（`define-derived-mode` 自 `seshat-reader-mode`），由它接管 `auto-mode-alist`；库身份解析**只读本地状态（零网络）**，唯一触网入口是显式 `seshat-reading-refresh`；入库由显式命令 `seshat-library-add` 完成（**复制上传、保留原件**）。
 
 **理由**：改造前「能否同步」由文件位置隐式决定（`seshat-reader-annotation--doc-id` 命中根即可同步），用户既无法把库外文档加进来，又会在通用阅读时被「降级为 local:」反复警告。派生而非叠加 minor mode，是为了让「打开即阅读」只有一个入口、且 mode-line 能直接表达库身份；`auto-mode-alist` 接管是「入库后再打开自动显示 `[库]`」的前提，代价是第三方依赖 `(eq major-mode 'seshat-reader-mode)` 的代码会失效（本仓已全部改为 `derived-mode-p`，仓库外未知，故在文档给出回退写法）。**零网络**是硬约束：`seshat-rest-resolve-uid` 是同步 HTTP，若在 mode 体里调用会在服务端不可达时阻塞打开，直接毁掉「打开即阅读」。入库用「复制」而非「移动」，是不动用户的文件布局（代价是本地可能有两份）。
+
+## 2026-10-25 · 阅读器术语定案（annotation / bookmark / outline / progress）
+
+**决策**：三端（服务端字段与文档、Android、Emacs）统一按行业惯例分四类概念，**互不借用名称**：① **批注 / 标注（annotation）** 是总称，子类型为 `highlight`（高亮）/ `underline`（下划线）/ `strikeout`（删除线）/ `note`（便签）/ `ink`（手写），载体是 `annotations` 的 `kind` 字段与 `seshat-reader-annotation.el`；② **书签（bookmark）** 是**位置标记**（无内容、无几何），载体是 `PdfBookmark` / `seshat-reader-bookmark.el`；③ **目录 / 大纲（outline / TOC）** 是**文档结构**，载体是 `PdfOutlineReader` / `seshat-reader-outline.el`；④ **阅读进度（reading progress）** 是**断点**，载体是 `reading_progress` 端点与 saveplace。已定语义但**尚未实现**的只有 `underline` / `strikeout`（暂无人产这两个值）；`bookmark` **永不进入** `annotations.kind`。
+
+**理由**：改造前三端存在实质性的 term drift，且漂移方向一致地指向同一个错误——**把 outline 叫成书签**：Android `PdfOutlineReader.kt` 通篇用「书签树 / 书签」描述 PDF outline（该类实际读的是 PDF 的大纲结构），`TocDrawer` 名义上是目录却同时装目录与书签，状态行把「第 N/M 页」与「N 个书签」拼成一句；`openspec/decisions.md` 的 v8 条目与 Go/Kotlin 测试夹具把 `bookmark` 当作 `kind` 的候选取值；分组文案在「批注 / 备注 / 标注 / 列表」之间混用。术语一旦互相借用，**同一句话在三端指的不是同一件事**（「加个书签」在 PDF 里可能指加位置标记、也可能指跳目录项），bug 报告与文档因此无法对齐。选这四组定名而非自造词，是因为它们与 PDF 规范（outline = 文档大纲）、主流阅读器（annotation 含 highlight/underline/strikeout/note/ink、bookmark = 位置）以及 Web Annotation Data Model 的层级一致，用户无需学习新词。
+
+**代价与约束**：① Android 侧的注释与用户可见文案必须同步改（`strings.xml` 的菜单项、`PdfOutlineReader.kt` 全部注释、`AnnotationGrouping.kt` 分组标题、`AnnotationDrawer.kt` 菜单项），未同步的一处就会留下两套词；② `TocDrawer` 的语义**扩大为「导航面板」**——它同时承载目录与书签两个 Tab，故不能说「`TocDrawer` = 目录」，文档与代码注释须写成「导航面板（目录 + 书签）」；③ 类名 / 资源键名**不改**（`PdfOutlineReader`、`pdf_toc_status` 等保持原样）——改名会穿透测试与存档数据，收益只在内部命名一致性，不值；④ `underline` / `strikeout` 只定语义、不实现：服务端不做枚举校验，客户端会把未知 `kind` 归入「其它」组，因此**新增形态无需服务端发版**，但三端的显示回退链必须同时确认。
+
+**影响**：`docs/api.md` §4、`docs/android.md`（§6.4 目录 / §6.8 批注抽屉）、`docs/emacs-reader.md` §5、`openspec/tech-debt.md` 措辞同步；Android 分组标题定为「便签 / 高亮 / 手写 / 其它」，PDF 顶栏的 `pdf_menu_highlight` 菜单项文案改为「添加本页备注」（该入口实际产 `kind=note` + `page:<n>`，旧文案把它称作「高亮」本就是错的）。
+
+## 2026-10-25 · `kind` 改为单维类型 + 备注由 `text` 表达
+
+**决策**：`kind` **只表示标注类型**（`note` / `highlight` / `underline` / `strikeout` / `ink`），与「有无备注」**正交**；「有无备注」由 `text` 的空 / 非空表达，「选中了哪段原文」由 `selected_text` 表达。三端落地规则：**选中文本 → `kind=highlight` + `text=""` + `selected_text`=选区原文；加备注时 `kind` 不变、只写 `text`；纯页级备注 → `kind=note` + `text`（无几何）**。Emacs `seshat-reader-annotation-create` 据此改为：无备注发 `highlight` + `selected_text`，`C-u` 输入备注发 `note` + `text` + `selected_text`；Android EPUB 改为「选中即 `highlight`，编辑备注**不改** `kind`」，PDF「添加本页备注」产 `note` + `location=page:<n>`。
+
+**理由**：改造前 `kind` 同时编码两个维度，导致两端在同一操作上给出不同答案——`EpubReaderActivity` 在「编辑备注并保存」时把 `kind` 从 `highlight` 改写成 `note`（高亮被降级成便签），而 `PdfReaderActivity` 的编辑路径不动 `kind`；Emacs 建标注**完全不发** `kind`，由存储层兜底为 `note`，于是「只选中原文、不写备注」在 Emacs 侧永远进不了「高亮」分组。单维类型是唯一自洽的模型：类型由用户动作决定（选/划线/手写），备注是可选的附注，两者没有因果关系。
+
+**代价与约束**：① **存量 `note` 不迁移**——无法可靠判定哪些旧 `note` 其实是高亮（Emacs 旧记录带 `rect:` 但 `kind=note`，Android 旧 `note` 无几何），强行推断会把用户的真实便签改写成高亮；记 `openspec/tech-debt.md`。② **幂等键 `(uid, kind, location, text)` 不变**，因此同一位置上「旧 `note`」与「新 `highlight`」会成为两条独立记录——这是刻意的（去重键带 `kind` 的原文语义不变），可接受。③ **REST 契约不变**：路径、字段名、已存 `kind` 字面量、`location` 四种串格式（`page:<n>` / `page:<n>;rect:...` / `page:<n>;ink:...` / `chapter:<i>@<s>-<e>`）全部原样，服务端仍不做枚举校验、仍只强制「`kind=note` 时 `text` 非空」。④ Emacs 侧**本期无编辑批注路径**（`seshat-rest-update-annotation` 的唯一调用者是测试），故 PUT 未改；将来接入编辑时必须显式带上原 `kind`，否则 `UpdateAnnotationAt` 会把空 `kind` 兜底成 `note`，「高亮加备注」会被降级。⑤ EPUB 当前 UI 下**没有**页级 `note` 创建入口（入口要求 `selectedText` 非空），`note` 分支为存量与未来入口预留。
+
+**影响**：`docs/api.md` §4.5 的 `kind` 说明与填充矩阵、`docs/emacs-reader.md` §5「建批注」、`docs/android.md` §6.8 分组语义、`CHANGELOG.md` 同步；新增 ERT 断言 payload 含 `kind` / `selected_text` 与离线队列往返；Android 侧 `AnnotationGroupingTest` 增加「加备注后 `kind` 仍为 `highlight`」用例。
+
+## 2026-10-25 · 装饰表（Decoration）替代单色 highlight 表
+
+**决策**：C 渲染层的 `Highlight`（单一填充色）升级为 **`Decoration` 表**，一条记录表达「几何 + 颜色 + alpha」，几何分两类——`DECORATION_KIND_RECT`（填充矩形，几何为四角）与 `DECORATION_KIND_STROKE`（折线，几何为 `fz_point *pts` + `pt_count` + `width`），两类**共用一张表**（渲染线程只遍历一次）。表在派发时**快照**进 `DrawThreadArgs`，stroke 的点列**逐条深拷贝**（不共享指针）。旧入口 `--add-highlight(page x0 y0 x1 y1)` 的**名字、arity（5,5）与行为全部不变**，内部映射为「rect + 默认黄 1.0/0.85/0.0 + α 0.35」，因此默认配置下的渲染结果与改造前**像素级相同**。新增三个入口：`--add-decoration(page x0 y0 x1 y1 r g b alpha)`（9 参，带颜色）、`--add-stroke(page r g b alpha width points)`（7 参，扁平点列表 `(x0 y0 x1 y1 …)`）、`--rects-in-rect(page x0 y0 x1 y1)`（返回矩形内每个命中字符的 quad，与 `--text-in-rect` 共享同一份 stext 遍历；空结果返回 nil 且**不发消息**——「矩形内没有文本」是正常答案）。
+
+**理由**：高亮、下划线/删除线细条与（将来的）手写轨迹必须**共存于同一份页面位图**，且必须能区分颜色——已定的 `kind` 语义（`highlight` / `underline` / `strikeout` / `ink`）在单色表里无法表达：单表恒用同一填充色，underline 与 strikeout 要么画成高亮方块（错），要么另建一张表（则绘制顺序、清空、快照、释放四处都要分叉）。装饰表把「几何」与「样式」放进同一条记录，`kind` 的解释权留在 Lisp（C 不认识 `kind`），于是新增一种装饰只需在 elisp 的 `--decoration-for` 加一个分支，渲染层零改动。颜色分组进同一 path 一次填充，还顺带保住了「同色重叠不叠深」这一既有视觉语义。
+
+**代价与约束**：① **所有权**——stroke 的点列是堆分配，浅拷贝会让渲染线程与 `DocState` 共享指针（`--clear-highlights` 释放后 use-after-free，或与 `free_draw_thread_args` 双 free），因此快照必须逐条深拷贝；所有权规则写进 `Decoration` 结构体注释（谁持有结构体谁释放 `pts`，恒只有一份所有权）并由**唯一释放函数** `free_decoration_table` 强制（`--clear-highlights` / `free_doc_state` / `free_draw_thread_args` 共用，后者仍是 `draw_page_thread` 全部 7 条退出路径的唯一漏斗）。② **上限**：`DECORATION_MAX_STYLE_GROUPS = 64` 个样式分组（越过组上限的 rect 各自单独填充，语义不变、只是多几次 fill）；沿用 `DECORATION_MAX_COUNT = 100000`、`DECORATION_MAX_ABS_COORD = 1e6`、新增 `DECORATION_MAX_POINTS = 1024`（每笔超限**截断而非拒绝**）。③ **dash 未支持**：`fz_stroke_state` 由栈副本构造且 `dash_len = 0`（柔性数组 `dash_list[]` 永不被读），虚线要动态分配 dash 数组并改所有权，本期不做。④ 内存正确性只能靠「所有权约定 + 唯一释放路径 + 压力循环」，**未做 valgrind / ASan**（记 tech-debt）。
+
+**影响**：Lisp 侧按 `kind` 选装饰规格（`seshat-reader-annotation--decoration-for` → 8 元素「几何 + RGB + alpha」），`highlight` 在默认配色下继续走 5 参 `--add-highlight`（像素等价），`underline` / `strikeout` 或自定义配色走 9 参 `--add-decoration`；`--rects-in-rect` 支撑字级框选高亮（字符 quad 按行合并），而多段 `rect:` 受写入端 **500 段**上限约束，因此 `character` 粒度只写前 500 段并提示一次。`docs/architecture.md`（装饰表小节、防御上限表）、`docs/api.md` §4.5.2、`docs/emacs-reader.md`（字级高亮、粒度与间隙选项、下划线/删除线配色表）、`emacs/seshat-reader/VENDORED.md`（C 改动登记）、`CHANGELOG.md` 同步。
+
+## 2026-10-25 · C 侧页号基数约定
+
+**决策**：C 动态模块里**按页索引的入口分两组、基数固定且必须显式声明**——① **装饰与搜索组，一律 1-based**：`--add-highlight` / `--add-decoration` / `--add-stroke` / `--search-page` 都经 `resolve_page_arg` 取页号（校验整数、范围检查、并完成**唯一一次** `-1` 换算到内部 0-based `DocState` 索引）；② **选区几何组，保持 0-based**：`--text-in-rect` / `--rects-in-rect` 继续直接取页索引（它们服务于已在页索引空间工作的选区代码）。今后**新增任何按页索引的 C 入口必须在函数注释首段显式写出基数**，默认跟 ①（1-based）。
+
+**理由**：`--search-page` 初版直接 `extract_integer` 取 **0-based**，与三个装饰入口的 **1-based** 相反——同一模块内两类按页入口语义相反，跨页搜索的命中整体错一页，而 Lisp 侧用 `(1- page)` 把错误掩盖掉了，任一侧改动即静默失效。Elisp 调用方手上**永远**是用户可见的 1-based 页码（`seshat-reader-current-page` / 状态行 / 批注的 `page:` 段），所以减一的边界应当落在模块内、只落一次，而不是让每个调用方各自记得换算。「与装饰入口统一」的实测依据：把 `--search-page` 改为 1-based 后，`--search-page p "的"` 与 `--text-in-rect p`（按其 0-based 口径传入同一页）逐页命中矩形完全相等，跨页搜索不再偏移。
+
+**代价**：两套基数在同一模块内并存，读者必须看注释才能确定某入口的页号语义；`--text-in-rect` / `--rects-in-rect` 的 0-based 属历史遗留，统一它们要同步改 `seshat-reader-select.el` 与 4 个测试文件的桩与断言，收益只在命名一致性，故本轮不动，代价是长期存在一个「例外组」。防退化只能靠注释约定 + 测试锁定：`seshat-reader-search-test` 的桩按 1-based 断言页号，`seshat-reader-select-*` 的桩按 0-based 断言，任一侧基数被改都会有用例失败。
+
+**影响**：`seshat-reader-search.el` 去掉全部 `(1- page)` / `(1+ page)` 换算（页码直接透传）；`render/render-core.c` 的 `emacs_search_page` 改走 `resolve_page_arg`，四个 1-based 入口的注释首段逐个写明基数；`openspec/tech-debt.md` 登记「两套基数并存」；`docs/architecture.md`（渲染层入口清单、搜索流程）与 `docs/emacs-reader.md` 同步。

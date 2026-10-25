@@ -224,20 +224,24 @@ curl -s -X PUT -H "Authorization: Bearer $SESHAT_AUTH_TOKEN" \
 |---|---|---|
 | `id` | int64 | 服务端自增主键（批注自身的标识，非文档标识） |
 | `uid` | string | 所属文档 uid；创建后不可修改 |
-| `kind` | string | 批注形态：约定 `note` / `highlight` / `ink`；缺省 `note`（服务端**不做**枚举校验，未知值原样保存与回传） |
+| `kind` | string | **单维类型**，只表标注类型：约定 `note` / `highlight` / `underline` / `strikeout` / `ink`；缺省 `note`（服务端**不做**枚举校验，未知值原样保存与回传）。与「有无备注」**正交**——加备注不改 `kind`。`bookmark`（书签）是位置标记，**永不**作为 `kind` 取值 |
 | `location` | string | 不透明位置串（约定见 §4.5 与 §4.6） |
-| `text` | string | 备注正文 / 显示摘要（`note` 必填；`highlight` 与 `ink` 为空串） |
-| `selected_text` | string | 选中原文（`highlight` 必非空；`note` 可空；`ink` 恒空） |
+| `text` | string | **备注维度**：备注正文 / 显示摘要。空串 = 无备注（标记类与手写），非空 = 有备注；`kind=note` 时必非空（便签以备注为本体） |
+| `selected_text` | string | 选中原文：标记类（`highlight` / `underline` / `strikeout`）存，其中 `highlight` 必非空；`note` 可空；`ink` 恒空 |
 | `created_at` | string | 创建时间（更新时保持不变） |
 | `updated_at` | string | 最后更新时间 |
 
-`kind` 与 `selected_text` 自 schema v8 起存在（存量行由迁移的 `DEFAULT` 回填为 `note` / `''`）。两者的**填充矩阵**是客户端约定，服务端只强制「`kind=note` 时 `text` 非空」这一条：
+`kind` 与 `selected_text` 自 schema v8 起存在（存量行由迁移的 `DEFAULT` 回填为 `note` / `''`）。**2026-10-25 起 `kind` 的语义收敛为「单维类型」**：`kind` 只回答「这是哪一类标注」，「有没有备注」由 `text` 的空 / 非空回答，「选中的是哪段原文」由 `selected_text` 回答——三者相互正交，**给高亮加备注不改 `kind`**。填充矩阵是客户端约定，服务端只强制「`kind=note` 时 `text` 非空」这一条：
 
 | `kind` | `text` | `selected_text` | 典型来源 |
 |---|---|---|---|
-| `note` | 备注正文，**必非空** | 选中原文，可为空串 | 选中文本后写了备注（Emacs `C-c C-a`、Android 批注对话框） |
-| `highlight` | 空串 | 选中原文，**必非空** | 只选中原文、不写备注（Android EPUB / PDF 选区） |
+| `note` | 备注正文，**必非空** | 选中原文，可为空串 | 页级备注（Android「添加本页备注」产 `note` + `location=page:<n>`，无几何）；Emacs 带前缀 `C-u` 建批注（`note` + `text`=备注 + `selected_text`=选区原文） |
+| `highlight` | 空串 | 选中原文，**必非空** | 选中原文、不写备注（Emacs `C-c C-a` 无前缀发 `highlight` + `text=""` + `selected_text`；Android EPUB 选中即此形态；Android PDF 选区） |
 | `ink` | 空串 | 空串 | PDF 一笔手写（`page:<n>;ink:...`，见 §4.5.1） |
+| `underline` / `strikeout` | 空串（可非空） | 选中原文 | **已定语义、尚未实现**（见下） |
+
+- **`underline` / `strikeout` 已定语义但尚未实现**：服务端**不做枚举校验**，因此这两个值无需服务端改动即可使用；但当前三端都没有产生它们的入口，Android 会把它们归入「其它」分组（行内仍保留原始 `kind`），Emacs 按 `note` 兜底进入列表。
+- **加备注不改 `kind`**：`highlight` 条目补备注时只写 `text`（`kind` 保持 `highlight`）；只有「纯页级备注」（无选中原文，如 Android「添加本页备注」）才是 `note`。这一点 PDF 与 EPUB 两端一致（EPUB 早期曾在保存备注时把 `kind` 改写为 `note`，已在 2026-10-25 修正）。
 
 ### 4.1 创建批注
 
@@ -357,7 +361,7 @@ page:<n>;rect:<x0>,<y0>,<x1>,<y1>
 - `x0,y0,x1,y1` 为矩形四角在**页面坐标**中的值（PDF point 空间，原点在左上、y 轴向下），保留两位小数。
 - 坐标**不含缩放**：取自页面坐标系，与客户端当前缩放级别无关，便于跨端复现。
 - **不支持已旋转页面**：页面旋转状态存在于客户端渲染器内部，本约定无法表达，旋转页面上采集的坐标会**静默错误**（无报错但位置不再正确）。
-- **渲染（M12 起）**：`rect` 段自 M12 起在 Emacs 客户端**会被渲染为页面上的半透明高亮**（缩放/旋转后按同一变换对齐）；`ink:` 段在 Emacs 端仍只做数据保留、不渲染。高亮由 C 渲染层在页面位图上绘制（开关 `seshat-reader-annotation-highlight-enabled`，刷新命令 `C-c C-h`），详见 [配置说明](configuration.md) 与 [架构设计](architecture.md)。
+- **渲染（M12 起）**：`rect` 段自 M12 起在 Emacs 客户端**会被渲染为页面上的半透明高亮**（缩放/旋转后按同一变换对齐）；`kind` 为 `underline` / `strikeout` 时同一 `rect` 段改绘为细条（见 §4.5.2）。`ink:` 段自 2026-10-25 起在 Emacs 客户端**也会被渲染为页面手写笔迹**（开关 `seshat-reader-annotation-ink-enabled`，默认 `t`；其坐标是页面 pt、与 `rect:` 同空间，见 §4.5.1）。高亮由 C 渲染层在页面位图上绘制（开关 `seshat-reader-annotation-highlight-enabled`，刷新命令 `C-c C-h`），详见 [配置说明](configuration.md) 与 [架构设计](architecture.md)。
 
 示例（第 12 页的矩形区域）：
 
@@ -365,17 +369,17 @@ page:<n>;rect:<x0>,<y0>,<x1>,<y1>
 page:12;rect:50.00,100.00,545.50,140.00
 ```
 
-PDF 的 `location` 共三形态（第一个 `;` 之后为可选尾段）：
+PDF 的 `location` 是**页锚 + 可选几何尾段**：`page:<n>`（**页锚**）是唯一的跳转真值；第一个 `;` 之后的 `rect:` / `ink:` 段是**可选几何尾段**，只供渲染（Emacs M12 起渲染 `rect:` 高亮，2026-10-25 起渲染 `ink:` 笔迹）与 `seshat:` 引用锚复用，**不参与导航判定**——因此「只有页锚」的 `page:<n>` 是完全合法的形态。共三形态：
 
 | 形态 | 串 | 谁在用 |
 |---|---|---|
-| 纯页号 | `page:<n>` | Android PDF 文本批注（顶栏「添加批注」按钮与长按菜单「高亮标注」都走 `PdfReaderActivity.addAnnotation`，只写 `page:<当前页>`）——`text` 承载内容，`location` 只记页。Emacs 侧**不产**此形态：`seshat-reader-annotation--location` 恒带 `rect:` |
+| 纯页号 | `page:<n>` | Android PDF 文本批注（顶栏「添加批注」按钮与长按菜单「添加本页备注」都走 `PdfReaderActivity.addAnnotation`，只写 `page:<当前页>`）——`text` 承载备注，`location` 只记页。Emacs 侧**不产**此形态：`seshat-reader-annotation--anchor`（页锚 + 几何尾段）恒带 `rect:` |
 | 页号 + 矩形 | `page:<n>;rect:<x0>,<y0>,<x1>,<y1>` | Emacs 选区批注（M11.3 起），也是 Emacs M12 高亮的唯一数据来源 |
 | 页号 + 笔迹 | `page:<n>;ink:<color>,<widthPt>,...` | Android PDF 手写（见 §4.5.1） |
 
 > **本轮范围**：**Android 侧** PDF 文本批注不产 `rect:`——`PdfReaderActivity.addAnnotation` 只写
 > `page:<当前页>` 定页，矩形采集（`rect:`）不在 M10.3 范围内（见 `openspec/tech-debt.md`）。
-> **Emacs 侧**文本批注**恒产** `page:<n>;rect:<x0>,<y0>,<x1>,<y1>`（`seshat-reader-annotation--location`
+> **Emacs 侧**文本批注**恒产** `page:<n>;rect:<x0>,<y0>,<x1>,<y1>`（`seshat-reader-annotation--anchor`
 > 唯一构造点恒带 `rect:`，即表格第二形态；它同时是 Emacs M12 高亮的唯一数据来源）。
 
 #### 4.5.1 手写笔迹（`ink`）
@@ -397,7 +401,30 @@ page:<n>;ink:<color>,<widthPt>,<x0>,<y0>,<x1>,<y1>,...
 - **当前状态（2026-10-22）**：Android 已接入同步——`PdfInkStore` 仍是渲染唯一真相，落笔完成时登记一条
   `kind=ink` 的**镜像批注**并随批注队列上行（`InkAnnotationMapper` → `LocationCodec.encodeInk`）；打开带 uid 的书时
   把本地既有笔迹一次性补登，靠服务端 `(uid, kind, location, text)` 幂等去重（§4.1）。
-  Emacs 端仍只渲染 `rect`、不渲染 `ink:`，但会按 `kind=ink` 聚合显示（「第 n 页手写（N 笔）」）。
+  Emacs 端现已渲染 `ink:` 段（2026-10-25 起，见下条），并按 `kind=ink` 在批注列表里聚合显示（「第 n 页手写（N 笔）」）。
+- **Emacs 端渲染（2026-10-25 起）**：`ink:` 段被解析为页面笔迹并交给 C 渲染层的 stroke 入口绘制，开关是
+  `seshat-reader-annotation-ink-enabled`（默认 `t`，与 rect 类装饰的 `seshat-reader-annotation-highlight-enabled` 互相独立）。
+  **坐标口径**：`ink:` 的点与线宽都是**页面 pt**，与 `rect:` **同一个 page space**（原点左上、y 向下），因此执行端
+  **不需要 y 翻转**；点数上限 1024（超出截断为前 1024 点）、颜色只接受恰好 8 位 `#AARRGGBB`，不满足则丢弃整笔。
+  契约本身不因渲染实现而改变——服务端仍按不透明字符串原样保存与回传。
+
+#### 4.5.2 多段 `rect:` 契约（字级高亮 / 下划线 / 删除线）
+
+`rect:` 段可以**重复出现多次**，一段一个几何块，顺序即绘制顺序：
+
+```
+page:<n>;rect:<x0>,<y0>,<x1>,<y1>;rect:<x0>,<y0>,<x1>,<y1>;...
+```
+
+- **为什么多段**：字级高亮把框选结果按行合并成「一行一条」，因此一个批注天然带多段 `rect:`；服务端把它当不透明串保存，**后端零改动**。
+- **段数上限**：写入端 **500 段**（Emacs `seshat-reader-annotation--anchor-max-segments`），解析端 **2000 段**（`seshat-reader-annotation--rect-max-segments`）。写入端刻意取更小值留三倍余量：超过解析端上限的段会被静默丢弃（表现为「高亮缺一块」而无任何线索）。超限时 Emacs **只写前 500 段**并提示一次（少画几段是可接受的降级）；`character` 粒度下逐字符矩形可达数千条，因此最容易撞上限，选 `line` 粒度（默认）不受影响。500 段 × 每段约 24 字符约 12 KB，仍远低于 `location` 的 64 KB 长度上限。
+- **`rect:` 的语义随 `kind` 而变**（`rect` 只是几何、不含 drawing 语义，跨端读取时**必须按 kind 解释**）：
+  - `kind=highlight`：`rect:` 是**填充块**（半透明黄，默认 α 0.35），覆盖整行文字高度的矩形。
+  - `kind=underline`：`rect:` 是**细条几何**（行矩形底边高 1.5 pt 的条，不是整行框）；客户端可按自己的描边风格渲染，但不应当作填充块。
+  - `kind=strikeout`：同上，细条取行矩形**垂直中线**（上下各 0.75 pt）。
+  - `kind=note` / 其它：`rect:` 只作定位参考，Emacs 按 `highlight` 兜底绘制。
+  - 即：同一串 `page:3;rect:10.00,20.00,30.00,40.00` 在 `highlight` 下要填满整个框，在 `underline` 下只需画底部那条细线——**框是数据，细条是解释**。
+- **跨端现状（2026-10-25）**：Emacs 产多段 `rect:`（字级高亮 + `underline` / `strikeout` 细条）；**Android 仍不产 `rect:`**（PDF 文本批注只写 `page:<n>`，见 §4.5 表格与 `openspec/tech-debt.md`），Android 读多段 `rect:` 时按整体 bbox 或逐段着色自行决定，尚无统一样式约定。
 
 ### 4.6 location 约定（EPUB）
 

@@ -246,5 +246,63 @@ STATE 是 (LIST) 形态的 cons 表达式，`(car STATE)' 按调用顺序收集
         ;; 缓冲区已死：既不重投也不报错
         (should-not (car state))))))
 
+(ert-deftest seshat-reader-select-flash-test--multiple-rects-flash ()
+  "多条矩形（按行合并后的选区）逐条写入 `--flash-rects'，只武装一个 timer."
+  (let ((state (list nil)))
+    (seshat-reader-select-flash-test--with-clean-timer
+      (seshat-reader-select-flash-test--with-stubs state
+        (with-temp-buffer
+          (seshat-reader-select--flash-selection
+           5 '((10.0 20.0 110.0 30.0)
+              (10.0 32.0 90.0 42.0)
+              (10.0 44.0 60.0 54.0)))
+          ;; 三条矩形各自带上页号，顺序与入参一致
+          (should (equal seshat-reader-select--flash-rects
+                         '((5 10.0 20.0 110.0 30.0)
+                           (5 10.0 32.0 90.0 42.0)
+                           (5 10.0 44.0 60.0 54.0))))
+          (should (= 3 (length seshat-reader-select--flash-rects)))
+          ;; 一次性重投 + 只武装一个 timer
+          (should (equal (nreverse (car state))
+                         '(redraw (at 2.0))))
+          (should (timerp seshat-reader-select--flash-timer)))))))
+
+(ert-deftest seshat-reader-select-flash-test--single-rect-falls-back ()
+  "单矩形两种写法（裸四元组 / 只含一条的列表）等价，都只闪一条."
+  (let ((state (list nil)))
+    (seshat-reader-select-flash-test--with-clean-timer
+      (seshat-reader-select-flash-test--with-stubs state
+        (with-temp-buffer
+          (seshat-reader-select--flash-selection 2 '(1.0 2.0 3.0 4.0))
+          (let ((from-bare seshat-reader-select--flash-rects))
+            (seshat-reader-select--flash-selection 2 '((1.0 2.0 3.0 4.0)))
+            (should (equal seshat-reader-select--flash-rects from-bare))
+            (should (equal seshat-reader-select--flash-rects
+                           '((2 1.0 2.0 3.0 4.0))))))))))
+
+(ert-deftest seshat-reader-select-flash-test--invalid-rects-skipped ()
+  "多矩形里逐条校验：非法条目跳过，合法条目照常闪现；全非法则不闪."
+  (let ((state (list nil)))
+    (seshat-reader-select-flash-test--with-clean-timer
+      (seshat-reader-select-flash-test--with-stubs state
+        (with-temp-buffer
+          (seshat-reader-select--flash-selection
+           3 '((1.0 2.0 3.0 4.0)     ; 合法
+              (1.0 2.0 1.0 4.0)     ; 宽为 0 → 跳过
+              (5.0 6.0 7.0)         ; 坐标不足 → 跳过
+              (8.0 9.0 10.0 11.0))) ; 合法
+          (should (equal seshat-reader-select--flash-rects
+                         '((3 1.0 2.0 3.0 4.0)
+                           (3 8.0 9.0 10.0 11.0))))
+          ;; 再闪一次：整批非法 → 全部跳过，状态不变、不武装新 timer
+          (setcar state nil)
+          (with-temp-buffer
+            (seshat-reader-select-flash-test--with-stubs state
+              (seshat-reader-select--flash-selection
+               3 '((1.0 2.0 1.0 4.0) (5.0 6.0 7.0)))
+              (should-not seshat-reader-select--flash-rects)
+              (should-not (car state))
+              (should-not seshat-reader-select--flash-timer))))))))
+
 (provide 'seshat-reader-select-flash-test)
 ;;; seshat-reader-select-flash-test.el ends here

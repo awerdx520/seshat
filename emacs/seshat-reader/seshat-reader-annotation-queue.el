@@ -56,8 +56,15 @@
 ;;    :uid \"01K8Q3M7D2X9V6T1B8N5C0RDEF\"
 ;;    :document-id \"ebook:x.pdf\"
 ;;    :location \"page:3;rect:10.00,20.00,110.00,40.00\"
-;;    :text \"批注正文\"
+;;    :kind \"highlight\"
+;;    :selected-text \"选中的原文\"
+;;    :text \"\"
 ;;    :queued-at \"2026-01-01T12:00:00+0800\")
+;;
+;; `:kind' 是批注**类型**（highlight / note / ink …），与「有无备注」正交：
+;; 高亮条目 `:text' 为空串、原文在 `:selected-text'；便签条目 `:text' 非空。
+;; 两字段在重放时原样透传给 `seshat-rest-create-annotation'；`:kind' 缺失的
+;; 旧条目按 \"note\" 参与去重比较、发送时也不带 kind（服务端兜底 note）。
 ;;
 ;; delete 条目标识 \"删除\"，按服务端批注 id 删除，形如
 ;;
@@ -261,8 +268,9 @@ UUID 与条目的 `:uuid' 用 `string=' 精确比较。找到并移除（含写�
 (defun seshat-reader-annotation-queue--sync-create (entry)
   "同步一条 create 条目 ENTRY，返回 `ok'、`skip' 或 `stop'.
 
-ENTRY 为队列中的 create 操作 plist（含 `:uid'、`:location'、`:text'）。
-`:uid' 是服务端权威身份，所有服务端调用都用它（`:document-id' 仅供显示）。
+ENTRY 为队列中的 create 操作 plist（含 `:uid'、`:location'、`:text'，
+以及 v8 起新增的 `:kind' 与 `:selected-text'）。`:uid' 是服务端权威身份，
+所有服务端调用都用它（`:document-id' 仅供显示）。
 
 - 缺 `:uid'（M7 之前入队的旧条目）时**不发起任何请求**，返回 `skip'，由
   `seshat-reader-annotation-queue-sync' 统一提示一次并保留该条；
@@ -274,8 +282,11 @@ ENTRY 为队列中的 create 操作 plist（含 `:uid'、`:location'、`:text'�
     Android 侧 `(kind, location, text)'、服务端 `(uid, kind, location,
     text)' 三端一致：同 location 上一条 note 与一条 ink 因此不会被误判为
     重复；`:kind' 缺失的旧条目按 \"note\" 参与比较。
-  - 否则调用 `seshat-rest-create-annotation'（首个实参为 uid）创建：成功
-    （返回含 `id' 的 alist）返回 `ok'，失败（返回 nil 或抛 error）返回 `stop'。"
+  - 否则调用 `seshat-rest-create-annotation'（实参为 uid、location、text，
+    并把本条目的 `:kind' 与 `:selected-text' 原样透传）创建：成功（返回含
+    `id' 的 alist）返回 `ok'，失败（返回 nil 或抛 error）返回 `stop'。
+    `:kind' 缺失的旧条目**不透传** kind，由服务端按 \"note\" 兜底——与本条
+    在去重比较里的语义一致。"
   (let* ((uid (plist-get entry :uid))
          (location (plist-get entry :location))
          (text (plist-get entry :text))
@@ -296,7 +307,10 @@ ENTRY 为队列中的 create 操作 plist（含 `:uid'、`:location'、`:text'�
           'ok)
          (t
           (condition-case nil
-              (let ((response (seshat-rest-create-annotation uid location text)))
+              (let ((response (seshat-rest-create-annotation
+                               uid location text
+                               (plist-get entry :kind)
+                               (plist-get entry :selected-text))))
                 (if (and (listp response) (alist-get 'id response))
                     'ok
                   'stop))

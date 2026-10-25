@@ -106,7 +106,7 @@ internal class TocDrawer(
 
     /** 书签空态：「尚无书签」15sp + 提示 12sp，两行文案用 Span 区分字号与灰度（不新增字符串资源）。 */
     private val bookmarkEmpty = TextView(root.context).apply {
-        text = buildEmptyBookmarkText()
+        text = buildEmptyBookmarkText(bookmarksSupported = true)
         gravity = Gravity.CENTER
         textSize = 15f
         visibility = View.GONE
@@ -245,10 +245,13 @@ internal class TocDrawer(
      *
      * @param allRows 全量行（含被折叠层级）
      * @param currentTarget 当前所在的章节索引 / 页索引；用于高亮、已读标记 + 自动展开其祖先 + 滚动到它
-     * @param statusLine 底部固定状态行文案（如「第 3 章 · 2/3」或「5/12 · 已读 3 个书签」）；空串则不显示该行
+     * @param statusLine 底部固定状态行文案（如「第 3 章 · 2/3」或「第 5/12 页 · 3 个书签」）；空串则不显示该行
      * @param bookmarks 书签列表（按页升序）
      * @param onBookmarkAdd 「增加新书签」按钮回调
      * @param onBookmarkDelete 书签行 × 回调
+     * @param bookmarksSupported 当前阅读器是否支持书签：EPUB 没有任何书签入口（调用方传
+     *   `bookmarks = emptyList()`），此时空态**不能**渲染「点顶栏的书签图标可添加」的指引
+     *   （那是个不存在的按钮），只保留「尚无书签」一行
      */
     fun show(
         allRows: List<TocRow>,
@@ -257,6 +260,7 @@ internal class TocDrawer(
         bookmarks: List<PdfBookmark>,
         onBookmarkAdd: () -> Unit,
         onBookmarkDelete: (PdfBookmark) -> Unit,
+        bookmarksSupported: Boolean = true,
     ) {
         val refresh = isShowing
         this.allRows = allRows
@@ -271,6 +275,8 @@ internal class TocDrawer(
         val hasBookmarks = bookmarks.isNotEmpty()
         bookmarkRecycler.visibility = if (hasBookmarks) View.VISIBLE else View.GONE
         bookmarkEmpty.visibility = if (hasBookmarks) View.GONE else View.VISIBLE
+        // 空态文案随「是否支持书签」重建：EPUB 只留标题，不提示不存在的入口
+        bookmarkEmpty.text = buildEmptyBookmarkText(bookmarksSupported)
 
         statusLineView.text = statusLine
         statusLineView.visibility = if (statusLine.isEmpty()) View.GONE else View.VISIBLE
@@ -405,25 +411,34 @@ internal class TocDrawer(
             setOnClickListener { onClick() }
         }
 
-    /** 书签空态文案：「尚无书签」15sp `#9E9E9E` + 提示行 12sp `#BDBDBD`（同色系更淡）。 */
-    private fun buildEmptyBookmarkText(): CharSequence {
-        val first = "尚无书签"
-        val hint = "阅读时点顶栏的书签图标可添加"
-        val text = "$first\n$hint"
+    /**
+     * 书签空态文案：「尚无书签」15sp `#9E9E9E` + 提示行 12sp `#BDBDBD`（同色系更淡）。
+     *
+     * 提示行由 [TocDrawerText.emptyBookmarkLines] 决定：不支持书签的阅读器（EPUB）没有顶栏
+     * 书签图标，此时只渲染标题一行——否则就是在指引用户去点一个不存在的按钮。
+     */
+    private fun buildEmptyBookmarkText(bookmarksSupported: Boolean): CharSequence {
+        val lines = TocDrawerText.emptyBookmarkLines(bookmarksSupported)
+        val first = lines.first
+        val hint = lines.second
+        val text = if (hint == null) first else "$first\n$hint"
         val span = SpannableString(text)
         span.setSpan(
             ForegroundColorSpan(0xFF9E9E9E.toInt()),
             0, first.length, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE,
         )
-        span.setSpan(
+        if (hint != null) {
             // 基线 15sp，提示行按 0.8 倍缩到 12sp（用相对倍率以跟随系统字体缩放）
-            RelativeSizeSpan(0.8f),
-            first.length + 1, text.length, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE,
-        )
-        span.setSpan(
-            ForegroundColorSpan(0xFFBDBDBD.toInt()),
-            first.length + 1, text.length, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE,
-        )
+            val hintStart = first.length + 1
+            span.setSpan(
+                RelativeSizeSpan(0.8f),
+                hintStart, text.length, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE,
+            )
+            span.setSpan(
+                ForegroundColorSpan(0xFFBDBDBD.toInt()),
+                hintStart, text.length, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE,
+            )
+        }
         return span
     }
 }

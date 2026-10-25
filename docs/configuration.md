@@ -239,7 +239,12 @@ Emacs 端通过 `seshat-reader-annotation` 采集 PDF 页面选区并同步为�
 |---|---|---|
 | `seshat-reader-page-join-lines` | `0` | 跨页衔接 strip 的高度，**单位是页面文本行高**（允许小数）。翻页时在当前页 image 上方插入一行显示上一页底部，形成阅读上下文；设 `0` 完全关闭，翻页行为与 M12 之前一致。改动在下次翻页生效。**默认关闭**：strip 行与页面 overlay 的几何存在已知冲突，开启后 `fit-to-height` 等整页操作可能裁切页面（见 `openspec/tech-debt.md`「跨页衔接（M12 strip）在 fit-to-height 下裁切页面」） |
 | `seshat-reader-annotation-highlight-enabled` | `t` | 是否把批注 `location` 的 `rect:` 段绘制为页面上的半透明高亮。`nil` 时只清空已有高亮并重绘（不添加矩形）；高亮由 C 渲染层绘制，与页面共用同一 `ctm`，故缩放/旋转自动对齐。改动后按 `C-c C-h` 立即刷新 |
+| `seshat-reader-annotation-ink-enabled` | `t` | 是否把批注 `location` 的 `ink:` 段绘制为页面手写笔迹（2026-10-25 起）。与 `annotation-highlight-enabled` **互相独立**：关掉它只影响 ink，rect 类装饰照常；ink 的坐标与 `rect:` 同 page space（页面 pt），不翻转 y。改动后按 `C-c C-h` 立即刷新 |
 | `seshat-reader-select-flash-duration` | `2.0` | 框选松手后闪现选区高亮的时长（秒），`<= 0` 关闭；不受 `annotation-highlight-enabled` 约束 |
+| `seshat-reader-search-limit` | `1024` | 跨页搜索的单页命中请求上限（C 侧夹到 1..10000，且实际收集硬上限也是 1024）；达上限时状态行提示「仅显示前 1024 条」 |
+| `seshat-reader-search-max-matches` | `20000` | 整次搜索保留的命中总数上限，达到即停止扫描并提示「命中过多」；`nil` 表示不限制（不推荐，可能占几十 MB） |
+| `seshat-reader-search-color` | `(1.0 0.45 0.0)` | 搜索命中的填充色 RGB（默认橙，与批注黄 / 下划线蓝可区分） |
+| `seshat-reader-search-alpha` | `0.55` | 搜索命中的填充透明度（比批注 highlight 的 `0.35` 更实，便于叠在已有高亮之上辨认） |
 
 说明：
 

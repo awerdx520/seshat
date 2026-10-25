@@ -914,7 +914,7 @@
 - 建议：彻底修法二选一——① 让页面 overlay 与 strip 行**彻底分离**（`move-overlay` 收回到当前页字符范围，页面几何只由页面 image 决定，strip 作为独立行处理，vscroll 上限不再叠加 strip 高）；② 改由 C 侧在渲染页面时**预留条带**（把上一页底部直接画进页面位图顶部），elisp 侧不再插行。任一方案落地并补真机验证后，再把默认值改回非 0。
 
 ## PDF 文本选区层与 `rect:` 采集未做（M10.3，2026-10-22）
-- 现状：PDF **文本**批注/高亮在 Android 侧只记 `page:<n>`（`PdfReaderActivity` 长按菜单的「高亮标注」走 `"page:${firstVisiblePage() + 1}"`），没有选区层、也没有 `rect:` 坐标采集；`page:<n>;rect:...` 目前只有 Emacs 选区批注产生。本轮（M10.3）**明确不做**，原因：Android 侧 PDF 文本坐标需要 `PdfRenderer` 之外的文本布局信息（当前只有 `PDFTextStripper` 的纯文本，无字/行边界），属新能力而非文档同步。
+- 现状：PDF **文本**批注在 Android 侧只记 `page:<n>`（`PdfReaderActivity` 长按菜单的「添加本页备注」走 `"page:${firstVisiblePage() + 1}"`，产 `kind=note`），没有选区层、也没有 `rect:` 坐标采集；`page:<n>;rect:...` 目前只有 Emacs 选区批注产生。本轮（M10.3）**明确不做**，原因：Android 侧 PDF 文本坐标需要 `PdfRenderer` 之外的文本布局信息（当前只有 `PDFTextStripper` 的纯文本，无字/行边界），属新能力而非文档同步。
 - 影响：Android 端 PDF 高亮只有「页 + 选中原文」，无法在页面上画出高亮；跨端显示不对称——Emacs 建的 `rect:` 批注在 Android 上只能按页展示。`docs/api.md` §4.5 已把「PDF 文本批注本轮不产 `rect:`」写入契约。
 - 建议：需要 PDF 高亮可视化时，先在 Android 引入文本行边界采集（`PDFTextStripper` 的 `TextPosition` 或换用带布局的抽取），再按 §4.5 的 `x0,y0,x1,y1` 换算；旋转页仍不支持（既有约束）。
 
@@ -1188,9 +1188,138 @@
 - 状态：本机无法复现，未修改。
 - 待办：在 `frame-scale-factor > 1` 的环境（或临时构造该参数）下复测，再决定是否把 `frame_scale` 纳入 `resolution` 并同步调整 elisp 侧换算。
 
+## 存量 `note` 无法迁移为 `highlight`（2026-10-25 术语与 kind 语义修正）
+
+- 现状：`kind` 收敛为单维类型后，正确的模型是「选中原文 → `highlight`；纯页级备注 → `note`」。但存量数据无法判定归属：Emacs 旧记录由服务端兜底为 `kind=note` **且带 `rect:`**（有几何但类型是 note），Android 旧 `note` 则完全没有几何（`location=page:<n>`）。两种情况都可能是「用户当时想标的是一段原文」。
+- 影响：存量批注在 Android 分组里继续进「便签」组、在 Emacs 列表里继续当 `note` 显示，与新建的 `highlight` 条目并列；同一段原文可能同时存在一条旧 `note` 与一条新 `highlight`（幂等键 `(uid, kind, location, text)` 带 `kind`，两条独立记录，`text` 也通常不同）。
+- 解除条件：不存在「安全」的自动迁移——按「有 `rect:` 就改 `highlight`」会改写 Emacs 用户的真实便签，按「无几何就保留」又会漏掉 Android 侧；且改写用户已有批注不可逆。只有引入「显式迁移命令 + 用户逐条确认」或等新的专用字段（如 `origin` 记录创建端与创建时版本）才可能处理，本期**不做**。
+
+## Android 无 AVD / 设备，UI 改动仅人工验收（2026-10-25 术语纠正批次）
+
+- 现状：本机无 Android SDK 模拟器镜像与实体设备，`./gradlew test` 只覆盖 JVM 纯逻辑（分组、location 编码、提示可见性等），**不覆盖**真实渲染与交互。
+- 影响：本批次改的可见文案与布局只能靠代码走查确认，以下各点需真机/模拟器人工确认：① PDF 长按菜单第二项显示「添加本页备注」且点击仍走 `PdfReaderActivity.addAnnotation`（`kind=note` + `page:<n>`）；② PDF 目录抽屉底部状态行为「第 N/M 页 · K 个书签」两段拼接、分隔符不重复；③ EPUB 目录抽屉的书签 Tab 空态只显示「尚无书签」，**没有**「点顶栏书签图标可添加」的错误指引；④ EPUB 批注抽屉看不到「添加本页备注」入口（选中即 `highlight`），编辑备注保存后该行仍在「高亮」组而非「便签」组；⑤ 批注抽屉「⋮」菜单显示「编辑便签 / 删除」。
+- 解除条件：接入 AVD 或真机后把上述 5 点转为 instrumentation / 手工验收清单并记录结果；在那之前本批次 UI 结论一律标注「待真机」。
+
+## `underline` / `strikeout` 已定语义但尚未实现（2026-10-25）
+
+- 现状：术语定案把 `underline`（下划线）/ `strikeout`（删除线）列为批注子类型，服务端**不做枚举校验**因而无需改服务端；但三端都还没有产生这两个值的入口——Android 无对应菜单项，Emacs 只有 `highlight` / `note` 两条路径，且两者都没有「画下划线 / 删除线」的渲染通道。
+- 影响：若外部客户端（或手写 JSON）提交这两个 `kind`，Android 会归入「其它」组（行内保留原始 `kind`，可跳转可删除），Emacs 按 `note` 兜底进入列表——数据不丢，但显示语义降级。文档已声明「已定语义、尚未实现」，避免读者误以为可用。
+- 解除条件：实现渲染通道（Emacs 侧需在 `draw_page_thread` 增加描边/删除线绘制，见装饰通道计划 `openspec/active/2026-10-25-reader-decoration-and-text-highlight.md`）与 Android 菜单项后，同步更新 `docs/api.md` §4 的填充矩阵与 `docs/android.md` §6.8 的分组映射。
+
+## Emacs 的 `seshat-rest-set-progress` 仍无调用点（2026-10-25 观察）
+
+- 现状：`seshat-rest.el` 已封装 `PUT /api/progress`（`seshat-rest-set-progress`），但仓库内**没有任何生产调用点**——唯二的两次 grep 命中是它自己的 `defun` 与文件头注释里的用法示例。阅读进度目前只由 Android 写入（`ReadingProgressStore` / `PdfProgressStore` → 进度端点），Emacs 侧只读取（`seshat-sync-status` 展示）。
+- 影响：Emacs 读完某页不会回报进度，跨端「继续阅读」在 Emacs 一侧永远停在 Android/初始值；该封装函数与 `GET` 版并列存在，容易被误读成「已支持双向」。
+- 解除条件：Emacs 侧接入进度上报（触发点建议沿用 reader 翻页命令 + idle 去抖，避免逐页打网络），或明确声明「进度单向（Android → 服务端）」，并把无调用点的封装标 `;;; TODO` 或下沉到测试辅助。
+
+## `TocDrawer.show` 旧签名已无调用者（2026-10-25，dead code 待清理）
+
+- 现状：`TocDrawer.show(allRows, currentTarget)` 这个两参重载现在没有任何生产代码或测试调用（两阅读器都改调带 `statusLine` / `bookmarks` / `bookmarksSupported` 的完整版本）。
+- 影响：多一条「看起来可用但永远拿不到状态行与书签」的入口，改动 `show` 语义时容易漏改；Kotlin 不会对未使用的 public 方法报警，测试也覆盖不到。
+- 解除条件：删除该重载（`TocDrawer` 是内部组件、`show` 非跨模块 API），或若确需保留则补一条用例锁定其默认值行为。
+
+## 装饰层未做内存检查（2026-10-25）
+
+- 现象：本轮 C 装饰表（rect + stroke，深拷贝快照）只靠「所有权规则写进 `Decoration` 结构体注释 + 唯一释放函数 `free_decoration_table` + 压力循环不崩溃」保证，**未做 valgrind / ASan 验证**——batch Emacs 无法构造 docstate + window，attach 运行中 daemon 不可行。
+- 影响：`pts` 的深拷贝与释放路径（`free_draw_thread_args` 的 7 条退出路径、`free_doc_state`、`free_decoration_table`）若存在漏 free 或双 free，现有 ERT 与人工压力循环都不会暴露，只会在长时间阅读 + 反复刷新装饰后表现为内存增长或崩溃。
+- 解除条件：补一次 valgrind 启动 daemon，或 ASan 构建下跑「加载文档 → 加 stroke → 刷新 → 关闭文档」循环并通过。
+
+## verify 实例无 GUI frame 导致 `image-flush` 抛错（2026-10-25）
+
+- 现象：`display_img_to_overlay` 在终端 frame 上必然抛「Window system frame should be used」，因 `overlay-put` 在其之前执行，像素仍可取，但**任何依赖 `display_cached_page` 返回值的断言在 verify 实例里不可信**。
+- 影响：隔离实例（`elisp-test`，无 GUI frame）上跑 ERT 时，凡断言「刷新后页面已重绘 / 返回 t」的用例都会失真（走 error 分支或断言到未定义值），结论不可作为回归依据。
+- 解除条件：改用 GUI frame 跑该类断言，或调整 flush 的顺序 / 条件（`image-flush` 移到 `overlay-put` 之前，或按 frame 能力跳过）。
+
+## `emacs_add_stroke` 点列表遍历未提前截断（2026-10-25）
+
+- **已修复**（2026-10-25，Phase 4 审查修复）：循环顶部先判 `pt_count >= DECORATION_MAX_POINTS`，达到即置 `truncated` 并 `break`（break 前仍做 `listp` 断言，不对非列表调 `car`/`cdr`），不再把超限输入的剩余部分逐点走完。取「达到上限即停」而非原「超过 2 倍上限再停」，是因为超过上限的点本就会被丢弃，多走一个都是纯浪费。上限值 1024 **未放宽**，「截断而非拒绝」语义不变；代价是上限之后的畸形数据不再被校验（历史正文保留如下）。
+- 现象：`DECORATION_MAX_POINTS`（1024）只是「存不下就不存」——一个百万点的 elisp 列表仍会被**完整遍历**（约 40 万次 module funcall），循环内没有提前退出。
+- 影响：异常或超大输入（不可信调用方、超长笔迹）会长时间占住 Emacs 主线程，表现为卡顿；该上限只保护了内存，没有保护 CPU。
+- 解除条件（已满足，见上）：循环内加「读到的点数超过 `2 × DECORATION_MAX_POINTS` 即 break」的提前退出（保留现有「截断而非拒绝」语义）。实际实现取更严的「达到 `DECORATION_MAX_POINTS` 即 break」。
+
+## `fz_stroke_state` 栈副本依赖 `dash_len == 0`（2026-10-25）
+
+- 现象：`draw_page_thread` 的 stroke 绘制用 `fz_default_stroke_state` 的**栈副本**，其 `dash_len = 0` 保证柔性数组 `dash_list[]` 永不被读；这是本轮「结构体放栈上」写法的唯一前提。
+- 影响：将来若支持虚线，`dash_list[]` 会被实际访问，而栈副本只含零长度的柔性数组尾部 → 越界读取（UB），且不会在编译期报错。
+- 解除条件：支持虚线时改用 `fz_new_stroke_state_with_dash_len(ctx, len)` 并在用后 `fz_drop_stroke_state`，同时补一条虚线渲染的像素回归。
 
 
 
 
 
 
+
+
+
+## `character` 粒度撞 500 段锚上限（2026-10-25 装饰表与字级高亮批次）
+
+- 现象：`seshat-reader-select-highlight-granularity` 设为 `character` 时，一行十几字就是十几段矩形，一页选区轻松过千段；`seshat-reader-annotation--anchor` 的写入端上限是 500 段（`--anchor-max-segments`），超出部分**被丢弃**——只写前 500 段并提示一次，页面下部因此**没有高亮**，而批注本身仍成功创建。
+- 影响：`character` 粒度的用户在大段选区上看到「高亮只覆盖上半页」，提示只说「只写入前 500 段」，看不出是被截断成半页。选 `line`（默认）时每页通常几十段，不受影响。
+- 解除条件：改为「先按行合并再写入」（`character` 只影响选择与闪现，落库时统一按行），或提高写入端上限并重新评估 64 KB `location` 长度上限与解析端 2000 段的余量关系。
+
+## `elisp_check_parens` 对大型测试文件假阳性（2026-10-25 装饰表与字级高亮批次）
+
+- 现象：`elisp_check_parens` 对 `emacs/tests/seshat-reader-annotation-test.el`（实测 948 行规模）报括号不平衡，而同一实例内对该 buffer 直接跑 `check-parens` 与命令行 batch 加载该文件均**通过**。
+- 影响：若把该工具当作 L1 门禁的唯一判据，会在大型测试文件上误判并诱导去「修」并不存在的括号错误；本批次改用「`make -C emacs/seshat-reader clean all` + batch ERT 加载」作为 L1 判据。
+- 解除条件：定位该工具与 `check-parens` 的差异（疑似只检查可见区或未 `revert` 磁盘新内容）后修工具；在那之前，L1 门禁不单独依赖 `elisp_check_parens`。
+
+## verify（headless）实例的 `--refresh-highlights` 恒返回 nil 且首帧尺寸不同（2026-10-25 装饰表与字级高亮批次）
+
+- 现象：隔离实例里 `seshat-reader-dyn--refresh-highlights` 恒返回 nil（无 GUI frame，重绘路径提前返回），且同一文档首帧与后续帧的 `image :data` 尺寸不同（实测 1454127 B vs 90897 B）。
+- 影响：**不能**把该实例里的像素结论当作绝对判据——只能在**同一会话内做相对比较**（如「加装饰前后同页 PNM 是否逐字节一致」），不能跨会话或跨首帧/后续帧比较尺寸与哈希。
+- 解除条件：为无 frame 场景提供「渲染到 PNM 但不经窗口」的判据入口（渲染确定性导出），或改用带 GUI 的实例做像素验收。
+
+## `--add-stroke` 已实现但 Lisp 侧尚未使用（2026-10-25 装饰表与字级高亮批次）
+
+- 现状：C 侧 `--add-stroke(page r g b alpha width points)`（7 参，扁平点列表，每笔 ≤1024 点，点列由 C 侧 `malloc` 自持）与装饰表的 stroke 类型都已落地，但 Lisp 侧没有任何调用点——`ink:` location 段仍不解析、不渲染。
+- 影响：手写笔迹在 Emacs 端只显示为「第 N 页手写（M 笔）」的聚合行，看不到轨迹；同时该入口没有真实调用方，等于未经端到端验证的 API（只有 ERT 桩级覆盖）。
+- 解除条件：ink 轨迹渲染与手写存储按计划 `openspec/active/2026-10-25-reader-search-and-ink.md` 落地后接入，并补一条「解析 `ink:` → 投 stroke → 像素出现」的回归。
+
+## `--anchor-segments` 对坏 rect 静默丢段（2026-10-25 装饰表与字级高亮批次）
+
+- 现象：`seshat-reader-annotation--anchor-segments` 对「不是前四元素都是数字」的坏元素直接跳过（`dolist` 里的 `when` 过滤），既不计入段数、也不提示；而**段数超限**时却会提示一次（`--warn-anchor-truncated`）。
+- 影响：两种数据丢失的处理**不对称**——超限提示、坏段静默。若上游给出畸形矩形（如坐标为字符串），用户只会看到「高亮少几段」而无任何线索，排查时容易误判为渲染问题。
+- 解除条件：对跳过的坏段做与截断同级的「一次性提示」（计数 + 样本），或把握手级别的 `numberp` 校验上移到产出方（`--rects-in-rect` / 合并函数）使其不可能产出坏段。
+
+## `--refresh-highlights` 存在「一步错位」（2026-10-25 搜索与 ink 批次）
+
+- 现象：单次 `--refresh-highlights` 之后立即取页面 overlay 的 image 数据（PNM），拿到的是**上一状态**的位图：重绘经渲染线程异步完成，`--refresh-highlights` 返回时新帧尚未挂到 overlay 上。
+- 影响：跨批次做像素断言时，一次 refresh + 立即取图会得出「装饰没生效」的错误结论（实测表现为「加了装饰但 PNM 与之前逐字节相同」）。
+- 可靠做法：`refresh → sleep（等渲染线程落地）→ refresh` 再取图；跨批次像素断言必须用此法，且只在同一会话内做相对比较（见上一条 headless 限制）。
+- 解除条件：让 `--refresh-highlights` 同步等待本页渲染完成（或提供「渲染完成」回调/返回值），使调用方无需靠 sleep 猜测。
+
+## `--highlight-module-available-p` 探针合并导致中间态 `.so` 连 rect 装饰也不画（2026-10-25 搜索与 ink 批次）
+
+- 现象：Lisp 侧把「模块是否支持装饰」的探测合并成**一个**函数 `--highlight-module-available-p`（同时检查 rect 与 stroke 入口），于是「有 rect 入口但无 stroke 入口」的中间态 `.so`（升级过程中的构建产物、或未重新编译的旧 `.so`）被整体判定为「装饰不可用」。
+- 影响：这种中间态下连**矩形高亮**（批注 rect）也不再绘制——用户看到「批注高亮全没了」，而实际能力只缺 stroke 一项；排查时容易误判为高亮投喂逻辑回归。
+- 解除条件：拆成 rect / stroke 两个独立探针（`--rects-available-p` / `--strokes-available-p`），按能力分别降级：缺 stroke 时仅跳过 ink，rect 装饰照常投喂。
+
+## `--add-*` 与 `--search-page` 的 page 基数曾不一致（2026-10-25 搜索与 ink 批次）
+
+- 现象：`--add-highlight` / `--add-decoration` / `--add-stroke` 经 `resolve_page_arg` 取 **1-based** 页号，而 `--search-page` 初版直接 `extract_integer` 取 **0-based** 页号——同一模块内两类按页索引的入口语义相反，跨页搜索的命中会整体错一页（Lisp 侧靠 `(1- page)` 掩盖，任一侧改动即失效）。
+- 现状：已在本次统一为 **1-based**（`--search-page` 改走 `resolve_page_arg`，Lisp 侧去掉 `(1- page)`，测试桩与断言同步；`--text-in-rect` / `--rects-in-rect` 保持 0-based，因为它们服务于已在页索引空间工作的选区代码）。
+- 解除条件/预防：后续新增任何按页索引的 C 入口必须**显式声明基数**并在函数注释首段标注（当前四个入口的基数已在注释中逐个写明）；`--text-in-rect` / `--rects-in-rect` 的 0-based 约定属于历史遗留，若将来统一，需同步 `seshat-reader-select.el` 与相关 ERT 桩断言。
+
+## 导出副本落在书库目录，会作为「新书」出现在书架上（2026-10-25 搜索与 ink 批次）
+
+- 现状：`PdfInkExporter` 把副本写在**源文件同目录**（`<base>.seshat.pdf`），去重靠 `-1` / `-2` 后缀。若该目录在书架扫描范围（`filesDir/books/`）内，导出结果下一轮扫描就会作为一本**独立新书**出现——同一本书在书架上出现两份，且副本自身也带批注/进度键差异。
+- 影响：用户可见的重复条目；副本再导出会产生 `a.seshat-1.pdf` 等递增文件，书架条目随导出次数线性增长，需手动清理。
+- 建议（**待产品决策**）：① 导出到「下载」目录（`Environment.DIRECTORY_DOWNLOADS`）或 SAF 目录选择器，与书库解耦；或 ② 落在原目录但写入书架忽略名单（需书架扫描支持排除规则）。当前实现保持「同目录」是因为它最符合「就地生成可见副本」的直觉，且不引入 storage 权限与路径管理。
+
+## 导出不支持 `content://` 源（2026-10-25 搜索与 ink 批次）
+
+- 现状：`PdfReaderActivity.exportInkCopy` 只接受 `file://` 源；SAF 等 `content://` 来源拿不到可写的同目录路径，直接提示「仅本地文件可导出副本」。
+- 影响：从系统文件选择器打开的 PDF **无法导出手写副本**（书库内的书走 `file://`，不受影响）。这是有意的拒绝而不是静默降级——把副本写到别处会让用户找不到文件，也会与书库扫描结果不一致。
+- 建议：接 SAF 后要额外解决「目标 URI 授予」与「同目录判定」，或改用 `ACTION_CREATE_DOCUMENT` 让用户指定副本位置；在此之前保持拒绝并给出明确提示。
+
+## 旋转页（`/Rotate` ≠ 0）导出时被跳过（2026-10-25 搜索与 ink 批次）
+
+- 现状：`PdfInkStore` 的归一化坐标相对**渲染后（已应用旋转）**的显示矩形，而 PDF 用户空间不含该旋转，两者差 90°；`PdfInkExporter.export` 因此跳过 `page.rotation % 360 != 0` 的页，被跳过页数在结果里回报（提示「已导出 X（N 页未导出）」）；若全部页被跳过则不产出空副本并报错。
+- 影响：旋转页上的手写与高亮**不会出现在导出副本里**（侧车数据本身完好，Emacs 端渲染时受同一旋转限制，见「旋转页的 rect 采不准导致高亮可能错位」）。
+- 解除条件：在导出侧按 `page.rotation` 做一次逆变换（把渲染后坐标转回未旋转用户空间），需要与屏幕渲染共用同一份旋转矩阵实现并补单测，属独立一轮。
+
+## `--text-in-rect` / `--rects-in-rect` 与装饰入口的页号基数不同（0-based vs 1-based，2026-10-25 起为显式约定）
+
+- 现状：装饰与搜索入口（`--add-highlight` / `--add-decoration` / `--add-stroke` / `--search-page`）一律 **1-based**，而选区几何入口（`--text-in-rect` / `--rects-in-rect`）保持 **0-based**（服务于已在页索引空间工作的 `seshat-reader-select.el`）。两套基数在同一模块内并存，判定只能看函数注释（四个 1-based 入口的注释首段已逐个写明）。历史成因与修正过程见「`--add-*` 与 `--search-page` 的 page 基数曾不一致」。
+- 影响：新增按页入口时若照抄了错的那一组，会出现整体错一页的静默 bug（Lisp 侧很容易用 `(1- page)` 把它掩盖掉，任一侧改动即失效）。
+- 约定/预防：**新增按页入参的 C 入口必须显式声明基数**（函数注释首段），默认跟 1-based；测试桩必须按各自基数断言（搜索用 1-based、选区用 0-based），任一侧被改都会有用例失败。统一两套基数的代价是同步改 `seshat-reader-select.el` 与 4 个测试文件的桩，本轮不做。

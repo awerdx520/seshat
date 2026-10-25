@@ -36,10 +36,16 @@
 ;; `#'/`%' 即 `user-error' 并提示重命名文档；解析端据此只需「最后一个 `#'
 ;; 分割」这一条规则，行为可完全断言。
 ;;
-;; 与批注模块的关系：本模块不自造位置表示，`location' 的构造
-;; （`seshat-reader-annotation--location'）与页码解析
+;; 与批注模块的关系：本模块不自造位置表示，**引用锚**的构造
+;; （`seshat-reader-annotation--anchor'）与页码解析
 ;; （`seshat-reader-annotation--page-from-location'）都直接复用
 ;; `seshat-reader-annotation'，两处口径始终一致。
+;;
+;; 「引用锚」= 页锚（`page:<n>'，唯一导航真值）+ 可选几何尾段
+;; （`;rect:...'，由最近一次鼠标选区派生）。**本模块的 rect 不产生任何渲染**：
+;; 引用锚只用于 `seshat:' 链接的跳转片段（`seshat-reader-reference--follow'
+;; 只读其中的页码），不投喂 C 层高亮、不画任何覆盖层——渲染只由
+;; `seshat-reader-annotation' 的批注投喂路径负责。
 ;;
 ;; 本文件是**本仓库自研扩展**：从上游 vendor 重拷 seshat-reader 时应保留本
 ;; 文件、不得覆盖（vendor 边界见同目录 VENDORED.md）。
@@ -396,11 +402,12 @@ PATH 为 `seshat:' 链接的路径部分（可带或不带 \"seshat:\" 前缀）
   "为 `org-store-link' 生成当前阅读位置的 `seshat:' 链接并返回 t.
 仅在 `seshat-reader-mode' 缓冲区中可用，否则 `user-error' 说明用法。文档
 标识由 variable `buffer-file-name' 经 `seshat-reader-annotation--doc-id' 派生；
-location 优先取最近一次选区（`seshat-reader-select-last'，其 `:file' 须与
-当前文件等价且 `:page'/`:rect' 齐备）构造的完整位置，否则退化为
-\"page:<n>\"（此时若 `seshat-reader-current-doc-pagenumber' 取不到整数页码，
-说明当前缓冲区不是阅读器视图，`user-error' 提示先打开文档）。描述在有选区
-文本时用 `seshat-reader-reference--summary'，否则用
+引用锚优先取最近一次选区（`seshat-reader-select-last'，其 `:file' 须与
+当前文件等价且 `:page'/`:rect' 齐备）构造的完整锚（页锚 + 几何尾段），否则
+退化为纯页锚 \"page:<n>\"（此时若 `seshat-reader-current-doc-pagenumber'
+取不到整数页码，说明当前缓冲区不是阅读器视图，`user-error' 提示先打开
+文档）。几何尾段只写进链接片段供将来取用，**本模块不据此渲染任何内容**。
+描述在有选区文本时用 `seshat-reader-reference--summary'，否则用
 `seshat-reader-reference--description'。
 
 可选 _INTERACTIVE 被忽略，仅为满足 org 9.7+ 对 `:store' 的首选单参签名。"
@@ -415,7 +422,9 @@ location 优先取最近一次选区（`seshat-reader-select-last'，其 `:file'
                             (plist-get selection :page)
                             (plist-get selection :rect)
                             (file-equal-p (plist-get selection :file) file))
-                       (seshat-reader-annotation--location
+                       ;; 引用锚只取整体 bbox（:rect），不含字级多段 :rects；
+                       ;; `--anchor' 单 rect / rect 列表两种入参都接受。
+                       (seshat-reader-annotation--anchor
                         (plist-get selection :page)
                         (plist-get selection :rect))
                      (let ((page (seshat-reader-current-doc-pagenumber)))
@@ -518,12 +527,19 @@ T6 的批注引用复用。"
      file (seshat-reader-annotation--quiet-p file))))
 
 (defun seshat-reader-reference--current-location ()
-  "(internal) 返回当前阅读位置的 `location' 字符串.
-优先使用最近一次鼠标选区（`seshat-reader-select-last'）：其 `:file' 与 variable
+  "(internal) 返回当前阅读位置的**引用锚**字符串.
+引用锚 = 页锚（`page:<n>'）+ 可选几何尾段（`;rect:...'）。优先使用最近一次
+鼠标选区（`seshat-reader-select-last'）：其 `:file' 与 variable
 `buffer-file-name' 等价（`file-equal-p'）且 `:page'/`:rect' 齐备时返回
-`seshat-reader-annotation--location' 构造的完整位置（与批注 location 同构）；
-否则退化为 \"page:<n>\"，其中 <n> 取 `seshat-reader-current-doc-pagenumber'
+`seshat-reader-annotation--anchor' 构造的完整锚（与批注 location 同构，但
+**只作跳转片段用，本模块的 rect 不产生任何渲染**）；否则退化为纯页锚
+\"page:<n>\"，其中 <n> 取 `seshat-reader-current-doc-pagenumber'
 （已是 1-based，**不再加 1**）。
+
+**引用锚只取整体 bbox**（`seshat-reader-select-last' 的 `:rect'），故意不用
+字级多段 `:rects'：引用只需要一个可复现的落点，链接串短一些更利于阅读与
+存储，多段几何对跳转没有任何增益。`seshat-reader-annotation--anchor' 两种
+入参都接受（单 rect / rect 列表），因此这里继续传单 rect 完全合法。
 
 当前缓冲区不是阅读器视图（`seshat-reader-current-doc-pagenumber' 取不到整数
 页码）时 `user-error'，提示先在阅读器中打开文档，而不是抛出
@@ -536,8 +552,8 @@ T6 的批注引用复用。"
              (plist-get selection :page)
              (plist-get selection :rect)
              (file-equal-p (plist-get selection :file) file))
-        (seshat-reader-annotation--location (plist-get selection :page)
-                                            (plist-get selection :rect))
+        (seshat-reader-annotation--anchor (plist-get selection :page)
+                                          (plist-get selection :rect))
       (let ((page (seshat-reader-current-doc-pagenumber)))
         (unless (integerp page)
           (user-error "Seshat Reader reference: 当前缓冲区不是阅读器视图，无法确定页码，请先在阅读器中打开文档"))

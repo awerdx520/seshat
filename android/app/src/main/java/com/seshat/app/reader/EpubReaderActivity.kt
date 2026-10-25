@@ -1224,6 +1224,8 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
             bookmarks = emptyList(),
             onBookmarkAdd = {},
             onBookmarkDelete = {},
+            // EPUB 顶栏没有书签图标：空态只留标题，不渲染「点顶栏书签图标」的假指引
+            bookmarksSupported = false,
         )
     }
 
@@ -1360,10 +1362,10 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
     }
 
     /**
-     * 编辑备注：与「添加批注」同款对话框，预填现有备注与选中原文。
+     * 编辑便签：与「添加批注」同款对话框，预填现有备注与选中原文。
      *
-     * 保存后置 `dirty = true` 并异步推送；写过备注即视为 `note`（服务端 `kind=note` 时 `text` 必填），
-     * 原本的 `highlight`（仅选中原文）因此升级为 `note`。
+     * 保存后置 `dirty = true` 并异步推送。**只改 `text`，不改 `kind`**：备注是有无内容的问题，
+     * 与标注类型正交——原本的 `highlight` 不会因为写了备注就变成 `note`（与 PDF 侧一致）。
      */
     private fun editAnnotationRow(row: AnnotationRow) {
         val target = annotationsForRow(row).firstOrNull() ?: return
@@ -1389,7 +1391,8 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
                 val note = input.text?.toString()?.trim().orEmpty()
                 if (note.isEmpty()) return@setPositiveButton
                 annotationStore.update(
-                    target.copy(note = note, kind = BookAnnotation.KIND_NOTE, dirty = true),
+                    // 只替换 text：kind 保持原值（加备注不改类型）
+                    target.copy(note = note, dirty = true),
                 )
                 enqueuePushAnnotations()
                 refreshAnnotationDrawer()
@@ -1496,7 +1499,7 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
     }
 
     /**
-     * 选区 → 弹窗：空选区给提示；非空进备注对话框。
+     * 选区 → 弹窗：空选区给提示；非空进便签对话框。
      *
      * [range] 为 `null` 表示取不到章内偏移（旧 WebView / JS 失败），此时仍可创建批注，
      * location 退回旧形态 `chapter-<chapterIndex>`（见 [SelectionPayload.locationFor]）。
@@ -1546,12 +1549,11 @@ class EpubReaderActivity : AppCompatActivity(), ChapterScrollHost {
                         note = note,
                         // 偏移可用 → chapter:<i>@<s>-<e>；不可用 → 旧形态 chapter-<i>（不崩溃）
                         location = SelectionPayload.locationFor(chapterIndex, range),
-                        // 只选中原文、没写备注 = highlight（text 允许空串）；写了备注 = note
-                        kind = if (note.isBlank()) {
-                            BookAnnotation.KIND_HIGHLIGHT
-                        } else {
-                            BookAnnotation.KIND_NOTE
-                        },
+                        // 选中即 highlight：备注只写 text，不参与 kind（两维正交，与 PDF 侧一致）
+                        kind = AnnotationGrouping.kindForSelection(
+                            hasSelectedText = selectedText.isNotBlank(),
+                            hasNote = note.isNotBlank(),
+                        ),
                     ),
                 )
                 // 本地已落盘，再异步推送（失败静默，下次推送会因幂等去重补齐）。

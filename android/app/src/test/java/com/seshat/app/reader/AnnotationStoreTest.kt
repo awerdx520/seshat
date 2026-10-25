@@ -231,6 +231,32 @@ class AnnotationStoreTest {
         assertEquals(listOf("旧"), store.list("doc-1").map { it.note })
     }
 
+    /**
+     * 编辑备注只替换 `text`：`kind` 必须保持原值。
+     *
+     * 这是「kind 只表类型、有无备注由 text 表达」在存储层的落点——EPUB 侧编辑备注不再把
+     * `highlight` 升级成 `note`（与 PDF 侧一致），靠的就是 `copy(note = …)` 不碰 kind。
+     */
+    @Test
+    fun updatingNoteKeepsKindUnchanged() {
+        val saved = store.add(
+            BookAnnotation(
+                documentId = "doc-1",
+                chapterIndex = 0,
+                selectedText = "选中的原文",
+                note = "",
+                kind = BookAnnotation.KIND_HIGHLIGHT,
+            ),
+        )
+        assertEquals(BookAnnotation.KIND_HIGHLIGHT, store.list("doc-1").single().kind)
+
+        assertTrue(store.update(saved.copy(note = "后来补的备注")))
+
+        val loaded = store.list("doc-1").single()
+        assertEquals("加备注不能改 kind", BookAnnotation.KIND_HIGHLIGHT, loaded.kind)
+        assertEquals("后来补的备注", loaded.note)
+    }
+
     @Test
     fun clearLegacyDeletesLegacyKeysAndKeepsUidKeys() {
         val hex = "a1b2c3d4e5f60718293a4b5c6d7e8f90"

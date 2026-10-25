@@ -122,24 +122,10 @@ class InkOverlayView @JvmOverloads constructor(
         }
         strokePaint.color = stroke.color
         strokePaint.strokeWidth =
-            InkGeometry.strokeWidthToPx(stroke.width, rect) * styleWidthScale(stroke.style)
+            InkGeometry.strokeWidthToPx(stroke.width, rect) * InkGeometry.styleWidthScale(stroke.style)
         // 必须在 setColor 之后设 alpha：setColor 会把 alpha 覆盖成颜色自带的分量
-        strokePaint.alpha = styleAlpha(stroke.style)
+        strokePaint.alpha = InkGeometry.styleAlpha(stroke.style)
         canvas.drawPath(path, strokePaint)
-    }
-
-    /** 笔型 → 线宽倍率：钢笔 1×、马克笔 2.2×、荧光笔 3.5×。 */
-    private fun styleWidthScale(style: InkStyle): Float = when (style) {
-        InkStyle.PEN -> 1f
-        InkStyle.MARKER -> 2.2f
-        InkStyle.HIGHLIGHTER -> 3.5f
-    }
-
-    /** 笔型 → 不透明度：钢笔不透明、马克笔半透明、荧光笔更淡。 */
-    private fun styleAlpha(style: InkStyle): Int = when (style) {
-        InkStyle.PEN -> 255
-        InkStyle.MARKER -> 170
-        InkStyle.HIGHLIGHTER -> 90
     }
 
     /** 无障碍语义：本 View 消费点击手势（实际落笔逻辑在 onTouchEvent）。 */

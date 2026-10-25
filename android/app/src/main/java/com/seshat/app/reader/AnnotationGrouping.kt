@@ -9,7 +9,7 @@ package com.seshat.app.reader
  * 设计要点：
  * - **一笔一条**：`kind=ink` 的批注在服务端是一笔一条（见 `docs/api.md §4.5.1`），
  *   若逐条渲染会淹没文本批注，故默认**折叠成一条汇总行**（带 `count`）。
- * - **分组顺序固定**（备注 → 高亮 → 手写 → 其它），与输入顺序无关，便于 UI 与测试稳定断言。
+ * - **分组顺序固定**（便签 → 高亮 → 手写 → 其它），与输入顺序无关，便于 UI 与测试稳定断言。
  * - **不丢数据**：未知 `kind` 的条目归入「其它」组，但每行仍保留原始 `kind` 与原始 `id`，
  *   调用方据此仍能定位到 store 里的记录做跳转/删除。
  * - **格式化克制**：纯函数只做「摘要/原文/备注 → 标题 + 副标题」的取舍与长度截断，
@@ -65,7 +65,7 @@ internal data class AnnotationRow(
  * 一个分组：分组标题 + 该组内的行。
  *
  * @property kind 分组种类（`note` / `highlight` / `ink`，或「其它」组的 [AnnotationGrouping.KIND_OTHER]）
- * @property title 分组标题（「备注」「高亮」「手写」「其它」）
+ * @property title 分组标题（「便签」「高亮」「手写」「其它」）
  * @property rows 组内行（保持输入顺序；空组的组本身不会出现）
  */
 internal data class AnnotationGroup(
@@ -94,10 +94,10 @@ internal enum class BackKeyAction {
  */
 internal object AnnotationGrouping {
 
-    /** `kind` 取值：有备注的批注。 */
+    /** `kind` 取值：页级便签——无选中几何，`text` 必填。 */
     const val KIND_NOTE = "note"
 
-    /** `kind` 取值：仅选中原文、无备注。 */
+    /** `kind` 取值：选中原文的标记（`text` 可空，写备注不改 kind）。 */
     const val KIND_HIGHLIGHT = "highlight"
 
     /** `kind` 取值：手写笔迹（一笔一条，默认折叠）。 */
@@ -106,8 +106,8 @@ internal object AnnotationGrouping {
     /** 「其它」分组的占位 kind（行内仍保留原始 kind）。 */
     const val KIND_OTHER = "other"
 
-    /** 分组标题：备注。 */
-    const val TITLE_NOTE = "备注"
+    /** 分组标题：便签。 */
+    const val TITLE_NOTE = "便签"
 
     /** 分组标题：高亮。 */
     const val TITLE_HIGHLIGHT = "高亮"
@@ -133,7 +133,7 @@ internal object AnnotationGrouping {
     /**
      * 按 `kind` 分组并产出渲染行。
      *
-     * 分组顺序固定为「备注 → 高亮 → 手写 → 其它」，空组不出现；组内保持输入顺序。
+     * 分组顺序固定为「便签 → 高亮 → 手写 → 其它」，空组不出现；组内保持输入顺序。
      * 空输入返回空列表（不抛异常）。
      *
      * @param items 待分组的批注（调用方已从 store 映射成中性条目）
@@ -157,6 +157,20 @@ internal object AnnotationGrouping {
      */
     fun rows(items: List<AnnotationItem>, currentPage: Int? = null): List<AnnotationRow> =
         group(items, currentPage).flatMap { it.rows }
+
+    /**
+     * 新建批注时的 `kind` 归属（**两维正交**：kind 只表类型，备注由 `text` 表达）。
+     *
+     * - 有任何选中原文 → [KIND_HIGHLIGHT]，**无论是否填了备注**（备注只写 `text`）；
+     * - 没有选中原文（页级纯备注）→ [KIND_NOTE]。
+     *
+     * @param hasSelectedText 是否选中了正文文本
+     * @param hasNote 是否填写了备注——**有意不参与判定**：备注是内容维度，不是类型维度；
+     *   保留该参数是为了让「填了备注仍是 highlight」这条不变量在调用点与单测里都显式可见
+     */
+    @Suppress("UNUSED_PARAMETER")
+    fun kindForSelection(hasSelectedText: Boolean, hasNote: Boolean = false): String =
+        if (hasSelectedText) KIND_HIGHLIGHT else KIND_NOTE
 
     /**
      * 待同步标记：`dirty=true` 返回 [PENDING_LABEL]，否则返回 `null`。

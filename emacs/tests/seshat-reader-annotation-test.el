@@ -238,22 +238,24 @@ ANNOTATIONS 为将作为服务端 JSON 响应返回的 Lisp 数据。"
 
 (ert-deftest seshat-reader-annotation-test--location-format ()
   "位置字符串为 1-based 页码加两位小数的四个坐标."
-  (should (equal (seshat-reader-annotation--location 1 '(10 20 30 40))
+  (should (equal (seshat-reader-annotation--anchor 1 '(10 20 30 40))
                  "page:1;rect:10.00,20.00,30.00,40.00"))
-  (should (equal (seshat-reader-annotation--location
+  (should (equal (seshat-reader-annotation--anchor
                   545 '(0.0 545.5 100.0 600.0))
                  "page:545;rect:0.00,545.50,100.00,600.00")))
 
 (ert-deftest seshat-reader-annotation-test--location-rejects-bad-page ()
   "页码不是正整数时抛 `user-error'."
   (dolist (page (list nil 0 -1 1.5))
-    (should-error (seshat-reader-annotation--location page '(0 0 1 1))
+    (should-error (seshat-reader-annotation--anchor page '(0 0 1 1))
                   :type 'user-error)))
 
 ;;; 创建批注
 
 (ert-deftest seshat-reader-annotation-test--create-assembles-request ()
-  "创建批注时请求体含正确的 uid、location 与 text（不发 doc-id）."
+  "无备注创建标注时请求体含 uid、location、kind=highlight 与 selected_text（不发 doc-id）.
+「有无备注」由 `text' 空/非空表达，故无备注时 `text' 是空串，选区原文进
+`selected_text'。"
   (seshat-reader-annotation-test--with-temp-dir dir
     (let* ((file (expand-file-name "book.pdf" dir))
            (seshat-reader-annotation-roots (list (cons "lib" dir)))
@@ -273,10 +275,29 @@ ANNOTATIONS 为将作为服务端 JSON 响应返回的 Lisp 数据。"
           (should-not (alist-get 'document-id body))
           (should (equal (alist-get 'location body)
                          "page:3;rect:1.00,2.00,3.00,4.00"))
-          (should (equal (alist-get 'text body) "选区文本")))))))
+          (should (equal (alist-get 'kind body) "highlight"))
+          (should (equal (alist-get 'selected_text body) "选区文本"))
+          (should (equal (alist-get 'text body) "")))))))
+
+(ert-deftest seshat-reader-annotation-test--create-uses-selection-rects ()
+  "选区带 `:rects' 时 location 写多段 rect（字级高亮的落地形态）."
+  (seshat-reader-annotation-test--with-temp-dir dir
+    (let* ((file (expand-file-name "book.pdf" dir))
+           (seshat-reader-annotation-roots (list (cons "lib" dir)))
+           (seshat-reader-select-last
+            (list :file file :page 2 :rect '(1 2 3 4)
+                  :rects '((1.0 2.0 3.0 4.0) (1.0 5.0 3.0 7.0))
+                  :text "选区文本")))
+      (with-temp-file file)
+      (let* ((calls (seshat-reader-annotation-test--with-stub 201 "{\"id\":9}"
+                      (seshat-reader-annotation-create)))
+             (body (json-parse-string (nth 2 (car calls)) :object-type 'alist)))
+        (should (equal (alist-get 'location body)
+                       (concat "page:2;rect:1.00,2.00,3.00,4.00"
+                               ";rect:1.00,5.00,3.00,7.00")))))))
 
 (ert-deftest seshat-reader-annotation-test--create-explicit-body-wins ()
-  "带前缀参数（显式 BODY）时覆盖选区文本."
+  "带前缀参数（显式 BODY）时创建便签：kind=note、text=BODY，原文仍进 selected_text."
   (seshat-reader-annotation-test--with-temp-dir dir
     (let* ((file (expand-file-name "book.pdf" dir))
            (seshat-reader-annotation-roots (list (cons "lib" dir)))
@@ -287,10 +308,12 @@ ANNOTATIONS 为将作为服务端 JSON 响应返回的 Lisp 数据。"
                       (seshat-reader-annotation-create "显式正文")))
              (call (car calls))
              (body (json-parse-string (nth 2 call) :object-type 'alist)))
-        (should (equal (alist-get 'text body) "显式正文"))))))
+        (should (equal (alist-get 'kind body) "note"))
+        (should (equal (alist-get 'text body) "显式正文"))
+        (should (equal (alist-get 'selected_text body) "选区文本"))))))
 
 (ert-deftest seshat-reader-annotation-test--create-blank-body-falls-back ()
-  "显式 BODY 为空白时退回使用选区文本."
+  "显式 BODY 为空白时视为「没有备注」，退回标记路径（highlight + 空 text）."
   (seshat-reader-annotation-test--with-temp-dir dir
     (let* ((file (expand-file-name "book.pdf" dir))
            (seshat-reader-annotation-roots (list (cons "lib" dir)))
@@ -301,12 +324,95 @@ ANNOTATIONS 为将作为服务端 JSON 响应返回的 Lisp 数据。"
                       (seshat-reader-annotation-create "   ")))
              (call (car calls))
              (body (json-parse-string (nth 2 call) :object-type 'alist)))
-        (should (equal (alist-get 'text body) "选区文本"))))))
+        (should (equal (alist-get 'kind body) "highlight"))
+        (should (equal (alist-get 'text body) ""))
+        (should (equal (alist-get 'selected_text body) "选区文本"))))))
 
 (ert-deftest seshat-reader-annotation-test--create-without-selection-errors ()
   "没有选区时创建批注抛 `user-error'."
   (let ((seshat-reader-select-last nil))
     (should-error (seshat-reader-annotation-create) :type 'user-error)))
+
+;;; kind 与 selected_text（类型 / 备注两维正交）
+
+(ert-deftest seshat-reader-annotation-test--create-sends-highlight-without-body ()
+  "不带备注建标注：服务端收到 `kind' = \"highlight\"、`selected_text' = 选区文本、`text' 为空串.
+只有 `kind' 是类型维度；「有无备注」由 `text' 空/非空表达，故无备注时
+`text' 必须是空串而不是选区文本——否则同一条高亮在跨端会被归进「便签」组。"
+  (seshat-reader-annotation-test--with-temp-dir dir
+    (let* ((file (expand-file-name "book.pdf" dir))
+           (seshat-reader-annotation-roots (list (cons "lib" dir)))
+           (seshat-reader-select-last
+            (list :file file :page 3 :rect '(1 2 3 4) :text "选区文本")))
+      (with-temp-file file)
+      (let* ((calls (seshat-reader-annotation-test--with-stub
+                        201 "{\"id\":7,\"kind\":\"highlight\"}"
+                      (seshat-reader-annotation-create)))
+             (body (json-parse-string (nth 2 (car calls)) :object-type 'alist)))
+        (should (equal (alist-get 'kind body) "highlight"))
+        (should (equal (alist-get 'selected_text body) "选区文本"))
+        (should (equal (alist-get 'text body) ""))))))
+
+(ert-deftest seshat-reader-annotation-test--create-sends-note-with-body ()
+  "带备注建标注：`kind' = \"note\"、`text' = 备注、`selected_text' = 选区文本."
+  (seshat-reader-annotation-test--with-temp-dir dir
+    (let* ((file (expand-file-name "book.pdf" dir))
+           (seshat-reader-annotation-roots (list (cons "lib" dir)))
+           (seshat-reader-select-last
+            (list :file file :page 2 :rect '(0 0 1 1) :text "选区文本")))
+      (with-temp-file file)
+      (let* ((calls (seshat-reader-annotation-test--with-stub
+                        201 "{\"id\":8,\"kind\":\"note\"}"
+                      (seshat-reader-annotation-create "我的备注")))
+             (body (json-parse-string (nth 2 (car calls)) :object-type 'alist)))
+        (should (equal (alist-get 'kind body) "note"))
+        (should (equal (alist-get 'text body) "我的备注"))
+        (should (equal (alist-get 'selected_text body) "选区文本"))))))
+
+(ert-deftest seshat-reader-annotation-test--create-offline-entry-carries-kind-and-selected-text ()
+  "离线入队的 create 条目携带 `:kind' 与 `:selected-text'，重放时才能带上.
+`:kind' 缺失时去重与创建都会按 \"note\" 处理，高亮会在重放后降级成便签。"
+  (seshat-reader-annotation-test--with-temp-dir dir
+    (let* ((file (expand-file-name "book.pdf" dir))
+           (seshat-reader-annotation-roots (list (cons "lib" dir)))
+           (seshat-reader-select-last
+            (list :file file :page 5 :rect '(1 1 2 2) :text "选区文本")))
+      (with-temp-file file)
+      ;; 队列文件是本套件独占的临时文件：删掉即等价于「清空队列」。
+      (ignore-errors (delete-file seshat-reader-annotation-queue-file))
+      (seshat-reader-annotation-test--with-stub
+          500 "{\"error\":{\"code\":\"internal\"}}"
+        (message "%s" (seshat-reader-annotation-create)))
+      (let ((entries (seshat-reader-annotation-queue-entries
+                      seshat-reader-annotation-test--uid)))
+        (should (= 1 (length entries)))
+        (let ((entry (car entries)))
+          (should (equal (plist-get entry :kind) "highlight"))
+          (should (equal (plist-get entry :selected-text) "选区文本"))
+          (should (equal (plist-get entry :text) ""))))
+      (ignore-errors (delete-file seshat-reader-annotation-queue-file)))))
+
+(ert-deftest seshat-reader-annotation-test--queue-sync-create-sends-kind-and-selected-text ()
+  "离线队列重放 create 时请求体带上 `kind' 与 `selected_text'."
+  (let ((entry (list :action 'create
+                     :uid seshat-reader-annotation-test--uid
+                     :document-id "lib:book.pdf"
+                     :location "page:5;rect:1.00,1.00,2.00,2.00"
+                     :kind "highlight"
+                     :selected-text "选区文本"
+                     :text ""))
+        (calls nil))
+    (cl-letf (((symbol-function 'seshat-reader-annotation--fetch)
+               (lambda (_uid) nil)))
+      (setq calls (seshat-reader-annotation-test--with-stub
+                      201 "{\"id\":9}"
+                    (should (eq (seshat-reader-annotation-queue--sync-create
+                                 entry)
+                                'ok)))))
+    (let ((body (json-parse-string (nth 2 (car calls)) :object-type 'alist)))
+      (should (equal (alist-get 'kind body) "highlight"))
+      (should (equal (alist-get 'selected_text body) "选区文本"))
+      (should (equal (alist-get 'text body) "")))))
 
 ;;; 列表渲染
 
@@ -470,6 +576,31 @@ ANNOTATIONS 为将作为服务端 JSON 响应返回的 Lisp 数据。"
       (should caught)
       (should (string-match-p "选区没有文本" (error-message-string caught))))))
 
+(ert-deftest seshat-reader-annotation-test--create-empty-selection-errors ()
+  "无几何（`:rect' 与 `:rects' 皆 nil）且无文本时不落成页级锚，直接 `user-error'."
+  (seshat-reader-annotation-test--with-temp-dir dir
+    (let* ((file (expand-file-name "x.pdf" dir))
+           (seshat-reader-annotation-roots (list (cons "lib" dir)))
+           (seshat-reader-select-last (list :text nil :page 3
+                                            :rect nil :rects nil :file file))
+           (caught nil)
+           (request-count nil)
+           (resolve-count nil))
+      (with-temp-file file)
+      (let ((calls (seshat-reader-annotation-test--with-stub
+                       201 "{\"id\":1}"
+                     (condition-case err
+                         (seshat-reader-annotation-create)
+                       (user-error (setq caught err)))
+                     (setq request-count (length seshat-reader-annotation-test--calls)
+                           resolve-count (length seshat-reader-annotation-test--resolve-calls)))))
+        (should caught)
+        (should (string-match-p "尚未选中任何文本" (error-message-string caught)))
+        ;; 守卫在解析 uid 与发请求**之前**生效：两条网络桩都没有被调用。
+        (should-not calls)
+        (should (= 0 request-count))
+        (should (= 0 resolve-count))))))
+
 (ert-deftest seshat-reader-annotation-test--create-interactive-prefix ()
   "交互声明：带前缀参数时读入正文；不带前缀时不读入、退回选区文本."
   (seshat-reader-annotation-test--with-temp-dir dir
@@ -490,8 +621,10 @@ ANNOTATIONS 为将作为服务端 JSON 响应返回的 Lisp 数据。"
           (should calls)
           (let* ((call (car calls))
                  (body (json-parse-string (nth 2 call) :object-type 'alist)))
-            (should (equal (alist-get 'text body) "读入正文"))))
-        ;; 不带前缀参数：不调用 read-string，退回选区文本
+            (should (equal (alist-get 'kind body) "note"))
+            (should (equal (alist-get 'text body) "读入正文"))
+            (should (equal (alist-get 'selected_text body) "选区文本"))))
+        ;; 不带前缀参数：不调用 read-string，按「无备注」建高亮
         (setq read-args nil)
         (let ((calls (seshat-reader-annotation-test--with-stub
                          201 "{\"id\":2}"
@@ -501,7 +634,9 @@ ANNOTATIONS 为将作为服务端 JSON 响应返回的 Lisp 数据。"
           (should calls)
           (let* ((call (car calls))
                  (body (json-parse-string (nth 2 call) :object-type 'alist)))
-            (should (equal (alist-get 'text body) "选区文本"))))))))
+            (should (equal (alist-get 'kind body) "highlight"))
+            (should (equal (alist-get 'text body) ""))
+            (should (equal (alist-get 'selected_text body) "选区文本"))))))))
 
 (ert-deftest seshat-reader-annotation-test--list-delete-without-id-messages ()
   "列表行无批注 id 时删除仅 message 提示，不发起请求、不抛错."
@@ -798,7 +933,7 @@ CELL 是一个 (LIST) 形态的 cons 表达式，`(car CELL)' 收集按调用顺
                  (push (apply #'format format-string args) messages))))
       (should (= 0 (seshat-reader-annotation--apply-highlights items)))
       (should (= 1 (length messages)))
-      (should (string-match-p "高亮模块未加载" (car messages)))
+      (should (string-match-p "装饰模块不可用" (car messages)))
       ;; 第二次刷新：仍返回 0，但不重复提示（`--highlight-warned' 已置 t）
       (should (= 0 (seshat-reader-annotation--apply-highlights items)))
       (should (= 1 (length messages)))

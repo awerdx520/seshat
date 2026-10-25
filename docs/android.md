@@ -138,12 +138,22 @@
 
 两个阅读器的目录都是**左侧滑出的树形抽屉**（`reader/TocDrawer.kt` + `reader/TocAdapter.kt`），取代 M10.6/M10.8 的 `AlertDialog.setSingleChoiceItems` 扁平列表。入口仍是顶栏「目录」（EPUB M10.8 从底栏移上来、PDF M10.8 新增）。
 
+**术语（2026-10-25 定案，见 `openspec/decisions.md`）**
+
+- **目录 / 大纲（outline / TOC）**：文档自带的**结构**——PDF 的 outline、EPUB 的 nav / NCX 层级。代码里对应 `PdfOutlineReader` / `EpubBook.tocTree`。
+- **书签（bookmark）**：用户自己插的**位置标记**（`PdfBookmark`，按页升序，无正文、无几何）。它是位置而不是标注，**不会**出现在批注列表里，也永不进入 `annotations.kind`。
+- **导航面板**：`TocDrawer` 同时以两个 Tab 承载「目录」与「书签」，故文档与代码注释统一称它为**导航面板（目录 + 书签）**；`PdfOutlineReader` 的**类名不改**（只把注释里的「书签」纠正为「目录 / 大纲」——它读的是 PDF outline，不是用户书签）。
+
+**状态行拆键（2026-10-25）**：底部固定状态行原来把页码与书签数拼成一句（「第 %1$d/%2$d 页 · %1$d 个书签」）。现拆为两个独立字符串资源——`pdf_toc_status`（只含「第 %1$d/%2$d 页」）与 `pdf_bookmark_count`（「%1$d 个书签」）——**拼接动作放在调用方**（`PdfReaderActivity` 传 `statusLine`，分隔符是常量 `TocDrawerText.STATUS_SEPARATOR` = `" · "`），因为 `TocDrawer` 的架构约束是「视图全部代码构建、**不引用任何 `R.string.`**」（两个阅读器共用同一实现，页面语义只能由调用方给）。
+
+**`bookmarksSupported`（2026-10-25）**：`TocDrawer.show(..., bookmarksSupported: Boolean = true)` 的显式参数声明「当前阅读器是否有书签入口」。**EPUB 没有任何书签入口**（调用方传 `bookmarks = emptyList()` + `bookmarksSupported = false`），此时空态只渲染「尚无书签」一行、**不**再提示「阅读时点顶栏的书签图标可添加」（那个按钮在 EPUB 里不存在，属错误指引）。
+
 **数据来源两条链**
 
 | 链 | 来源 | 层级 | 跳转目标 |
 |---|---|---|---|
 | EPUB | `EpubParser.parseNavTree(navXml, baseDir)`（EPUB3 nav）/ `parseNcxTree(ncxXml, baseDir)`（EPUB2 NCX）→ `EpubBook.tocTree` | 保留 `<ol><li>` / `<navPoint>` 嵌套 | `TocNode.href` 是**已归一化的 epub 根相对路径**，可直接与 `chapters[i].href` 精确比较 |
-| PDF | `reader/PdfOutlineReader.kt` 读书签树（PdfBox，后台线程）→ `PdfOutlineItem` | 保留书签嵌套（受下方三重上限约束） | `pageIndex`（0 起页索引）；`-1` = 纯 URI 链接书签，不可跳转 |
+| PDF | `reader/PdfOutlineReader.kt` 读**大纲 / 目录**（PDF outline，PdfBox，后台线程）→ `PdfOutlineItem` | 保留大纲嵌套（受下方三重上限约束） | `pageIndex`（0 起页索引）；`-1` = 纯 URI 链接项，不可跳转 |
 | PDF 回退 | 无 outline 或解析失败 → `PdfOutlineReader.pageDirectory(pageCount)` 的「第 N 页」列表，转成同构 `PdfOutlineItem` | 一级 | 每行一页 |
 
 - **`href` 的 base 是 nav/ncx 文档自身所在目录**（不是 `opfDir`）：`OEBPS/text/nav.xhtml` 里的 `ch1.xhtml` 归一化为 `OEBPS/text/ch1.xhtml`。归一化在**解析层**完成一次，行模型里**不要**再传 `opfDir` 二次归一化（会拼出 `OEBPS/OEBPS/x`）。
@@ -170,7 +180,7 @@
 
 | 操作 | 行为 |
 |---|---|
-| 顶栏「目录」 | 打开抽屉；PDF 侧先在 `ioExecutor` 上读书签树、读完再弹；已打开时再点则关闭 |
+| 顶栏「目录」 | 打开抽屉；PDF 侧先在 `ioExecutor` 上读大纲、读完再弹；已打开时再点则关闭 |
 | 打开时 | 自动展开当前章 / 当前页的**祖先链**（长目录若整树全展开会把当前项挤出屏幕）、`scrollToPosition` 滚到该项并高亮 |
 | 点箭头 `▸/▾` | 折叠 / 展开（仅 `hasChildren` 的行有箭头） |
 | 点标题 | `targetIndex >= 0` → 关闭抽屉并跳转；`targetIndex = -1` 的纯容器行 → **只切换折叠**（不跳第一页） |
@@ -199,8 +209,8 @@
 | 上限 | 值 | 防的是什么 |
 |---|---|---|
 | `MAX_OUTLINE_BYTES` | 50 MiB | 文件大小闸门（超大 PDF 直接跳过解析，不 OOM） |
-| `MAX_DEPTH` | 64 | 书签树递归深度（防栈溢出） |
-| `MAX_NODES` | 5000 | 节点总数预算（防海量兄弟书签撑爆内存） |
+| `MAX_DEPTH` | 64 | 大纲树递归深度（防栈溢出） |
+| `MAX_NODES` | 5000 | 节点总数预算（防海量兄弟节点撑爆内存） |
 
 - `BoundedInputStream`：**不信任** `ContentResolver.openAssetFileDescriptor().length`——外部 provider 自报值可以谎报（`0` / `-1` / 远小于实际），包一层限流把 50 MiB 从「provider 说了算」变回「App 说了算」。
 - 加密 / 损坏 / 超大 / 越界一律返回**空表或空串**，不抛异常：目录解析或文本提取失败不得让阅读器崩。
@@ -225,7 +235,7 @@
 - **手写面板**（`activity_pdf_reader.xml` 的 `inkPanel`，仅手写模式显示）：参数面板是**屏幕右侧竖排浮动条**，宽 **96dp**、`layout_gravity="end|center_vertical"`（`R.id.content` 上覆一层，独立于顶部浮层），含 `✕`（退出手写）/ 撤销 / 清空 与 6 色 × 3 档粗细（归一化 0.0025 / 0.004 / 0.007）× 3 种笔型；选中态用 alpha 1.0 / 0.35 区分。**面板不属于顶部浮层**，故不计入 `ReaderChrome` / `applyContentPadding` 的浮层高度——不影响顶部栏高度，也不改变阅读区 padding。`c4a76d3` 之前该面板横排在顶栏内（分「颜色行 / 粗细行 / 笔型行」三行以避开 360dp 屏横向溢出），竖排后宽度固定、条数随内容纵向增长。
 - **手写条覆盖正文右缘**：96dp 在实测设备（`24091RPADC`，density 2.75）为 **264px**，手写模式下这条带内的正文不可书写（未做右侧留白），见 §6.7 第 10 条。
 - **进入 / 退出**：双击阅读区，或顶栏「手写」按钮；手写模式下单击**不翻页**（落笔优先）。
-- **长按菜单**：复制本页文字（`PDFTextStripper` 提取当前页，写入剪贴板前截断到 10 万字符，防 binder 事务超限）/ 高亮标注 / 进入手写。
+- **长按菜单**：复制本页文字（`PDFTextStripper` 提取当前页，写入剪贴板前截断到 10 万字符，防 binder 事务超限）/ 添加本页备注 / 进入手写。
 
 ### 6.7 已知限制
 
@@ -244,14 +254,36 @@
 
 ### 6.8 批注抽屉（M10.3）
 
-两个阅读器的顶栏「批注」按钮改为打开**左侧滑出的批注抽屉**（`reader/AnnotationDrawer`），列出当前书的全部批注。
+两个阅读器的顶栏「批注」按钮改为打开**左侧滑出的批注抽屉**（`reader/AnnotationDrawer`），列出当前书的全部批注。**术语**：列表里的每一行都是**批注（annotation）**；「书签」是位置标记，不进本列表（见 §6.4）。
+
+**批注类型（`kind`，2026-10-25 起为单维类型）**：`kind` 只表类型，「有没有备注」由 `text` 空 / 非空表达——**加备注不改 `kind`**。Android 两端落地：**EPUB** 选中即 `kind=highlight` + `selectedText`，编辑备注并保存也**不**把 `kind` 改成 `note`（与 PDF 一致；EPUB 当前 UI 下没有页级 `note` 创建入口，`note` 分支只对存量记录生效）；**PDF** 顶栏／长按菜单的「添加本页备注」写 `kind=note` + `location=page:<n>`（**无** `rect:`，代之以页面几何的采集仍未做，见 tech-debt）。
 
 - **复用 `TocDrawer` 骨架**：遮罩 + `translationX` 面板，**不用 `DrawerLayout`**（其边缘横向手势与横向翻页抢事件），面板宽 `min(320dp, 屏宽 × 0.78)`；零新增 XML / 零 `R.id.`，视图全部代码构建。与目录抽屉**互斥**（同时只开一个，由 Activity 打开前先关另一个）。
-- **按 `kind` 分组**：分组逻辑全在纯函数 `reader/AnnotationGrouping.group(items, currentPage)`，**顺序固定**「备注 → 高亮 → 手写 → 其它」，未知 `kind` 归入「其它」且每行保留原始 `kind` / `id`（仍可跳转与删除）。文案是取值契约：`[待同步]`（`dirty`）、「本页 N 处手写」/「共 N 处手写」。
+- **按 `kind` 分组**：分组逻辑全在纯函数 `reader/AnnotationGrouping.group(items, currentPage)`，**顺序固定**「便签 → 高亮 → 手写 → 其它」（`TITLE_NOTE` / `TITLE_HIGHLIGHT` / `TITLE_INK` / `TITLE_OTHER`），未知 `kind`（含已定语义但尚未实现的 `underline` / `strikeout`）归入「其它」且每行保留原始 `kind` / `id`（仍可跳转与删除）。文案是取值契约：`[待同步]`（`dirty`）、「本页 N 处手写」/「共 N 处手写」。
 - **ink 默认折叠**：`kind=ink` 在服务端是**一笔一条**，逐条渲染会淹没文本批注，故折叠成一条汇总行（`AnnotationGrouping.INK_SUMMARY_ID`，`count` = 笔数）。**文案与页号是两件事**：页号取 `inkItems.map { it.page }.distinct().singleOrNull()`（全部笔迹同页才有 `page`），文案只由「是否同页且等于当前页」决定——同页且等于当前页 → 「本页 N 处手写」；其余（跨页 / 有笔迹缺页号 / 同页但不是当前页）→ 「共 N 处手写」。**因此「共 N 处手写」也可能带 `page`、可跳转**，只有跨页或缺页号时才 `page = null`、不可跳页（跳转目标取该组第一条 ink 记录的页）。
 - **跳转**：点条目行 → `RET` 语义的跳转（PDF 按 `page:<n>` 翻页；EPUB 按 `chapter:<i>@<s>-<e>` 跳章 + 章内按字符偏移滚动，见 §9 与 `LocationScroll`）；ink 汇总行按该组第一条 ink 记录的页定位。
-- **编辑 / 删除**：`note` / `highlight` 行有「⋮」菜单（编辑备注 / 删除）；`ink` 汇总行**不可删除**——「⋮」隐藏、长按只提示（背后是 N 条独立记录，批量删除需服务端按 location 前缀查询，属另一轮，见 `openspec/tech-debt.md`）。
+- **编辑 / 删除**：`note` / `highlight` 行有「⋮」菜单（**编辑便签** / 删除）；`ink` 汇总行**不可删除**——「⋮」隐藏、长按只提示（背后是 N 条独立记录，批量删除需服务端按 location 前缀查询，属另一轮，见 `openspec/tech-debt.md`）。
 - **返回键优先关抽屉**：`OnBackPressedCallback` 中先判 `annotationDrawer.isShowing` → `hide()` 并吞掉返回，其次才是退出阅读器；打开目录/抽屉前也会先关另一块浮层。
+
+### 6.9 导出手写副本（`.seshat.pdf`）
+
+PDF 阅读器溢出菜单「导出手写副本」（`pdf_menu_export_ink` → `PdfReaderActivity.exportInkCopy`）把本地笔迹与高亮批注写成一份**标准 PDF 副本**，供通用阅读器查看（`reader/PdfInkExporter`，纯逻辑、无 Android 依赖，JVM 可测）。
+
+- **命名与去重**：同目录 `<源文件名去 .pdf>.seshat.pdf`；**目标已存在时依次尝试** `-1`、`-2`…，**绝不覆盖**。对已导出的副本再次导出会先剥掉 `.seshat` 中缀（得到 `a.seshat-1.pdf`，不是 `a.seshat.seshat.pdf`）；循环条件同时排除源路径本身。
+- **源文件只读**：源只以 `PDDocument.load`（只读）打开，结果先写同目录 `<目标>.part` 临时文件，成功后 `renameTo` 目标名（同目录原子改名）；任何异常路径都删掉临时文件并返回可读的中文错误，**绝不写回源文件**——源文件可能正在 WebDAV 同步、或带签名，原地修改会破坏签名并制造同步冲突。
+- **批注路径**：
+  - 笔迹 → `/Subtype /Ink`（`/Rect`、`/C`、`/CA`、`/F`、`/BS`、`/InkList`），再交给 `PDInkAppearanceHandler` 生成外观流。
+  - 高亮 → `/Subtype /Highlight` 文本标记批注 + `/QuadPoints` + `PDHighlightAppearanceHandler` 生成的 `/AP`。
+  - **必须显式生成 `/AP`**：PDF 查看器不保证为批注现算外观，没有 `/AP` 的 `/Ink` 或 `/Highlight` 在不少阅读器里直接不可见（pdfbox-android 2.0.27.0 的 `PDAnnotationTextMarkup.constructAppearances()` 对 `/Highlight` 并不产出 `/AP`）。该库没有 `PDAnnotationInk` 便捷类，故 `/Ink` 按规范直接构造 `COSDictionary`。
+- **口径一致性**：归一化坐标 → PDF point 的 y 翻转只在 `pagePoint` 一个落点；线宽复用 `InkAnnotationMapper.widthPt` × `InkGeometry.styleWidthScale`；透明度复用 `InkGeometry.styleAlpha`（屏幕上 `Paint.setAlpha` 会覆盖颜色自带 alpha，导出必须同口径，否则荧光笔会变成实心粗线）。
+- **高亮统一色**：所有 `/Highlight` 用 `0xFFFFD900`（`PdfInkExporter.DEFAULT_HIGHLIGHT_ARGB`，与 Emacs 端 `seshat-reader-annotation-highlight-color` 默认 `(1.0 0.85 0.0)` 一致）——`PdfAnnotation` 没有颜色字段，`/Highlight` 的外观流由 Multiply 混合生成，天然半透明。
+- **跳过与拒绝**：
+  - **旋转页（`/Rotate` ≠ 0）跳过**：归一化坐标相对**渲染后（已应用旋转）**的显示矩形，与 PDF 用户空间差一个 90° 旋转。被跳过页数在结果里回报，提示语为「已导出 X（N 页未导出）」。若全部页被跳过（旋转/越界），不产出空副本，报错。
+  - **`content://` 源不支持**：SAF 等来源拿不到可写的同目录路径，直接提示「仅本地文件可导出副本」，而不是把副本悄悄写到别处（用户找不到，也会与书库扫描结果不一致）。
+  - **没有可导出内容**（无 ≥2 点的笔迹、也无含 `rect:` 的 `kind=highlight`）时不加载 PDF、不生成任何文件，提示「没有手写或高亮，无需导出」。
+- **线程**：笔迹与批注在**主线程**取出（prefs 读取很轻），PDF 解析 + 写盘交给 `ioExecutor`；完成后回主线程 toast。
+- **副本会进书库**：副本写在源文件同目录，若该目录在书架扫描范围内，导出结果会作为**一本新书**出现在书架上。是否改为导出到「下载」目录属产品决策，见 `openspec/tech-debt.md`。
+- **真机验收待办**：本机无 AVD / 设备，导出链路的 JVM 单测覆盖命名去重、坐标换算与降级分支；「导出后在第三方阅读器里可见且位置一致」仍需真机验收。
 
 ## 7. 书架（M10.6 B3）
 

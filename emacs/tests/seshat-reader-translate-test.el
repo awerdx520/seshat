@@ -925,7 +925,9 @@ M 为链路上 `message' 的文本。
           (should (equal seshat-reader-translate-last-result
                          seshat-reader-translate-test--translated-text))
           (cl-letf (((symbol-function 'seshat-rest-create-annotation)
-                     (lambda (uid location text)
+                     ;; create 自 v8 起有 5 个实参（新增 kind / selected-text）；
+                     ;; 桩点用 &optional 兜住，仍只断言前三个实参。
+                     (lambda (uid location text &optional _kind _selected)
                        (push (list uid location text) created)
                        '((id . 42))))
                     ((symbol-function 'seshat-rest-resolve-uid)
