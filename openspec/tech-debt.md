@@ -1384,3 +1384,15 @@
 - 影响：极端情形下可能误判——源 buffer 名本身形如 `*Seshat Sidebar*`、或含 `*Outline of ` 文本时，推断可能命中错的 kind，`q` 关掉的是另一个面板（或退回 `seshat-reader-sidebar-toggle` 把面板全关）。实际触发需要用户把文件 buffer 命名成面板名，概率极低；两个判据函数是既有契约，本批次**未改**。
 - 来源：`openspec/active/2026-10-24-emacs-reader-panel-childframe-and-ux.md`
 - 解除条件：kind 改由 buffer-local 变量（或面板自身的 `seshat-reader-panel-kind` frame/window parameter——后者已是 childframe 的唯一判据）承载，`q` 直接读它，不再解析名字。
+
+## 跨计划协调：gt 预设查表有两处，迁移预设必须同步修改
+
+- 现象：`seshat-reader-translate--translator` 与
+  `seshat-reader-translate--preset-chatgpt-engine` 各自执行
+  `(alist-get preset (gt-ensure-plain gt-preset-translators))`。若按
+  `openspec/active/2026-10-25-reader-translate-preset-isolation-and-explain-quality.md`
+  把 `reader` / `reader-explain` 移出全局 `gt-preset-translators`、改存自定义变量，只改
+  `--translator` 会让追问（`C-c C-q`）取不到 ChatGPT 引擎，直接 `user-error`。
+- 影响：多轮追问功能立刻失效（且错误信息只提示"预设引擎不支持多轮"）。
+- 来源：本计划 T5 实现与上述并行计划的 T1 冲突面（2026-10-25 代码审查发现）。
+- 解除条件：两处查表统一为一个辅助函数（如 `--preset-translator`），或迁移时同时改两处并补一条 ERT 断言「预设迁出后 `--preset-chatgpt-engine` 仍能取到引擎」。
