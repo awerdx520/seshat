@@ -132,6 +132,12 @@
 (defvar seshat-reader-current-doc-pagecount nil
   "Total page count of the current document, set by the native module.")
 
+;; 本模块**不碰** `n' / `p'：阅读 buffer 里这两个键在 evil normal state 下由
+;; `seshat-reader' 的 evil 段统一补绑为翻页（`seshat-reader-next-page' /
+;; `-previous-page'），搜索会话不改变该语义；会话内的命中导航由临时键表
+;; `seshat-reader-search--map' 提供，会话一结束即自动失效。侧栏内的 `n' / `p'
+;; 是「上下移动条目」，绑在 `seshat-reader-search--sidebar-map' 上。
+
 (defgroup seshat-reader-search nil
   "Cross-page text search in `seshat-reader-mode'."
   :group 'seshat-reader)
@@ -430,7 +436,7 @@ The **search sidebar is dropped too** (see
   (setq seshat-reader-search--capped nil)
   (setq seshat-reader-search--origin-page nil)
   (setq seshat-reader-search--doc-id nil)
-  (seshat-reader-search--set-extra-hook nil)
+  (seshat-reader-search--uninstall-hook)
   (seshat-reader-search--clear-sidebar))
 
 (defun seshat-reader-search--active-decorations ()
@@ -479,13 +485,23 @@ when the entry point is missing, and never signals."
 (defun seshat-reader-search--install-hook ()
   "Install `seshat-reader-search--active-decorations' as the extra source.
 The variable only exists when the annotation module is loaded; without it
-the degraded path in `seshat-reader-search--redraw' is used instead."
+the degraded path in `seshat-reader-search--redraw' is used instead.
+
+The reader's `post-command-hook' is armed here as well
+\\(`--sidebar-follow-page'): paging does not call into this module at all (the
+page is displayed by the native module), so a command hook is the cheapest
+place to keep the sidebar's \"hits on this page\" highlight on the page that is
+now on screen.  It is buffer-local, so it dies with the session buffer."
   (seshat-reader-search--set-extra-hook
-   #'seshat-reader-search--active-decorations))
+   #'seshat-reader-search--active-decorations)
+  (add-hook 'post-command-hook #'seshat-reader-search--sidebar-follow-page nil t))
 
 (defun seshat-reader-search--uninstall-hook ()
-  "Stop contributing decorations to the annotation redraw path."
-  (seshat-reader-search--set-extra-hook nil))
+  "Stop contributing decorations to the annotation redraw path.
+The sidebar page-follow hook of the session is removed too, so paging a buffer
+without a session costs nothing."
+  (seshat-reader-search--set-extra-hook nil)
+  (remove-hook 'post-command-hook #'seshat-reader-search--sidebar-follow-page t))
 
 (defun seshat-reader-search--redraw ()
   "Redraw the page decorations, keeping annotation and flash decorations.
@@ -643,6 +659,9 @@ close."
           (when (overlayp seshat-reader-search--sidebar-cursor)
             (delete-overlay seshat-reader-search--sidebar-cursor)
             (setq seshat-reader-search--sidebar-cursor nil))
+          ;; 「当前页的匹配」那一整组 overlay 同理（见
+          ;; `--sidebar-highlight-page'）。
+          (seshat-reader-search--sidebar-clear-page-overlays)
           (set-buffer-modified-p nil)))))
   (ignore-errors
     (when (seshat-reader-sidebar-panel-visible-p 'search)
@@ -763,6 +782,84 @@ Best effort: a marker without a live buffer does nothing."
                         (save-excursion (goto-char marker) (line-end-position)))
           (overlay-put overlay 'window window))))))
 
+;;; 当前页的匹配在侧栏里高亮
+
+;; 翻页（`n' / `p'、`M-<' / `M->'、鼠标滚动到页边界、`RET' 跳页）之后，侧栏里
+;; 属于**新页面**的条目要能一眼看出来：只靠「当前命中」那一行的 `hl-line' 不够，
+;; 因为读者想知道的是「这一页在结果里还有哪几处」。故除 `--sidebar-cursor'（跟随
+;; 命中）外，另加**一组** overlay 标出当前页的全部条目。
+
+(defface seshat-reader-search-sidebar-current-page
+  '((t :inherit secondary-selection))
+  "搜索结果侧栏中「当前页的匹配」的高亮.
+默认继承 `secondary-selection'，故随主题变化；侧栏里「当前命中」那一行走
+`hl-line'（见 `--sidebar-cursor'），两者可以同时出现在同一行上。"
+  :group 'seshat-reader-search)
+
+(defvar-local seshat-reader-search--sidebar-page-overlays nil
+  "侧栏 buffer 里标出「当前页的匹配」的 overlay 列表.
+每个 overlay 覆盖**一条**属于当前页的侧栏行。整组随页面切换重建（先全删再新建），
+故重复调用不会叠加；`--clear-sidebar' 清空侧栏内容时一并删除。")
+
+(defvar-local seshat-reader-search--sidebar-page-shown nil
+  "上一次在侧栏里高亮的页号（1-based），或 nil.
+只用于 `--sidebar-follow-page' 的提前返回：同页的连续命令不重建 overlay。")
+
+(defun seshat-reader-search--sidebar-clear-page-overlays ()
+  "Delete every overlay of `--sidebar-page-overlays' in the current buffer."
+  (mapc (lambda (overlay)
+          (when (overlayp overlay) (delete-overlay overlay)))
+        seshat-reader-search--sidebar-page-overlays)
+  (setq seshat-reader-search--sidebar-page-overlays nil))
+
+(defun seshat-reader-search--sidebar-highlight-page (page)
+  "Highlight the sidebar entries whose hit is on PAGE (1-based).
+侧栏 buffer 不存在、`--sidebar-markers' 为空或 PAGE 不是整数时只清旧高亮并
+返回。**不改 point、不滚动**：位置跟随是 `--sidebar-sync' 的职责，两者可以同时
+存在于同一条侧栏行上（当前命中的 `hl-line' + 当前页的 `secondary-selection'）。
+
+高亮用 overlay 而非 `add-face-text-property'：侧栏只读，但 overlay 不写 buffer
+内容，重渲染（`erase-buffer' + 重新 `insert'）后不会留下文本属性残渣，删除也不
+需要 `inhibit-read-only'。行范围取 `line-end-position'，与 `--sidebar-cursor'
+一致（覆盖整行，包括折行后的续行由 overlay 的 face 自然延续）。"
+  (let ((buffer (get-buffer seshat-reader-search-sidebar-buffer-name)))
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (seshat-reader-search--sidebar-clear-page-overlays)
+        (when (and (integerp page) seshat-reader-search--sidebar-markers)
+          (let ((entries seshat-reader-search--sidebar-matches)
+                (markers seshat-reader-search--sidebar-markers))
+            (while (and entries markers)
+              (let ((marker (car markers)))
+                (when (and (eql (nth 0 (car entries)) page)
+                           (marker-position marker))
+                  (let ((overlay (make-overlay
+                                  marker
+                                  (save-excursion
+                                    (goto-char marker)
+                                    (line-end-position))
+                                  buffer)))
+                    (overlay-put overlay 'face
+                                 'seshat-reader-search-sidebar-current-page)
+                    (push overlay seshat-reader-search--sidebar-page-overlays))))
+              (setq entries (cdr entries)
+                    markers (cdr markers)))))))))
+
+(defun seshat-reader-search--sidebar-follow-page ()
+  "把侧栏的「当前页高亮」跟到阅读 buffer 现在显示的页.
+挂在阅读 buffer 的 `post-command-hook' 上（会话存续期间，见 `--install-hook'）：
+翻页命令（`seshat-reader-next-page' 等）与 `RET' 跳页都会经过它，而搜索模块本身
+在翻页时**不会**被调用（页显示由动态模块完成，不经过本模块的任何函数），故这是
+最轻的接线点——不做任何 buffer 扫描，只比一次页号。
+
+只有会话仍在进行（`--active' 且 `--matches' 非空）时才工作；页号与上次记录的
+`--sidebar-page-shown' 相同则直接返回，避免每条命令都重建 overlay。"
+  (when (and seshat-reader-search--active seshat-reader-search--matches)
+    (let ((page (seshat-reader-search--current-page)))
+      (unless (eql page seshat-reader-search--sidebar-page-shown)
+        (setq seshat-reader-search--sidebar-page-shown page)
+        (seshat-reader-search--sidebar-highlight-page page)))))
+
 (defun seshat-reader-search--sidebar-scroll (window position)
   "Scroll WINDOW to show POSITION, roughly centred, without moving focus.
 Same frame: `with-selected-window' + `recenter' — the window is selected only
@@ -837,11 +934,19 @@ keystrokes, not failures."
 The page is shown first so that the redraw reads the page number of the page
 that is now on screen, then the decorations are re-fed: the full redraw keeps
 annotations and the selection flash alive (see
-`seshat-reader-search--redraw') and swaps the search hits to the new page."
+`seshat-reader-search--redraw') and swaps the search hits to the new page.
+
+The reading buffer's transient keymap is re-armed here as well
+\(`--arm-transient-map' with BUFFER): it is dropped as soon as one command runs
+in another buffer (the sidebar), so a jump from the sidebar must re-arm it or
+the next `n' / `p' pressed in the reading buffer would fall through to evil's
+own bindings."
   (with-current-buffer buffer
     (setq seshat-reader-search--index index)
     (seshat-reader-search--goto-page page)
-    (seshat-reader-search--redraw)))
+    (seshat-reader-search--redraw)
+    (when seshat-reader-search--active
+      (seshat-reader-search--arm-transient-map buffer))))
 
 (defun seshat-reader-search--sidebar-jump (page index)
   "Show PAGE and highlight hit INDEX in the reading buffer of the sidebar.
@@ -922,6 +1027,13 @@ working; only the four keys that mean something here are overridden."
   "n"   #'seshat-reader-search-sidebar-next
   "p"   #'seshat-reader-search-sidebar-prev)
 
+(defconst seshat-reader-search--sidebar-line-spacing 2
+  "搜索结果侧栏的行距（`line-spacing'，单位像素）.
+侧栏每条命中是一行「[p.N] 片段」，窄栏里片段会折成两三行；行距为 0 时相邻
+命中在视觉上粘成一片，辨认成本明显高于占用的那点高度。取 2：条目之间能看出
+分界，又不会让一屏装不下几条。用 `setq-local' 写进侧栏 buffer，只影响该
+buffer，不改全局 `line-spacing'。")
+
 (defun seshat-reader-search--render-sidebar (matches)
   "Render MATCHES into the search sidebar buffer and show the panel.
 The sidebar is a **read-only text buffer** (\\`special-mode', `q' closes only
@@ -929,6 +1041,9 @@ this panel) listing one line per hit — \"[p.PAGE] snippet\" — under a header
 stating the query and how many hits were found.  Width comes from the panel
 machinery: kind `search' is pinned to the left side and takes the slot after
 `outline', so it coexists with the table of contents instead of replacing it.
+Line spacing is set to `seshat-reader-search--sidebar-line-spacing' (2 px) so
+consecutive hits stay visually separated in the narrow column; it is a
+buffer-local `line-spacing', not a global setting.
 
 MATCHES is the search module's flat hit list (PAGE X0 Y0 X1 Y1 ...), i.e. the
 value of `seshat-reader-search--matches'.  Rendering happens **in the buffer of
@@ -989,6 +1104,9 @@ buffer 之前**取（C 侧矩形查询要求当前 buffer 就是文档 buffer）
           ;; 不折行，故显式置 nil）。
           (setq truncate-lines nil)
           (setq word-wrap t)
+          ;; 行距：条目之间留出可见间隔（见
+          ;; `seshat-reader-search--sidebar-line-spacing'）。
+          (setq-local line-spacing seshat-reader-search--sidebar-line-spacing)
           (goto-char (point-min))
           (set-buffer-modified-p nil)
           (setq buffer-read-only t))))
@@ -1010,16 +1128,27 @@ paging everywhere else."
   "RET" #'seshat-reader-search-accept
   "C-g" #'seshat-reader-search-quit)
 
-(defun seshat-reader-search--arm-transient-map ()
-  "Arm `seshat-reader-search--map' until the session ends or another key runs.
+(defun seshat-reader-search--arm-transient-map (&optional buffer)
+  "Arm `seshat-reader-search--map' for BUFFER (default: the current buffer).
 The keep predicate requires both an active session and the same buffer, so
 switching away from the document exits the session cleanly instead of
-shadowing keys in an unrelated buffer."
-  (let ((buffer (current-buffer)))
+shadowing keys in an unrelated buffer.  The session flag is read from BUFFER
+itself (not from whatever buffer the next command happens to run in), so the
+predicate stays correct when it fires after the reader switched to another
+window.
+
+BUFFER is explicit rather than implicitly `(current-buffer)' so the map can
+also be re-armed from the sidebar jump path (`--sidebar-jump-in', which runs
+inside the reader buffer) — the map is dropped as soon as one command runs in
+a different buffer (e.g. the sidebar), and a stale-free re-arm is what makes
+`n' / `p' work again after the reader comes back from the sidebar."
+  (let ((buffer (or buffer (current-buffer))))
     (set-transient-map seshat-reader-search--map
                        (lambda ()
-                         (and seshat-reader-search--active
-                              (eq buffer (current-buffer)))))))
+                         (and (eq buffer (current-buffer))
+                              (buffer-live-p buffer)
+                              (buffer-local-value 'seshat-reader-search--active
+                                                  buffer))))))
 
 ;;;; 交互命令
 
@@ -1109,7 +1238,10 @@ so."
     ;; 放在 `--show' 之后——页面高亮与状态行先就位，侧栏只是附加视图；渲染
     ;; 失败也不能影响已经成立的搜索会话。
     (seshat-reader-search--render-sidebar seshat-reader-search--matches)
-    (seshat-reader-search--arm-transient-map))))
+    ;; 显式传当前 buffer 给临时键表：`--render-sidebar' 的 `post-command-select-window'
+    ;; 虽然在**命令结束后**才把光标移进侧栏，但显式传参让这里的意图不依赖那个
+    ;; 时序细节。
+    (seshat-reader-search--arm-transient-map (current-buffer)))))
 
 ;;;###autoload
 (defun seshat-reader-search (needle)

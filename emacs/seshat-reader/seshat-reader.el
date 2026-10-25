@@ -1750,12 +1750,20 @@ window and never recovers."
 ;; + evil：normal state 下 `(key-binding (kbd "?"))' 为 `evil-search-backward'
 ;; 而不是 `seshat-reader-help'。
 ;;
-;; **只接管 `?'**：evil 的 `/`（正向搜索）、`n` / `N`（下一/上一处）一律不动。
+;; **只接管 `?' 与 `n' / `p'**：evil 的 `/`（正向搜索）、`N`（上一处）一律不动。
 ;; 阅读器自己的搜索走 `C-s'（`seshat-reader-search'，全程基于页面坐标、与
 ;; buffer 文本无关），evil 的 `?` 反向搜索在只读、单页位图的阅读 buffer 里没有
 ;; 用武之地，故让给帮助页；想保留 evil 反向搜索的用户可在自己配置里覆盖本绑定
 ;; （`(evil-define-key* 'normal seshat-reader-mode-map (kbd "?")
 ;; #'evil-search-backward)'）——本包只在**加载时**注册一次，不会再次抢回。
+;;
+;; `n' / `p' 在阅读 buffer 是**翻页**（`seshat-reader-next-page' /
+;; `-previous-page'，与 `seshat-reader-mode-map' 里的绑定一致），但 normal state
+;; 下被 `evil-search-next' / `evil-paste-after' 抢走；`hjkl' / `v' / `y' /
+;; `gg' / `G' 等原生键**一律不碰**，evil 的移动、可视选取与复制照旧可用。
+;; 搜索会话期间 `n' / `p' 的「下一个/上一个命中」由搜索模块的临时键表提供（见
+;; `seshat-reader-search--map'），会话一结束即恢复翻转页语义——本函数不参与该
+;; 切换，故两个模块不抢同一个键。
 ;;
 ;; 为什么用 `evil-define-key*'：它是**函数**（evil-core.el，签名
 ;; `(STATE KEYMAP KEY DEF &rest BINDINGS)'），把绑定写进 KEYMAP 关联的
@@ -1775,14 +1783,20 @@ window and never recovers."
 ;; `seshat-reader-sidebar-toggle'）。将来若某个 evil 版本占了它，按同一模式在
 ;; 本函数里加一对绑定即可。
 (defun seshat-reader--install-evil-bindings ()
-  "Install the reader's `?' binding for evil's normal state.
+  "Install the reader's `?' and `n' / `p' bindings for evil's normal state.
+`n' / `p' keep meaning \"next / previous page\" in the reading buffer (the
+same commands `seshat-reader-mode-map' binds); evil's `evil-search-next' /
+`evil-paste-after' would otherwise take them.  `hjkl' / `v' / `y' are left
+alone, so evil's motion, visual selection and yank stay available.
 
 Soft dependency: does nothing when evil (or `evil-define-key*') is absent, so
 loading this library never requires evil.  Extracted from the
 `with-eval-after-load' block below only so that it can be unit-tested."
   (when (fboundp 'evil-define-key*)
     (evil-define-key* 'normal seshat-reader-mode-map
-      (kbd "?") #'seshat-reader-help)))
+      (kbd "?") #'seshat-reader-help
+      "n"       #'seshat-reader-next-page
+      "p"       #'seshat-reader-previous-page)))
 
 ;; evil 可能在本文件之后才加载（用户把 evil 放在 init 更后面），故用
 ;; `with-eval-after-load' 挂到 evil 上：evil 已加载时立即执行，未加载则等它加载

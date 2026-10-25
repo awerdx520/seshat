@@ -1003,5 +1003,269 @@
           (should-not seshat-reader-search--sidebar-cursor)
           (should (= 0 (buffer-size))))))))
 
+;;; 搜索会话内的 `n' / `p'（evil normal state 与临时键表）
+
+(ert-deftest seshat-reader-search-test--sidebar-render-sets-line-spacing ()
+  "侧栏 buffer 的行距为 `--sidebar-line-spacing'（2），且不外溢到别的 buffer."
+  (seshat-reader-search-test--with-stubs
+    (with-temp-buffer
+      (setq seshat-reader-search--query "the")
+      (seshat-reader-search--render-sidebar
+       '((1 1.0 2.0 3.0 4.0) (2 5.0 6.0 7.0 8.0)))
+      (with-current-buffer seshat-reader-search-sidebar-buffer-name
+        (should (= 2 line-spacing))
+        (should (= seshat-reader-search--sidebar-line-spacing line-spacing)))
+      ;; 阅读 buffer 的 `line-spacing' 不受影响（是 `setq-local'，不是 setq）
+      (should-not line-spacing))))
+
+(ert-deftest seshat-reader-search-test--session-arms-transient-n-p ()
+  "搜索会话内 `n' / `p' / `RET' / `C-g' 解析为本模块的命令（临时键表）."
+  (unwind-protect
+      (seshat-reader-search-test--with-stubs
+        (with-temp-buffer
+          (setq overriding-terminal-local-map nil)
+          (setq seshat-reader-search-test--total-pages 2)
+          (setq seshat-reader-search-test--pages
+                '((1 . ((1.0 2.0 3.0 4.0))) (2 . ((5.0 6.0 7.0 8.0)))))
+          (seshat-reader-search "the")
+          (should seshat-reader-search--active)
+          ;; 临时键表已武装：键解析直达本模块命令
+          (should overriding-terminal-local-map)
+          (should (eq (key-binding (kbd "n")) #'seshat-reader-search-next))
+          (should (eq (key-binding (kbd "p")) #'seshat-reader-search-prev))
+          (should (eq (key-binding (kbd "RET")) #'seshat-reader-search-accept))
+          (should (eq (key-binding (kbd "C-g")) #'seshat-reader-search-quit))
+          ;; 只覆盖这四个键：evil 的移动/选取键不在临时键表里
+          (dolist (key '("h" "j" "k" "l" "v" "y"))
+            (should-not (lookup-key overriding-terminal-local-map key)))
+          ;; 会话结束后不再残留
+          (seshat-reader-search-accept)
+          (should-not seshat-reader-search--active)))
+    (setq overriding-terminal-local-map nil)))
+
+(ert-deftest seshat-reader-search-test--sidebar-jump-in-rearms-transient-map ()
+  "从侧栏跳页时重新武装阅读 buffer 的临时键表（否则回到阅读 buffer 后 `n' 失效）.
+临时键表在「命令切换了 buffer」时被注销——用户在侧栏里按过键之后，回到阅读
+buffer 的 `n' / `p' 就会落到 evil 的搜索/粘贴上。故跳页路径必须重新武装。"
+  (unwind-protect
+      (seshat-reader-search-test--with-stubs
+        (with-temp-buffer
+          (setq overriding-terminal-local-map nil)
+          (setq seshat-reader-search--active t)
+          (setq seshat-reader-search--index 0)
+          (cl-letf (((symbol-function 'seshat-reader-search--goto-page)
+                     (lambda (_page) nil))
+                    ((symbol-function 'seshat-reader-search--redraw)
+                     (lambda () nil)))
+            ;; 命中页（不触发 goto）+ 换页（触发 goto）两条路径都要重新武装
+            (seshat-reader-search--sidebar-jump-in (current-buffer) 1 0)
+            (should overriding-terminal-local-map)
+            (should (eq (key-binding (kbd "n")) #'seshat-reader-search-next))
+            (setq overriding-terminal-local-map nil)
+            (seshat-reader-search--sidebar-jump-in (current-buffer) 2 1)
+            (should (eq (key-binding (kbd "p")) #'seshat-reader-search-prev))
+            ;; 会话已结束（`--active' 为 nil）时不再武装
+            (setq overriding-terminal-local-map nil)
+            (setq seshat-reader-search--active nil)
+            (seshat-reader-search--sidebar-jump-in (current-buffer) 2 1)
+            (should-not overriding-terminal-local-map))))
+    (setq overriding-terminal-local-map nil)))
+
+(ert-deftest seshat-reader-search-test--goto-match-syncs-sidebar-without-goto ()
+  "`n' / `p' 的调用链 `--move' → `--goto-match' → `--sidebar-sync' 始终执行.
+命中就在当前页时不触发跳页，但侧栏仍必须同步到该命中（否则阅读侧换了命中、
+侧栏却停在上一条）。"
+  (seshat-reader-search-test--with-stubs
+    (with-temp-buffer
+      (setq seshat-reader-search--active t)
+      (setq seshat-reader-search--index 0)
+      (setq seshat-reader-search-test--current-page 1)
+      (setq seshat-reader-search--matches
+            '((1 1.0 2.0 3.0 4.0) (1 5.0 6.0 7.0 8.0)))
+      (let ((synced nil))
+        (cl-letf (((symbol-function 'seshat-reader-search--sidebar-sync)
+                   (lambda (index) (push index synced))))
+          (seshat-reader-search--move 1))
+        (should (equal synced '(1)))
+        ;; 没有跳页（命中就在当前页）
+        (should-not (seshat-reader-search-test--goto-pages))))))
+
+;;; 搜索会话不接管 `n' / `p'（2026-10-26 按用户要求撤销）
+
+;; 用户在阅读 buffer 里要的是「`n' / `p' 翻页」，而不是「下一个/上一个命中」。
+;; 命中导航只在**会话存续期间**由临时键表（`--map'）提供，落到阅读 buffer 的
+;; evil normal state 绑定由 `seshat-reader--install-evil-bindings' 统一负责
+;; （见 `seshat-reader' 的 evil 段）。`--install-hook' 因此只挂装饰与翻页跟随，
+;; 不碰任何 evil 键表。
+
+(ert-deftest seshat-reader-search-test--session-does-not-bind-n-p ()
+  "搜索会话不再补绑 `n' / `p'：旧的 session-evil-keys 机制整体移除."
+  (should-not (fboundp 'seshat-reader-search--install-evil-session-keys))
+  (should-not (fboundp 'seshat-reader-search--uninstall-evil-session-keys))
+  (should-not (boundp 'seshat-reader-search--session-evil-keys))
+  (should-not (boundp 'seshat-reader-search--saved-local-keys))
+  ;; `--install-hook' 也不得触碰 evil 的键表（evil 存在时同样不动）
+  (let ((evil-calls 0))
+    (cl-letf (((symbol-function 'evil-define-key*)
+               (lambda (&rest _args) (setq evil-calls (1+ evil-calls)) nil)))
+      (with-temp-buffer
+        (seshat-reader-search-test--with-stubs
+          (unwind-protect
+              (progn
+                (seshat-reader-search--install-hook)
+                (should (= 0 evil-calls)))
+            (seshat-reader-search--uninstall-hook)))))))
+
+(ert-deftest seshat-reader-search-test--install-hook-arms-page-follow ()
+  "`--install-hook' 把翻页跟高亮挂进本 buffer 的 `post-command-hook'，结束即摘掉."
+  (with-temp-buffer
+    (seshat-reader-search-test--with-stubs
+      (unwind-protect
+          (progn
+            (seshat-reader-search--install-hook)
+            (should (memq #'seshat-reader-search--sidebar-follow-page
+                          post-command-hook)))
+        (seshat-reader-search--uninstall-hook))
+      (should-not (memq #'seshat-reader-search--sidebar-follow-page
+                        post-command-hook)))))
+
+;;; 侧栏里「当前页的匹配」高亮
+
+(defvar seshat-reader-search-test--sidebar-buffer nil
+  "本用例里创建出来的 `*Seshat Search*' buffer（收尾时 kill）。")
+
+(defmacro seshat-reader-search-test--with-sidebar (matches &rest body)
+  "在已渲染 MATCHES 的结果侧栏 buffer 上求值 BODY.
+BODY 内 `seshat-reader-search-test--sidebar-buffer' 是侧栏 buffer；求值结束后
+（无论成败）kill 掉它，保证下一个用例从干净状态开始。"
+  (declare (indent 1) (debug t))
+  `(seshat-reader-search-test--with-stubs
+     (with-temp-buffer
+       (setq seshat-reader-search--query "the")
+       (let ((seshat-reader-search-test--sidebar-buffer nil))
+         (unwind-protect
+             (progn
+               (seshat-reader-search--render-sidebar ,matches)
+               (setq seshat-reader-search-test--sidebar-buffer
+                     (get-buffer seshat-reader-search-sidebar-buffer-name))
+               (should (buffer-live-p seshat-reader-search-test--sidebar-buffer))
+               ,@body)
+           (when (buffer-live-p seshat-reader-search-test--sidebar-buffer)
+             (kill-buffer seshat-reader-search-test--sidebar-buffer)))))))
+
+(defun seshat-reader-search-test--sidebar-line-texts (overlays)
+  "把 OVERLAYS 覆盖到的整行文本取出来（按 buffer 位置升序）."
+  (let ((buffer seshat-reader-search-test--sidebar-buffer)
+        texts)
+    (dolist (overlay (sort (copy-sequence overlays)
+                           (lambda (a b)
+                             (< (overlay-start a) (overlay-start b)))))
+      (push (with-current-buffer buffer
+              (buffer-substring-no-properties
+               (overlay-start overlay) (overlay-end overlay)))
+            texts))
+    (nreverse texts)))
+
+(ert-deftest seshat-reader-search-test--sidebar-highlight-page-marks-current-page ()
+  "只有当前页的条目带 `--sidebar-current-page' face；重复调用不叠加 overlay."
+  (seshat-reader-search-test--with-sidebar
+      '((1 1.0 2.0 3.0 4.0) (2 5.0 6.0 7.0 8.0) (1 9.0 10.0 11.0 12.0))
+    (seshat-reader-search--sidebar-highlight-page 1)
+    (with-current-buffer seshat-reader-search-test--sidebar-buffer
+      (should (= 2 (length seshat-reader-search--sidebar-page-overlays)))
+      ;; 两个 overlay 都落在 `[p.1]' 开头的行上（顺序与命中顺序一致）
+      (should (equal (mapcar (lambda (text) (substring text 0 5))
+                             (seshat-reader-search-test--sidebar-line-texts
+                              seshat-reader-search--sidebar-page-overlays))
+                     '("[p.1]" "[p.1]")))
+      ;; face 是本用例新增的那个（随主题，不在测试里断言具体颜色）
+      (dolist (overlay seshat-reader-search--sidebar-page-overlays)
+        (should (eq (overlay-get overlay 'face)
+                    'seshat-reader-search-sidebar-current-page)))
+      ;; 幂等：重复调用后 overlay 数量与内容都不变
+      (seshat-reader-search--sidebar-highlight-page 1)
+      (should (= 2 (length seshat-reader-search--sidebar-page-overlays)))
+      (should (= 2 (length (overlays-in (point-min) (point-max)))))
+      ;; 换页：只剩第 2 页那一条
+      (seshat-reader-search--sidebar-highlight-page 2)
+      (should (= 1 (length seshat-reader-search--sidebar-page-overlays)))
+      (should (equal (mapcar (lambda (text) (substring text 0 5))
+                             (seshat-reader-search-test--sidebar-line-texts
+                              seshat-reader-search--sidebar-page-overlays))
+                     '("[p.2]")))
+      ;; 没有匹配的页：高亮清空
+      (seshat-reader-search--sidebar-highlight-page 9)
+      (should-not seshat-reader-search--sidebar-page-overlays)
+      (should (= 0 (length (overlays-in (point-min) (point-max))))))))
+
+(ert-deftest seshat-reader-search-test--sidebar-highlight-page-follows-page-turn ()
+  "翻页后 `--sidebar-follow-page' 把高亮移到新页，且不改 point、不滚动."
+  (seshat-reader-search-test--with-sidebar
+      '((1 1.0 2.0 3.0 4.0) (2 5.0 6.0 7.0 8.0))
+    (let ((seshat-reader-search--active t)
+          (seshat-reader-search--matches '((1 1.0 2.0 3.0 4.0)
+                                           (2 5.0 6.0 7.0 8.0)))
+          (seshat-reader-search-test--current-page 1))
+      ;; 第 1 页：两条命中里的一条
+      (seshat-reader-search--sidebar-follow-page)
+      (with-current-buffer seshat-reader-search-test--sidebar-buffer
+        (should (= 1 (length seshat-reader-search--sidebar-page-overlays))))
+      ;; 翻页（桩变量即「当前页」）→ 高亮跟着走
+      (setq seshat-reader-search-test--current-page 2)
+      (seshat-reader-search--sidebar-follow-page)
+      (with-current-buffer seshat-reader-search-test--sidebar-buffer
+        (should (= 1 (length seshat-reader-search--sidebar-page-overlays)))
+        (should (equal (mapcar (lambda (text) (substring text 0 5))
+                               (seshat-reader-search-test--sidebar-line-texts
+                                seshat-reader-search--sidebar-page-overlays))
+                       '("[p.2]")))
+        ;; point 留在原处（新渲染的侧栏 point 在 `point-min'）
+        (should (= (point) (point-min))))
+      ;; 同一页的后续命令不重建 overlay（对象身份不变）
+      (let ((before (with-current-buffer seshat-reader-search-test--sidebar-buffer
+                      (car seshat-reader-search--sidebar-page-overlays))))
+        (should before)
+        (seshat-reader-search--sidebar-follow-page)
+        (should (eq before
+                    (with-current-buffer seshat-reader-search-test--sidebar-buffer
+                      (car seshat-reader-search--sidebar-page-overlays)))))
+      ;; 会话结束后不再工作
+      (setq seshat-reader-search--active nil)
+      (setq seshat-reader-search-test--current-page 1)
+      (seshat-reader-search--sidebar-follow-page)
+      (with-current-buffer seshat-reader-search-test--sidebar-buffer
+        (should (equal (mapcar (lambda (text) (substring text 0 5))
+                               (seshat-reader-search-test--sidebar-line-texts
+                                seshat-reader-search--sidebar-page-overlays))
+                       '("[p.2]")))))))
+
+(ert-deftest seshat-reader-search-test--clear-sidebar-drops-page-overlays ()
+  "`--clear-sidebar' 之后侧栏既没有内容也没有残留 overlay."
+  (seshat-reader-search-test--with-sidebar
+      '((1 1.0 2.0 3.0 4.0) (1 5.0 6.0 7.0 8.0))
+    (seshat-reader-search--sidebar-highlight-page 1)
+    (with-current-buffer seshat-reader-search-test--sidebar-buffer
+      (should (= 2 (length seshat-reader-search--sidebar-page-overlays))))
+    (seshat-reader-search--clear-sidebar)
+    (with-current-buffer seshat-reader-search-test--sidebar-buffer
+      (should-not seshat-reader-search--sidebar-page-overlays)
+      (should (= 0 (buffer-size)))
+      (should (= 0 (length (overlays-in (point-min) (point-max))))))))
+
+(ert-deftest seshat-reader-search-test--reset-state-clears-page-overlays ()
+  "`--reset-state'（换文档）同时清掉侧栏内容与「当前页」高亮."
+  (seshat-reader-search-test--with-sidebar
+      '((1 1.0 2.0 3.0 4.0))
+    (seshat-reader-search--sidebar-highlight-page 1)
+    (with-current-buffer seshat-reader-search-test--sidebar-buffer
+      (should (= 1 (length seshat-reader-search--sidebar-page-overlays))))
+    (with-temp-buffer
+      (setq seshat-reader-search--active t)
+      (setq seshat-reader-search--matches '((1 1.0 2.0 3.0 4.0)))
+      (seshat-reader-search--reset-state))
+    (with-current-buffer seshat-reader-search-test--sidebar-buffer
+      (should-not seshat-reader-search--sidebar-page-overlays)
+      (should (= 0 (buffer-size))))))
+
 (provide 'seshat-reader-search-test)
 ;;; seshat-reader-search-test.el ends here
