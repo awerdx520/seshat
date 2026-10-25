@@ -185,9 +185,9 @@ ETAF 渲染层是可选外部依赖：`Makefile` 先探测 `~/Workspace/emacs-ta
 
 `seshat-reader-select` 只绑一个事件：`[down-mouse-1]` → `seshat-reader-select-drag`（`seshat-reader-mode` 与 `special-mode` 都不占用该事件）。拖拽松手后：
 
-- 取矩形内文本，回显区显示截断摘要（上限 200 字符），完整文本存进 `seshat-reader-select-last`；
+- 取矩形内文本，**回显区只报行列数**——`seshat-reader-select-copy-to-kill-ring` 非 nil 时 `已复制 N 行 · M 字`，取 `nil` 时 `已选中 N 行 · M 字`；**不再回显正文**（回显正文既干扰阅读，也会把选中内容留在 `*Messages*` 里）。完整文本存进 `seshat-reader-select-last`；
 - 把选区矩形投给 C 渲染层闪现高亮，时长 `seshat-reader-select-flash-duration`（默认 `2.0` 秒，`<= 0` 关闭）；
-- `seshat-reader-select-copy-to-kill-ring` 默认 `nil`；设 `t` 才把文本 `kill-new` 进 kill ring。
+- `seshat-reader-select-copy-to-kill-ring` 默认 `nil`；设 `t` 才把文本 `kill-new` 进 kill ring（回显措辞同时由「已选中」变为「已复制」）。
 
 **字级高亮（框选贴合文字，而不是一个大方块）**：选区几何由 `seshat-reader-select-highlight-scope` 决定取哪一段文字，再由 elisp 侧的纯函数整理成可画的横条。
 
@@ -292,7 +292,8 @@ Emacs 端**只显示**手写（无笔事件、无压感，输入永远在 Androi
 |---|---|---|
 | `C-c C-t` | `seshat-reader-translate-selection` | 翻译最近一次选区 |
 | `C-c C-e` | `seshat-reader-translate-explain-selection` | 解释最近一次选区 |
-| `q`（面板内） | `seshat-reader-sidebar-toggle` | 关面板（`seshat-reader-translate-panel-mode` 承载） |
+| `q`（面板内） | `seshat-reader-sidebar-quit` | 关面板（`seshat-reader-translate-panel-mode` 承载；按 buffer 名推断 kind，child frame 承载时走 `delete-frame`） |
+| `C-c C-q`（面板内） | `seshat-reader-translate-follow-up` | 针对同一段原文继续追问（多轮上下文，见下文「继续追问」） |
 | `C-c C-s`（面板内） | `seshat-reader-translate-save-as-annotation` | 把最近一次译文存为批注 |
 
 - 依赖 go-translate：`seshat-reader-translate-preset`（默认 `reader`）与 `seshat-reader-translate-explain-preset`（默认 `reader-explain`）按名从 `gt-preset-translators` 取用，两个预设需在**用户配置侧**定义；缺失时翻译回退内置 youdao/google，解释需显式配置端点。gt 的中转 buffer `" *Seshat gt*"` 由包隐藏，用户无需改 `display-buffer-alist`。
@@ -301,6 +302,55 @@ Emacs 端**只显示**手写（无笔事件、无压感，输入永远在 Androi
 - `seshat-reader-translate-show-source`（默认 `t`）控制是否在正文前插入选中原文的引用块（不截断）。
 - `seshat-reader-translate-visual-fill-column`（默认 `t`）在面板启用 `visual-fill-column-mode`（软依赖，未安装静默跳过）。
 - 语言对由 `seshat-reader-translate-fallback-langs`（默认 `(en zh)`）推导，可用命令前缀参数覆盖。
+- **多引擎结果**：`seshat-reader-translate-engines-pick`（默认 `all`）——`all` 展示**全部**成功结果，每条前标注 `【引擎名】`、段间用 Markdown 分隔线 `---` 隔开（多引擎预设本就是为了一眼比对各家译文）；`first` / `last` 只展示第一个 / 最后一个**成功**结果，且**不带**来源标签。带 `gt-buffer-render-error-face` 的片段视为失败并跳过；来源取不到（单引擎不写前缀行）时退化为纯译文，不加标签也不加分隔线。旧的「拼接后不可区分」行为已不存在——想要单条输出请显式设为 `first`。
+- **流式增量**：`seshat-reader-translate-stream`（默认 `t`）边生成边显示，骨架只写一次、正文区替换、完成不重写；细节见下文「译文流式渲染」。
+- **继续追问**：`C-c C-q` 在面板里针对同一段原文继续提问，多轮上下文随请求发送；轮次上限 `seshat-reader-translate-follow-up-max-rounds`（默认 `6`），详见下文「继续追问」。
+
+## 面板承载（childframe / 窗口）
+
+阅读器的所有面板（`outline` 目录 / `annotations` 批注列表 / `translate` 译文与解释）都由承载层 `seshat-reader-sidebar` 显示，**承载方式**由 `seshat-reader-panel-carrier` 决定（M12 T8a 起默认 `childframe`）：
+
+| carrier | 行为 | 决定几何的配置 |
+|---|---|---|
+| `childframe`（**默认**） | child frame 覆盖在父 frame **右上角**，不参与窗口树：显示 / 刷新 / 滚动面板都**不改变阅读窗口的像素尺寸**，因此不会触发阅读器按窗口尺寸重新适配（版面跳动） | `seshat-reader-panel-width` / `-height` / `-margin` |
+| `window` | 沿用 side window / 底部窗口承载（进 `display-buffer` 窗口树，会压缩阅读区） | `seshat-reader-sidebar-position` / `-width` / `-height` / `-min-height` / `-max-height`、`seshat-reader-outline-sidebar-position` / `-width` |
+
+- **per-kind 覆盖**：`seshat-reader-panel-carrier-alist`（默认 `((annotations . window))`）按 kind 覆盖全局 carrier，键取 `outline` / `annotations` / `translate`。默认把**批注列表留在窗口承载**：条目多、需要长列表浏览与逐条跳转，覆盖浮层既遮挡正文又放不下。解析顺序见 `seshat-reader-sidebar--carrier-for-kind`：alist 命中项 → 全局值 → 非法取值静默回落 `window`。
+- **非图形回退**：`(display-graphic-p)` 为 nil（tty / 终端）时一律回退 `window`——child frame 只存在于图形终端。此外 `childframe` 路径本身带软回退：父 frame 不是图形 frame 或面板尺寸算不出来时 `--cf-show` 返回 nil，显示层**自动走窗口后端**，不抛错。
+- **固定尺寸**：child frame 的面板几何在**打开那一刻**固定——宽 = 父 frame 像素宽 × `seshat-reader-panel-width`（默认 `0.34`），高 = 父 frame 像素高 × `seshat-reader-panel-height`（默认 `0.45`），距父 frame 右 / 上边缘各 `seshat-reader-panel-margin`（默认 `16`）像素。**全程不 resize**，内容超出后在面板窗口内**内部滚动**——流式输出期间遮挡区域恒定，读者视线不会被反复挤压。
+  - 这套口径只对 `childframe` 生效：窗口承载的面板仍按 `seshat-reader-sidebar-height` / `-width` 决定尺寸，译文面板在**底部模式**下还会按内容行数自适应（`--fit-height-for-content`，childframe 承载下不参与）。
+  - 多个 child frame 面板同时存在时由 `--cf-position` **纵向堆叠**（已有面板逐个下移），互不重叠。
+- **跟随底部**：`seshat-reader-panel-follow-bottom`（默认 `t`）——流式输出期间面板自动滚到最底显示最新内容；用户**向上滚动后停止跟随**，自己滚回底部时恢复。想全程手动滚动设 `nil`。
+- **去 mode-line**：child frame 的面板窗口设 window parameter `mode-line-format` 为 `none`，省掉一行无信息量的 modeline；`header-line` **保留**（仍显示「Seshat 译文」/「Seshat 解释」）。
+- **面板内 `q`**：统一走 `seshat-reader-sidebar-quit`——按 buffer 名推断当前面板 kind，再按**承载单元**分派 `delete-window`（窗口）或 `delete-frame`（child frame）；当前 buffer 不是面板时退回 `seshat-reader-sidebar-toggle`。译文面板与目录面板的 `q` 已改绑到它，批注列表仍是 `quit-window`（批注走窗口承载，`quit-window` 本来就对）。
+- **阅读器侧 `C-c C-o`**：`seshat-reader-sidebar-toggle`（无参）——**面板开着就全部关闭，关了重开最近一个面板**。只开合目录的 `seshat-reader-sidebar-toggle-outline` 不绑键（与 `o` 重复），仍可 `M-x` 调用；目录面板自己的 `o`（`seshat-reader-outline-show`）语义不变。
+- **切走即隐藏**：`seshat-reader-panel-hide-on-buffer-change`（默认 `t`）挂在全局 `window-buffer-change-functions` 上——当前 buffer 不再派生自 `seshat-reader-mode` 时关闭本包 child frame 面板（覆盖浮层不属于任何窗口树，放任不管会在回邮件 / 看终端时一直悬在右上角）。面板内容仍留在 buffer 里，`C-c C-o` 可重开；设 `nil` 则常驻。
+- **与 popper 的关系**：popper 分流函数 `seshat-reader-sidebar-display-buffer` 仍只服务 `window` 承载的面板；child frame 面板**不经过** `display-buffer`，popper 的 `C-'` 开关因此不影响它（面板里那份 buffer 仍可照常用 popper 打开成普通窗口）。
+
+## 译文流式渲染
+
+`seshat-reader-translate-stream`（默认 `t`）开启后，译文 / 解释面板**边生成边显示**：
+
+- **骨架只写一次**：首个增量到达时先按模板渲染一次骨架（正文 `%t` 为空）并记下正文起点 marker；
+- **正文区替换**：后续每个增量只替换 marker 之后的正文区；标题、语言对、原文引用块一次成型、不重写；
+- **完成不重写**：结束时只更新 header-line 状态，不 `erase-buffer` 重排，避免完成瞬间整块跳变；
+- **跟随底部**：由 `seshat-reader-panel-follow-bottom` 控制（见上节），向上滚动即停止跟随。
+
+引擎不支持流式（无 `stream` 槽）或该选项取 `nil` 时，退回「完成后一次性渲染」的旧路径，差别只是没有中间过程。**已知退化路径**：gt 升级若改动 `gt-buffer-render-output-hook` 的增量语义，本功能会**静默退化**为完成时渲染——不报错、只是生成期间面板没有更新，排查时先看 header-line 是否在生成期间变化。
+
+## 继续追问（多轮上下文）
+
+解释 / 译文面板里可以针对**同一段原文**继续提问，历史轮次随请求一起发送。
+
+| 键位 | 命令 | 说明 |
+|---|---|---|
+| `C-c C-q` | `seshat-reader-translate-follow-up` | 迷你缓冲区读问题 → 发起追问（阅读器与面板内均可，`C-c C-a` 已被批注占用故选 `C-c C-q`） |
+
+- **上下文形态**：历史以 OpenAI `messages` 形式随请求发送——首轮的原文与首轮解释（前两条）**始终保留**，其后是每次的「问 + 答」。实现是克隆预设里的 `gt-chatgpt-engine` 并把 `prompt` 槽换成「返回 messages 列表的函数」（gt 的 `gt-chatgpt-send` 在 prompt 为列表时按 `messages` 数组发送），**不改 gt 源码、不自行拼 JSON**。
+- **面板呈现**：答案追加到面板，每轮渲染为 `---` + `### 追问 N` + `**问：**` + `**答：**`；流式时只替换**当前轮答案区**，不触碰首轮骨架与此前各轮问答。
+- **轮次上限**：`seshat-reader-translate-follow-up-max-rounds`（默认 `6`）——超出后**丢弃最早的轮次**，但首轮的原文与首轮解释不在丢弃范围（否则追问失去讨论对象）；取 `0` 表示每次追问只看原文与首轮解释，不带任何历史轮次。
+- **引擎限制**：预设里必须有 `gt-chatgpt-engine`（如 `reader-explain`），否则 `user-error` 并提示改配置——**不做文本拼接降级**：youdao / google 这类纯翻译引擎没有对话语义，拼进去只会产出误导性答案。
+- **状态生命周期**：追问状态是面板 buffer 的 buffer-local plist（原文、首轮答案、语言对、kind、轮次），**新一次翻译 / 解释会重置**全部追问历史。
 
 ## 7. 跨页衔接
 
@@ -371,6 +421,8 @@ Emacs 端**只显示**手写（无笔事件、无压感，输入永远在 Androi
 | `C-s` | `seshat-reader-search` | 跨页文本搜索（会话内 `n` / `p` / `RET` / `C-g`；`n` / `p` 只在会话期间接管翻页键） |
 | `C-c C-r` | `seshat-reader-reference-insert` | 插入选区摘录 |
 | `C-c C-t` / `C-c C-e` | `seshat-reader-translate-selection` / `-explain-selection` | 翻译 / 解释 |
+| `C-c C-q` | `seshat-reader-translate-follow-up` | 对译文 / 解释继续追问（多轮上下文） |
+| `C-c C-o` | `seshat-reader-sidebar-toggle` | 快捷关闭 / 重开面板（无参：开着即全部关闭，关了重开最近一个） |
 
 另有 `next-line` / `previous-line` / `next` / `prior` / `scroll-up-command` / `scroll-down-command` / `forward-char` / `backward-char` / `beginning-of-buffer` / `end-of-buffer` / `goto-line` / `move-end-of-line` / `move-beginning-of-line` 的 remap，及 6 个鼠标命令 remap 到 `ignore`（防止误移 point 破坏页面边框绘制）。
 
@@ -383,7 +435,7 @@ Emacs 端**只显示**手写（无笔事件、无压感，输入永远在 Androi
 | `f` | `seshat-reader-outline-avy-jump` | avy 风格单键跳转 |
 | `o` | `seshat-reader-outline-show` | 关闭面板（面板内按一次即关）；`seshat-reader-outline-select-doc-window` 不再占 `o`，仅供 `RET` 跳页切回阅读窗口 |
 | `s` | `seshat-reader-outline-select-doc-window` | 切回阅读窗口（回跳当前文档；`o` 改为面板开合后它换绑到 `s`） |
-| `q` | `quit-window` | 关闭面板 |
+| `q` | `seshat-reader-sidebar-quit` | 关闭面板（child frame 承载时走 `delete-frame`，窗口承载走 `delete-window`） |
 | `TAB` | `outline-mode` 自身 | 折叠 / 展开子树 |
 
 evil 用户同样可用上述单键（包内 `evil-define-key*` 补绑 normal state 的 `f` / `p` / `n` / `o` / `s` / `q` / `RET` / `M-RET`）。
@@ -401,7 +453,8 @@ evil 用户同样可用上述单键（包内 `evil-define-key*` 补绑 normal st
 
 | 键位 | 命令 | 作用 |
 |---|---|---|
-| `q` | `seshat-reader-sidebar-toggle` | 关面板 |
+| `q` | `seshat-reader-sidebar-quit` | 关面板（child frame 承载时 `delete-frame`） |
+| `C-c C-q` | `seshat-reader-translate-follow-up` | 对当前原文继续追问 |
 | `C-c C-s` | `seshat-reader-translate-save-as-annotation` | 存为批注 |
 
 ## 10. 配置速查
@@ -421,6 +474,13 @@ evil 用户同样可用上述单键（包内 `evil-define-key*` 补绑 normal st
 | `seshat-reader-sidebar-select-window` | `t` | 面板显示后是否把光标移入面板 | |
 | `seshat-reader-sidebar-translate-buffer-name` | `"*Seshat Sidebar*"` | 译文展示 buffer 名 | gt 中转改用隐藏 buffer |
 | `seshat-reader-etaf-enabled` | `t` | 批注列表是否用 ETAF 渲染 | 译文/解释不受影响 |
+| `seshat-reader-panel-carrier` | `childframe` | 面板承载方式：`childframe`（覆盖在父 frame 右上角，不参与窗口树，**不改变阅读窗口尺寸**）/ `window`（side window / 底部窗口，会压缩阅读区）。非图形环境强制回退 `window` | **M12 T8a 破坏性变更**（原为窗口承载）；回退 `(setq seshat-reader-panel-carrier 'window)` |
+| `seshat-reader-panel-carrier-alist` | `((annotations . window))` | 逐 kind 覆盖 `seshat-reader-panel-carrier`，键取 `outline` / `annotations` / `translate` | 默认让批注列表保留窗口承载（列表长、需逐条跳转，浮层放不下） |
+| `seshat-reader-panel-width` | `0.34` | child frame 宽度 = 父 frame 像素宽 × 本值 | 仅 `childframe` 生效 |
+| `seshat-reader-panel-height` | `0.45` | child frame 高度 = 父 frame 像素高 × 本值；**打开即固定、全程不 resize**，内容超出在面板内滚动 | 仅 `childframe` 生效 |
+| `seshat-reader-panel-margin` | `16` | child frame 距父 frame **右 / 上**边缘的像素间距 | 仅 `childframe` 生效 |
+| `seshat-reader-panel-follow-bottom` | `t` | 流式输出期间是否自动跟随底部（显示最新内容）；用户向上滚动后停止跟随、回到底部时恢复 | 仅 `childframe` 生效 |
+| `seshat-reader-panel-hide-on-buffer-change` | `t` | 当前 buffer 不再是阅读器 buffer 时关闭本包 child frame 面板；面板内容留在 buffer 里可 `C-c C-o` 重开 | `nil` = 面板常驻 |
 
 ### 阅读
 
@@ -471,6 +531,9 @@ evil 用户同样可用上述单键（包内 `evil-define-key*` 补绑 normal st
 | `seshat-reader-translate-visual-fill-column` | `t` | 面板启用 `visual-fill-column-mode` |
 | `seshat-reader-translate-capture-window` | `120` | 捕获译文的时间窗口（秒） |
 | `seshat-reader-translate-fallback-langs` | `(en zh)` | 语言回退 |
+| `seshat-reader-translate-stream` | `t` | 流式增量输出（骨架写一次 → 只替换正文区 → 完成不重写）；引擎不支持流式或取 `nil` 时退回「完成即整体渲染」 |
+| `seshat-reader-translate-engines-pick` | `all` | 多引擎结果展示：`all`（全部成功结果，每条 `【引擎名】` 标注 + `---` 分隔）/ `first`（第一个成功结果，无标签）/ `last`（最后一个成功结果，无标签） |
+| `seshat-reader-translate-follow-up-max-rounds` | `6` | 追问保留的轮数上限，超出**丢弃最早轮次**（首轮原文与首轮解释始终保留）；`0` = 不带任何历史轮次 |
 
 ### 引用
 
@@ -617,9 +680,9 @@ GTROOT=$(dirname "$(find "$HOME" -maxdepth 6 -type d \
 echo "$GTROOT"
 ```
 
-现有套件：`seshat-reader-page-join-test.el`、`seshat-reader-sidebar-test.el`、`seshat-reader-outline-test.el`、`seshat-reader-annotation-test.el`、`seshat-reader-annotation-queue-test.el`、`seshat-reader-annotation-v8-test.el`、`seshat-reader-annotation-decoration-test.el`（21 例）、`seshat-reader-annotation-ink-test.el`（24 例）、`seshat-reader-search-test.el`（17 例）、`seshat-reader-select-flash-test.el`、`seshat-reader-select-merge-test.el`（18 例）、`seshat-reader-translate-test.el`、`seshat-reader-reference-test.el`、`seshat-reader-resize-test.el`、`seshat-reader-etaf-test.el`、`seshat-rest-test.el`、`seshat-state-test.el`、`seshat-transport-test.el`、`seshat-conflict-test.el`（10 例）、`seshat-merge-test.el`（13 例）、`seshat-sync-cmd-test.el`（14 例）、`seshat-sync-test.el`（77 例）、`seshat-reading-test.el`（**45 例**）。**前置**：`seshat-render-core.so` 已构建，否则加载 `seshat-reader` 会触发交互式构建询问并阻塞 batch 运行。
+现有套件：`seshat-reader-page-join-test.el`、`seshat-reader-sidebar-test.el`、`seshat-reader-outline-test.el`、`seshat-reader-annotation-test.el`、`seshat-reader-annotation-queue-test.el`、`seshat-reader-annotation-v8-test.el`、`seshat-reader-annotation-decoration-test.el`（21 例）、`seshat-reader-annotation-ink-test.el`（24 例）、`seshat-reader-search-test.el`（**19 例**）、`seshat-reader-select-flash-test.el`、`seshat-reader-select-merge-test.el`（18 例）、`seshat-reader-select-scope-test.el`（7 例）、`seshat-reader-select-report-test.el`（**7 例**，M12 T8a 新增：框选回显只报行列数、`seshat-reader-select-message-limit` 已删除）、`seshat-reader-translate-test.el`、`seshat-reader-reference-test.el`、`seshat-reader-resize-test.el`、`seshat-reader-etaf-test.el`、`seshat-rest-test.el`、`seshat-state-test.el`、`seshat-transport-test.el`、`seshat-conflict-test.el`（10 例）、`seshat-merge-test.el`（13 例）、`seshat-sync-cmd-test.el`（14 例）、`seshat-sync-test.el`（77 例）、`seshat-reading-test.el`（**45 例**）。**前置**：`seshat-render-core.so` 已构建，否则加载 `seshat-reader` 会触发交互式构建询问并阻塞 batch 运行。
 
-**必须逐文件运行**：一次 `emacs --batch` 加载全部测试文件时，`seshat-reader-annotation-test.el` 与 `seshat-reader-annotation-queue-test.el` 各有 3 个列表渲染用例会失败——同时加载 `etaf` 测试后 `etaf-ui` 变为可用，批注列表改走 EBOX/ETAF 渲染，而那两个用例断言的是纯文本（如 `"没有批注"`）。这是**既有基线特性、不是回归**：全仓用例总数按逐文件求和计（当前 23 个文件合计 **773** 例，0 unexpected / 0 skipped）。跑全仓脚本见下（`for` 循环逐文件执行，任一文件非零退出即整体失败）：
+**必须逐文件运行**：一次 `emacs --batch` 加载全部测试文件时，`seshat-reader-annotation-test.el` 与 `seshat-reader-annotation-queue-test.el` 各有 3 个列表渲染用例会失败——同时加载 `etaf` 测试后 `etaf-ui` 变为可用，批注列表改走 EBOX/ETAF 渲染，而那两个用例断言的是纯文本（如 `"没有批注"`）。这是**既有基线特性、不是回归**：全仓用例总数按逐文件求和计（当前 **25** 个文件合计 **849** 例，0 unexpected / 0 skipped）。跑全仓脚本见下（`for` 循环逐文件执行，任一文件非零退出即整体失败）：
 
 ```bash
 cd /home/thomas/Workspace/seshat && rm -f emacs/seshat-reader/*.elc && \

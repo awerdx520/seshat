@@ -686,3 +686,33 @@ refit 按当前窗口尺寸做一次几何适配 + 重渲染，一次到位。
 **代价**：两套基数在同一模块内并存，读者必须看注释才能确定某入口的页号语义；`--text-in-rect` / `--rects-in-rect` 的 0-based 属历史遗留，统一它们要同步改 `seshat-reader-select.el` 与 4 个测试文件的桩与断言，收益只在命名一致性，故本轮不动，代价是长期存在一个「例外组」。防退化只能靠注释约定 + 测试锁定：`seshat-reader-search-test` 的桩按 1-based 断言页号，`seshat-reader-select-*` 的桩按 0-based 断言，任一侧基数被改都会有用例失败。
 
 **影响**：`seshat-reader-search.el` 去掉全部 `(1- page)` / `(1+ page)` 换算（页码直接透传）；`render/render-core.c` 的 `emacs_search_page` 改走 `resolve_page_arg`，四个 1-based 入口的注释首段逐个写明基数；`openspec/tech-debt.md` 登记「两套基数并存」；`docs/architecture.md`（渲染层入口清单、搜索流程）与 `docs/emacs-reader.md` 同步。
+
+## 2026-10-25 · 阅读器面板承载由 side window 改为 child frame 覆盖
+
+**决策**：阅读器面板（`outline` / `annotations` / `translate`）的承载由「窗口」（side window / 底部窗口）默认改为 **child frame 覆盖**：child frame 贴在父 frame 右上角、**不参与窗口树**，尺寸由 `seshat-reader-panel-width`（`0.34` × 父 frame 像素宽）/ `seshat-reader-panel-height`（`0.45` × 父 frame 像素高）/ `seshat-reader-panel-margin`（`16` px）在**打开那一刻**固定，内容超出后在面板内滚动。承载方式由 `seshat-reader-panel-carrier`（默认 `childframe`）统一决定，`seshat-reader-panel-carrier-alist`（默认 `((annotations . window))`）逐 kind 覆盖；窗口承载及其全部旧配置（`seshat-reader-sidebar-position` / `-width` / `-height` / `-min-height` / `-max-height` 一族）原样保留。非图形环境强制回退 `window`。完整论证见 `docs/adr/0005-reader-panel-carrier.md`。
+
+**理由**：根因是**阅读器版面与窗口像素尺寸耦合**——页面居中、`fit` 缩放、`--refit-window` 全部按当前窗口的像素尺寸计算，而窗口承载的面板一旦显示 / 收起 / 改尺寸，就在同一个 frame 的窗口树里挤压阅读窗口，触发 `window-size-change-functions` → 重新适配 → 用户看到页面「跳一下」；译文面板在流式输出期间反复自适应高度时，这种跳动会被放大成持续抖动。child frame 不占窗口树，面板的开合、刷新、滚动因此**在结构上不可能**改变阅读窗口尺寸——等于把「面板刷新不得改动阅读窗口尺寸」这条不变量编码进承载模型，而不是继续在窗口体系里加去抖 / 抑制动画的特例。
+
+**代价与约束**：① **非图形环境不可用**（tty / 终端没有 child frame），必须回退窗口承载，且要有两条回退路径（`display-graphic-p` 判否 + `--cf-show` 返回 nil 的软回退）；② **多面板需纵向堆叠防重叠**——三个 kind 同时显示时不能都贴同一个角，`--cf-position` 按已有面板逐个下移；③ **popper 失效**——popper 经 `display-buffer-alist` 接管 popup，child frame 面板不经过 `display-buffer`，`C-'` 只对窗口承载的面板有效（面板内 buffer 仍可用 popper 打开成普通窗口）；④ 面板尺寸全部固定，长内容只能内部滚动，读者失去「把面板拖高一点」这种手工调法（改用 `seshat-reader-panel-height`）；⑤ child frame 不属于任何窗口树，切走 buffer 后必须靠 `window-buffer-change-functions` 显式关闭（`seshat-reader-panel-hide-on-buffer-change`），否则会盖在别的窗口上。
+
+**影响**：`seshat-reader-sidebar.el` 新增承载分派（`--carrier-for-kind`）与 childframe 后端（`--cf-show` / `--cf-position` / `--cf-size` / `--cf-suppress-mode-line` / `--cf-close`），`seshat-reader-sidebar-quit` 统一面板内 `q`（child frame 走 `delete-frame`），`C-c C-o` 改绑无参的 `seshat-reader-sidebar-toggle`；`docs/emacs-reader.md`「面板承载」节、`docs/configuration.md`「阅读器面板」表、`docs/adr/0005-reader-panel-carrier.md`、`CHANGELOG.md`（破坏性 + 回退写法）同步。
+
+## 2026-10-25 · 译文面板流式增量输出 + 面板尺寸固定
+
+**决策**：译文 / 解释面板改为**边生成边显示**（`seshat-reader-translate-stream` 默认 `t`）：首个增量到达时按模板渲染一次**骨架**（正文 `%t` 为空）并记录正文起点 marker，后续增量只**替换 marker 之后的正文区**，完成时只更新 `header-line`、不 `erase-buffer` 重写；同时面板几何**打开即固定**（childframe 承载下由 `seshat-reader-panel-width` / `-height` 决定，全程不 resize），内容超出在面板内滚动，`seshat-reader-panel-follow-bottom`（默认 `t`）在流式期间跟随底部、用户上滚后停止跟随。
+
+**理由**：LLM 输出长（单次解释常见数百到上千字、耗时数十秒），「等全部生成完再显示」让面板在整段时间里只有占位内容，用户既无法判断是否卡住、也无法提前读到开头。增量渲染解决实时反馈，但只有在**遮挡区域恒定**时才成立——如果面板还按内容行数自适应高度，每来一段增量就改一次 frame 布局，等于把阅读器拖进持续 refit；「固定尺寸 + 内部滚动 + 跟随底部」把「新内容进入视野」与「阅读窗口尺寸不变」两件事解耦。骨架只写一次而非每次增量重排，是为了避免完成瞬间整块跳变（也顺带避开 `erase-buffer` 会丢 point / marker 的问题）。
+
+**代价与约束**：① **gt 升级可能静默退化为完成时渲染**——实现依赖 `gt-buffer-render-output-hook` 的增量语义与引擎的 `stream` 槽，gt 改动后可能不报错、只是不再流式，排查只能看 header-line 是否在生成期间更新（已写入 `docs/emacs-reader.md` 的「已知退化路径」）；② 面板不再按内容自适应高度（`--fit-height-for-content` 只服务窗口承载的 `translate` 面板），长译文必须滚动查看；③ 增量替换依赖 marker，任何重建正文的路径都要重建 marker（新一次翻译会重置骨架与正文起点，并清空追问状态）；④ 跟随底部是「用户上滚即停」，不是严格锁底——滚回底部才恢复。
+
+**影响**：`seshat-reader-translate.el` 新增增量同步与追问状态机，`seshat-reader-sidebar.el` 新增 `seshat-reader-panel-follow-bottom` 与 childframe 固定尺寸；`docs/emacs-reader.md`「译文流式渲染」与「继续追问」节、`docs/configuration.md`「阅读器翻译 / 解释」表、`CHANGELOG.md` 同步。
+
+## 2026-10-25 · 复制回显改行列统计 + 多引擎结果标注来源
+
+**决策**：① 框选回显**不再显示正文**——echo area 只报 `已复制 N 行 · M 字`（`seshat-reader-select-copy-to-kill-ring` 非 nil）或 `已选中 N 行 · M 字`（`nil`），并删除截断常量 `seshat-reader-select-message-limit`；② 多引擎译文默认**全量展示并标注来源**——`seshat-reader-translate-engines-pick` 默认 `all`，每条结果前标 `【引擎名】`、段间用 `---` 分隔；`first` / `last` 只留一个**成功**结果且不带标签。
+
+**理由**：① 回显正文既**干扰阅读**（选中内容与页面闪现高亮重复表达同一件事，还占用唯一的回显行），也**可能泄露内容**——选中文本会进入 `*Messages*`（以及任何 `message` 日志），而选区往往是敏感正文；行列数足以回答「我刚选到了多大范围」，真要读文本可查 `seshat-reader-select-last` 或 kill ring。② 多引擎预设（`reader` = youdao-dict + google）的价值就是**对比各家译文**，改造前的拼接让两段结果首尾相接、看不出哪段出自哪个引擎，比对价值为零；逐条标注来源后 `all` 才成立。`first` / `last` 不带标签是刻意的：只有一个结果时标注来源没有信息量，反而多一行噪声。
+
+**代价与约束**：① 想知道选中的具体文字必须另取（`seshat-reader-select-last` / kill ring），回显层不再提供摘要；② `seshat-reader-select-message-limit` 删除后配置侧残留的 `setq` 不报错但**静默失效**（已在 `CHANGELOG.md`「移除」与 `docs/configuration.md` 写明）；③ `all` 的输出更长，多引擎 + 长原文时面板内容显著变长（由固定尺寸 + 内部滚动承接）；④ 失败引擎必须跳过（`gt-buffer-render-error-face`），否则错误块也会被标上来源，且 `first` 需**顺延**到下一个成功片段。
+
+**影响**：`seshat-reader-select.el`（回显两分支、删常量）、`seshat-reader-translate.el`（`--format-engine-results`）、新增测试 `emacs/tests/seshat-reader-select-report-test.el`（7 例，含 `(should-not (boundp 'seshat-reader-select-message-limit))`）；`docs/emacs-reader.md` §5「框选取文」与 §6「多引擎结果」、`docs/configuration.md`、`CHANGELOG.md` 同步。

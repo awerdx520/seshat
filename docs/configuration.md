@@ -177,11 +177,15 @@ Emacs 端通过 `seshat-reader-annotation` 采集 PDF 页面选区并同步为�
 | `seshat-reader-translate-template` | `"%l\n\n%q\n\n---\n\n%t\n"` | **翻译**面板的 Markdown 模板；`nil` 表示不套模板、直接插入正文。默认**不含标题**（`header-line` 显示「Seshat 译文」/「Seshat 解释」）；`%k` 标题占位符保留供自定义模板使用。占位符：`%k` 标题、`%l` 语言对（斜体，如 `*en → zh*`；无 langs 时留空）、`%q` 原文引用块、`%t` 正文。模板非法（未知占位符等）时回退纯正文并 `message` 警告 |
 | `seshat-reader-translate-explain-template` | `"%q\n\n---\n\n%t\n"` | **解释**面板的独立 Markdown 模板；默认不含标题与语言对（解释场景前者由 `header-line` 承担、后者信息价值低），占位符与上一行相同。`nil` 退回纯正文，**不会借用** `seshat-reader-translate-template` |
 | `seshat-reader-translate-visual-fill-column` | `t` | 译文/解释面板启用 `visual-fill-column-mode`（**软依赖**，未安装时静默跳过），按 `visual-fill-column-width`（`nil` → `fill-column`）缩窄正文；设 `nil` 关闭并清理窗口 margin；批注列表不受影响（ETAF 按窗口宽度布局） |
+| `seshat-reader-translate-stream` | `t` | 译文/解释**流式增量输出**：为克隆后的引擎设 `stream` 槽，把 `gt-buffer-render-output-hook` 的增量同步到面板——模板骨架只写一次（正文 `%t` 为空）并记正文起点 marker，后续只替换 marker 之后的正文区，完成时只更新 `header-line` 不再 `erase-buffer`（避免完成瞬间整块跳变）。引擎不支持流式或取 `nil` 时退回「完成即整体渲染」的旧路径 |
+| `seshat-reader-translate-engines-pick` | `all` | 多引擎结果的展示方式：`all`（**默认**，展示全部**成功**结果，每条前标注 `【引擎名】`、段间用 Markdown 分隔线 `---`）/ `first`（只展示第一个成功结果）/ `last`（只展示最后一个成功结果）——`first` / `last` **不带**来源标签。带 `gt-buffer-render-error-face` 的片段视为失败跳过；来源取不到时退化为纯译文（不加标签不加分隔线）。改成「拼接后不可区分」的旧观感请显式设 `first` |
+| `seshat-reader-translate-follow-up-max-rounds` | `6` | 追问（`C-c C-q`）历史保留的**轮数上限**（一轮 = 问 + 答两条 messages）；超出时**丢弃最早的轮次**，但首轮的原文与首轮解释（messages 前两条）**始终保留**。取 `0` 表示不带任何历史轮次（每次追问只看原文与首轮解释）。轮数越多每次请求的上下文越长、费用越高 |
 
 说明：
 
 - `reader` / `reader-explain` 两个 gt 预设**需在用户配置侧定义**（示例见 `thomas-emacs/lisp/init-tools.el`）；阅读器侧只按预设名取用，缺失时回退内置默认（翻译回退 youdao/google，解释需显式配置端点）。
 - gt 的 key（如 `gt-chatgpt-key`）**一律走 authinfo / 环境变量**（本项目经 `DEEPSEEK_API_KEY` 环境变量注入），**禁止写入配置文件**。
+- **多引擎与追问的配置前提（M12 T8a，2026-10-25）**：① `seshat-reader-translate-engines-pick` 默认 `all`，多引擎预设（如 `reader` = youdao-dict + google）的输出改为逐条 `【引擎名】` 标注 + `---` 分隔；想要单条输出（旧观感）设 `first` / `last`。② `C-c C-q` 追问（`seshat-reader-translate-follow-up`）要求预设里**含 `gt-chatgpt-engine`**（如 `reader-explain`）——引擎克隆后把 `prompt` 槽换成「返回 messages 列表的函数」，由 `gt-chatgpt-send` 按 `messages` 数组发送；预设只有 youdao / google 这类纯翻译引擎时**报 `user-error` 并提示改配置**，不做文本拼接降级（翻译引擎没有对话语义）。追问历史轮数由 `seshat-reader-translate-follow-up-max-rounds`（默认 `6`）限制。
 
 ### 批注离线队列（服务不可用时的本地暂存）
 
@@ -219,6 +223,13 @@ Emacs 端通过 `seshat-reader-annotation` 采集 PDF 页面选区并同步为�
 | `seshat-reader-sidebar-min-height` | `0.25` | 译文/解释面板按内容自适应的**下限**（占 frame 比例，至少 1 行）；与 `max-height` 共同夹紧。仅对 `translate` 且未挂载 ETAF runtime 的面板生效，批注列表不受影响；`min` 配得比 `max` 大时以 `max` 为准 |
 | `seshat-reader-sidebar-select-window` | `t` | 面板显示后是否在**命令结束时**把光标移入面板（`display-buffer` 的 `post-command-select-window`）；`nil` 时光标留在原窗口 |
 | `seshat-reader-sidebar-translate-buffer-name` | `"*Seshat Sidebar*"` | 译文/解释的**展示 buffer** 名（只读 Markdown 文本 buffer，也是 popper 判定的名字之一）；gt 中转改用隐藏 buffer ` *Seshat gt*`，本变量不再作 gt `:name`、也不再作结果捕获的守卫依据 |
+| `seshat-reader-panel-carrier` | `childframe` | 面板**承载方式**：`childframe`（child frame 覆盖在父 frame 右上角，不参与窗口树，显示/刷新/滚动面板**不改变阅读窗口像素尺寸**，故不触发阅读器 refit）/ `window`（沿用 side window / 底部窗口承载，行为与 `seshat-reader-sidebar-position` 一族一致）。**非图形环境**（`display-graphic-p` 为 nil）强制回退 `window`；`childframe` 建不出 frame 时自动回退窗口后端。**M12 T8a 破坏性变更**：原为窗口承载，回退写法 `(setq seshat-reader-panel-carrier 'window)` |
+| `seshat-reader-panel-carrier-alist` | `((annotations . window))` | 逐 kind 覆盖 `seshat-reader-panel-carrier`：键取 `outline` / `annotations` / `translate`，值取 `childframe` / `window`。默认让**批注列表**保留窗口承载（条目多、需长列表浏览与逐条跳转，覆盖浮层既遮挡正文又放不下）；解析顺序 alist 命中项 → 全局值 → 非法值静默回落 `window` |
+| `seshat-reader-panel-width` | `0.34` | child frame 承载时的宽度**比例**（占父 frame 像素宽）。与 `-height` 一起在**打开那一刻**固定几何，改动只对随后新建的面板生效 |
+| `seshat-reader-panel-height` | `0.45` | child frame 承载时的高度**比例**（占父 frame 像素高）。面板**打开即固定、全程不 resize**，内容超出后在面板窗口内滚动（按内容行数自适应高度是窗口后端的行为，childframe 承载下不参与） |
+| `seshat-reader-panel-margin` | `16` | child frame 距父 frame **右 / 上**边缘的像素间距 |
+| `seshat-reader-panel-follow-bottom` | `t` | 流式输出期间面板是否自动跟随底部（显示最新内容）；用户**向上滚动后停止跟随**，自己滚回底部时恢复 |
+| `seshat-reader-panel-hide-on-buffer-change` | `t` | 当前 buffer 不再是阅读器 buffer（不派生自 `seshat-reader-mode`）时关闭本包 child frame 面板；面板内容仍留在 buffer 里，可用 `C-c C-o` 重开。设 `nil` 让面板常驻 |
 
 说明：
 
@@ -230,6 +241,8 @@ Emacs 端通过 `seshat-reader-annotation` 采集 PDF 页面选区并同步为�
 - **per-kind 尺寸记忆（仅会话内，带方向标签）**：M11 的单窗口语义下同一时刻只有一个面板窗口，但 `annotations` 与 `translate` **各自记住自己的尺寸**——切换内容前先把当前窗口的实际尺寸（比例）记给它的类型，再用目标类型记住的尺寸新建窗口；同一类型重复显示走 `display-buffer` 复用，不重建、也不重置用户手动调整过的尺寸。M12 起记忆项带**方向标签**（宽度语义 vs 高度语义），因此把方位在 `left`/`right` 与 `below-selected`/`at-bottom` 之间切换时，旧值不会被按错误单位复用。某类型首次显示时，side 模式用 `seshat-reader-sidebar-width` / `seshat-reader-outline-sidebar-width`，底部模式用 `seshat-reader-sidebar-height`。状态保存在内存 alist 中，**重启 Emacs 后回到默认值**。
 - **关闭**：面板是非固定窗口；面板内 `q` 由 minor mode 承载（批注列表与译文面板各有其 minor mode 键位），`seshat-reader-sidebar-toggle` 可开合（关闭本包面板窗口，打开时按最近一次的内容类型重开，含 `translate`）。toggle **不使用** `window-toggle-side-windows`——它是 frame 级全量开关，会连带删除/恢复 eca-chat、which-key 的侧窗。
 - **popper 集成**：`*Seshat Annotations*` 与 `*Seshat Sidebar*` 两个 buffer 名已在 `thomas-emacs/lisp/init-window.el` 登记为 popper popup，可用 `C-'` 或 `` M-` `` 开关；popper 重开时经 `seshat-reader-sidebar-display-buffer` 分流回本包的显示逻辑，因此**布局（`position` / `width` / `height` / per-kind 尺寸）仍由本包掌控**，不会被 popper 的默认 bottom side window 规则改写。该分流由用户配置侧（`init-window.el`）接入，本包只提供函数。
+- **承载变更与回退（M12 T8a，2026-10-25）**：面板默认承载由 **窗口** 改为 **child frame 覆盖**（`seshat-reader-panel-carrier` 默认 `childframe`）——child frame 不参与窗口树，显示/刷新/滚动面板不再改变阅读窗口像素尺寸，也就消除了「开面板 → 窗口尺寸变化 → 阅读器 refit → 页面跳动」这条链。随之而来的四点行为差异：① **固定尺寸**（`seshat-reader-panel-width` / `-height` / `-margin`），打开即固定、内容超出内部滚动，`seshat-reader-panel-follow-bottom` 控制流式期间是否跟随底部；② **去 mode-line**（面板窗口设 window parameter `mode-line-format` 为 `none`，`header-line` 保留）；③ **面板内 `q` 统一走 `seshat-reader-sidebar-quit`**（按 buffer 名推断 kind，child frame 走 `delete-frame`；批注列表仍是 `quit-window`），阅读器侧 `C-c C-o` 重新绑到无参的 `seshat-reader-sidebar-toggle`（开着即全部关闭、关了重开最近一个）；④ **切走即隐藏**（`seshat-reader-panel-hide-on-buffer-change`，默认 `t`）。**回退写法**：`(setq seshat-reader-panel-carrier 'window)`；只把译文/目录退回窗口承载可设 `(setq seshat-reader-panel-carrier-alist '((annotations . window) (translate . window) (outline . window)))`；**非图形环境自动回退 `window`**，无需配置。child frame 面板**不经过** `display-buffer`，故 popper 的 `C-'` 只作用于窗口承载的面板；多个 child frame 面板同时存在时由承载层**纵向堆叠**、互不重叠。
+- **已删除的变量（M12 T8a，2026-10-25）**：`seshat-reader-select-message-limit`（原「框选回显摘要上限 200 字符」的截断阈值）**已删除**——框选回显改为只报 `已复制 N 行 · M 字` / `已选中 N 行 · M 字`（取决于 `seshat-reader-select-copy-to-kill-ring`），不再回显正文。配置里残留的 `setq` 不报错但**不再有效**，删掉即可。
 
 ### 阅读器版式、跨页衔接与批注高亮（M12）
 
