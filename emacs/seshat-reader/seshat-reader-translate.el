@@ -86,7 +86,12 @@
 ;;
 ;; 多轮追问（`seshat-reader-translate-follow-up'，面板键位 `C-c C-q'）：解释
 ;; 或译文面板里可以针对**同一段原文**继续提问，历史轮次以 OpenAI messages
-;; 形式随请求发送，答案追加到面板（流式时增量追加到当前轮答案区）。实现方式
+;; 形式随请求发送，答案追加到面板。轮次正文不带标签：问题写成 Markdown 引用
+;; 块（每行加 `> '，与首轮原文引用块同风格），空行之后直出答案正文，轮次之间
+;; 用 `---' 分隔线（首轮答案与第 1 轮追问之间也有）；轮次序号只留在
+;; header-line。追问**恒不开引擎流式**——gt 的纯流式链路既不调 `gt-update'
+;; 也不调渲染器的 output 函数，渲染对象的 `:then' 永不触发，而追问写面板的
+;; 唯一通路就是 `:then'（详见 `--follow-up-translator' 的注释）。实现方式
 ;; 是克隆预设里的 `gt-chatgpt-engine'，把它的 `prompt' 槽换成「返回 messages
 ;; 列表的函数」——gt 的 `gt-execute' 对函数型 `prompt' 走
 ;; `(pdd-funcall prompt (list item tgt))'，`gt-chatgpt-send' 在 prompt 为列表
@@ -94,7 +99,7 @@
 ;; `gt-chatgpt-engine'（例如只配了 youdao/google 这类纯翻译引擎）时报
 ;; `user-error' 提示改配置，**不做文本拼接降级**——翻译引擎没有对话语义，
 ;; 降级只会产出误导性答案。追问的中转 buffer 与首轮分开
-;; （` *Seshat gt follow-up*'），增量只替换「当前轮答案区」的 marker 区间，
+;; （` *Seshat gt follow-up*'），完成时只替换「当前轮答案区」的 marker 区间，
 ;; 不触碰首轮骨架与此前各轮问答。轮次上限由
 ;; `seshat-reader-translate-follow-up-max-rounds'（默认 6）控制——超出后丢弃
 ;; 最早的轮次，但首轮原文与首轮解释恒保留（否则追问失去讨论对象），取 0 表示
@@ -1982,17 +1987,38 @@ PRESET 先查 `seshat-reader-translate-presets'，未命中再查
     (cl-find-if #'seshat-reader-translate--chatgpt-engine-p
                 (ensure-list (gt-ensure-plain (oref trans engines))))))
 
-(defun seshat-reader-translate--follow-up-append-round (panel question round)
-  "在面板 buffer PANEL 末尾追加第 ROUND 轮追问的问题区，返回答案区起点 marker.
-追加的文本为 `---' 分隔线 + `### 追问 ROUND' + `**问：** QUESTION' +
-`**答：**' 占位；返回的 marker 指向 `**答：**' 之后的正文起点，后续增量与
-最终答案都只替换它之后到 buffer 末尾的内容（`copy-marker' 用默认插入类型，
-在 marker 处插入的文本落在 marker 之后，正好是答案区起点）。"
+(defun seshat-reader-translate--follow-up-quote (text)
+  "把追问 TEXT 转成 Markdown 引用块（每行加 `> ' 前缀）.
+与首轮原文引用块（`seshat-reader-translate--quote-block'）同风格，只是不带
+`> **原文**' 那一行标签：追问的问题本身就是正文，不需要额外标签。多行问题逐行
+加前缀，空行变成单独的 `>'（Markdown 引用块内的段落分隔，与首轮原文引用块的
+`>' 空引用行同形态，不留行尾空白——面板不折行，行尾空白会被横向溢出）。TEXT
+先经 `seshat-reader-translate--as-string' 规范成字符串（gt 的 taker `text'
+槽可能是分段列表）。"
+  (mapconcat (lambda (line)
+               (if (string-empty-p (string-trim line))
+                   ">"
+                 (concat "> " line)))
+             (split-string (seshat-reader-translate--as-string text) "\n")
+             "\n"))
+
+(defun seshat-reader-translate--follow-up-append-round (panel question)
+  "在面板 buffer PANEL 末尾追加本轮追问的问题区，返回答案区起点 marker.
+QUESTION 为问题原文，经 `--follow-up-quote' 转成引用块。追加的文本为 `---'
+分隔线 + 问题引用块 + 一个空行：**不再**写「### 追问 N」「**问：**」
+「**答：**」三种标签——轮次序号只留在 header-line（它是状态不是正文），标签行
+在窄面板里还会横向溢出。分隔线同时充当「首轮答案 → 第 1 轮追问」与
+「此前各轮 → 本轮」的边界。
+
+返回的 marker 指向引用块之后的空行之后，即答案区起点；最终答案只替换它之后到
+buffer 末尾的内容（`copy-marker' 用默认插入类型，在 marker 处插入的文本落在
+marker 之后）。"
   (with-current-buffer panel
     (let ((inhibit-read-only t))
       (goto-char (point-max))
-      (insert (format "\n\n---\n\n### 追问 %d\n\n**问：** %s\n\n**答：**\n\n"
-                      round question))
+      (insert "\n---\n\n"
+              (seshat-reader-translate--follow-up-quote question)
+              "\n\n")
       (copy-marker (point)))))
 
 (defun seshat-reader-translate--follow-up-translator (panel question state engine)
@@ -2002,7 +2028,11 @@ STATE）；引擎克隆自 ENGINE 后构造，保证不改用户预设单例。�
 `gt-buffer-render' 指向**独立**隐藏中转 buffer
 （`seshat-reader-translate--follow-up-buffer-name'），`:dislike-header' /
 `:dislike-source' 为 t（面板已有标题与原文，中转 buffer 不需要重复），
-`:then' 在完成时调 `seshat-reader-translate--follow-up-complete'。"
+`:then' 在完成时调 `seshat-reader-translate--follow-up-complete'。
+
+引擎克隆体的 `stream' 槽**恒为 nil**：追问的答案只能经 `:then' 写进面板，
+而 gt 的流式链路不触发 `:then'（详见函数内注释与
+`seshat-reader-translate--stream-wanted-p'）。"
   (let* ((source (plist-get state :source))
          (answer (plist-get state :answer))
          (turns (plist-get state :turns))
@@ -2020,7 +2050,18 @@ STATE）；引擎克隆自 ENGINE 后构造，保证不改用户预设单例。�
           (lambda (_text _lang)
             (seshat-reader-translate--follow-up-messages
              source answer turns question limit)))
-    (oset engine-copy stream (and seshat-reader-translate-stream t))
+    ;; 追问**恒不**为引擎开启流式，与 `seshat-reader-translate-stream' 无关。
+    ;; 原因：面板路径下 gt 的纯流式链路（实测 gt 2026-10 版 `gt-core.el'）
+    ;; `gt-finalize' 只调 task 级 `gt-output'（把增量写进中转 buffer 的 marker），
+    ;; **不调** `gt-update'，也不调渲染器的 output 函数——于是渲染对象的
+    ;; `:then' 永不触发（详见 `seshat-reader-translate--stream-wanted-p' 的文档）。
+    ;; 而追问把答案写进面板的**唯一**通路就是 `:then'
+    ;; （`seshat-reader-translate--follow-up-complete'），中转 buffer
+    ;; （`seshat-reader-translate--follow-up-buffer-name'）又是隐藏的——开着流式
+    ;; 就只剩「模型答案写进没人看得到的 buffer，面板答案区永远空白、header 卡在
+    ;; 『生成中…』」。故此处必须显式置 nil，不能沿用首轮的
+    ;; `seshat-reader-translate-stream' 开关。
+    (oset engine-copy stream nil)
     (gt-translator
      :engines (list engine-copy)
      :taker (gt-taker :text question :pick nil :langs langs)
@@ -2038,14 +2079,16 @@ STATE）；引擎克隆自 ENGINE 后构造，保证不改用户预设单例。�
 ENGINE 为预设里的 ChatGPT 引擎（`--follow-up-translator' 会克隆它）。返回
 登记好的 translator。
 
-步骤：先在面板末尾追加问题区（拿到答案区 marker），再更新状态（`:round'
-自增、`:answer-marker'、`:answer-start' 置真）与 header-line（「追问 N
-生成中…」），最后登记 `seshat-reader-translate--current-translator'（复用
-`--stream-sync' 的身份守卫）与 `seshat-reader-translate--active'（时间窗
-守卫）并 `gt-start'。"
+步骤：先在面板末尾追加问题区（`---' 分隔线 + 问题引用块，拿到答案区
+marker），再更新状态（`:round' 自增、`:answer-marker'、`:answer-start' 置真）
+与 header-line（「追问 N 生成中…」），最后登记
+`seshat-reader-translate--current-translator'（复用 `--stream-sync' 的身份
+守卫）与 `seshat-reader-translate--active'（时间窗守卫）并 `gt-start'。
+追问的引擎不开流式（见 `--follow-up-translator'），答案由 `:then' 回调
+`seshat-reader-translate--follow-up-complete' 一次性写入。"
   (let* ((round (1+ (or (plist-get state :round) 0)))
          (marker (seshat-reader-translate--follow-up-append-round
-                  panel question round))
+                  panel question))
          (trans (seshat-reader-translate--follow-up-translator
                  panel question state engine)))
     (with-current-buffer panel
@@ -2065,10 +2108,17 @@ ENGINE 为预设里的 ChatGPT 引擎（`--follow-up-translator' 会克隆它）
 
 (defun seshat-reader-translate--follow-up-stream-render (text)
   "把追问增量 TEXT 写进面板的当前轮答案区（`:answer-marker' 之后到 buffer 末尾）.
-只替换答案区：首轮骨架、原文引用与**此前各轮**问答都不动。`TEXT' 是 gt 每次
+只替换答案区：首轮骨架、原文引用块与**此前各轮**问答都不动。`TEXT' 是 gt 每次
 输出时的**全量快照**（该引擎把增量拼在 `res' 上整体重发），故直接整块替换
-即可，不需要自行做差异合并。滚动跟随条件与首轮一致
-（`seshat-reader-panel-follow-bottom' + 写入前判定窗口是否停在底部 + 节流）。"
+即可，不需要自行做差异合并。答案区里只有答案正文——问题以引用块写在
+`:answer-marker' 之前，本轮不带「问：」「答：」标签。滚动跟随条件与首轮一致
+（`seshat-reader-panel-follow-bottom' + 写入前判定窗口是否停在底部 + 节流）。
+
+**当前无调用路径**：追问的引擎恒不开流式（见
+`seshat-reader-translate--follow-up-translator'），而 gt 的流式链路又不调渲染器
+的 output 函数（`gt-buffer-render-output-hook' 不 run），故 `--stream-sync' 的
+追问分支拿不到调用者。保留它是为了「gt 补上流式完成/增量回调」后增量实现不
+必从零重写；届时需同时打开 `--follow-up-translator' 里的 `stream' 开关。"
   (let* ((panel (seshat-reader-translate--panel-buffer)))
     (when (buffer-live-p panel)
       (let* ((window (seshat-reader-translate--panel-display-window panel))
@@ -2094,65 +2144,93 @@ ENGINE 为预设里的 ChatGPT 引擎（`--follow-up-translator' 会克隆它）
 (defun seshat-reader-translate--follow-up-complete (panel question)
   "追问完成回调：把最终答案写进面板 PANEL、更新状态、记录结果，返回答案文本.
 从追问的隐藏中转 buffer（`--follow-up-buffer-name'）取最终答案（SKIP-LOADING
-过滤掉尚未产出的占位），替换 `:answer-marker' 之后到 buffer 末尾的答案区；
+过滤掉尚未产出的占位），替换 `:answer-marker' 之后到 buffer 末尾的答案区
+（问题以引用块写在前面，答案正文直接接在空行之后，不带任何标签）；
 随后把 QUESTION 与本轮答案追加进 `:turns'（并按
 `seshat-reader-translate-follow-up-max-rounds' 裁剪）、`:answer-start' 与
 `:answer-marker' 置 nil、header-line 改成「已完成 · N 轮追问」（N 取自状态
 里的 `:round'，不依赖闭包捕获）。
 
-取不到答案（翻译失败或流式未产出）时不改面板内容、不追加轮次，只 `message'
-提示。成功时把**整面板纯文本**交给 `seshat-reader-translate--record-result'
-（存批注语义：批注要保存的是整段对话，而非孤立的一轮答案）。"
-  (let ((answer (let ((gt-buffer (get-buffer
-                                  seshat-reader-translate--follow-up-buffer-name)))
-                  (when (buffer-live-p gt-buffer)
-                    (with-current-buffer gt-buffer
-                      (car (seshat-reader-translate--extract-result t)))))))
+取不到答案（请求失败、中转 buffer 不存在或内容仍全是 `Loading...'）时不改
+面板内容、不追加轮次，但**必须**把 `:answer-start' / `:answer-marker' 清空
+并把 header-line 改成「追问 N 失败」——否则面板永久停在「生成中…」，下一轮
+追问也会被当成「上一轮仍在生成」。成功时把**整面板纯文本**交给
+`seshat-reader-translate--record-result'（存批注语义：批注要保存的是整段
+对话，而非孤立的一轮答案）。
+
+本函数是 gt 渲染对象 `:then' 的唯一入口（`pdd' 回调），**任何异常都不许外泄**
+（外泄会被 gt 的 `gt-output :around' 捕获并把 translator state 置 4，面板同样
+停在生成中且无提示），故取答案、更新面板、记录结果三段各自 `condition-case'
++ `message'。执行顺序保证「清 translator 登记」永远发生（迟到增量不再误写）。"
+  (let ((answer nil))
+    (condition-case err
+        (let ((gt-buffer (get-buffer
+                          seshat-reader-translate--follow-up-buffer-name)))
+          (when (buffer-live-p gt-buffer)
+            (with-current-buffer gt-buffer
+              (setq answer (car (seshat-reader-translate--extract-result t))))))
+      (error (message "Seshat Reader translate: 追问取答案失败（%s）"
+                      (error-message-string err))))
     (when (buffer-live-p panel)
-      (with-current-buffer panel
-        (let* ((state seshat-reader-translate--follow-up-state)
-               (round (or (plist-get state :round) 1))
-               (marker (plist-get state :answer-marker))
-               (turns (plist-get state :turns)))
-          (when (and answer (markerp marker) (marker-position marker))
-            (let ((inhibit-read-only t))
-              (save-excursion
-                (goto-char marker)
-                (delete-region (point) (point-max))
-                (insert answer)
-                (unless (string-suffix-p "\n" answer)
-                  (insert "\n"))))
-            (setq turns (append (ensure-list turns) (list (cons question answer)))))
-          (when (markerp marker) (set-marker marker nil))
-          (setq seshat-reader-translate--follow-up-state
-                (list :source (plist-get state :source)
-                      :answer (plist-get state :answer)
-                      :langs (plist-get state :langs)
-                      :kind (plist-get state :kind)
-                      :round round
-                      :turns (seshat-reader-translate--follow-up-trim turns)
-                      :answer-marker nil
-                      :answer-start nil))
-          (setq-local header-line-format
-                      (concat (or seshat-reader-translate--panel-title "Seshat 解释")
-                              (format "（已完成 · %d 轮追问）" round)))))
-      (if answer
-          (seshat-reader-translate--record-result
-           (cons (with-current-buffer panel
-                   (buffer-substring-no-properties (point-min) (point-max)))
-                 nil))
-        (message "Seshat Reader translate: 追问失败（未取到答案），面板保留占位")))
+      (condition-case err
+          (with-current-buffer panel
+            (let* ((state seshat-reader-translate--follow-up-state)
+                   (round (or (plist-get state :round) 1))
+                   (marker (plist-get state :answer-marker))
+                   (turns (plist-get state :turns)))
+              (when (and answer (markerp marker) (marker-position marker))
+                (let ((inhibit-read-only t))
+                  (save-excursion
+                    (goto-char marker)
+                    (delete-region (point) (point-max))
+                    (insert answer)
+                    (unless (string-suffix-p "\n" answer)
+                      (insert "\n"))))
+                (setq turns (append (ensure-list turns)
+                                    (list (cons question answer)))))
+              (when (markerp marker) (set-marker marker nil))
+              (setq seshat-reader-translate--follow-up-state
+                    (list :source (plist-get state :source)
+                          :answer (plist-get state :answer)
+                          :langs (plist-get state :langs)
+                          :kind (plist-get state :kind)
+                          :round round
+                          :turns (seshat-reader-translate--follow-up-trim turns)
+                          :answer-marker nil
+                          :answer-start nil))
+              (setq-local header-line-format
+                          (concat (or seshat-reader-translate--panel-title
+                                      "Seshat 解释")
+                                  (if answer
+                                      (format "（已完成 · %d 轮追问）" round)
+                                    (format "（追问 %d 失败）" round))))))
+        (error (message "Seshat Reader translate: 追问面板更新失败（%s）"
+                        (error-message-string err)))))
     ;; 本轮已结束：清掉 translator 登记，防止 gt 在收尾后再次输出增量时
     ;; `--stream-sync' 误把追问答案写进首轮正文区。
     (setq seshat-reader-translate--current-translator nil)
+    (if answer
+        (condition-case err
+            (when (buffer-live-p panel)
+              (seshat-reader-translate--record-result
+               (cons (with-current-buffer panel
+                       (buffer-substring-no-properties (point-min) (point-max)))
+                     nil)))
+          (error (message "Seshat Reader translate: 追问结果记录失败（%s）"
+                          (error-message-string err))))
+      (message "Seshat Reader translate: 追问失败（未取到答案），面板保留问题块；可重试一次"))
     answer))
 
 (defun seshat-reader-translate-follow-up (question)
   "针对当前译文/解释面板的原文继续追问，QUESTION 为本轮问题.
 追问复用面板记录的首轮原文与首轮答案，并把最近
 `seshat-reader-translate-follow-up-max-rounds' 轮问答一起作为 messages 发送
-（组装见 `seshat-reader-translate--follow-up-messages'），答案追加到面板；
-`seshat-reader-translate-stream' 为真时增量写入当前轮答案区。
+（组装见 `seshat-reader-translate--follow-up-messages'），答案追加到面板：
+问题写成 Markdown 引用块（每行 `> ` 前缀），空行之后直出答案正文，轮次之间
+用 `---' 分隔线分隔；轮次序号只显示在 header-line（「追问 N 生成中…」→
+「已完成 · N 轮追问」）。追问**不走流式**（原因见
+`seshat-reader-translate--follow-up-translator'），答案在 `:then' 回调里一次
+写入面板。
 
 前置条件缺失时一律 `user-error' 并说明原因：面板未打开、面板尚无首轮结果
 （`:source' 缺失）、问题为空、或预设里的引擎不是 `gt-chatgpt-engine'

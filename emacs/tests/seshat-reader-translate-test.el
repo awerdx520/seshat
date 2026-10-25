@@ -1656,13 +1656,27 @@ STATE 为 plist（可含 `:source' `:answer' `:langs' `:kind' `:round' `:turns'
                    (lambda (&rest _args) (setq started t))))
           (should-error (seshat-reader-translate-follow-up "问题") :type 'user-error)
           (should-not started)
-          ;; 面板内容不受影响（没有追加任何轮次）
+          ;; 面板内容不受影响（没有追加问题引用块，也没有分隔线）
           (with-current-buffer panel
-            (should-not (string-match-p "### 追问" (buffer-string)))))
+            (should (equal (buffer-string)
+                           "> **原文**\n>\n> 原文片段\n\n---\n首轮解释\n"))))
       (when (buffer-live-p panel) (kill-buffer panel)))))
 
+(ert-deftest seshat-reader-translate-test--follow-up-quote-multiline ()
+  "追问问题按行加 `> ' 前缀（引用块），空行变成单独的 `>'，不带任何标签."
+  (should (equal (seshat-reader-translate--follow-up-quote "单行问题")
+                 "> 单行问题"))
+  (should (equal (seshat-reader-translate--follow-up-quote "第一行\n第二行")
+                 "> 第一行\n> 第二行"))
+  ;; 段间空行 → 单独的 `>'（Markdown 引用块内的段落分隔）
+  (should (equal (seshat-reader-translate--follow-up-quote "甲\n\n乙")
+                 "> 甲\n>\n> 乙"))
+  ;; gt 的分段列表形状不报错（`--as-string' 规范）
+  (should (equal (seshat-reader-translate--follow-up-quote '("甲" "乙"))
+                 "> 甲\n> 乙")))
+
 (ert-deftest seshat-reader-translate-test--follow-up-appends-round ()
-  "追问在面板末尾追加「### 追问 1 / **问：** / **答：**」，记录答案区 marker 并递增轮次."
+  "追问在面板末尾追加「--- + 问题引用块 + 空行」，记录答案区 marker 并递增轮次."
   (skip-unless (require 'gt nil t))
   (skip-unless (require 'gt-render-buffer nil t))
   (let* ((seshat-reader-sidebar-translate-buffer-name
@@ -1688,11 +1702,15 @@ STATE 为 plist（可含 `:source' `:answer' `:langs' `:kind' `:round' `:turns'
             (seshat-reader-translate-follow-up "  测试追问  "))
           (should captured)
           (with-current-buffer panel
-            (should (string-match-p "### 追问 1" (buffer-string)))
-            (should (string-match-p "\\*\\*问：\\*\\* 测试追问" (buffer-string)))
+            ;; 轮次格式：分隔线 + 引用块问题 + 空行（答案区起点），无标签行
+            (should (string-suffix-p
+                     "> **原文**\n>\n> 原文片段\n\n---\n首轮解释\n\n---\n\n> 测试追问\n\n"
+                     (buffer-string)))
+            (should-not (string-match-p "### 追问" (buffer-string)))
+            (should-not (string-match-p "问：" (buffer-string)))
+            (should-not (string-match-p "答：" (buffer-string)))
             ;; 问题被 `string-trim' 处理（前后空白不进面板）
             (should-not (string-match-p "  测试追问" (buffer-string)))
-            (should (string-suffix-p "**答：**\n\n" (buffer-string)))
             (let ((state seshat-reader-translate--follow-up-state))
               (should (= 1 (plist-get state :round)))
               (should (eq (plist-get state :answer-start) t))
@@ -1704,6 +1722,8 @@ STATE 为 plist（可含 `:source' `:answer' `:langs' `:kind' `:round' `:turns'
           (let* ((engine (car (slot-value captured 'engines)))
                  (prompt (slot-value engine 'prompt)))
             (should (functionp prompt))
+            ;; 追问恒不开流式：gt 的流式分支不调 `:then'，开了答案就永远不出现
+            (should-not (slot-value engine 'stream))
             ;; H5：克隆体不是预设里的那个引擎对象
             (should-not (eq engine preset-engine))
             (should-not (eq (slot-value preset-engine 'prompt) prompt))
@@ -1734,7 +1754,7 @@ STATE 为 plist（可含 `:source' `:answer' `:langs' `:kind' `:round' `:turns'
           (with-current-buffer panel
             (let ((inhibit-read-only t))
               (goto-char (point-max))
-              (insert "\n\n---\n\n### 追问 1\n\n**问：** 测试追问\n\n**答：**\n\n"))
+              (insert "\n---\n\n> 测试追问\n\n"))
             (setq seshat-reader-translate--follow-up-state
                   (list :source "原文片段" :answer "首轮解释" :langs '(en zh)
                         :kind 'explain :round 1 :turns nil
@@ -1752,15 +1772,64 @@ STATE 为 plist（可含 `:source' `:answer' `:langs' `:kind' `:round' `:turns'
               (should-not (plist-get state :answer-start))
               (should-not (plist-get state :answer-marker))
               (should (= 1 (plist-get state :round))))
-            (should (string-suffix-p "**答：**\n\n本轮答案\n" (buffer-string)))
+            ;; 引用块问题 + 空行 + 答案正文 + 一个尾换行（无标签、无占位残留）
+            (should (string-suffix-p "> 测试追问\n\n本轮答案\n" (buffer-string)))
+            (should-not (string-match-p "问：" (buffer-string)))
+            (should-not (string-match-p "答：" (buffer-string)))
             (goto-char (point-min))
-            (should (= 1 (how-many "### 追问")))
+            (should (= 2 (how-many "^---$")))
+            (should (= 1 (how-many "^> 测试追问$")))
             (should (string-match-p "已完成 · 1 轮追问" header-line-format)))
           ;; 存批注口径：记录整面板纯文本（含首轮解释与本轮答案）
           (should seshat-reader-translate-last-result)
           (should (string-match-p "首轮解释" seshat-reader-translate-last-result))
           (should (string-match-p "本轮答案" seshat-reader-translate-last-result))
           ;; 收尾后清掉 translator 登记，防止迟到增量误写首轮正文区
+          (should-not seshat-reader-translate--current-translator))
+      (when (buffer-live-p panel) (kill-buffer panel))
+      (when (buffer-live-p gt-buffer) (kill-buffer gt-buffer)))))
+
+(ert-deftest seshat-reader-translate-test--follow-up-complete-failure-unsticks ()
+  "取不到答案时不追加轮次、不改面板内容，但清掉生成中状态并报「追问 N 失败」."
+  (skip-unless (require 'gt nil t))
+  (let* ((seshat-reader-sidebar-translate-buffer-name
+          seshat-reader-translate-test--panel-name)
+         (seshat-reader-translate-last-result nil)
+         (seshat-reader-translate--current-translator 'fake-translator)
+         ;; 中转 buffer 只有 `Loading...' 占位（等价于请求失败 / 未产出）
+         (gt-buffer (get-buffer-create
+                     seshat-reader-translate--follow-up-buffer-name))
+         (panel (seshat-reader-translate-test--follow-up-panel nil))
+         (before nil))
+    (unwind-protect
+        (progn
+          (with-current-buffer panel
+            (let ((inhibit-read-only t))
+              (goto-char (point-max))
+              (insert "\n---\n\n> 失败的追问\n\n"))
+            (setq before (buffer-string))
+            (setq seshat-reader-translate--follow-up-state
+                  (list :source "原文片段" :answer "首轮解释" :langs '(en zh)
+                        :kind 'explain :round 1 :turns nil
+                        :answer-marker (copy-marker (point-max))
+                        :answer-start t)))
+          (with-current-buffer gt-buffer
+            (erase-buffer)
+            (insert (propertize seshat-reader-translate--loading-text 'gt-result t)))
+          (should-not (seshat-reader-translate--follow-up-complete
+                       panel "失败的追问"))
+          (with-current-buffer panel
+            (let ((state seshat-reader-translate--follow-up-state))
+              ;; 关键：`生成中' 状态必须清掉，否则面板永久卡住、下一轮追问错乱
+              (should-not (plist-get state :answer-start))
+              (should-not (plist-get state :answer-marker))
+              (should-not (plist-get state :turns)))
+            ;; 面板正文不变（问题块保留，答案区仍是空行）
+            (should (equal (buffer-string) before))
+            (should (string-match-p "追问 1 失败" header-line-format)))
+          ;; 失败也不记录结果（不覆盖上一次的 `last-result'）
+          (should-not seshat-reader-translate-last-result)
+          ;; 收尾同样清掉 translator 登记
           (should-not seshat-reader-translate--current-translator))
       (when (buffer-live-p panel) (kill-buffer panel))
       (when (buffer-live-p gt-buffer) (kill-buffer gt-buffer)))))

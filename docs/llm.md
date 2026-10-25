@@ -222,6 +222,31 @@ authinfo → `gt-chatgpt-key` → `OPENAI_API_KEY`）。配置侧**不再** `set
 或调小 `seshat-reader-translate-context-lines` / `-context-max-chars` 降低数据量。如需本地
 处理，可改用本地模型端点（例如把 `reader-explain` 预设指向本机 Ollama 的 OpenAI 兼容接口）。
 
+**多轮追问（`C-c C-q`）**：面板里可以对**同一段原文**继续提问（命令
+`seshat-reader-translate-follow-up`，也可在阅读 buffer 里按 `C-c C-q`）。请求以 OpenAI
+`messages` 形式携带上下文：首轮「原文（带引导语）」→ 首轮答案 → 最近
+`seshat-reader-translate-follow-up-max-rounds`（默认 `6`）轮问答 → 本次问题；首轮原文与首轮
+解释**始终保留**（超过上限只丢弃最早的追问轮次，取 `0` 表示每次只看原文与首轮解释）。实现
+方式是克隆预设里的 `gt-chatgpt-engine` 并把 `prompt` 槽换成「返回 messages 列表的函数」，
+**不改 gt 源码、不自行拼 JSON**。预设里没有该引擎（例如只配了 youdao / google）时以
+`user-error` 提示改配置，**不做文本拼接降级**——翻译引擎没有对话语义。
+
+**追问轮次的正文格式**（刻意不含标签，避免窄面板横向溢出与视觉噪音）：
+
+- 问题写成 **Markdown 引用块**（每行 `> ` 前缀，与首轮原文引用块同风格，不带「原文」那行
+  标签）；多行问题逐行加前缀，空行变成单独的 `>`；
+- 问题块与答案之间**空一行**，答案正文直接输出；
+- 轮次之间用 **`---` 分隔线**（首轮答案与第 1 轮追问之间也有），此前各轮内容不重排；
+- 轮次序号只出现在 `header-line`：`Seshat 解释（追问 N 生成中…）` → `Seshat 解释（已完成 ·
+  N 轮追问）`；取不到答案时变 `（追问 N 失败）` 并清掉「生成中」状态（面板不会永久卡住）。
+
+**追问不走流式**：gt 的纯流式链路（`gt-finalize` 的 `stream` 分支）只把增量写进渲染对象的
+marker，既**不调** `gt-update` 也不调渲染器的 output 函数，因此渲染对象的 `:then` 回调永不
+触发。而追问把答案写进面板的**唯一**通路就是 `:then`，中转 buffer 又是隐藏的——一旦给追问
+引擎开流式，模型答案会写进没人看得到的 ` *Seshat gt follow-up*`，面板答案区永远空白、
+`header-line` 卡在「生成中…」。故追问引擎的 `stream` 槽恒为 `nil`，答案在完成回调里一次
+写入。
+
 **后续计划**：待服务端补齐 LLM HTTP 端点后，可把阅读器翻译 / 解释切换为「服务端统一入口 +
 本地节点路由」（见 [`openspec/tech-debt.md`](../openspec/tech-debt.md)「服务端 LLM 端点缺口」条）。
 
