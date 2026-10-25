@@ -1480,12 +1480,14 @@ batch 与终端 frame 下真实 `display-graphic-p' 恒为 nil，而默认 carri
 ;;; 承载单元访问器（window 后端；frame 后端的访问器同时用桩对象覆盖）
 
 (ert-deftest seshat-reader-sidebar-test--panels-window-backend ()
-  "`--panels' 在窗口后端返回与 `--windows' 完全一致的列表.
-本任务只实现窗口后端，故两者必须同源：child frame 后端接入前，任何上层逻辑
-经 `--panels' 得到的仍是「本包面板窗口」这一既有语义。"
+  "`--panels' 在 frame 后端无面板时与 `--windows' 完全一致.
+这是旧行为不回归的判据：childframe 后端接入后，只要当前没有本包 child frame，
+上层经 `--panels' 得到的仍是「本包面板窗口」这一既有语义与顺序。"
   (let ((panels (list 'w-outline 'w-annotations)))
     (cl-letf (((symbol-function 'seshat-reader-sidebar--windows)
-               (lambda () panels)))
+               (lambda () panels))
+              ((symbol-function 'seshat-reader-sidebar--cf-frames)
+               (lambda () nil)))
       (should (equal (seshat-reader-sidebar--panels) panels)))))
 
 (ert-deftest seshat-reader-sidebar-test--panel-kind-window-and-frame ()
@@ -1565,6 +1567,272 @@ batch 与终端 frame 下真实 `display-graphic-p' 恒为 nil，而默认 carri
       (seshat-reader-sidebar--panel-close 'unknown-object)
       (should (equal delete-window-calls '(w-tr)))
       (should (equal delete-frame-calls '(fake-frame))))))
+
+;;; childframe 后端：几何纯函数、frame 过滤与幂等复用
+
+(ert-deftest seshat-reader-sidebar-test--cf-parameters-required-keys ()
+  "child frame parameters 必含约定项，且**不含** `no-accept-focus'.
+`no-accept-focus' 会让面板连点击都无法聚焦，从而不能滚动、不能选文本复制，
+是本方案明确排除的取值——出现即视为回归。`name' 也不得出现在参数里：GUI frame
+的 name 随 buffer 名变化（目录 buffer 名还带源文件名），不能作「本包面板」的
+标识，标识一律用 `seshat-reader-panel-kind'。
+
+本用例是纯函数断言：batch 下父 frame 取不到像素尺寸，宽高退化为字符占位值，不
+影响被测参数（这正是把几何计算与 frame 创建分开的目的）。"
+  (let ((params (seshat-reader-sidebar--cf-parameters
+                 'fake-parent 'translate)))
+    (should (equal (cdr (assq 'parent-frame params)) 'fake-parent))
+    (should (eq (cdr (assq 'undecorated params)) t))
+    (should (eq (cdr (assq 'no-focus-on-map params)) t))
+    (should (eq (cdr (assq 'no-other-frame params)) t))
+    (should (eq (cdr (assq 'no-delete-other-frames params)) t))
+    (should (equal (cdr (assq 'internal-border-width params)) 8))
+    (should (eq (cdr (assq 'seshat-reader-panel-kind params)) 'translate))
+    ;; 明确排除的参数
+    (should-not (assq 'no-accept-focus params))
+    (should-not (assq 'name params))
+    ;; 背景色必须是字符串（取不到 default face 时回退 #ffffff）
+    (should (stringp (cdr (assq 'background-color params))))
+    ;; 初始字符尺寸至少 1，供 `display-buffer-in-child-frame' 建 frame
+    (should (>= (cdr (assq 'width params)) 1))
+    (should (>= (cdr (assq 'height params)) 1))))
+
+(ert-deftest seshat-reader-sidebar-test--cf-size-ratio-and-invalid-parent ()
+  "像素尺寸 = 父 frame 像素尺寸 × 比例；父尺寸异常时返回 nil.
+1000 × 800 的父 frame 按默认比例 0.34 / 0.45 得 (340 . 360)。返回 nil 而非
+(0 . 0) 是要点：调用方靠 nil 判定「本环境建不出 child frame」，返回 0 尺寸会
+让它去建一个不可见的 frame。"
+  (cl-letf (((symbol-function 'frame-pixel-width)
+             (lambda (&optional _frame) 1000))
+            ((symbol-function 'frame-pixel-height)
+             (lambda (&optional _frame) 800)))
+    (should (equal (seshat-reader-sidebar--cf-size 'parent 'translate)
+                   '(340 . 360)))
+    ;; 比例可配置，且与 kind 无关（kind 目前只作签名占位）
+    (let ((seshat-reader-panel-width 0.5)
+          (seshat-reader-panel-height 0.25))
+      (should (equal (seshat-reader-sidebar--cf-size 'parent 'outline)
+                     '(500 . 200))))
+    ;; 父尺寸非数值 / 非正 → nil
+    (cl-letf (((symbol-function 'frame-pixel-width)
+               (lambda (&optional _frame) nil)))
+      (should-not (seshat-reader-sidebar--cf-size 'parent 'translate)))
+    (cl-letf (((symbol-function 'frame-pixel-height)
+               (lambda (&optional _frame) 0)))
+      (should-not (seshat-reader-sidebar--cf-size 'parent 'translate)))))
+
+(ert-deftest seshat-reader-sidebar-test--cf-position-right-edge-and-stacking ()
+  "面板贴父 frame 右边缘、多面板纵向堆叠时按「高度 + margin」逐层下移.
+公式（与 `seshat-reader-sidebar--cf-position' 的 docstring 一致）：
+
+  LEFT = 父宽 - 面板宽 - margin
+  TOP  = margin + Σ(已存在面板高度 + margin)
+
+父宽 1000、面板宽 340、margin 16 → LEFT 644；无其它面板时 TOP 16；已有高度
+300 / 200 两个面板时 TOP = 16 + 300 + 16 + 200 + 16 = 548（正是「后者不遮挡
+前者」的要求）。"
+  (let ((seshat-reader-panel-width 0.34)
+        (seshat-reader-panel-height 0.45)
+        (seshat-reader-panel-margin 16))
+    (cl-letf (((symbol-function 'frame-pixel-width)
+               (lambda (&optional _frame) 1000))
+              ((symbol-function 'frame-pixel-height)
+               (lambda (&optional _frame) 800)))
+      ;; 唯一面板：贴右上角
+      (should (equal (seshat-reader-sidebar--cf-position
+                      'parent 'translate nil)
+                     '(644 . 16)))
+      ;; 已有两个面板 → 堆叠
+      (should (equal (seshat-reader-sidebar--cf-position
+                      'parent 'translate '(300 200))
+                     '(644 . 548)))
+      ;; 空表等同于 nil
+      (should (equal (seshat-reader-sidebar--cf-position
+                      'parent 'translate '())
+                     '(644 . 16)))
+      ;; 非法高度项不占位（调用方可能从 `frame-pixel-height' 拿到 nil）
+      (should (equal (seshat-reader-sidebar--cf-position
+                      'parent 'translate '(nil 0))
+                     '(644 . 16)))
+      ;; 父尺寸异常 → nil（调用方跳过定位）
+      (cl-letf (((symbol-function 'frame-pixel-width)
+                 (lambda (&optional _frame) nil)))
+        (should-not (seshat-reader-sidebar--cf-position
+                     'parent 'translate nil))))))
+
+(ert-deftest seshat-reader-sidebar-test--cf-frames-filter-and-lookup ()
+  "`--cf-frames' 只保留带 kind 参数的活 frame，`--cf-frame-for-kind' 按 kind 命中.
+过滤判据是**自有 frame parameter**（`seshat-reader-panel-kind'）而不是 frame
+的 `name'：name 随 buffer 名变化，用它当标识会在面板换内容后失配。已死 frame
+必须排除——`delete-frame' 之后对象可能仍留在 `frame-list' 的残余里，误当成
+「面板已显示」会让显示路径永远走幂等复用、内容再也不刷新。"
+  (cl-letf (((symbol-function 'frame-list)
+             (lambda () '(cf-outline cf-translate other dead-cf)))
+            ((symbol-function 'frame-live-p)
+             (lambda (frame) (not (eq frame 'dead-cf))))
+            ((symbol-function 'frame-parameter)
+             (lambda (frame param)
+               (when (eq param 'seshat-reader-panel-kind)
+                 (pcase frame
+                   ('cf-outline 'outline)
+                   ('cf-translate 'translate)
+                   ('dead-cf 'translate))))))
+    (should (equal (seshat-reader-sidebar--cf-frames)
+                   '(cf-outline cf-translate)))
+    (should (eq (seshat-reader-sidebar--cf-frame-for-kind 'translate)
+                'cf-translate))
+    (should (eq (seshat-reader-sidebar--cf-frame-for-kind 'outline)
+                'cf-outline))
+    ;; 该 kind 没有面板 → nil（走创建路径）
+    (should-not (seshat-reader-sidebar--cf-frame-for-kind 'annotations))
+    ;; 显式传 FRAMES 时不读 `--cf-frames'
+    (should (eq (seshat-reader-sidebar--cf-frame-for-kind
+                 'translate '(cf-translate))
+                'cf-translate))
+    (should-not (seshat-reader-sidebar--cf-frame-for-kind
+                 'outline '(cf-translate)))))
+
+(ert-deftest seshat-reader-sidebar-test--cf-show-reuses-existing-frame ()
+  "同 kind 的 child frame 已存在时只换 buffer 并重新定位，**不**重建 frame.
+幂等是面板能承受流式刷新的前提：每次增量都重建 frame 会闪烁，并丢掉滚动位置
+与面板内的 point。判据即 `display-buffer' 调用 0 次、`set-window-buffer'
+1 次。"
+  (let ((buf (get-buffer-create " *seshat-cf-reuse*"))
+        (display-calls 0)
+        set-buffer-calls placed)
+    (unwind-protect
+        (cl-letf (((symbol-function 'selected-frame) (lambda () 'gui-frame))
+                  ((symbol-function 'display-graphic-p)
+                   (lambda (&optional _frame) t))
+                  ((symbol-function 'seshat-reader-sidebar--cf-frame-for-kind)
+                   (lambda (_kind) 'cf-translate))
+                  ((symbol-function 'frame-live-p) (lambda (_frame) t))
+                  ((symbol-function 'frame-selected-window)
+                   (lambda (_frame) 'cf-window))
+                  ((symbol-function 'windowp)
+                   (lambda (obj) (eq obj 'cf-window)))
+                  ((symbol-function 'set-window-buffer)
+                   (lambda (window buffer)
+                     (push (cons window buffer) set-buffer-calls)))
+                  ((symbol-function 'seshat-reader-sidebar--cf-place)
+                   (lambda (frame kind) (push (cons frame kind) placed)))
+                  ((symbol-function 'display-buffer)
+                   (lambda (&rest _)
+                     (setq display-calls (1+ display-calls))
+                     'never-window)))
+          (should (eq (seshat-reader-sidebar--cf-show buf 'translate)
+                      'cf-window))
+          (should (zerop display-calls))
+          (should (equal set-buffer-calls (list (cons 'cf-window buf))))
+          (should (equal placed '((cf-translate . translate)))))
+      (kill-buffer buf))))
+
+(ert-deftest seshat-reader-sidebar-test--cf-show-creates-frame-with-dotted-action ()
+  "创建路径：ACTION 必须是**点对** `(FUNC . ALIST)'，并按像素收口尺寸与位置.
+嵌套列表 `((display-buffer-in-child-frame (child-frame-parameters ...)))' 会让
+`display-buffer' 收到的 ALIST 变成 nil、child frame 参数全丢（frame 只用默认
+参数建出来）——这是本用例锁死的不变量：car 必须是动作函数符号，cdr 必须是含
+`child-frame-parameters' 的 alist。
+
+尺寸与位置必须走像素级接口：`set-frame-size' 带 PIXELWISE 非 nil，尺寸等于
+「父 frame 像素 × 比例」，位置走 `set-frame-position'（frame parameters 的
+width/height 是字符单位，无法精确等于像素比例）。"
+  (let ((buf (get-buffer-create " *seshat-cf-create*"))
+        captured-action sized positioned)
+    (unwind-protect
+        (cl-letf (((symbol-function 'selected-frame) (lambda () 'gui-frame))
+                  ((symbol-function 'display-graphic-p)
+                   (lambda (&optional _frame) t))
+                  ((symbol-function 'seshat-reader-sidebar--cf-frame-for-kind)
+                   (lambda (_kind) nil))
+                  ((symbol-function 'display-buffer)
+                   (lambda (&rest _)
+                     (setq captured-action display-buffer-overriding-action)
+                     'cf-window))
+                  ((symbol-function 'windowp)
+                   (lambda (obj) (eq obj 'cf-window)))
+                  ((symbol-function 'window-frame) (lambda (_window) 'cf-new))
+                  ((symbol-function 'frame-parameter)
+                   (lambda (frame param)
+                     (when (and (eq frame 'cf-new)
+                                (eq param 'parent-frame))
+                       'gui-frame)))
+                  ((symbol-function 'seshat-reader-sidebar--cf-frames)
+                   (lambda () nil))
+                  ((symbol-function 'frame-pixel-width)
+                   (lambda (&optional _frame) 1000))
+                  ((symbol-function 'frame-pixel-height)
+                   (lambda (&optional _frame) 800))
+                  ((symbol-function 'set-frame-size)
+                   (lambda (frame width height &optional pixelwise)
+                     (push (list frame width height pixelwise) sized)))
+                  ((symbol-function 'set-frame-position)
+                   (lambda (frame left top)
+                     (push (list frame left top) positioned))))
+          (should (eq (seshat-reader-sidebar--cf-show buf 'translate)
+                      'cf-window))
+          ;; ACTION 是点对：car 为动作函数，cdr 为 alist
+          (should (eq (car captured-action) 'display-buffer-in-child-frame))
+          (should (consp (cdr captured-action)))
+          (should (assq 'child-frame-parameters (cdr captured-action)))
+          (should (eq (cdr (assq 'seshat-reader-panel-kind
+                                 (alist-get 'child-frame-parameters
+                                            (cdr captured-action))))
+                      'translate))
+          ;; 像素级收口：340 × 360 @ (644, 16)
+          (should (equal sized '((cf-new 340 360 t))))
+          (should (equal positioned '((cf-new 644 16)))))
+      (kill-buffer buf))))
+
+(ert-deftest seshat-reader-sidebar-test--cf-show-non-graphic-returns-nil ()
+  "非图形 frame（batch / 终端）直接返回 nil，且完全不触碰 `display-buffer'.
+回退窗口承载的决定必须由调用方拿着 nil 做出：本函数只懂 child frame 一种后端，
+在此自行降级会把「谁负责回退」这件事藏起来；报错则会让终端用户连面板都没得用。"
+  (let ((buf (get-buffer-create " *seshat-cf-terminal*"))
+        (display-calls 0))
+    (unwind-protect
+        (cl-letf (((symbol-function 'selected-frame)
+                   (lambda () 'terminal-frame))
+                  ((symbol-function 'display-graphic-p)
+                   (lambda (&optional _frame) nil))
+                  ((symbol-function 'display-buffer)
+                   (lambda (&rest _)
+                     (setq display-calls (1+ display-calls))
+                     'never-window)))
+          (should-not (seshat-reader-sidebar--cf-show buf 'translate))
+          (should (zerop display-calls)))
+      (kill-buffer buf))))
+
+(ert-deftest seshat-reader-sidebar-test--cf-close-deletes-live-frame-only ()
+  "`--cf-close' 只对活 frame 调 `delete-frame'，死 frame 与非 frame 静默返回.
+关闭必须幂等：面板可能已被 `q' / `delete-other-frames' / 父 frame 关闭连带
+删掉，此时再关不该报错。"
+  (let (deleted)
+    (cl-letf (((symbol-function 'framep)
+               (lambda (obj) (memq obj '(cf dead-cf))))
+              ((symbol-function 'frame-live-p)
+               (lambda (frame) (not (eq frame 'dead-cf))))
+              ((symbol-function 'delete-frame)
+               (lambda (frame &optional _force) (push frame deleted))))
+      (seshat-reader-sidebar--cf-close 'cf)
+      (seshat-reader-sidebar--cf-close 'dead-cf)
+      (seshat-reader-sidebar--cf-close 'not-a-frame)
+      (should (equal deleted '(cf))))))
+
+(ert-deftest seshat-reader-sidebar-test--panels-merges-windows-and-frames ()
+  "`--panels' = 本包面板窗口 + 本包 child frame 面板，窗口在前、frame 在后.
+拼接顺序是有意固定的：窗口是既有后端，「按 kind 取第一个」在混合场景下优先命中
+窗口，与历史行为一致。"
+  (cl-letf (((symbol-function 'seshat-reader-sidebar--windows)
+             (lambda () '(w1 w2)))
+            ((symbol-function 'seshat-reader-sidebar--cf-frames)
+             (lambda () '(f1 f2))))
+    (should (equal (seshat-reader-sidebar--panels) '(w1 w2 f1 f2))))
+  (cl-letf (((symbol-function 'seshat-reader-sidebar--windows)
+             (lambda () nil))
+            ((symbol-function 'seshat-reader-sidebar--cf-frames)
+             (lambda () '(f1))))
+    (should (equal (seshat-reader-sidebar--panels) '(f1)))))
 
 (provide 'seshat-reader-sidebar-test)
 ;;; seshat-reader-sidebar-test.el ends here

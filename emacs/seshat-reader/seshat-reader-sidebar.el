@@ -649,19 +649,250 @@ slot 会被 `display-buffer-in-side-window' 拒绝而回落为普通窗口，此
                          seshat-reader-panel-carrier)))
         (if (memq carrier '(childframe window)) carrier 'window)))))
 
+;;; childframe 后端（覆盖式承载，不参与窗口树）
+
+;; child frame 是「不属于任何窗口树的 frame」：它浮在父 frame 之上，创建、
+;; 换内容、关闭都不改动父 frame 的窗口树与其窗口尺寸。这正是本后端存在的唯一
+;; 理由——阅读器版面与窗口像素尺寸耦合（`seshat-reader--refit-window' 挂在
+;; `window-size-change-functions' 上），把面板做成 side window 必然压缩阅读窗
+;; 口并触发重新适配，观感就是「跳一下」。本节只提供**机制**（几何计算、创建、
+;; 幂等复用、关闭），分派到本后端的逻辑由上层的 carrier 判断决定。
+
+(defun seshat-reader-sidebar--cf-size (parent kind)
+  "返回 KIND 面板在父 frame PARENT 下的应有尺寸，形式为像素 (WIDTH . HEIGHT).
+宽度 = `seshat-reader-panel-width' × PARENT 的像素宽，高度 =
+`seshat-reader-panel-height' × PARENT 的像素高，均四舍五入为整数像素。
+PARENT 的像素尺寸取不到或非正（`frame-pixel-width' / `frame-pixel-height'
+返回 nil / 0，终端 frame 即如此）时返回 nil——调用方据此放弃创建 child
+frame 并回退窗口承载，而不是拿 nil 去算坐标。
+
+**面板尺寸固定、不做内容自适应**：内容长度差异极大（一行译文 vs 几十行解
+释），若按内容调高，面板每次刷新都会改变遮挡区域，正好制造本方案要消除的观感
+跳动；固定尺寸 + 面板窗口内部滚动可让遮挡区域全程恒定。
+
+KIND 目前不参与计算（比例由两个全局变量决定），保留该参数只为将来支持
+per-kind 比例时不必改调用点；故此处显式 `ignore' 它，避免字节编译器报「未使用
+的语汇参数」。"
+  (ignore kind)                         ; 见 docstring：仅为将来 per-kind 比例预留
+  (let ((width (ignore-errors (frame-pixel-width parent)))
+        (height (ignore-errors (frame-pixel-height parent))))
+    (when (and (numberp width) (> width 0)
+               (numberp height) (> height 0))
+      (cons (round (* width seshat-reader-panel-width))
+            (round (* height seshat-reader-panel-height))))))
+
+(defun seshat-reader-sidebar--cf-position (parent kind existing)
+  "返回 KIND 面板相对父 frame PARENT 左上角的像素位置，形式为 (LEFT . TOP).
+EXISTING 是**已存在面板的像素高度列表**（整数列表，不是 frame 对象——纯数据
+入参才能在无 GUI 的 batch 下断言）。计算公式：
+
+  LEFT = PARENT 像素宽 - 面板像素宽 - `seshat-reader-panel-margin'
+  TOP  = margin + Σ(EXISTING 中每个高度 + margin)
+
+即所有面板都贴父 frame **右边缘**、从上往下纵向堆叠：最上面一个只留 margin
+作上边距，每多一个已存在面板就再下移「该面板高度 + margin」，故多个 kind 的
+面板（目录 + 译文）同时显示时**互不遮挡**——这是多面板共存的前提，否则后来者
+会完全盖住先来者。EXISTING 为 nil 时 TOP 就是 margin。
+
+EXISTING 中的非数值与非正项被跳过（不占位）：调用方从 `frame-pixel-height'
+取值，个别 frame 取不到时会得到 nil，不能让它把 TOP 算成 NaN。
+
+PARENT 尺寸异常或面板尺寸算不出（见 `seshat-reader-sidebar--cf-size'）时返回
+nil，调用方跳过定位、让 frame 停在创建时的默认位置。"
+  (let ((parent-width (ignore-errors (frame-pixel-width parent)))
+        (size (seshat-reader-sidebar--cf-size parent kind)))
+    (when (and (numberp parent-width) (> parent-width 0) size)
+      (let ((margin seshat-reader-panel-margin)
+            (top seshat-reader-panel-margin))
+        (dolist (height existing)
+          (when (and (numberp height) (> height 0))
+            (setq top (+ top height margin))))
+        (cons (- parent-width (car size) margin) top)))))
+
+(defun seshat-reader-sidebar--cf-parameters (parent kind)
+  "构造 KIND 面板 child frame 的 frame parameters（alist，元素为 cons）.
+PARENT 是父 frame：用它的像素尺寸反算初始宽高、用它的 default face 背景色
+作面板背景。各参数的理由：
+
+- `parent-frame'：绑定父子关系——父 frame 删除时 Emacs 自动删除子 frame，故
+  本模块不需要额外的父 frame 清理逻辑；
+- `undecorated' 与 `internal-border-width'：去掉窗口系统标题栏/外框（其高度
+  由主题决定、不可控，会让「贴右上角」错位），改用 8 像素内边框作视觉间隔；
+- `no-focus-on-map'：面板出现时**不抢**输入焦点（不打断阅读）；
+  **不设** `no-accept-focus'——那个参数会让点击也无法聚焦，面板从此不能滚动、
+  不能选文本复制，是本方案明确排除的取值；
+- `no-other-frame' 与 `no-delete-other-frames'：`other-frame'（\\[other-frame]）
+  跳过面板、`delete-other-frames' 不删面板，面板不算「用户可直接操作的
+  frame」；
+- `background-color'：取 PARENT 的 default face 背景色，取不到（终端 frame、
+  无色主题给出 nil 或 \"unspecified-bg\"）时回退 \"#ffffff\"，避免面板用与
+  阅读区不协调的默认色；
+- `seshat-reader-panel-kind'：**本包面板的唯一判据**。不能用 `name'——GUI
+  frame 的 name 随 buffer 名变化（目录 buffer 名还带源文件名），不足以标识
+  「这个 frame 是本包的面板」；
+- `width' / `height'：**字符单位**的初始尺寸，由 `--cf-size' 的像素尺寸按
+  `frame-char-width' / `frame-char-height' 反算（至少 1 个字符）。它只在
+  frame 创建的那一瞬间生效，`seshat-reader-sidebar--cf-place' 随后用像素级
+  接口精确收口。
+
+PARENT 尺寸取不到时（batch / 终端）宽高退化为 40 × 20 字符的占位值：这类环境
+根本不会创建 frame，占位值只为让本纯函数在任何环境下都返回结构完整的 alist
+（因而可在 batch 中通测）。"
+  (let* ((size (seshat-reader-sidebar--cf-size parent kind))
+         (char-width (max 1 (or (ignore-errors (frame-char-width parent)) 1)))
+         (char-height (max 1 (or (ignore-errors (frame-char-height parent)) 1)))
+         (background (ignore-errors (face-background 'default parent))))
+    (list (cons 'parent-frame parent)
+          (cons 'undecorated t)
+          (cons 'no-focus-on-map t)
+          (cons 'no-other-frame t)
+          (cons 'no-delete-other-frames t)
+          (cons 'internal-border-width 8)
+          (cons 'background-color
+                (if (and (stringp background)
+                         (not (equal background "unspecified-bg")))
+                    background
+                  "#ffffff"))
+          (cons 'seshat-reader-panel-kind kind)
+          (cons 'width (if size (max 1 (/ (car size) char-width)) 40))
+          (cons 'height (if size (max 1 (/ (cdr size) char-height)) 20)))))
+
+(defun seshat-reader-sidebar--cf-frames ()
+  "返回本包当前全体 child frame 面板（已死的不算）.
+判据：`(frame-list)' 中 `frame-live-p' 为真、且带非 nil
+`seshat-reader-panel-kind' frame parameter 的 frame。**不用**
+`frame-child-frames'（本 Emacs 不存在该函数），也**不用** frame 的 `name'
+（它随 buffer 名变化，见 `seshat-reader-sidebar--cf-parameters'）。"
+  (let (frames)
+    (dolist (frame (frame-list))
+      (when (and (frame-live-p frame)
+                 (frame-parameter frame 'seshat-reader-panel-kind))
+        (push frame frames)))
+    (nreverse frames)))
+
+(defun seshat-reader-sidebar--cf-frame-for-kind (kind &optional frames)
+  "返回本包 child frame 面板中 kind 标记等于 KIND 的那个 frame，没有则 nil.
+FRAMES 省略时取 `seshat-reader-sidebar--cf-frames'。遍历与返回语义逐字对应
+`seshat-reader-sidebar--window-for-kind'，供 `seshat-reader-sidebar--cf-show'
+判断「同 kind 是否已显示」——命中即走幂等复用，不重建 frame。"
+  (let ((rest (or frames (seshat-reader-sidebar--cf-frames)))
+        found)
+    (while (and rest (null found))
+      (when (eq (frame-parameter (car rest) 'seshat-reader-panel-kind) kind)
+        (setq found (car rest)))
+      (setq rest (cdr rest)))
+    found))
+
+(defun seshat-reader-sidebar--cf-place (frame kind)
+  "把已创建的 child frame FRAME 精确设置为 KIND 面板的像素尺寸与右上角位置.
+父 frame 取 FRAME 的 `parent-frame' frame parameter（由
+`seshat-reader-sidebar--cf-parameters' 设置）。
+
+  ;; HACK: 为什么创建后还要再摆一次位置，而不是全靠 frame parameters：
+  ;; parameters 里的 (width . W) / (height . H) 是**字符单位**，实际像素取决
+  ;; 于字体度量与 fringe，无法等于「父 frame 像素宽 × 比例」；child frame 也
+  ;; 不吃 `left' / `top' 参数。故创建后走像素级接口收口：
+  ;; `set-frame-size' 的第三参数 PIXELWISE 非 nil 时宽高按**像素**解释，
+  ;; `set-frame-position' 本身就是像素坐标。
+
+其它本包 child frame 的像素高度作为 EXISTING 传给
+`seshat-reader-sidebar--cf-position'，使多面板纵向堆叠不重叠；定位前先从列表
+里排除 FRAME 自身（它此刻已带 kind 参数、已在 `--cf-frames' 中）。
+
+任一步失败静默跳过（尺寸与定位是「更好看」，不该让面板显示整体失败），返回
+FRAME。"
+  (let* ((parent (frame-parameter frame 'parent-frame))
+         (size (and parent (seshat-reader-sidebar--cf-size parent kind)))
+         (others (delq frame (seshat-reader-sidebar--cf-frames)))
+         (heights (mapcar (lambda (other)
+                            (ignore-errors (frame-pixel-height other)))
+                          others))
+         (position (and parent
+                        (seshat-reader-sidebar--cf-position
+                         parent kind heights))))
+    (when size
+      (ignore-errors (set-frame-size frame (car size) (cdr size) t)))
+    (when position
+      (ignore-errors (set-frame-position frame (car position) (cdr position))))
+    frame))
+
+(defun seshat-reader-sidebar--cf-show (buffer kind &optional select)
+  "在选中 frame 的右上角以 child frame 覆盖显示 BUFFER，返回被显示的 window.
+返回 nil 表示**本环境无法用 child frame 承载**（选中 frame 不是图形 frame）或
+创建失败，调用方据此回退窗口承载。步骤：
+
+1. 父 frame 取 `(selected-frame)'；`display-graphic-p' 为 nil（batch、终端
+   frame）时直接返回 nil——child frame 只存在于图形终端，且此处**不**自行
+   降级成窗口承载（回退决策属于上层，本函数只管一种后端）。
+2. **幂等复用**：同 KIND 的 child frame 已存在 → 只 `set-window-buffer' 换
+   内容 + 重新定位后返回它的选中窗口。重复显示同一 kind（批注/译文刷新、流式
+   输出）因此不重建 frame：不闪、不丢滚动位置。
+3. 否则经 `display-buffer' 创建。action 经
+   `display-buffer-overriding-action' 绑定为**点对**
+   `(display-buffer-in-child-frame . ((child-frame-parameters . PARAMS)))'。
+   **点对是硬要求**：`display-buffer' 只把 ACTION 的 cdr 整体当 ALIST 交给
+   动作函数，写成嵌套列表 `((display-buffer-in-child-frame
+   (child-frame-parameters ...)))' 会让 ALIST 变成 nil、参数全丢（frame 只会
+   用默认参数建出来）。用 overriding-action 而非 ACTION 实参，是因为它优先级
+   高于 `display-buffer-alist'——popper 启用时会在表头插入接管规则，普通
+   action 会被它改道。
+4. 创建后按像素精确收口尺寸与位置（`seshat-reader-sidebar--cf-place'）。
+5. SELECT 非 nil 时把光标移入面板：`select-frame' + `select-window'。
+   **不调** `select-frame-set-input-focus'：面板带 `no-focus-on-map'（出现时
+   不抢焦点），再抢输入焦点与该参数语义相反，也会打断正在阅读的父 frame。"
+  (let ((parent (selected-frame)))
+    (when (display-graphic-p parent)
+      (let ((existing (seshat-reader-sidebar--cf-frame-for-kind kind)))
+        (if (and existing (frame-live-p existing))
+            (let ((window (frame-selected-window existing)))
+              (when (windowp window)
+                (set-window-buffer window buffer))
+              (seshat-reader-sidebar--cf-place existing kind)
+              (when (and select (windowp window))
+                (select-frame existing)
+                (select-window window))
+              window)
+          (let* ((display-buffer-overriding-action
+                  (cons 'display-buffer-in-child-frame
+                        (list (cons 'child-frame-parameters
+                                    (seshat-reader-sidebar--cf-parameters
+                                     parent kind)))))
+                 (window (display-buffer buffer)))
+            (when window
+              (let ((frame (window-frame window)))
+                (seshat-reader-sidebar--cf-place frame kind)
+                (when select
+                  (select-frame frame)
+                  (select-window window))))
+            window))))))
+
+(defun seshat-reader-sidebar--cf-close (frame)
+  "关闭 child frame 面板 FRAME；死 frame 或非 frame 静默返回 nil.
+`delete-frame' 包 `ignore-errors'：面板可能已被用户手工关掉（`q' /
+`delete-other-frames' / 父 frame 关闭时连带删除），此时关闭是幂等操作，不该
+把「frame 已不存在」变成用户可见的错误。父 frame 删除时其 child frame 由
+Emacs 自动清理，故本函数不做额外清理。"
+  (when (and (framep frame) (frame-live-p frame))
+    (ignore-errors (delete-frame frame))))
+
+;;; 承载单元访问器（--panels 与三个访问器）
+
 (defun seshat-reader-sidebar--panels ()
   "返回本包当前全体**承载单元**（window 或 child frame）的列表.
 承载单元是「显示某个面板内容的那个东西」：窗口承载时是带
 `seshat-reader-sidebar' window parameter 的窗口（判定与
-`seshat-reader-sidebar-window-p' 一致），frame 承载时是带
-`seshat-reader-panel-kind' frame parameter 的 child frame。上层只经本函数与
-`seshat-reader-sidebar--panel-kind' / `--panel-buffer' / `--panel-close'
-访问承载单元，故「同 kind 是否已显示」「关掉这个 kind」这类判断不必各自区分
-两类承载单元，新增后端也只需扩展本函数与那几个访问器。
+`seshat-reader-sidebar-window-p' 一致，见 `seshat-reader-sidebar--windows'），
+frame 承载时是带 `seshat-reader-panel-kind' frame parameter 的 child frame
+（见 `seshat-reader-sidebar--cf-frames'）。返回值是两者的拼接，**窗口在前、
+frame 在后**——窗口是既有后端，保序使「按 kind 取第一个」在混合场景下与历史
+行为一致（先命中窗口）。
 
-当前只实现窗口后端（返回值与 `seshat-reader-sidebar--windows' 完全一致）；
-frame 后端尚未实现，故其承载单元暂时不在本列表中。"
-  (seshat-reader-sidebar--windows))
+两类承载单元的 kind 标记、内容 buffer、关闭原语都不同，而上层（toggle / 关闭
+/ 生命周期）只关心「有哪些面板、各自什么 kind、显示的是哪个 buffer」，故差异
+全部收敛在 `seshat-reader-sidebar--panel-kind' / `--panel-buffer' /
+`--panel-close' 三个访问器里，上层只经本函数与它们工作。"
+  (append (seshat-reader-sidebar--windows)
+          (seshat-reader-sidebar--cf-frames)))
 
 (defun seshat-reader-sidebar--panel-kind (panel)
   "返回承载单元 PANEL 的面板 kind（`outline' / `annotations' / `translate'）.
