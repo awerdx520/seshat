@@ -60,6 +60,10 @@
 ;; 的命令本身也未定义，故实际显示「（未加载）」）。
 (defvar seshat-reader-search--sidebar-map)
 
+;; 帮助页也是 `special-mode' 只读页，同样要摘掉 evil normal state；该函数由
+;; `seshat-reader' 提供（本模块不 require 它），故在此仅声明以消除字节编译告警。
+(declare-function seshat-reader--disable-evil "seshat-reader" ())
+
 (defconst seshat-reader-help-buffer-name "*Seshat Reader Help*"
   "帮助页的 buffer 名.
 由 `seshat-reader-help' 复用（已存在就重写内容，不重建 buffer），也是本页作为
@@ -71,12 +75,17 @@ parameter，因此 `seshat-reader-sidebar-toggle' 之类的面板命令不管它
     (seshat-reader-previous-page . "上一页")
     (seshat-reader-scroll-down-screen-or-next-page . "下滚一屏，到底翻页")
     (seshat-reader-scroll-up-screen-or-prev-page . "上滚一屏，到顶翻页")
+    (seshat-reader-scroll-left . "横向左滚")
+    (seshat-reader-scroll-right . "横向右滚")
     (seshat-reader-goto-page . "跳到指定页")
+    (seshat-reader-first-page . "跳到首页")
+    (seshat-reader-last-page . "跳到末页")
     (seshat-reader-fit-to-height . "按整页适配（页面完整可见）")
     (seshat-reader-fit-to-width . "按整宽适配（纵向可滚动）")
     (seshat-reader-enlarge-size . "放大")
     (seshat-reader-shrink-size . "缩小")
     (seshat-reader-rotate-clockwise . "顺时针旋转 90°")
+    (seshat-reader-refresh-doc-buffer . "重渲染当前页")
     (seshat-reader-close-doc . "关闭文档"))
   "阅读 buffer 的**翻页 / 缩放**键位表，形式为 (命令 . 一行说明).
 键位在 `seshat-reader-mode-map' 中解析（见
@@ -84,7 +93,8 @@ parameter，因此 `seshat-reader-sidebar-toggle' 之类的面板命令不管它
 只为让帮助页读起来有分组，二者渲染方式完全相同。")
 
 (defconst seshat-reader-help--feature-keys
-  '((seshat-reader-translate-toggle . "翻译最近一次选区（面板已开则关闭）")
+  '((seshat-reader-annotation-create . "在最近一次选区上建批注")
+    (seshat-reader-translate-toggle . "翻译最近一次选区（面板已开则关闭）")
     (seshat-reader-translate-explain-toggle . "解释最近一次选区（与译文共用面板）")
     (seshat-reader-translate-follow-up . "对同一段原文继续追问")
     (seshat-reader-search . "跨页文本搜索（命中同时列进左侧搜索结果面板）")
@@ -251,6 +261,8 @@ buffer 已存在时**复用**并重写内容（不新建 buffer、不丢窗口�
   (let ((buffer (get-buffer-create seshat-reader-help-buffer-name)))
     (with-current-buffer buffer
       (special-mode)
+      (when (fboundp 'seshat-reader--disable-evil)
+        (seshat-reader--disable-evil))
       (let ((inhibit-read-only t)
             (close-key (substitute-command-keys "\\[quit-window]")))
         (erase-buffer)
@@ -262,6 +274,11 @@ buffer 已存在时**复用**并重写内容（不新建 buffer、不丢窗口�
                    '((display-buffer-reuse-window
                       display-buffer-below-selected)
                      (window-height . 0.4)))
+    ;; 显示之后要再摘一次 evil：上面那次只管 major mode 刚就位的时点，
+    ;; 而 evil 会在 buffer 被显示时把 `evil-local-mode' 重新打开（实测：
+    ;; `pop-to-buffer' 之后它又变回 t），此处再关一次才真正生效。
+    (when (fboundp 'seshat-reader--disable-evil)
+      (seshat-reader--disable-evil))
     buffer))
 
 ;;; 键位

@@ -29,6 +29,11 @@
 (require 'imenu)
 (require 'outline)
 
+;; 本模块在 `seshat-reader-outline-mode' 里调用 `seshat-reader--disable-evil'
+;; （定义在 `seshat-reader.el'，本模块顶部已 require 它）。声明一下只为在**单独
+;; 字节编译**本文件时消除 byte-compile-function-not-defined 类告警。
+(declare-function seshat-reader--disable-evil "seshat-reader" ())
+
 ;;; Imenu
 
 ;;;###autoload
@@ -623,9 +628,7 @@ overlay 的 `before-string' 在其前面显示 1-2 个字符的标签（face 为
 (defun seshat-reader-outline-select-doc-window ()
   "Display and switch to the original document's window.
 
-Bound to `s' in `seshat-reader-outline-mode-map', and (for evil users) in
-the normal state bindings installed by
-`seshat-reader-outline--install-evil-bindings'.  The `o' key does not reach
+Bound to `s' in `seshat-reader-outline-mode-map'.  The `o' key does not reach
 this command any more: it is carried by `seshat-reader-outline-show', which
 toggles the panel open/closed and closes it when point is inside the panel
 \(pressing this command there would instead move point back into the reading
@@ -666,6 +669,8 @@ annotation panels are left alone, and a childframe carrier is removed with
 `delete-frame' instead of leaving an empty frame behind."
   "p"        #'previous-line
   "n"        #'next-line
+  "j"        #'next-line
+  "k"        #'previous-line
   "f"        #'seshat-reader-outline-avy-jump
   "o"        #'seshat-reader-outline-toggle
   "s"        #'seshat-reader-outline-select-doc-window
@@ -677,7 +682,11 @@ annotation panels are left alone, and a childframe carrier is removed with
   "Major mode for navigating document outlines."
   (setq buffer-read-only t)
   (setq-local outline-regexp "^\\*+ ")
-  (use-local-map seshat-reader-outline-mode-map))
+  (use-local-map seshat-reader-outline-mode-map)
+  ;; 目录面板同样关掉 evil：evil 的各 state keymap 经
+  ;; `emulation-mode-map-alists' 压在本 mode 的键表之前，会把 j/k/f/q/RET 抢走
+  ;; （与阅读器 buffer 的处理一致，见 `seshat-reader-disable-evil'）。
+  (seshat-reader--disable-evil))
 
 (defun seshat-reader-outline-goto-entry (button)
   "Shared logic to jump to an outline BUTTON.
@@ -748,49 +757,6 @@ opened there is no panel to close."
               (erase-buffer))))))))
 
 (add-hook 'kill-buffer-hook #'seshat-reader-outline--kill-buffer-cleanup)
-
-;;; Evil 兼容（软依赖）
-
-;; evil 是**软依赖**：本包不 `require'、不写进 `Package-Requires'，也不做任何
-;; 版本探测；evil 不在时下面的注册整体静默跳过。
-;;
-;; 为什么需要它：evil 把各 state 的 keymap（`evil-normal-state-map' →
-;; `evil-motion-state-map'）经 `emulation-mode-map-alists' 挂在 major-mode-map
-;; **之前**，所以 `seshat-reader-outline-mode-map' 里的 `f' 会被
-;; `evil-find-char' 抢走（`q' 会被 `evil-record-macro'、`RET' 会被 `evil-ret'
-;; 抢）。要靠用户自己在配置里补绑才可用，显然是包的责任没尽到。
-;;
-;; 为什么用 `evil-define-key*'：它是**函数**（evil-core.el，实读签名
-;; `(STATE KEYMAP KEY DEF &rest BINDINGS)'，STATE 为 `normal'/`insert'/... 或
-;; 其列表，KEYMAP 可给符号 `global'/`local'），把绑定写进 KEYMAP 关联的
-;; **auxiliary keymap**；`evil-normalize-keymaps' 装载时 auxiliary keymap 的
-;; 优先级高于 state 自身的 map，因此这些绑定只在**本 major mode** 生效、且压过
-;; `evil-motion-state-map'，同时**不触碰** evil 的全局 map（传的 KEYMAP 是本
-;; mode 的 map，不是 `global'）。`evil-define-key'（无星号）是宏、且会把绑定
-;; 延迟到 `after-load-functions'，不如函数版确定。
-;;
-;; KEY 的形式：`define-key'/`evil-define-key*' 对**字符串**不做 `kbd' 解析
-;; （实测 Emacs 31.1：`"RET"' 会被当成 R、E、T 三个键的序列），故特殊键必须传
-;; `(kbd "RET")' 这样的向量。
-(defun seshat-reader-outline--install-evil-bindings ()
-  "Install the outline panel's single-key bindings for evil's normal state.
-
-Soft dependency: does nothing when evil (or `evil-define-key*') is absent, so
-loading this library never requires evil.  Extracted from the
-`with-eval-after-load' block below only so that it can be unit-tested."
-  (when (fboundp 'evil-define-key*)
-    (evil-define-key* 'normal seshat-reader-outline-mode-map
-      "f"           #'seshat-reader-outline-avy-jump
-      "p"           #'previous-line
-      "n"           #'next-line
-      "o"           #'seshat-reader-outline-toggle
-      "s"           #'seshat-reader-outline-select-doc-window
-      "q"           #'seshat-reader-sidebar-quit
-      (kbd "RET")   #'seshat-reader-outline-visit-page
-      (kbd "M-RET") #'seshat-reader-outline-visit-page)))
-
-(with-eval-after-load 'evil
-  (seshat-reader-outline--install-evil-bindings))
 
 (provide 'seshat-reader-outline)
 ;;; seshat-reader-outline.el ends here

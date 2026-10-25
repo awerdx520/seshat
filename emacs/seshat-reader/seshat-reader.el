@@ -6,7 +6,7 @@
 ;; Author: Divya Ranjan Pattanaik <divya@subvertising.org>
 ;; Keywords: lisp, files, tools
 ;; Version: 0.3.2
-;; Package-Requires: ((emacs "26.1"))
+;; Package-Requires: ((emacs "29.1"))
 ;; URL: https://codeberg.org/divyaranjan/emacs-reader
 
 ;; This program is free software; you can redistribute it and/or modify
@@ -1680,8 +1680,6 @@ window and never recovers."
   "DEL"     #'seshat-reader-scroll-up-screen-or-prev-page
   "S-SPC"   #'seshat-reader-scroll-up-screen-or-prev-page
 
-  "C-f"     #'seshat-reader-scroll-right
-  "C-b"     #'seshat-reader-scroll-left
   "<remap> <forward-char>" #'seshat-reader-scroll-right
   "<remap> <backward-char>" #'seshat-reader-scroll-left
 
@@ -1694,8 +1692,6 @@ window and never recovers."
   "M->" #'seshat-reader-last-page
   "<remap> <beginning-of-buffer>" #'seshat-reader-first-page
   "<remap> <end-of-buffer>" #'seshat-reader-last-page
-
-  "g" #'seshat-reader-refresh-doc-buffer
 
   "M-g g"   #'seshat-reader-goto-page
   "M-g M-g" #'seshat-reader-goto-page
@@ -1738,71 +1734,143 @@ window and never recovers."
   "<remap> <mouse-drag-region>"    #'ignore
   "<remap> <mouse-drag-secondary>" #'ignore)
 
+
+;;; 键位预设
+
+;; 前置声明：`seshat-reader--install-keymap-preset' 在定义它的 `defcustom' 之前
+;; 引用该变量（`defcustom' 的 :set 必须指向已定义的函数，故 defcustom 只能排在
+;; 函数之后），这里先声明一次让字节编译器知道它是 special variable；真正的
+;; 默认值与 :set 钩子由下面的 `defcustom' 给出。
+(defvar seshat-reader-keymap-preset 'vim
+  "Keymap preset for `seshat-reader-mode-map'; see the `defcustom' below.")
+
+(defconst seshat-reader--key-bindings-shared
+  '(("t" . seshat-reader-translate-toggle)
+    ("e" . seshat-reader-translate-explain-toggle)
+    ("a" . seshat-reader-annotation-create)
+    ("m" . seshat-reader-annotation-toggle)
+    ("w" . seshat-reader-sidebar-toggle-width))
+  "Bindings installed under every `seshat-reader-keymap-preset'.
+The commands live in the extension modules, which may not be loaded yet:
+storing the symbols in the keymap is safe (no funcall happens).")
+
+(defconst seshat-reader--key-bindings-emacs-only
+  '(("C-f" . seshat-reader-scroll-right)
+    ("C-b" . seshat-reader-scroll-left)
+    ("g"   . seshat-reader-refresh-doc-buffer))
+  "Bindings installed when `seshat-reader-keymap-preset' is `emacs'.
+This is the upstream reader semantics: the character-motion keys scroll
+horizontally and the refresh key re-renders the current page.")
+
+(defconst seshat-reader--key-bindings-vim-only
+  '(("j"   . seshat-reader-scroll-down-or-next-page)
+    ("k"   . seshat-reader-scroll-up-or-prev-page)
+    ("h"   . seshat-reader-scroll-left)
+    ("l"   . seshat-reader-scroll-right)
+    ("^"   . seshat-reader-scroll-left-most)
+    ("$"   . seshat-reader-scroll-right-most)
+    ("g g" . seshat-reader-first-page)
+    ("G"   . seshat-reader-last-page)
+    ("C-l" . seshat-reader-refresh-doc-buffer)
+    ("C-f" . seshat-reader-scroll-down-screen)
+    ("C-b" . seshat-reader-scroll-up-screen)
+    ("/"   . seshat-reader-search))
+  "Bindings installed when `seshat-reader-keymap-preset' is `vim'.
+The screen-scroll pair scrolls by a screen (vim semantics), \"g g\" jumps to
+the first page and the vim refresh key re-renders it; \"/\" starts the
+cross-page search.")
+
+(defconst seshat-reader--preset-keys
+  '("g" "C-f" "C-b" "C-l" "j" "k" "h" "l" "^" "$" "g g" "G"
+    "t" "e" "a" "m" "w" "/")
+  "Keys removed before a preset is (re)installed.
+Unsetting \"g\" removes the whole prefix (including \"g g\"), which is what
+the emacs preset needs.  No `<remap>' or wheel key is listed here, so those
+bindings are never touched.")
+
+(defun seshat-reader--install-keymap-preset (&optional preset)
+  "Install PRESET bindings into `seshat-reader-mode-map'.
+Idempotent: every key in `seshat-reader--preset-keys' is unset first, then
+the shared and preset-specific tables are written.  The keymap is a mutable
+shared object, so the change takes effect immediately in already-open
+buffers; no `evil-normalize-keymaps' or keymap rebuild is needed."
+  (let ((preset (or preset seshat-reader-keymap-preset 'vim)))
+    (dolist (key seshat-reader--preset-keys)
+      (keymap-unset seshat-reader-mode-map key))
+    (dolist (entry seshat-reader--key-bindings-shared)
+      (keymap-set seshat-reader-mode-map (car entry) (cdr entry)))
+    (dolist (entry (if (eq preset 'emacs)
+                       seshat-reader--key-bindings-emacs-only
+                     seshat-reader--key-bindings-vim-only))
+      (keymap-set seshat-reader-mode-map (car entry) (cdr entry)))))
+
+(defun seshat-reader--set-keymap-preset (symbol value)
+  "Customize setter for `seshat-reader-keymap-preset'.
+Set SYMBOL's default to VALUE, then install the bindings for VALUE.
+Must be defined BEFORE the defcustom that references it, because
+`defcustom' funcalls its :set function while being evaluated."
+  (set-default symbol value)
+  (seshat-reader--install-keymap-preset value))
+
+(defcustom seshat-reader-disable-evil t
+  "Non-nil means turn evil off in every Seshat reader buffer.
+The reader is read-only and its keys are defined by its own mode maps, so
+evil's normal state only shadows them.  Set to nil to keep evil available."
+  :type 'boolean
+  :group 'seshat-reader)
+
+(defcustom seshat-reader-screen-context-lines 1
+  "Lines of overlap kept when scrolling by a screen.
+Bound locally to `next-screen-context-lines' in reader buffers, which makes
+\\[seshat-reader-scroll-down-screen] scroll by (window height - N) lines.
+0 means a full screen with no overlap; 1 keeps one line of context."
+  :type 'integer
+  :group 'seshat-reader)
+
+(defcustom seshat-reader-keymap-preset 'vim
+  "Keymap preset for `seshat-reader-mode-map'.
+`vim'   = the Emacs native bindings plus vim aliases (\"j\", \"k\", \"h\",
+          \"l\", \"^\", \"$\", \"g g\", \"G\", \"/\"), with the screen-scroll
+          commands on the character-motion keys.
+`emacs' = upstream Emacs bindings only: the character-motion keys scroll
+          horizontally and \"g\" refreshes the current page."
+  :type '(choice (const :tag "vim" vim)
+                 (const :tag "emacs" emacs))
+  :group 'seshat-reader
+  :set #'seshat-reader--set-keymap-preset)
+
 ;;; Evil 兼容（软依赖）
 
-;; evil 是**软依赖**：本包不 `require'、不写进 `Package-Requires'，也不做任何
-;; 版本探测；evil 不在时下面的注册整体静默跳过（`fboundp' 守卫）。
+;; evil 是软依赖：本包不 require、不写进 Package-Requires；evil 不在时下面的
+;; helper 全部是空操作（fboundp 守卫）。
 ;;
-;; 为什么需要它：evil 把各 state 的 keymap（`evil-normal-state-map' →
-;; `evil-motion-state-map'）经 `emulation-mode-map-alists' 挂在 major-mode-map
-;; **之前**，而 `?' 在 normal state 是 `evil-search-backward'，于是上面
-;; `seshat-reader-mode-map' 里的 `?' 在 evil 用户手里按不到——实测 Emacs 31.1
-;; + evil：normal state 下 `(key-binding (kbd "?"))' 为 `evil-search-backward'
-;; 而不是 `seshat-reader-help'。
-;;
-;; **只接管 `?' 与 `n' / `p'**：evil 的 `/`（正向搜索）、`N`（上一处）一律不动。
-;; 阅读器自己的搜索走 `C-s'（`seshat-reader-search'，全程基于页面坐标、与
-;; buffer 文本无关），evil 的 `?` 反向搜索在只读、单页位图的阅读 buffer 里没有
-;; 用武之地，故让给帮助页；想保留 evil 反向搜索的用户可在自己配置里覆盖本绑定
-;; （`(evil-define-key* 'normal seshat-reader-mode-map (kbd "?")
-;; #'evil-search-backward)'）——本包只在**加载时**注册一次，不会再次抢回。
-;;
-;; `n' / `p' 在阅读 buffer 是**翻页**（`seshat-reader-next-page' /
-;; `-previous-page'，与 `seshat-reader-mode-map' 里的绑定一致），但 normal state
-;; 下被 `evil-search-next' / `evil-paste-after' 抢走；`hjkl' / `v' / `y' /
-;; `gg' / `G' 等原生键**一律不碰**，evil 的移动、可视选取与复制照旧可用。
-;; 搜索会话期间 `n' / `p' 的「下一个/上一个命中」由搜索模块的临时键表提供（见
-;; `seshat-reader-search--map'），会话一结束即恢复翻转页语义——本函数不参与该
-;; 切换，故两个模块不抢同一个键。
-;;
-;; 为什么用 `evil-define-key*'：它是**函数**（evil-core.el，签名
-;; `(STATE KEYMAP KEY DEF &rest BINDINGS)'），把绑定写进 KEYMAP 关联的
-;; **auxiliary keymap**；`evil-normalize-keymaps' 装载时 auxiliary keymap 的
-;; 优先级高于 state 自身的 map，因此这条绑定只在本 mode 生效、压过
-;; `evil-motion-state-map'，且**不触碰** evil 的全局 map（传的 KEYMAP 是本 mode
-;; 的 map，不是 `global'）。`evil-define-key'（无星号）是宏、且会把绑定延迟到
-;; `after-load-functions'，不如函数版确定。
-;;
-;; 注册位置必须在**阅读器本身**、而不是帮助页模块（`seshat-reader-help'）里：
-;; 帮助页是 `?' 首次按下时才由 autoload 加载的，若把补绑写在那边，evil 用户
-;; 第一次按 `?' 走的仍是 `evil-search-backward'、永远不会加载帮助页，补绑也就
-;; 永远不生效。
-;;
-;; `M-o'（全部面板开合）**不需要**补绑：evil 的 normal state 未占该键（实测
-;; Emacs 31.1 + evil：normal state 下 `(key-binding (kbd "M-o"))' 已经是
-;; `seshat-reader-sidebar-toggle'）。将来若某个 evil 版本占了它，按同一模式在
-;; 本函数里加一对绑定即可。
-(defun seshat-reader--install-evil-bindings ()
-  "Install the reader's `?' and `n' / `p' bindings for evil's normal state.
-`n' / `p' keep meaning \"next / previous page\" in the reading buffer (the
-same commands `seshat-reader-mode-map' binds); evil's `evil-search-next' /
-`evil-paste-after' would otherwise take them.  `hjkl' / `v' / `y' are left
-alone, so evil's motion, visual selection and yank stay available.
+;; 阅读器关闭 evil 而不是给它补绑：阅读 buffer 是只读单页位图，evil 的 normal
+;; state 只会通过 `emulation-mode-map-alists' 压在本 mode 的键表之前，把
+;; C-v / C-f / j / k / n / p 抢走。关闭后键位完全由 mode-map 决定。
+(defun seshat-reader--disable-evil ()
+  "Turn evil off in the current buffer if `seshat-reader-disable-evil'.
+That variable is non-nil by default; setting it to nil keeps evil available."
+  (when (and seshat-reader-disable-evil
+             (fboundp 'evil-local-mode)
+             (bound-and-true-p evil-local-mode))
+    (evil-local-mode -1)))
 
-Soft dependency: does nothing when evil (or `evil-define-key*') is absent, so
-loading this library never requires evil.  Extracted from the
-`with-eval-after-load' block below only so that it can be unit-tested."
-  (when (fboundp 'evil-define-key*)
-    (evil-define-key* 'normal seshat-reader-mode-map
-      (kbd "?") #'seshat-reader-help
-      "n"       #'seshat-reader-next-page
-      "p"       #'seshat-reader-previous-page)))
+(defun seshat-reader--disable-evil-in-existing-buffers ()
+  "Apply `seshat-reader--disable-evil' to already-open reader and panel buffers.
+Needed because evil may be loaded AFTER this package (the user's
+`init-evil.el' is a `use-package' :config block, so its load order is not
+guaranteed): buffers opened before evil is up would otherwise be pulled into
+normal state when evil turns on."
+  (dolist (buffer (buffer-list))
+    (with-current-buffer buffer
+      (when (or (derived-mode-p 'seshat-reader-mode)
+                (derived-mode-p 'seshat-reader-outline-mode)
+                (derived-mode-p 'seshat-reader-annotation-list-mode)
+                (bound-and-true-p seshat-reader-translate-panel-mode))
+        (seshat-reader--disable-evil)))))
 
-;; evil 可能在本文件之后才加载（用户把 evil 放在 init 更后面），故用
-;; `with-eval-after-load' 挂到 evil 上：evil 已加载时立即执行，未加载则等它加载
-;; 完再执行，两条路径都只注册一次。
 (with-eval-after-load 'evil
-  (seshat-reader--install-evil-bindings))
+  (seshat-reader--disable-evil-in-existing-buffers))
 
 ;;;###autoload
 (define-derived-mode seshat-reader-mode special-mode "Seshat Reader"
@@ -1829,6 +1897,9 @@ Keybindings:
 	      ;; default value is 8, so we keep it at that.
 	      left-fringe-width 8)
   (set-buffer-modified-p nil)
+  (seshat-reader--disable-evil)
+  (setq-local next-screen-context-lines
+              (max 0 seshat-reader-screen-context-lines))
   (blink-cursor-mode 0)
   (auto-revert-mode 1)
   (setq-local revert-buffer-function #'seshat-reader--non-queue-refresh-doc-buffer)

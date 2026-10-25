@@ -178,6 +178,10 @@
 ;; visual-fill-column 同样是软依赖（只在 `--prepare-view' 内按需加载），
 ;; 编译期不加载其库，故显式声明签名以消除「not known to be defined」告警。
 (declare-function visual-fill-column-mode "visual-fill-column" (&optional arg))
+;; 译文面板开启时关闭 evil（`seshat-reader--disable-evil'，定义在
+;; `seshat-reader'）。这里的 `require' 只在运行时执行，字节编译期不加载，
+;; 故显式声明签名以消除「not known to be defined」告警。
+(declare-function seshat-reader--disable-evil "seshat-reader" ())
 
 (defvar gt-preset-translators)
 
@@ -667,6 +671,9 @@ go-translate function `gt-buffer-render' 是该库中定义的**类名**（不�
     (define-key map (kbd "C-c w") #'seshat-reader-sidebar-toggle-width)
     (define-key map (kbd "C-c C-s") 'seshat-reader-translate-save-as-annotation)
     (define-key map (kbd "C-c C-q") #'seshat-reader-translate-follow-up)
+    (define-key map (kbd "j") #'next-line)
+    (define-key map (kbd "k") #'previous-line)
+    (define-key map (kbd "w") #'seshat-reader-sidebar-toggle-width)
     map)
   "面板 buffer 的键位.
 `q' 关闭面板（`seshat-reader-sidebar-quit'：只关本面板所在 kind，child frame
@@ -680,12 +687,22 @@ go-translate function `gt-buffer-render' 是该库中定义的**类名**（不�
 同一键位）；
 `seshat-reader-translate-save-as-annotation' 把最近一次译文存为批注；
 `seshat-reader-translate-follow-up'（对面板里的原文继续追问）也绑在本 map 上。
+`j' / `k' 逐行上下移动（`next-line' / `previous-line'：面板是只读视图，与
+evil 的 normal state 同名键位一致，故面板开启时关闭 evil，见
+`seshat-reader--disable-evil'）；`w' 切换面板宽度，与 `C-c w' 等价（两个绑定
+都指向 `seshat-reader-sidebar-toggle-width'）。
 用 minor mode 承载而非 `local-set-key'，以免污染 Markdown 视图 mode 的键位表
 （同名 mode 的 map 是共享对象）。")
 
 (define-minor-mode seshat-reader-translate-panel-mode
   "Seshat 译文/解释面板的键位与只读视图小模式." :lighter nil
-  :keymap seshat-reader-translate-panel-map)
+  :keymap seshat-reader-translate-panel-map
+  ;; evil 是软依赖：面板里 `j' / `k' 必须落到本 map 的 `next-line' /
+  ;; `previous-line'，而 evil 的 normal state 经 `emulation-mode-map-alists'
+  ;; 优先于本 mode 的键表。只在开启方向关闭 evil；关闭本 minor mode 时不必
+  ;; 恢复（面板 buffer 随之关闭或被复用，无残留状态）。
+  (when seshat-reader-translate-panel-mode
+    (seshat-reader--disable-evil)))
 
 (defun seshat-reader-translate--view-mode-function ()
   "返回可用的 Markdown 只读视图 major mode 函数符号.
@@ -2753,7 +2770,13 @@ TARGET-LANG 与 FORCE 语义与 `seshat-reader-translate-toggle' 完全相同（
     #'seshat-reader-translate-explain-toggle)
   ;; 追问：`C-c C-a' 已被 `seshat-reader-annotation-create' 占用，故用 C-c C-q。
   (define-key seshat-reader-mode-map (kbd "C-c C-q")
-    #'seshat-reader-translate-follow-up))
+    #'seshat-reader-translate-follow-up)
+  ;; 单键快捷（阅读 buffer 里 evil 已被关闭，`t' / `e' 不会被 normal state 抢走）：
+  ;; 与 `C-c C-t' / `C-c C-e' 双绑，保持既有前缀绑定不变。
+  (define-key seshat-reader-mode-map (kbd "t")
+    #'seshat-reader-translate-toggle)
+  (define-key seshat-reader-mode-map (kbd "e")
+    #'seshat-reader-translate-explain-toggle))
 
 (provide 'seshat-reader-translate)
 ;;; seshat-reader-translate.el ends here

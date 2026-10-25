@@ -445,38 +445,33 @@ Section 1.2 5 / Chapter 2 7 / Part II 10.")
           (should-not shows))
       (when (buffer-live-p panel) (kill-buffer panel)))))
 
-(ert-deftest seshat-reader-outline-test--o-is-bound-to-toggle-in-both-keymaps ()
-  "`o' 在原生 keymap 与 evil normal state 两条注册路径上都指向 per-kind toggle.
-`s' 则在两条路径上都指向 `seshat-reader-outline-select-doc-window'（切回阅读
-窗口）。2026-10-26 起 `o' 由 `seshat-reader-outline-show' 改绑
+(ert-deftest seshat-reader-outline-test--o-is-bound-to-toggle-in-mode-map ()
+  "`o' / `s' 绑定在 `seshat-reader-outline-mode-map'，键位不再依赖 evil.
+2026-10-26 起 `o' 由 `seshat-reader-outline-show' 改绑
 `seshat-reader-outline-toggle'：面板已显示则关闭、否则构建并显示，与批注列表 /
-译文 / 解释的键语义统一。"
+译文 / 解释的键语义统一。
+
+同日起不再给 evil 的 normal state 补绑（`seshat-reader-outline--install-evil-bindings'
+已删除），改为在 mode body 里关闭面板 buffer 的 evil——键位只由本 mode 的键表
+决定，evil 的 state keymap 不再参与解析。"
   ;; ① 原生 keymap（`seshat-reader-outline-mode-map'）
   (should (eq (keymap-lookup seshat-reader-outline-mode-map "o")
               #'seshat-reader-outline-toggle))
   (should (eq (keymap-lookup seshat-reader-outline-mode-map "s")
               #'seshat-reader-outline-select-doc-window))
-  ;; ② evil normal state：batch -Q 下 evil 未加载，故桩替 `evil-define-key*'
-  ;;    捕获注册内容。本套件 skipped 必须恒为 0，所以用「桩替 + 条件段」而不是
-  ;;    `skip-unless'；`o' 必须与原生 keymap 一致（都指向 `toggle'）。
-  (let (pairs)
-    (cl-letf (((symbol-function 'evil-define-key*)
-               (lambda (&rest args)
-                 (setq pairs (cl-loop for (key def) on (cddr args) by #'cddr
-                                      collect (cons key def))))))
-      (seshat-reader-outline--install-evil-bindings))
-    (should (equal (assoc "o" pairs) '("o" . seshat-reader-outline-toggle)))
-    (should (equal (assoc "s" pairs)
-                   '("s" . seshat-reader-outline-select-doc-window))))
-  ;; ③ 若本会话真的加载了 evil（手工加载 evil 的调试会话），按真实注册再验一
-  ;;    次：normal state 的 auxiliary keymap 里 `o' 解析到 `toggle'。evil 不在时
-  ;;    整段不执行，不计入 skipped。
-  (when (fboundp 'evil-define-key*)
-    (seshat-reader-outline--install-evil-bindings)
-    (should (eq (lookup-key (evil-get-auxiliary-keymap
-                             seshat-reader-outline-mode-map 'normal)
-                            "o")
-                #'seshat-reader-outline-toggle))))
+  ;; ② 旧的 evil 补绑入口已删除（语义改为「关闭 evil」）
+  (should-not (fboundp 'seshat-reader-outline--install-evil-bindings))
+  ;; ③ 取代补绑的路径是「mode body 关闭 evil」：桩替 helper 记录调用次数，再真正
+  ;;    进入 mode body。本套件 skipped 必须恒为 0，故用桩替而不是 `skip-unless'。
+  (let ((calls 0)
+        (buffer (get-buffer-create " *Seshat outline evil-off*")))
+    (unwind-protect
+        (with-current-buffer buffer
+          (cl-letf (((symbol-function 'seshat-reader--disable-evil)
+                     (lambda () (cl-incf calls))))
+            (seshat-reader-outline-mode))
+          (should (= 1 calls)))
+      (when (buffer-live-p buffer) (kill-buffer buffer)))))
 
 (ert-deftest seshat-reader-outline-test--toggle-closes-when-visible ()
   "`outline-toggle' 在面板已显示时只走 per-kind 关闭，不重建内容.
@@ -933,63 +928,32 @@ Emacs 31 的 `outline-hide-subtree' 用 **overlay**（`invisible' = `outline'）
               (goto-char (point-min))
               (search-forward "Part I" nil t)))))
 
-;;; 17. evil 软依赖：包内补绑（不依赖用户配置）
+;;; 17. evil 软依赖：面板内关闭 evil（不再补绑）
 
 (ert-deftest seshat-reader-outline-test--evil-soft-dependency ()
-  "evil 缺失时静默跳过；evil 存在时把面板 8 个键（含 `f'）补绑到 normal state."
-  ;; ① evil 未加载（`evil-define-key*' 不可用）→ 静默跳过，不改 mode-map
-  (cl-letf (((symbol-function 'evil-define-key*) nil))
-    (should-not (fboundp 'evil-define-key*))
-    (should-not (seshat-reader-outline--install-evil-bindings)))
+  "evil 的接入从「补绑」改为「关闭」：旧入口消失，面板键全部来自 mode-map."
+  ;; ① 旧补绑入口整体删除（语义改为 mode body 里关 evil）
+  (should-not (fboundp 'seshat-reader-outline--install-evil-bindings))
+  ;; ② 关闭 helper 由阅读器提供（本模块 `require' 了它，故必然可用）
+  (should (fboundp 'seshat-reader--disable-evil))
+  ;; ③ 面板 8 个键（含 `f'）全部绑在本 mode 的键表上：evil 关闭后不会被
+  ;;    `evil-find-char' / `evil-ret' 一类命令抢走，故无需任何补绑
   (should (eq (lookup-key seshat-reader-outline-mode-map "f")
               #'seshat-reader-outline-avy-jump))
-  ;; ② 桩替 `evil-define-key*'：断言实参是 (normal <本 mode 的 map> 8 对绑定)
-  (let (calls)
-    (cl-letf (((symbol-function 'evil-define-key*)
-               (lambda (&rest args) (push args calls) nil)))
-      (seshat-reader-outline--install-evil-bindings))
-    (should (= 1 (length calls)))
-    (let* ((args (car calls))
-           (pairs (cl-loop for (key def) on (cddr args) by #'cddr
-                           collect (cons key def))))
-      (should (eq (nth 0 args) 'normal))
-      (should (eq (nth 1 args) seshat-reader-outline-mode-map))
-      (should (= 8 (length pairs)))
-      ;; `f' 必须补绑（evil 的 `evil-find-char' 会抢它）
-      (should (equal (assoc "f" pairs)
-                     '("f" . seshat-reader-outline-avy-jump)))
-      (should (equal (assoc "p" pairs) '("p" . previous-line)))
-      (should (equal (assoc "n" pairs) '("n" . next-line)))
-      (should (equal (assoc "o" pairs)
-                     '("o" . seshat-reader-outline-toggle)))
-      (should (equal (assoc "s" pairs)
-                     '("s" . seshat-reader-outline-select-doc-window)))
-      (should (equal (assoc "q" pairs) '("q" . seshat-reader-sidebar-quit)))
-      ;; 特殊键必须走 `kbd' 向量（`define-key' 不解析字符串 "RET"）
-      (should (equal (assoc (kbd "RET") pairs)
-                     (cons (kbd "RET") 'seshat-reader-outline-visit-page)))
-      (should (equal (assoc (kbd "M-RET") pairs)
-                     (cons (kbd "M-RET") 'seshat-reader-outline-visit-page))))
-    ;; ③ 注册路径：`with-eval-after-load' 在 evil **已加载**时立即执行
-    (let ((calls nil)
-          (saved-features features)
-          (source (expand-file-name
-                   "seshat-reader-outline.el"
-                   (file-name-directory
-                    (locate-library "seshat-reader-outline")))))
-      (unwind-protect
-          (progn
-            ;; `featurep' 读的是 `features' 的全局值（C 层），故直接 push 伪造
-            ;; 「evil 已加载」，结束后原样还原，不真的加载 evil。
-            (push 'evil features)
-            (should (featurep 'evil))
-            (cl-letf (((symbol-function 'evil-define-key*)
-                       (lambda (&rest args) (push args calls) nil)))
-              (load source nil t)))
-        (setq features saved-features))
-      (should (= 1 (length calls)))
-      (should (eq (nth 0 (car calls)) 'normal))
-      (should (eq (nth 1 (car calls)) seshat-reader-outline-mode-map)))))
+  (should (eq (lookup-key seshat-reader-outline-mode-map "p")
+              #'previous-line))
+  (should (eq (lookup-key seshat-reader-outline-mode-map "n")
+              #'next-line))
+  (should (eq (lookup-key seshat-reader-outline-mode-map "o")
+              #'seshat-reader-outline-toggle))
+  (should (eq (lookup-key seshat-reader-outline-mode-map "s")
+              #'seshat-reader-outline-select-doc-window))
+  (should (eq (lookup-key seshat-reader-outline-mode-map "q")
+              #'seshat-reader-sidebar-quit))
+  (should (eq (lookup-key seshat-reader-outline-mode-map (kbd "RET"))
+              #'seshat-reader-outline-visit-page))
+  (should (eq (lookup-key seshat-reader-outline-mode-map (kbd "M-RET"))
+              #'seshat-reader-outline-visit-page)))
 
 ;;; 7. 阅读器 buffer 被 kill 时的目录面板清理（T3b）
 

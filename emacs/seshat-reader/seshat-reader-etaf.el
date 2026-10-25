@@ -38,12 +38,14 @@
 ;; 故本模块自带两套色板，按 `(frame-parameter nil 'background-mode)' 选择；
 ;; 用户切换明暗主题后需**重新渲染面板**（再次调用渲染函数）才会换成新色板。
 ;;
-;; **键位与 evil 的加载顺序**：ETAF 的 `:keys' 依赖 `emulation-mode-map-alists'
-;; 的**顺序**——ETAF 的 keymap 会被放在该列表首位，从而优先于 evil 的
-;; emulation map。前提是「evil 先启用、面板后 mount」：正常使用场景中 evil 在
-;; 启动时已加载而面板是运行期 mount，故前提满足；若在面板挂载**之后**才
-;; `(evil-mode 1)'，evil 的 map 会抢在 ETAF 之前，此时需重新渲染（重新 mount）
-;; 面板，键位才恢复。
+;; **键位与 evil 的关系**：阅读器在**所有面板与阅读 buffer** 里关闭 evil
+;; （`seshat-reader--disable-evil'，受 `seshat-reader-disable-evil' 控制，默认
+;; 开启），故本模块所在 buffer 中不存在 evil 抢占 `:keys' 的前提。ETAF 的
+;; `:keys' 仍挂在 `emulation-mode-map-alists' 首位，在**没有 evil** 的 buffer
+;; 里照常生效。仅当用户把 `seshat-reader-disable-evil' 设为 nil（保留 evil）
+;; 时，旧说明「evil 先启用、面板后 mount」才重新成为前提——此时 evil 的
+;; emulation map 会抢在 ETAF 之前，需在 `(evil-mode 1)' 之后重新渲染（重新
+;; mount）面板，键位才恢复。
 ;;
 ;; **禁止在渲染期写状态**：`etaf-ref' 的写入必须发生在命令/回调中，渲染期只
 ;; 读值（ETAF 对此有断言）。

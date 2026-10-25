@@ -83,6 +83,50 @@ ETAF 渲染层是可选外部依赖：`Makefile` 先探测 `~/Workspace/emacs-ta
 
 **重要**：Emacs 已运行时替换 `.so` **必须重启 Emacs**。动态模块加载后不能卸载，覆盖磁盘上的 `.so` 不会影响已加载的模块实例；`make all` 顺带重编的 `.elc` 同理只在下次启动（或显式 `unload-feature` + 重新 `require`）后生效。
 
+## evil 与键位预设
+
+三个 defcustom 决定「seshat buffer 里 evil 是否参与」与「阅读 buffer 的键位风格」，推荐写在 `use-package` 的 `:custom` 里：
+
+```elisp
+(use-package seshat-reader
+  :custom
+  (seshat-reader-disable-evil t)         ; 阅读器内关闭 evil（默认）
+  (seshat-reader-screen-context-lines 1) ; 翻屏保留 1 行重叠（步长 = 窗口高 − 1 行）
+  (seshat-reader-keymap-preset 'vim))    ; 'vim（默认）或 'emacs
+```
+
+### `seshat-reader-disable-evil`（默认 `t`）
+
+非 `nil` 时**每个 seshat buffer** 都关闭 evil：阅读 buffer（`seshat-reader-mode`）、目录（`seshat-reader-outline-mode`）、批注列表（`seshat-reader-annotation-list-mode`）在各自 mode body 里调 `seshat-reader--disable-evil`（即 `evil-local-mode -1`）；译文/解释面板与搜索结果侧栏在**显示路径**上再关一次，帮助页在**显示之后**再关一次——evil 可能在显示 / 切换 buffer 的过程中重新 enable，故显示后再补一刀。evil 是软依赖：未安装时该 helper 是空操作（`fboundp` 守卫）；evil 若比本包更晚加载，`with-eval-after-load 'evil` 也会回头把已打开的 seshat buffer 再关一次。
+
+- 关闭后 evil 的 normal state 不再经 `emulation-mode-map-alists` 压在 mode map 之前，`C-v` / `j` / `k` / `n` / `p` / `q` / `RET` / `d` / `?` 等键全部按本手册的键位表解析。
+- 设为 `nil` 回到「evil 可用」的旧状态：normal state 会先吃掉这些单键（`q` = `evil-record-macro`、`n` / `p` = evil 的搜索/粘贴、`RET` = `evil-ret`、`d` = `evil-delete`），本手册其余章节的键位表**不再成立**。
+- 判断当前 buffer 是否还开着 evil：`(bound-and-true-p evil-local-mode)` 应为 `nil`。
+
+### `seshat-reader-keymap-preset`（默认 `vim`）
+
+只影响 `seshat-reader-mode-map`（阅读 buffer），面板键位不受影响。
+
+| 键 | `vim`（默认） | `emacs`（上游语义） |
+|---|---|---|
+| `C-f` / `C-b` | 滚一屏（`seshat-reader-scroll-down-screen` / `-scroll-up-screen`） | 横向滚动（`seshat-reader-scroll-right` / `-scroll-left`） |
+| `g` / `gg` / `C-l` | `gg` 首页、`G` 末页、`C-l` 重渲染当前页；`g` 不绑 | `g` 重渲染当前页（上游行为）；无 `gg` / `G` / `C-l` |
+| `j` / `k` | 下/上滚一行，越界翻页 | 不绑 |
+| `h` / `l` | 横向左 / 右滚 | 不绑 |
+| `^` / `$` | 横向最左 / 最右 | 不绑 |
+
+两套预设**共有**的 vim 风格单键别名（与预设无关，始终安装）：`t` / `e`（译文 / 解释）、`a` / `m`（建批注 / 批注列表）、`w`（面板宽度切换）——它们只是 `C-c C-t` / `C-c C-e` / `C-c C-a` / `C-c C-l` / `C-c w` 的重复绑定，原键一律保留。
+
+安装方式：`seshat-reader--install-keymap-preset` 先把预设管辖的键（`g`、`C-f`、`C-b`、`C-l`、`j`、`k`、`h`、`l`、`^`、`$`、`g g`、`G`、`t`、`e`、`a`、`m`、`w`、`/`）`keymap-unset` 掉，再依次写入共有表与所选预设表；`<remap>` 与滚轮键不在此列，永远不会被预设改动。
+
+- **对已打开的 buffer 立即生效**：`seshat-reader-mode-map` 是共享的 keymap 对象（所有阅读 buffer 共用同一张表），改预设即改这张表，既不需要重开文档，也不需要 `evil-normalize-keymaps` 之类的重建。
+- **用 `:custom` / `customize-set-variable` 改**才会触发安装（`defcustom` 的 `:set` 调安装函数，本包加载时也按默认值装一次）；用 `setq` 只改值、不装键，需再执行 `(seshat-reader--install-keymap-preset 'emacs)`。
+- 设成 `emacs` 后 `j` / `k` / `h` / `l` / `^` / `$` / `gg` / `G` / `C-l` 恢复为**未绑定**（`j` / `k` 仍可直接按 `C-n` / `C-p`；横向滚动仍可用 `S-<wheel-up>` / `S-<wheel-down>` 与 remap 过的 `forward-char` / `backward-char`）。
+
+### `seshat-reader-screen-context-lines`（默认 `1`）
+
+阅读 buffer 里会被局部写进 `next-screen-context-lines`（`max 0` 夹紧），因此 `SPC` / `DEL` / `S-SPC` / `C-v` / `M-v` 每次滚「窗口正文高（`window-body-height`）− N 行」：`1`（默认）留 1 行重叠，翻屏时上一屏的最后一行仍在视野里；`0` 表示整屏无重叠。只作用于阅读 buffer（面板是普通文本 buffer，沿用 Emacs 全局值）。
+
 ## 3. 打开与基本阅读
 
 - `find-file` 打开即进 `seshat-reader-mode`：`seshat-reader.el` 加载时按 `seshat-reader-supported-formats` 注册 `auto-mode-alist`（小写扩展名）；`init-reader.el` 另补一套大小写不敏感关联，故 `.PDF` / `.Pdf` 也能直接进阅读器。**注意**：加载项目层 `emacs/seshat-reading.el` 后 `auto-mode-alist` 被 `seshat-reading-mode` 接管（渲染仍 100% 来自 reader），见下节「阅读模式」。
@@ -101,17 +145,24 @@ ETAF 渲染层是可选外部依赖：`Makefile` 先探测 `~/Workspace/emacs-ta
 | 操作 | 键位 | 备注 |
 |---|---|---|
 | 下一页 / 上一页 | `n` / `p` | 队列化命令，可连续快速按键 |
-| 下一屏 / 上一屏 | `C-v` / `M-v` | 屏幕级滚动 |
-| 下/上滚一屏到底则翻页 | `SPC` / `DEL`、`S-SPC` | 交替阅读最顺手 |
-| 下/上一行则越界翻页 | `C-n` / `C-p` | 同时 remap 了 `next-line` / `previous-line` |
+| 下/上一行则越界翻页 | `j` / `k` | **vim 预设**新增；同一命令也绑在 `C-n` / `C-p`（remap 了 `next-line` / `previous-line`） |
+| 下/上滚一屏到底则翻页 | `SPC` / `DEL`、`S-SPC` | 步长 = 窗口正文高 − `seshat-reader-screen-context-lines` 行（默认 1，即留 1 行重叠） |
+| 下一屏 / 上一屏 | `C-v` / `M-v` | 屏幕级滚动，不翻页；步长同上 |
+| 滚一屏 / 横向滚动 | `C-f` / `C-b` | **语义随 `seshat-reader-keymap-preset` 变**：`vim` = 滚一屏；`emacs` = 横向滚动 |
+| 横向左 / 右滚 | `h` / `l` | **vim 预设** |
+| 横向最左 / 最右 | `^` / `$` | **vim 预设**；`C-a` / `C-e` 是同一组命令的固定别名 |
 | 跳页 | `M-g g`（或 `M-g M-g`） | 读页码，转 0-based 后交给 MuPDF |
-| 首页 / 末页 | `M-<` / `M->` | |
+| 首页 / 末页 | `gg` / `G` | **vim 预设**；`M-<` / `M->` 是同一组命令的固定别名 |
 | 放大 / 缩小 | `=`、`+` / `-` | 倍率见 `seshat-reader-enlarge-factor`（1.25）/ `-shrink-factor`（0.75） |
 | 缩放滚轮 | `C-<wheel-up>` / `C-<wheel-down>` | |
 | 复位缩放 | `0` | |
 | 整页适配 / 整宽适配 | `H` / `W` | 持久模式：写入窗口 `fit-mode`，之后尺寸变化仍按该维度适配 |
 | 旋转 | `r` / `R` | 顺时针 / 逆时针各 90° |
-| 重渲染当前页 | `g` | 用于外部修改或渲染异常 |
+| 重渲染当前页 | `C-l` | **vim 预设**（外部修改或渲染异常时用）；`emacs` 预设仍为 `g` |
+| 翻译 / 解释 | `t` / `e` | 单键别名（`C-c C-t` / `C-c C-e` 同样可用） |
+| 建批注 / 批注列表 | `a` / `m` | 单键别名（`C-c C-a` / `C-c C-l` 同样可用） |
+| 跨页搜索 | `/` | **vim 预设**单键别名（`C-s` 同样可用） |
+| 面板宽度切换 | `w` | 单键别名（`C-c w` 同样可用） |
 | 关闭文档 | `Q` | |
 | 演示模式 | `M-x seshat-reader-presentation-mode` | 隐藏模式行并 fit-to-height；无默认键位 |
 | 暗色模式 | `M-x seshat-reader-dark-mode` | 反色显示；无默认键位 |
@@ -168,10 +219,10 @@ ETAF 渲染层是可选外部依赖：`Makefile` 先探测 `~/Workspace/emacs-ta
 
 - 开合：`o`（`seshat-reader-outline-show`，**目录面板开关**——已显示则关闭，未显示则按当前文档大纲重建内容后打开）。`o` 与 `seshat-reader-sidebar-toggle-outline` 语义一致（关闭都走 `seshat-reader-sidebar--toggle-kind`，尺寸记忆与恢复行为相同），区别只在 `o` 会顺带刷新目录内容；后者**不再绑键**（与 `o` 功能重复，用户要求移除），仍可 `M-x seshat-reader-sidebar-toggle-outline` 调用，只动目录、不动右侧批注/译文面板。**光标在目录面板内时，`o` 同样关闭面板**（一次即关；此前绑的是「切回阅读窗口」，需按第二次才关）。
 - 行内容：缩进层级 + 折叠符号（`▾` / `▸`，无子节点用 2 空格占位）+ 标题按钮 + 右缘页码；当前章用 `line-prefix` 画竖线标记。
-- `p` / `n` 移动光标，`RET` / `M-RET` 跳到该标题所在页，`o` 关闭面板（面板内按一次即关，无需先切回阅读窗口），`q` 关闭面板。
+- `p` / `n`（或 `j` / `k`）移动光标，`RET` / `M-RET` 跳到该标题所在页，`o` 关闭面板（面板内按一次即关，无需先切回阅读窗口），`q` 关闭面板。
 - `TAB` 折叠由 `outline-mode` 自身承载（`outline-hide-subtree`）；注意折叠符号**不随折叠状态刷新**，属已知限制（见 §12）。
 - `f` 触发 avy 风格单键跳转（`seshat-reader-outline-avy-jump`）：候选是当前可见区的目录按钮，标签由 overlay `before-string` 承载，`read-key` 逐键匹配。avy 未安装时功能等价——标签字符表退化为内置表（与 `avy-keys` 默认值一致）。
-- evil 用户：包内已用 `evil-define-key*` 为 normal state 补绑 `f` / `p` / `n` / `o` / `q` / `RET` / `M-RET`，否则这些键会被 `evil-find-char` / `evil-record-macro` / `evil-ret` 抢走。用的是 auxiliary keymap，只在本 major mode 生效，不污染全局。
+- evil 用户：无需任何补绑——目录面板进入 mode 时即关闭 evil（`seshat-reader--disable-evil`，受 `seshat-reader-disable-evil` 控制，默认 `t`），`f` / `p` / `n` / `j` / `k` / `o` / `q` / `RET` / `M-RET` 全部由 `seshat-reader-outline-mode-map` 解析，不会被 `evil-find-char` / `evil-record-macro` / `evil-ret` 抢走。若这些键又变回 evil 语义，先查 `seshat-reader-disable-evil` 是否被设成 `nil`（见「evil 与键位预设」）。
 
 其它跳转入口：
 
@@ -248,7 +299,7 @@ ETAF 渲染层是可选外部依赖：`Makefile` 先探测 `~/Workspace/emacs-ta
 模块 `seshat-reader-search`（自研扩展，不属上游 vendored 代码）。`C-s` 在 `seshat-reader-mode-map` 里原本未被占用；绑定后**该 buffer 内的全局 `isearch-forward` 被有意覆盖**——页面是图片，isearch 搜不到正文，只会命中 buffer 里那几个换行符。
 
 - **交互**：`C-s` → 迷你缓冲区读搜索串 → 整本扫描后落到「当前页及其后的第一个命中」。会话期间进入 `set-transient-map` 武装的临时键表：`n` 下一个命中 / `p` 上一个命中 / `RET` 结束会话并停在当前命中页 / `C-g` 取消并回到搜索起始页。
-- **`n` / `p` 的双重身份**：`n` / `p` 在阅读 buffer = **下一页 / 上一页**（`seshat-reader-next-page` / `seshat-reader-previous-page`，`seshat-reader-mode-map` 里一直这么绑，evil normal state 下也补绑为同一命令）；**搜索会话进行中**由 `set-transient-map` 的临时键表临时接管为**上 / 下一条命中**，会话结束（`RET` / `C-g` / 按任何其它键退出临时键表）后立即恢复翻页。
+- **`n` / `p` 的双重身份**：`n` / `p` 在阅读 buffer = **下一页 / 上一页**（`seshat-reader-next-page` / `seshat-reader-previous-page`，`seshat-reader-mode-map` 里一直这么绑；阅读 buffer 已关闭 evil，键位由 mode map 直接解析）；**搜索会话进行中**由 `set-transient-map` 的临时键表临时接管为**上 / 下一条命中**，会话结束（`RET` / `C-g` / 按任何其它键退出临时键表）后立即恢复翻页。
 - **当前页高亮**：翻页或跳转后，若新页有命中，左侧结果栏里**该页的条目**以 `secondary-selection` 系背景高亮（face `seshat-reader-search-sidebar-current-page`，定义 `:inherit secondary-selection`），一眼看出当前页落在结果列表的哪一行。
 - **跨页与回绕**：命中序列按「页号升序 + 页内 MuPDF 命中顺序」排列；`n` 到文末回绕到第一个命中、`p` 到文首回绕到最后一个，各提示一次。
 - **状态行**：`第 i/N 个命中 · 第 p 页`；`C-g` 后回到起始页并清空命中装饰。
@@ -281,10 +332,11 @@ Emacs 端**只显示**手写（无笔事件、无压感，输入永远在 Androi
 |---|---|---|
 | `RET` | `seshat-reader-annotation-list-goto` | 跳到该行批注所在页 |
 | `d` | `seshat-reader-annotation-list-delete` | 删除该行批注（服务端项走 API，`[待同步]` 项只取消本地条目、不发 HTTP） |
+| `j` / `k` | `next-line` / `previous-line` | 上下移动一行（面板已关闭 evil，`j` / `k` 由本 mode map 直接承载） |
 | `C-c C-r` | `seshat-reader-reference-insert-annotation` | 把该行批注的引用写入目标笔记（取值不触网） |
-| `q` | `quit-window`（`special-mode`） | 关闭面板 |
+| `q` | `seshat-reader-sidebar-quit` | 关闭面板：只关批注列表这一个 kind（`special-mode` 自带的 `quit-window` 已被覆盖；ETAF 渲染路径同一语义） |
 
-列表页头徽章显示总条数；服务端暂时拉不到时**不报错也不清空**，只显示本地待同步条目并提示「（离线）仅显示本地待同步批注 N 条」。批注列表面板**保持 evil normal state**（不切 emacs state），面板键在 normal 下用 `evil-define-key*` 补绑（见 §「面板承载」里的「面板保持 evil normal state，只补绑面板键」条），故 `RET` / `q` / `M-o` / `C-c w` / `d` 等单键在 evil 用户手里同样生效（此前会被 `evil-ret` / `evil-delete` / `evil-record-macro` 吃掉），而 `hjkl` / `v` / `y` 仍为 evil 原生行为。
+列表页头徽章显示总条数；服务端暂时拉不到时**不报错也不清空**，只显示本地待同步条目并提示「（离线）仅显示本地待同步批注 N 条」。批注列表面板与阅读 buffer 一样**关闭 evil**（`seshat-reader--disable-evil`，受 `seshat-reader-disable-evil` 控制，默认 `t`，见「面板承载」与「evil 与键位预设」），`RET` / `d` / `j` / `k` / `q` / `M-o` / `C-c w` 全部由 `seshat-reader-annotation-list-mode-map` 解析，不需要任何 normal state 补绑（此前会被 `evil-ret` / `evil-delete` / `evil-record-macro` 吃掉）。
 
 ### 离线队列
 
@@ -299,6 +351,8 @@ Emacs 端**只显示**手写（无笔事件、无压感，输入永远在 Androi
 | `C-c C-t` | `seshat-reader-translate-toggle` | 翻译最近一次选区；面板里已是译文时**关闭**面板（原命令 `seshat-reader-translate-selection` 仍可用 `M-x` 调用） |
 | `C-c C-e` | `seshat-reader-translate-explain-toggle` | 解释最近一次选区；面板里已是解释时**关闭**面板（原命令 `seshat-reader-translate-explain-selection` 仍可用 `M-x` 调用） |
 | `q`（面板内） | `seshat-reader-sidebar-quit` | 关面板（`seshat-reader-translate-panel-mode` 承载；按 buffer 名推断 kind，child frame 承载时走 `delete-frame`） |
+| `j` / `k`（面板内） | `next-line` / `previous-line` | 面板内上下移动一行（面板已关闭 evil，`j` / `k` 由 `seshat-reader-translate-panel-map` 直接承载） |
+| `w`（面板内） | `seshat-reader-sidebar-toggle-width` | 面板宽度切换，与 `C-c w` 等价 |
 | `C-c C-q`（面板内） | `seshat-reader-translate-follow-up` | 针对同一段原文继续追问（多轮上下文，见下文「继续追问」） |
 | `C-c C-s`（面板内） | `seshat-reader-translate-save-as-annotation` | 把最近一次译文存为批注 |
 | `C-c w`（面板内） | `seshat-reader-sidebar-toggle-width` | 面板宽度切换：常态 ↔ `seshat-reader-sidebar-expanded-width`（默认 `0.75`），再按一次恢复原宽度 |
@@ -335,10 +389,10 @@ Emacs 端**只显示**手写（无笔事件、无压感，输入永远在 Androi
 - **去 mode-line**：child frame 的面板窗口设 window parameter `mode-line-format` 为 `none`，省掉一行无信息量的 modeline；`header-line` **保留**（仍显示「Seshat 译文」/「Seshat 解释」）。
 - **面板内 `q`（各面板统一）**：一律走 `seshat-reader-sidebar-quit`——按 buffer 名推断当前面板 kind（内置三种面板 + 注册表 `seshat-reader-sidebar-extra-kinds` 里的自建面板，如搜索结果侧栏 `search`），再按**承载单元**分派 `delete-window`（窗口）或 `delete-frame`（child frame），**只关当前这一个面板**，不连带关闭其它 kind 的面板；当前 buffer 不是面板时退回 `seshat-reader-sidebar-toggle`。目录面板与译文/解释面板直接绑该命令，批注列表（含 ETAF 渲染路径）也绑到它（`seshat-reader-etaf-quit` 委托同一命令），搜索结果侧栏经注册表同样命中它。
 - **per-kind 开合键（阅读窗口里）**：每个 kind 一个 toggle——`o` 目录（`seshat-reader-outline-toggle`）、`C-c C-l` 批注列表（`seshat-reader-annotation-toggle`）、`C-c C-t` / `C-c C-e` 译文与解释（`seshat-reader-translate-toggle` / `-explain-toggle`）。语义：**语境匹配时关闭，否则打开/生成并替换内容**。「已显示」由 `seshat-reader-sidebar-panel-visible-p` 判定，与承载方式无关（side window / 底部窗口 / child frame 都算），因此 childframe 承载下同样能一键关闭。译文与解释共用同一个面板 buffer 与同一个 kind（`translate'），故两个键额外比对面板记录的**语境**（`seshat-reader-translate--panel-context`，`translate' / `explain'）：只有「已显示 **且** 语境就是自己那一份」才关闭，否则重新执行对应命令覆盖面板内容——面板里是译文时按 `C-c C-e` 是**换成解释**（不是关面板再按一次），反之亦然（2026-10-26 修复，此前两键都只判「已显示」故互相误关）。原命令（`-outline-show` / `-annotation-list` / `-translate-selection` / `-explain-selection`）保留不变，`M-x` 调用语义如旧。
-- **面板保持 evil normal state，只补绑面板键**：面板（译文/解释、搜索结果侧栏、批注列表、目录）是**只读展示视图**，evil 的 normal state 会先吃掉单键——`q` 变成 `evil-record-macro`（宏录制，第一次按 `q` 开始等寄存器，再按一次才有别的反应）、`n` / `p` 走 evil 的搜索/粘贴、`RET` 由 `evil-ret` 处理、`d` 走 `evil-delete`，于是面板自己绑的单键失效。做法是**保持 normal state**，在面板显示的**统一漏斗**（`seshat-reader-sidebar--display`，以及面板禁用时 `show' 的 `pop-to-buffer' 回退分支）里用 **`evil-define-key*` 的 `'normal' + `'local'`**（即 buffer-local 的 `evil-normal-state-local-map`）把**面板专用键**补绑进**面板 buffer 自己**：`q` / `M-o` / `C-c w`（四个面板）、`RET`（目录、批注、搜索侧栏）、`n` / `p`（搜索侧栏）、`d`（批注）。`hjkl` / `v` / `y` / `gg` / `G` 等 evil 原生键**一律不碰**，因此面板里 normal state 的移动、可视选取与复制照旧可用（面板正是「看着内容挑一段复制」的场景）。
-  - **为什么必须是 `'local'`**：`'local` 解析成 buffer-local 的 `evil-normal-state-local-map`，它在 evil 为该 state 组装的 keymap alist 里排在**最前**（interior 顺序：intercept → **local** → minor-mode → auxiliary → overriding → state map），且 `evil-mode-map-alist` 里存的就是这个 keymap 对象，`define-key` 改它**立即生效、无需重新 normalize**。
-  - **为什么不能用面板 keymap 对象**（上一轮的做法，已弃用）：传 map 对象时 `evil-define-key*` 把绑定写进该 map 关联的 **auxiliary keymap**，而它只有经过 `evil-normalize-keymaps` 才会进入 buffer-local 的 `evil-mode-map-alist`；面板显示时用户早已处于 normal state、补绑发生在其后，装载就不可靠（实测四个面板里有三个的 auxiliary keymap 不在该 alist 中）。后果正是用户看到的「第一次按 `q` 进 macro 录制」；而 `(key-binding (kbd "q"))` 可能返回正确命令、真实按键却走不通。
-  - 绑定写在面板 buffer 自己的 local keymap 里，不外溢到用户其它 buffer，buffer 被 kill 时随 buffer 消失。无 evil 时 `fboundp` 守卫使其零副作用；渲染/重开会反复经过该漏斗，绑定幂等。
+- **面板与阅读 buffer 一律关闭 evil，键位直接来自各自 keymap**：seshat 的每个 buffer——阅读（`seshat-reader-mode`）、目录（`seshat-reader-outline-mode`）、批注列表（`seshat-reader-annotation-list-mode`）、译文/解释面板（`seshat-reader-translate-panel-mode`）、搜索结果侧栏、帮助页——进入时都调 `seshat-reader--disable-evil` 关掉 `evil-local-mode`（受 `seshat-reader-disable-evil` 控制，默认 `t`），因此 **evil 的 normal state 不参与任何 seshat buffer**：`q` 不会再变成 `evil-record-macro`、`RET` 不走 `evil-ret`、`d` 不走 `evil-delete`、`n` / `p` 不走 evil 的搜索/粘贴、`[down-mouse-1]` 也不会先被 `evil-mouse-drag-region` 吞掉。面板键位直接来自面板自己的 keymap：`seshat-reader-outline-mode-map`（目录）、`seshat-reader-annotation-list-mode-map`（批注）、`seshat-reader-translate-panel-map`（译文/解释）、`seshat-reader-search--sidebar-map`（搜索侧栏）；`M-o` / `C-c w` 由承载层 `seshat-reader-sidebar` 在各模块加载后补注册进这些表（不改 `global-map`）。
+  - **关闭时机有两处**：阅读 buffer、目录、批注列表在**各自 mode body** 里关（进入 mode 即生效）；译文/解释面板与搜索结果侧栏在**显示路径**上再关一次，**帮助页在显示之后**再关一次——evil 可能在显示 / 切换 buffer 的过程中重新 enable，故显示之后再补一刀。
+  - **evil 是软依赖**：未安装时 `seshat-reader--disable-evil` 是空操作（`fboundp` 守卫），其它配置零副作用。evil 若比本包更晚加载，`with-eval-after-load 'evil` 会回头把已打开的 seshat buffer 再关一次。
+  - **想保留 evil**（`seshat-reader-disable-evil` 设 `nil`）就得自行处理冲突：normal state 会排在 mode map 之前，`C-v` / `j` / `k` / `n` / `p` / `q` / `RET` / `d` 都按 evil 的语义走，本手册的键位表不再成立。preset 与 evil 的完整说明见「evil 与键位预设」。
 - **`M-o` 全部面板开合**：`seshat-reader-sidebar-toggle`（无参）——**面板开着就全部关闭，关了重开最近一个面板**。`C-c C-o` 已**解绑**，让给 org / `outline-minor-mode` 的结构操作。选 `M-o` 是因为单键、右手拇指可直接够到；它虽是 `global-map` 里 `facemenu-keymap` 的前缀，但本包把绑定写进 `seshat-reader-mode-map`（mode-map 优先），阅读器 buffer 内的 `M-o` 因此归本包，其它 buffer 的 `M-o` 行为不受影响。**`M-o` 在阅读 buffer 与所有面板内都可用**：译文/解释面板（`seshat-reader-translate-panel-map`）、批注列表、目录面板、搜索结果侧栏四个键表各自也绑了同一个命令（后三者由 `seshat-reader-sidebar` 用 `with-eval-after-load` 补注册，不改 `global-map`），故光标在面板里按 `M-o` 同样是「全部开合」，不必先切回阅读 window。「重开最近一个面板」时**位置与内容一致**：关闭时 buffer 与它的 kind 成对记下（`--last-buffer` / `--last-kind`），重开就按该 kind 的方位弹出（此前只记 buffer，`M-o` 关掉多 kind 面板后再按会弹到错误的一侧）。**「最近」= 最近显示的那个**：`--recent-kinds`（`seshat-reader-sidebar--display` 每次显示后把该 kind 提到头部）决定挑谁，再按 kind 从 `--last-buffers` 取 buffer；只有 `--recent-kinds` 为空、或其中 kind 都不在本批面板里时才回退到旧的「遍历承载单元取最后一个」——旧顺序是「窗口在前、child frame 在后」，child frame 面板因此恒压过窗口面板，与实际最后显示的那个不一致（2026-10-26 修复）。
 - **`C-c w` 面板宽度切换**：`seshat-reader-sidebar-toggle-width` —— 把当前面板从常态宽度（`seshat-reader-sidebar-width` 默认 `0.25`；目录栏为 `seshat-reader-outline-sidebar-width` 默认 `0.20`）扩到 `seshat-reader-sidebar-expanded-width`（默认 **`0.75`**），**再按一次恢复扩大前的宽度**。作用对象：在面板 buffer 里按作用于该面板，在阅读 buffer 里按作用于「最近的」本包面板（`seshat-reader-sidebar--windows` 的第一个，通常是最右侧的译文/批注面板）；没有面板时只提示、不报错。实现是水平 `window-resize` 差量调整——side window 与阅读区同属一个水平窗口组合，扩大面板会等量压缩阅读区、恢复时等量归还，不新建窗口。「扩大前宽度」按 **kind** 记在会话内哈希里（`seshat-reader-sidebar--width-memory`），所以面板关掉再打开也能恢复；扩大后的宽度本身不写配置，重启 Emacs 回到常态。**仅窗口承载 + 左右分栏**生效：childframe 承载（宽度由 `seshat-reader-panel-width` 决定）与底部模式（高度语义）只提示、不改布局。键位同时写在阅读 buffer、译文面板、批注列表、目录面板、搜索结果侧栏五个 keymap 上；ETAF 渲染的批注卡片走 ETAF 自己的 `:keys`、无对外 keymap 变量，故卡片里需用 `M-x seshat-reader-sidebar-toggle-width`。
 - **位置与复用**：每个 kind 的 side 由「kind → 位置」解析决定（目录默认左、译文/批注默认右），slot 按 kind 固定分配，故同一 kind 重开时**复用同一 side window**（不新建、不改侧）；运行中改方位才会重建该 kind 的窗口。
@@ -416,17 +470,22 @@ Emacs 端**只显示**手写（无笔事件、无压感，输入永远在 Androi
 | 键位 | 命令 | 作用 |
 |---|---|---|
 | `n` / `p` | `seshat-reader-next-page` / `-previous-page` | 下/上一页 |
-| `C-n` / `C-p` | `seshat-reader-scroll-down-or-next-page` / `-scroll-up-or-prev-page` | 下/上一行，越界翻页 |
+| `j` / `k`（**vim 预设**） | `seshat-reader-scroll-down-or-next-page` / `-scroll-up-or-prev-page` | 下/上一行，越界翻页 |
+| `C-n` / `C-p` | `seshat-reader-scroll-down-or-next-page` / `-scroll-up-or-prev-page` | 与 `j` / `k` 同一命令（同时 remap 了 `next-line` / `previous-line`） |
 | `SPC` | `seshat-reader-scroll-down-screen-or-next-page` | 下滚一屏，到底翻页 |
 | `DEL` / `S-SPC` | `seshat-reader-scroll-up-screen-or-prev-page` | 上滚一屏，到顶翻页 |
-| `C-v` / `M-v` | `seshat-reader-scroll-down-screen` / `-scroll-up-screen` | 下/上滚一屏 |
+| `C-v` / `M-v` | `seshat-reader-scroll-down-screen` / `-scroll-up-screen` | 下/上滚一屏，不翻页；步长 = `window-body-height` − `seshat-reader-screen-context-lines` 行 |
 | `<wheel-up>` / `<wheel-down>` | `seshat-reader-mwheel-scroll-up` / `-down` | 滚轮纵向 |
 | `S-<wheel-up>` / `S-<wheel-down>` | `seshat-reader-mwheel-scroll-left` / `-right` | 滚轮横向 |
-| `C-f` / `C-b` | `seshat-reader-scroll-right` / `-scroll-left` | 横向滚动 |
-| `C-e` / `C-a` | `seshat-reader-scroll-right-most` / `-scroll-left-most` | 横向到右/左缘 |
+| `C-f` / `C-b` | **vim 预设**：`seshat-reader-scroll-down-screen` / `-scroll-up-screen`（滚一屏）；**emacs 预设**：`seshat-reader-scroll-right` / `-scroll-left`（横向滚动） | 语义随 `seshat-reader-keymap-preset` 变，见「evil 与键位预设」 |
+| `h` / `l`（**vim 预设**） | `seshat-reader-scroll-left` / `-scroll-right` | 横向左/右滚 |
+| `^` / `$`（**vim 预设**） | `seshat-reader-scroll-left-most` / `-scroll-right-most` | 横向到最左/最右 |
+| `C-e` / `C-a` | `seshat-reader-scroll-right-most` / `-scroll-left-most` | 横向到右/左缘（与 `$` / `^` 同一命令） |
 | `M-<` / `M->` | `seshat-reader-first-page` / `-last-page` | 首页 / 末页 |
+| `gg` / `G`（**vim 预设**） | `seshat-reader-first-page` / `-last-page` | 首页 / 末页（`gg` 是两键序列，先 `g` 再 `g`；与 `M-<` / `M->` 同一命令） |
 | `M-g g`、`M-g M-g` | `seshat-reader-goto-page` | 跳页 |
-| `g` | `seshat-reader-refresh-doc-buffer` | 重渲染当前页 |
+| `C-l`（**vim 预设**） | `seshat-reader-refresh-doc-buffer` | 重渲染当前页 |
+| `g`（**仅 emacs 预设**） | `seshat-reader-refresh-doc-buffer` | 重渲染当前页（上游键位；vim 预设下 `g` 不绑，用 `C-l`） |
 | `=` / `+` | `seshat-reader-enlarge-size` | 放大 ×1.25 |
 | `-` | `seshat-reader-shrink-size` | 缩小 ×0.75 |
 | `C-<wheel-up>` / `C-<wheel-down>` | `seshat-reader-mwheel-enlarge-size` / `-shrink-size` | 滚轮缩放 |
@@ -435,15 +494,18 @@ Emacs 端**只显示**手写（无笔事件、无压感，输入永远在 Androi
 | `r` / `R` | `seshat-reader-rotate-clockwise` / `-counter-clockwise` | 顺/逆时针 90° |
 | `o` | `seshat-reader-outline-toggle` | 开合目录面板（已显示则关闭，未显示则重建内容后打开） |
 | `Q` | `seshat-reader-close-doc` | 关闭文档 |
+| `t` / `e` | `seshat-reader-translate-toggle` / `-explain-toggle` | 译文 / 解释面板开合（单键别名；`C-c C-t` / `C-c C-e` 同一命令，语境对应见下） |
+| `a` / `m` | `seshat-reader-annotation-create` / `-toggle` | 建批注 / 批注列表面板开合（单键别名；`C-c C-a` / `C-c C-l` 同一命令） |
 | `C-c C-a` / `C-c C-l` | `seshat-reader-annotation-create` / `-toggle` | 建批注 / 批注列表面板开合（已显示则关，否则拉取渲染） |
 | `C-c C-h` | `seshat-reader-annotation-refresh-highlights` | 刷新页面高亮 |
-| `C-s` | `seshat-reader-search` | 跨页文本搜索（会话内 `n` / `p` / `RET` / `C-g`；`n` / `p` 只在会话期间接管翻页键）。搜索成功后同时打开**左侧搜索结果侧栏**并把光标切过去，侧栏键位见 §9.5 |
+| `/`（**vim 预设**）、`C-s` | `seshat-reader-search` | 跨页文本搜索（会话内 `n` / `p` / `RET` / `C-g`；`n` / `p` 只在会话期间接管翻页键）。搜索成功后同时打开**左侧搜索结果侧栏**并把光标切过去，侧栏键位见 §9.5 |
 | `C-c C-r` | `seshat-reader-reference-insert` | 插入选区摘录 |
 | `C-c C-t` / `C-c C-e` | `seshat-reader-translate-toggle` / `-explain-toggle` | 译文 / 解释面板开合，**语境一一对应**：面板里是译文时 `C-c C-t` 关闭（`C-c C-e` 换成解释），面板里是解释时 `C-c C-e` 关闭（`C-c C-t` 换成译文），面板未显示则翻译 / 解释并弹出 |
 | `C-c C-q` | `seshat-reader-translate-follow-up` | 对译文 / 解释继续追问（多轮上下文） |
+| `w` | `seshat-reader-sidebar-toggle-width` | 面板宽度切换（单键别名；`C-c w` 同一命令） |
 | `M-o` | `seshat-reader-sidebar-toggle` | **全部面板**开合：有面板就全部关闭，没有就重开最近一个。同一键位在**所有面板**（译文/解释、批注列表、目录、搜索结果侧栏）内也生效——光标在面板里照样按得到，不必先切回阅读 window |
 | `C-c w` | `seshat-reader-sidebar-toggle-width` | 面板宽度**切换**：常态宽度（`seshat-reader-sidebar-width` / `seshat-reader-outline-sidebar-width`）↔ `seshat-reader-sidebar-expanded-width`（默认 `0.75`）；再按一次恢复原宽度。同一键位在译文面板 / 批注列表 / 目录面板 / 搜索结果侧栏内也生效 |
-| `?` | `seshat-reader-help` | 打开本帮助页：键位、功能简介与面板行为（`seshat-reader-help` 自带 autoload，无需 require，见「安装与加载」）。**evil 用户同样可用**：包内用 `evil-define-key*` 把 normal state 的 `?` 补绑到本命令（evil 原绑的是 `evil-search-backward`），`/`、`n`、`N` 不被改动，见 §11 最后一条 |
+| `?` | `seshat-reader-help` | 打开本帮助页：键位、功能简介与面板行为（`seshat-reader-help` 自带 autoload，无需 require，见「安装与加载」）。seshat buffer 已关闭 evil（`seshat-reader-disable-evil`），normal state 不会压掉本键 |
 
 `C-c C-o` **已解绑**（让给 org / `outline-minor-mode` 的结构操作）：单个 kind 的开合改由各自
 的键承担（`o` 目录、`C-c C-l` 批注列表、`C-c C-t` / `C-c C-e` 译文与解释），全部开合统一走
@@ -455,7 +517,7 @@ Emacs 端**只显示**手写（无笔事件、无压感，输入永远在 Androi
 
 | 键位 | 命令 | 作用 |
 |---|---|---|
-| `p` / `n` | `previous-line` / `next-line` | 上下移动 |
+| `p` / `n`（或 `j` / `k`） | `previous-line` / `next-line` | 上下移动 |
 | `RET`、`M-RET` | `seshat-reader-outline-visit-page` | 跳到该标题所在页 |
 | `f` | `seshat-reader-outline-avy-jump` | avy 风格单键跳转 |
 | `o` | `seshat-reader-outline-toggle` | 开合面板：已显示则关闭，未显示则重建内容后打开；`seshat-reader-outline-select-doc-window` 不再占 `o`，仅供 `RET` 跳页切回阅读窗口 |
@@ -465,7 +527,7 @@ Emacs 端**只显示**手写（无笔事件、无压感，输入永远在 Androi
 | `C-c w` | `seshat-reader-sidebar-toggle-width` | 面板宽度切换（常态 ↔ `seshat-reader-sidebar-expanded-width`，再按一次恢复） |
 | `TAB` | `outline-mode` 自身 | 折叠 / 展开子树 |
 
-evil 用户同样可用上述单键（包内 `evil-define-key*` 补绑 normal state 的 `f` / `p` / `n` / `o` / `s` / `q` / `RET` / `M-RET`；目录面板本身也**保持 normal state**，面板专用键（`q` / `M-o` / `C-c w` / `RET`）在面板显示的统一漏斗里一并补绑，见 §「面板承载」里的「面板保持 evil normal state，只补绑面板键」条；`hjkl` / `v` / `y` 仍为 evil 原生行为）。
+面板已关闭 evil（`seshat-reader--disable-evil`，受 `seshat-reader-disable-evil` 控制，默认 `t`），上述单键全部由 `seshat-reader-outline-mode-map` 解析，不需要任何 evil 补绑；`M-o` / `C-c w` 由 `seshat-reader-sidebar` 在该模块加载后补注册进同一张表。若单键又变回 evil 语义，先查 `seshat-reader-disable-evil` 是否为 `nil`（见「evil 与键位预设」）。
 
 ### 9.3 批注列表（`seshat-reader-annotation-list-mode-map`）
 
@@ -473,6 +535,7 @@ evil 用户同样可用上述单键（包内 `evil-define-key*` 补绑 normal st
 |---|---|---|
 | `RET` | `seshat-reader-annotation-list-goto` | 跳到该条批注所在页 |
 | `d` | `seshat-reader-annotation-list-delete` | 删除该条批注 |
+| `j` / `k` | `next-line` / `previous-line` | 上下移动一行（面板已关闭 evil，`j` / `k` 由本 mode map 直接承载） |
 | `C-c C-r` | `seshat-reader-reference-insert-annotation` | 插入该条批注的引用 |
 | `q` | `seshat-reader-sidebar-quit` | 只关当前（批注列表）面板，与目录 / 译文面板一致（ETAF 渲染路径同一语义，键由 `seshat-reader-etaf--annotation-keys` 绑到 `seshat-reader-etaf-quit`，后者委托 `sidebar-quit`） |
 | `M-o` | `seshat-reader-sidebar-toggle` | **全部面板**开合（与阅读 buffer 内同一个键） |
@@ -485,18 +548,21 @@ evil 用户同样可用上述单键（包内 `evil-define-key*` 补绑 normal st
 | `q` | `seshat-reader-sidebar-quit` | 关面板（child frame 承载时 `delete-frame`） |
 | `M-o` | `seshat-reader-sidebar-toggle` | **全部面板**开合（与阅读 buffer 内同一个键） |
 | `C-c w` | `seshat-reader-sidebar-toggle-width` | 面板宽度切换（常态 ↔ 扩大值，再按一次恢复） |
+| `j` / `k` | `next-line` / `previous-line` | 面板内上下移动一行（面板已关闭 evil，`j` / `k` 由 `seshat-reader-translate-panel-map` 直接承载） |
+| `w` | `seshat-reader-sidebar-toggle-width` | 面板宽度切换，与 `C-c w` 等价 |
 | `C-c C-q` | `seshat-reader-translate-follow-up` | 对当前原文继续追问 |
 | `C-c C-s` | `seshat-reader-translate-save-as-annotation` | 存为批注 |
 
 ### 9.5 搜索结果侧栏（`seshat-reader-search--sidebar-map`）
 
 `C-s` 成功后光标落在左侧结果侧栏（`*Seshat Search*`，`special-mode` + 只读），键表以
-`special-mode-map` 为父表（滚动等基础键照旧可用），只覆盖下面六个键：
+`special-mode-map` 为父表（滚动等基础键照旧可用），只覆盖下列键（`j` / `k` 移动光标，`n` / `p` 走命中列表，两族语义不同）：
 
 | 键位 | 命令 | 作用 |
 |---|---|---|
 | `RET` | `seshat-reader-search-sidebar-goto` | 跳到当前行命中所在页并高亮该命中（光标留在侧栏，便于继续挑结果） |
 | `n` / `p` | `seshat-reader-search-sidebar-next` / `-prev` | 移动下一条 / 上一条并跳转；首条 `p`、末条 `n` 只提示「已是第一个 / 最后一个结果」，不报错 |
+| `j` / `k` | `next-line` / `previous-line` | 光标上下移动一行（**不动阅读器**）；`n` / `p` 才是「移动上/下一条命中并跳页」，两族语义不同，故都保留 |
 | `q` | `seshat-reader-sidebar-quit` | **只关搜索结果侧栏**（其它面板保留）。侧栏在 `seshat-reader-search.el` 加载末尾把自己登记进 `seshat-reader-sidebar-extra-kinds`（buffer 名 → kind `search`），故通用的关闭命令按 buffer 名就能推断出 `search`、只关自己；`seshat-reader-search-sidebar-quit` 保留为**委托同一命令**的兼容别名 |
 | `M-o` | `seshat-reader-sidebar-toggle` | **全部面板**开合（光标在侧栏里也按得到，不必先切回阅读 window；绑定由 `seshat-reader-sidebar` 在 search 模块加载后补注册） |
 | `C-c w` | `seshat-reader-sidebar-toggle-width` | 面板宽度切换：常态 ↔ `seshat-reader-sidebar-expanded-width`，再按一次恢复原宽度（侧栏在左侧、与目录栏同为宽度语义；绑定同样由 `seshat-reader-sidebar` 补注册） |
@@ -620,6 +686,7 @@ M12 回归（strip 行破坏页面几何 + `--center-page` 在 `window-size-chan
 按顺序排查：
 
 1. `(key-binding [down-mouse-1])` 应为 `seshat-reader-select-drag`；若为 nil，说明 `seshat-reader-select` 未加载（`(featurep 'seshat-reader-select)`）。
+   - evil 用户无需额外处理：seshat buffer 已关闭 evil（`seshat-reader-disable-evil` 默认 `t`），`[down-mouse-1]` 不会先被 `evil-mouse-drag-region` 吞掉；若选区不生效而 `seshat-reader-disable-evil` 为 `nil`，先设回 `t` 再试。
 2. 高亮链路是否需要重启：`(fboundp 'seshat-reader-dyn--add-highlight)` 与 `(fboundp 'seshat-reader-dyn--add-decoration)` 都应为 `t`——任一为 nil 表示加载的 `.so` 太旧（后者缺失时 underline / strikeout 与自定义配色都画不出来），重新 `make all` 并**重启 Emacs**。
 3. `seshat-reader-annotation-highlight-enabled` 是否为 `t`。
 4. 批注数据是否真的拉到过：`C-c C-l` 打开列表，看目标批注是否在列表里（矩形是从列表项投给 C 层的）。
@@ -627,7 +694,7 @@ M12 回归（strip 行破坏页面几何 + `--center-page` 在 `window-size-chan
 
 **目录面板里 `f` 变成 `evil-find-char`**
 
-包内已用 `evil-define-key*` 补绑；若仍旧行为，说明加载的是本次补绑之前的版本——重启 Emacs。自定义配置里不必再补绑，除非你用 `evil-define-key` 覆盖了同一 state。
+2026-10-26 前的版本靠 `evil-define-key*` 给 normal state 补绑；现在目录面板**关闭 evil**（`seshat-reader--disable-evil`，受 `seshat-reader-disable-evil` 控制，默认 `t`），`f` 直接由 `seshat-reader-outline-mode-map` 解析，不存在被 `evil-find-char` 抢走的情况。仍被抢说明 `seshat-reader-disable-evil` 被设成了 `nil`（或你的配置在面板 buffer 里重新 `(evil-local-mode 1)`）；改回 `t` 后重开面板即可，不需要任何 `evil-define-key`。
 
 **退出 PDF 后目录面板还留着**
 
@@ -652,16 +719,16 @@ M12 回归（strip 行破坏页面几何 + `--center-page` 在 `window-size-chan
 
 **面板里按 `q` / `n` / `p` / `RET` 没反应（evil 用户）**
 
-已修：evil 的 normal state 排在 major-mode / minor-mode map 之前，会先吃掉这些单键（`q` = `evil-record-macro`、`n` / `p` = evil 的搜索/粘贴、`RET` = `evil-ret`），面板自己绑的键根本收不到。本包**不再切换 state**——面板保持 evil **normal state**，改在**面板显示的统一漏斗**（`seshat-reader-sidebar--display`）里用 **`evil-define-key*` 的 `'normal' + `'local'`**（buffer-local、优先级最高）在面板 buffer 内补绑面板专用键：`q`（关面板）/ `M-o`（重开）/ `C-c w`（四个面板通用）、`RET`（目录、批注、搜索侧栏跳转）、`n` / `p`（搜索侧栏上/下一条）、`d`（批注删除）。因此面板里既恢复了单键，也保住了 `hjkl` 移动、`v` 可视选取与 `y` 复制。验证：evil 用户把光标放进任一面板后 `(evil-state)` 应为 `normal`、`(key-binding (kbd "q"))` 应为 `seshat-reader-sidebar-quit`。
+2026-10-26 前的做法是在面板 buffer 里给 evil normal state 补绑（`'normal` + `'local`）；现在**面板与阅读 buffer 一律关闭 evil**：进入 mode（阅读 / 目录 / 批注列表）以及面板的显示路径（译文/解释、搜索结果侧栏）都调 `seshat-reader--disable-evil`，`q` / `M-o` / `C-c w` / `RET` / `n` / `p` / `d` / `j` / `k` 全部落到面板自己的 keymap 上，evil 的 `evil-record-macro`（`q`）/ 搜索与粘贴（`n` / `p`）/ `evil-ret` / `evil-delete`（`d`）不再参与。验证：光标进任一面板后 `(bound-and-true-p evil-local-mode)` 应为 `nil`、`(key-binding (kbd "q"))` 应为 `seshat-reader-sidebar-quit`。
 
-**若曾出现「第一次按 `q` 进了 macro 录制（等寄存器），再按一次才退出」**：说明绑定退化到了 auxiliary keymap（`evil-define-key*` 传的是面板 keymap **对象**而不是 `'local'`）——那个 keymap 装入 `evil-mode-map-alist` 的时机不可靠，真实按键仍落到 `evil-normal-state-map`。此时**必须确认 `'local'` 生效**：光标进面板后 `(with-current-buffer (window-buffer) (lookup-key evil-normal-state-local-map (kbd "q")))` 应为 `seshat-reader-sidebar-quit`（或看到 `'local` 版本的补绑代码）；只查 `(key-binding (kbd "q"))` **不够**——auxiliary keymap 场景下它也可能返回正确命令，而真实按键照样进 macro 录制。仍不对则说明加载的是旧 `.elc`（`make clean all` 后重启 Emacs），或你在自己配置里对该面板 buffer **显式**重设了 state / 覆盖了键（如 `(evil-emacs-state)` / 自定义 `evil-define-key`），此时以你的配置为准——删掉那条覆盖即恢复。`hjkl` / `v` / `y` 应保持 evil 原生行为，不需要也不应另行补绑。
+**仍被 evil 抢**：检查 `seshat-reader-disable-evil` 是否为 `nil`（`C-h v seshat-reader-disable-evil`）；为 `nil` 时本包**故意**保留 evil，normal state 会压掉上述单键，此时要么设回 `t`（重开面板即生效），要么自行用 `evil-define-key` 覆盖。另需确认加载的是新 `.elc`（`make clean all` 后重启 Emacs），并排除自己的配置在 seshat buffer 里重新 enable 了 evil（如 `(evil-local-mode 1)` / `(evil-normal-state)` 钩子）。
 
 **追问时冒出 `*Seshat gt follow-up*` 缓冲区，PDF 被挤到左边**
 
 已修（2026-10-26）：追问的答案原本写在隐藏中转 buffer `" *Seshat gt follow-up*"` 里，但 `gt-buffer-render` 在请求完成时会**再**调一次 `display-buffer`（不带 action），从 `display-buffer-alist` 的默认动作落到「弹窗」；`:window-config` 只挡得住初始化那一次。现在两个中转 buffer 名（`" *Seshat gt*"` 与 `" *Seshat gt follow-up*"`）都由 `seshat-reader-translate--ensure-hidden-gt-buffers` 登记为 `(display-buffer-no-window)` + `(allow-no-window . t)`，两次显示都落空。验证：`M-: (display-buffer (get-buffer-create " *Seshat gt follow-up*"))` 应返回 `nil` 且**不弹窗**；仍弹窗说明加载的是旧 `.elc`（`make clean all` 后重启 Emacs）。
 
 **evil 下按 `?` 变成了反向搜索（`evil-search-backward`）**
-已修：evil 的 normal state 把 `?` 绑在 `evil-normal-state-map`，而 state map 经 `emulation-mode-map-alists` 排在 major-mode map **之前**，所以 `seshat-reader-mode-map` 里的 `?` 被压掉。包内用 `evil-define-key*` 把 normal state 的 `?` 补绑到 `seshat-reader-help`（只写本 mode 的 auxiliary keymap，不动 evil 全局表，也不碰 `/`、`n`、`N`）。验证：evil 用户（已启用 `evil-local-mode`、normal state）在阅读 buffer 里 `(key-binding (kbd "?"))` 应为 `seshat-reader-help`；仍为 `evil-search-backward` 说明加载的是旧 `.elc`——`make clean all` 后重启 Emacs。阅读器里的搜索本来就走 `C-s`（基于页面坐标，不用 buffer 文本），故 `?` 让给帮助页；若确实想保留 evil 的反向搜索，在自己配置里覆盖即可：`(evil-define-key* 'normal seshat-reader-mode-map (kbd "?") #'evil-search-backward)`——本包只在加载时注册一次，不会抢回用户的覆盖。`M-o` 无需此类补绑（evil 未占该键），若将来某个 evil 版本占了它，用同一条 `evil-define-key*` 覆盖即可。
+已修（2026-10-26）：阅读 buffer 进入 `seshat-reader-mode` 时关闭 evil（`seshat-reader--disable-evil`，受 `seshat-reader-disable-evil` 控制，默认 `t`），`?` 直接由 `seshat-reader-mode-map` 解析，不再被 `evil-normal-state-map` 压掉。验证：阅读 buffer 里 `(bound-and-true-p evil-local-mode)` 应为 `nil`、`(key-binding (kbd "?"))` 应为 `seshat-reader-help`；仍为 `evil-search-backward` 说明 `seshat-reader-disable-evil` 被设成了 `nil`（此时 evil 可用，见「evil 与键位预设」）或加载的是旧 `.elc`（`make clean all` 后重启 Emacs）。若确实想保留 evil 的反向搜索，把 `seshat-reader-disable-evil` 设回 `nil` 并在自己配置里覆盖 `?` 即可。
 
 ## 12. 已知限制
 
@@ -708,7 +775,7 @@ M12 回归（strip 行破坏页面几何 + `--center-page` 在 `window-size-chan
 | `seshat-reader-annotation-queue.el` | 离线队列（读写、原子写、定时同步） |
 | `seshat-reader-search.el` | 跨页文本搜索：整本扫描、按页缓存、`n` / `p` 临时键表、命中装饰投喂、左侧搜索结果侧栏（`kind=search`） |
 | `seshat-reader-sidebar.el` | 面板承载层（零依赖：位置、宽度/高度、slot、per-kind 尺寸记忆） |
-| `seshat-reader-outline.el` | 目录面板：行模型、渲染、avy 跳转、evil 补绑、关文档清理 |
+| `seshat-reader-outline.el` | 目录面板：行模型、渲染、avy 跳转、关闭 evil（`seshat-reader-disable-evil`）、关文档清理 |
 | `seshat-reader-translate.el` | 翻译/解释：gt 预设取用、面板 Markdown 渲染、存为批注 |
 | `seshat-reader-reference.el` | `seshat:` 协议（`:follow` / `:store` / `:complete` / `:export`）、摘录写入 |
 | `seshat-reader-etaf.el` | 批注列表的可选 ETAF 渲染层（硬依赖 `etaf-ui`，缺失则不编译） |

@@ -52,8 +52,9 @@
 ## 上游对照能力丧失（M11.2c，2026-10-12）
 - seshat-reader 改名后与上游 emacs-reader 无逐文件映射，上游修复无法机械合并，须人工比对。
 
-## evil 键位自维护（M11.2c，2026-10-12）
+## evil 键位自维护（M11.2c，2026-10-12）——已解决（2026-10-26，阅读器关闭 evil、键位改由包内 mode-map 承担）
 - evil-collection 的 reader 支持绑定硬编码于 `reader-mode-map`（且以 `eval-after-load 'reader` 触发），改名后不再生效；本地在 `thomas-emacs/lisp/init-evil.el` 重建 49 条绑定（含 outline 6 条），上游更新不会自动同步。
+- 解决：2026-10-26 起阅读器全部 buffer 关闭 evil（`seshat-reader--disable-evil` / `evil-local-mode -1`，受 `seshat-reader-disable-evil` 控制），键位由包内 `seshat-reader-mode-map` 与各面板 mode-map 唯一承担，evil 侧不再需要任何 seshat 绑定；包内三处补绑实现（`--install-evil-bindings` ×2、`--ensure-panel-evil-keys`）与 `thomas-emacs/lisp/init-evil.el` 的 49 条绑定一并删除，双份维护消失。
 
 ## C 源名与产物名不一致（M11.2c，2026-10-12）
 - 源码仍为 `render/render-core.c`，产物却为 `seshat-render-core.so`（有意保留以缩小改动面）。
@@ -95,11 +96,12 @@
 ## L3 端到端待补（M11.3，2026-10-16）
 - M11.3 的服务端闭环验证因服务端不可用而未执行，启动方式见 `docs/configuration.md` 与 `deploy/`（密钥不入库）。
 
-## evil 遮蔽 major-mode 的鼠标绑定（M11.3，2026-10-16）
+## evil 遮蔽 major-mode 的鼠标绑定（M11.3，2026-10-16）——已解决（2026-10-26，阅读器相关 buffer 关闭 evil）
 - evil 经 `emulation-mode-map-alists` 把 `[down-mouse-1]` 解析到 `evil-mouse-drag-region`，优先于 major-mode-map；`seshat-reader-mode-map` 上既有的 `<remap> mouse-drag-region → ignore` 亦无法拦截（evil 走的是 `evil-mouse-drag-region`，不是 `mouse-drag-region`）。
 - 影响所有依赖 `down-mouse-1` 的 major-mode 级交互（如 seshat-reader 的鼠标拖拽选区取文）。
 - 当前在 `thomas-emacs/lisp/init-evil.el` 侧以 normal state 显式重绑规避。
 - 根治需上游 evil 提供更细的 state 映射策略或改用 aux keymap 的更明确写法。
+- 解决：阅读器 buffer 关闭 evil 后 `emulation-mode-map-alists` 里不再有 evil 的 normal state map，`[down-mouse-1]` 直接解析到 major-mode 的 `<remap> mouse-drag-region`（框选取文恢复），不再需要 `init-evil.el` 侧的 normal state 重绑规避。
 
 ## 服务端 LLM 端点缺口（M11.5，2026-10-16）
 - `internal/llm` 的 5 类能力（含云端/本地节点混合路由）尚未暴露任何客户端 HTTP 接口（`internal/api/server.go` 中零命中）；Emacs 侧因此暂时绕过服务端直连本地 gt。
@@ -1469,3 +1471,22 @@
 - 剩余隐患：**gt 侧组合本身仍不安全**——「流式 + `delimit` 非 nil」在 gt 内部依旧会崩。托管配置的其它路径（或用户自定义预设）若手动 `oset stream t` 给这类引擎，同样会踩中。
 - 来源：2026-10-25 主实例实测（`--enable-stream` 给全部带 `stream` 槽的引擎开流式，youdao/google 各报一次 `stringp` 错误）。
 - 解除条件：gt 修复该组合（stream 为 t 时仍按 `delimit` join，或给出能力探测/声明式约束），本包即可去掉 `delimit` 判据；在此之前**勿在配置侧手动**给 `delimit` 非 nil 的引擎 `oset stream t`。
+
+## `C-u N G` 跳指定页能力收窄（2026-10-26）
+
+- 现状：阅读器关闭 evil 后，包内 `vim` preset 的 `G` **只跳末页**（`seshat-reader-last-page`）；原 `thomas-emacs/lisp/init-evil.el` 里带前缀参数的 `+seshat-reader-goto-page` helper（`C-u 5 G` 跳第 5 页）随该文件的 seshat 段（103 行）一并删除，包内没有等价实现。
+- 影响：习惯「`C-u N G` 跳页」的用户少一条路径；**跳指定页仍可用** `M-g g`（`M-g M-g` / `<remap> goto-line` 同绑），功能不缺失，只是键位形态变了。
+- 建议：如需恢复 vim 风格，可在 `vim` preset 里把 `G` 绑到一个 wrapper——`(if current-prefix-arg (seshat-reader-goto-page) (seshat-reader-last-page))`，并保证 `seshat-reader-goto-page` 在无前缀时能取到默认页号（现为交互式读 `read-number`）。注意 `G` 目前在 `--key-bindings-vim-only` 表内，改动同时要更新 `seshat-reader-evil-keymap-test.el` 的键位断言与帮助页键位表。
+
+## evil 在 buffer 显示路径上会重新 enable（2026-10-26）
+
+- 现象：`seshat-reader--disable-evil` 在 mode body 里调用之后，buffer 一旦被 `pop-to-buffer` / `display-buffer` 显示，`evil-local-mode` 会**重新变回 `t`**（2026-10-26 verify 实例实测），因此「在 mode body 里关一次即可」的假设不成立。
+- 现状：帮助页 `seshat-reader-help` 在 `special-mode` 就位时关一次、`pop-to-buffer` **之后**再关一次；面板由 `seshat-reader-sidebar--display`（window / childframe 两条承载路径）在显示前关一次，`show` 的 `pop-to-buffer` 回退分支另关一次；另有 ERT 断言「re-enable 后重关」。阅读 buffer 本身路径稳定，未见回弹。
+- 风险：任何**新增的显示路径**（新的面板承载、新的 `display-buffer` 调用、第三方接管显示）都可能漏掉第二次关闭，症状是「evil 键位在某些 buffer 里突然回来」，且 `(key-binding …)` 查得到正确命令、真实按键却落到 evil（与 M11.2c 的 keymap 装载问题同形）。
+- 建议：长期改为不依赖「关两次」的形态——给 help / panel buffer 派生专用 major mode 并在其中以 buffer-local 方式维持 `evil-local-mode` 为 nil（例如挂 `change-major-mode` 或在 `window-buffer-change-functions` 里补关），或向 evil 请求「此 buffer 恒 emacs state」的声明式入口。在此之前，新增显示路径必须复用 `--display` 漏斗或显式补一次 `seshat-reader--disable-evil`，并加对应 ERT。
+
+## 帮助页键位表与实际绑定无一致性断言（2026-10-26）
+
+- 现状：`seshat-reader-help--navigation-keys` / `--feature-keys` / `--panel-keys` / `--search-panel-keys` 是「命令符号 → 说明」的静态表，帮助页渲染时用 `substitute-command-keys` 从**运行时** keymap 解析键位，取不到绑定就显示「（未加载）」。若某命令改名或删除而未同步改表，帮助页会**静默**把该行显示成「（未加载）」，既不报错也不失败测试——本轮改键位时就依赖人工核对。
+- 影响：文档与代码漂移只表现为帮助页多出一行「（未加载）」，容易被忽略；比编造键位好，但仍不是不变量。
+- 建议：加一条 ERT 遍历四张表的 `car` 并断言 `(fboundp cmd)`（模块未加载时用 `require` 或 `declare-function` 桩），把「表里的命令必须存在」编码成可机械检查的不变量；`make -C emacs/seshat-reader all` 的 checkdoc 不覆盖这类语义，只能靠测试。

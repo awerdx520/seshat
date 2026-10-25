@@ -126,6 +126,8 @@
                   (page x0 y0 x1 y1))
 (declare-function seshat-reader-dyn--text-in-rect "seshat-render-core"
                   (page x0 y0 x1 y1))
+;; 侧栏渲染完再防御性关一次 evil（软依赖：evil 未加载时 `fboundp' 守卫跳过）。
+(declare-function seshat-reader--disable-evil "seshat-reader" ())
 
 ;; 该变量由 C 模块（`permanent_buffer_local_var'）注册为 buffer-local，编译期
 ;; 不可见；在此声明以消除 byte-compiler 的 free variable 警告。
@@ -1020,12 +1022,18 @@ on the same path as the annotation / translate / outline panels."
   :doc "Keymap of the search result sidebar buffer.
 Parented on `special-mode-map', so the usual read-only-buffer keys (scrolling
 with \\[scroll-up-command] / \\[scroll-down-command], \\[quit-window]) keep
-working; only the four keys that mean something here are overridden."
+working; only the six keys that mean something here are overridden.
+
+`j' / `k' move the cursor one line down / up (like `special-mode' users
+expect), while `n' / `p' walk the hit list and jump the reader to the hit on
+the current line — different semantics, so both families stay bound."
   :parent special-mode-map
   "q"   #'seshat-reader-sidebar-quit
   "RET" #'seshat-reader-search-sidebar-goto
   "n"   #'seshat-reader-search-sidebar-next
-  "p"   #'seshat-reader-search-sidebar-prev)
+  "p"   #'seshat-reader-search-sidebar-prev
+  "j"   #'next-line
+  "k"   #'previous-line)
 
 (defconst seshat-reader-search--sidebar-line-spacing 2
   "搜索结果侧栏的行距（`line-spacing'，单位像素）.
@@ -1110,6 +1118,16 @@ buffer 之前**取（C 侧矩形查询要求当前 buffer 就是文档 buffer）
           (goto-char (point-min))
           (set-buffer-modified-p nil)
           (setq buffer-read-only t))))
+    ;; 防御性关闭侧栏 buffer 的 evil：显示路径 `seshat-reader-sidebar--display'
+    ;; 已关过一次，这里再幂等关一次，保证即使显示路径改变（或显示失败）侧栏
+    ;; 也仍由 `seshat-reader-search--sidebar-map' 说了算——evil 的 normal state
+    ;; 会经 `emulation-mode-map-alists' 抢走 j / k / n / p。evil 是软依赖，
+    ;; `fboundp' 守卫让未加载 evil 时静默跳过；必须切到 **侧栏 buffer**：此处
+    ;; 当前 buffer 是阅读 buffer，不能顺手关掉阅读器的 evil。
+    (when (and (fboundp 'seshat-reader--disable-evil)
+               (buffer-live-p buffer))
+      (with-current-buffer buffer
+        (seshat-reader--disable-evil)))
     (ignore-errors (seshat-reader-sidebar-show buffer 'search t))
     ;; 渲染后立即定位一次：侧栏刚建好时应当指着**当前**命中（搜索从文档中部
     ;; 开始时 `--index' 不是 0），而不是停在标题行。
@@ -1276,7 +1294,9 @@ closes only this panel."
 ;; 自研扩展一律在自己的模块里注册键位（与 annotation / reference / translate
 ;; 一致）：不往 vendored 的 `seshat-reader.el' 里塞本地键位。
 (with-eval-after-load 'seshat-reader
-  (define-key seshat-reader-mode-map (kbd "C-s") #'seshat-reader-search))
+  (define-key seshat-reader-mode-map (kbd "C-s") #'seshat-reader-search)
+  ;; `/` 是 search 模块自己补的第二入口（与 `C-s' 双绑）：阅读器自身不绑 `/`。
+  (define-key seshat-reader-mode-map (kbd "/") #'seshat-reader-search))
 
 ;; 把搜索结果侧栏登记为面板 kind `search'：`seshat-reader-sidebar' 是零依赖的
 ;; 承载层（不 require 本模块），故由**创建该 buffer 的模块**在此声明

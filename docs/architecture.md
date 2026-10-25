@@ -150,7 +150,7 @@ seshat-sync-now
 **渲染层 `seshat-reader-etaf`（可选，依赖 `etaf-ui`；只负责批注卡片）**：
 
 - 职责（M11.10 起）：**仅渲染批注卡片列表**——标题栏（文档名 + 条数徽章）、批注卡片（页码徽章 / 摘要 / `[待同步]` 标记 / 选中标记）、底部键位提示。**译文/解释不经过本层**（原「译文排版」组件树已删除）。
-- 交互：`:keys`（`RET` / `d` / `C-c C-r` / `q` / `n` / `p`）+ `:on-press`。Host keys 位于 `emulation-mode-map-alists` 最前，evil 不会吃掉——**但依赖加载顺序**：evil 先启用、面板再 mount 才成立；运行期 toggle evil 需重新 mount 面板。
+- 交互：`:keys`（`RET` / `d` / `C-c C-r` / `q` / `n` / `p`）+ `:on-press`。Host keys 位于 `emulation-mode-map-alists` 最前，**与 evil 是否启用无关**——阅读器默认在**所有面板与阅读 buffer** 里关闭 evil（`seshat-reader--disable-evil`，受 `seshat-reader-disable-evil` 控制），故不存在 evil 抢占 `:keys` 的前提；**仅当**用户把 `seshat-reader-disable-evil` 设为 nil 时才回到旧前提（evil 先启用、面板再 mount，运行期 toggle evil 需重新 mount 面板）。
 - 双色板：按 `background-mode` 取内置明/暗配色，文字一律用普通 `text` + 父 Host 样式（`etaf-label` / `etaf-badge` 自带颜色会覆盖父 Host，故不用）；换主题后需重新渲染面板。
 - 增量更新：状态（items / 选中项 / 文档标签）放在 `etaf-ref` 中，改 ref 由 ETAF 做 keyed patch + 行级 diff，不整树重渲染。
 - 视口高度（M11.13 起）：卡片列表**不设固定高度、不做内部滚动**，改按条目数**显式计算 viewport 高度**（`seshat-reader-etaf--content-viewport-height`：chrome 6 行 + 每卡 2 行，最小 20 行）；已挂载时经 `etaf-runtime-refit` 放大视口，条目增多不被裁剪，超出面板高度的部分由**面板窗口**滚动查看。

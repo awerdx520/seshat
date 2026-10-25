@@ -95,6 +95,13 @@
 (declare-function seshat-reader-annotation-queue-entries "seshat-reader-annotation-queue")
 (declare-function seshat-reader-annotation-queue-sync "seshat-reader-annotation-queue")
 
+;; 关闭 evil 的 helper 定义在 `seshat-reader'（阅读 buffer 模块）中；本文件
+;; 不 require 它（annotation 是阅读器的附属模块，反向 require 会形成循环），
+;; 故此处声明签名以免字节编译告警。实际调用点只有
+;; `seshat-reader-annotation-list-mode' 的 body——列表 buffer 只在阅读器流程
+;; 中被创建，此时 `seshat-reader' 必已加载。
+(declare-function seshat-reader--disable-evil "seshat-reader" ())
+
 ;; ETAF 渲染层是**软依赖**：本文件不在顶部 require 它（未安装 ETAF 时列表中
 ;; 的批注仍需可用），渲染入口在 `seshat-reader-annotation--render-list-etaf'
 ;; 内按需 `(require 'seshat-reader-etaf nil t)'。此处声明公开符号以避免字节
@@ -1882,14 +1889,24 @@ UID 为可选的文档服务端身份：删除请求按批注 `id' 定位，并�
 Keybindings:
 \\{seshat-reader-annotation-list-mode-map}
 
-`RET' 跳转到当前行批注所在页面，`d' 删除当前行批注。
-列表为全量单列连续流（不分页），条目超出面板高度时滚动面板窗口查看。"
-  (setq-local truncate-lines t))
+`RET' 跳转到当前行批注所在页面，`d' 删除当前行批注，`j'/`k' 上下移动。
+列表为全量单列连续流（不分页），条目超出面板高度时滚动面板窗口查看。
+
+body 里调 `seshat-reader--disable-evil'：evil 的 normal state 会经
+`emulation-mode-map-alists' 压在本 mode 的键表之前，把 `j'/`k' 抢走；关闭后
+本文件绑定的 `j'/`k'/`RET'/`d'/`q' 才真正生效（evil 是软依赖，未安装时
+helper 是空操作）。"
+  (setq-local truncate-lines t)
+  (seshat-reader--disable-evil))
 
 (define-key seshat-reader-annotation-list-mode-map (kbd "RET")
             #'seshat-reader-annotation-list-goto)
 (define-key seshat-reader-annotation-list-mode-map (kbd "d")
             #'seshat-reader-annotation-list-delete)
+;; vim 风格的逐行移动：列表 buffer 已关闭 evil（见 mode body），这两个键由
+;; 本文件直接绑定，语义即 Emacs 原生的 `next-line' / `previous-line'。
+(define-key seshat-reader-annotation-list-mode-map (kbd "j") #'next-line)
+(define-key seshat-reader-annotation-list-mode-map (kbd "k") #'previous-line)
 ;; 面板内 `q' 统一走 `seshat-reader-sidebar-quit'（只关本面板所在 kind），与目录
 ;; 面板、译文面板的 `q' 一致。`special-mode' 自带的 `q'（`quit-window'）只删窗口，
 ;; 不走 sidebar 的 per-kind 尺寸记忆与 buffer 记忆，三面板行为会不一致。
@@ -1951,6 +1968,10 @@ delete/refresh 后需要重绘），所以本命令**不是**用记忆 buffer �
 (with-eval-after-load 'seshat-reader
   (define-key seshat-reader-mode-map (kbd "C-c C-a") #'seshat-reader-annotation-create)
   (define-key seshat-reader-mode-map (kbd "C-c C-l") #'seshat-reader-annotation-toggle)
+  ;; 无前缀的 vim 风格别名（与上面的 `C-c' 前缀键双绑，前缀键不删）：
+  ;; `a' 建批注、`m' 批注列表面板开合。
+  (define-key seshat-reader-mode-map (kbd "a") #'seshat-reader-annotation-create)
+  (define-key seshat-reader-mode-map (kbd "m") #'seshat-reader-annotation-toggle)
   ;; C-c C-h 在 `seshat-reader-mode-map' 中未被占用（已占用：C-a / C-l /
   ;; C-r / C-o / C-t / C-e），用于按缓存重投页面高亮。
   (define-key seshat-reader-mode-map (kbd "C-c C-h")

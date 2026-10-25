@@ -156,23 +156,27 @@ To test emacs-reader in a default Emacs config, first generate the auto loads us
 This command adds the current directory to path, and loads =reader-autoloads.el=.
 
 * Key Bindings
-- =n= for going to next page
-- =p=  for going to previous page
-- =C-n= for scrolling down.
-- =C-p= for scrolling up.
-- =C-b= for scrolling left.
-- =C-f= for scrolling right.
-- =Q= for closing the Emacs Reader buffer.
-- =M-<= for going to the first page.
-- =M->= for going to the last page.
+- =n= / =p= for going to the next / previous page.
+- =j= / =k= for scrolling one line down / up, turning the page at the edges (vim preset).
+- =C-n= / =C-p= for the same two commands as =j= / =k= (also remapped over =next-line= / =previous-line=).
+- =SPC= / =DEL=, =S-SPC= for scrolling a screen and turning the page at the edges.
+- =C-v= / =M-v= (or =Page Down= / =Page Up=) for scrolling a screen without turning the page.
+- =C-f= / =C-b= scroll a screen with the =vim= preset, or scroll right / left with the =emacs= preset.
+- =h= / =l= (vim preset) for scrolling left / right.
+- =^= / =$= (vim preset) for scrolling to the leftmost / rightmost column; =C-a= / =C-e= do the same.
+- =gg= / =G= (vim preset) for going to the first / last page; =M-<= / =M->= do the same.
 - =M-g g= for going to a particular page.
-- =M-v= or =Page Up=  for scrolling to the top of the page.
-- =C-v=  or =Page Down= for scrolling to the end of the page.
-- =SPC=, =S-SPC= , and =DEL= make the above two commands keep scrolling the pages.
+- =C-l= (vim preset; =g= with the =emacs= preset) for re-rendering the current page.
 - ===, =+=, and =C-<wheel-up>= for zooming into the page.
 - =-= and =C-<wheel-down>= for zooming out of the page.
+- =0= for resetting the zoom.
 - =H= to make the page fit the height of the current window.
 - =W= to make the page fit the width of the current window.
+- =Q= for closing the Emacs Reader buffer.
+
+Screen scrolling moves by the window body height minus =seshat-reader-screen-context-lines= lines, so =seshat-reader-screen-context-lines= (default =1=) keeps one line of overlap; set it to =0= to scroll a full screen.
+
+=seshat-reader-keymap-preset= selects the =vim= (default) or =emacs= bindings above. =seshat-reader-disable-evil= (default =t=) turns evil off in every reader buffer, so these keys are not shadowed by its normal state; set it to =nil= to keep evil available.
 
 * How It Works
 This package is entirely distinct from =DocView= and =pdf-tools= in both its architecture and implementation. It leverages Emacs’ dynamic/native modules which allows it to interoperate with other programming languages outside of its Emacs Lisp environment.

@@ -1093,10 +1093,11 @@ buffer 的 `n' / `p' 就会落到 evil 的搜索/粘贴上。故跳页路径必�
 ;;; 搜索会话不接管 `n' / `p'（2026-10-26 按用户要求撤销）
 
 ;; 用户在阅读 buffer 里要的是「`n' / `p' 翻页」，而不是「下一个/上一个命中」。
-;; 命中导航只在**会话存续期间**由临时键表（`--map'）提供，落到阅读 buffer 的
-;; evil normal state 绑定由 `seshat-reader--install-evil-bindings' 统一负责
-;; （见 `seshat-reader' 的 evil 段）。`--install-hook' 因此只挂装饰与翻页跟随，
-;; 不碰任何 evil 键表。
+;; 命中导航只在**会话存续期间**由临时键表（`--map'）提供；阅读 buffer 的
+;; `n' / `p' 由 `seshat-reader-mode-map' 直接绑定——2026-10-26 起阅读器关闭 evil，
+;; 旧的 `seshat-reader--install-evil-bindings' 补绑入口已删除，故不再有「evil
+;; normal state 绑定」这一层。`--install-hook' 因此只挂装饰与翻页跟随，不碰任何
+;; evil 键表。
 
 (ert-deftest seshat-reader-search-test--session-does-not-bind-n-p ()
   "搜索会话不再补绑 `n' / `p'：旧的 session-evil-keys 机制整体移除."
