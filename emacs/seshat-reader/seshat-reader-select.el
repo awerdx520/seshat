@@ -25,8 +25,10 @@
 ;; Mouse selection support for the vendored `seshat-reader' package of this
 ;; repository (see `VENDORED.md' in the same directory).  Dragging the
 ;; left mouse button over a page shown by `seshat-reader-mode' extracts the
-;; text inside the dragged rectangle: the result is reported in the
-;; echo area and can optionally be pushed onto the kill ring.
+;; text inside the dragged rectangle: the echo area reports only how many
+;; lines and characters were selected (never the text itself, see
+;; `seshat-reader-select--report') and the text can optionally be pushed
+;; onto the kill ring.
 ;;
 ;; This file is a self-contained extension.  The vendored `seshat-reader.el'
 ;; and the C sources under `render/' are deliberately left untouched;
@@ -99,6 +101,7 @@
 ;;; Code:
 
 (require 'seshat-reader)
+(require 'cl-lib)
 
 (defgroup seshat-reader-select nil
   "Extract text from mouse selections in `seshat-reader-mode'."
@@ -107,16 +110,16 @@
 (defcustom seshat-reader-select-copy-to-kill-ring nil
   "Whether selected text is also pushed onto the kill ring.
 When non-nil, the text extracted by `seshat-reader-select-drag' is
-copied with `kill-new' in addition to being reported in the echo
-area."
+copied with `kill-new'; the echo area then says 已复制, i.e. the
+selection can be pasted.  When nil the kill ring is left alone and
+the echo area says 已选中 instead (在 echo area 报告行数与字数统计).
+
+Either way the echo area only reports the line and character count of
+the selection — never the text itself.  The text stays available to the
+annotation and translation commands through
+`seshat-reader-select-last' regardless of this option."
   :type 'boolean
   :group 'seshat-reader-select)
-
-(defconst seshat-reader-select-message-limit 200
-  "Maximum number of characters reported for one selection.
-Longer selections are truncated in the echo area; the full text is
-still pushed onto the kill ring when
-`seshat-reader-select-copy-to-kill-ring' is non-nil.")
 
 (defcustom seshat-reader-select-flash-duration 2.0
   "How long the selection rectangle is highlighted after a drag, in seconds.
@@ -685,23 +688,32 @@ by two such positions, to `seshat-reader-dyn--text-in-rect'."
                   (* (float (cdr xy)) factor))))))))))
 
 (defun seshat-reader-select--report (text)
-  "Report the extracted TEXT in the echo area, optionally copying it.
-TEXT shorter than `seshat-reader-select-message-limit' is shown in
-full; longer text is truncated for display.  When
-`seshat-reader-select-copy-to-kill-ring' is non-nil the full TEXT is
-also pushed onto the kill ring with `kill-new'."
+  "Report the extracted TEXT as a line count and a character count.
+Nothing of TEXT itself is echoed — the echo area only says how much
+was selected, e.g. \"已复制 3 行 · 145 字\", so that a long selection
+cannot flood the minibuffer or leak the page content into it.
+
+Line count is the number of newlines plus one (TEXT is passed through
+`string-trim' first, so surrounding blank lines do not count) and
+character count is `length' of the trimmed string, i.e. code points: a
+CJK character counts as one character, not as its bytes.
+
+The wording follows `seshat-reader-select-copy-to-kill-ring': when it
+is non-nil the trimmed TEXT really is pushed with `kill-new' and the
+report says 已复制; when it is nil nothing is copied and the report
+says 已选中.  Empty or nil TEXT keeps the older, explanatory message
+about the rectangle holding no text, and copies nothing either way."
   (let ((str (and text (string-trim text))))
     (if (or (null str) (equal str ""))
         (message "Seshat Reader select: no text in the selected rectangle.")
       (when seshat-reader-select-copy-to-kill-ring
         (kill-new str))
-      (message "%s%s%s"
-               (if (> (length str) seshat-reader-select-message-limit)
-                   (concat (substring str 0 seshat-reader-select-message-limit)
-                           "...")
-                 str)
-               (format " [%d chars]" (length str))
-               " [C-c C-a 建批注]"))))
+      (let ((lines (1+ (cl-count ?\n str)))
+            (chars (length str)))
+        (if seshat-reader-select-copy-to-kill-ring
+            (message "Seshat Reader select: 已复制 %d 行 · %d 字" lines chars)
+          (message "Seshat Reader select: 已选中 %d 行 · %d 字"
+                   lines chars))))))
 
 (defun seshat-reader-select--rects-in-rect (page x0 y0 x1 y1)
   "Return the selection geometry for the characters in a region.
