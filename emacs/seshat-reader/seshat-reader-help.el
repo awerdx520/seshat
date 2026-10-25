@@ -54,6 +54,11 @@
 ;; 处理（`seshat-reader-help--key-text' 会退化为解析全局表）。
 (defvar seshat-reader-mode-map)
 (defvar seshat-reader-translate-panel-map)
+;; 搜索结果侧栏的键表定义在 `seshat-reader-search'（本模块不 require 它，同一条
+;; 「渲染时只读、不拉依赖」的边界）。声明只为消除字节编译的 free variable 告警；
+;; 运行时该模块未加载时按 nil 处理（`--key-text' 会退化为解析全局表，但那一行
+;; 的命令本身也未定义，故实际显示「（未加载）」）。
+(defvar seshat-reader-search--sidebar-map)
 
 (defconst seshat-reader-help-buffer-name "*Seshat Reader Help*"
   "帮助页的 buffer 名.
@@ -82,7 +87,7 @@ parameter，因此 `seshat-reader-sidebar-toggle' 之类的面板命令不管它
   '((seshat-reader-translate-toggle . "翻译最近一次选区（面板已开则关闭）")
     (seshat-reader-translate-explain-toggle . "解释最近一次选区（与译文共用面板）")
     (seshat-reader-translate-follow-up . "对同一段原文继续追问")
-    (seshat-reader-search . "跨页文本搜索（会话内用临时键表逐个跳转）")
+    (seshat-reader-search . "跨页文本搜索（命中同时列进左侧搜索结果面板）")
     (seshat-reader-outline-toggle . "开合目录面板")
     (seshat-reader-annotation-toggle . "开合批注列表面板")
     (seshat-reader-sidebar-toggle . "全部面板开合（有面板即全关，否则重开最近一个）")
@@ -100,13 +105,24 @@ parameter，因此 `seshat-reader-sidebar-toggle' 之类的面板命令不管它
 键位在 `seshat-reader-translate-panel-map' 中解析——面板是独立 buffer，它的
 键表不在 `seshat-reader-mode-map' 里，混用会解析出错误的键位。")
 
+(defconst seshat-reader-help--search-panel-keys
+  '((seshat-reader-search-sidebar-goto . "跳到该条命中所在页并高亮它")
+    (seshat-reader-search-sidebar-next . "下一条命中（并跳过去）")
+    (seshat-reader-search-sidebar-prev . "上一条命中（并跳过去）")
+    (seshat-reader-sidebar-quit . "关闭当前面板（只关自己，其它面板保留）"))
+  "搜索结果侧栏内的键位表，形式为 (命令 . 一行说明).
+键位在 `seshat-reader-search--sidebar-map' 中解析——搜索侧栏有自己的
+`defvar-keymap'，与译文/批注/目录面板的键表不是同一张，混用会解析出错误键位
+（面板内的 `q' 在三处都绑 `seshat-reader-sidebar-quit'，故这一行解析出的键位
+与译文面板一致）。")
+
 (defconst seshat-reader-help--feature-descriptions
   '(("翻译" . "把选区发往翻译引擎，结果写进译文面板。多引擎预设会逐条标注来源引擎、段间加分隔线。")
     ("解释" . "仍是同一个面板，但送模型的是「上下文 + 原文 + 指令」的装配串，用来理解术语与句法。")
     ("追问" . "针对同一段原文继续提问，历史轮次随请求发送；保留轮数由配置决定，首轮原文与首轮答案始终保留。")
     ("批注" . "框选取文后建服务端批注（高亮 / 便签），批注几何会画回页面；批注列表面板可跳转与删除。")
-    ("目录" . "按文档大纲跳转，支持 avy 式单键定位；目录在左、信息在右是默认版式。")
-    ("搜索" . "整本跨页文本搜索，命中直接标在页面上，可在命中之间逐个跳转。")
+    ("目录" . "按文档大纲跳转，支持 avy 式单键定位；目录与搜索结果在左、译文与批注在右是默认版式。")
+    ("搜索" . "整本跨页文本搜索，命中直接标在页面上，同时列进左侧搜索结果面板，可在命中之间逐个跳转。")
     ("面板承载" . "child frame 覆盖或窗口承载，逐类型的方位与宽度都可配；面板内容超出后在面板内滚动。")
     ("缓存" . "翻译与解释结果在**本会话内**缓存：同一内容（含上下文）再次打开不再请求，前缀参数 \\[universal-argument] 强制重新生成。"))
   "功能简介条目，形式为 (名称 . 说明).
@@ -178,21 +194,24 @@ buffer 内解析 `quit-window' 得到，故与本页真实的 `q' 一致）。�
     reader-map)
    (format "  %-12s %s\n" close-key "关闭本帮助页")
    "\n"
-   "  位置固定：目录在左、信息（译文 / 批注 / 搜索）在右，方位与宽度可配；\n"
+   "  位置固定：**目录与搜索结果在左**，译文与批注在右，方位与宽度可配；\n"
    "  同一类型重复打开复用同一窗口，不重置你手动调过的尺寸。\n"
    "  译文 / 解释缓存只在本会话内存里，重启 Emacs 即清空；\n"
    "  想立刻清空用 M-x seshat-reader-translate-clear-cache。\n"))
 
 (defun seshat-reader-help--content (close-key)
   "返回帮助页的完整正文，CLOSE-KEY 为关闭本页的键位文本.
-正文分五段：标题与一句话简介、「阅读（翻页 / 缩放）」、「功能键」、「面板内
-键位」、「功能简介」、「面板行为」。两处 keymap 在函数内按 `boundp' 取值——
-`seshat-reader' 或 `seshat-reader-translate' 未加载时对应变量为 nil，键位解析
-退化为全局表，而不是报 void-variable。"
+正文分五段（每段之间空行分隔）：标题与一句话简介、「阅读（翻页 / 缩放）」、
+「功能键」、「面板内键位」（译文 / 批注 / 目录面板一张表，搜索结果侧栏另
+一张表）、「功能简介」、「面板行为」。三处 keymap 在函数内按 `boundp' 取值——
+`seshat-reader' / `seshat-reader-translate' / `seshat-reader-search' 未加载时
+对应变量为 nil，键位解析退化为全局表，而不是报 void-variable。"
   (let ((reader-map (and (boundp 'seshat-reader-mode-map)
                          seshat-reader-mode-map))
         (panel-map (and (boundp 'seshat-reader-translate-panel-map)
-                        seshat-reader-translate-panel-map)))
+                        seshat-reader-translate-panel-map))
+        (search-map (and (boundp 'seshat-reader-search--sidebar-map)
+                         seshat-reader-search--sidebar-map)))
     (concat
      "Seshat Reader 帮助\n"
      "==================\n\n"
@@ -205,6 +224,8 @@ buffer 内解析 `quit-window' 得到，故与本页真实的 `q' 一致）。�
      (seshat-reader-help--rows seshat-reader-help--feature-keys reader-map)
      "\n* 面板内键位（光标在译文 / 批注 / 目录面板里时）\n\n"
      (seshat-reader-help--rows seshat-reader-help--panel-keys panel-map)
+     "\n* 搜索结果面板内键位（光标在 *Seshat Search* 里时）\n\n"
+     (seshat-reader-help--rows seshat-reader-help--search-panel-keys search-map)
      "\n* 功能简介\n\n"
      (seshat-reader-help--features)
      "\n* 面板行为\n\n"

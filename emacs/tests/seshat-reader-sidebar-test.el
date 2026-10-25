@@ -77,6 +77,10 @@
 (require 'seshat-reader-translate)
 ;; 帮助页模块：`?' 绑定与 `*Seshat Reader Help*' 的内容断言都要用到它。
 (require 'seshat-reader-help)
+;; 搜索结果侧栏在加载时把自己登记进 `seshat-reader-sidebar-extra-kinds'（面板
+;; buffer 名 → kind `search'）。本套件要断言「注册后 sidebar 的按名判定认得它」，
+;; 故显式加载该模块，而不是在用例里手写注册表。
+(require 'seshat-reader-search)
 
 ;;; 显示参数（--display-params / --display）
 
@@ -2767,6 +2771,29 @@ kind 由 buffer 名推断；命令必须把 kind 交给 `--toggle-kind'（它按
             (should (> (with-current-buffer second (buffer-size)) 0))))
       (when (buffer-live-p first) (kill-buffer first)))))
 
+(ert-deftest seshat-reader-sidebar-test--help-panel-position-and-search-keys ()
+  "帮助页：「目录与搜索结果在左」；搜索侧栏四键都解析出可读键位."
+  (require 'seshat-reader-search)
+  (let ((content (seshat-reader-help--content
+                  (substitute-command-keys "\\[quit-window]"))))
+    ;; 位置描述：目录与搜索结果同在左，信息（译文/批注）在右
+    (should (string-match-p "目录与搜索结果在左" content))
+    (should-not (string-match-p "信息（译文 / 批注 / 搜索）在右" content))
+    ;; 搜索侧栏段落存在
+    (should (string-match-p "搜索结果面板内键位" content))
+    ;; 四个键的说明都在，且键位是运行时解析出的真实键（不是「（未加载）」）
+    (dolist (desc '("跳到该条命中所在页" "下一条命中" "上一条命中"
+                    "关闭当前面板（只关自己"))
+      (should (string-match-p (regexp-quote desc) content)))
+    (should (string-match-p (concat "^  " (regexp-quote (key-description (kbd "RET")))
+                                    " +跳到该条命中") content))
+    (should (string-match-p (concat "^  " (regexp-quote (key-description (kbd "n")))
+                                    " +下一条命中") content))
+    (should (string-match-p (concat "^  " (regexp-quote (key-description (kbd "p")))
+                                    " +上一条命中") content))
+    (should (string-match-p (concat "^  " (regexp-quote (key-description (kbd "q")))
+                                    " +关闭当前面板") content))))
+
 ;;; 搜索结果侧栏 kind `search'（左侧、slot 排在目录之后）
 
 (ert-deftest seshat-reader-sidebar-test--search-kind-order-and-slot ()
@@ -2794,6 +2821,48 @@ kind 由 buffer 名推断；命令必须把 kind 交给 `--toggle-kind'（它按
     ;; 信息栏改到底部不影响搜索栏
     (should (eq (seshat-reader-sidebar--position-for-kind 'search) 'left))
     (should (seshat-reader-sidebar--horizontal-p 'search))))
+
+(ert-deftest seshat-reader-sidebar-test--buffer-p-extra-kinds-registry ()
+  "注册表命中即算面板 buffer；表为空时行为回到注册表引入前."
+  (let ((name seshat-reader-search-sidebar-buffer-name))
+    ;; 真实注册：搜索结果侧栏模块加载时已把自己登记进来
+    (should (assoc name seshat-reader-sidebar-extra-kinds))
+    (should (seshat-reader-sidebar-buffer-p name))
+    ;; 空表时不认（证明判定确实来自注册表，而不是内置名单里恰好有它）
+    (let ((seshat-reader-sidebar-extra-kinds nil))
+      (should-not (seshat-reader-sidebar-buffer-p name)))
+    ;; 手工绑定注册表同样生效（不依赖 search 模块）
+    (let ((seshat-reader-sidebar-extra-kinds '(("*Seshat Custom*" . search))))
+      (should (seshat-reader-sidebar-buffer-p "*Seshat Custom*")))
+    ;; 内置三种面板与无关 buffer 的判定不受注册表影响
+    (should (seshat-reader-sidebar-buffer-p "*Outline of foo.pdf*"))
+    (should (seshat-reader-sidebar-buffer-p
+             seshat-reader-sidebar-translate-buffer-name))
+    (should-not (seshat-reader-sidebar-buffer-p "*scratch*"))))
+
+(ert-deftest seshat-reader-sidebar-test--kind-for-buffer-name-extra-kinds ()
+  "注册表命中返回登记 kind，且排在内置判据之后、`annotations' 兜底之前."
+  (let ((name seshat-reader-search-sidebar-buffer-name))
+    (should (eq (seshat-reader-sidebar--kind-for-buffer-name name) 'search))
+    ;; 空表时搜索侧栏会落到兜底 `annotations'（故注册表不能漏）
+    (let ((seshat-reader-sidebar-extra-kinds nil))
+      (should (eq (seshat-reader-sidebar--kind-for-buffer-name name)
+                  'annotations)))
+    ;; 内置 kind 优先：注册表里即使写了译文面板名也不改变内置判据
+    (let ((seshat-reader-sidebar-extra-kinds
+           (list (cons seshat-reader-sidebar-translate-buffer-name 'search))))
+      (should (eq (seshat-reader-sidebar--kind-for-buffer-name
+                   seshat-reader-sidebar-translate-buffer-name)
+                  'translate)))
+    ;; 目录正则优先于注册表
+    (let ((seshat-reader-sidebar-extra-kinds
+           '(("*Outline of x.pdf*" . search))))
+      (should (eq (seshat-reader-sidebar--kind-for-buffer-name
+                   "*Outline of x.pdf*")
+                  'outline)))
+    ;; 表里没有的名字仍回落到批注列表
+    (should (eq (seshat-reader-sidebar--kind-for-buffer-name "*whatever*")
+                'annotations))))
 
 (provide 'seshat-reader-sidebar-test)
 ;;; seshat-reader-sidebar-test.el ends here

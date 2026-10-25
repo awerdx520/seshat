@@ -64,7 +64,11 @@
 ;; （`gfm-view-mode' 降级链），本模块只负责**显示与参数**。渲染抽象不在本步
 ;; 引入：若将来需统一渲染层再抽象（记入 tech-debt）。
 ;;
-;; 模块零依赖：不 require 任何本项目/外部模块，只操作 buffer 与 window。
+;; 模块零依赖：不 require 任何本项目/外部模块，只操作 buffer 与 window。其它模块
+;; 自建的面板 buffer（如搜索结果侧栏 `*Seshat Search*'）不 require 本模块的名字
+;; 常量，而是把自己注册进 `seshat-reader-sidebar-extra-kinds'——本模块按名查表，
+;; 故 `seshat-reader-sidebar-buffer-p' / `--kind-for-buffer-name' 与 `q' 的统一
+;; 关闭路径对它们同样成立，且不会形成 search → sidebar → search 的循环依赖。
 ;;
 ;; 显示**必须**经 `display-buffer'（其复用逻辑保证同一 buffer 重复显示时窗口
 ;; 布局不变），**不得**绕过 `display-buffer' 直接操作窗口。
@@ -1447,41 +1451,72 @@ SELECT 原样透传给选中的后端（`--cf-show' / `--display-window'），�
           (seshat-reader-sidebar--display-window buffer kind select))
     (seshat-reader-sidebar--display-window buffer kind select)))
 
+(defvar seshat-reader-sidebar-extra-kinds nil
+  "其它模块注册的面板 buffer 名 → kind 映射.
+形如 ((\"*Buffer*\" . kind) …)：键是 buffer 名字符串，值是面板 kind 符号。
+供 `seshat-reader-sidebar-buffer-p' 与
+`seshat-reader-sidebar--kind-for-buffer-name' 识别由其它模块自建的面板 buffer
+（例如搜索结果侧栏），避免 sidebar 模块反向依赖它们。
+
+**为什么用注册表**：本模块是零依赖的承载层（不 require 任何本项目模块），而
+`*Seshat Search*' 一类的面板 buffer 由各自模块创建、名字也是它们的私有常量。
+若让本模块 require 那些模块，既毁掉零依赖边界、也会形成
+`search → sidebar → search' 的循环依赖；故改由**创建 buffer 的模块**在加载
+末尾 `add-to-list' 注册一行，本模块只查表。内置的三种面板（批注列表 / 译文 /
+目录）不走本表——它们的名字由本模块自己的常量或正则判定，见
+`seshat-reader-sidebar-buffer-p'。
+
+条目按 **buffer 名到 kind 的 cons** 存放，注册方负责保证名字与实际创建的
+buffer 一致；同一名字重复注册时 `add-to-list' 只保留第一次的条目（kind 不
+会来回抖动）。表为空（任何模块都未注册）时两个判定函数的表现与引入本表之前
+完全一致。")
+
 (defun seshat-reader-sidebar-buffer-p (buffer)
   "判断 BUFFER 是否本包信息面板的 buffer.
 BUFFER 可以是 buffer 对象或 buffer 名（字符串），其它类型返回 nil。判定**只
 按名字**进行，不检查 major-mode 或 window parameter，故对尚未显示的 buffer
-同样有效（popper 登记 popup 时 buffer 可能还没被显示）。三种面板 buffer 名：
+同样有效（popper 登记 popup 时 buffer 可能还没被显示）。
+
+先查**内置** kind，再查注册表 `seshat-reader-sidebar-extra-kinds'：
 
 - 批注列表：精确等于 `seshat-reader-sidebar--annotation-buffer-name'；
 - 译文/解释：精确等于 `seshat-reader-sidebar-translate-buffer-name'；
 - 目录：匹配 `seshat-reader-sidebar--outline-buffer-regexp'（目录 buffer 名
-  带源文件名，是**动态**的，无法精确匹配）。
+  带源文件名，是**动态**的，无法精确匹配）；
+- 其它模块自建的面板（如搜索结果侧栏 `*Seshat Search*'）：命中
+  `seshat-reader-sidebar-extra-kinds' 里的名字即算面板。
 
-供 popper 的分流使用。"
+供 popper 的分流使用，也是 `seshat-reader-sidebar-quit' 判断「当前 buffer 是不是
+面板」的入口。"
   (let ((name (cond ((bufferp buffer) (buffer-name buffer))
                     ((stringp buffer) buffer)
                     (t nil))))
     (and name
          (or (member name (list seshat-reader-sidebar--annotation-buffer-name
                                 seshat-reader-sidebar-translate-buffer-name))
-             (string-match-p seshat-reader-sidebar--outline-buffer-regexp name))
+             (string-match-p seshat-reader-sidebar--outline-buffer-regexp name)
+             ;; 注册表：其它模块自建的面板 buffer（搜索侧栏等）。
+             (assoc name seshat-reader-sidebar-extra-kinds))
          t)))
 
 (defun seshat-reader-sidebar--kind-for-buffer-name (name)
   "按 buffer 名 NAME 推断面板 kind.
-推断顺序**必须**是：先 `translate'（精确匹配
-`seshat-reader-sidebar-translate-buffer-name'），再 `outline'（匹配
-`seshat-reader-sidebar--outline-buffer-regexp'），最后回落到 `annotations'。
+推断顺序**必须**是：先查**内置** kind——`translate'（精确匹配
+`seshat-reader-sidebar-translate-buffer-name'）、`outline'（匹配
+`seshat-reader-sidebar--outline-buffer-regexp'）——再查注册表
+`seshat-reader-sidebar-extra-kinds'，最后回落到 `annotations'。
 顺序很关键：目录 buffer 名带源文件名，若先判 `annotations' 兜底则 outline
-会被误判为批注面板（popper 重开目录时按批注 kind 恢复高度/尺寸即错）。
+会被误判为批注面板（popper 重开目录时按批注 kind 恢复高度/尺寸即错）；注册表
+同理必须排在兜底之前，否则搜索侧栏会被当成批注面板，`q' 关掉的就是批注列表。
 
-NAME 为 nil 或非字符串时同样回落到 `annotations'（批注列表是默认面板）。"
+NAME 为 nil、非字符串或表里没命中时同样回落到 `annotations'（批注列表是默认
+面板）。"
   (cond
    ((equal name seshat-reader-sidebar-translate-buffer-name) 'translate)
    ((and (stringp name)
          (string-match-p seshat-reader-sidebar--outline-buffer-regexp name))
     'outline)
+   ((cdr (assoc name seshat-reader-sidebar-extra-kinds)))
    (t 'annotations)))
 
 (defun seshat-reader-sidebar-display-buffer (buffer alist)
@@ -1674,10 +1709,12 @@ side 窗口），frame 走 `delete-frame'。关闭后提示「已关闭 %d 个�
 (defun seshat-reader-sidebar-quit ()
   "关闭当前缓冲所在的面板；当前缓冲不是面板时退回 `seshat-reader-sidebar-toggle'.
 kind 由 `seshat-reader-sidebar-buffer-p' 与
-`seshat-reader-sidebar--kind-for-buffer-name' 按 buffer 名推断，因此本命令既能
-从面板内部（`q'）调用，也能被阅读器 buffer 的键位复用。面板可能是窗口，也可能是
-child frame：关闭统一经 `seshat-reader-sidebar--toggle-kind'（它按承载单元分派
-`delete-window' / `delete-frame'）。"
+`seshat-reader-sidebar--kind-for-buffer-name' 按 buffer 名推断（先查内置三种
+面板，再查注册表 `seshat-reader-sidebar-extra-kinds'，故搜索结果侧栏 `search'
+同样能推断出正确的 kind），因此本命令既能从面板内部（`q'）调用，也能被阅读器
+buffer 的键位复用。面板可能是窗口，也可能是 child frame：关闭统一经
+`seshat-reader-sidebar--toggle-kind'（它按承载单元分派 `delete-window' /
+`delete-frame'）。"
   (interactive)
   (let* ((name (buffer-name (current-buffer)))
          (kind (and (seshat-reader-sidebar-buffer-p name)

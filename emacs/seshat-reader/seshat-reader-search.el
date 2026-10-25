@@ -48,6 +48,14 @@
 ;; 结果而不是翻页；侧栏内的 `RET' 跳转、`n' / `p' 逐条移动、`q' 只关自己（与
 ;; 其它面板一致）。侧栏与目录同侧（`left'），slot 排在目录之后，二者上下并存。
 ;;
+;; 侧栏在文件末尾登记进 `seshat-reader-sidebar-extra-kinds'（buffer 名 →
+;; kind `search'），因为承载层 `seshat-reader-sidebar' 是零依赖模块、不能反向
+;; require 本模块。登记之后侧栏与其它面板行为完全一致：`q' 走统一的
+;; `seshat-reader-sidebar-quit'（按 buffer 名推断 kind，只关自己）、`M-o' 的
+;; 「重开最近面板」能覆盖它、popper 分流认得它；换文档时
+;; `seshat-reader-search--reset-state' 还会清空侧栏并关闭面板，不保留上份文档
+;; 的搜索结果。
+;;
 ;; 侧栏是**并存视图**，不是搜索会话的第二套状态：命中全集仍是阅读 buffer 的
 ;; `--matches'，侧栏只记「行 → (PAGE INDEX RECTS)」映射；跳转时回到阅读 buffer
 ;; 设置 `--index' 再走既有 `--goto-page' + `--redraw' 路径，故页面高亮、批注
@@ -406,7 +414,13 @@ Called from `--active-decorations' when the buffer has been pointed at
 another document: the recorded hits, their per-page cache and the query
 all describe a document that is no longer displayed, so keeping them
 would feed geometry into the wrong pages.  The annotation hook is cleared
-as well, since a session that no longer exists has nothing to contribute."
+as well, since a session that no longer exists has nothing to contribute.
+
+The **search sidebar is dropped too** (see
+`seshat-reader-search--clear-sidebar'): 换文档后不再保留旧搜索结果——侧栏里那些
+行属于上一份文档，留着既会让 `RET' / `n' / `p' 跳到与新文档无关的页码，也会
+让面板看起来仍属于当前文档。故清空侧栏内容与「行 → 命中」映射，并在面板显示
+时把它关掉。"
   (setq seshat-reader-search--active nil)
   (setq seshat-reader-search--query nil)
   (setq seshat-reader-search--page-results nil)
@@ -416,7 +430,8 @@ as well, since a session that no longer exists has nothing to contribute."
   (setq seshat-reader-search--capped nil)
   (setq seshat-reader-search--origin-page nil)
   (setq seshat-reader-search--doc-id nil)
-  (seshat-reader-search--set-extra-hook nil))
+  (seshat-reader-search--set-extra-hook nil)
+  (seshat-reader-search--clear-sidebar))
 
 (defun seshat-reader-search--active-decorations ()
   "Return the decorations of the hits on the current page.
@@ -572,6 +587,40 @@ buffer `--matches' 里的 0-based 下标，RECTS 是该命中的页面坐标矩�
 自己没有页号窗口参数、也没有搜索会话状态（`--matches' / `--index' 都是阅读
 buffer 的 buffer-local）。该变量在 `seshat-reader-search--render-sidebar' 渲染
 时写入；为 nil 或已被 kill 时跳转只提示、不发信号。")
+
+(defun seshat-reader-search--clear-sidebar ()
+  "Clear the search sidebar of stale results and close the `search' panel.
+Called from `seshat-reader-search--reset-state' when the buffer has been
+pointed at another document: the sidebar still lists the hits of the
+document that is no longer displayed, so its `RET' / `n' / `p' would jump to
+pages that mean nothing in the new document, and the panel would look like
+it still describes the current one.  The content and the line → hit mapping
+\(`seshat-reader-search--sidebar-matches') are therefore dropped, together
+with the recorded source buffer.
+
+The panel is closed only when it is actually displayed
+\\(`seshat-reader-sidebar-panel-visible-p'): `--toggle-kind' means \"open it
+when nothing is shown\", so calling it unconditionally would *open* a panel
+just to be done with it.
+
+Best effort throughout: the sidebar buffer may never have been created
+\(search never ran, no hits, or the search module was loaded but unused) and
+the panel backend may be unavailable.  Neither may make a document switch
+signal, hence the `buffer-live-p' guard and `ignore-errors' around the panel
+close."
+  (let ((buffer (get-buffer seshat-reader-search-sidebar-buffer-name)))
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (when (or seshat-reader-search--sidebar-matches
+                  (> (buffer-size) 0))
+          (let ((inhibit-read-only t))
+            (erase-buffer))
+          (setq seshat-reader-search--sidebar-matches nil)
+          (setq seshat-reader-search--sidebar-source nil)
+          (set-buffer-modified-p nil)))))
+  (ignore-errors
+    (when (seshat-reader-sidebar-panel-visible-p 'search)
+      (seshat-reader-sidebar--toggle-kind 'search))))
 
 (defun seshat-reader-search--one-line (text)
   "Return TEXT collapsed onto one line, or an empty string.
@@ -757,14 +806,18 @@ header."
 
 (defun seshat-reader-search-sidebar-quit ()
   "Close the search sidebar, leaving every other panel open.
-Closing goes through `seshat-reader-sidebar-toggle' with KIND `search', i.e.
-`seshat-reader-sidebar--toggle-kind', which only touches panels whose kind is
-`search'.  `seshat-reader-sidebar-quit' is **not** used: it derives the kind
-from the buffer name, and \"*Seshat Search*\" is not one of the known panel
-names, so it would fall back to the all-panels toggle and close the
-annotation / translate panels as well."
+Kept as a thin alias of `seshat-reader-sidebar-quit' for compatibility (the
+command existed before the sidebar was registered as a panel kind): the
+generic command now derives kind `search' from the buffer name
+\\(`*Seshat Search*' is in `seshat-reader-sidebar-extra-kinds', registered at
+the end of this file) and closes only that panel, so both entry points have
+exactly the same effect — `q' in the sidebar closes nothing but the sidebar.
+
+It is **not** a wrapper around `seshat-reader-sidebar-toggle' with an explicit
+kind anymore: routing through the name-based command keeps the search sidebar
+on the same path as the annotation / translate / outline panels."
   (interactive)
-  (seshat-reader-sidebar-toggle 'search))
+  (seshat-reader-sidebar-quit))
 
 (defvar-keymap seshat-reader-search--sidebar-map
   :doc "Keymap of the search result sidebar buffer.
@@ -772,7 +825,7 @@ Parented on `special-mode-map', so the usual read-only-buffer keys (scrolling
 with \\[scroll-up-command] / \\[scroll-down-command], \\[quit-window]) keep
 working; only the four keys that mean something here are overridden."
   :parent special-mode-map
-  "q"   #'seshat-reader-search-sidebar-quit
+  "q"   #'seshat-reader-sidebar-quit
   "RET" #'seshat-reader-search-sidebar-goto
   "n"   #'seshat-reader-search-sidebar-next
   "p"   #'seshat-reader-search-sidebar-prev)
@@ -973,6 +1026,18 @@ closes only this panel."
 ;; 一致）：不往 vendored 的 `seshat-reader.el' 里塞本地键位。
 (with-eval-after-load 'seshat-reader
   (define-key seshat-reader-mode-map (kbd "C-s") #'seshat-reader-search))
+
+;; 把搜索结果侧栏登记为面板 kind `search'：`seshat-reader-sidebar' 是零依赖的
+;; 承载层（不 require 本模块），故由**创建该 buffer 的模块**在此声明
+;; 「`*Seshat Search*' 属于 kind `search'」。登记后
+;; `seshat-reader-sidebar-buffer-p' / `--kind-for-buffer-name' 认得它，于是：
+;; ① `q'（`seshat-reader-sidebar-quit'）按 kind 只关侧栏；
+;; ② `M-o' 的「重开最近面板」能覆盖侧栏（`--last-buffers' 按 kind 记忆）；
+;; ③ popper 分流（`seshat-reader-sidebar-display-buffer'）按 `search' 处理它。
+;; 放在文件末尾而不是变量定义处：登记的是「本模块加载完成」这一事实，且必须在
+;; `seshat-reader-sidebar-extra-kinds' 已绑定（顶部 require 已保证）之后。
+(add-to-list 'seshat-reader-sidebar-extra-kinds
+             (cons seshat-reader-search-sidebar-buffer-name 'search))
 
 (provide 'seshat-reader-search)
 ;;; seshat-reader-search.el ends here

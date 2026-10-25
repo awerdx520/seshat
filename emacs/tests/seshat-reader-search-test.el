@@ -655,26 +655,75 @@
         (should (equal (seshat-reader-search-test--goto-pages) '(2 1)))))))
 
 (ert-deftest seshat-reader-search-test--sidebar-keybindings ()
-  "侧栏键表：`RET' 跳转、`n' / `p' 逐条、`q' 只关自己；其余继承 `special-mode-map'."
+  "侧栏键表：`RET' 跳转、`n' / `p' 逐条、`q' 走统一的面板关闭命令；其余继承 `special-mode-map'."
   (should (eq (lookup-key seshat-reader-search--sidebar-map (kbd "RET"))
               #'seshat-reader-search-sidebar-goto))
   (should (eq (lookup-key seshat-reader-search--sidebar-map (kbd "n"))
               #'seshat-reader-search-sidebar-next))
   (should (eq (lookup-key seshat-reader-search--sidebar-map (kbd "p"))
               #'seshat-reader-search-sidebar-prev))
+  ;; `q' 与译文 / 批注 / 目录面板一致：走通用的 `seshat-reader-sidebar-quit'
+  ;; （按 buffer 名推断 kind），不再是搜索模块自己的专用命令。
   (should (eq (lookup-key seshat-reader-search--sidebar-map (kbd "q"))
-              #'seshat-reader-search-sidebar-quit))
+              #'seshat-reader-sidebar-quit))
   ;; 父键表仍是 `special-mode-map'（滚动等基础键不丢）
   (should (eq (keymap-parent seshat-reader-search--sidebar-map)
               special-mode-map)))
 
+(ert-deftest seshat-reader-search-test--sidebar-registered-as-panel-kind ()
+  "侧栏在文件末尾登记为面板 kind `search'：零依赖的 sidebar 模块按名认得它."
+  (should (assoc seshat-reader-search-sidebar-buffer-name
+                 seshat-reader-sidebar-extra-kinds))
+  (should (seshat-reader-sidebar-buffer-p
+           seshat-reader-search-sidebar-buffer-name))
+  (should (eq (seshat-reader-sidebar--kind-for-buffer-name
+               seshat-reader-search-sidebar-buffer-name)
+              'search)))
+
 (ert-deftest seshat-reader-search-test--sidebar-quit-closes-only-search ()
-  "`sidebar-quit' 只按 kind `search' 关面板，不走「全部开合」."
-  (let (kinds)
-    (cl-letf (((symbol-function 'seshat-reader-sidebar-toggle)
-               (lambda (kind) (push kind kinds))))
-      (seshat-reader-search-sidebar-quit)
-      (should (equal kinds '(search))))))
+  "`sidebar-quit' 委托 `seshat-reader-sidebar-quit'，只按 kind `search' 关面板."
+  (let ((kinds nil)
+        (buffer (get-buffer-create seshat-reader-search-sidebar-buffer-name)))
+    (unwind-protect
+        (with-current-buffer buffer
+          (cl-letf (((symbol-function 'seshat-reader-sidebar--toggle-kind)
+                     (lambda (kind) (push kind kinds))))
+            (seshat-reader-search-sidebar-quit)
+            ;; buffer 名 → kind `search' → 只关自己，不走「全部面板开合」
+            (should (equal kinds '(search)))))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-search-test--reset-state-clears-sidebar ()
+  "换文档（`--reset-state'）后侧栏不保留旧结果；显示中的面板被关闭."
+  (seshat-reader-search-test--with-stubs
+    (with-temp-buffer
+      (setq seshat-reader-search--query "the")
+      (setq seshat-reader-search--matches
+            '((1 1.0 2.0 3.0 4.0) (2 5.0 6.0 7.0 8.0)))
+      (seshat-reader-search--render-sidebar seshat-reader-search--matches)
+      (with-current-buffer seshat-reader-search-sidebar-buffer-name
+        (should seshat-reader-search--sidebar-matches)
+        (should (> (buffer-size) 0)))
+      (let ((kinds nil))
+        (cl-letf (((symbol-function 'seshat-reader-sidebar-panel-visible-p)
+                   (lambda (_kind) t))
+                  ((symbol-function 'seshat-reader-sidebar--toggle-kind)
+                   (lambda (kind) (push kind kinds))))
+          (seshat-reader-search--reset-state))
+        (should (equal kinds '(search))))
+      ;; 内容与「行 → 命中」映射都清空，源 buffer 记录也一并丢掉
+      (with-current-buffer seshat-reader-search-sidebar-buffer-name
+        (should-not seshat-reader-search--sidebar-matches)
+        (should-not seshat-reader-search--sidebar-source)
+        (should (= 0 (buffer-size))))
+      ;; 面板未显示时不调用 `--toggle-kind'（否则会「先开一个再关」）
+      (let ((called nil))
+        (cl-letf (((symbol-function 'seshat-reader-sidebar-panel-visible-p)
+                   (lambda (_kind) nil))
+                  ((symbol-function 'seshat-reader-sidebar--toggle-kind)
+                   (lambda (_kind) (setq called t))))
+          (seshat-reader-search--reset-state))
+        (should-not called)))))
 
 (ert-deftest seshat-reader-search-test--search-opens-sidebar ()
   "`C-s' 成功后侧栏被列出且**请求光标切过去**（SELECT 非 nil）."
