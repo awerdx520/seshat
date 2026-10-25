@@ -765,5 +765,243 @@
         (should (string-match-p "3 条" (buffer-string)))
         (should (string-match-p "仅列出前 2 条" (buffer-string)))))))
 
+;;; 阅读 buffer ↔ 结果侧栏同步（阅读 buffer 里 `n' / `p' → 侧栏跟随）
+
+(defun seshat-reader-search-test--sidebar-marker-positions ()
+  "返回侧栏 buffer 里 `--sidebar-markers' 的位置列表（侧栏缺失时 nil）."
+  (let ((buffer (get-buffer seshat-reader-search-sidebar-buffer-name)))
+    (when (buffer-live-p buffer)
+      (mapcar #'marker-position
+              (buffer-local-value 'seshat-reader-search--sidebar-markers buffer)))))
+
+(defun seshat-reader-search-test--sidebar-line-starts ()
+  "返回侧栏 buffer 里每条结果行（`[p.N]' 开头）的行首位置，正序."
+  (let ((buffer (get-buffer seshat-reader-search-sidebar-buffer-name))
+        starts)
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (save-excursion
+          (goto-char (point-min))
+          (while (not (eobp))
+            (when (looking-at-p "\\[p\\.[0-9]+\\]")
+              (push (point) starts))
+            (forward-line 1)))))
+    (nreverse starts)))
+
+(defmacro seshat-reader-search-test--with-sidebar-window (&rest body)
+  "把侧栏 buffer 真的显示在窗口里求值 BODY；`sidebar-window' 绑定该窗口.
+`--batch' 下也有真实 frame，故 `get-buffer-window' / `set-window-point' /
+`recenter' 全走真实现，同步逻辑不靠桩（桩只能证明「调用了」，证明不了
+「落在正确的行上」）。退出时删窗口并 kill 侧栏 buffer，避免泄漏到后续用例。"
+  (declare (indent 0) (debug t))
+  `(let ((sidebar-window (split-window)))
+     (unwind-protect
+         (progn
+           (set-window-buffer sidebar-window
+                              (get-buffer-create
+                               seshat-reader-search-sidebar-buffer-name))
+           ,@body)
+       (when (window-live-p sidebar-window)
+         (delete-window sidebar-window))
+       (let ((buffer (get-buffer seshat-reader-search-sidebar-buffer-name)))
+         (when (buffer-live-p buffer)
+           (kill-buffer buffer))))))
+
+(ert-deftest seshat-reader-search-test--sidebar-markers-record-line-starts ()
+  "渲染后 `--sidebar-markers' 条数等于条目数，且每个 marker 指向对应行行首."
+  (seshat-reader-search-test--with-stubs
+    (with-temp-buffer
+      (setq seshat-reader-search--query "the")
+      (seshat-reader-search--render-sidebar
+       '((1 1.0 2.0 3.0 4.0) (1 5.0 6.0 7.0 8.0) (3 9.0 10.0 11.0 12.0)))
+      (let ((positions (seshat-reader-search-test--sidebar-marker-positions))
+            (starts (seshat-reader-search-test--sidebar-line-starts)))
+        ;; 条数 == 条目数，顺序与 `--sidebar-matches' 一致
+        (should (= 3 (length positions)))
+        (should (equal positions starts))
+        (with-current-buffer seshat-reader-search-sidebar-buffer-name
+          (should (= 3 (length seshat-reader-search--sidebar-matches)))
+          ;; 每个 marker 都落在行首，且该行以 `[p.N]' 开头
+          (dolist (position positions)
+            (should (= position (save-excursion (goto-char position)
+                                                (line-beginning-position))))
+            (should (string-match-p
+                     "\\`\\[p\\.[0-9]+\\]"
+                     (buffer-substring-no-properties
+                      position
+                      (save-excursion (goto-char position)
+                                      (line-end-position))))))
+          ;; 是 marker 而不是整数：内容变化后仍指向原来那一行的行首
+          (should (cl-every #'markerp
+                            (buffer-local-value
+                             'seshat-reader-search--sidebar-markers
+                             (current-buffer))))
+          (let ((inhibit-read-only t))
+            (goto-char (point-min))
+            (insert "# 插入一行\n"))
+          (setq positions (seshat-reader-search-test--sidebar-marker-positions))
+          (should (equal positions
+                         (seshat-reader-search-test--sidebar-line-starts))))))))
+
+(ert-deftest seshat-reader-search-test--sidebar-sync-moves-point-to-marker ()
+  "`--sidebar-sync' 把侧栏窗口 point 设到第 N 条 marker、滚动到可见并高亮，不动焦点."
+  (seshat-reader-search-test--with-stubs
+    (with-temp-buffer
+      (setq seshat-reader-search--query "x")
+      (let ((matches (mapcar (lambda (i) (list 1 (* 1.0 i) 2.0 3.0 4.0))
+                             (number-sequence 1 40))))
+        (seshat-reader-search-test--with-sidebar-window
+          (seshat-reader-search--render-sidebar matches)
+          (let* ((buffer (get-buffer seshat-reader-search-sidebar-buffer-name))
+                 (markers (seshat-reader-search-test--sidebar-marker-positions))
+                 (target (nth 30 markers))
+                 (before (selected-window)))
+            ;; 渲染后的初始同步：`--index' 为 nil → 落在第 0 条
+            (should (= (nth 0 markers) (window-point sidebar-window)))
+            (seshat-reader-search--sidebar-sync 30)
+            (should (= target (window-point sidebar-window)))
+            ;; 滚动：窗口已离开首行，且目标行就在窗口起点之后不足 3 屏处
+            ;; （≈ `recenter' 的居中效果）。`pos-visible-in-window-p' 在 batch
+            ;; 下不可用——没有 redisplay，`window-end' 取不到有效值。
+            (should (> (window-start sidebar-window) 1))
+            (should (<= (window-start sidebar-window) target))
+            (should (< (- target (window-start sidebar-window))
+                       (* 3 (window-height sidebar-window))))
+            ;; 不抢焦点：同步前后选中的窗口是同一个
+            (should (eq before (selected-window)))
+            ;; 高亮：overlay 覆盖目标行，且只在侧栏窗口里显示
+            (let ((overlay (buffer-local-value
+                            'seshat-reader-search--sidebar-cursor buffer)))
+              (should (overlayp overlay))
+              (should (= target (overlay-start overlay)))
+              (should (= (with-current-buffer buffer
+                           (save-excursion (goto-char target)
+                                           (line-end-position)))
+                         (overlay-end overlay)))
+              (should (eq sidebar-window (overlay-get overlay 'window))))))))))
+
+(ert-deftest seshat-reader-search-test--sidebar-sync-ignores-bad-index ()
+  "INDEX 越界（或 markers 为空）时不报错、也不调用 `set-window-point'."
+  (seshat-reader-search-test--with-stubs
+    (with-temp-buffer
+      (setq seshat-reader-search--query "the")
+      (seshat-reader-search-test--with-sidebar-window
+        (seshat-reader-search--render-sidebar
+         '((1 1.0 2.0 3.0 4.0) (2 5.0 6.0 7.0 8.0)))
+        (let ((calls nil))
+          (cl-letf (((symbol-function 'set-window-point)
+                     (lambda (window position) (push (list window position) calls))))
+            (dolist (index '(2 99 -1 nil))
+              (should-not (seshat-reader-search--sidebar-sync index)))
+            (should-not calls)
+            ;; markers 为空（例如侧栏已清空但窗口还在）时同样静默
+            (with-current-buffer seshat-reader-search-sidebar-buffer-name
+              (setq seshat-reader-search--sidebar-markers nil))
+            (should-not (seshat-reader-search--sidebar-sync 0))
+            (should-not calls)))))))
+
+(ert-deftest seshat-reader-search-test--sidebar-sync-without-window ()
+  "侧栏没有可见窗口时静默返回：不调用 `set-window-point'，不建高亮 overlay."
+  (seshat-reader-search-test--with-stubs
+    (with-temp-buffer
+      (setq seshat-reader-search--query "the")
+      (seshat-reader-search--render-sidebar
+       '((1 1.0 2.0 3.0 4.0) (2 5.0 6.0 7.0 8.0)))
+      ;; 侧栏 buffer 存在但没有任何窗口显示它
+      (should (buffer-live-p (get-buffer seshat-reader-search-sidebar-buffer-name)))
+      (should-not (get-buffer-window seshat-reader-search-sidebar-buffer-name t))
+      (with-current-buffer seshat-reader-search-sidebar-buffer-name
+        (should (= 2 (length seshat-reader-search--sidebar-markers)))
+        (should-not seshat-reader-search--sidebar-cursor))
+      (let ((calls nil))
+        (cl-letf (((symbol-function 'set-window-point)
+                   (lambda (&rest _args) (push t calls))))
+          (should-not (seshat-reader-search--sidebar-sync 1))
+          (should-not (seshat-reader-search--sidebar-sync 0))
+          (should-not calls)))
+      (with-current-buffer seshat-reader-search-sidebar-buffer-name
+        (should-not seshat-reader-search--sidebar-cursor)))))
+
+(ert-deftest seshat-reader-search-test--render-syncs-to-current-index ()
+  "渲染结束后侧栏立刻定位到**当前**命中（`--index'），不是停在标题行."
+  (seshat-reader-search-test--with-stubs
+    (with-temp-buffer
+      (setq seshat-reader-search--query "the")
+      (setq seshat-reader-search--index 1)
+      (seshat-reader-search-test--with-sidebar-window
+        (seshat-reader-search--render-sidebar
+         '((1 1.0 2.0 3.0 4.0) (2 5.0 6.0 7.0 8.0) (3 9.0 10.0 11.0 12.0)))
+        (should (= (nth 1 (seshat-reader-search-test--sidebar-marker-positions))
+                   (window-point sidebar-window)))))))
+
+(ert-deftest seshat-reader-search-test--move-syncs-sidebar ()
+  "阅读 buffer 里 `n' / `p'（`--move'）切换命中后，侧栏同步到新的下标."
+  (seshat-reader-search-test--with-stubs
+    (with-temp-buffer
+      (setq seshat-reader-search--active t)
+      (setq seshat-reader-search--index 0)
+      (setq seshat-reader-search--matches
+            '((1 1.0 2.0 3.0 4.0) (2 5.0 6.0 7.0 8.0) (3 9.0 10.0 11.0 12.0)))
+      (let ((synced nil))
+        (cl-letf (((symbol-function 'seshat-reader-search--sidebar-sync)
+                   (lambda (index) (push index synced))))
+          (seshat-reader-search--move 1)
+          (should (equal synced '(1)))
+          (seshat-reader-search--move -1)
+          (should (equal synced '(0 1)))
+          ;; 末条回绕到首条
+          (seshat-reader-search--move -1)
+          (should (equal (list (car synced) seshat-reader-search--index) '(2 2)))
+          (seshat-reader-search--move 1)
+          (should (equal (list (car synced) seshat-reader-search--index) '(0 0))))))))
+
+(ert-deftest seshat-reader-search-test--sidebar-snippet-read-in-source-buffer ()
+  "片段取文在**阅读 buffer** 里执行：C 侧矩形查询要求当前 buffer 就是文档 buffer.
+在侧栏 buffer 里调用会静默失败、每条只剩「[p.N]」——真机「匹配信息显示不
+完整」的成因。"
+  (seshat-reader-search-test--with-stubs
+    (with-temp-buffer
+      (setq reader (current-buffer))
+      (setq seshat-reader-search--query "the")
+      (let ((seen (list)))
+        (cl-letf (((symbol-function 'seshat-reader-dyn--lines-in-rect)
+                   (lambda (page x0 y0 x1 y1)
+                     (push (list 'lines page (current-buffer)) seen)
+                     (list (list x0 y0 x1 y1))))
+                  ((symbol-function 'seshat-reader-dyn--text-in-rect)
+                   (lambda (page &rest _rect)
+                     (push (list 'text page (current-buffer)) seen)
+                     "整行文本")))
+          (seshat-reader-search--render-sidebar '((2 1.0 2.0 3.0 4.0))))
+        (setq seen (nreverse seen))
+        (should (= 2 (length seen)))
+        ;; 两处取文都发生在阅读 buffer，而不是侧栏 buffer
+        (should (cl-every (lambda (entry) (eq reader (nth 2 entry))) seen))
+        ;; 页号换算：侧栏是 1-based，两个矩形入口是 0-based
+        (should (equal (mapcar #'cadr seen) '(1 1)))
+        ;; 因此侧栏行里真的有片段
+        (with-current-buffer seshat-reader-search-sidebar-buffer-name
+          (should (string-match-p "\\[p\\.2\\] 整行文本" (buffer-string))))))))
+
+(ert-deftest seshat-reader-search-test--clear-sidebar-drops-markers ()
+  "清空侧栏（换文档）时 marker 列表与高亮 overlay 一并丢弃."
+  (seshat-reader-search-test--with-stubs
+    (with-temp-buffer
+      (setq seshat-reader-search--query "the")
+      (seshat-reader-search-test--with-sidebar-window
+        (seshat-reader-search--render-sidebar
+         '((1 1.0 2.0 3.0 4.0) (2 5.0 6.0 7.0 8.0)))
+        (seshat-reader-search--sidebar-sync 1)
+        (with-current-buffer seshat-reader-search-sidebar-buffer-name
+          (should seshat-reader-search--sidebar-markers)
+          (should (overlayp seshat-reader-search--sidebar-cursor)))
+        (cl-letf (((symbol-function 'seshat-reader-sidebar-panel-visible-p)
+                   (lambda (_kind) nil)))
+          (seshat-reader-search--clear-sidebar))
+        (with-current-buffer seshat-reader-search-sidebar-buffer-name
+          (should-not seshat-reader-search--sidebar-markers)
+          (should-not seshat-reader-search--sidebar-cursor)
+          (should (= 0 (buffer-size))))))))
+
 (provide 'seshat-reader-search-test)
 ;;; seshat-reader-search-test.el ends here

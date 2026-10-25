@@ -514,11 +514,17 @@ module may not be loaded at all, hence the `fboundp' guards and
 ;;;; 会话：显示与提示
 
 (defun seshat-reader-search--goto-match ()
-  "Display the page of the current hit, if it is not the visible page."
+  "Display the page of the current hit, if it is not the visible page.
+The search sidebar follows: `--sidebar-sync' scrolls the result list to the
+same hit and highlights it without touching the reader's focus, which is what
+makes `n' / `p' in the reading buffer keep the two views pointing at the same
+result.  Syncing after the jump (rather than in `--move') covers every caller
+of `--show'; `--start' additionally syncs right after rendering."
   (let ((match (nth seshat-reader-search--index seshat-reader-search--matches)))
     (when (and match (integerp (nth 0 match))
                (/= (nth 0 match) (seshat-reader-search--current-page)))
-      (seshat-reader-search--goto-page (nth 0 match)))))
+      (seshat-reader-search--goto-page (nth 0 match))))
+  (seshat-reader-search--sidebar-sync seshat-reader-search--index))
 
 (defun seshat-reader-search--announce (&optional notice)
   "Report the current hit in the echo area, with an optional NOTICE suffix.
@@ -588,6 +594,20 @@ buffer `--matches' 里的 0-based 下标，RECTS 是该命中的页面坐标矩�
 buffer 的 buffer-local）。该变量在 `seshat-reader-search--render-sidebar' 渲染
 时写入；为 nil 或已被 kill 时跳转只提示、不发信号。")
 
+(defvar-local seshat-reader-search--sidebar-markers nil
+  "侧栏 buffer 里每条命中行行首的 marker 列表，顺序与 `--sidebar-matches' 一致.
+用 marker 而不是行号：侧栏重渲染（`erase-buffer' + 重新 `insert'）或将来任何
+改动 buffer 内容的操作都会让行号漂移，而 marker 跟着它指向的位置走。索引
+下标与命中下标同义——「第 N 条命中」就取 `(nth N --sidebar-markers)'，这是阅读
+buffer 里 `n' / `p' 时把侧栏滚到对应条目的唯一依据。")
+
+(defvar-local seshat-reader-search--sidebar-cursor nil
+  "侧栏里标记「当前条目」的 overlay，或 nil.
+只覆盖当前条目那一行、且用 `window' 属性限定在侧栏窗口上显示（见
+`seshat-reader-search--sidebar-highlight'）：侧栏窗口在被同步时**不是**选中的
+窗口，所以不能用 `hl-line-mode'（它的 overlay 跟随当前 buffer 的 point 且默认
+限制在 `(selected-window)'）。")
+
 (defun seshat-reader-search--clear-sidebar ()
   "Clear the search sidebar of stale results and close the `search' panel.
 Called from `seshat-reader-search--reset-state' when the buffer has been
@@ -616,7 +636,13 @@ close."
           (let ((inhibit-read-only t))
             (erase-buffer))
           (setq seshat-reader-search--sidebar-matches nil)
+          (setq seshat-reader-search--sidebar-markers nil)
           (setq seshat-reader-search--sidebar-source nil)
+          ;; 高亮 overlay 随内容一起丢弃：留着会在空 buffer 上留下一个零长度
+          ;; overlay，下一次同步又会把它挪到新内容上，状态来源就不唯一了。
+          (when (overlayp seshat-reader-search--sidebar-cursor)
+            (delete-overlay seshat-reader-search--sidebar-cursor)
+            (setq seshat-reader-search--sidebar-cursor nil))
           (set-buffer-modified-p nil)))))
   (ignore-errors
     (when (seshat-reader-sidebar-panel-visible-p 'search)
@@ -710,6 +736,72 @@ like a rendering bug."
     (if (string-empty-p snippet)
         (format "[p.%d]" page)
       (format "[p.%d] %s" page snippet))))
+
+(defun seshat-reader-search--sidebar-highlight (marker window)
+  "Highlight the sidebar line starting at MARKER, visible in WINDOW only.
+MARKER belongs to the sidebar buffer.  The highlight is a dedicated overlay
+whose `window' property is pinned to WINDOW, because the sidebar window is
+*not* the selected window while the reader walks its hits: `hl-line-mode'
+cannot be used here — its overlay follows the point of the **current buffer**
+and is restricted to the selected window (see `hl-line-highlight'), so a
+line synced into a background window would never light up and would be
+re-pointed at the reader's own line by that buffer's post-command hook.
+
+Using the `hl-line' face (when it exists) keeps the look consistent with the
+rest of Emacs; `highlight' is the fallback for a build without hl-line.
+
+Best effort: a marker without a live buffer does nothing."
+  (let ((buffer (marker-buffer marker)))
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (let ((overlay seshat-reader-search--sidebar-cursor))
+          (unless (overlayp overlay)
+            (setq overlay (make-overlay (point-min) (point-min)))
+            (overlay-put overlay 'face (if (facep 'hl-line) 'hl-line 'highlight))
+            (setq seshat-reader-search--sidebar-cursor overlay))
+          (move-overlay overlay marker
+                        (save-excursion (goto-char marker) (line-end-position)))
+          (overlay-put overlay 'window window))))))
+
+(defun seshat-reader-search--sidebar-scroll (window position)
+  "Scroll WINDOW to show POSITION, roughly centred, without moving focus.
+Same frame: `with-selected-window' + `recenter' — the window is selected only
+for the duration of the call and the user's window is restored right after,
+so the final focus is unchanged.  Another frame: fall back to setting
+`window-start' directly, since selecting a window on a different frame would
+raise that frame just to scroll it."
+  (if (eq (window-frame window) (selected-frame))
+      (with-selected-window window (recenter))
+    (with-current-buffer (window-buffer window)
+      (set-window-start window (max (point-min) (- position 2))))))
+
+(defun seshat-reader-search--sidebar-sync (index)
+  "把侧栏滚动到第 INDEX 条命中并高亮，不抢光标.
+侧栏 buffer 不存在、INDEX 越界、或侧栏没有可见窗口时静默返回。
+只 `set-window-point' 与 `recenter'（`recenter' 经 `with-selected-window'
+短暂选中侧栏窗口后立即恢复），**不**把用户的焦点留在侧栏。
+
+INDEX 是**命中的 0-based 下标**（与 `--sidebar-matches' / `--index' 同义），
+不是行号：侧栏前两行是标题与空行，且行号会随重渲染漂移。目标位置取自
+`--sidebar-markers'（渲染时记录的 marker），因此内容变化后依然指向同一条命中。
+
+这条函数是「阅读 buffer 里 `n' / `p' 命中切换 → 左侧结果栏跟随」的唯一入口，
+与反向的 `seshat-reader-search--sidebar-jump'（侧栏 `n' / `p' / `RET' → 阅读
+buffer 跳页）互为镜像；两侧都只动对方视图的**显示**位置，不改会话状态。"
+  (let ((buffer (get-buffer seshat-reader-search-sidebar-buffer-name)))
+    (when (buffer-live-p buffer)
+      (let* ((markers (buffer-local-value 'seshat-reader-search--sidebar-markers
+                                          buffer))
+             (marker (and (integerp index)
+                          (>= index 0)
+                          (nth index markers))))
+        (when (and marker (marker-position marker))
+          (let ((window (get-buffer-window buffer t)))
+            (when window
+              (seshat-reader-search--sidebar-highlight marker window)
+              (set-window-point window marker)
+              (seshat-reader-search--sidebar-scroll window
+                                                     (marker-position marker)))))))))
 
 (defun seshat-reader-search--sidebar-entry-at (position)
   "Return the sidebar entry recorded at POSITION, or nil.
@@ -848,35 +940,62 @@ The panel is displayed with SELECT non-nil (cursor moves into the sidebar at
 the end of the command) — the search is finished at that point and the next
 keystroke is expected to be a result choice, not a page turn.  Displaying never
 signals: a missing or failing panel backend must not break a search that
-already succeeded, so the call is wrapped in `ignore-errors'."
+already succeeded, so the call is wrapped in `ignore-errors'.
+
+每行的行首另记进 `--sidebar-markers'（marker 列表，与 `--sidebar-matches'
+同序），供 `--sidebar-sync' 在阅读 buffer 里切换命中时把侧栏滚到对应条目；
+渲染结束时立刻同步一次，故侧栏一出现就指着当前命中。片段文本在**进入侧栏
+buffer 之前**取（C 侧矩形查询要求当前 buffer 就是文档 buffer）。"
   (let ((query seshat-reader-search--query)
         (source (current-buffer))
         (entries (seshat-reader-search--sidebar-entries matches))
         (buffer (get-buffer-create seshat-reader-search-sidebar-buffer-name))
         (index 0))
-    (with-current-buffer buffer
-      (special-mode)
-      (let ((inhibit-read-only t))
-        (erase-buffer)
-        (insert (seshat-reader-search--sidebar-header
-                 query (length matches) (length entries)))
-        (dolist (entry entries)
-          (insert (propertize (concat (seshat-reader-search--sidebar-line entry)
-                                      "\n")
-                              'seshat-reader-search-sidebar-entry entry
-                              'seshat-reader-search-sidebar-index index))
-          (setq index (1+ index)))
-        (setq seshat-reader-search--sidebar-matches entries)
-        (setq seshat-reader-search--sidebar-source source)
-        (use-local-map seshat-reader-search--sidebar-map)
-        ;; 折行：侧栏很窄，片段必须折行而不是横向溢出（`special-mode' 默认
-        ;; 不折行，故显式置 nil）。
-        (setq truncate-lines nil)
-        (setq word-wrap t)
-        (goto-char (point-min))
-        (set-buffer-modified-p nil)
-        (setq buffer-read-only t)))
+    ;; 片段**必须**在阅读 buffer（= 当前 buffer，也就是调用者）里取：C 侧的
+    ;; `--lines-in-rect' / `--text-in-rect' 先经 `get_reader_current_state' 校验
+    ;; 「当前 buffer 就是文档 buffer」（文档状态指针是 permanent buffer-local，
+    ;; overlay 的 buffer 还必须等于 `(current-buffer)'）。在侧栏 buffer 里调用
+    ;; 一律失败且 `--snippet' 静默降级，于是每条只剩「[p.N]」——这正是真机上
+    ;; 「匹配信息显示不完整」的成因。故先在这里逐条算出整行文本，再进侧栏
+    ;; buffer 写入。
+    (let ((rows (mapcar (lambda (entry)
+                          (cons entry (seshat-reader-search--sidebar-line entry)))
+                        entries)))
+      (with-current-buffer buffer
+        (special-mode)
+        (let ((inhibit-read-only t)
+              (markers nil))
+          (erase-buffer)
+          ;; 旧高亮 overlay 的位置随内容一起失效，重建时先丢弃。
+          (when (overlayp seshat-reader-search--sidebar-cursor)
+            (delete-overlay seshat-reader-search--sidebar-cursor)
+            (setq seshat-reader-search--sidebar-cursor nil))
+          (insert (seshat-reader-search--sidebar-header
+                   query (length matches) (length entries)))
+          (dolist (row rows)
+            (let ((start (point)))
+              (insert (propertize (concat (cdr row) "\n")
+                                  'seshat-reader-search-sidebar-entry (car row)
+                                  'seshat-reader-search-sidebar-index index))
+              ;; marker 记行首：`copy-marker' 不推进（插入型为 nil），故对
+              ;; 之后任何插入/删除都仍然指向这一行的开头。
+              (push (copy-marker start) markers)
+              (setq index (1+ index))))
+          (setq seshat-reader-search--sidebar-matches entries)
+          (setq seshat-reader-search--sidebar-markers (nreverse markers))
+          (setq seshat-reader-search--sidebar-source source)
+          (use-local-map seshat-reader-search--sidebar-map)
+          ;; 折行：侧栏很窄，片段必须折行而不是横向溢出（`special-mode' 默认
+          ;; 不折行，故显式置 nil）。
+          (setq truncate-lines nil)
+          (setq word-wrap t)
+          (goto-char (point-min))
+          (set-buffer-modified-p nil)
+          (setq buffer-read-only t))))
     (ignore-errors (seshat-reader-sidebar-show buffer 'search t))
+    ;; 渲染后立即定位一次：侧栏刚建好时应当指着**当前**命中（搜索从文档中部
+    ;; 开始时 `--index' 不是 0），而不是停在标题行。
+    (seshat-reader-search--sidebar-sync (or seshat-reader-search--index 0))
     buffer))
 
 ;;;; 临时键表（n / p / RET / C-g）
