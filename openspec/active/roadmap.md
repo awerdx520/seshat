@@ -200,7 +200,7 @@ M0–M6 已完成并归档，见 `openspec/completed/personal-notes-system.md`�
 
 ### M12 后续：阅读器面板 childframe 覆盖承载 + 流式 + 多轮追问 + 复制回显
 
-计划与执行记录：`openspec/active/2026-10-24-emacs-reader-panel-childframe-and-ux.md`（代码与文档完成，待真机验收后归档）。
+计划与执行记录：`openspec/completed/2026-10-25-emacs-reader-panel-childframe-and-ux.md`（**已归档，2026-10-25**；真机视觉验收未执行，留待使用中观察）。
 
 | 子项 | 内容 | 状态 |
 |---|---|---|
