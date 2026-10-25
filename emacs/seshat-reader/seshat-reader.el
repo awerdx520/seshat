@@ -1818,11 +1818,16 @@ buffer-local 变量 `seshat-reader-current-doc-pagecount'（由动态模块设�
                 (cons seshat-reader--page-mode-line mode-line-misc-info)))
   ;; doom-modeline 的行列段在 PDF 阅读 buffer 里恒为 "1:0"（整页只有一行），
   ;; 对阅读毫无意义且占位，故在本 buffer 把三种格式都清空（保留 mode 判断逻辑，
-  ;; 只是不产生文本）。`boundp' 守卫使非 doom-modeline 环境完全无副作用。
+  ;; 只是不产生文本）；行列段与百分比段一并隐藏。
+  ;; `boundp' 守卫使非 doom-modeline 环境完全无副作用。
   (when (boundp 'doom-modeline-position-column-line-format)
     (setq-local doom-modeline-position-column-line-format '(""))
     (setq-local doom-modeline-position-line-format '(""))
-    (setq-local doom-modeline-position-column-format '(""))))
+    (setq-local doom-modeline-position-column-format '(""))
+    ;; 同一 segment 还带 `%p'（buffer 百分比）：PDF 阅读 buffer 只有一行、整段
+    ;; 可见，`%p' 恒为 "All"，对阅读无意义。该变量是 (CONDITION THEN ELSE) 的
+    ;; 条件，nil 时走 else 分支（只剩分隔符），故安全。
+    (setq-local doom-modeline-percent-position nil)))
 
 (add-hook 'seshat-reader-mode-hook #'seshat-reader-mode-line)
 (add-hook 'seshat-reader-mode-hook #'imenu-add-menubar-index)

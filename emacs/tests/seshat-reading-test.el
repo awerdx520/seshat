@@ -1197,7 +1197,9 @@ buffer，`(buffer-live-p (current-buffer))' 恒为真，旧守卫因此完全失
 (ert-deftest seshat-reading-test-page-mode-line-clears-doom-position-formats ()
   "`doom-modeline-position-*' 存在时本 buffer 的三个格式都被清成 `(\"\")' .
 清成 `(\"\")' 而非 nil：doom-modeline 的 buffer-position 段会先
-`(car …)' 再 `string-replace'，nil 会报 wrong-type-argument。"
+`(car …)' 再 `string-replace'，nil 会报 wrong-type-argument。
+同一 segment 的 `%p' 百分比由 `doom-modeline-percent-position' 控制，该变量是
+`(CONDITION THEN ELSE)' 的条件，故这里桩成非 nil 后应被置为 buffer-local nil。"
   (let ((vars '(doom-modeline-position-column-line-format
                 doom-modeline-position-line-format
                 doom-modeline-position-column-format))
@@ -1207,12 +1209,23 @@ buffer，`(buffer-live-p (current-buffer))' 恒为真，旧守卫因此完全失
           (dolist (var vars)
             (push (cons var (and (boundp var) (symbol-value var))) saved)
             (set var '("%l:%c")))
+          ;; 百分比段条件：桩成 doom-modeline 默认形态的非 nil 值，验证它在
+          ;; 本 buffer 被清成 nil（nil 时 doom-modeline 只输出分隔符）。
+          (push (cons 'doom-modeline-percent-position
+                      (and (boundp 'doom-modeline-percent-position)
+                           (symbol-value 'doom-modeline-percent-position)))
+                saved)
+          (set 'doom-modeline-percent-position '(-3 "%p"))
           (with-temp-buffer
             (seshat-reader-mode-line)
             (dolist (var vars)
               (should (local-variable-p var (current-buffer)))
               (should (equal (buffer-local-value var (current-buffer))
-                             '(""))))))
+                             '(""))))
+            (should (local-variable-p 'doom-modeline-percent-position
+                                      (current-buffer)))
+            (should-not (buffer-local-value 'doom-modeline-percent-position
+                                            (current-buffer)))))
       (dolist (pair saved)
         (if (cdr pair)
             (set (car pair) (cdr pair))
