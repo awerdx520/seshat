@@ -1396,7 +1396,9 @@ LOADING 非 nil 时给片段加 `gt-buffer-render-loading-face'（模拟 gt 的
 (ert-deftest seshat-reader-translate-test--enable-stream-clones-engines ()
   "`--enable-stream' 为引擎克隆体开流式，且不改预设共享的引擎对象（H5）."
   (skip-unless (require 'gt nil t))
-  (let* ((preset-engine (gt-google-engine))
+  ;; 用 `delimit' 为 nil 的 chatgpt 引擎：只有这类引擎会被开流式
+  ;; （google/youdao 的 `delimit' 默认 t，见下面几条用例）。
+  (let* ((preset-engine (gt-chatgpt-engine))
          (preset (gt-translator :engines (list preset-engine)))
          (trans (clone preset))
          (seshat-reader-translate--current-translator nil))
@@ -1405,12 +1407,62 @@ LOADING 非 nil 时给片段加 `gt-buffer-render-loading-face'（模拟 gt 的
     (let ((engines (slot-value trans 'engines)))
       (should (= 1 (length engines)))
       (should-not (eq (car engines) preset-engine))
-      (should (eq (eieio-object-class (car engines)) 'gt-google-engine))
+      (should (eq (eieio-object-class (car engines)) 'gt-chatgpt-engine))
       (should (eq (slot-value (car engines) 'stream) t)))
     ;; 预设里那个引擎对象没有被污染
     (should-not (slot-value preset-engine 'stream))
     ;; 登记了本次请求的 translator（守卫用）
     (should (eq seshat-reader-translate--current-translator trans))))
+
+(ert-deftest seshat-reader-translate-test--enable-stream-skips-delimit-engines ()
+  "`delimit' 非 nil 的引擎不开流式：不改槽、也不被克隆替换."
+  (skip-unless (require 'gt nil t))
+  (let* ((engine (gt-google-engine))
+         (trans (gt-translator :engines (list engine)))
+         (seshat-reader-translate--current-translator nil))
+    ;; google 引擎的 `delimit' 默认 t（依赖 gt 的 join）
+    (should (eq (oref engine delimit) t))
+    (seshat-reader-translate--enable-stream trans)
+    (let ((engines (oref trans engines)))
+      (should (= 1 (length engines)))
+      ;; 未开流式
+      (should-not (oref (car engines) stream))
+      ;; 且是**同一个对象**：不 clone、不替换
+      (should (eq (car engines) engine)))))
+
+(ert-deftest seshat-reader-translate-test--enable-stream-clones-nil-delimit-engines ()
+  "`delimit' 为 nil 的引擎开流式，且原对象不被污染."
+  (skip-unless (require 'gt nil t))
+  (let* ((engine (gt-chatgpt-engine))
+         (trans (gt-translator :engines (list engine)))
+         (seshat-reader-translate--current-translator nil))
+    ;; chatgpt 引擎未覆盖 `delimit'，继承基类的 nil
+    (should-not (oref engine delimit))
+    (seshat-reader-translate--enable-stream trans)
+    (let ((result (car (oref trans engines))))
+      (should (oref result stream))
+      ;; 新对象（克隆体），原引擎保持原样
+      (should-not (eq result engine))
+      (should-not (oref engine stream)))))
+
+(ert-deftest seshat-reader-translate-test--enable-stream-mixed-engines ()
+  "混合引擎：顺序与长度不变，只有 `delimit' 为 nil 的那个被开流式."
+  (skip-unless (require 'gt nil t))
+  (let* ((google (gt-google-engine))
+         (chatgpt (gt-chatgpt-engine))
+         (trans (gt-translator :engines (list google chatgpt)))
+         (seshat-reader-translate--current-translator nil))
+    (seshat-reader-translate--enable-stream trans)
+    (let ((engines (oref trans engines)))
+      (should (= 2 (length engines)))
+      ;; 顺序不变
+      (should (eq (eieio-object-class (nth 0 engines)) 'gt-google-engine))
+      (should (eq (eieio-object-class (nth 1 engines)) 'gt-chatgpt-engine))
+      ;; 前者不流式（原对象），后者流式（克隆体）
+      (should-not (oref (nth 0 engines) stream))
+      (should (eq (nth 0 engines) google))
+      (should (oref (nth 1 engines) stream))
+      (should-not (eq (nth 1 engines) chatgpt)))))
 
 ;;; 追问（多轮 messages）
 

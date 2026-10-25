@@ -1454,3 +1454,11 @@
 - 临时规避：`(setq seshat-reader-translate-stream nil)`——退回「完成时一次性渲染」，`:then` 路径恢复。
 - 来源：2026-10-25 主实例诊断（`gt-finalize' 的 stream 分支与 `gt-update' 调用链）；与上方「流式增量路径不经过 `--strip-chatter`」同属流式分支的 gt 契约缺口。
 - 解除条件：gt 在 stream 收尾路径补调 `gt-update`（或提供独立的「流式完成」回调）；或本包在 `gt-buffer-render-output-hook` 里自行判定「translator state = 3」并收尾，不依赖 `:then`。
+
+## gt 在引擎 `stream` 为 t 时跳过 `delimit` 的 join（2026-10-25 修复，gt 侧组合仍不安全）
+
+- 现象：gt 的 `gt-execute`（`gt-core.el`）只在 `(and delimiter (not (oref engine stream)))` 时把 translator `text` 槽的分段列表 `string-join` 成字符串。引擎 `stream` 为 `t` 时**跳过 join**，依赖字符串的引擎（google / youdao / 多数非 LLM 引擎，`delimit` 默认 `t`）随即在内部字符串函数上报 `Wrong type argument: stringp, ("…")`（每个引擎一次，两个引擎即 `[2 times]`）。chatgpt 引擎因为走 `gt-dolist-concurrency` 逐项处理所以不受影响。
+- 本包已做的规避（`seshat-reader-translate.el`）：`--enable-stream` 的开流判据加上 `(null (oref engine delimit))`——只有 `delimit` 为 nil 的引擎（LLM 类）才克隆并 `oset stream t`；`delimit` 非 nil 的引擎保持原对象（不 clone、不改槽），翻译一次性返回。判据用引擎自身的槽，与 gt 的 join 决策同源，不硬编码引擎类名。
+- 剩余隐患：**gt 侧组合本身仍不安全**——「流式 + `delimit` 非 nil」在 gt 内部依旧会崩。托管配置的其它路径（或用户自定义预设）若手动 `oset stream t` 给这类引擎，同样会踩中。
+- 来源：2026-10-25 主实例实测（`--enable-stream` 给全部带 `stream` 槽的引擎开流式，youdao/google 各报一次 `stringp` 错误）。
+- 解除条件：gt 修复该组合（stream 为 t 时仍按 `delimit` join，或给出能力探测/声明式约束），本包即可去掉 `delimit` 判据；在此之前**勿在配置侧手动**给 `delimit` 非 nil 的引擎 `oset stream t`。

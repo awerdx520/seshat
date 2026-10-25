@@ -71,7 +71,10 @@
 ;;
 ;; 流式增量（`seshat-reader-translate-stream'，默认开启）：构造翻译器时把
 ;; **克隆后的**引擎的 `stream' 槽设为 t（引擎对象也要再克隆——eieio 的
-;; `clone' 是浅拷贝，translator 的 `engines' 槽与预设共享同一批引擎对象），
+;; `clone' 是浅拷贝，translator 的 `engines' 槽与预设共享同一批引擎对象）；
+;; **只对 `delimit' 为 nil 的引擎开**（gt 在 `stream' 为 t 时跳过 `delimit'
+;; 的 join，youdao/google 这类依赖字符串的引擎会收到分段列表并报
+;; `Wrong type argument: stringp'），其余引擎保持原对象、一次性返回。
 ;; 并把 `gt-buffer-render-output-hook' 的增量同步到面板：首个增量写入模板
 ;; 骨架（正文 `%t' 为空）并记录正文起点 marker，后续只替换 marker 之后的
 ;; 正文区；完成时只更新 header-line 状态、不 erase 重写（避免完成瞬间整块
@@ -138,6 +141,9 @@
   ;; `stream' 槽，同样在编译期登记，避免两条无意义的「Unknown slot」告警。
   (put 'engines 'slot-name t)
   (put 'stream 'slot-name t)
+  ;; 流式的开流判据读引擎的 `delimit' 槽（gt 在 `stream' 为 t 时跳过 join，
+  ;; 故 `delimit' 非 nil 的引擎不能开流式），同样登记槽名消除告警。
+  (put 'delimit 'slot-name t)
   ;; 追问（T5）要改写 `gt-chatgpt-engine' 的 `prompt' 槽（换成返回 messages
   ;; 列表的函数），同样登记槽名消除告警。
   (put 'prompt 'slot-name t)
@@ -488,7 +494,12 @@ Markdown 分隔线（`---`）分隔——多引擎预设能让用户一眼比对
   "非 nil 时对支持流式的引擎开启增量输出（面板边生成边显示）.
 实现方式是为克隆后的引擎设置 `stream' 槽，并把
 `gt-buffer-render-output-hook' 的增量同步到面板；引擎不支持流式或取 nil 时，退回
-「完成后一次性渲染」的旧路径。"
+「完成后一次性渲染」的旧路径。
+
+**只对 `delimit' 为 nil 的引擎生效（LLM 类）**：gt 在引擎 `stream' 为 t 时
+跳过 `delimit' 的 join（`gt-core.el' 的 `gt-execute'），引擎会拿到分段列表
+而非字符串；youdao / google 等依赖 join 的引擎（`delimit' 非 nil）自动跳过，
+翻译仍然一次性返回。"
   :type 'boolean
   :group 'seshat-reader-translate)
 
@@ -1524,11 +1535,25 @@ nil。供 `seshat-reader-translate--capture-result'（posframe 捕获）与
   "在 TRANSLATOR 的引擎上开启流式，并登记本次请求的 translator 身份.
 引擎必须**再克隆一次**：eieio 的 `clone' 是浅拷贝，translator 的 `engines'
 槽与预设共享同一批引擎对象，直接 `oset' `stream' 会污染用户在 gt 里的预设
-（用户自己的其它 gt 用法会突然变成流式）。没有 `stream' 槽的引擎（不支持
-流式）保持原样、不做包装。返回 TRANSLATOR。"
+（用户自己的其它 gt 用法会突然变成流式）。
+
+**只有 `delimit' 为 nil 的引擎才开流式**：gt 的 `gt-execute'
+（`gt-core.el'）在引擎 `stream' 为 t 时**跳过** `delimit' 决定的 join——
+`(when (and delimiter (not (oref engine stream))) (string-join ...))'
+——于是引擎拿到的是 translator `text' 槽里的**分段列表**而不是拼接后的
+字符串。依赖字符串的引擎（youdao / google / 多数非 LLM 引擎）随即在内部
+字符串函数上报 `Wrong type argument: stringp, (\"…\")'（多引擎各报一次）。
+判据直接用引擎自己的 `delimit' 槽（gt-engine 基类定义，google / youdao 等
+`web-engine' 子类 `:initform t'），与 gt 的 join 决策**同源**，因此不硬编码
+引擎类名、新增引擎也自动正确。
+
+不开流式的引擎（`delimit' 非 nil）保持**原对象**：不 clone、不改任何槽，
+翻译仍一次性返回。没有 `stream' 槽的引擎（不支持流式）同样保持原样。
+返回 TRANSLATOR。"
   (oset translator engines
         (mapcar (lambda (engine)
-                  (if (slot-exists-p engine 'stream)
+                  (if (and (slot-exists-p engine 'stream)
+                           (null (oref engine delimit)))
                       (let ((copy (clone engine)))
                         (oset copy stream t)
                         copy)
