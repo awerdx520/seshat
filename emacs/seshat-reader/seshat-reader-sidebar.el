@@ -79,6 +79,12 @@
 
 ;;; Code:
 
+;; 本模块零依赖（不 `require' `seshat-reader'），但键位要注册到阅读器的
+;; `seshat-reader-mode-map' 上。此处声明只为消除字节编译的「reference to free
+;; variable」告警；运行时该变量由文末 `with-eval-after-load' 保证（只在
+;; `seshat-reader' 加载完成后才注册键位，故届时它必然已定义）。
+(defvar seshat-reader-mode-map)
+
 (defgroup seshat-reader-sidebar nil
   "阅读器信息面板的显示方式与参数."
   :group 'seshat-reader
@@ -794,6 +800,28 @@ FRAMES 省略时取 `seshat-reader-sidebar--cf-frames'。遍历与返回语义�
       (setq rest (cdr rest)))
     found))
 
+(defun seshat-reader-sidebar--cf-suppress-mode-line (frame)
+  "抑制 child frame FRAME 的 mode-line（保留 header-line），返回其选中窗口.
+实现：给该 frame 的窗口设 window parameter `mode-line-format' 为 `none'——
+Emacs 手册「Window Parameters」节点的语义是「本窗口显示时不显示 mode-line，
+且不影响其它窗口显示同一 buffer 时的 mode-line」，正是面板需要的粒度（不必改
+buffer-local 变量，故同一 buffer 在别的窗口里显示时不受影响）。
+
+**实测（Emacs 31.1 + pgtk GUI child frame）**：设参数前
+`window-pixel-height' 700 / `window-body-height' 680 /
+`window-mode-line-height' 20；设参数并 redisplay 后回读参数为 `none'、body
+升到 700、mode-line 高降为 0——即本机确实支持该 window parameter，故走这条
+路径，**不**回退 buffer-local `mode-line-format' 置 nil（那会连带影响其它窗口
+显示同一 buffer，且需要额外的恢复逻辑）。
+
+幂等：窗口参数重复设置无副作用，故创建路径与复用路径（同 kind frame 已存在）
+都调用；取不到窗口（frame 异常 / 已死）时静默跳过。返回该窗口或 nil。"
+  (let ((window (ignore-errors (frame-selected-window frame))))
+    (when (windowp window)
+      (ignore-errors
+        (set-window-parameter window 'mode-line-format 'none)))
+    window))
+
 (defun seshat-reader-sidebar--cf-place (frame kind)
   "把已创建的 child frame FRAME 精确设置为 KIND 面板的像素尺寸与右上角位置.
 父 frame 取 FRAME 的 `parent-frame' frame parameter（由
@@ -811,7 +839,12 @@ FRAMES 省略时取 `seshat-reader-sidebar--cf-frames'。遍历与返回语义�
 里排除 FRAME 自身（它此刻已带 kind 参数、已在 `--cf-frames' 中）。
 
 任一步失败静默跳过（尺寸与定位是「更好看」，不该让面板显示整体失败），返回
-FRAME。"
+FRAME。
+
+最后一步顺手抑制该 frame 窗口的 mode-line
+（`seshat-reader-sidebar--cf-suppress-mode-line'：window parameter
+`mode-line-format' 置 `none'，header-line 保留）——放在此处而非创建路径，
+是因为复用路径也必经本函数，故两个路径都得到同样的面板外观且幂等。"
   (let* ((parent (frame-parameter frame 'parent-frame))
          (size (and parent (seshat-reader-sidebar--cf-size parent kind)))
          (others (delq frame (seshat-reader-sidebar--cf-frames)))
@@ -825,6 +858,7 @@ FRAME。"
       (ignore-errors (set-frame-size frame (car size) (cdr size) t)))
     (when position
       (ignore-errors (set-frame-position frame (car position) (cdr position))))
+    (seshat-reader-sidebar--cf-suppress-mode-line frame)
     frame))
 
 (defun seshat-reader-sidebar--cf-show (buffer kind &optional select)
@@ -1443,8 +1477,15 @@ WINDOW 参数由 hook 传入（也可能是手工调用，省略时按当前 buf
 ;;; 键位
 
 ;; `C-c C-o' 曾绑到 `seshat-reader-sidebar-toggle-outline'，与阅读 buffer 的
-;; `o'（`seshat-reader-outline-show'）功能重复，用户要求移除；命令本身仍可 M-x 调用。
-;; 本模块仍不 require `seshat-reader'（模块零依赖），本文件因此不再有键位注册代码。
+;; `o'（`seshat-reader-outline-show'）功能重复，2026-10-23 被移除；真机反馈后按
+;; 用户要求恢复该键，但改绑**无参**的 `seshat-reader-sidebar-toggle`：面板开着
+;; 就全部关闭，关了就重开最近一个面板——比「只开合目录」更贴近「快捷关闭」的直
+;; 觉。面板内 `q'（`seshat-reader-translate-panel-map'）保持原样。
+;; 本模块仍不 require `seshat-reader'（模块零依赖），故键位用
+;; `with-eval-after-load' 在阅读器加载后注册，与 translate 模块的写法一致。
+(with-eval-after-load 'seshat-reader
+  (define-key seshat-reader-mode-map (kbd "C-c C-o")
+    #'seshat-reader-sidebar-toggle))
 
 ;; 挂到**全局**的 `window-buffer-change-functions'（不传 LOCAL）：阅读器 buffer
 ;; 退出后当前 buffer 已不是阅读器 buffer，buffer-local 的钩子绑在谁身上都不对，

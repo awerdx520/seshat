@@ -121,6 +121,24 @@
 - **范围确认**：`emacs/seshat-reader/seshat-reader-etaf.el`（批注列表渲染与 `seshat-reader-sidebar-toggle` 调用）保持 window 承载、不得改动；其 toggle 调用经 `--panels` 抽象后行为不变，须有回归断言。
 - 验收：ERT ≥4 例——carrier=window 时仍走 `--display-params`；carrier=childframe 时走 `--cf-show`；toggle 关闭 frame；切到非阅读 buffer 触发隐藏。
 
+### T3.5 真机反馈三项修复（依赖：T3）
+
+用户真机验收后追加的三项修复：
+
+1. **译文重复**：`reader` 预设含两个引擎（youdao + google），`seshat-reader-translate--extract-result`
+   收集**全部** `gt-result` 片段并换行拼接，导致面板显示两份译文。修复：新增
+   `seshat-reader-translate-engines-pick`（默认 `first`，可选 `last` / `all`），只取第一个
+   **成功**片段；首个失败（error face）时顺延；`all` 保留旧行为供调试。`--panel-result`
+   （面板）与 `--capture-result`（posframe）两条路径都经该函数，一并修复。
+2. **childframe 去 mode-line**：面板窗口不再显示 mode-line（header-line 保留）。实现优先给
+   child frame 的窗口设 window parameter `mode-line-format` 为 `none`；若本机不支持，
+   回退为面板 buffer 的 buffer-local `mode-line-format` 置 nil。
+3. **阅读器侧快捷关闭**：`C-c C-o` 绑到 `seshat-reader-sidebar-toggle`（无参：面板开着即全部
+   关闭，关了就重开最近一个）；面板内 `q` 保留。
+
+验收：ERT 覆盖三项（去重三取值、失败顺延、window parameter/modeline、键位绑定）；既有
+translate/sidebar/outline/etaf 套件全绿。
+
 ### T4 流式渲染（依赖：T3）
 
 - 文件：`emacs/seshat-reader/seshat-reader-translate.el`

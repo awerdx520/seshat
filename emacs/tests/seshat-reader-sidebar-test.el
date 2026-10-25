@@ -1204,8 +1204,9 @@ KIND 为面板内容类型，CONTENT-LINES 为桩出的内容行数，INIT-HEIGH
 
 (ert-deftest seshat-reader-sidebar-test--toggle-outline-command-still-works ()
   "目录开合命令保留（可 M-x 调用），`o' 仍是 `seshat-reader-outline-show'."
-  ;; 2026-10-23 起 `C-c C-o' 不再绑定（与 `o' 功能重复，用户要求移除），本用例
-  ;; 改为只验证「命令本体仍可用」；键位缺失由 `--c-c-c-o-unbound' 断言。
+  ;; 2026-10-25 起 `C-c C-o' 改绑**无参** `seshat-reader-sidebar-toggle'（真机反馈
+  ;; 的快捷关闭）；目录专用命令仍保留，可 M-x 调用。键位绑定由
+  ;; `--c-c-c-o-toggles-panel' 断言。
   (should (commandp 'seshat-reader-sidebar-toggle-outline))
   (should (eq (lookup-key seshat-reader-mode-map (kbd "o"))
               'seshat-reader-outline-show))
@@ -1215,11 +1216,14 @@ KIND 为面板内容类型，CONTENT-LINES 为桩出的内容行数，INIT-HEIGH
       (seshat-reader-sidebar-toggle-outline))
     (should (equal calls '(outline)))))
 
-(ert-deftest seshat-reader-sidebar-test--c-c-c-o-unbound ()
-  "`C-c C-o' 已无绑定，且同前缀的 `C-c C-l' 仍有绑定（只删了目标键）."
-  (let ((binding (lookup-key seshat-reader-mode-map (kbd "C-c C-o"))))
-    (should (or (null binding) (eq binding 'undefined))))
-  ;; 同前缀的批注列表键必须原样保留，证明确实只删了目录开合那一个键
+(ert-deftest seshat-reader-sidebar-test--c-c-c-o-toggles-panel ()
+  "`C-c C-o' 绑到无参的 `seshat-reader-sidebar-toggle'，且同前缀键不受影响.
+真机反馈的第三项修复：阅读器侧需要「快捷关闭」——面板开着就全部关闭，关了就
+重开最近一个（无参语义），而非只开合目录；面板内 `q' 仍保留（见
+`seshat-reader-translate-panel-map'）。"
+  (should (eq (lookup-key seshat-reader-mode-map (kbd "C-c C-o"))
+              'seshat-reader-sidebar-toggle))
+  ;; 同前缀的批注列表键必须原样保留（新增绑定不得吞掉同前缀其它键）
   (should (eq (lookup-key seshat-reader-mode-map (kbd "C-c C-l"))
               'seshat-reader-annotation-list)))
 
@@ -1802,6 +1806,67 @@ width/height 是字符单位，无法精确等于像素比例）。"
           (should-not (seshat-reader-sidebar--cf-show buf 'translate))
           (should (zerop display-calls)))
       (kill-buffer buf))))
+
+(ert-deftest seshat-reader-sidebar-test--cf-place-suppresses-mode-line ()
+  "`--cf-place' 给 child frame 的窗口设 window parameter `mode-line-format' 为 `none'.
+真机反馈的第二项修复：面板不应显示 mode-line（header-line 保留）。实测 Emacs
+31.1 支持该 window parameter（设后 `window-mode-line-height' 20 → 0、body
+680 → 700），故断言 `set-window-parameter' 收到 (WINDOW `mode-line-format'
+`none')。创建路径与复用路径都经本函数，故一处设置两路生效。"
+  (let (param-calls sized positioned)
+    (cl-letf (((symbol-function 'frame-parameter)
+               (lambda (frame param)
+                 (when (and (eq frame 'cf-new) (eq param 'parent-frame))
+                   'gui-frame)))
+              ((symbol-function 'seshat-reader-sidebar--cf-frames)
+               (lambda () nil))
+              ((symbol-function 'frame-pixel-width)
+               (lambda (&optional _frame) 1000))
+              ((symbol-function 'frame-pixel-height)
+               (lambda (&optional _frame) 800))
+              ((symbol-function 'set-frame-size)
+               (lambda (&rest args) (push args sized)))
+              ((symbol-function 'set-frame-position)
+               (lambda (&rest args) (push args positioned)))
+              ((symbol-function 'frame-selected-window)
+               (lambda (_frame) 'cf-window))
+              ((symbol-function 'windowp)
+               (lambda (obj) (eq obj 'cf-window)))
+              ((symbol-function 'set-window-parameter)
+               (lambda (window parameter value)
+                 (push (list window parameter value) param-calls))))
+      (should (eq (seshat-reader-sidebar--cf-place 'cf-new 'translate)
+                  'cf-new))
+      (should (equal param-calls '((cf-window mode-line-format none))))
+      ;; 尺寸与定位仍然生效（新增的一步不得挤掉既有收口）
+      (should sized)
+      (should positioned))))
+
+(ert-deftest seshat-reader-sidebar-test--cf-place-mode-line-tolerates-missing-window ()
+  "取不到 child frame 的窗口时不设参数、不报错，仍返回 FRAME.
+`--cf-place' 的定位/尺寸/去 mode-line 都是「更好看」的收口步骤，任一失败都不
+该让面板显示整体失败（frame 可能已死、选中窗口可能取不到）。"
+  (let (param-calls)
+    (cl-letf (((symbol-function 'frame-parameter)
+               (lambda (frame param)
+                 (when (and (eq frame 'cf-dead) (eq param 'parent-frame))
+                   'gui-frame)))
+              ((symbol-function 'seshat-reader-sidebar--cf-frames)
+               (lambda () nil))
+              ((symbol-function 'frame-pixel-width)
+               (lambda (&optional _frame) 1000))
+              ((symbol-function 'frame-pixel-height)
+               (lambda (&optional _frame) 800))
+              ((symbol-function 'set-frame-size) (lambda (&rest _args) nil))
+              ((symbol-function 'set-frame-position) (lambda (&rest _args) nil))
+              ;; 选中窗口取不到（死 frame / 无窗口）
+              ((symbol-function 'frame-selected-window) (lambda (_frame) nil))
+              ((symbol-function 'set-window-parameter)
+               (lambda (window parameter value)
+                 (push (list window parameter value) param-calls))))
+      (should (eq (seshat-reader-sidebar--cf-place 'cf-dead 'translate)
+                  'cf-dead))
+      (should-not param-calls))))
 
 (ert-deftest seshat-reader-sidebar-test--cf-close-deletes-live-frame-only ()
   "`--cf-close' 只对活 frame 调 `delete-frame'，死 frame 与非 frame 静默返回.

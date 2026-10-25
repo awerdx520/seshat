@@ -114,8 +114,11 @@
 由 `seshat-reader-translate--record-result' 写入：面板路径经
 `seshat-reader-translate--panel-result' 在 gt 的 `:then' 回调内调用它，
 posframe 路径经 `seshat-reader-translate--capture-result' 从输出 hook 调用它。
-值为渲染缓冲区中所有带 `gt-result' 文本属性的片段以换行拼接的结果。
-翻译失败语义分两个层面（有意为之）：**显示层**不清空——失败路径不会调用
+值为按 `seshat-reader-translate-engines-pick' 从渲染缓冲区中带 `gt-result'
+文本属性的片段里**选出的那一份**译文（默认取第一个成功片段；多引擎预设会为
+每份译文各渲染一个片段，故不取全部，见
+`seshat-reader-translate--extract-result'）。翻译失败语义分两个层面（有意为之）：
+**显示层**不清空——失败路径不会调用
 `seshat-reader-translate--render-panel'，面板 buffer 保留上一次渲染的内容，
 用户仍能看到旧译文；**变量层**则会被清空——
 `seshat-reader-translate-selection' 与
@@ -240,6 +243,16 @@ nil 关闭——仅当面板已显示时传 -1 清理窗口 margin（面板未�
 译文；超出窗口视为其它 go-translate 用法触发的渲染，直接忽略，以免把非
 本包的译文写进 `seshat-reader-translate-last-result'。"
   :type 'natnum
+  :group 'seshat-reader-translate)
+
+(defcustom seshat-reader-translate-engines-pick 'first
+  "多个引擎时取哪个结果展示.
+`first'：取第一个**成功**的引擎结果（默认）；`last'：取最后一个成功的；
+`all'：把全部成功结果按换行拼接（旧行为，仅调试用）。片段带
+`gt-buffer-render-error-face' 时视为失败并顺延到下一个。"
+  :type '(choice (const :tag "第一个成功结果" first)
+                 (const :tag "最后一个成功结果" last)
+                 (const :tag "全部拼接（调试）" all))
   :group 'seshat-reader-translate)
 
 ;;; 内部辅助
@@ -559,40 +572,51 @@ TARGET-LANG 为 \"ja\" 且回退 langs 为 (en zh) 时返回 (en ja)）。
             #'seshat-reader-translate--capture-result))
 
 (defun seshat-reader-translate--extract-result ()
-  "从当前缓冲区提取译文片段与失败标记.
-返回 `(TEXT . FAILED)'：TEXT 为所有带 `gt-result' 文本属性的片段以
-`string-join' 用换行拼接的字符串（无片段时为 nil）；FAILED 非 nil 表示
-渲染结果带 `gt-buffer-render-error-face'（翻译失败标记）。供 posframe 捕获
+  "从当前缓冲区提取译文片段并按 `seshat-reader-translate-engines-pick' 选取.
+返回 `(TEXT . FAILED)'：TEXT 为按 pick 选出的译文（无可用片段时为 nil）；
+FAILED 非 nil 表示**没有成功片段**——没有任何 `gt-result' 片段，或全部片段
+都带 `gt-buffer-render-error-face'。供 posframe 捕获
 （`seshat-reader-translate--capture-result'）与面板捕获
-（`seshat-reader-translate--panel-result'）两条路径共用，避免逻辑重复。"
-  (let ((pieces nil)
-        (failed nil))
-    ;; 收集带 `gt-result' 属性的片段。
+（`seshat-reader-translate--panel-result'）两条路径共用，签名与语义不变。
+
+为什么只取一个片段：多引擎预设（默认 `reader' 预设含 youdao + google 两个
+引擎）会把**每份**译文都渲染成带 `gt-result' 属性的片段，全收再换行拼接就会
+把两份译文一起显示在面板里（真机反馈的「译文重复」）。故本函数先逐片段收集
+`(TEXT . FAILED)'，再按 pick 选：`first'（默认）取第一个**成功**片段、首个
+失败时顺延到下一个；`last' 取最后一个成功片段；`all' 把所有成功片段换行拼接
+（旧行为，仅调试用）。
+
+单个片段的失败判定口径不变：只看**片段起点**的 `face` 属性是否含
+`gt-buffer-render-error-face`（用 `get-text-property' 读一次，不做逐字符推进，
+故在长缓冲区上也不会退化）。错误 face 落在片段之外时不再影响判定——此时
+「没有成功片段」这件事由「无片段」分支覆盖，语义等价。"
+  (let (pieces)
+    ;; 收集带 `gt-result' 属性的片段，并就地判定每片的失败标记。
     (save-excursion
       (goto-char (point-min))
       (while (let ((match (text-property-search-forward 'gt-result)))
                (when match
-                 (push (buffer-substring-no-properties
-                        (prop-match-beginning match)
-                        (prop-match-end match))
-                       pieces)
+                 (let ((begin (prop-match-beginning match))
+                       (face nil))
+                   (setq face (get-text-property begin 'face))
+                   (push (cons (buffer-substring-no-properties
+                                begin (prop-match-end match))
+                               (or (eq face 'gt-buffer-render-error-face)
+                                   (and (consp face)
+                                        (memq 'gt-buffer-render-error-face
+                                              face))))
+                         pieces))
                  t))))
-    ;; 失败检测：只在带 `face' 属性的连续片段上遍历
-    ;; （`text-property-search-forward' 一次跳到下一个带 face 的区域），
-    ;; 避免逐字符推进在无 face 的长缓冲上退化为 O(n^2)。
-    (save-excursion
-      (goto-char (point-min))
-      (while (and (not failed)
-                  (let ((match (text-property-search-forward 'face)))
-                    (when match
-                      (let ((face (get-text-property
-                                   (prop-match-beginning match) 'face)))
-                        (when (or (eq face 'gt-buffer-render-error-face)
-                                  (and (consp face)
-                                       (memq 'gt-buffer-render-error-face face)))
-                          (setq failed t)))
-                      t)))))
-    (cons (when pieces (string-join (nreverse pieces) "\n")) failed)))
+    (let* ((all (nreverse pieces))
+           ;; 成功片段：FAILED 列（cdr）为 nil 的那些，保持原有顺序。
+           (ok (cl-remove-if #'cdr all)))
+      (cond
+       ((null ok) (cons nil t))
+       ((eq seshat-reader-translate-engines-pick 'all)
+        (cons (string-join (mapcar #'car ok) "\n") nil))
+       ((eq seshat-reader-translate-engines-pick 'last)
+        (cons (car (car (last ok))) nil))
+       (t (cons (car (car ok)) nil))))))
 
 (defun seshat-reader-translate--record-result (extracted)
   "把 EXTRACTED（`seshat-reader-translate--extract-result' 的返回值）写入译文.

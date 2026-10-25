@@ -234,12 +234,16 @@
 ;;; 译文捕获
 
 (ert-deftest seshat-reader-translate-test--capture-result-joins-pieces ()
-  "`--capture-result' 把带 `gt-result' 的片段以换行拼接，忽略无属性内容."
+  "`--capture-result' 在 pick 取 `all' 时把带 `gt-result' 的片段换行拼接.
+默认 pick 已改为 `first'（多引擎预设只展示一份译文，见
+`seshat-reader-translate-engines-pick'），故本用例显式绑定 `all' 锁死旧行为——
+它是调试用取值，拼接逻辑仍须可用。"
   (with-temp-buffer
     (insert (propertize "第一段" 'gt-result t))
     (insert "（无属性，忽略）")
     (insert (propertize "第二段" 'gt-result t))
     (let ((seshat-reader-translate-last-result nil)
+          (seshat-reader-translate-engines-pick 'all)
           (seshat-reader-translate--active (float-time)))
       (cl-letf (((symbol-function 'message) (lambda (&rest _) nil)))
         (should (equal (seshat-reader-translate--capture-result)
@@ -300,6 +304,73 @@
            (- (float-time) (+ seshat-reader-translate-capture-window 10))))
       (should-not (seshat-reader-translate--capture-result))
       (should (equal seshat-reader-translate-last-result "OLD")))))
+
+;;; 多引擎结果去重（T3.5：真机反馈「面板显示两份译文」）
+
+(defun seshat-reader-translate-test--insert-pieces (pieces)
+  "在当前 buffer 依次插入 PIECES 描述的译文片段.
+PIECES 是 `(TEXT . FAILED)' 列表：每个元素插成带 `gt-result' 属性的片段，
+FAILED 非 nil 时再带 `gt-buffer-render-error-face'（模拟该引擎失败）。
+
+片段之间插一个**无属性**的换行：真实渲染缓冲区里各引擎结果之间有分隔文本，
+而相邻且同属性的片段会被 `text-property-search-forward' 合并成同一个
+`gt-result' 区域（那样就测不到「多片段」的场景了）。"
+  (dolist (piece pieces)
+    (insert (if (cdr piece)
+                (propertize (car piece) 'gt-result t
+                            'face 'gt-buffer-render-error-face)
+              (propertize (car piece) 'gt-result t)))
+    (insert "\n")))
+
+(ert-deftest seshat-reader-translate-test--extract-pick-first-takes-first ()
+  "pick 取 `first'（默认）时只返回第一个片段——多引擎不再拼成两份译文."
+  (with-temp-buffer
+    (seshat-reader-translate-test--insert-pieces
+     '(("youdao 译文" . nil) ("google 译文" . nil)))
+    (let ((seshat-reader-translate-engines-pick 'first))
+      (should (equal (seshat-reader-translate--extract-result)
+                     '("youdao 译文"))))))
+
+(ert-deftest seshat-reader-translate-test--extract-pick-last-takes-last ()
+  "pick 取 `last' 时返回最后一个成功片段."
+  (with-temp-buffer
+    (seshat-reader-translate-test--insert-pieces
+     '(("youdao 译文" . nil) ("google 译文" . nil)))
+    (let ((seshat-reader-translate-engines-pick 'last))
+      (should (equal (seshat-reader-translate--extract-result)
+                     '("google 译文"))))))
+
+(ert-deftest seshat-reader-translate-test--extract-pick-all-joins-successes ()
+  "pick 取 `all' 时把所有成功片段换行拼接（旧行为，仅调试用）."
+  (with-temp-buffer
+    (seshat-reader-translate-test--insert-pieces
+     '(("youdao 译文" . nil) ("失败片段" . t) ("google 译文" . nil)))
+    (let ((seshat-reader-translate-engines-pick 'all))
+      (should (equal (seshat-reader-translate--extract-result)
+                     '("youdao 译文\ngoogle 译文"))))))
+
+(ert-deftest seshat-reader-translate-test--extract-pick-first-skips-failed ()
+  "pick 取 `first' 时首个片段带 error face 则顺延到下一个成功片段."
+  (with-temp-buffer
+    (seshat-reader-translate-test--insert-pieces
+     '(("失败片段" . t) ("google 译文" . nil)))
+    (let ((seshat-reader-translate-engines-pick 'first))
+      (should (equal (seshat-reader-translate--extract-result)
+                     '("google 译文"))))))
+
+(ert-deftest seshat-reader-translate-test--extract-all-failed-returns-failed ()
+  "全部片段都失败或没有片段时返回 `(nil . t)'（失败语义不变）."
+  (with-temp-buffer
+    (seshat-reader-translate-test--insert-pieces
+     '(("失败一" . t) ("失败二" . t)))
+    (dolist (pick '(first last all))
+      (let ((seshat-reader-translate-engines-pick pick))
+        (should (equal (seshat-reader-translate--extract-result) (cons nil t))))))
+  ;; 无任何 `gt-result' 片段：同样判定为失败
+  (with-temp-buffer
+    (insert "没有任何属性的文本")
+    (let ((seshat-reader-translate-engines-pick 'first))
+      (should (equal (seshat-reader-translate--extract-result) (cons nil t))))))
 
 ;;; 面板内 Markdown 文本 buffer 渲染
 
