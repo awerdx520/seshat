@@ -1790,11 +1790,39 @@ Keybindings:
   (add-hook 'window-buffer-change-functions #'seshat-reader--handle-window-buffer-change nil t)
   (add-hook 'pre-redisplay-functions #'seshat-reader--pre-redisplay-center nil t))
 
+(defun seshat-reader--page-indicator ()
+  "返回 `[当前页/总页]' 形式的字符串，供 mode-line 显示.
+当前页取 `seshat-reader-current-doc-pagenumber'（读窗口参数），总页数取
+buffer-local 变量 `seshat-reader-current-doc-pagecount'（由动态模块设置）；
+任一取不到（文档尚未加载完）时该项用 `?' 占位，不报错、不阻塞 redisplay。"
+  (format "[%s/%s]"
+          (or (seshat-reader-current-doc-pagenumber) "?")
+          (or (bound-and-true-p seshat-reader-current-doc-pagecount) "?")))
+
+(defvar seshat-reader--page-mode-line '(:eval (seshat-reader--page-indicator))
+  "挂到 `mode-line-misc-info' 的页码元素.
+用 defvar 而非字面量，便于用 `member'/`equal' 去重（`mode-line-misc-info' 是
+全局变量，重复进入 mode 时不能累积多个副本）。")
+
 (defun seshat-reader-mode-line ()
   "Set custom mode-line interface when reading documents."
   (setq-local mode-line-position
 	      '(" P" (:eval (number-to-string (seshat-reader-current-doc-pagenumber)))
-                "/" (:eval (number-to-string seshat-reader-current-doc-pagecount)))))
+                "/" (:eval (number-to-string seshat-reader-current-doc-pagecount))))
+  ;; 第三方 modeline（doom-modeline 等）接管 `mode-line-format' 后不会读
+  ;; `mode-line-position'，故同时把页码挂到 `mode-line-misc-info'：
+  ;; doom-modeline 的 misc-info segment 会 `format-mode-line' 它，原生 modeline
+  ;; (`mode-line-misc-info' 默认就在 `mode-line-format' 里) 同样会显示。
+  (unless (member seshat-reader--page-mode-line mode-line-misc-info)
+    (setq-local mode-line-misc-info
+                (cons seshat-reader--page-mode-line mode-line-misc-info)))
+  ;; doom-modeline 的行列段在 PDF 阅读 buffer 里恒为 "1:0"（整页只有一行），
+  ;; 对阅读毫无意义且占位，故在本 buffer 把三种格式都清空（保留 mode 判断逻辑，
+  ;; 只是不产生文本）。`boundp' 守卫使非 doom-modeline 环境完全无副作用。
+  (when (boundp 'doom-modeline-position-column-line-format)
+    (setq-local doom-modeline-position-column-line-format '(""))
+    (setq-local doom-modeline-position-line-format '(""))
+    (setq-local doom-modeline-position-column-format '(""))))
 
 (add-hook 'seshat-reader-mode-hook #'seshat-reader-mode-line)
 (add-hook 'seshat-reader-mode-hook #'imenu-add-menubar-index)

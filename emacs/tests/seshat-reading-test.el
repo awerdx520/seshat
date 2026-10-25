@@ -44,6 +44,10 @@
 ;; 条目（实测恒返回空串），因此用例直接求值 `:eval' 的载荷
 ;; （`seshat-reading--mode-line-text'），并断言条目确实装在
 ;; `mode-line-misc-info' 里。
+;;
+;; 3. T3（页码指示）：`seshat-reader--page-indicator' 的三种取值形态、
+;;    `seshat-reader-mode-line' 装 `mode-line-misc-info' 的幂等性，以及
+;;    `doom-modeline-position-*' 存在时被本 buffer 清空（不存在时不报错）。
 
 ;;; Code:
 
@@ -1155,6 +1159,83 @@ buffer，`(buffer-live-p (current-buffer))' 恒为真，旧守卫因此完全失
                                                    seshat-reading-test--root)))
       (should-not (file-exists-p (expand-file-name "a"
                                                    seshat-reading-test--root))))))
+
+;;; T3：页码指示（第三方 modeline 走 `mode-line-misc-info'）
+
+(ert-deftest seshat-reading-test-page-indicator-formats ()
+  "`seshat-reader--page-indicator' 的三种取值形态.
+当前页取 `seshat-reader-current-doc-pagenumber'（桩替，真实实现读窗口参数
+`page'），总页数取 buffer-local `seshat-reader-current-doc-pagecount'；任一
+缺失时用 `?' 占位而不是报错。"
+  (cl-flet* ((indicator (page count)
+              (with-temp-buffer
+                (setq-local seshat-reader-current-doc-pagecount count)
+                (cl-letf (((symbol-function
+                            'seshat-reader-current-doc-pagenumber)
+                           (lambda (&optional _window) page)))
+                  (seshat-reader--page-indicator)))))
+    (should (equal (indicator 3 9) "[3/9]"))
+    (should (equal (indicator nil nil) "[?/?]"))
+    (should (equal (indicator 3 nil) "[3/?]"))
+    (should (equal (indicator nil 9) "[?/9]"))))
+
+(ert-deftest seshat-reading-test-page-mode-line-install-is-idempotent ()
+  "连续调用 `seshat-reader-mode-line' 只装一个页码元素.
+`mode-line-misc-info' 是全局变量，重复进入 mode（或 mode 体与 mode hook 各跑
+一次）时不能累积副本。"
+  (with-temp-buffer
+    (seshat-reader-mode-line)
+    (seshat-reader-mode-line)
+    (should (= 1 (seq-count (lambda (item)
+                              (equal item seshat-reader--page-mode-line))
+                            mode-line-misc-info)))
+    ;; 装进去的是 `:eval' 构造，载荷就是页码函数（batch 下
+    ;; `format-mode-line' 不求值 `:eval'，故直接求载荷）。
+    (should (equal (nth 1 seshat-reader--page-mode-line)
+                   '(seshat-reader--page-indicator)))))
+
+(ert-deftest seshat-reading-test-page-mode-line-clears-doom-position-formats ()
+  "`doom-modeline-position-*' 存在时本 buffer 的三个格式都被清成 `(\"\")' .
+清成 `(\"\")' 而非 nil：doom-modeline 的 buffer-position 段会先
+`(car …)' 再 `string-replace'，nil 会报 wrong-type-argument。"
+  (let ((vars '(doom-modeline-position-column-line-format
+                doom-modeline-position-line-format
+                doom-modeline-position-column-format))
+        (saved nil))
+    (unwind-protect
+        (progn
+          (dolist (var vars)
+            (push (cons var (and (boundp var) (symbol-value var))) saved)
+            (set var '("%l:%c")))
+          (with-temp-buffer
+            (seshat-reader-mode-line)
+            (dolist (var vars)
+              (should (local-variable-p var (current-buffer)))
+              (should (equal (buffer-local-value var (current-buffer))
+                             '(""))))))
+      (dolist (pair saved)
+        (if (cdr pair)
+            (set (car pair) (cdr pair))
+          (makunbound (car pair)))))))
+
+(ert-deftest seshat-reading-test-page-mode-line-without-doom-modeline ()
+  "`doom-modeline-*' 未定义时不报错、也不留下 buffer-local 值.
+批处理 `-Q' 环境里 doom-modeline 未加载，即本用例的默认分支；若某天它被加载，
+用例改走「已绑 → 被清空」分支，仍不跳过、不依赖环境假设。"
+  (with-temp-buffer
+    (cond
+     ((boundp 'doom-modeline-position-column-line-format)
+      (seshat-reader-mode-line)
+      (should (equal (buffer-local-value
+                      'doom-modeline-position-column-line-format
+                      (current-buffer))
+                     '(""))))
+     (t
+      (seshat-reader-mode-line)
+      (should-not (local-variable-p 'doom-modeline-position-column-line-format
+                                    (current-buffer)))
+      ;; 页码元素照样装上（与 doom-modeline 是否加载无关）
+      (should (member seshat-reader--page-mode-line mode-line-misc-info))))))
 
 (provide 'seshat-reading-test)
 ;;; seshat-reading-test.el ends here

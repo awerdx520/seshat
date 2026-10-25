@@ -86,7 +86,7 @@ ETAF 渲染层是可选外部依赖：`Makefile` 先探测 `~/Workspace/emacs-ta
 - `find-file` 打开即进 `seshat-reader-mode`：`seshat-reader.el` 加载时按 `seshat-reader-supported-formats` 注册 `auto-mode-alist`（小写扩展名）；`init-reader.el` 另补一套大小写不敏感关联，故 `.PDF` / `.Pdf` 也能直接进阅读器。**注意**：加载项目层 `emacs/seshat-reading.el` 后 `auto-mode-alist` 被 `seshat-reading-mode` 接管（渲染仍 100% 来自 reader），见下节「阅读模式」。
 - `M-x seshat-reader-open-doc` 交互式读文件名，候选只含 `seshat-reader-supported-formats` 中的扩展名。
 - 打开的瞬间按 `seshat-reader-default-fit` 的初值适配——默认 `contain`（取 `min(按高, 按宽)`，整页可见），可设为 `width` / `height` 让新窗口一开始就按该维度填满；`W` / `H` 在会话内覆盖它，见第 12 节。
-- 模式行默认显示 `P<n>/<总页数>`（`seshat-reader-mode-line`）。
+- 模式行显示 `[当前页/总页]`：原生 modeline 走 `mode-line-position`（`P<n>/<总页数>`）；doom-modeline 这类**整体接管 `mode-line-format`** 的第三方 modeline 不读 `mode-line-position`，故同一页码同时以 `:eval` 元素挂到 `mode-line-misc-info`（`seshat-reader--page-mode-line` → `seshat-reader--page-indicator`，跟随 redisplay 求值，无需重建 modeline；doom-modeline 的 misc-info segment 会 `format-mode-line` 它）。文档尚未加载完时该项显示 `[?/?]`，不报错、不阻塞 redisplay。同时在阅读 buffer 内**隐藏 doom-modeline 的行列段**——整页只有一行，`1:0` 恒无信息量，`seshat-reader-mode-line` 会把 `doom-modeline-position-column-line-format` / `-line-format` / `-column-format` 在本 buffer 设为 `("")`（`boundp` 守卫，非 doom-modeline 环境零副作用；不用 `nil`，因为该段会 `(car …)` 后 `string-replace`）。
 
 > **窗口尺寸变化后自动重贴合**：开关目录（`o`）或批注面板（`C-c C-l`）会改变阅读区宽度，阅读器会在同一次重绘内按当前的**适配模式**（`fit-mode`，见下段；未选择时为 `contain`）把页面缩放到目标几何，并由 idle 阶段补一次清晰化重渲染（几何不变，画面只从模糊变清晰）。用户手动缩放过的窗口（`+` / `-` / `=` / `0`）会保留缩放比例，只归位滚动位置。拖分割线期间不会逐帧重渲染，停手后只重算一次。
 >
