@@ -51,10 +51,11 @@ Emacs 端文档阅读器（`emacs/seshat-reader/`）：MuPDF 负责栅格化、C
   (require 'seshat-reader-annotation nil t)
   (require 'seshat-reader-sidebar nil t)
   (require 'seshat-reader-reference nil t)
-  (require 'seshat-reader-translate nil t))
+  (require 'seshat-reader-translate nil t)
+  (require 'seshat-reader-help nil t))
 ```
 
-扩展模块的加载顺序有约束：`seshat-reader` 最先；`seshat-reader-sidebar` 紧随其后（零依赖承载层）；`seshat-reader-annotation` 依赖 `seshat-rest`；`seshat-reader-reference` 依赖批注的 `roots` 配置；`seshat-reader-translate` 依赖 `seshat-reader`。
+扩展模块的加载顺序有约束：`seshat-reader` 最先；`seshat-reader-sidebar` 紧随其后（零依赖承载层）；`seshat-reader-annotation` 依赖 `seshat-rest`；`seshat-reader-reference` 依赖批注的 `roots` 配置；`seshat-reader-translate` 依赖 `seshat-reader`。`seshat-reader-help`（`?` 帮助页）零依赖、可放最后，也可以**不 require**：`?` 已写进 `seshat-reader-mode-map`，而 `seshat-reader-help` 自带 `;;;###autoload`，第一次按 `?` 时由 autoload 懒加载（上面显式 require 只为把帮助页提前加载好，幂等无害）。
 
 ### 手动 load-path + make
 
@@ -69,6 +70,7 @@ make -C emacs/seshat-reader all      # 产物：seshat-render-core.so、*.elc、
 (require 'seshat-reader-annotation)
 (require 'seshat-reader-reference)
 (require 'seshat-reader-translate)
+(require 'seshat-reader-help)
 ```
 
 ETAF 渲染层是可选外部依赖：`Makefile` 先探测 `~/Workspace/emacs-taf` / `~/WorkSpace/emacs-taf` 源码树，缺失时回退 straight 的 `build-*` 目录；两者都没有时 `seshat-reader-etaf.el` **不参与 `.elc` 编译**（运行期由 `(require 'seshat-reader-etaf nil t)` 软加载并降级）。可用 `make ETAF_ROOT=/path/to/emacs-taf` 覆盖位置。
@@ -297,6 +299,8 @@ Emacs 端**只显示**手写（无笔事件、无压感，输入永远在 Androi
 | `C-c C-s`（面板内） | `seshat-reader-translate-save-as-annotation` | 把最近一次译文存为批注 |
 | `C-c w`（面板内） | `seshat-reader-sidebar-toggle-width` | 面板宽度切换：常态 ↔ `seshat-reader-sidebar-expanded-width`（默认 `0.75`），再按一次恢复原宽度 |
 
+- **结果缓存（仅本会话内存）**：翻译与解释的结果按键 `(KIND PRESET LANGS REQUEST-TEXT)` 存在 `seshat-reader-translate--cache` 里——同一段内容、同一预设与语言对**再次打开不再请求**，直接按模板重绘面板并回显「使用缓存结果」；解释路径的 `REQUEST-TEXT` 是装配好的「上下文 + 原文 + 指令」串，因此**上下文不同即视为不同条目**（同一句原文在不同页、邻近文字不同，各存一份）。要跳过缓存重新生成按 `C-u`（`C-c C-t` / `C-c C-e` 的 `C-u` 前缀既读目标语言也强制重算）；想整体丢弃用 `M-x seshat-reader-translate-clear-cache`。缓存**不落盘**、重启 Emacs 即清空；posframe 承载下的流式结果不写缓存（面板路径恒为非流式，写入点在 `seshat-reader-translate--record-result` 的成功分支）。
+
 - **解释带同页上下文**：`C-c C-e` 送模型的是「结构化指令 + 同页邻近上下文（上下各 `seshat-reader-translate-context-lines` 行，上限 `seshat-reader-translate-context-max-chars` 字）+ 选区原文（上限 `seshat-reader-translate-explain-max-chars` 字）」，不再只是孤立片段；指令模板可用 `seshat-reader-translate-explain-prompt` 自定义（设 `nil` 退回「纯选区 + 预设引擎自带 prompt」的旧行为），关掉上下文用 `(setq seshat-reader-translate-context-enabled nil)`。**注意隐私**：默认会把同页邻近正文一并送出（见 [`llm.md`](llm.md)「隐私提示」）。
 - 依赖 go-translate：`seshat-reader-translate-preset`（默认 `reader`）与 `seshat-reader-translate-explain-preset`（默认 `reader-explain`）按名从 `seshat-reader-translate-presets` → `gt-preset-translators` 依次取用（seshat 自有表优先，故这两个预设不必进 gt 全局表）；预设通常定义在**用户配置侧**，缺失时翻译回退内置 youdao/google，解释需显式配置端点。gt 的中转 buffer `" *Seshat gt*"` 由包隐藏，用户无需改 `display-buffer-alist`。
 - 呈现方式由 `seshat-reader-translate-render`（默认 `sidebar`）决定：`sidebar` 写进面板内的**只读 Markdown 文本 buffer**（`gfm-view-mode` → `markdown-view-mode` → `text-mode` 降级链，原生折行/滚动/复制/isearch 可用，**不经 ETAF**）；`pop`（posframe 弹出、失焦消失）；`pin`（posframe 常驻）。取 `sidebar` 但 `seshat-reader-sidebar-enabled` 为 `nil` 时退回 `pop` 式 posframe。
@@ -431,6 +435,7 @@ Emacs 端**只显示**手写（无笔事件、无压感，输入永远在 Androi
 | `C-c C-q` | `seshat-reader-translate-follow-up` | 对译文 / 解释继续追问（多轮上下文） |
 | `M-o` | `seshat-reader-sidebar-toggle` | **全部面板**开合：有面板就全部关闭，没有就重开最近一个 |
 | `C-c w` | `seshat-reader-sidebar-toggle-width` | 面板宽度**切换**：常态宽度（`seshat-reader-sidebar-width` / `seshat-reader-outline-sidebar-width`）↔ `seshat-reader-sidebar-expanded-width`（默认 `0.75`）；再按一次恢复原宽度。同一键位在译文面板 / 批注列表 / 目录面板内也生效 |
+| `?` | `seshat-reader-help` | 打开本帮助页：键位、功能简介与面板行为（`seshat-reader-help` 自带 autoload，无需 require，见「安装与加载」） |
 
 `C-c C-o` **已解绑**（让给 org / `outline-minor-mode` 的结构操作）：单个 kind 的开合改由各自
 的键承担（`o` 目录、`C-c C-l` 批注列表、`C-c C-t` / `C-c C-e` 译文与解释），全部开合统一走
@@ -613,6 +618,10 @@ M12 回归（strip 行破坏页面几何 + `--center-page` 在 `window-size-chan
 | ETAF 渲染 | 见上一条，终端/无 frame 下可能挂起 |
 | 批注、引用、队列、翻译文本 | 与窗口无关，功能正常 |
 
+**按 `?` 没反应怎么办**
+
+先确认键位与加载状态：在阅读 buffer 里 `(key-binding (kbd "?"))` 应为 `seshat-reader-help`、`(autoloadp (symbol-function 'seshat-reader-help))` 为 `t`（或 `(require 'seshat-reader-help nil t)` 返回非 nil，说明模块可加载——autoload 已注册，无需预先 require）。若手动管理 load-path，确认 `seshat-reader-help.el` 与 `seshat-reader.el` 在**同一目录**（autoloads 与 `require` 都按文件名找）。`?` 只在阅读 buffer 里被本包接管，其它 buffer 仍是 `describe-mode`——当前 buffer 不是 `seshat-reader-mode` 当然没反应。仍为 `nil` 说明加载的是旧 `.elc`（键位表里还没有这一行）：`make clean all` 后重启 Emacs。
+
 ## 12. 已知限制
 
 以下条目全部出自 [`../openspec/tech-debt.md`](../openspec/tech-debt.md)，如实列出，未做美化。
@@ -652,6 +661,7 @@ M12 回归（strip 行破坏页面几何 + `--center-page` 在 `window-size-chan
 | 文件 | 职责 |
 |---|---|
 | `seshat-reader.el` | major mode、键位表、翻页/滚动/缩放/旋转/适配、页面 overlay 与几何、跨页 strip、C 模块加载与构建 |
+| `seshat-reader-help.el` | `?` 帮助页：按运行时 keymap 解析键位、功能简介与面板行为（零依赖，autoload 懒加载） |
 | `seshat-reader-select.el` | 鼠标框选取文 + 选区闪现 |
 | `seshat-reader-annotation.el` | 批注 CRUD、`document_id` / `location` 解析、页面高亮投喂、批注列表 |
 | `seshat-reader-annotation-queue.el` | 离线队列（读写、原子写、定时同步） |
@@ -700,9 +710,9 @@ GTROOT=$(dirname "$(find "$HOME" -maxdepth 6 -type d \
 echo "$GTROOT"
 ```
 
-现有套件：`seshat-reader-page-join-test.el`、`seshat-reader-sidebar-test.el`、`seshat-reader-outline-test.el`、`seshat-reader-annotation-test.el`、`seshat-reader-annotation-queue-test.el`、`seshat-reader-annotation-v8-test.el`、`seshat-reader-annotation-decoration-test.el`（21 例）、`seshat-reader-annotation-ink-test.el`（24 例）、`seshat-reader-search-test.el`（**19 例**）、`seshat-reader-select-flash-test.el`、`seshat-reader-select-merge-test.el`（18 例）、`seshat-reader-select-scope-test.el`（7 例）、`seshat-reader-select-report-test.el`（**7 例**，M12 T8a 新增：框选回显只报行列数、`seshat-reader-select-message-limit` 已删除）、`seshat-reader-translate-test.el`（115 例）、`seshat-reader-reference-test.el`、`seshat-reader-resize-test.el`、`seshat-reader-etaf-test.el`、`seshat-rest-test.el`、`seshat-state-test.el`、`seshat-transport-test.el`、`seshat-conflict-test.el`（10 例）、`seshat-merge-test.el`（13 例）、`seshat-sync-cmd-test.el`（14 例）、`seshat-sync-test.el`（77 例）、`seshat-reading-test.el`（**45 例**）。**前置**：`seshat-render-core.so` 已构建，否则加载 `seshat-reader` 会触发交互式构建询问并阻塞 batch 运行。
+现有套件：`seshat-reader-page-join-test.el`、`seshat-reader-sidebar-test.el`（115 例）、`seshat-reader-outline-test.el`、`seshat-reader-annotation-test.el`、`seshat-reader-annotation-queue-test.el`、`seshat-reader-annotation-v8-test.el`、`seshat-reader-annotation-decoration-test.el`（21 例）、`seshat-reader-annotation-ink-test.el`（24 例）、`seshat-reader-search-test.el`（**19 例**）、`seshat-reader-select-flash-test.el`、`seshat-reader-select-merge-test.el`（18 例）、`seshat-reader-select-scope-test.el`（7 例）、`seshat-reader-select-report-test.el`（**7 例**，M12 T8a 新增：框选回显只报行列数、`seshat-reader-select-message-limit` 已删除）、`seshat-reader-translate-test.el`（138 例）、`seshat-reader-reference-test.el`、`seshat-reader-resize-test.el`、`seshat-reader-etaf-test.el`、`seshat-rest-test.el`、`seshat-state-test.el`、`seshat-transport-test.el`、`seshat-conflict-test.el`（10 例）、`seshat-merge-test.el`（13 例）、`seshat-sync-cmd-test.el`（14 例）、`seshat-sync-test.el`（77 例）、`seshat-reading-test.el`（**45 例**）。**前置**：`seshat-render-core.so` 已构建，否则加载 `seshat-reader` 会触发交互式构建询问并阻塞 batch 运行。
 
-**必须逐文件运行**：一次 `emacs --batch` 加载全部测试文件时，`seshat-reader-annotation-test.el` 与 `seshat-reader-annotation-queue-test.el` 各有 3 个列表渲染用例会失败——同时加载 `etaf` 测试后 `etaf-ui` 变为可用，批注列表改走 EBOX/ETAF 渲染，而那两个用例断言的是纯文本（如 `"没有批注"`）。这是**既有基线特性、不是回归**：全仓用例总数按逐文件求和计（当前 **25** 个文件合计 **896** 例，0 unexpected / 0 skipped；translate 套件例数含 gt 预设隔离与解释质量并行改动（74 → **115**））。跑全仓脚本见下（`for` 循环逐文件执行，任一文件非零退出即整体失败）：
+**必须逐文件运行**：一次 `emacs --batch` 加载全部测试文件时，`seshat-reader-annotation-test.el` 与 `seshat-reader-annotation-queue-test.el` 各有 3 个列表渲染用例会失败——同时加载 `etaf` 测试后 `etaf-ui` 变为可用，批注列表改走 EBOX/ETAF 渲染，而那两个用例断言的是纯文本（如 `"没有批注"`）。这是**既有基线特性、不是回归**：全仓用例总数按逐文件求和计（当前 **25** 个文件合计 **950** 例，0 unexpected / 0 skipped；translate 套件例数含 gt 预设隔离、解释质量并行改动与结果缓存（74 → **138**））。跑全仓脚本见下（`for` 循环逐文件执行，任一文件非零退出即整体失败）：
 
 ```bash
 cd /home/thomas/Workspace/seshat && rm -f emacs/seshat-reader/*.elc && \

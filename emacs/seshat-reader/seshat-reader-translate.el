@@ -206,6 +206,37 @@ posframe 路径经 `seshat-reader-translate--capture-result' 从输出 hook 调�
 `seshat-reader-translate-save-as-annotation' 会以 `user-error' 提示「尚无
 译文」，不会把上一次的旧译文误存为批注。")
 
+(defvar seshat-reader-translate--cache (make-hash-table :test #'equal)
+  "翻译/解释结果缓存：KEY → 结果字符串.
+KEY 为 `(KIND PRESET LANGS REQUEST-TEXT)'：KIND 取 `translate' / `explain'
+（译文与解释**不共用**条目——两者的模板与模型输入都不同），PRESET 是本次使用
+的 gt 预设名，LANGS 是目标语言列表，REQUEST-TEXT 是**实际送给模型的文本**
+（译文路径为纯选区，解释路径为 `seshat-reader-translate--explain-request-text'
+装配出的「上下文 + 原文 + 指令」串，故上下文变化自然视为不同条目）。
+
+命中的效果与「重新请求」一致：把结果写进
+`seshat-reader-translate-last-result'，再按原模板渲染面板，只是**不发起请求**。
+`C-u' 前缀（或 `seshat-reader-translate-selection' 的 FORCE 参数）跳过命中。
+
+**仅本会话内存**：不落盘、不跨 Emacs 进程，重启即清空；清空用
+`seshat-reader-translate-clear-cache'。**流式路径不写缓存**：面板路径恒为非
+流式（`seshat-reader-translate--stream-wanted-p' 对面板返回 nil），故缓存只在
+`seshat-reader-translate--record-result' 的成功分支写入——posframe 模式的流式
+增量不经过该函数，其结果不进本表（要缓存就让面板承载接管，或关掉流式）。")
+
+(defvar seshat-reader-translate--pending-cache-key nil
+  "本次请求成功后要写入 `seshat-reader-translate--cache' 的 KEY，或 nil.
+**只由 `seshat-reader-translate--render-object' 的 `:then' 回调动态绑定**
+（`let`），并只在回调内被 `seshat-reader-translate--record-result' 读取一次、
+随后清回 nil；它**没有**全局值，也不由命令 `setq'。
+
+为什么绑定放在回调里：gt 的请求是**异步**完成的，命令返回时结果还没到，命令
+里的动态绑定那时早已出栈。`:then' 闭包捕获了本次请求的 KEY（由
+`--translator' 经 `--cache-key' 算出），在回调执行时再建立绑定，于是「写缓存」
+与「这次请求」严格一一对应——不会出现「上一个请求留下的 KEY 被下一个请求的
+结果写入」这种串条目，也正是靠这条，posframe / 流式路径（不经过 `:then'）
+天然不写缓存。")
+
 (defvar seshat-reader-translate--active nil
   "最近一次本包发起的翻译/解释的启动时间戳（the function `float-time' 的返回值），或 nil.
 由 `seshat-reader-translate-selection' 与
@@ -827,7 +858,7 @@ CONTEXT 选定模板（`explain' 用 `seshat-reader-translate-explain-template'�
           (seshat-reader-translate--follow-up-update-answer result)
           result)))))
 
-(defun seshat-reader-translate--render-object (mode &optional title langs context)
+(defun seshat-reader-translate--render-object (mode &optional title langs context cache-key)
   "按 MODE 构造一个 gt 渲染对象，TITLE 为译文面板的 header-line 标题.
 MODE 为 `sidebar' 且 `seshat-reader-sidebar-enabled' 非 nil 时，返回 go-translate
 function `gt-buffer-render'，让 gt 渲染到**隐藏中转 buffer**：`:name' 取
@@ -855,7 +886,14 @@ TITLE 由 `seshat-reader-translate--translator' 按 context 传入（译作
 
 CONTEXT 同样由 `seshat-reader-translate--translator' 传入（`translate' 或
 `explain'），经 `:then' 回调原样转交 `seshat-reader-translate--render-panel'，
-由后者据其选择翻译模板或解释模板；默认 nil 时按翻译模板处理。"
+由后者据其选择翻译模板或解释模板；默认 nil 时按翻译模板处理。
+
+CACHE-KEY 由 `--translator' 传入（`--cache-key' 构造的键，或 nil）：sidebar
+分支把 `:then' 回调里的 `seshat-reader-translate--pending-cache-key' 动态绑定
+成它，`--record-result' 据此在这次请求成功后写缓存。绑定写在**回调内**而不是
+命令内——请求是异步完成的，命令的动态绑定那时已出栈，只有闭包捕获的 KEY 能在
+回调触发时重新建立绑定。CACHE-KEY 为 nil（或 posframe 分支，那里不经过
+`:then'）时 `--record-result' 不写缓存，与「posframe 流式结果不缓存」一致。"
   (pcase mode
     ('pin (gt-posframe-pin-render))
     ('sidebar
@@ -869,11 +907,12 @@ CONTEXT 同样由 `seshat-reader-translate--translator' 传入（`translate' 或
             :then (lambda (&rest _args)
                     ;; 先判定「增量期间是否已建骨架」，再调 `--panel-result'
                     ;; ——后者会清掉骨架标志，顺序反了就走不到流式分支。
-                    (let ((streamed (seshat-reader-translate--panel-streamed-p))
-                          (result (seshat-reader-translate--panel-result)))
-                      (when (and result (not streamed))
-                        (seshat-reader-translate--render-panel
-                         result title langs context))))))
+                    (let ((seshat-reader-translate--pending-cache-key cache-key))
+                      (let ((streamed (seshat-reader-translate--panel-streamed-p))
+                            (result (seshat-reader-translate--panel-result)))
+                        (when (and result (not streamed))
+                          (seshat-reader-translate--render-panel
+                           result title langs context)))))))
        (gt-posframe-pop-render)))
     (_ (gt-posframe-pop-render))))
 
@@ -1263,6 +1302,26 @@ TEXT 为 nil 或非字符串时原样返回。本函数是纯函数，不读写�
                    (alist-get preset (gt-ensure-plain gt-preset-translators)))))
     (if (functionp value) (funcall value) value)))
 
+(defun seshat-reader-translate--cache-key (context preset langs text)
+  "返回翻译/解释结果的缓存键，形式为 `(KIND PRESET LANGS TEXT)'.
+KIND 由 CONTEXT 归一：`explain' → `explain'，其余（含 nil）→ `translate'——
+译文与解释的模板、模型输入都不同，必须分表。PRESET 是 gt 预设名，LANGS 是
+目标语言列表，TEXT 是**实际送模型的文本**（译文为纯选区，解释为装配好的
+「上下文 + 原文 + 指令」串）。
+
+本函数是键结构的**单一来源**：命令查表、`--translator' 交给 `:then' 回调写表，
+都调它，避免「查的键」与「写的键」两处手写而漂移（那种漂移的表现为「缓存永远
+不命中、或者命中到别的请求」）。"
+  (list (if (eq context 'explain) 'explain 'translate) preset langs text))
+
+(defun seshat-reader-translate--title (context)
+  "返回面板标题：CONTEXT 为 `explain' 时是解释标题，其余为译文标题.
+把「语境 → 标题」的映射收敛到一处：`seshat-reader-translate--translator' 用它
+写面板 header-line 与流式状态，两个命令的缓存命中分支用它重绘面板——命中缓存
+时不装配 translator，若无本函数就得在命令里重复一份同样的判断，两处一旦漂移就
+会出现「首次请求显示『Seshat 译文』、命中缓存显示别的标题」。"
+  (if (eq context 'explain) "Seshat 解释" "Seshat 译文"))
+
 (defun seshat-reader-translate--translator (preset text langs &optional context request-text)
   "为 PRESET、TEXT 与 LANGS 构造一个可供 gt 使用的翻译器对象.
 PRESET 是预设名（符号）：先查 `seshat-reader-translate-presets'，未命中
@@ -1297,7 +1356,14 @@ CONTEXT 用于区分预设缺失时的提示文案，并决定面板模板，取
 `seshat-reader-translate--stream-sync' 的守卫与骨架创建使用）。"
   (seshat-reader-translate--ensure-gt)
   (let* ((preset-trans (seshat-reader-translate--preset-translator preset))
-         (title (if (eq context 'explain) "Seshat 解释" "Seshat 译文"))
+         (title (seshat-reader-translate--title context))
+         ;; 本次请求的缓存键：与命令查表用的是同一个构造函数（见
+         ;; `--cache-key'），故「查的键」与「写的键」不会漂移。它被交给
+         ;; `--render-object'，由 `:then' 回调在**回调执行时**把
+         ;; `--pending-cache-key' 动态绑定成它——请求是异步完成的，命令里的
+         ;; `let'/`setq' 那时早已出栈，只有闭包捕获的静态绑定能在回调里存活。
+         (cache-key (seshat-reader-translate--cache-key
+                     context preset langs (or request-text text)))
          (trans (if preset-trans
                     (clone preset-trans)
                   (message (if (eq context 'explain)
@@ -1308,7 +1374,8 @@ CONTEXT 用于区分预设缺失时的提示文案，并决定面板模板，取
                                                 (gt-google-engine))))))
     (oset trans taker (gt-taker :text (or request-text text) :pick nil :langs langs))
     (oset trans render (seshat-reader-translate--render-object
-                        seshat-reader-translate-render title langs context))
+                        seshat-reader-translate-render title langs context
+                        cache-key))
     (when (seshat-reader-translate--stream-wanted-p)
       (setq seshat-reader-translate--stream-title title
             seshat-reader-translate--stream-langs langs
@@ -1516,7 +1583,12 @@ TEXT。posframe 路径与面板路径（`seshat-reader-translate--panel-result'�
 gt 的 translator `text' 槽可能是**分段列表**，直接写进
 `seshat-reader-translate-last-result' 会让后续
 `seshat-reader-translate-save-as-annotation' 的 `string-trim' 崩溃（同源
-第二现场）。"
+第二现场）。
+
+成功分支同时把净化后的文本写入 `seshat-reader-translate--cache'——KEY 取自
+`seshat-reader-translate--pending-cache-key'（命令在发起请求前登记，为 nil 时
+不写，故 posframe 流式等不经过本函数的路径自然不缓存），写完把该变量清回
+nil。"
   (let ((text (car extracted))
         (failed (cdr extracted)))
     (cond
@@ -1531,7 +1603,18 @@ gt 的 translator `text' 槽可能是**分段列表**，直接写进
         (setq seshat-reader-translate-last-result
               (if seshat-reader-translate-strip-chatter
                   (seshat-reader-translate--strip-chatter clean)
-                clean)))))))
+                clean))
+        ;; 成功即写缓存。KEY 由命令在发起请求前登记到
+        ;; `seshat-reader-translate--pending-cache-key'（本函数拿不到请求参数；
+        ;; 异步回调场景下动态绑定已出栈，故那条路径用全局变量传递）。写入值取
+        ;; 刚写好的 `last-result'，保证「命中缓存看到的内容」与首次请求逐字一
+        ;; 致；写完清回 nil，一个 KEY 只被消费一次。
+        (when seshat-reader-translate--pending-cache-key
+          (puthash seshat-reader-translate--pending-cache-key
+                   seshat-reader-translate-last-result
+                   seshat-reader-translate--cache)
+          (setq seshat-reader-translate--pending-cache-key nil))
+        seshat-reader-translate-last-result)))))
 
 (defun seshat-reader-translate--capture-result ()
   "从当前缓冲区捕获纯译文并写入 `seshat-reader-translate-last-result'.
@@ -2279,7 +2362,7 @@ marker），再更新状态（`:round' 自增、`:answer-marker'、`:answer-star
 
 ;;; 交互式命令
 
-(defun seshat-reader-translate-selection (&optional target-lang)
+(defun seshat-reader-translate-selection (&optional target-lang force)
   "翻译最近一次鼠标选区，译文经信息面板展示（默认）或 posframe 弹出.
 TARGET-LANG 为非空字符串时用作目标语言：源语言取
 `seshat-reader-translate-fallback-langs' 的第一个元素，目标语言为
@@ -2314,33 +2397,58 @@ youdao/google 翻译器。呈现方式见 `seshat-reader-translate-render'：默
 误存，也避免其它 go-translate 用法污染结果）。
 
 翻译路径不做长度截断（选区通常只有几个词）；解释路径的长度护栏见
-`seshat-reader-translate-explain-selection'。"
-  (interactive (list (when current-prefix-arg (read-string "目标语言: "))))
+`seshat-reader-translate-explain-selection'。
+
+**缓存**：`(translate 预设 语言 选区原文)' 命中
+`seshat-reader-translate--cache' 时**不发起请求**——直接把缓存结果写进
+`seshat-reader-translate-last-result' 并按原模板重绘面板，回显
+「使用缓存结果（`C-u' 重新生成）」。FORCE 非 nil（`C-u' 前缀）时跳过缓存、照常
+请求；`C-u' 同时仍会读目标语言（既有行为不变）。"
+  (interactive (list (when current-prefix-arg (read-string "目标语言: "))
+                     current-prefix-arg))
   (let* ((text (seshat-reader-translate--selection-text))
          (langs (if (and (stringp target-lang)
                          (not (string-empty-p (string-trim target-lang))))
                     (seshat-reader-translate--target-langs target-lang)
-                  seshat-reader-translate-fallback-langs)))
-    ;; `trans' 在 `condition-case' 之外绑定：错误分支要靠它取引擎标识
-    ;; （见 `seshat-reader-translate--engine-label'），绑定在受保护体内部
-    ;; 的 `let' 里时 handler 看不到。
-    (let (trans)
-      (condition-case err
-          (progn
-            (setq trans (seshat-reader-translate--translator
-                         seshat-reader-translate-preset text langs 'translate))
-            (seshat-reader-translate--install-capture-hook-for-mode)
-            (setq seshat-reader-translate-last-result nil)
-            (setq seshat-reader-translate--active (float-time))
-            (gt-start trans))
-        (user-error
-         (signal (car err) (cdr err)))
-        (error
-         (message "Seshat Reader translate: 翻译失败%s：%s"
-                  (if trans (seshat-reader-translate--engine-label trans) "")
-                  (error-message-string err)))))))
+                  seshat-reader-translate-fallback-langs))
+         ;; 缓存键把「预设 + 语言对 + **送给模型的文本**」一起纳入：预设换了、
+         ;; 目标语言换了都算不同条目；译文路径送模型的就是纯选区，故文本相同即
+         ;; 内容相同。
+         (key (seshat-reader-translate--cache-key
+               'translate seshat-reader-translate-preset langs text))
+         (cached (and (not force)
+                      (gethash key seshat-reader-translate--cache))))
+    (if cached
+        ;; 命中：只重绘，不碰 translator、不启动 gt、不更新捕获时间戳（没有请求
+        ;; 需要被捕获），因此 `--capture-result' 的窗口守卫也不会被这次操作打开。
+        (progn
+          (setq seshat-reader-translate-last-result cached)
+          (seshat-reader-translate--render-panel
+           cached (seshat-reader-translate--title 'translate) langs 'translate)
+          (message "Seshat Reader translate: 使用缓存结果（C-u 重新生成）"))
+      ;; 未命中：照原路请求。缓存写入的 KEY 不在命令里登记——它由
+      ;; `--translator' 用同一个构造函数算出、随渲染对象交给 `:then' 回调，在
+      ;; 回调内动态绑定 `--pending-cache-key'（见 `--render-object'）。
+      ;; `trans' 在 `condition-case' 之外绑定：错误分支要靠它取引擎标识
+      ;; （见 `seshat-reader-translate--engine-label'），绑定在受保护体内部
+      ;; 的 `let' 里时 handler 看不到。
+      (let (trans)
+        (condition-case err
+            (progn
+              (setq trans (seshat-reader-translate--translator
+                           seshat-reader-translate-preset text langs 'translate))
+              (seshat-reader-translate--install-capture-hook-for-mode)
+              (setq seshat-reader-translate-last-result nil)
+              (setq seshat-reader-translate--active (float-time))
+              (gt-start trans))
+          (user-error
+           (signal (car err) (cdr err)))
+          (error
+           (message "Seshat Reader translate: 翻译失败%s：%s"
+                    (if trans (seshat-reader-translate--engine-label trans) "")
+                    (error-message-string err))))))))
 
-(defun seshat-reader-translate-explain-selection (&optional target-lang)
+(defun seshat-reader-translate-explain-selection (&optional target-lang force)
   "解释（而非纯翻译）最近一次鼠标选区，译文经信息面板展示（默认）或 posframe 弹出.
 TARGET-LANG 的语义与 `seshat-reader-translate-selection' 完全相同：非空
 字符串时用作目标语言（源语言取 `seshat-reader-translate-fallback-langs'
@@ -2378,8 +2486,15 @@ taker 的 `:text'；面板原文引用块（`%q'）与 `last-result' 语义不�
 长度护栏：装配前先用 `seshat-reader-translate--truncate-selection' 按
 `seshat-reader-translate-explain-max-chars' 截断**送模型的选区原文**，
 超限时尾部追加「（选区过长，以上为节选）」；面板引用块与追问来源仍取
-完整选区文本。"
-  (interactive (list (when current-prefix-arg (read-string "目标语言: "))))
+完整选区文本。
+
+**缓存**：键为 `(explain 预设 语言 REQUEST-TEXT)'，其中 REQUEST-TEXT 就是装配
+好的「上下文 + 原文 + 指令」串——因此**同一段原文在不同上下文（不同页 / 邻近
+文字不同）下是两个条目**，不会把上一处的解释套到这一处。命中时照
+`seshat-reader-translate-selection' 的做法直接重绘面板并提示「使用缓存结果」，
+不发请求；FORCE 非 nil（`C-u' 前缀）跳过命中、强制重新生成。"
+  (interactive (list (when current-prefix-arg (read-string "目标语言: "))
+                     current-prefix-arg))
   (let* ((text (seshat-reader-translate--selection-text))
          (langs (if (and (stringp target-lang)
                          (not (string-empty-p (string-trim target-lang))))
@@ -2398,26 +2513,53 @@ taker 的 `:text'；面板原文引用块（`%q'）与 `last-result' 语义不�
          (request-text (seshat-reader-translate--explain-request-text
                         send-text context-text
                         (seshat-reader-translate--document-title)
-                        langs)))
-    ;; `trans' 在 `condition-case' 之外绑定：错误分支要靠它取引擎标识
-    ;; （见 `seshat-reader-translate--engine-label'），绑定在受保护体内部
-    ;; 的 `let' 里时 handler 看不到。
-    (let (trans)
-      (condition-case err
-          (progn
-            (setq trans (seshat-reader-translate--translator
-                         seshat-reader-translate-explain-preset text langs 'explain
-                         request-text))
-            (seshat-reader-translate--install-capture-hook-for-mode)
-            (setq seshat-reader-translate-last-result nil)
-            (setq seshat-reader-translate--active (float-time))
-            (gt-start trans))
-        (user-error
-         (signal (car err) (cdr err)))
-        (error
-         (message "Seshat Reader translate: 解释失败%s：%s"
-                  (if trans (seshat-reader-translate--engine-label trans) "")
-                  (error-message-string err)))))))
+                        langs))
+         ;; 键里的 REQUEST-TEXT 已含上下文，故上下文不同即不同条目。
+         (key (seshat-reader-translate--cache-key
+               'explain seshat-reader-translate-explain-preset
+               langs request-text))
+         (cached (and (not force)
+                      (gethash key seshat-reader-translate--cache))))
+    (if cached
+        ;; 命中：与译文路径同构——只重绘，不发请求、不动捕获时间戳。
+        (progn
+          (setq seshat-reader-translate-last-result cached)
+          (seshat-reader-translate--render-panel
+           cached (seshat-reader-translate--title 'explain) langs 'explain)
+          (message "Seshat Reader translate: 使用缓存结果（C-u 重新生成）"))
+      ;; 未命中：照原路请求；缓存 KEY 由 `--translator' 用同一个构造函数算出,
+      ;; 随渲染对象交给 `:then' 回调（见 `--render-object'）。
+      ;; `trans' 在 `condition-case' 之外绑定：错误分支要靠它取引擎标识
+      ;; （见 `seshat-reader-translate--engine-label'），绑定在受保护体内部
+      ;; 的 `let' 里时 handler 看不到。
+      (let (trans)
+        (condition-case err
+            (progn
+              (setq trans (seshat-reader-translate--translator
+                           seshat-reader-translate-explain-preset text langs 'explain
+                           request-text))
+              (seshat-reader-translate--install-capture-hook-for-mode)
+              (setq seshat-reader-translate-last-result nil)
+              (setq seshat-reader-translate--active (float-time))
+              (gt-start trans))
+          (user-error
+           (signal (car err) (cdr err)))
+          (error
+           (message "Seshat Reader translate: 解释失败%s：%s"
+                    (if trans (seshat-reader-translate--engine-label trans) "")
+                    (error-message-string err))))))))
+
+(defun seshat-reader-translate-clear-cache ()
+  "清空翻译/解释的结果缓存（`seshat-reader-translate--cache'）.
+缓存只在**本会话内存**里：容量随「用过的原文 × 语言对 × 预设」增长，完全不
+落盘，重启 Emacs 自然清空。本命令用于会话内主动释放——例如改了预设的 prompt
+或换了模型之后，想立刻丢掉旧结果重新生成，又不想退出 Emacs。
+
+清空后所有请求都回到「重新请求」路径（`C-u' 强制重算因此不再必要）。只影响
+缓存，不动 `seshat-reader-translate-last-result' 与已显示的面板内容。"
+  (interactive)
+  (clrhash seshat-reader-translate--cache)
+  (message "Seshat Reader translate: 翻译/解释缓存已清空"))
 
 (defun seshat-reader-translate-save-as-annotation ()
   "把最近一次译文存为服务端批注（**侧车**，不写回文档）.
@@ -2477,33 +2619,36 @@ taker 的 `:text'；面板原文引用块（`%q'）与 `last-result' 语义不�
 ;; （`seshat-reader-translate-selection' / `-explain-selection'）**保留不变**，
 ;; 脚本化调用（`M-x'、用户配置里的 `define-key'）语义不受影响，永远执行翻译。
 
-(defun seshat-reader-translate-toggle (&optional target-lang)
+(defun seshat-reader-translate-toggle (&optional target-lang force)
   "译文面板开合：已显示则关闭，否则翻译选区并弹出.
 「已显示」由 `seshat-reader-sidebar-panel-visible-p' 判定（承载无关：side
 window / 底部窗口 / child frame 一律算已显示），关闭走
 `seshat-reader-sidebar--toggle-kind'——只关 `translate' 这一 kind，批注列表与
 目录面板不受影响，且关闭前捕获尺寸、记住 buffer 供 `M-o' 重开。
 
-未显示时原样调用 `seshat-reader-translate-selection'（TARGET-LANG 语义与它
-完全一致，`C-u' 前缀参数读目标语言）。渲染方式取 `pop' / `pin'（posframe）时
-面板不是承载单元，本命令恒判「未显示」→ 行为与原命令一致（每次都翻译），无需特判。"
-  (interactive (list (when current-prefix-arg (read-string "目标语言: "))))
+未显示时原样调用 `seshat-reader-translate-selection'（TARGET-LANG 与 FORCE
+语义都与它完全一致，`C-u' 前缀参数既读目标语言也强制重新生成、跳过缓存）。
+渲染方式取 `pop' / `pin'（posframe）时面板不是承载单元，本命令恒判「未显示」
+→ 行为与原命令一致（每次都翻译），无需特判。"
+  (interactive (list (when current-prefix-arg (read-string "目标语言: "))
+                     current-prefix-arg))
   (if (seshat-reader-sidebar-panel-visible-p 'translate)
       (seshat-reader-sidebar--toggle-kind 'translate)
-    (seshat-reader-translate-selection target-lang)))
+    (seshat-reader-translate-selection target-lang force)))
 
-(defun seshat-reader-translate-explain-toggle (&optional target-lang)
+(defun seshat-reader-translate-explain-toggle (&optional target-lang force)
   "解释面板开合：已显示则关闭，否则解释选区并弹出.
-TARGET-LANG 语义与 `seshat-reader-translate-toggle' 完全相同（`C-u' 前缀参数
-读目标语言）。与它同构，区别只在「未显示」分支调用
+TARGET-LANG 与 FORCE 语义与 `seshat-reader-translate-toggle' 完全相同（`C-u'
+前缀参数既读目标语言也强制重新生成）。与它同构，区别只在「未显示」分支调用
 `seshat-reader-translate-explain-selection'（解释而非纯翻译）。译文与解释共用
 同一个面板 kind（`translate'）与同一个展示 buffer，故两者**互为开合**：译文
 面板开着时再触发解释会关掉同一个面板，而不会生成一份新解释——这是刻意的，一个
 面板只承载一份最新结果，否则两个命令会争同一个 buffer。"
-  (interactive (list (when current-prefix-arg (read-string "目标语言: "))))
+  (interactive (list (when current-prefix-arg (read-string "目标语言: "))
+                     current-prefix-arg))
   (if (seshat-reader-sidebar-panel-visible-p 'translate)
       (seshat-reader-sidebar--toggle-kind 'translate)
-    (seshat-reader-translate-explain-selection target-lang)))
+    (seshat-reader-translate-explain-selection target-lang force)))
 
 ;;; 键位
 

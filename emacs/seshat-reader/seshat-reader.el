@@ -1650,6 +1650,9 @@ window and never recovers."
 ;; We explicitly bind default keys because relying on the rebinding
 ;; mechanism can lead to them not being bound at all if users have
 ;; overridden the defaults with other commands.
+;; `seshat-reader-help' 在另一个文件里，这里只声明不 require（首次调用由
+;; autoload 加载），声明同时消掉字节编译的未定义函数告警。
+(declare-function seshat-reader-help "seshat-reader-help")
 (defvar-keymap seshat-reader-mode-map
   :doc "Keymap for `seshat-reader-mode'."
   "n"       #'seshat-reader-next-page
@@ -1716,6 +1719,11 @@ window and never recovers."
   "o"       #'seshat-reader-outline-toggle
 
   "Q"       #'seshat-reader-close-doc
+
+  ;; "?" 打开内置帮助页：`seshat-reader-help' 自带 `;;;###autoload'，首次按下
+  ;; 时由 autoload 懒加载该模块，故这里**不需要** require 它，也不会把帮助
+  ;; 模块拖进阅读器的加载路径。
+  "?"       #'seshat-reader-help
 
 
   ;; Disable a few mouse commands to make sure the user is not able to

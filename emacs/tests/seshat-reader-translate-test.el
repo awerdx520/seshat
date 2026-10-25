@@ -62,6 +62,14 @@
         :rect '(10.0 20.0 30.0 40.0)
         :file seshat-reader-translate-test--selection-file))
 
+(defun seshat-reader-translate-test--fresh-cache ()
+  "返回一张空的翻译/解释缓存表.
+`seshat-reader-translate--cache' 是**会话级**全局状态，用例之间必须隔离：
+前一个用例成功写入的条目会让后一个用例「误命中缓存」而跳过 `gt-start'，表现为
+莫名其妙的 `captured` 为 nil。凡是走真实请求路径、或断言请求是否发生的用例，
+都在 `let' 里把它绑成这个函数的返回值."
+  (make-hash-table :test #'equal))
+
 ;;; 软依赖 gt 的按需加载
 
 (ert-deftest seshat-reader-translate-test--ensure-gt-missing-errors ()
@@ -98,6 +106,7 @@
         (seshat-reader-translate-fallback-langs '(en zh))
         (seshat-reader-translate-preset 'reader)
         (seshat-reader-translate-render 'pop)
+        (seshat-reader-translate--cache (seshat-reader-translate-test--fresh-cache))
         (gt-preset-translators nil)
         (gt-posframe-pop-render-output-hook nil)
         (gt-posframe-pin-render-output-hook nil)
@@ -122,6 +131,7 @@
   (let ((seshat-reader-select-last (seshat-reader-translate-test--selection))
         (seshat-reader-translate-fallback-langs '(en zh))
         (seshat-reader-translate-preset 'reader)
+        (seshat-reader-translate--cache (seshat-reader-translate-test--fresh-cache))
         (gt-preset-translators nil)
         (gt-posframe-pop-render-output-hook nil)
         (gt-posframe-pin-render-output-hook nil)
@@ -147,6 +157,7 @@
          (seshat-reader-select-last (seshat-reader-translate-test--selection))
          (seshat-reader-translate-preset 'chosen)
          (seshat-reader-translate-render 'pin)
+         (seshat-reader-translate--cache (seshat-reader-translate-test--fresh-cache))
          (gt-preset-translators presets)
          (gt-posframe-pop-render-output-hook nil)
          (gt-posframe-pin-render-output-hook nil)
@@ -172,6 +183,7 @@
   (let ((seshat-reader-select-last (seshat-reader-translate-test--selection))
         (seshat-reader-translate-fallback-langs '(en zh))
         (seshat-reader-translate-preset 'reader)
+        (seshat-reader-translate--cache (seshat-reader-translate-test--fresh-cache))
         (gt-preset-translators nil)
         (gt-posframe-pop-render-output-hook nil)
         (gt-posframe-pin-render-output-hook nil)
@@ -221,6 +233,7 @@
     (let ((seshat-reader-select-last (seshat-reader-translate-test--selection))
           (seshat-reader-translate-preset 'reader)
           (seshat-reader-translate-render (car case))
+          (seshat-reader-translate--cache (seshat-reader-translate-test--fresh-cache))
           (gt-preset-translators nil)
           (gt-posframe-pop-render-output-hook nil)
           (gt-posframe-pin-render-output-hook nil)
@@ -970,6 +983,7 @@ ENTRIES 是 `(TEXT FAILED SOURCE)' 列表。gt 的 `gt-buffer-render-init' 把�
   "`gt-start' 抛 `user-error' 时命令原样冒泡、不崩溃、不吞掉提示."
   (let ((seshat-reader-select-last (seshat-reader-translate-test--selection))
         (seshat-reader-translate-preset 'reader)
+        (seshat-reader-translate--cache (seshat-reader-translate-test--fresh-cache))
         (gt-preset-translators nil)
         (gt-posframe-pop-render-output-hook nil)
         (gt-posframe-pin-render-output-hook nil)
@@ -987,6 +1001,7 @@ ENTRIES 是 `(TEXT FAILED SOURCE)' 列表。gt 的 `gt-buffer-render-init' 把�
   "`gt-start' 抛一般 error 时命令捕获并 message 提示、不冒泡."
   (let ((seshat-reader-select-last (seshat-reader-translate-test--selection))
         (seshat-reader-translate-preset 'reader)
+        (seshat-reader-translate--cache (seshat-reader-translate-test--fresh-cache))
         (gt-preset-translators nil)
         (gt-posframe-pop-render-output-hook nil)
         (gt-posframe-pin-render-output-hook nil)
@@ -1083,6 +1098,7 @@ M 为链路上 `message' 的文本。
          (seshat-reader-sidebar-enabled t)
          (seshat-reader-translate-show-source nil)
          (seshat-reader-translate-preset 'reader)
+         (seshat-reader-translate--cache (seshat-reader-translate-test--fresh-cache))
          (gt-preset-translators nil)
          (seshat-reader-sidebar-translate-buffer-name "*Seshat T6 Panel*")
          (seshat-reader-translate--gt-buffer-name " *Seshat T6 gt*")
@@ -1148,6 +1164,7 @@ M 为链路上 `message' 的文本。
          (seshat-reader-sidebar-enabled t)
          (seshat-reader-translate-show-source nil)
          (seshat-reader-translate-preset 'reader)
+         (seshat-reader-translate--cache (seshat-reader-translate-test--fresh-cache))
          (gt-preset-translators nil)
          (seshat-reader-sidebar-translate-buffer-name "*Seshat T6 Panel*")
          (seshat-reader-translate--gt-buffer-name " *Seshat T6 gt*")
@@ -2419,6 +2436,7 @@ STATE 为 plist（可含 `:source' `:answer' `:langs' `:kind' `:round' `:turns'
         (seshat-reader-translate-render 'pop)
         (seshat-reader-translate-stream nil)
         (seshat-reader-translate-last-result "旧结果")
+        (seshat-reader-translate--cache (seshat-reader-translate-test--fresh-cache))
         (gt-preset-translators nil)
         (gt-posframe-pop-render-output-hook nil)
         (gt-posframe-pin-render-output-hook nil)
@@ -2564,6 +2582,7 @@ STATE 为 plist（可含 `:source' `:answer' `:langs' `:kind' `:round' `:turns'
          (seshat-reader-translate-fallback-langs '(en zh))
          (seshat-reader-select-last (list :text "Hello world"))
          (seshat-reader-translate-last-result nil)
+         (seshat-reader-translate--cache (seshat-reader-translate-test--fresh-cache))
          (gt-posframe-pop-render-output-hook nil)
          (gt-posframe-pin-render-output-hook nil)
          (messages nil))
@@ -2654,7 +2673,7 @@ STATE 为 plist（可含 `:source' `:answer' `:langs' `:kind' `:round' `:turns'
               ((symbol-function 'seshat-reader-sidebar--toggle-kind)
                (lambda (kind) (push kind toggles)))
               ((symbol-function 'seshat-reader-translate-selection)
-               (lambda (&optional _lang) (push 'translated translated))))
+               (lambda (&optional _lang _force) (push 'translated translated))))
       (seshat-reader-translate-toggle))
     (should (equal toggles '(translate)))
     (should-not translated)))
@@ -2668,7 +2687,7 @@ STATE 为 plist（可含 `:source' `:answer' `:langs' `:kind' `:round' `:turns'
               ((symbol-function 'seshat-reader-sidebar--toggle-kind)
                (lambda (kind) (push kind toggles)))
               ((symbol-function 'seshat-reader-translate-selection)
-               (lambda (&optional lang) (push lang langs))))
+               (lambda (&optional lang _force) (push lang langs))))
       (seshat-reader-translate-toggle "ja"))
     (should-not toggles)
     (should (equal langs '("ja")))))
@@ -2683,7 +2702,7 @@ STATE 为 plist（可含 `:source' `:answer' `:langs' `:kind' `:round' `:turns'
               ((symbol-function 'seshat-reader-sidebar--toggle-kind)
                (lambda (kind) (push kind toggles)))
               ((symbol-function 'seshat-reader-translate-explain-selection)
-               (lambda (&optional _lang) (push 'explained explained))))
+               (lambda (&optional _lang _force) (push 'explained explained))))
       (seshat-reader-translate-explain-toggle))
     (should (equal toggles '(translate)))
     (should-not explained))
@@ -2696,13 +2715,191 @@ STATE 为 plist（可含 `:source' `:answer' `:langs' `:kind' `:round' `:turns'
               ((symbol-function 'seshat-reader-sidebar--toggle-kind)
                (lambda (kind) (push kind toggles)))
               ((symbol-function 'seshat-reader-translate-explain-selection)
-               (lambda (&optional lang) (push lang explained)))
+               (lambda (&optional lang _force) (push lang explained)))
               ((symbol-function 'seshat-reader-translate-selection)
-               (lambda (&optional _lang) (push 'translated translated))))
+               (lambda (&optional _lang _force) (push 'translated translated))))
       (seshat-reader-translate-explain-toggle "ja"))
     (should-not toggles)
     (should (equal explained '("ja")))
     (should-not translated)))
+
+;;; 翻译/解释结果缓存（2026-10-26）
+
+(defun seshat-reader-translate-test--with-cache-stubs (fn)
+  "在「不发请求」的桩环境下调用 FN，返回结果 plist.
+桩替三个出口：`gt-start'（只计数，不发起任何网络请求）、
+`seshat-reader-sidebar-show'（记录面板 buffer，不真的开窗口）、`message'
+（收集回显文本）。返回 `(:started N :messages M :panel B)'：N 为 `gt-start'
+被调用的次数（0 表示完全走缓存路径），M 为回显文本列表，B 为被显示的面板
+buffer（未显示则为 nil）。"
+  (let ((started 0)
+        (messages nil)
+        (panel nil))
+    (cl-letf (((symbol-function 'gt-start)
+               (lambda (_translator) (cl-incf started) nil))
+              ((symbol-function 'seshat-reader-sidebar-show)
+               (lambda (buffer _kind &optional _select)
+                 (setq panel buffer)
+                 'fake-window))
+              ((symbol-function 'message)
+               (lambda (fmt &rest args)
+                 (push (apply #'format fmt args) messages)
+                 nil)))
+      (funcall fn))
+    (list :started started :messages (nreverse messages) :panel panel)))
+
+(defun seshat-reader-translate-test--cache-key (kind preset langs text)
+  "按实现口径构造缓存 KEY：KIND、PRESET、LANGS、TEXT 依次成表.
+测试直接复现键结构（而不是调用实现里的构造函数——实现里并没有这个函数），
+故键结构一旦改变，本 helper 与用例需同步调整。"
+  (list kind preset langs text))
+
+(ert-deftest seshat-reader-translate-test--cache-hit-skips-request ()
+  "命中缓存时**不**调用 `gt-start'：直接重绘面板、回显缓存提示、写入 last-result."
+  (skip-unless (require 'gt nil t))
+  (skip-unless (require 'gt-render-buffer nil t))
+  (let* ((seshat-reader-select-last (seshat-reader-translate-test--selection))
+         (seshat-reader-translate-show-source nil)
+         (seshat-reader-translate-last-result nil)
+         (seshat-reader-translate--cache (make-hash-table :test #'equal))
+         (seshat-reader-sidebar-translate-buffer-name "*Seshat cache-hit panel*")
+         (gt-posframe-pop-render-output-hook nil)
+         (gt-posframe-pin-render-output-hook nil)
+         (key (seshat-reader-translate-test--cache-key
+               'translate seshat-reader-translate-preset
+               seshat-reader-translate-fallback-langs "Hello world"))
+         (result nil)
+         (panel nil))
+    (puthash key "CACHED" seshat-reader-translate--cache)
+    (unwind-protect
+        (progn
+          (setq result (seshat-reader-translate-test--with-cache-stubs
+                        (lambda () (seshat-reader-translate-selection))))
+          (setq panel (plist-get result :panel))
+          ;; ① 一次请求都没发
+          (should (= 0 (plist-get result :started)))
+          ;; ② 面板被重新绘制，正文含缓存结果（模板包了一层，故用正则）
+          (should (bufferp panel))
+          (should (string-match-p
+                   "CACHED"
+                   (with-current-buffer panel (buffer-string))))
+          ;; ③ 结果同步进 last-result（存为批注仍可用）
+          (should (equal seshat-reader-translate-last-result "CACHED"))
+          ;; ④ 回显明确告知走了缓存
+          (should (cl-some (lambda (msg) (string-match-p "使用缓存结果" msg))
+                           (plist-get result :messages))))
+      (when (buffer-live-p panel) (kill-buffer panel)))))
+
+(ert-deftest seshat-reader-translate-test--cache-key-includes-context ()
+  "同一原文、不同上下文视为不同条目：预置的「上下文 A」条目不会命中「上下文 B」.
+键里放的是**实际送模型的文本**，解释路径的该串由上下文装配而成，故上下文一变
+键就变——这正是「解释的 context 不同即不同条目」的落点。"
+  (skip-unless (require 'gt nil t))
+  (skip-unless (require 'gt-render-buffer nil t))
+  (let* ((seshat-reader-select-last (seshat-reader-translate-test--selection))
+         (seshat-reader-translate-show-source nil)
+         (seshat-reader-translate-last-result nil)
+         (seshat-reader-translate--cache (make-hash-table :test #'equal))
+         (gt-posframe-pop-render-output-hook nil)
+         (gt-posframe-pin-render-output-hook nil)
+         (langs seshat-reader-translate-fallback-langs)
+         (request-a (seshat-reader-translate--explain-request-text
+                     "Hello world" "CTX-A" "doc.pdf" langs))
+         (key-a (seshat-reader-translate-test--cache-key
+                 'explain seshat-reader-translate-explain-preset langs request-a))
+         (result nil))
+    (puthash key-a "CACHED-A" seshat-reader-translate--cache)
+    (cl-letf (((symbol-function 'seshat-reader-translate--context-text)
+               (lambda () "CTX-B"))
+              ((symbol-function 'seshat-reader-translate--document-title)
+               (lambda () "doc.pdf")))
+      (setq result (seshat-reader-translate-test--with-cache-stubs
+                    (lambda () (seshat-reader-translate-explain-selection)))))
+    ;; 上下文不同 → 未命中 → 真的发起了请求
+    (should (= 1 (plist-get result :started)))
+    (should-not (cl-some (lambda (msg) (string-match-p "使用缓存结果" msg))
+                         (plist-get result :messages)))))
+
+(ert-deftest seshat-reader-translate-test--cache-force-bypasses ()
+  "FORCE 非 nil（`C-u'）时即使命中也不使用缓存，照常请求."
+  (skip-unless (require 'gt nil t))
+  (skip-unless (require 'gt-render-buffer nil t))
+  (let* ((seshat-reader-select-last (seshat-reader-translate-test--selection))
+         (seshat-reader-translate-show-source nil)
+         (seshat-reader-translate-last-result nil)
+         (seshat-reader-translate--cache (make-hash-table :test #'equal))
+         (seshat-reader-translate--pending-cache-key nil)
+         (gt-posframe-pop-render-output-hook nil)
+         (gt-posframe-pin-render-output-hook nil)
+         (key (seshat-reader-translate-test--cache-key
+               'translate seshat-reader-translate-preset
+               seshat-reader-translate-fallback-langs "Hello world"))
+         (result nil))
+    (puthash key "CACHED" seshat-reader-translate--cache)
+    (setq result (seshat-reader-translate-test--with-cache-stubs
+                  (lambda () (seshat-reader-translate-selection nil t))))
+    (should (= 1 (plist-get result :started)))
+    (should-not (cl-some (lambda (msg) (string-match-p "使用缓存结果" msg))
+                         (plist-get result :messages)))))
+
+(ert-deftest seshat-reader-translate-test--cache-record-result-writes ()
+  "请求成功后写入缓存：`:then' 回调里的 `--record-result' 把结果记进表，再打开即命中."
+  (skip-unless (require 'gt nil t))
+  (skip-unless (require 'gt-render-buffer nil t))
+  (let* ((seshat-reader-select-last (seshat-reader-translate-test--selection))
+         (seshat-reader-translate-show-source nil)
+         (seshat-reader-translate-render 'sidebar)
+         (seshat-reader-sidebar-enabled t)
+         (seshat-reader-translate-last-result nil)
+         (seshat-reader-translate--cache (seshat-reader-translate-test--fresh-cache))
+         (seshat-reader-translate--pending-cache-key nil)
+         (seshat-reader-sidebar-translate-buffer-name "*Seshat cache-write panel*")
+         (seshat-reader-translate--gt-buffer-name " *Seshat cache-write gt*")
+         (gt-posframe-pop-render-output-hook nil)
+         (gt-posframe-pin-render-output-hook nil)
+         (key (seshat-reader-translate-test--cache-key
+               'translate seshat-reader-translate-preset
+               seshat-reader-translate-fallback-langs "Hello world"))
+         (chain nil)
+         (panel nil)
+         (second-run nil))
+    (unwind-protect
+        (progn
+          ;; ① 完整链路：`gt-start' 桩写入 gt-result，再触发 `:then' 回调
+          (setq chain (seshat-reader-translate-test--panel-chain))
+          (setq panel (plist-get chain :panel))
+          (should (equal (gethash key seshat-reader-translate--cache)
+                         seshat-reader-translate-test--translated-text))
+          (should (equal seshat-reader-translate-last-result
+                         seshat-reader-translate-test--translated-text))
+          ;; ② 待写 KEY 只被消费一次
+          (should-not seshat-reader-translate--pending-cache-key)
+          ;; ③ 同一请求再来一次 → 命中缓存，`gt-start' 不再被调用
+          (setq second-run (seshat-reader-translate-test--with-cache-stubs
+                            (lambda () (seshat-reader-translate-selection))))
+          (should (= 0 (plist-get second-run :started)))
+          (should (equal seshat-reader-translate-last-result
+                         seshat-reader-translate-test--translated-text)))
+      (when (buffer-live-p panel) (kill-buffer panel)))))
+
+(ert-deftest seshat-reader-translate-test--cache-clear-empties ()
+  "`seshat-reader-translate-clear-cache' 清空整张表并回显."
+  (let ((seshat-reader-translate--cache (make-hash-table :test #'equal))
+        (messages nil))
+    (puthash (seshat-reader-translate-test--cache-key
+              'translate 'reader '(en zh) "Hello")
+             "译文" seshat-reader-translate--cache)
+    (puthash (seshat-reader-translate-test--cache-key
+              'explain 'reader-explain '(en zh) "Prompt")
+             "解释" seshat-reader-translate--cache)
+    (should (= 2 (hash-table-count seshat-reader-translate--cache)))
+    (cl-letf (((symbol-function 'message)
+               (lambda (fmt &rest args)
+                 (push (apply #'format fmt args) messages)
+                 nil)))
+      (seshat-reader-translate-clear-cache))
+    (should (= 0 (hash-table-count seshat-reader-translate--cache)))
+    (should (cl-some (lambda (msg) (string-match-p "缓存已清空" msg)) messages))))
 
 (provide 'seshat-reader-translate-test)
 ;;; seshat-reader-translate-test.el ends here

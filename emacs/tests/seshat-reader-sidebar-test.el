@@ -75,6 +75,8 @@
 (require 'seshat-reader)
 (require 'seshat-reader-sidebar)
 (require 'seshat-reader-translate)
+;; 帮助页模块：`?' 绑定与 `*Seshat Reader Help*' 的内容断言都要用到它。
+(require 'seshat-reader-help)
 
 ;;; 显示参数（--display-params / --display）
 
@@ -2706,6 +2708,54 @@ kind 由 buffer 名推断；命令必须把 kind 交给 `--toggle-kind'（它按
               #'seshat-reader-sidebar-toggle-width))
   (should (eq (lookup-key seshat-reader-outline-mode-map (kbd "C-c w"))
               #'seshat-reader-sidebar-toggle-width)))
+
+;;; 帮助页（seshat-reader-help，2026-10-26）
+
+(ert-deftest seshat-reader-sidebar-test--help-creates-special-mode-buffer ()
+  "`seshat-reader-help' 生成只读 `special-mode' 帮助页，内容含真实键位与功能词."
+  (let ((buffer nil)
+        (displayed nil))
+    (unwind-protect
+        (progn
+          (cl-letf (((symbol-function 'pop-to-buffer)
+                     (lambda (b &optional _action) (setq displayed b) b)))
+            (setq buffer (seshat-reader-help)))
+          (should (buffer-live-p buffer))
+          (should (eq buffer (get-buffer seshat-reader-help-buffer-name)))
+          (should (eq displayed buffer))
+          (with-current-buffer buffer
+            (should (eq major-mode 'special-mode))
+            (should buffer-read-only)
+            (let ((content (buffer-string)))
+              ;; 键位来自真实绑定（`M-o' 由 sidebar 模块注册），不是硬编码字符串
+              (should (string-match-p
+                       (regexp-quote (key-description (kbd "M-o")))
+                       content))
+              ;; 至少 5 个功能词
+              (dolist (word '("翻译" "解释" "追问" "批注" "目录" "搜索" "缓存"))
+                (should (string-match-p (regexp-quote word) content))))))
+      (when (buffer-live-p buffer) (kill-buffer buffer)))))
+
+(ert-deftest seshat-reader-sidebar-test--help-bound-to-question-mark ()
+  "阅读 buffer 的 `?' 绑到 `seshat-reader-help'（override `special-mode' 的 `describe-mode'）."
+  (should (eq (lookup-key seshat-reader-mode-map (kbd "?"))
+              #'seshat-reader-help)))
+
+(ert-deftest seshat-reader-sidebar-test--help-reuses-buffer ()
+  "重复调用复用同一个帮助 buffer，不新建、不清空."
+  (let ((first nil)
+        (second nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'pop-to-buffer)
+                   (lambda (b &optional _action) b)))
+          (setq first (seshat-reader-help))
+          (let ((buffers-before (length (buffer-list))))
+            (setq second (seshat-reader-help))
+            (should (eq first second))
+            ;; 不新建 buffer：总数不变
+            (should (= buffers-before (length (buffer-list))))
+            (should (> (with-current-buffer second (buffer-size)) 0))))
+      (when (buffer-live-p first) (kill-buffer first)))))
 
 (provide 'seshat-reader-sidebar-test)
 ;;; seshat-reader-sidebar-test.el ends here
