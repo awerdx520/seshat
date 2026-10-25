@@ -66,6 +66,19 @@
 
 > ETAF 四仓库（`ecss` / `ebox` / `etaf` / `etaf-ui`）**不入本仓库**：属软依赖，安装、开关与降级说明见 `docs/configuration.md`。
 
+### 本轮自研改动登记（2026-10-25，面板承载批次）
+
+面板承载 / 流式 / 追问 / 复制回显批次（计划 `openspec/active/2026-10-24-emacs-reader-panel-childframe-and-ux.md`）在四处的改动范围：
+
+| 文件 | 本次改动范围 |
+|---|---|
+| `seshat-reader-sidebar.el` | **childframe 承载后端**：`seshat-reader-panel-carrier`（默认 `childframe`）与 per-kind 覆盖 `seshat-reader-panel-carrier-alist`、`--carrier-for-kind` 解析、`--cf-show` / `--cf-position` / `--cf-size` / `--cf-close`、固定尺寸 + 多面板纵向堆叠、非图形环境强制回退窗口、`--panel-for-kind`、`seshat-reader-panel-hide-on-buffer-change`、`seshat-reader-sidebar-quit`（按承载单元分派 `delete-window` / `delete-frame`） |
+| `seshat-reader-translate.el` | **流式增量**（`seshat-reader-translate-stream`：骨架 marker + `gt-buffer-render-output-hook` 增量，配 `gt-buffer-render-translator` 身份守卫）、**多引擎来源标注**（`-engines-pick` + `--format-engine-results`）、**多轮追问**（`-follow-up` / `C-c C-q`、以 messages 形式克隆 `gt-chatgpt-engine`、`-follow-up-max-rounds` 轮次上限） |
+| `seshat-reader-outline.el` | **跨 frame 跳转**：childframe 承载下目录面板不在阅读窗口所在 frame，`seshat-reader-outline-goto-entry` 先 `-select-doc-window` 切回阅读窗口、再 `(redisplay t)` 强制重绘**所有** frame（无参 `redisplay` 只刷子 frame，父 frame 的页面会停在上一次内容），最后 `goto-page`；`o` 的开合判定改用 `--panel-for-kind`（childframe 下「面板」是 frame 而非窗口） |
+| `seshat-reader-select.el` | **复制回显改行列统计**：`--report` 只报 `已复制 N 行 · M 字` / `已选中 N 行 · M 字`，并删除截断常量 `seshat-reader-select-message-limit` |
+
+> 前三处为**本仓库自研扩展**；`seshat-reader-outline.el` 属 vendored 文件改名后的持续本地修改（见上节清单）。**从上游 vendor 重拷 seshat-reader 时须保留这四个文件的本地版本**，不得覆盖或删除。
+
 ## 目录内容
 
 - `seshat-reader.el`、`seshat-reader-bookmark.el`、`seshat-reader-outline.el`、`seshat-reader-saveplace.el` — 上游派生的 elisp 源码（已改名）

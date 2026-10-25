@@ -198,6 +198,14 @@ M0–M6 已完成并归档，见 `openspec/completed/personal-notes-system.md`�
 - 状态：**已完成并归档（2026-10-24）**——全仓 ERT 637 → **669**（19 个文件，0 unexpected / 0 skipped）；L3 真机 5 项待人工（`find-file` 进 reading-mode、四态显示、入库后自动 `[库]`、库内批注可见、纯 reader 仍可批注）。
 - 关系：本计划**不替代** M8.4 多根分流与书籍列表 UI；「库外批注 + 入库迁移」记 tech-debt。
 
+### M12 后续：阅读器面板 childframe 覆盖承载 + 流式 + 多轮追问 + 复制回显
+
+计划与执行记录：`openspec/active/2026-10-24-emacs-reader-panel-childframe-and-ux.md`（代码与文档完成，待真机验收后归档）。
+
+| 子项 | 内容 | 状态 |
+|---|---|---|
+| — | **阅读器面板 childframe 覆盖承载 + 流式 + 多轮追问 + 复制回显** | ✅ 代码/文档完成（2026-10-25）；L3 真机验收与 thomas-emacs 配置改动待办；见 `openspec/active/2026-10-24-emacs-reader-panel-childframe-and-ux.md` |
+
 ## 风险登记
 
 | # | 风险 | 影响 | 缓解 |

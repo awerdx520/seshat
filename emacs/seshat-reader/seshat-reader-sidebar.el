@@ -74,6 +74,15 @@
 ;; 只对本包面板窗口（带 `seshat-reader-sidebar' window parameter）逐个
 ;; `delete-window'。
 ;;
+;; **两类承载后端**：显示前经 `seshat-reader-panel-carrier' 与逐 kind 覆盖表
+;; `seshat-reader-panel-carrier-alist' 解析承载方式后分派。child frame **打开
+;; 即固定尺寸**（父 frame 宽高之比 `seshat-reader-panel-width' / `-height'，
+;; 距右上边缘 `seshat-reader-panel-margin' 像素），覆盖在父 frame 右上角且
+;; **不参与窗口树**——显示 / 刷新 / 滚动都不改变阅读窗口尺寸，多面板经
+;; `--cf-position' 纵向堆叠；非图形环境（`display-graphic-p' 为 nil）强制回退
+;; 窗口承载。`seshat-reader-sidebar-quit' 按**承载单元**关闭：窗口走
+;; `delete-window'、child frame 走 `delete-frame'。
+;;
 ;; 本文件是**本仓库自研扩展**：从上游 vendor 重拷 seshat-reader 时应保留本
 ;; 文件、不得覆盖（vendor 边界见同目录 VENDORED.md）。
 

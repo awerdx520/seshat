@@ -48,13 +48,24 @@
 ;; - `pop'/`pin'：回退 posframe（`gt-posframe-pop-render' 弹出、失焦即消失 /
 ;;   `gt-posframe-pin-render' 常驻），可在配置侧切回。
 ;;
+;; 多引擎来源标注（`seshat-reader-translate-engines-pick'，默认 `all'）：多引擎
+;; 预设本就是为了一眼比对各家译文，故默认展示**全部成功结果**，每条前标
+;; `【引擎名】'、段间用 Markdown 分隔线 `---'（`--format-engine-results'）；
+;; `first' / `last' 只留第一个 / 最后一个**成功**结果且不带标签。带
+;; `gt-buffer-render-error-face' 的片段视为失败并跳过（`first' 顺延到下一个
+;; 成功片段），来源取不到时退化为纯译文。
+;;
 ;; 流式增量（`seshat-reader-translate-stream'，默认开启）：构造翻译器时把
 ;; **克隆后的**引擎的 `stream' 槽设为 t（引擎对象也要再克隆——eieio 的
 ;; `clone' 是浅拷贝，translator 的 `engines' 槽与预设共享同一批引擎对象），
 ;; 并把 `gt-buffer-render-output-hook' 的增量同步到面板：首个增量写入模板
 ;; 骨架（正文 `%t' 为空）并记录正文起点 marker，后续只替换 marker 之后的
 ;; 正文区；完成时只更新 header-line 状态、不 erase 重写（避免完成瞬间整块
-;; 跳变）。`stream' 为 nil 或引擎无该槽时退回「完成即整体渲染」的旧路径。
+;; 跳变）。**hook 守卫**：`gt-buffer-render-output-hook' 不带参数，只能事后
+;; 比对中转 buffer 的 buffer-local `gt-buffer-render-translator' 与本次登记的
+;; translator（`--current-translator'）是否 `eq`——这是绕过 gt 内部约定的
+;; HACK；gt 若改名或改时机，守卫退化为永不匹配，面板静默退回完成时整体渲染
+;; （不出错、只是没有中间过程）。`stream' 为 nil 或引擎无该槽时同样退回旧路径。
 ;;
 ;; 多轮追问（`seshat-reader-translate-follow-up'，面板键位 `C-c C-q'）：解释
 ;; 或译文面板里可以针对**同一段原文**继续提问，历史轮次以 OpenAI messages
@@ -67,7 +78,10 @@
 ;; `user-error' 提示改配置，**不做文本拼接降级**——翻译引擎没有对话语义，
 ;; 降级只会产出误导性答案。追问的中转 buffer 与首轮分开
 ;; （` *Seshat gt follow-up*'），增量只替换「当前轮答案区」的 marker 区间，
-;; 不触碰首轮骨架与此前各轮问答。
+;; 不触碰首轮骨架与此前各轮问答。轮次上限由
+;; `seshat-reader-translate-follow-up-max-rounds'（默认 6）控制——超出后丢弃
+;; 最早的轮次，但首轮原文与首轮解释恒保留（否则追问失去讨论对象），取 0 表示
+;; 每次只看原文与首轮解释。
 ;;
 ;; 捕获译文：面板路径在 `:then' 回调内完成（`--panel-result'），不依赖任何
 ;; 全局 hook，故零误捕获；posframe 路径复用

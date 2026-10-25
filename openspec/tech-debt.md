@@ -1335,3 +1335,52 @@
 - 现状：整行吸附的几何（每行 x0/x1、行数、双栏互斥）已在隔离实例（`elisp-test`，tty frame）里用模块函数返回值与 ERT 断言验证，但**像素级**确认（高亮实际画在哪几个像素、有无越界出页）需要把页面 image 真正渲染出来；隔离实例是 tty frame，`create-image` 无法创建图像，页面 overlay 的 `display` 落不成位图，故像素级对照只能留待图形帧。
 - 影响：算法级结论（返回值）可靠，视觉结论（是否看起来是整行）仍只在托管用户的主实例里由肉眼确认过，未做自动化像素断言。
 - 解除条件：在图形 frame 环境（或主实例显式授权）里跑同一框选，导出页面 PNM 做逐像素/边界断言。
+
+## gt 流式 hook 守卫依赖 gt 内部变量名与 hook 时机（2026-10-25 面板承载批次）
+
+- 现象：流式增量的归属判定（`seshat-reader-translate--stream-sync`）只能事后比对中转 buffer 的 buffer-local `gt-buffer-render-translator` 与本次登记的 translator 是否 `eq`——`gt-buffer-render-output-hook` 不带任何参数，没有别的可用标识。这是绕过 gt 内部约定的 HACK。
+- 影响：gt 升级若把该变量改名、写到别的 buffer-local 上、或改变 hook 的触发时机，守卫会**永久失配且不报错**：面板静默退回「完成时整体渲染」，用户只感觉「这次没有边生成边显示」。排查入口是 header-line 在生成期间是否变化。
+- 来源：`openspec/active/2026-10-24-emacs-reader-panel-childframe-and-ux.md`
+- 解除条件：gt 提供带 translator 参数（或 stream id）的输出 hook 后改走正式接口；或本包侧对「守卫连续失配」计数并告警一次（当前无告警是刻意的保守取舍——流式与否属体验差异，不是功能错误）。
+
+## `"Loading..."` 占位符按字面量匹配（2026-10-25 面板承载批次）
+
+- 现象：`seshat-reader-translate--extract-result` 的 `SKIP-LOADING` 分支用 `string=` 把片段文本与常量 `seshat-reader-translate--loading-text`（字面 `"Loading..."`）比较，以丢弃 gt 尚未产出结果的占位片段。
+- 影响：gt 若改文案（大小写、省略号形态、本地化），占位符不再被识别，会**短暂作为译文**写进面板与 `seshat-reader-translate-last-result`；流式下表现为答案开头多一行 `Loading…`，完成后被正文替换，只在生成期间可见——容易被当成「gt 自己的小毛病」而无人排查。
+- 来源：`openspec/active/2026-10-24-emacs-reader-panel-childframe-and-ux.md`
+- 解除条件：改为结构判据（该片段不含 `gt-result` 文本属性即视为占位），或在启动时按 gt 实际写入的占位文本动态取常量。
+
+## 追问与首轮流式并发时 `--current-translator` 是单例（2026-10-25 面板承载批次）
+
+- 现象：`seshat-reader-translate--current-translator` 只有一个槽，登记的是**最近一次**装配的 translator。首轮译文尚未完成时发起追问（`C-c C-q`）会把它改写成追问的 translator。
+- 影响：首轮的迟到增量此时不再满足 `eq` 守卫，因此**不会**写进追问答案区（守卫已缓解）；但守卫只保证「不匹配就不写」，一旦 gt 在同一 buffer-local 上的写入次序与预期相反、或将来放宽守卫，首轮增量仍可能落进追问的答案区，表现为答案里混入译文片段。**已缓解、未根治**。
+- 来源：`openspec/active/2026-10-24-emacs-reader-panel-childframe-and-ux.md`
+- 解除条件：改为 **per-request 令牌**——每次请求生成唯一 id 并随请求携带，增量按 id 归属，而不是按「最近一次」归属。
+
+## 多 child frame 面板按固定 margin 纵向堆叠，无底部避让（2026-10-25 面板承载批次）
+
+- 现象：`seshat-reader-sidebar--cf-position` 只按 `TOP = margin + Σ(已存在面板高 + margin)` 往下排，**不检查父 frame 高度**（docstring 明确只把非数值/非正项跳过，不做上界夹紧）。
+- 影响：目录 + 译文两个面板同时显示时，若父 frame 过矮（矮屏、缩小后的 frame、或两面板高度比例之和逼近 1），后一个面板会**溢出父 frame 底部**：面板自身有内部滚动条，但 frame 本身位于父 frame 之外，用户看不到也滚不到。
+- 来源：`openspec/active/2026-10-24-emacs-reader-panel-childframe-and-ux.md`
+- 解除条件：`--cf-position` 增加底部夹紧（`TOP` 上界取「父高 − 面板高 − margin」），空间不足时降级为「只显示最近一个面板」，或按可用高度动态压缩 `seshat-reader-panel-height`。
+
+## `make all` 产物的忽略规则只由 vendored `.gitignore` 承担（2026-10-25 面板承载批次，原假设已修正）
+
+- 现象：`*.elc` 与 `seshat-reader-autoloads.el` 实际由 **`emacs/seshat-reader/.gitignore`** 排除（实测 `git check-ignore -v` 分别命中其 `*.elc` 与 `seshat-reader-autoloads.el` 两行）；仓库根 `.gitignore` 的「构建产物」段只列 `/bin/`、`/dist/`、`*.exe`、`/server`，**不含**这两个模式。故构建后 `git status` 并**不会**变脏（本批次实测：`make -C emacs/seshat-reader all` 之后工作区只有本次待提交改动，无 `.elc` 条目）。
+- 影响：该 `.gitignore` 属 vendored 目录内文件（本仓库已无逐文件对照上游的能力，见 `VENDORED.md`「同步策略」），**从上游重拷整个目录时会被覆盖**；若覆盖后的版本不再含 `seshat-reader-autoloads.el` 行，构建产物就落回未跟踪状态，`git status` 每次验证后变脏，且容易被 `git add -A` 误提交。
+- 来源：`openspec/active/2026-10-24-emacs-reader-panel-childframe-and-ux.md`（原计划记为「未被 `.gitignore` 覆盖、每次须手工清理」，实测后该前提被推翻）
+- 解除条件：在仓库根 `.gitignore` 补 `*.elc` 与 `emacs/seshat-reader/seshat-reader-autoloads.el` 作兜底；重拷后核对子目录 `.gitignore` 是否仍含这两条。
+
+## `elisp_check_parens` 对 `.el` 假阳性的成因待定位（跨仓库，2026-10-25 面板承载批次）
+
+- 现象：该工具（thomas-emacs 的 `site-lisp/thomas-mcp-tools.el`）在**临时 buffer** 里读文件后直接 `check-parens`，未先把 buffer 切到 `emacs-lisp-mode`，因此用的不是 elisp 的语法表；此外工具经跨行 shell 命令取内容时，命令自身的括号也可能带偏扫描起点。**本批次对 `seshat-reader-sidebar.el` / `seshat-reader-translate.el` 实测均返回 `status: ok`（未复现误报）**，故成因属**未完全定位**，候选解释为 ① 语法表不是 elisp 的（`standard-syntax-table` 里 `(`/`)` 是标点，`check-parens` 语义随之漂移）、② 跨行命令把无关括号带进扫描范围。
+- 影响：该工具不能单独作为本仓库 L1 门禁（本批次用「`elisp_check_parens` + `make -C emacs/seshat-reader all`」双判据）。与既有条目「`elisp_check_parens` 对大型测试文件假阳性」同源但成因未归并，两条暂并存。
+- 来源：`openspec/active/2026-10-24-emacs-reader-panel-childframe-and-ux.md`；修复归属 **thomas-emacs 仓库**（临时 buffer 内先 `(emacs-lisp-mode)` 或 `(set-syntax-table emacs-lisp-mode-syntax-table)` 再 `check-parens`）。
+- 解除条件：thomas-emacs 侧修好工具后回本仓库复验（对注释中含单侧括号的 `.el` 应报 `status: ok`），并把成因结论并回既有条目。
+
+## 面板 `q` 的 kind 推断依赖 buffer 名（2026-10-25 面板承载批次，既有契约未改）
+
+- 现象：`seshat-reader-sidebar-quit` 用 `seshat-reader-sidebar-buffer-p` + `--kind-for-buffer-name` 按 **buffer 名**推断 kind（目录面板 `*Outline of <源 buffer 名>*`、译文面板 `*Seshat Sidebar*`），再据此调 `--toggle-kind`。
+- 影响：极端情形下可能误判——源 buffer 名本身形如 `*Seshat Sidebar*`、或含 `*Outline of ` 文本时，推断可能命中错的 kind，`q` 关掉的是另一个面板（或退回 `seshat-reader-sidebar-toggle` 把面板全关）。实际触发需要用户把文件 buffer 命名成面板名，概率极低；两个判据函数是既有契约，本批次**未改**。
+- 来源：`openspec/active/2026-10-24-emacs-reader-panel-childframe-and-ux.md`
+- 解除条件：kind 改由 buffer-local 变量（或面板自身的 `seshat-reader-panel-kind` frame/window parameter——后者已是 childframe 的唯一判据）承载，`q` 直接读它，不再解析名字。
