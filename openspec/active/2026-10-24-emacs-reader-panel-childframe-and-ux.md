@@ -169,6 +169,8 @@ pick 格式化：`all` → 每段 `【来源】\n译文`，段间 `\n\n---\n\n`�
 - 文件：`emacs/seshat-reader/seshat-reader-translate.el`
 - 新增 `seshat-reader-translate-stream`；克隆引擎设 `stream`；`gt-buffer-render-output-hook` 增量同步 + 双重守卫；模板骨架一次写入 + 正文 region 替换；完成不重写；底部跟随。
 - 验收：ERT ≥5 例——外部 translator 的增量被拒（守卫）；骨架只写一次；增量只替换正文区（骨架区文本不变）；完成后 buffer 内容不被 erase 重写；`stream`=nil 时退回旧路径（`--render-panel` 整块渲染）。
+- **骨架与增量**：首次增量到达时写入模板骨架（`%t` 为空）并在正文起点记录 marker；后续只替换 marker 之后的正文区，不重建 buffer、不重设 major mode；完成回调只更新 header-line 与历史记录，**不 erase 重写**（避免完成瞬间整块跳变）。
+- **跟随底部**：`seshat-reader-panel-follow-bottom` 为真时每次增量后把面板窗口 point 移到正文末尾并保证可见；检测到用户把 point 移离底部（差值 > 3 行）即停止跟随，回到底部自动恢复。
 
 ### T5 追问（依赖：T4）
 

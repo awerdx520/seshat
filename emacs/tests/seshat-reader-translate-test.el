@@ -802,10 +802,25 @@ ENTRIES 是 `(TEXT FAILED SOURCE)' 列表。gt 的 `gt-buffer-render-init' 把�
     (should (equal calls (list (list "结果" "Seshat 译文" '(en zh) 'translate))))))
 
 (ert-deftest seshat-reader-translate-test--install-capture-hook-for-mode-sidebar-no-hook ()
-  "sidebar + enabled 时不安装任何捕获 hook（捕获在 `:then' 内完成）."
+  "sidebar + enabled 时不装 posframe 捕获 hook；流式开启时只装增量同步 hook."
   (skip-unless (require 'gt nil t))
+  (skip-unless (require 'gt-render-buffer nil t))
+  ;; ① 默认（流式开启）：挂 `gt-buffer-render-output-hook' 的增量同步，不挂 posframe
   (let ((seshat-reader-translate-render 'sidebar)
         (seshat-reader-sidebar-enabled t)
+        (seshat-reader-translate-stream t)
+        (gt-buffer-render-output-hook nil)
+        (gt-posframe-pop-render-output-hook nil)
+        (gt-posframe-pin-render-output-hook nil))
+    (seshat-reader-translate--install-capture-hook-for-mode)
+    (should (memq #'seshat-reader-translate--stream-sync
+                  gt-buffer-render-output-hook))
+    (should-not gt-posframe-pop-render-output-hook)
+    (should-not gt-posframe-pin-render-output-hook))
+  ;; ② 关掉流式：三个 hook 都不装（译文捕获仍在 `:then' 内完成）
+  (let ((seshat-reader-translate-render 'sidebar)
+        (seshat-reader-sidebar-enabled t)
+        (seshat-reader-translate-stream nil)
         (gt-buffer-render-output-hook nil)
         (gt-posframe-pop-render-output-hook nil)
         (gt-posframe-pin-render-output-hook nil))
@@ -816,6 +831,7 @@ ENTRIES 是 `(TEXT FAILED SOURCE)' 列表。gt 的 `gt-buffer-render-init' 把�
   ;; 对照：posframe 路径（`pop'）仍安装两个 posframe 输出 hook
   (let ((seshat-reader-translate-render 'pop)
         (seshat-reader-sidebar-enabled t)
+        (seshat-reader-translate-stream t)
         (gt-posframe-pop-render-output-hook nil)
         (gt-posframe-pin-render-output-hook nil))
     (seshat-reader-translate--install-capture-hook-for-mode)
@@ -1144,5 +1160,258 @@ M 为链路上 `message' 的文本。
                                messages)))
       (when (buffer-live-p panel) (kill-buffer panel)))))
 
+;;; 流式增量渲染（T4）
+
+(defun seshat-reader-translate-test--stream-translator ()
+  "返回一个空的 gt translator 桩，供流式守卫的身份比对使用.
+顺带确保 `gt-render-buffer' 已加载——buffer-local 变量
+`gt-buffer-render-translator' 由该库定义，`--stream-sync' 的守卫要用 `boundp'
+判定它是否存在。"
+  (require 'gt-render-buffer)
+  (gt-translator :engines nil))
+
+(defun seshat-reader-translate-test--stream-feed (translator text &optional loading)
+  "在临时「中转 buffer」里放入片段 TEXT 并调用 `--stream-sync'.
+LOADING 非 nil 时给片段加 `gt-buffer-render-loading-face'（模拟 gt 的
+`Loading...' 占位）。用 `with-temp-buffer' 复刻 gt 的中转 buffer 环境：
+`--stream-sync' 被调用时 `current-buffer' 就是中转 buffer，且
+`gt-buffer-render-translator' 是 buffer-local。"
+  (with-temp-buffer
+    (setq-local gt-buffer-render-translator translator)
+    (if loading
+        (insert (propertize text 'gt-result t
+                            'face 'gt-buffer-render-loading-face))
+      (insert (propertize text 'gt-result t)))
+    (seshat-reader-translate--stream-sync)))
+
+(ert-deftest seshat-reader-translate-test--stream-sync-skips-when-disabled ()
+  "`seshat-reader-translate-stream' 为 nil 时 `--stream-sync' 不写面板."
+  (skip-unless (require 'gt nil t))
+  (skip-unless (require 'gt-render-buffer nil t))
+  (let* ((panel-name "*Seshat Test Stream Panel*")
+         (seshat-reader-sidebar-translate-buffer-name panel-name)
+         (trans (seshat-reader-translate-test--stream-translator))
+         (seshat-reader-translate-stream nil)
+         (seshat-reader-translate-render 'sidebar)
+         (seshat-reader-sidebar-enabled t)
+         (seshat-reader-translate--current-translator trans)
+         (seshat-reader-translate--active (float-time))
+         (shown nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'seshat-reader-sidebar-show)
+                   (lambda (&rest args) (push args shown) 'fake-window)))
+          (seshat-reader-translate-test--stream-feed trans "译文片段")
+          (should-not shown)
+          (should-not (get-buffer panel-name))
+          ;; 打开开关后再喂一次，面板就建起来了（对照组，证明上一步不是「实现没生效」）
+          (let ((seshat-reader-translate-stream t))
+            (seshat-reader-translate-test--stream-feed trans "译文片段")
+            (should (get-buffer panel-name))))
+      (when (get-buffer panel-name) (kill-buffer (get-buffer panel-name))))))
+
+(ert-deftest seshat-reader-translate-test--stream-sync-skips-foreign-translator ()
+  "中转 buffer 的 translator 与本次登记的不同（其它 gt 用法）时不写面板."
+  (skip-unless (require 'gt nil t))
+  (skip-unless (require 'gt-render-buffer nil t))
+  (let* ((panel-name "*Seshat Test Stream Panel*")
+         (seshat-reader-sidebar-translate-buffer-name panel-name)
+         (mine (seshat-reader-translate-test--stream-translator))
+         (theirs (seshat-reader-translate-test--stream-translator))
+         (seshat-reader-translate-stream t)
+         (seshat-reader-translate-render 'sidebar)
+         (seshat-reader-sidebar-enabled t)
+         ;; 本包登记的是 MINE，而中转 buffer 里挂的是 THEIRS
+         (seshat-reader-translate--current-translator mine)
+         (seshat-reader-translate--active (float-time))
+         (shown nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'seshat-reader-sidebar-show)
+                   (lambda (&rest args) (push args shown) 'fake-window)))
+          (seshat-reader-translate-test--stream-feed theirs "别人的译文")
+          (should-not shown)
+          (should-not (get-buffer panel-name))
+          ;; 换成自己的 translator 后应当通过守卫
+          (seshat-reader-translate-test--stream-feed mine "自己的译文")
+          (should (get-buffer panel-name)))
+      (when (get-buffer panel-name) (kill-buffer (get-buffer panel-name))))))
+
+(ert-deftest seshat-reader-translate-test--stream-sync-writes-skeleton-once ()
+  "两次增量只写一次模板骨架：原文引用块在面板正文里只出现 1 次."
+  (skip-unless (require 'gt nil t))
+  (skip-unless (require 'gt-render-buffer nil t))
+  (let* ((panel-name "*Seshat Test Stream Panel*")
+         (seshat-reader-sidebar-translate-buffer-name panel-name)
+         (trans (seshat-reader-translate-test--stream-translator))
+         (seshat-reader-translate-stream t)
+         (seshat-reader-translate-render 'sidebar)
+         (seshat-reader-sidebar-enabled t)
+         (seshat-reader-translate--current-translator trans)
+         (seshat-reader-translate--active (float-time))
+         (seshat-reader-translate--stream-title "Seshat 译文")
+         (seshat-reader-translate--stream-langs nil)
+         (seshat-reader-translate--stream-context 'translate)
+         (seshat-reader-translate-show-source t)
+         (seshat-reader-select-last (list :text "原文片段"))
+         (shown nil)
+         (panel nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'seshat-reader-sidebar-show)
+                   (lambda (buffer kind &optional select)
+                     (push (list buffer kind select) shown)
+                     'fake-window)))
+          (seshat-reader-translate-test--stream-feed trans "第一段")
+          (seshat-reader-translate-test--stream-feed trans "第一段与第二段")
+          (setq panel (get-buffer panel-name))
+          (should (bufferp panel))
+          ;; 面板以 SELECT=nil 显示（流式期间不抢焦点）
+          (should (= 1 (length shown)))
+          (should (null (nth 2 (car shown))))
+          (with-current-buffer panel
+            (should (equal seshat-reader-translate--panel-skeleton t))
+            (should (markerp seshat-reader-translate--panel-body-marker))
+            (goto-char (point-min))
+            ;; 骨架只写一次
+            (should (= 1 (how-many (regexp-quote "> **原文**"))))
+            (should (= 1 (how-many "^---$")))
+            (should (string-match-p "第一段与第二段" (buffer-string)))
+            ;; header-line 带「生成中…」状态后缀
+            (should (string-match-p "生成中" header-line-format))))
+      (when (get-buffer panel-name) (kill-buffer (get-buffer panel-name))))))
+
+(ert-deftest seshat-reader-translate-test--stream-sync-replaces-body ()
+  "第二次增量只替换正文区：旧正文消失、骨架保持不变."
+  (skip-unless (require 'gt nil t))
+  (skip-unless (require 'gt-render-buffer nil t))
+  (let* ((panel-name "*Seshat Test Stream Panel*")
+         (seshat-reader-sidebar-translate-buffer-name panel-name)
+         (trans (seshat-reader-translate-test--stream-translator))
+         (seshat-reader-translate-stream t)
+         (seshat-reader-translate-render 'sidebar)
+         (seshat-reader-sidebar-enabled t)
+         (seshat-reader-translate--current-translator trans)
+         (seshat-reader-translate--active (float-time))
+         (seshat-reader-translate--stream-title "Seshat 译文")
+         (seshat-reader-translate--stream-langs nil)
+         (seshat-reader-translate--stream-context 'translate)
+         (seshat-reader-translate-show-source t)
+         (seshat-reader-select-last (list :text "原文片段"))
+         (panel nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'seshat-reader-sidebar-show)
+                   (lambda (&rest _args) 'fake-window)))
+          (seshat-reader-translate-test--stream-feed trans "旧译文")
+          (seshat-reader-translate-test--stream-feed trans "新译文")
+          (setq panel (get-buffer panel-name))
+          (with-current-buffer panel
+            (let ((content (buffer-string)))
+              (should (string-match-p "新译文" content))
+              ;; 旧正文被整块替换，而不是追加
+              (should-not (string-match-p "旧译文" content))
+              ;; 骨架区完好（引用块 + 分隔线各一次），正文在分隔线之后
+              (goto-char (point-min))
+              (should (= 1 (how-many (regexp-quote "> **原文**"))))
+              (should (= 1 (how-many "^---$")))
+              (should (string-suffix-p "---\n新译文\n" content)))))
+      (when (get-buffer panel-name) (kill-buffer (get-buffer panel-name))))))
+
+(ert-deftest seshat-reader-translate-test--stream-sync-ignores-loading ()
+  "片段仍是 gt 的 `Loading...' 占位时不写面板（面板不创建）."
+  (skip-unless (require 'gt nil t))
+  (skip-unless (require 'gt-render-buffer nil t))
+  (let* ((panel-name "*Seshat Test Stream Panel*")
+         (seshat-reader-sidebar-translate-buffer-name panel-name)
+         (trans (seshat-reader-translate-test--stream-translator))
+         (seshat-reader-translate-stream t)
+         (seshat-reader-translate-render 'sidebar)
+         (seshat-reader-sidebar-enabled t)
+         (seshat-reader-translate--current-translator trans)
+         (seshat-reader-translate--active (float-time))
+         (shown nil))
+    (unwind-protect
+        (progn
+          ;; 先确认 `--extract-result' 带 SKIP-LOADING 时确实把占位过滤干净
+          (with-temp-buffer
+            (insert (propertize seshat-reader-translate--loading-text
+                                'gt-result t
+                                'face 'gt-buffer-render-loading-face))
+            (should (equal (seshat-reader-translate--extract-result t)
+                           '(nil . t)))
+            ;; 不过滤时它会被当译文取出来（对照，说明过滤是必要的）
+            (should (equal (car (seshat-reader-translate--extract-result))
+                           seshat-reader-translate--loading-text)))
+          (cl-letf (((symbol-function 'seshat-reader-sidebar-show)
+                     (lambda (&rest args) (push args shown) 'fake-window)))
+            (seshat-reader-translate-test--stream-feed
+             trans seshat-reader-translate--loading-text t)
+            (should-not shown)
+            (should-not (get-buffer panel-name))))
+      (when (get-buffer panel-name) (kill-buffer (get-buffer panel-name))))))
+
+(ert-deftest seshat-reader-translate-test--panel-result-keeps-stream-content ()
+  "流式已渲染时 `--panel-result' 不重写面板，只把 header-line 改成「已完成」."
+  (skip-unless (require 'gt nil t))
+  (let* ((panel-name "*Seshat Test Stream Panel*")
+         (seshat-reader-sidebar-translate-buffer-name panel-name)
+         (gt-buffer (get-buffer-create seshat-reader-translate--gt-buffer-name))
+         (seshat-reader-translate-last-result nil)
+         (panel (get-buffer-create panel-name)))
+    (unwind-protect
+        (progn
+          ;; 造一个「已由流式骨架渲染过」的面板
+          (with-current-buffer panel
+            (insert "> **原文**\n>\n> 原文片段\n\n---\n流式正文\n")
+            (setq seshat-reader-translate--panel-skeleton t)
+            (setq seshat-reader-translate--panel-title "Seshat 译文")
+            (setq-local header-line-format "Seshat 译文（生成中…）"))
+          (with-current-buffer gt-buffer
+            (erase-buffer)
+            (insert (propertize "流式正文" 'gt-result t)))
+          (should (equal (seshat-reader-translate--panel-result) "流式正文"))
+          ;; 面板内容一字未变（没有 erase 重写）
+          (with-current-buffer panel
+            (should (equal (buffer-string)
+                           "> **原文**\n>\n> 原文片段\n\n---\n流式正文\n"))
+            (should-not seshat-reader-translate--panel-skeleton)
+            (should-not (string-match-p "生成中" header-line-format))
+            (should (string-match-p "已完成" header-line-format)))
+          ;; 译文照常记录（存批注依赖它）
+          (should (equal seshat-reader-translate-last-result "流式正文")))
+      (when (buffer-live-p panel) (kill-buffer panel))
+      (when (buffer-live-p gt-buffer) (kill-buffer gt-buffer)))))
+
+(ert-deftest seshat-reader-translate-test--extract-result-source-strips-stream-suffix ()
+  "引擎前缀行的 \" (stream)\" 后缀不进入来源标签."
+  (with-temp-buffer
+    (insert (propertize "youdao (stream)\n"
+                        'face 'gt-buffer-render-block-prefix-face))
+    (insert "\n")
+    (insert (propertize "译文" 'gt-result t))
+    (should (equal (car (seshat-reader-translate--extract-result))
+                   "【youdao】\n译文")))
+  (should (equal (seshat-reader-translate--strip-stream-mark "google (stream)")
+                 "google"))
+  (should (equal (seshat-reader-translate--strip-stream-mark "google")
+                 "google")))
+
+(ert-deftest seshat-reader-translate-test--enable-stream-clones-engines ()
+  "`--enable-stream' 为引擎克隆体开流式，且不改预设共享的引擎对象（H5）."
+  (skip-unless (require 'gt nil t))
+  (let* ((preset-engine (gt-google-engine))
+         (preset (gt-translator :engines (list preset-engine)))
+         (trans (clone preset))
+         (seshat-reader-translate--current-translator nil))
+    (seshat-reader-translate--enable-stream trans)
+    ;; 克隆出来的 translator 有自己的一份引擎，且已开流式
+    (let ((engines (slot-value trans 'engines)))
+      (should (= 1 (length engines)))
+      (should-not (eq (car engines) preset-engine))
+      (should (eq (eieio-object-class (car engines)) 'gt-google-engine))
+      (should (eq (slot-value (car engines) 'stream) t)))
+    ;; 预设里那个引擎对象没有被污染
+    (should-not (slot-value preset-engine 'stream))
+    ;; 登记了本次请求的 translator（守卫用）
+    (should (eq seshat-reader-translate--current-translator trans))))
+
 (provide 'seshat-reader-translate-test)
 ;;; seshat-reader-translate-test.el ends here
+

@@ -48,6 +48,14 @@
 ;; - `pop'/`pin'：回退 posframe（`gt-posframe-pop-render' 弹出、失焦即消失 /
 ;;   `gt-posframe-pin-render' 常驻），可在配置侧切回。
 ;;
+;; 流式增量（`seshat-reader-translate-stream'，默认开启）：构造翻译器时把
+;; **克隆后的**引擎的 `stream' 槽设为 t（引擎对象也要再克隆——eieio 的
+;; `clone' 是浅拷贝，translator 的 `engines' 槽与预设共享同一批引擎对象），
+;; 并把 `gt-buffer-render-output-hook' 的增量同步到面板：首个增量写入模板
+;; 骨架（正文 `%t' 为空）并记录正文起点 marker，后续只替换 marker 之后的
+;; 正文区；完成时只更新 header-line 状态、不 erase 重写（避免完成瞬间整块
+;; 跳变）。`stream' 为 nil 或引擎无该槽时退回「完成即整体渲染」的旧路径。
+;;
 ;; 捕获译文：面板路径在 `:then' 回调内完成（`--panel-result'），不依赖任何
 ;; 全局 hook，故零误捕获；posframe 路径复用
 ;; `gt-posframe-pop-render-output-hook'（弹出）与
@@ -84,7 +92,11 @@
   ;; 「Unknown slot」告警。这里在编译期登记这两个槽名，消除无意义告警；
   ;; 只影响编译期判定，运行时语义不变。
   (put 'taker 'slot-name t)
-  (put 'render 'slot-name t))
+  (put 'render 'slot-name t)
+  ;; 流式渲染（T4）还要读写 `gt-translator' 的 `engines' 槽与 `gt-engine' 的
+  ;; `stream' 槽，同样在编译期登记，避免两条无意义的「Unknown slot」告警。
+  (put 'engines 'slot-name t)
+  (put 'stream 'slot-name t))
 
 (declare-function eieio-oset "eieio-core" (obj slot value))
 (declare-function eieio-oref "eieio-core" (obj slot))
@@ -98,6 +110,9 @@
 (declare-function gt-posframe-pin-render "gt-render-posframe" (&rest args))
 (declare-function gt-buffer-render "gt-render-buffer" (&rest args))
 (declare-function gt-start "gt-core" (translator))
+;; 流式渲染需要判定引擎是否有 `stream' 槽（`gt-engine' 基类定义，部分引擎不
+;; 支持）；`slot-exists-p' 是 eieio-core 的函数，编译期声明签名以免告警。
+(declare-function slot-exists-p "eieio-core" (object-or-class slot))
 ;; visual-fill-column 同样是软依赖（只在 `--prepare-view' 内按需加载），
 ;; 编译期不加载其库，故显式声明签名以消除「not known to be defined」告警。
 (declare-function visual-fill-column-mode "visual-fill-column" (&optional arg))
@@ -137,6 +152,52 @@ posframe 路径经 `seshat-reader-translate--capture-result' 从输出 hook 调�
 不超过 `seshat-reader-translate-capture-window' 秒时才捕获译文，用以区分
 本包发起的翻译与其它 go-translate 用法（后者同样会触发全局渲染输出
 hook）。")
+
+(defvar seshat-reader-translate--current-translator nil
+  "本次发起的 gt translator 对象，或 nil.
+由 `seshat-reader-translate--enable-stream' 在装配翻译器时写入，供
+`seshat-reader-translate--stream-sync' 做身份守卫：go-translate 每次输出都会
+把当前 translator 写进中转 buffer 的 buffer-local 变量
+`gt-buffer-render-translator'，只有二者 `eq' 相同时才认为这份增量属于本包
+（否则可能是用户自己的 gt 用法触发的输出）。
+**这是绕过 gt 内部约定的 HACK**：gt 的 `gt-buffer-render-output-hook' 不带
+translator 参数，只能事后比对 buffer-local 变量；gt 升级若改用其它变量名或
+改变调用时机，本守卫会退化为「永不匹配」，此时面板退回完成时整体渲染
+（`seshat-reader-translate--panel-result' 路径仍在），不会出错。")
+
+(defvar seshat-reader-translate--stream-title nil
+  "本次请求写进面板 header-line 的标题（\"Seshat 译文\" / \"Seshat 解释\"），或 nil.
+由 `seshat-reader-translate--translator' 在装配翻译器时写入，供流式骨架首次
+创建面板 buffer 时使用（`seshat-reader-translate--stream-init'）。")
+
+(defvar seshat-reader-translate--stream-langs nil
+  "本次请求的目标语言列表（供面板模板 `%l'），由 `--translator' 写入.")
+
+(defvar seshat-reader-translate--stream-context nil
+  "本次请求的语境（`translate' / `explain'，决定用哪个模板），由 `--translator' 写入.")
+
+(defvar seshat-reader-translate--last-sync-time nil
+  "最近一次流式滚动跟随的时间戳（the function `float-time' 的返回值），或 nil.
+只用于节流滚动，见 `seshat-reader-translate--stream-scroll-due-p'。")
+
+(defvar-local seshat-reader-translate--panel-skeleton nil
+  "面板 buffer 中是否已写入流式骨架（buffer-local）.
+非 nil 表示本 buffer 已由 `seshat-reader-translate--stream-init' 建好模板骨架
+与正文 marker，后续增量只替换正文区；`seshat-reader-translate--render-panel'
+与 `seshat-reader-translate--stream-reset' 会把它清回 nil（新一次翻译重建骨架）。")
+
+(defvar-local seshat-reader-translate--panel-body-marker nil
+  "面板 buffer 中正文起点的 marker（buffer-local），无骨架时为 nil.
+`seshat-reader-translate--stream-insert-body' 用它定位「骨架 + 正文」的交界：
+marker 之前的模板骨架（原文引用块、分隔线）保持不变，只重写 marker 到
+`point-max' 的正文区。marker 的插入类型为默认值，故在 marker 处插入文本时
+marker 停在插入文本之前，正好指向正文起点。")
+
+(defvar-local seshat-reader-translate--panel-title nil
+  "面板 buffer 当前 header-line 的标题（buffer-local），用作状态后缀的前缀.
+流式完成时 `seshat-reader-translate--stream-complete' 需要「标题 + 已完成」
+而非只知道后缀，故在此记下标题（`--panel-result' 拿不到 `:then' 闭包里的
+TITLE 参数）。")
 
 (defgroup seshat-reader-translate nil
   "阅读器选区的翻译与解释（基于 go-translate）."
@@ -261,6 +322,14 @@ Markdown 分隔线（`---`）分隔——多引擎预设能让用户一眼比对
                  (const :tag "最后一个成功结果" last))
   :group 'seshat-reader-translate)
 
+(defcustom seshat-reader-translate-stream t
+  "非 nil 时对支持流式的引擎开启增量输出（面板边生成边显示）.
+实现方式是为克隆后的引擎设置 `stream' 槽，并把
+`gt-buffer-render-output-hook' 的增量同步到面板；引擎不支持流式或取 nil 时，退回
+「完成后一次性渲染」的旧路径。"
+  :type 'boolean
+  :group 'seshat-reader-translate)
+
 ;;; 内部辅助
 
 (defun seshat-reader-translate--ensure-gt ()
@@ -300,6 +369,13 @@ go-translate function `gt-buffer-render' 是该库中定义的**类名**（不�
 各一个空格是约定（gt 隐藏 buffer 的惯例），`seshat-reader-sidebar-buffer-p'
 不匹配它。gt 渲染完成后由 `:then' 回调（`--panel-result'）从这里提取纯译文，
 再写入真正的展示 buffer `seshat-reader-sidebar-translate-buffer-name'。")
+
+(defconst seshat-reader-translate--loading-text "Loading..."
+  "中转 buffer 里占位文本的字面值（gt 结果位置的初值）.
+`gt-buffer-render-init' 先把 `Loading...' 写进每个结果位置，`gt-extract-data'
+在任务尚无结果时也把它当作结果文本。流式期间尚未产出结果的引擎在中转 buffer
+里就是这段文本；捕获与增量同步都要把它当作「还没有内容」，不得当译文写进面板
+或 `last-result'。")
 
 (defun seshat-reader-translate--selection-source-text ()
   "Return the text of the last mouse selection, or nil.
@@ -442,16 +518,24 @@ CONTEXT 选定模板（`explain' 用 `seshat-reader-translate-explain-template'�
 `seshat-reader-translate--prepare-view' 设视图与只读、`header-line-format' 写
 标题、`seshat-reader-translate-panel-mode' 挂键位，最后经
 `seshat-reader-sidebar-show' 以 `translate' 类型显示（SELECT 非 nil：内容已
-就绪，可跟随光标）。"
+就绪，可跟随光标）。
+
+本函数是**非流式**路径：进入时先用 `seshat-reader-translate--stream-reset' 清掉
+上一次的流式骨架状态（skeleton 标志与正文 marker），保证内容被整块重写后不会
+再有增量按旧 marker 往新内容里插文本。"
   (let ((buffer (get-buffer-create
                  seshat-reader-sidebar-translate-buffer-name))
         (content (seshat-reader-translate--apply-template
                   text title langs context)))
     (with-current-buffer buffer
+      ;; 新一次翻译：清掉上一次的流式骨架状态（skeleton 标志与正文 marker），
+      ;; 否则后续增量会误以为骨架已存在、只替换正文区而丢掉新模板。
+      (seshat-reader-translate--stream-reset)
       (let ((inhibit-read-only t))
         (erase-buffer)
         (insert content))
       (seshat-reader-translate--prepare-view)
+      (setq seshat-reader-translate--panel-title title)
       (setq-local header-line-format title)
       (seshat-reader-translate-panel-mode 1)
       (goto-char (point-min)))
@@ -464,13 +548,19 @@ CONTEXT 选定模板（`explain' 用 `seshat-reader-translate-explain-template'�
 调 `seshat-reader-translate--extract-result' 取 `(TEXT . FAILED)'，再交
 `seshat-reader-translate--record-result' 写入（保留 error face 的失败判定）。
 
+写入后无论成功失败都调 `seshat-reader-translate--stream-complete' 收尾流式渲染
+（把面板 header-line 从「生成中…」改成「已完成」并清骨架状态）；面板内容**不
+重写**——增量期间写好的正文即最终内容，erase 重写会在完成瞬间造成整块跳变。
+非流式路径（面板 buffer 无骨架）下该收尾是空操作。
+
 返回写入的译文；中转 buffer 不存在、译文为空（翻译失败或流式尚未产出）或
 渲染结果带错误 face 时返回 nil，并保留上一次的译文。"
   (let ((buffer (get-buffer seshat-reader-translate--gt-buffer-name)))
     (when (buffer-live-p buffer)
       (with-current-buffer buffer
-        (seshat-reader-translate--record-result
-         (seshat-reader-translate--extract-result))))))
+        (prog1 (seshat-reader-translate--record-result
+                (seshat-reader-translate--extract-result))
+          (seshat-reader-translate--stream-complete))))))
 
 (defun seshat-reader-translate--render-object (mode &optional title langs context)
   "按 MODE 构造一个 gt 渲染对象，TITLE 为译文面板的 header-line 标题.
@@ -481,7 +571,10 @@ function `gt-buffer-render'，让 gt 渲染到**隐藏中转 buffer**：`:name' 
 `display-buffer' 会回退默认动作而弹窗）。渲染完成（translator state = 3）后
 gt 调用 `:then' 回调：先用 `seshat-reader-translate--panel-result' 提取并记录
 纯译文，成功则交 `seshat-reader-translate--render-panel' 写入信息面板 buffer
-并以 Markdown 只读视图显示。
+并以 Markdown 只读视图显示。若本次请求已在流式期间渲染过骨架
+（`seshat-reader-translate--panel-streamed-p' 非 nil），则**不**再调
+`--render-panel'：面板内容已是最新，重写只会在完成瞬间造成整块跳变；此时仅由
+`--panel-result' 把 header-line 状态从「生成中…」改成「已完成」。
 
 `seshat-reader-sidebar-enabled' 为 nil 时退回弹出式 posframe（与 `pop' 取值
 同款），以保留禁用面板时的旧行为。
@@ -509,8 +602,11 @@ CONTEXT 同样由 `seshat-reader-translate--translator' 传入（`translate' 或
             :window-config '((display-buffer-no-window)
                              (allow-no-window . t))
             :then (lambda (&rest _args)
-                    (let ((result (seshat-reader-translate--panel-result)))
-                      (when result
+                    ;; 先判定「增量期间是否已建骨架」，再调 `--panel-result'
+                    ;; ——后者会清掉骨架标志，顺序反了就走不到流式分支。
+                    (let ((streamed (seshat-reader-translate--panel-streamed-p))
+                          (result (seshat-reader-translate--panel-result)))
+                      (when (and result (not streamed))
                         (seshat-reader-translate--render-panel
                          result title langs context))))))
        (gt-posframe-pop-render)))
@@ -532,9 +628,15 @@ translator 对象；调用前会先确保 gt 已加载。
 CONTEXT 用于区分预设缺失时的提示文案，并决定面板模板，取 `translate'
 （默认，纯翻译）或 `explain'（解释）：前者提示回退到内置翻译器并用
 `seshat-reader-translate-template'，后者提示回退为普通翻译、建议在配置侧
-定义解释预设，并用 `seshat-reader-translate-explain-template'。"
+定义解释预设，并用 `seshat-reader-translate-explain-template'。
+
+`seshat-reader-translate-stream' 非 nil 时末尾经
+`seshat-reader-translate--enable-stream' 为各引擎开启流式，并登记本次请求的
+标题 / 语言对 / 语境与 translator 身份（供
+`seshat-reader-translate--stream-sync' 的守卫与骨架创建使用）。"
   (seshat-reader-translate--ensure-gt)
   (let* ((preset-trans (alist-get preset (gt-ensure-plain gt-preset-translators)))
+         (title (if (eq context 'explain) "Seshat 解释" "Seshat 译文"))
          (trans (if preset-trans
                     (clone preset-trans)
                   (message (if (eq context 'explain)
@@ -545,11 +647,12 @@ CONTEXT 用于区分预设缺失时的提示文案，并决定面板模板，取
                                                 (gt-google-engine))))))
     (oset trans taker (gt-taker :text text :pick nil :langs langs))
     (oset trans render (seshat-reader-translate--render-object
-                        seshat-reader-translate-render
-                        (if (eq context 'explain)
-                            "Seshat 解释"
-                          "Seshat 译文")
-                        langs context))
+                        seshat-reader-translate-render title langs context))
+    (when seshat-reader-translate-stream
+      (setq seshat-reader-translate--stream-title title
+            seshat-reader-translate--stream-langs langs
+            seshat-reader-translate--stream-context context)
+      (seshat-reader-translate--enable-stream trans))
     trans))
 
 (defun seshat-reader-translate--target-langs (target-lang)
@@ -613,7 +716,10 @@ gt 的 `gt-buffer-render-init' 在隐藏中转 buffer 里把每个引擎的 `:pr
 取到文本后还要过 `seshat-reader-translate--engine-prefix-face-p' 的 face
 校验才算来源：单引擎时片段上方紧邻的非空行是**原文引用块**（带
 `gt-buffer-render-source-face'），不做校验就会把原文误当来源标签。校验不过
-即返回 nil。
+即返回 nil。校验通过后还要经
+`seshat-reader-translate--strip-stream-mark' 去掉 gt 为流式引擎追加的
+\" (stream)\" 后缀（`seshat-reader-translate-stream' 开启后每个引擎的前缀行都
+带它）。
 
 契约失效的后果：gt 改渲染格式（不再给前缀加这两个 face，或把前缀并入结果
 片段）时本函数返回 nil，面板退化为纯译文——不加标签也不加分隔线，既不会
@@ -630,8 +736,21 @@ gt 的 `gt-buffer-render-init' 在隐藏中转 buffer 里把每个引擎的 `:pr
             (setq done t
                   found (and (seshat-reader-translate--engine-prefix-face-p
                               (line-beginning-position))
-                             text)))))
+                             ;; 引擎开启流式后 gt 会在前缀行追加
+                             ;; \" (stream)\"（`gt-extract-data' 的
+                             ;; 拼接逻辑），那是 gt 的内部标记而非引擎名，
+                             ;; 直接显示会变成「【youdao (stream)】」。
+                             (seshat-reader-translate--strip-stream-mark text))))))
       found)))
+
+(defun seshat-reader-translate--strip-stream-mark (label)
+  "去掉 gt 加在引擎前缀行末尾的流式标记，返回真正的来源标签.
+gt 在引擎开启流式时把前缀写成 \"引擎名 (stream)\"；该后缀只对调试有意义，
+显示层要去掉。LABEL 不以该后缀结尾时原样返回。"
+  (let ((suffix " (stream)"))
+    (if (string-suffix-p suffix label)
+        (string-trim (substring label 0 (- (length label) (length suffix))))
+      label)))
 
 (defun seshat-reader-translate--format-engine-results (results pick)
   "按 PICK 把 RESULTS 格式化为面板正文；无可展示内容时返回 nil.
@@ -662,7 +781,7 @@ ERT 直接覆盖。"
                     ok)
             "\n\n---\n\n"))))))
 
-(defun seshat-reader-translate--extract-result ()
+(defun seshat-reader-translate--extract-result (&optional skip-loading)
   "从当前缓冲区提取译文片段并按 `seshat-reader-translate-engines-pick' 格式化.
 返回 `(TEXT . FAILED)'：TEXT 为格式化后的正文（无可用片段时为 nil）；
 FAILED 非 nil 表示**没有成功片段**——没有任何 `gt-result' 片段，或全部片段
@@ -680,7 +799,12 @@ FAILED 非 nil 表示**没有成功片段**——没有任何 `gt-result' 片段
 
 单个片段的失败判定口径不变：只看**片段起点**的 `face` 属性是否含
 `gt-buffer-render-error-face`（用 `get-text-property' 读一次，不做逐字符推进，
-故在长缓冲区上也不会退化）。"
+故在长缓冲区上也不会退化）。
+
+SKIP-LOADING 非 nil 时先丢弃「文本等于 `Loading...'」的片段：gt 在结果位置
+先写 `Loading...' 占位（`gt-buffer-render-init'），流式期间尚未产出结果的引擎
+在缓冲区里就是这段占位文本，不过滤就会把 `Loading...' 当译文写进面板。过滤后
+若没有剩余片段，返回 `(nil . t)'（调用方据此按「还没内容」处理，不写面板）。"
   (let (pieces)
     ;; 收集带 `gt-result' 属性的片段，并就地判定失败标记与来源标签。
     (save-excursion
@@ -698,6 +822,12 @@ FAILED 非 nil 表示**没有成功片段**——没有任何 `gt-result' 片段
                                (seshat-reader-translate--result-source begin))
                          pieces))
                  t))))
+    (when skip-loading
+      (setq pieces (cl-remove-if
+                    (lambda (piece)
+                      (equal (string-trim (nth 0 piece))
+                             seshat-reader-translate--loading-text))
+                    pieces)))
     (let ((formatted (seshat-reader-translate--format-engine-results
                       (nreverse pieces)
                       seshat-reader-translate-engines-pick)))
@@ -748,27 +878,247 @@ TEXT。posframe 路径与面板路径（`seshat-reader-translate--panel-result'�
 `gt-buffer-render-error-face' 属性的文本）以 `message' 明确提示，且**不
 写入** `seshat-reader-translate-last-result'（保持上一次的译文）。本函数
 在非 gt 缓冲区中同样可安全调用：只提示、不报错。返回写入的译文，或 nil。"
-  (when (let ((started seshat-reader-translate--active))
-          (and started
-               (<= (- (float-time) started)
-                   seshat-reader-translate-capture-window)))
+  (when (seshat-reader-translate--within-capture-window-p)
     (seshat-reader-translate--record-result
      (seshat-reader-translate--extract-result))))
 
+;;; 流式增量渲染（`seshat-reader-translate-stream'）
+
+(defconst seshat-reader-translate--streaming-suffix "（生成中…）"
+  "流式进行中时面板 header-line 标题后的状态后缀.")
+
+(defconst seshat-reader-translate--done-suffix "（已完成）"
+  "流式结束后面板 header-line 标题后的状态后缀，用于替换前者（不改内容）.")
+
+(defconst seshat-reader-translate--stream-scroll-interval 0.05
+  "流式期间两次「滚动跟随」之间的最小间隔（秒）.
+只节流滚动，不节流正文写入——见 `seshat-reader-translate--stream-scroll-due-p'。")
+
+(defun seshat-reader-translate--within-capture-window-p ()
+  "距本包最近一次翻译启动是否仍在 `seshat-reader-translate-capture-window' 秒内.
+`seshat-reader-translate--active' 为 nil（本包从未发起翻译）或已超窗口时返回
+nil。供 `seshat-reader-translate--capture-result'（posframe 捕获）与
+`seshat-reader-translate--stream-sync'（面板增量）共用的时间窗守卫。"
+  (let ((started seshat-reader-translate--active))
+    (and started
+         (<= (- (float-time) started)
+             seshat-reader-translate-capture-window))))
+
+(defun seshat-reader-translate--enable-stream (translator)
+  "在 TRANSLATOR 的引擎上开启流式，并登记本次请求的 translator 身份.
+引擎必须**再克隆一次**：eieio 的 `clone' 是浅拷贝，translator 的 `engines'
+槽与预设共享同一批引擎对象，直接 `oset' `stream' 会污染用户在 gt 里的预设
+（用户自己的其它 gt 用法会突然变成流式）。没有 `stream' 槽的引擎（不支持
+流式）保持原样、不做包装。返回 TRANSLATOR。"
+  (oset translator engines
+        (mapcar (lambda (engine)
+                  (if (slot-exists-p engine 'stream)
+                      (let ((copy (clone engine)))
+                        (oset copy stream t)
+                        copy)
+                    engine))
+                (oref translator engines)))
+  (setq seshat-reader-translate--current-translator translator)
+  translator)
+
+(defun seshat-reader-translate--stream-active-p ()
+  "判断当前输出是否属于本包的流式请求（`--stream-sync' 的守卫）.
+四重判定：① `seshat-reader-translate-stream' 非 nil；② 渲染方式为 `sidebar' 且
+面板已启用（posframe 路径没有面板可写）；③ 中转 buffer 的 buffer-local 变量
+`gt-buffer-render-translator' 与本次登记的 translator `eq' 相同——这是绕过 gt
+内部约定的 HACK：gt 的 `gt-buffer-render-output-hook' 不带任何参数，只能事后
+比对 buffer-local 变量；④ 仍在 `seshat-reader-translate-capture-window' 时间窗
+内（避免长时间后残留的一次输出误写面板）。"
+  (and seshat-reader-translate-stream
+       (eq seshat-reader-translate-render 'sidebar)
+       seshat-reader-sidebar-enabled
+       seshat-reader-translate--current-translator
+       (boundp 'gt-buffer-render-translator)
+       (eq gt-buffer-render-translator
+           seshat-reader-translate--current-translator)
+       (seshat-reader-translate--within-capture-window-p)))
+
+(defun seshat-reader-translate--panel-buffer ()
+  "返回译文面板 buffer，不存在时返回 nil（**不创建**）."
+  (get-buffer seshat-reader-sidebar-translate-buffer-name))
+
+(defun seshat-reader-translate--panel-streamed-p ()
+  "面板 buffer 是否已写入流式骨架（读 buffer-local 标志）.
+`seshat-reader-translate--panel-skeleton' 是 buffer-local 的，而流式同步执行在
+中转 buffer 内，故必须用 `buffer-local-value' 读面板 buffer 的那一份。"
+  (let ((buffer (seshat-reader-translate--panel-buffer)))
+    (and (buffer-live-p buffer)
+         (buffer-local-value 'seshat-reader-translate--panel-skeleton buffer)
+         t)))
+
+(defun seshat-reader-translate--panel-display-window (buffer)
+  "返回显示面板 BUFFER 的窗口（含 child frame 内的窗口），没有时 nil.
+child frame 承载时窗口在另一个 frame 上，故先带 ALL-FRAMES=t 查，再退回当前
+frame。"
+  (and (buffer-live-p buffer)
+       (or (get-buffer-window buffer t)
+           (get-buffer-window buffer))))
+
+(defun seshat-reader-translate--panel-tailing-p (window buffer)
+  "判断面板窗口 WINDOW 是否停在 BUFFER 底部（距末尾 ≤ 3 行）.
+WINDOW 不是活窗口、或显示的不是 BUFFER 时返回 nil（按「不跟随」处理，不动
+用户的 point）。"
+  (and (window-live-p window)
+       (eq (window-buffer window) buffer)
+       (with-current-buffer buffer
+         (let ((position (window-point window)))
+           (and (<= (point-min) position)
+                (<= position (point-max))
+                (<= (count-lines position (point-max)) 3))))))
+
+(defun seshat-reader-translate--stream-scroll-due-p ()
+  "滚动跟随是否已过节流间隔；是则记下本次时间戳并返回 t.
+节流只作用于**滚动**：正文每次都写（增量是「全量快照」——每次输出都包含截至
+当前的完整译文，偶尔少写一帧只会让内容晚 ≤0.05 秒，不丢内容），而每次增量都
+`set-window-point' + `recenter' 才是抖动来源。"
+  (let ((now (float-time)))
+    (when (or (null seshat-reader-translate--last-sync-time)
+              (<= seshat-reader-translate--stream-scroll-interval
+                  (- now seshat-reader-translate--last-sync-time)))
+      (setq seshat-reader-translate--last-sync-time now)
+      t)))
+
+(defun seshat-reader-translate--panel-scroll-to-bottom (window buffer)
+  "把显示 BUFFER 的面板窗口 WINDOW 的 point 移到正文末尾并保证末行可见."
+  (when (and (window-live-p window) (eq (window-buffer window) buffer))
+    (with-current-buffer buffer
+      (set-window-point window (point-max))
+      ;; frame 刚布局（窗口高度为 0）等情形下 recenter 可能报错，滚动只是观感，
+      ;; 失败不影响内容，故静默。
+      (ignore-errors
+        (with-selected-window window
+          (recenter -1))))))
+
+(defun seshat-reader-translate--stream-reset ()
+  "清除流式骨架状态（buffer-local 的 skeleton 标志与正文 marker）."
+  (setq seshat-reader-translate--panel-skeleton nil)
+  (when (markerp seshat-reader-translate--panel-body-marker)
+    (set-marker seshat-reader-translate--panel-body-marker nil))
+  (setq seshat-reader-translate--panel-body-marker nil)
+  (setq seshat-reader-translate--last-sync-time nil))
+
+(defun seshat-reader-translate--stream-insert-body (text)
+  "在当前（面板）buffer 用 TEXT 替换 marker 之后的正文区.
+marker 之前的模板骨架（原文引用块、分隔线）保持不变：不重建 buffer、不重设
+major mode，markdown 视图只对真正变化的正文重算 font-lock。"
+  (let ((inhibit-read-only t)
+        (marker seshat-reader-translate--panel-body-marker))
+    (when (and (markerp marker) (marker-position marker))
+      (save-excursion
+        (goto-char marker)
+        (delete-region (point) (point-max))
+        (insert text)
+        (unless (string-suffix-p "\n" text)
+          (insert "\n"))))))
+
+(defun seshat-reader-translate--stream-init (text)
+  "首次增量：在当前（面板）buffer 写入模板骨架与正文 TEXT，并显示面板.
+骨架由 `seshat-reader-translate--apply-template' 以空正文（`%t' 为 \"\"）生成，
+故模板里的原文引用块、分隔线与语言对行只写一次；正文起点用 marker 记录，后续
+增量只重写 marker 之后的部分。显示时 SELECT 传 nil：流式期间不抢焦点。"
+  (let ((title (or seshat-reader-translate--stream-title "Seshat 译文"))
+        (inhibit-read-only t))
+    (erase-buffer)
+    (insert (seshat-reader-translate--apply-template
+             "" title
+             seshat-reader-translate--stream-langs
+             seshat-reader-translate--stream-context))
+    ;; 顺序要紧：切视图 major mode 会 `kill-all-local-variables'，把下面要设的
+    ;; buffer-local 状态（skeleton 标志、正文 marker、面板标题）一并清掉。
+    (seshat-reader-translate--prepare-view)
+    (setq seshat-reader-translate--panel-skeleton t)
+    (setq seshat-reader-translate--panel-title title)
+    (setq seshat-reader-translate--panel-body-marker (copy-marker (point-max)))
+    (seshat-reader-translate--stream-insert-body text)
+    (setq-local header-line-format
+                (concat title seshat-reader-translate--streaming-suffix))
+    (seshat-reader-translate-panel-mode 1)
+    (seshat-reader-sidebar-show (current-buffer) 'translate nil)))
+
+(defun seshat-reader-translate--stream-render (text)
+  "把增量 TEXT 写入面板：首次写骨架，之后只替换正文区，并按需跟随底部.
+「是否跟随」由**写入前**的窗口位置判定：用户已把 point 移离底部（距末尾 > 3
+行）就不再动它，回到底部后自动恢复。判定必须在写入前做——写正文会先删除再插入
+正文区，窗口 point 若正落在被删区间会被 relocation 到 marker 处，写后再判定会
+把「一直停在底部」误判成「用户滚走了」。"
+  (let* ((buffer (get-buffer-create seshat-reader-sidebar-translate-buffer-name))
+         (window (seshat-reader-translate--panel-display-window buffer))
+         (tailing (and window
+                       (seshat-reader-translate--panel-tailing-p window buffer))))
+    (with-current-buffer buffer
+      (if (and seshat-reader-translate--panel-skeleton
+               (markerp seshat-reader-translate--panel-body-marker)
+               (marker-position seshat-reader-translate--panel-body-marker))
+          (seshat-reader-translate--stream-insert-body text)
+        (seshat-reader-translate--stream-init text)))
+    (when (and seshat-reader-panel-follow-bottom
+               tailing
+               window
+               (seshat-reader-translate--stream-scroll-due-p))
+      (seshat-reader-translate--panel-scroll-to-bottom window buffer))))
+
+(defun seshat-reader-translate--stream-sync ()
+  "把中转 buffer 的增量同步到译文面板（`gt-buffer-render-output-hook' 挂载点）.
+gt 每次流式输出后都在**隐藏中转 buffer 内**运行该 hook，故本函数执行时
+`current-buffer' 就是中转 buffer（`--extract-result' 直接读它）。守卫见
+`seshat-reader-translate--stream-active-p'；`Loading...' 占位片段由
+`--extract-result' 的 SKIP-LOADING 过滤，全部片段都还是 Loading 时本函数直接
+返回、完全不碰面板（面板也不创建）。
+
+整体套 `ignore-errors'：hook 抛错会被 gt 的 `gt-output :around' 捕获并把
+translator state 置 4（整次翻译中止）；流式是增强功能，绝不能因为它让翻译失败。"
+  (ignore-errors
+    (when (seshat-reader-translate--stream-active-p)
+      (let ((text (car (seshat-reader-translate--extract-result t))))
+        (when (and text (not (string-empty-p text)))
+          (seshat-reader-translate--stream-render text))))))
+
+(defun seshat-reader-translate--stream-complete ()
+  "流式渲染收尾：header-line 状态改成「已完成」并清骨架状态，**不重写内容**.
+仅在面板 buffer 已由骨架渲染过时生效（非流式路径为无操作）。不 erase 重写是
+刻意的：增量期间写好的正文就是最终内容，重写会在完成瞬间造成整块跳变。"
+  (let ((buffer (seshat-reader-translate--panel-buffer)))
+    (when (and (buffer-live-p buffer)
+               (buffer-local-value 'seshat-reader-translate--panel-skeleton buffer))
+      (with-current-buffer buffer
+        (setq-local header-line-format
+                    (concat (or seshat-reader-translate--panel-title "Seshat 译文")
+                            seshat-reader-translate--done-suffix))
+        (seshat-reader-translate--stream-reset)))))
+
+(defun seshat-reader-translate--install-stream-hook ()
+  "把 `seshat-reader-translate--stream-sync' 挂到 `gt-buffer-render-output-hook'.
+经 `add-hook' 安装，重复调用幂等。hook 常驻不卸载：函数体自带守卫（关闭流式、
+切换渲染方式、或输出属于别的 translator 时直接返回），卸载反而要在每次渲染方式
+切换时重新协调。"
+  (add-hook 'gt-buffer-render-output-hook
+            #'seshat-reader-translate--stream-sync))
+
 (defun seshat-reader-translate--install-capture-hook-for-mode ()
-  "按 `seshat-reader-translate-render' 决定是否安装译文捕获 hook.
-取 `sidebar' 且 `seshat-reader-sidebar-enabled' 非 nil 时**不安装任何 hook**：
-面板路径的译文捕获在 gt 渲染对象的 `:then' 回调内完成（见
-`seshat-reader-translate--panel-result'），它只操作本包专属的隐藏中转 buffer，
-零误捕获，也不需要全局 hook 与其时间窗口守卫。
+  "按 `seshat-reader-translate-render' 决定安装哪些输出 hook.
+取 `sidebar' 且 `seshat-reader-sidebar-enabled' 非 nil 时：译文捕获在 gt 渲染
+对象的 `:then' 回调内完成（见 `seshat-reader-translate--panel-result'），它只
+操作本包专属的隐藏中转 buffer，零误捕获，故**不挂** posframe 的输出 hook；但
+`seshat-reader-translate-stream' 非 nil 时挂
+`gt-buffer-render-output-hook'（`seshat-reader-translate--stream-sync'）以实现
+增量显示——该 hook **是**全局的，故函数体内用
+`seshat-reader-translate--stream-active-p'（translator 身份 + 时间窗）双重守卫，
+不会误捕获其它 gt 用法。
 
 其余情形（`pop'/`pin'，或取 `sidebar' 但 `seshat-reader-sidebar-enabled' 为
 nil 而回退 posframe）挂两个 posframe 输出 hook
 （`seshat-reader-translate--install-capture-hooks'），与
 `seshat-reader-translate--render-object' 的选取保持一致。安装经 `add-hook'，
 重复调用幂等。"
-  (unless (and (eq seshat-reader-translate-render 'sidebar)
-               seshat-reader-sidebar-enabled)
+  (if (and (eq seshat-reader-translate-render 'sidebar)
+           seshat-reader-sidebar-enabled)
+      (when seshat-reader-translate-stream
+        (seshat-reader-translate--install-stream-hook))
     (seshat-reader-translate--install-capture-hooks)))
 
 ;;; 交互式命令
