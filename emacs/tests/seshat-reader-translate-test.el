@@ -234,22 +234,23 @@
 ;;; 译文捕获
 
 (ert-deftest seshat-reader-translate-test--capture-result-joins-pieces ()
-  "`--capture-result' 在 pick 取 `all' 时把带 `gt-result' 的片段换行拼接.
-默认 pick 已改为 `first'（多引擎预设只展示一份译文，见
-`seshat-reader-translate-engines-pick'），故本用例显式绑定 `all' 锁死旧行为——
-它是调试用取值，拼接逻辑仍须可用。"
+  "`--capture-result' 在 pick 取 `all' 时把带 `gt-result' 的片段按分隔线拼接.
+默认 pick 已改为 `all'（多引擎展示全部结果，见
+`seshat-reader-translate-engines-pick'）。本用例的中转 buffer 里片段上方
+没有引擎前缀行（无来源），故格式化退化为纯文本：不加 `【来源】' 标签，
+但多条之间仍插 Markdown 分隔线。"
   (with-temp-buffer
     (insert (propertize "第一段" 'gt-result t))
-    (insert "（无属性，忽略）")
+    (insert "（无属性，忽略）\n")
     (insert (propertize "第二段" 'gt-result t))
     (let ((seshat-reader-translate-last-result nil)
           (seshat-reader-translate-engines-pick 'all)
           (seshat-reader-translate--active (float-time)))
       (cl-letf (((symbol-function 'message) (lambda (&rest _) nil)))
         (should (equal (seshat-reader-translate--capture-result)
-                       "第一段\n第二段")))
+                       "第一段\n\n---\n\n第二段")))
       (should (equal seshat-reader-translate-last-result
-                     "第一段\n第二段")))))
+                     "第一段\n\n---\n\n第二段")))))
 
 (ert-deftest seshat-reader-translate-test--capture-result-no-piece-keeps-nil ()
   "无 `gt-result' 片段时 `--capture-result' 提示且不写入译文."
@@ -314,7 +315,10 @@ FAILED 非 nil 时再带 `gt-buffer-render-error-face'（模拟该引擎失败�
 
 片段之间插一个**无属性**的换行：真实渲染缓冲区里各引擎结果之间有分隔文本，
 而相邻且同属性的片段会被 `text-property-search-forward' 合并成同一个
-`gt-result' 区域（那样就测不到「多片段」的场景了）。"
+`gt-result' 区域（那样就测不到「多片段」的场景了）。该行也不带 gt 的引擎
+前缀 face，故 `seshat-reader-translate--result-source' 取不到来源（标签为
+nil）——需要来源标注的用例改用
+`seshat-reader-translate-test--insert-engine-results'。"
   (dolist (piece pieces)
     (insert (if (cdr piece)
                 (propertize (car piece) 'gt-result t
@@ -322,8 +326,31 @@ FAILED 非 nil 时再带 `gt-buffer-render-error-face'（模拟该引擎失败�
               (propertize (car piece) 'gt-result t)))
     (insert "\n")))
 
+(defun seshat-reader-translate-test--insert-engine-results (entries)
+  "按 gt 的真实渲染格式在当前 buffer 插入引擎结果片段.
+ENTRIES 是 `(TEXT FAILED SOURCE)' 列表。gt 的 `gt-buffer-render-init' 把每个
+引擎的 `:prefix' 渲染成**单独一行**（带
+`gt-buffer-render-block-prefix-face'），随后再写一个**空行**，然后才写带
+`gt-result' 属性的结果片段——原文未被切成多段时就是这种「前缀行 + 空行 +
+结果」三行结构；单引擎没有前缀行，只有结果行。本函数如实复刻该结构（face
+符号以引号形式使用，不依赖 face 是否已定义），用于验证「上一行（跳过空行）
+取来源」的契约。"
+  (dolist (entry entries)
+    (let ((text (nth 0 entry))
+          (failed (nth 1 entry))
+          (source (nth 2 entry)))
+      (when source
+        (insert (propertize (concat source "\n")
+                            'face 'gt-buffer-render-block-prefix-face))
+        (insert "\n"))
+      (insert (if failed
+                  (propertize text 'gt-result t
+                              'face 'gt-buffer-render-error-face)
+                (propertize text 'gt-result t)))
+      (insert "\n\n"))))
+
 (ert-deftest seshat-reader-translate-test--extract-pick-first-takes-first ()
-  "pick 取 `first'（默认）时只返回第一个片段——多引擎不再拼成两份译文."
+  "pick 取 `first' 时只返回第一个片段（默认取值为 `all'，见 T3.7）."
   (with-temp-buffer
     (seshat-reader-translate-test--insert-pieces
      '(("youdao 译文" . nil) ("google 译文" . nil)))
@@ -341,13 +368,13 @@ FAILED 非 nil 时再带 `gt-buffer-render-error-face'（模拟该引擎失败�
                      '("google 译文"))))))
 
 (ert-deftest seshat-reader-translate-test--extract-pick-all-joins-successes ()
-  "pick 取 `all' 时把所有成功片段换行拼接（旧行为，仅调试用）."
+  "pick 取 `all' 时把所有成功片段用 Markdown 分隔线拼接（失败片段跳过）."
   (with-temp-buffer
     (seshat-reader-translate-test--insert-pieces
      '(("youdao 译文" . nil) ("失败片段" . t) ("google 译文" . nil)))
     (let ((seshat-reader-translate-engines-pick 'all))
       (should (equal (seshat-reader-translate--extract-result)
-                     '("youdao 译文\ngoogle 译文"))))))
+                     '("youdao 译文\n\n---\n\ngoogle 译文"))))))
 
 (ert-deftest seshat-reader-translate-test--extract-pick-first-skips-failed ()
   "pick 取 `first' 时首个片段带 error face 则顺延到下一个成功片段."
@@ -371,6 +398,88 @@ FAILED 非 nil 时再带 `gt-buffer-render-error-face'（模拟该引擎失败�
     (insert "没有任何属性的文本")
     (let ((seshat-reader-translate-engines-pick 'first))
       (should (equal (seshat-reader-translate--extract-result) (cons nil t))))))
+
+;;; 多引擎结果标注来源 + 分隔线（T3.7：默认展示全部结果）
+
+(ert-deftest seshat-reader-translate-test--format-engine-results-all-labels-and-separates ()
+  "pick 取 `all' 时逐条标注来源并用 Markdown 分隔线分段."
+  (should (equal (seshat-reader-translate--format-engine-results
+                  '(("A" nil "youdao") ("B" nil "google")) 'all)
+                 "【youdao】\nA\n\n---\n\n【google】\nB")))
+
+(ert-deftest seshat-reader-translate-test--format-engine-results-all-without-source ()
+  "pick 取 `all' 且来源为 nil/空串时只保留分隔线、不加标签."
+  (should (equal (seshat-reader-translate--format-engine-results
+                  '(("A" nil nil) ("B" nil "")) 'all)
+                 "A\n\n---\n\nB"))
+  ;; 单条且无来源：纯文本，连分隔线也没有
+  (should (equal (seshat-reader-translate--format-engine-results
+                  '(("A" nil nil)) 'all)
+                 "A")))
+
+(ert-deftest seshat-reader-translate-test--format-engine-results-all-skips-failed ()
+  "pick 取 `all' 时跳过失败条目，成功条目仍带自己的来源标签."
+  (should (equal (seshat-reader-translate--format-engine-results
+                  '(("A" t "youdao") ("B" nil "google")) 'all)
+                 "【google】\nB")))
+
+(ert-deftest seshat-reader-translate-test--format-engine-results-all-all-failed ()
+  "全部条目失败、或列表为空时 pick 取 `all' 返回 nil."
+  (should-not (seshat-reader-translate--format-engine-results
+               '(("A" t "youdao") ("B" t "google")) 'all))
+  (should-not (seshat-reader-translate--format-engine-results nil 'all)))
+
+(ert-deftest seshat-reader-translate-test--format-engine-results-first-last-return-plain-text ()
+  "pick 取 `first'/`last' 时返回纯译文，不带来源标签与分隔线."
+  (let ((results '(("A" nil "youdao") ("B" t "google") ("C" nil "bing"))))
+    (should (equal (seshat-reader-translate--format-engine-results
+                    results 'first)
+                   "A"))
+    (should (equal (seshat-reader-translate--format-engine-results
+                    results 'last)
+                   "C")))
+  ;; 未知 pick 值按 `all' 处理（配置写错时不静默丢结果）
+  (should (equal (seshat-reader-translate--format-engine-results
+                  '(("A" nil "youdao") ("B" nil "google")) 'bogus)
+                 "【youdao】\nA\n\n---\n\n【google】\nB")))
+
+(ert-deftest seshat-reader-translate-test--extract-result-source-from-previous-line ()
+  "`--extract-result' 从片段上方的引擎前缀行取来源；取不到时退化为纯文本."
+  ;; ① gt 实际布局（前缀行 + 空行 + 结果，多引擎）：每条带来源标签与分隔线
+  (with-temp-buffer
+    (seshat-reader-translate-test--insert-engine-results
+     '(("youdao 译文" nil "youdao") ("google 译文" nil "google")))
+    (let ((seshat-reader-translate-engines-pick 'all))
+      (should (equal (seshat-reader-translate--extract-result)
+                     '("【youdao】\nyoudao 译文\n\n---\n\n【google】\ngoogle 译文")))))
+  ;; ② 前缀行紧贴结果（原文被切成多段时 gt 不再写空行）：同样取到来源
+  (with-temp-buffer
+    (insert (propertize "youdao\n" 'face
+                        'gt-buffer-render-inline-prefix-face))
+    (insert (propertize "译文" 'gt-result t))
+    (let ((seshat-reader-translate-engines-pick 'all))
+      (should (equal (seshat-reader-translate--extract-result)
+                     '("【youdao】\n译文")))))
+  ;; ③ 片段上方是原文引用块（gt source face，单引擎无前缀行）：不含标签
+  (with-temp-buffer
+    (insert "\n")
+    (insert (propertize "Hello world\n\n" 'face 'gt-buffer-render-source-face))
+    (insert (propertize "译文" 'gt-result t))
+    (let ((seshat-reader-translate-engines-pick 'all))
+      (should (equal (seshat-reader-translate--extract-result) '("译文")))))
+  ;; ④ 片段上方只有空行：不含标签
+  (with-temp-buffer
+    (insert "\n\n")
+    (insert (propertize "译文" 'gt-result t))
+    (let ((seshat-reader-translate-engines-pick 'all))
+      (should (equal (seshat-reader-translate--extract-result) '("译文")))))
+  ;; ⑤ 失败片段也带来源时仍被跳过（来源不影响失败判定）
+  (with-temp-buffer
+    (seshat-reader-translate-test--insert-engine-results
+     '(("失败译文" t "youdao") ("google 译文" nil "google")))
+    (let ((seshat-reader-translate-engines-pick 'all))
+      (should (equal (seshat-reader-translate--extract-result)
+                     '("【google】\ngoogle 译文"))))))
 
 ;;; 面板内 Markdown 文本 buffer 渲染
 

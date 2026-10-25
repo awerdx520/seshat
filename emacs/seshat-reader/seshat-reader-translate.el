@@ -116,9 +116,10 @@
 `seshat-reader-translate--panel-result' 在 gt 的 `:then' 回调内调用它，
 posframe 路径经 `seshat-reader-translate--capture-result' 从输出 hook 调用它。
 值为按 `seshat-reader-translate-engines-pick' 从渲染缓冲区中带 `gt-result'
-文本属性的片段里**选出的那一份**译文（默认取第一个成功片段；多引擎预设会为
-每份译文各渲染一个片段，故不取全部，见
-`seshat-reader-translate--extract-result'）。翻译失败语义分两个层面（有意为之）：
+文本属性的片段里**格式化出的正文**（默认 `all'：全部成功结果逐条标注来源引擎
+名、段间加 Markdown 分隔线，与面板显示完全一致；取 `first'/`last' 时只有选
+中那一份的纯译文、不带标签，见 `seshat-reader-translate--extract-result'）。
+翻译失败语义分两个层面（有意为之）：
 **显示层**不清空——失败路径不会调用
 `seshat-reader-translate--render-panel'，面板 buffer 保留上一次渲染的内容，
 用户仍能看到旧译文；**变量层**则会被清空——
@@ -246,14 +247,18 @@ nil 关闭——仅当面板已显示时传 -1 清理窗口 margin（面板未�
   :type 'natnum
   :group 'seshat-reader-translate)
 
-(defcustom seshat-reader-translate-engines-pick 'first
-  "多个引擎时取哪个结果展示.
-`first'：取第一个**成功**的引擎结果（默认）；`last'：取最后一个成功的；
-`all'：把全部成功结果按换行拼接（旧行为，仅调试用）。片段带
-`gt-buffer-render-error-face' 时视为失败并顺延到下一个。"
-  :type '(choice (const :tag "第一个成功结果" first)
-                 (const :tag "最后一个成功结果" last)
-                 (const :tag "全部拼接（调试）" all))
+(defcustom seshat-reader-translate-engines-pick 'all
+  "多个引擎时如何展示结果.
+`all'（**默认**）：展示**全部**成功结果，每条前标注来源引擎名，段间用
+Markdown 分隔线（`---`）分隔——多引擎预设能让用户一眼比对各家译文；来源
+取不到时（单引擎不写前缀行）退化为纯译文，不加标签也不加分隔线。`first'：
+只展示第一个**成功**结果；`last'：只展示最后一个成功结果；二者都**不带**
+来源标签（只有一个结果时标注来源没有价值）。片段带
+`gt-buffer-render-error-face' 时视为失败并跳过（`first' 顺延到下一个成功
+片段）。格式化细节见 `seshat-reader-translate--format-engine-results'。"
+  :type '(choice (const :tag "全部结果，标注来源（默认）" all)
+                 (const :tag "第一个成功结果" first)
+                 (const :tag "最后一个成功结果" last))
   :group 'seshat-reader-translate)
 
 ;;; 内部辅助
@@ -573,52 +578,130 @@ TARGET-LANG 为 \"ja\" 且回退 langs 为 (en zh) 时返回 (en ja)）。
   (add-hook 'gt-posframe-pin-render-output-hook
             #'seshat-reader-translate--capture-result))
 
+(defun seshat-reader-translate--engine-prefix-face-p (position)
+  "POSITION 处的 `face' 属性是否为 gt 的引擎前缀 face.
+用于判定「上一行是不是来源标签」。gt 的 `gt-buffer-render-init' 给每个引擎的
+`:prefix' 单独加 `gt-buffer-render-block-prefix-face'（原文被切成多段时是
+`gt-buffer-render-inline-prefix-face'）；而原文引用块用
+`gt-buffer-render-source-face'、译文片段用结果自身的 face。三个 face 符号以
+引号形式参与比较，故 gt 未加载时也不会 void-variable。
+
+FACE 可能是符号、符号列表，或含 `(face . plist)' 形式的属性表
+（如 `(:foreground \"red\")'），三者都按「是否含目标 face 符号」判定。"
+  (let ((face (get-text-property position 'face))
+        (wanted '(gt-buffer-render-block-prefix-face
+                  gt-buffer-render-inline-prefix-face)))
+    (cond
+     ((null face) nil)
+     ((symbolp face) (and (memq face wanted) t))
+     ((consp face)
+      (and (cl-some (lambda (item)
+                      (memq (if (consp item) (car item) item) wanted))
+                    face)
+           t))
+     (t nil))))
+
+(defun seshat-reader-translate--result-source (beg)
+  "返回 BEG 处译文片段的来源标签（引擎名），取不到时返回 nil.
+gt 的 `gt-buffer-render-init' 在隐藏中转 buffer 里把每个引擎的 `:prefix'
+渲染在译文片段**上方**：多引擎时为 `gt-tag'（如 \"youdao\" / \"google\"，
+带 `gt-buffer-render-block-prefix-face'），单引擎时**没有前缀行**。原文
+未被切成多段时 gt 在前缀行后再写一个**空行**才写结果（前缀行、空行、结果
+三行），故本函数从 BEG 上方的行起**逐行向上跳过空白行**，取最靠下的非空行
+的文本（`buffer-substring-no-properties' 后 `string-trim'）。
+
+取到文本后还要过 `seshat-reader-translate--engine-prefix-face-p' 的 face
+校验才算来源：单引擎时片段上方紧邻的非空行是**原文引用块**（带
+`gt-buffer-render-source-face'），不做校验就会把原文误当来源标签。校验不过
+即返回 nil。
+
+契约失效的后果：gt 改渲染格式（不再给前缀加这两个 face，或把前缀并入结果
+片段）时本函数返回 nil，面板退化为纯译文——不加标签也不加分隔线，既不会
+报错，也不会显示错标签。"
+  (save-excursion
+    (goto-char beg)
+    (let ((done nil)
+          (found nil))
+      (while (and (not done) (zerop (forward-line -1)))
+        (let ((text (string-trim (buffer-substring-no-properties
+                                  (line-beginning-position)
+                                  (line-end-position)))))
+          (unless (string-empty-p text)
+            (setq done t
+                  found (and (seshat-reader-translate--engine-prefix-face-p
+                              (line-beginning-position))
+                             text)))))
+      found)))
+
+(defun seshat-reader-translate--format-engine-results (results pick)
+  "按 PICK 把 RESULTS 格式化为面板正文；无可展示内容时返回 nil.
+RESULTS 是 `(TEXT FAILED SOURCE)' 三元组列表，顺序即渲染缓冲区中的顺序；
+FAILED 非 nil 表示该引擎失败，SOURCE 为来源引擎名或 nil（单引擎、或取不到
+来源时为 nil）。
+
+PICK 取 `all'（默认）：跳过 FAILED 条目，其余每条 SOURCE 非空时渲染为
+\"【来源】\\n译文\"，SOURCE 为 nil 时原样用 TEXT；多条之间用 Markdown 分隔线
+\"\\n\\n---\\n\\n\" 连接；没有任何成功条目时返回 nil。PICK 取 `first' / `last'
+时只返回第一个 / 最后一个成功条目的 TEXT，**不带**来源标签。其它取值（含
+nil）一律按 `all' 处理——不静默退回「只显示一个」，避免配置写错时丢失结果。
+
+本函数是纯函数（只依赖入参 RESULTS 与 PICK，不读缓冲区），故格式化逻辑可被
+ERT 直接覆盖。"
+  (let ((ok (cl-remove-if #'cadr results)))
+    (pcase pick
+      ('first (car (car ok)))
+      ('last (car (car (last ok))))
+      (_ (when ok
+           (string-join
+            (mapcar (lambda (item)
+                      (let ((text (nth 0 item))
+                            (source (nth 2 item)))
+                        (if (and source (not (string-empty-p source)))
+                            (format "【%s】\n%s" source text)
+                          text)))
+                    ok)
+            "\n\n---\n\n"))))))
+
 (defun seshat-reader-translate--extract-result ()
-  "从当前缓冲区提取译文片段并按 `seshat-reader-translate-engines-pick' 选取.
-返回 `(TEXT . FAILED)'：TEXT 为按 pick 选出的译文（无可用片段时为 nil）；
+  "从当前缓冲区提取译文片段并按 `seshat-reader-translate-engines-pick' 格式化.
+返回 `(TEXT . FAILED)'：TEXT 为格式化后的正文（无可用片段时为 nil）；
 FAILED 非 nil 表示**没有成功片段**——没有任何 `gt-result' 片段，或全部片段
 都带 `gt-buffer-render-error-face'。供 posframe 捕获
 （`seshat-reader-translate--capture-result'）与面板捕获
 （`seshat-reader-translate--panel-result'）两条路径共用，签名与语义不变。
 
-为什么只取一个片段：多引擎预设（默认 `reader' 预设含 youdao + google 两个
-引擎）会把**每份**译文都渲染成带 `gt-result' 属性的片段，全收再换行拼接就会
-把两份译文一起显示在面板里（真机反馈的「译文重复」）。故本函数先逐片段收集
-`(TEXT . FAILED)'，再按 pick 选：`first'（默认）取第一个**成功**片段、首个
-失败时顺延到下一个；`last' 取最后一个成功片段；`all' 把所有成功片段换行拼接
-（旧行为，仅调试用）。
+为什么在这里做来源标注：多引擎预设（默认 `reader' 预设含 youdao + google
+两个引擎）会把**每份**译文各渲染成一个带 `gt-result' 属性的片段。默认展示
+**全部**结果，故本函数先逐片段收集 `(TEXT FAILED SOURCE)'——SOURCE 由
+`seshat-reader-translate--result-source' 从片段上方的引擎前缀行取得——再交
+`seshat-reader-translate--format-engine-results' 按 pick 格式化（`all' 标注
+来源并用 `---' 分段，`first'/`last' 只给纯译文）。单引擎时 gt 不写前缀行，
+来源为 nil，格式化自然退化为纯译文。
 
 单个片段的失败判定口径不变：只看**片段起点**的 `face` 属性是否含
 `gt-buffer-render-error-face`（用 `get-text-property' 读一次，不做逐字符推进，
-故在长缓冲区上也不会退化）。错误 face 落在片段之外时不再影响判定——此时
-「没有成功片段」这件事由「无片段」分支覆盖，语义等价。"
+故在长缓冲区上也不会退化）。"
   (let (pieces)
-    ;; 收集带 `gt-result' 属性的片段，并就地判定每片的失败标记。
+    ;; 收集带 `gt-result' 属性的片段，并就地判定失败标记与来源标签。
     (save-excursion
       (goto-char (point-min))
       (while (let ((match (text-property-search-forward 'gt-result)))
                (when match
-                 (let ((begin (prop-match-beginning match))
-                       (face nil))
-                   (setq face (get-text-property begin 'face))
-                   (push (cons (buffer-substring-no-properties
+                 (let* ((begin (prop-match-beginning match))
+                        (face (get-text-property begin 'face)))
+                   (push (list (buffer-substring-no-properties
                                 begin (prop-match-end match))
                                (or (eq face 'gt-buffer-render-error-face)
                                    (and (consp face)
                                         (memq 'gt-buffer-render-error-face
-                                              face))))
+                                              face)))
+                               (seshat-reader-translate--result-source begin))
                          pieces))
                  t))))
-    (let* ((all (nreverse pieces))
-           ;; 成功片段：FAILED 列（cdr）为 nil 的那些，保持原有顺序。
-           (ok (cl-remove-if #'cdr all)))
-      (cond
-       ((null ok) (cons nil t))
-       ((eq seshat-reader-translate-engines-pick 'all)
-        (cons (string-join (mapcar #'car ok) "\n") nil))
-       ((eq seshat-reader-translate-engines-pick 'last)
-        (cons (car (car (last ok))) nil))
-       (t (cons (car (car ok)) nil))))))
+    (let ((formatted (seshat-reader-translate--format-engine-results
+                      (nreverse pieces)
+                      seshat-reader-translate-engines-pick)))
+      (cons formatted (if formatted nil t)))))
 
 (defun seshat-reader-translate--record-result (extracted)
   "把 EXTRACTED（`seshat-reader-translate--extract-result' 的返回值）写入译文.

@@ -152,6 +152,18 @@ buffer 时退回「全部开合」旧语义。outline 的两处 `q`（mode-map �
 验收：ERT 覆盖四分支（translate/outline 面板内关闭、非面板回退、frame 走 delete-frame）；
 verify 实例 GUI 实测 childframe 内按 `q` 能真正关闭 frame。
 
+### T3.7 多引擎结果标注来源 + 分隔线（依赖：T3.6）
+
+用户确认：翻译面板**默认显示全部引擎结果**，每条标注来源、段间加分隔线（此前 T3.5 的去重
+默认改为可选）。实现：`seshat-reader-translate-engines-pick` 默认由 `first` 改为 `all`；
+`--extract-result` 收集每个 `gt-result` 片段时一并取其**前一行文本**作为来源标签（gt 在隐藏
+中转 buffer 中把每个引擎的 `:prefix` 单独成行，多引擎时为 `gt-tag`，单引擎时为 nil），再按
+pick 格式化：`all` → 每段 `【来源】\n译文`，段间 `\n\n---\n\n`，无来源时退化为纯文本、不
+加标签与分隔；`first`/`last` → 只返回该段纯译文。失败片段在 `all` 模式跳过，全失败仍返回
+`(nil . t)`。`--record-result` 存入的 `last-result` 与面板显示保持一致（含来源标注）。
+
+验收：ERT 覆盖 all 格式化（含/不含来源）、失败跳过、first/last 纯文本；translate 套件全绿。
+
 ### T4 流式渲染（依赖：T3）
 
 - 文件：`emacs/seshat-reader/seshat-reader-translate.el`
