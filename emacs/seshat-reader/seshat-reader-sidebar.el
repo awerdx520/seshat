@@ -96,6 +96,13 @@
 ;; `seshat-reader' 加载完成后才注册键位，故届时它必然已定义）。
 (defvar seshat-reader-mode-map)
 
+;; 同理：批注列表与目录面板的 keymap 定义在各自模块（本模块不 require 它们，
+;; 否则会毁掉「零依赖」这条边界）。声明只服务字节编译；运行时的绑定注册见文末
+;; `with-eval-after-load`——那时两个 map 已由 `define-derived-mode' /
+;; `defvar-keymap' 建好。
+(defvar seshat-reader-annotation-list-mode-map)
+(defvar seshat-reader-outline-mode-map)
+
 (defgroup seshat-reader-sidebar nil
   "阅读器信息面板的显示方式与参数."
   :group 'seshat-reader
@@ -191,6 +198,21 @@ side 模式下的宽度由 `seshat-reader-outline-sidebar-width' 决定；目录
   :type 'number
   :group 'seshat-reader-sidebar)
 
+(defcustom seshat-reader-sidebar-expanded-width 0.75
+  "面板「扩大」后的宽度（占 frame 宽度的比例）.
+由 `seshat-reader-sidebar-toggle-width' 使用：该命令在当前面板的常态宽度与
+本值之间**来回切换**（再次调用恢复扩大前的宽度）。语义与常态宽度变量一致——
+**小数**按 frame 根窗口总宽的比例换算为列数，**整数**直接作列数；与
+`seshat-reader-sidebar-width'（信息栏常态宽度）/
+`seshat-reader-outline-sidebar-width'（目录栏常态宽度）的区别只在于**用途**：
+它们决定面板打开时的宽度，本变量决定「按一次键临时放大到多少」。
+
+**仅窗口承载 + 左右分栏生效**：childframe 承载的面板是独立 frame，宽度由
+`seshat-reader-panel-width' 决定，命令会提示不支持；底部模式
+（`below-selected' / `at-bottom'）的面板尺寸是**高度**语义，宽度不可调。"
+  :type 'number
+  :group 'seshat-reader)
+
 (defcustom seshat-reader-panel-carrier 'window
   "面板承载方式（除 `seshat-reader-panel-carrier-alist' 逐 kind 覆盖外生效).
 `window'（默认）：沿用既有的 **side window** / 底部窗口承载，行为与
@@ -250,11 +272,18 @@ nil 时回落到 `seshat-reader-panel-height' 的比例。"
   :type 'boolean
   :group 'seshat-reader)
 
-(defcustom seshat-reader-panel-truncate-lines t
-  "面板正文是否不折行（nil 表示折行）.
-非 nil 时不折行、内容超过面板宽度可横向滚动（`truncate-lines' 为 t、`word-wrap'
-为 nil、`auto-hscroll-mode' 为 t）；同时禁用 `visual-fill-column-mode'——两者
-互斥，折行与横向滚动不能并存。nil 时保持原来的折行行为。"
+(defcustom seshat-reader-panel-truncate-lines nil
+  "面板正文是否不折行（**默认 nil = 折行**）.
+nil（默认）：**折行**——`truncate-lines' 为 nil、`word-wrap' 为 t，并按
+`seshat-reader-translate-visual-fill-column' 启停 `visual-fill-column-mode'
+（该 minor mode 把文本区按 `visual-fill-column-width'、nil 时回退 `fill-column'
+缩窄/居中），长行在面板内自动换行，不需要横向滚动。
+非 nil：**不折行**——`truncate-lines' 为 t、`word-wrap' 为 nil、
+`auto-hscroll-mode' 为 t，内容超过面板宽度时可**横向滚动**；同时**禁用**
+`visual-fill-column-mode'——按列宽折行与横向滚动互斥，不能并存。
+
+无论取值如何都不影响面板的纵向滚动。改动只对**此后渲染**的面板内容生效
+（已渲染的面板重开或重新生成时按新取值设置）。"
   :type 'boolean
   :group 'seshat-reader)
 
@@ -395,6 +424,19 @@ DIRECTION 与当前方向一致时复用记忆值，否则回落到
 面板高度后写入（记忆的是调整后的实测高度比例）。仅会话内记忆，不持久化；
 为空时各 kind 使用方向对应的默认值
 （`seshat-reader-sidebar--default-size'）。")
+
+(defvar seshat-reader-sidebar--width-memory (make-hash-table :test #'eq)
+  "「扩大前的宽度」记忆，键为面板 kind、值为该面板**扩大前**的列数.
+由 `seshat-reader-sidebar-toggle-width' 在扩大时写入、恢复时读出并删除，因此
+本表同时是「当前处于扩大态」的登记表：**有条目**表示该 kind 已被扩大、再按一次
+键要回退到记下的列数。
+
+与 `seshat-reader-sidebar--state' 的分工：后者记的是**下次新建窗口**用的比例
+（关闭面板时由 `--capture-state' 从实测尺寸写入，故扩大后的宽度会被自然记住、
+重开仍是扩大的），本表只记扩大前的列数、只为「改回来」这一个目的，二者各管
+一端、互不覆盖。按 **kind**（而非窗口）分记：面板关掉再打开后仍能回退——同一
+kind 只有一组常态/扩大值，与 `--state' 的 per-kind 语义一致。仅会话内记忆，
+不持久化。")
 
 (defun seshat-reader-sidebar-window-p (window)
   "判断 WINDOW 是否本包信息面板窗口.
@@ -1640,6 +1682,91 @@ child frame：关闭统一经 `seshat-reader-sidebar--toggle-kind'（它按承�
   (interactive)
   (seshat-reader-sidebar-toggle 'outline))
 
+;;; 宽度切换：常态 ↔ 扩大
+
+;; 宽度在两种意义上被「记住」，分工必须分清，否则两点会互相打脸：
+;; - `seshat-reader-sidebar--state' 记**下次新建窗口**用的比例——关闭面板时由
+;;   `--capture-state' 从实测尺寸写入，所以「扩大 → 关面板 → 重开」会自然用
+;;   扩大后的宽度（用户没撤销扩大，重开就该还是扩大的）；
+;; - `seshat-reader-sidebar--width-memory' 记**扩大前**的列数——只为「再按一次
+;;   恢复原宽度」，恢复时读出并删除。
+
+(defun seshat-reader-sidebar--width-target-window ()
+  "返回 `seshat-reader-sidebar-toggle-width' 要调整的面板窗口，没有则返回 nil.
+优先级：① 选中窗口本身就是本包面板（用户在面板里按 `C-c w'）；② 当前 buffer
+显示在本包面板窗口里；③ `seshat-reader-sidebar--windows' 的第一个——在阅读窗口
+里按 `C-c w' 时阅读 buffer 的窗口不是面板，故取「最近的」本包 side window（通常
+即最右侧的译文/批注面板）。三者都不命中时返回 nil，命令据此只提示、不报错。"
+  (or (and (seshat-reader-sidebar-window-p (selected-window))
+           (selected-window))
+      (let ((window (get-buffer-window (current-buffer) t)))
+        (and (seshat-reader-sidebar-window-p window) window))
+      (car (seshat-reader-sidebar--windows))))
+
+(defun seshat-reader-sidebar--resize-width (window columns)
+  "把 WINDOW 的宽度**差量**调整到 COLUMNS 列；调整不了时返回 nil.
+调用形式是 `(window-resize WINDOW DELTA HORIZONTAL)'——Emacs 29+ 的第三参就是
+HORIZONTAL（非 nil 表示按列调宽），DELTA 为目标列数减当前 `window-total-width'
+的差。左右分栏的 side window 与其相邻的阅读区同属一个水平窗口组合，故扩大面板
+会**等量压缩**阅读区、恢复时等量归还，不会新建窗口。差量为 0 时直接返回 t
+（不必触发一次布局重算）；目标超出 frame 能给的范围（例如 `window-min-width'
+不再满足）时 `window-resize' 会报错，此处吞掉并返回 nil，由调用方按实测宽度
+决定提示文案——面板宽度调整失败不该让按键抛错。"
+  (let ((delta (- columns (window-total-width window))))
+    (if (zerop delta)
+        t
+      (condition-case nil
+          (progn (window-resize window delta t) t)
+        (error nil)))))
+
+(defun seshat-reader-sidebar-toggle-width ()
+  "在常态宽度与 `seshat-reader-sidebar-expanded-width' 之间切换当前面板宽度.
+作用对象由 `seshat-reader-sidebar--width-target-window' 决定：在面板里按作用于
+该面板；在阅读窗口里按作用于「最近的」本包面板（`--windows' 的第一个）。没有
+面板时只 `message' 提示并返回，不报错、不动布局。
+
+扩大：目标列数 = `(round (* (frame-width) seshat-reader-sidebar-expanded-width))'，
+先把该 kind 的**当前列数**记进 `seshat-reader-sidebar--width-memory'，再差量
+`window-resize'；恢复：从记忆里取回扩大前的列数同法回退，并删掉该 kind 的记忆
+项（这样第三次按键又是扩大）。记忆**按 kind** 而非按窗口——面板关掉再打开后仍
+能回退；扩大后的宽度本身不必写进记忆，关闭面板时 `--capture-state' 会把实测
+尺寸记进 `seshat-reader-sidebar--state'，重开自然还是扩大的。
+
+只在「窗口承载 + 左右分栏」下有效：childframe 承载的面板是独立 frame（宽度由
+`seshat-reader-panel-width' 决定，`window-resize' 无从下手），底部模式的面板
+是**高度**语义（宽度由 frame 决定、不可调），这两种情况一律只提示、不改布局。"
+  (interactive)
+  (let ((window (seshat-reader-sidebar--width-target-window)))
+    (if (null window)
+        (message "Seshat Reader sidebar: 没有可调整宽度的面板")
+      (let* ((kind (window-parameter window 'seshat-reader-sidebar-kind))
+             (remembered (gethash kind seshat-reader-sidebar--width-memory)))
+        (cond
+         ((eq (seshat-reader-sidebar--carrier-for-kind kind) 'childframe)
+          (message
+           "Seshat Reader sidebar: childframe 承载的面板不支持调整宽度"))
+         ((not (seshat-reader-sidebar--horizontal-p kind))
+          (message
+           (concat "Seshat Reader sidebar: 底部模式的面板宽度不可调"
+                   "（高度见 seshat-reader-sidebar-height）")))
+         (remembered
+          (seshat-reader-sidebar--resize-width window remembered)
+          (remhash kind seshat-reader-sidebar--width-memory)
+          (message "Seshat Reader sidebar: %s 面板已恢复原宽度（%s 列）"
+                   kind remembered))
+         (t
+          (let* ((target (round (* (frame-width (window-frame window))
+                                   seshat-reader-sidebar-expanded-width)))
+                 (original (window-total-width window)))
+            (puthash kind original seshat-reader-sidebar--width-memory)
+            (if (seshat-reader-sidebar--resize-width window target)
+                (message
+                 "Seshat Reader sidebar: %s 面板宽度 %s → %s 列（再按一次恢复）"
+                 kind original (window-total-width window))
+              (remhash kind seshat-reader-sidebar--width-memory)
+              (message "Seshat Reader sidebar: %s 面板宽度无法调整到 %s 列"
+                       kind target)))))))))
+
 ;;; 生命周期：切出阅读 buffer 时隐藏 child frame 面板
 
 ;; 窗口承载的面板属于某个窗口，切到别的 buffer 时它自然留在原 frame 的窗口树里
@@ -1716,7 +1843,30 @@ redisplay 之外的安全阶段，`selected-window' / `selected-frame' 语义明
 ;; `with-eval-after-load' 在阅读器加载后注册，与 translate 模块的写法一致。
 (with-eval-after-load 'seshat-reader
   (define-key seshat-reader-mode-map (kbd "M-o")
-    #'seshat-reader-sidebar-toggle))
+    #'seshat-reader-sidebar-toggle)
+  ;; `C-c w'：面板宽度在常态与 `seshat-reader-sidebar-expanded-width'（0.75）
+  ;; 之间切换。`C-c` + 单字母是用户保留前缀，本包只用到 `C-c C-x' 形态
+  ;; （`C-c C-t/e/q/s/r/a/l/h`），`C-c w' 既不与它们重叠，也便于「w = width」
+  ;; 记忆；同一绑定还写在译文面板、批注列表、目录面板三个 keymap 上（见下），
+  ;; 故从哪个面板里按都生效。
+  (define-key seshat-reader-mode-map (kbd "C-c w")
+    #'seshat-reader-sidebar-toggle-width))
+
+;; 面板内的 `C-c w' 必须写进**各面板自己的键位表**：译文面板用 minor mode 的
+;; `seshat-reader-translate-panel-map'（在该模块内绑，见 `seshat-reader-translate'），
+;; 批注列表与目录面板用的是各自的 major mode map。本模块零依赖、不 require 它们，
+;; 故与阅读器侧同样用 `with-eval-after-load' 注册：文件已加载时 `eval-after-load'
+;; 立即执行，未加载时等它加载完再执行，且每次重新加载都会重放（面板 map 由
+;; `define-derived-mode' / `defvar-keymap' 重建时绑定不会丢）。
+;; ETAF 渲染的批注卡片走 ETAF 自己的 `:keys'，没有对外暴露的 keymap 变量，故不绑
+;; （在 ETAF 卡片里按 `C-c w' 无效，`M-x seshat-reader-sidebar-toggle-width' 或
+;; `q' 回纯文本列表均可）。
+(with-eval-after-load 'seshat-reader-annotation
+  (define-key seshat-reader-annotation-list-mode-map (kbd "C-c w")
+    #'seshat-reader-sidebar-toggle-width))
+(with-eval-after-load 'seshat-reader-outline
+  (define-key seshat-reader-outline-mode-map (kbd "C-c w")
+    #'seshat-reader-sidebar-toggle-width))
 
 ;; 挂到**全局**的 `post-command-hook'（不传 LOCAL）：判定对象是「命令结束后选中
 ;; 窗口的 buffer 是否还是阅读器 buffer」，与「哪个 buffer 是 local 的」无关——阅读

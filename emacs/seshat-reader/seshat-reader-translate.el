@@ -467,7 +467,9 @@ Markdown 只读视图显示：gt 只负责把纯译文渲染到隐藏中转 buff
 按 `visual-fill-column-width'（nil 时回退 `fill-column'）缩窄文本区；设为
 nil 关闭——仅当面板已显示时传 -1 清理窗口 margin（面板未显示时不触碰窗口，
 避免误清阅读器窗口的 margin/fringe）。`visual-fill-column' 是软依赖：未安装
-时静默跳过。批注列表面板不受本变量影响。"
+时静默跳过。批注列表面板不受本变量影响。
+只在**折行模式**下生效（`seshat-reader-panel-truncate-lines' 为 nil，即默认
+配置）——不折行 + 横向滚动与按列宽折行互斥。"
   :type 'boolean
   :safe #'booleanp
   :group 'seshat-reader-translate)
@@ -585,12 +587,16 @@ go-translate function `gt-buffer-render' 是该库中定义的**类名**（不�
 (defvar seshat-reader-translate-panel-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "q") #'seshat-reader-sidebar-quit)
+    (define-key map (kbd "C-c w") #'seshat-reader-sidebar-toggle-width)
     (define-key map (kbd "C-c C-s") 'seshat-reader-translate-save-as-annotation)
     (define-key map (kbd "C-c C-q") #'seshat-reader-translate-follow-up)
     map)
   "面板 buffer 的键位.
 `q' 关闭面板（`seshat-reader-sidebar-quit'：只关本面板所在 kind，child frame
 承载时走 `delete-frame'，不会连带关掉其它 kind）；
+`C-c w' 切换面板宽度（`seshat-reader-sidebar-toggle-width'：常态 ↔
+`seshat-reader-sidebar-expanded-width'，与阅读 buffer / 批注列表 / 目录面板
+同一键位）；
 `seshat-reader-translate-save-as-annotation' 把最近一次译文存为批注；
 `seshat-reader-translate-follow-up'（对面板里的原文继续追问）也绑在本 map 上。
 用 minor mode 承载而非 `local-set-key'，以免污染 Markdown 视图 mode 的键位表
@@ -615,22 +621,24 @@ go-translate function `gt-buffer-render' 是该库中定义的**类名**（不�
 Markdown 标记、标题分级、列表缩进、代码块），再按
 `seshat-reader-panel-truncate-lines' 设置折行与横向滚动：
 
-- 非 nil（默认）：不折行——`truncate-lines' 为 t、`word-wrap' 为 nil、
-  `auto-hscroll-mode' 为 t（面板宽度固定且较窄，长行必须能横向滚动，否则
-  超出宽度的内容既看不见也到不了）；此时**跳过** `visual-fill-column-mode`，
-  二者互斥（按列宽折行与横向滚动不能并存），跳过时不 `message' 提示；
-- nil：保持原来的折行行为（`truncate-lines' 为 nil、`word-wrap' 为 t）——
+- nil（**默认**）：**折行**——`truncate-lines' 为 nil、`word-wrap' 为 t。
   `gfm-view-mode' 实测不设 `word-wrap'，不显式设置就只能按字符边界硬折行，
-  CJK 折行效果差。
+  CJK 折行效果差，故必须显式打开；
+- 非 nil：不折行——`truncate-lines' 为 t、`word-wrap' 为 nil、
+  `auto-hscroll-mode' 为 t（面板较窄，长行必须能横向滚动，否则超出宽度的内容
+  既看不见也到不了）；此时**跳过** `visual-fill-column-mode`，二者互斥（按列宽
+  折行与横向滚动不能并存），跳过时不 `message' 提示。
 
 最后设 `buffer-read-only' 为 t。
 
 major mode 调用失败（如 autoload 指向的库缺失）时回退 `text-mode'，保证
 面板渲染不因软依赖缺失而报错。
 
-**折行模式**下，末尾按 `seshat-reader-translate-visual-fill-column' 启停
-`visual-fill-column-mode'（软依赖 `visual-fill-column'，未安装时静默跳过），
-让面板正文按 `visual-fill-column-width'（nil 时回退 `fill-column'）缩窄/居中。"
+**折行模式**（默认）下，末尾按 `seshat-reader-translate-visual-fill-column'
+启停 `visual-fill-column-mode'（软依赖 `visual-fill-column'，未安装时静默
+跳过），让面板正文按 `visual-fill-column-width'（nil 时回退 `fill-column'）
+缩窄/居中；不折行模式不做这一步（二者互斥）。故默认配置下面板正文是
+「折行 + 可选 `visual-fill-column-mode`」，横向滚动只在不折行模式出现。"
   (let ((mode (seshat-reader-translate--view-mode-function)))
     (condition-case nil
         (funcall mode)

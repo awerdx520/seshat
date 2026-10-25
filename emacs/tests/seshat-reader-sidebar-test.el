@@ -2560,5 +2560,152 @@ kind 由 buffer 名推断；命令必须把 kind 交给 `--toggle-kind'（它按
             (should (string-match-p "隐藏" (car messages))))
         (kill-buffer buf)))))
 
+;;; 折行默认与面板宽度切换（M12 后续）
+
+(ert-deftest seshat-reader-sidebar-test--panel-defaults ()
+  "面板折行默认 `nil`（折行），扩大宽度默认 `0.75`。"
+  ;; `standard-value' 存的是**求值形式**（defcustom 会把常量包成
+  ;; `(funcall (function (lambda nil VALUE)))'），故必须先 `eval' 再比较
+  (should-not (eval (car (get 'seshat-reader-panel-truncate-lines
+                              'standard-value))
+                    t))
+  (should (null (default-value 'seshat-reader-panel-truncate-lines)))
+  (should (equal (eval (car (get 'seshat-reader-sidebar-expanded-width
+                                 'standard-value))
+                       t)
+                 0.75))
+  (should (= (default-value 'seshat-reader-sidebar-expanded-width) 0.75)))
+
+(defun seshat-reader-sidebar-test--toggle-width-run
+    (kind init-width frame-width &optional expanded-width)
+  "在桩环境下跑两次 `seshat-reader-sidebar-toggle-width'（扩大 → 恢复）.
+桩：`seshat-reader-sidebar-window-p' 恒 t（选中窗口当作面板）、
+`window-parameter' 恒返回 KIND、`window-total-width' 返回可变的当前列数、
+`frame-width' 固定 FRAME-WIDTH、`window-resize' 记录 `(WINDOW DELTA)' 并累加
+列数、`message' 收集文案。EXPANDED-WIDTH 省略时固定为 `0.75`（显式绑定，避免
+用例受用户配置影响）。返回 plist：`:resizes' / `:width' / `:memory' 为**第一次**
+调用（扩大）后的状态，`:resizes2' / `:width2' / `:memory2' / `:messages2' 为
+**第二次**调用（恢复）后的状态（`:memory' 取不到时用符号 `none' 占位）。"
+  (let* ((width init-width)
+         (resizes nil)
+         (messages nil)
+         (memory (make-hash-table :test #'eq))
+         (first nil))
+    (let ((seshat-reader-sidebar--width-memory memory)
+          ;; 左右分栏（宽度语义）与扩大比例都显式固定
+          (seshat-reader-sidebar-position 'right)
+          (seshat-reader-sidebar-expanded-width (or expanded-width 0.75)))
+      (cl-letf (((symbol-function 'seshat-reader-sidebar-window-p)
+                 (lambda (&rest _) t))
+                ((symbol-function 'window-parameter)
+                 (lambda (&rest _) kind))
+                ((symbol-function 'window-total-width)
+                 (lambda (&rest _) width))
+                ((symbol-function 'frame-width)
+                 (lambda (&rest _) frame-width))
+                ((symbol-function 'window-resize)
+                 (lambda (window delta &rest _)
+                   (push (list window delta) resizes)
+                   (cl-incf width delta)))
+                ((symbol-function 'message)
+                 (lambda (fmt &rest args)
+                   (push (apply #'format fmt args) messages))))
+        (seshat-reader-sidebar-toggle-width)
+        (setq first (list :resizes (nreverse resizes)
+                          :width width
+                          :memory (gethash kind memory 'none)))
+        (setq resizes nil
+              messages nil)
+        (seshat-reader-sidebar-toggle-width)
+        (append first
+                (list :resizes2 (nreverse resizes)
+                      :width2 width
+                      :memory2 (gethash kind memory 'none)
+                      :messages2 (nreverse messages)))))))
+
+(ert-deftest seshat-reader-sidebar-test--toggle-width-expands-and-restores ()
+  "首次调用扩大到 `round(frame 宽 × 0.75)`，再次调用回到原列数并清记忆."
+  (let* ((kind 'translate)
+         (result (seshat-reader-sidebar-test--toggle-width-run kind 20 80))
+         (win (selected-window)))
+    ;; 目标列数 = round(80 × 0.75) = 60；DELTA = 60 − 20 = 40
+    (should (= 60 (plist-get result :width)))
+    (should (equal (plist-get result :resizes) (list (list win 40))))
+    ;; 扩大前宽度按 kind 记下，供恢复使用
+    (should (= 20 (plist-get result :memory)))
+    ;; 第二次：DELTA = 20 − 60 = −40，恢复后记忆被清空
+    (should (= 20 (plist-get result :width2)))
+    (should (equal (plist-get result :resizes2) (list (list win -40))))
+    (should (eq 'none (plist-get result :memory2)))
+    ;; 恢复时给出可见反馈
+    (should (string-match-p "恢复" (car (plist-get result :messages2))))))
+
+(ert-deftest seshat-reader-sidebar-test--toggle-width-target-smaller-than-current ()
+  "`expanded-width' 小于当前宽度时照常工作（差量为负），恢复仍回到原列数."
+  (let* ((result (seshat-reader-sidebar-test--toggle-width-run
+                  'annotations 60 80 0.25))
+         (win (selected-window)))
+    ;; 目标 = round(80 × 0.25) = 20 → DELTA = −40
+    (should (= 20 (plist-get result :width)))
+    (should (equal (plist-get result :resizes) (list (list win -40))))
+    (should (= 60 (plist-get result :memory)))
+    (should (= 60 (plist-get result :width2)))
+    (should (equal (plist-get result :resizes2) (list (list win 40))))))
+
+(ert-deftest seshat-reader-sidebar-test--toggle-width-without-panel ()
+  "没有面板时只 `message' 提示，不调用 `window-resize'。"
+  (let ((resized nil)
+        (messages nil))
+    (cl-letf (((symbol-function 'seshat-reader-sidebar-window-p)
+               (lambda (&rest _) nil))
+              ((symbol-function 'get-buffer-window) (lambda (&rest _) nil))
+              ((symbol-function 'seshat-reader-sidebar--windows)
+               (lambda () nil))
+              ((symbol-function 'window-resize)
+               (lambda (&rest _) (setq resized t)))
+              ((symbol-function 'message)
+               (lambda (fmt &rest args)
+                 (push (apply #'format fmt args) messages))))
+      (seshat-reader-sidebar-toggle-width)
+      (should-not resized)
+      (should (= 1 (length messages)))
+      (should (string-match-p "没有可调整宽度的面板" (car messages))))))
+
+(ert-deftest seshat-reader-sidebar-test--toggle-width-childframe-unsupported ()
+  "childframe 承载时提示不支持、不 `window-resize'、不写宽度记忆."
+  (let ((resized nil)
+        (messages nil)
+        (memory (make-hash-table :test #'eq)))
+    (let ((seshat-reader-sidebar--width-memory memory))
+      (cl-letf (((symbol-function 'seshat-reader-sidebar-window-p)
+                 (lambda (&rest _) t))
+                ((symbol-function 'window-parameter)
+                 (lambda (&rest _) 'translate))
+                ((symbol-function 'seshat-reader-sidebar--carrier-for-kind)
+                 (lambda (&rest _) 'childframe))
+                ((symbol-function 'window-resize)
+                 (lambda (&rest _) (setq resized t)))
+                ((symbol-function 'message)
+                 (lambda (fmt &rest args)
+                   (push (apply #'format fmt args) messages))))
+        (seshat-reader-sidebar-toggle-width)
+        (should-not resized)
+        (should (= 1 (length messages)))
+        (should (string-match-p "childframe" (car messages)))
+        (should (= 0 (hash-table-count memory)))))))
+
+(ert-deftest seshat-reader-sidebar-test--toggle-width-keybindings ()
+  "`C-c w' 在阅读 buffer 与三个面板 keymap 上都绑到 `--toggle-width'."
+  ;; 目录面板的 keymap 在其自己的模块里定义，本用例必须先加载该模块
+  (require 'seshat-reader-outline)
+  (should (eq (lookup-key seshat-reader-mode-map (kbd "C-c w"))
+              #'seshat-reader-sidebar-toggle-width))
+  (should (eq (lookup-key seshat-reader-translate-panel-map (kbd "C-c w"))
+              #'seshat-reader-sidebar-toggle-width))
+  (should (eq (lookup-key seshat-reader-annotation-list-mode-map (kbd "C-c w"))
+              #'seshat-reader-sidebar-toggle-width))
+  (should (eq (lookup-key seshat-reader-outline-mode-map (kbd "C-c w"))
+              #'seshat-reader-sidebar-toggle-width)))
+
 (provide 'seshat-reader-sidebar-test)
 ;;; seshat-reader-sidebar-test.el ends here

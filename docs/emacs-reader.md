@@ -295,6 +295,7 @@ Emacs 端**只显示**手写（无笔事件、无压感，输入永远在 Androi
 | `q`（面板内） | `seshat-reader-sidebar-quit` | 关面板（`seshat-reader-translate-panel-mode` 承载；按 buffer 名推断 kind，child frame 承载时走 `delete-frame`） |
 | `C-c C-q`（面板内） | `seshat-reader-translate-follow-up` | 针对同一段原文继续追问（多轮上下文，见下文「继续追问」） |
 | `C-c C-s`（面板内） | `seshat-reader-translate-save-as-annotation` | 把最近一次译文存为批注 |
+| `C-c w`（面板内） | `seshat-reader-sidebar-toggle-width` | 面板宽度切换：常态 ↔ `seshat-reader-sidebar-expanded-width`（默认 `0.75`），再按一次恢复原宽度 |
 
 - **解释带同页上下文**：`C-c C-e` 送模型的是「结构化指令 + 同页邻近上下文（上下各 `seshat-reader-translate-context-lines` 行，上限 `seshat-reader-translate-context-max-chars` 字）+ 选区原文（上限 `seshat-reader-translate-explain-max-chars` 字）」，不再只是孤立片段；指令模板可用 `seshat-reader-translate-explain-prompt` 自定义（设 `nil` 退回「纯选区 + 预设引擎自带 prompt」的旧行为），关掉上下文用 `(setq seshat-reader-translate-context-enabled nil)`。**注意隐私**：默认会把同页邻近正文一并送出（见 [`llm.md`](llm.md)「隐私提示」）。
 - 依赖 go-translate：`seshat-reader-translate-preset`（默认 `reader`）与 `seshat-reader-translate-explain-preset`（默认 `reader-explain`）按名从 `seshat-reader-translate-presets` → `gt-preset-translators` 依次取用（seshat 自有表优先，故这两个预设不必进 gt 全局表）；预设通常定义在**用户配置侧**，缺失时翻译回退内置 youdao/google，解释需显式配置端点。gt 的中转 buffer `" *Seshat gt*"` 由包隐藏，用户无需改 `display-buffer-alist`。
@@ -327,6 +328,7 @@ Emacs 端**只显示**手写（无笔事件、无压感，输入永远在 Androi
 - **面板内 `q`（三面板统一）**：一律走 `seshat-reader-sidebar-quit`——按 buffer 名推断当前面板 kind，再按**承载单元**分派 `delete-window`（窗口）或 `delete-frame`（child frame），**只关当前这一个面板**，不连带关闭其它 kind 的面板；当前 buffer 不是面板时退回 `seshat-reader-sidebar-toggle`。目录面板与译文/解释面板直接绑该命令，批注列表（含 ETAF 渲染路径）也绑到它（`seshat-reader-etaf-quit` 委托同一命令）。
 - **per-kind 开合键（阅读窗口里）**：每个 kind 一个 toggle——`o` 目录（`seshat-reader-outline-toggle`）、`C-c C-l` 批注列表（`seshat-reader-annotation-toggle`）、`C-c C-t` / `C-c C-e` 译文与解释（`seshat-reader-translate-toggle` / `-explain-toggle`）。语义统一：**面板已显示则关闭，否则打开/生成**。「已显示」由 `seshat-reader-sidebar-panel-visible-p` 判定，与承载方式无关（side window / 底部窗口 / child frame 都算），因此 childframe 承载下同样能一键关闭。原命令（`-outline-show` / `-annotation-list` / `-translate-selection` / `-explain-selection`）保留不变，`M-x` 调用语义如旧。
 - **`M-o` 全部面板开合**：`seshat-reader-sidebar-toggle`（无参）——**面板开着就全部关闭，关了重开最近一个面板**。`C-c C-o` 已**解绑**，让给 org / `outline-minor-mode` 的结构操作。选 `M-o` 是因为单键、右手拇指可直接够到；它虽是 `global-map` 里 `facemenu-keymap` 的前缀，但本包把绑定写进 `seshat-reader-mode-map`（mode-map 优先），阅读器 buffer 内的 `M-o` 因此归本包，其它 buffer 的 `M-o` 行为不受影响。
+- **`C-c w` 面板宽度切换**：`seshat-reader-sidebar-toggle-width` —— 把当前面板从常态宽度（`seshat-reader-sidebar-width` 默认 `0.25`；目录栏为 `seshat-reader-outline-sidebar-width` 默认 `0.20`）扩到 `seshat-reader-sidebar-expanded-width`（默认 **`0.75`**），**再按一次恢复扩大前的宽度**。作用对象：在面板 buffer 里按作用于该面板，在阅读 buffer 里按作用于「最近的」本包面板（`seshat-reader-sidebar--windows` 的第一个，通常是最右侧的译文/批注面板）；没有面板时只提示、不报错。实现是水平 `window-resize` 差量调整——side window 与阅读区同属一个水平窗口组合，扩大面板会等量压缩阅读区、恢复时等量归还，不新建窗口。「扩大前宽度」按 **kind** 记在会话内哈希里（`seshat-reader-sidebar--width-memory`），所以面板关掉再打开也能恢复；扩大后的宽度本身不写配置，重启 Emacs 回到常态。**仅窗口承载 + 左右分栏**生效：childframe 承载（宽度由 `seshat-reader-panel-width` 决定）与底部模式（高度语义）只提示、不改布局。键位同时写在阅读 buffer、译文面板、批注列表、目录面板四个 keymap 上；ETAF 渲染的批注卡片走 ETAF 自己的 `:keys`、无对外 keymap 变量，故卡片里需用 `M-x seshat-reader-sidebar-toggle-width`。
 - **位置与复用**：每个 kind 的 side 由「kind → 位置」解析决定（目录默认左、译文/批注默认右），slot 按 kind 固定分配，故同一 kind 重开时**复用同一 side window**（不新建、不改侧）；运行中改方位才会重建该 kind 的窗口。
 - **译文/解释面板不抢光标**：面板显示后光标留在阅读窗口（`seshat-reader-translate--render-panel` / `--stream-init` 的 SELECT 传 `nil`）。需要时点进面板，或把 `seshat-reader-sidebar-select-window` 与调用点改回非 nil。批注列表面板保持原行为（内容就绪后跟随光标）。
 - **切走即隐藏**：`seshat-reader-panel-hide-on-buffer-change`（默认 `t`）挂在全局 `window-buffer-change-functions` 上——当前 buffer 不再派生自 `seshat-reader-mode` 时关闭本包 child frame 面板（覆盖浮层不属于任何窗口树，放任不管会在回邮件 / 看终端时一直悬在右上角）。面板内容仍留在 buffer 里，`M-o` 可重开；设 `nil` 则常驻。
@@ -428,6 +430,7 @@ Emacs 端**只显示**手写（无笔事件、无压感，输入永远在 Androi
 | `C-c C-t` / `C-c C-e` | `seshat-reader-translate-toggle` / `-explain-toggle` | 译文 / 解释面板开合（已显示则关，否则翻译 / 解释选区并弹出） |
 | `C-c C-q` | `seshat-reader-translate-follow-up` | 对译文 / 解释继续追问（多轮上下文） |
 | `M-o` | `seshat-reader-sidebar-toggle` | **全部面板**开合：有面板就全部关闭，没有就重开最近一个 |
+| `C-c w` | `seshat-reader-sidebar-toggle-width` | 面板宽度**切换**：常态宽度（`seshat-reader-sidebar-width` / `seshat-reader-outline-sidebar-width`）↔ `seshat-reader-sidebar-expanded-width`（默认 `0.75`）；再按一次恢复原宽度。同一键位在译文面板 / 批注列表 / 目录面板内也生效 |
 
 `C-c C-o` **已解绑**（让给 org / `outline-minor-mode` 的结构操作）：单个 kind 的开合改由各自
 的键承担（`o` 目录、`C-c C-l` 批注列表、`C-c C-t` / `C-c C-e` 译文与解释），全部开合统一走
@@ -445,6 +448,7 @@ Emacs 端**只显示**手写（无笔事件、无压感，输入永远在 Androi
 | `o` | `seshat-reader-outline-toggle` | 开合面板：已显示则关闭，未显示则重建内容后打开；`seshat-reader-outline-select-doc-window` 不再占 `o`，仅供 `RET` 跳页切回阅读窗口 |
 | `s` | `seshat-reader-outline-select-doc-window` | 切回阅读窗口（回跳当前文档；`o` 改为面板开合后它换绑到 `s`） |
 | `q` | `seshat-reader-sidebar-quit` | **只关当前面板**（child frame 承载时走 `delete-frame`，窗口承载走 `delete-window`；不连带关闭译文/批注面板） |
+| `C-c w` | `seshat-reader-sidebar-toggle-width` | 面板宽度切换（常态 ↔ `seshat-reader-sidebar-expanded-width`，再按一次恢复） |
 | `TAB` | `outline-mode` 自身 | 折叠 / 展开子树 |
 
 evil 用户同样可用上述单键（包内 `evil-define-key*` 补绑 normal state 的 `f` / `p` / `n` / `o` / `s` / `q` / `RET` / `M-RET`）。
@@ -457,12 +461,14 @@ evil 用户同样可用上述单键（包内 `evil-define-key*` 补绑 normal st
 | `d` | `seshat-reader-annotation-list-delete` | 删除该条批注 |
 | `C-c C-r` | `seshat-reader-reference-insert-annotation` | 插入该条批注的引用 |
 | `q` | `seshat-reader-sidebar-quit` | 只关当前（批注列表）面板，与目录 / 译文面板一致（ETAF 渲染路径同一语义，键由 `seshat-reader-etaf--annotation-keys` 绑到 `seshat-reader-etaf-quit`，后者委托 `sidebar-quit`） |
+| `C-c w` | `seshat-reader-sidebar-toggle-width` | 面板宽度切换：常态 ↔ `seshat-reader-sidebar-expanded-width`，再按一次恢复原宽度 |
 
 ### 9.4 译文/解释面板（`seshat-reader-translate-panel-mode-map`）
 
 | 键位 | 命令 | 作用 |
 |---|---|---|
 | `q` | `seshat-reader-sidebar-quit` | 关面板（child frame 承载时 `delete-frame`） |
+| `C-c w` | `seshat-reader-sidebar-toggle-width` | 面板宽度切换（常态 ↔ 扩大值，再按一次恢复） |
 | `C-c C-q` | `seshat-reader-translate-follow-up` | 对当前原文继续追问 |
 | `C-c C-s` | `seshat-reader-translate-save-as-annotation` | 存为批注 |
 
@@ -477,6 +483,7 @@ evil 用户同样可用上述单键（包内 `evil-define-key*` 补绑 normal st
 | `seshat-reader-sidebar-width` | `0.24` | 信息栏宽度（小数=frame 比例，整数=列数） | 仅 side 模式；只对新建窗口生效 |
 | `seshat-reader-outline-sidebar-position` | `left` | 目录栏位置 | 只作用于 `outline` |
 | `seshat-reader-outline-sidebar-width` | `0.20` | 目录栏宽度 | 仅 side 模式 |
+| `seshat-reader-sidebar-expanded-width` | `0.75` | `C-c w`（`seshat-reader-sidebar-toggle-width`）把当前面板扩大到的宽度（占 frame 宽比例；整数=列数） | 仅窗口承载 + 左右分栏；childframe 与底部模式只提示、不改布局。再按一次恢复原宽度 |
 | `seshat-reader-sidebar-height` | `0.35` | 面板首次显示的初始高度 | 高度语义；批注列表固定用此值 |
 | `seshat-reader-sidebar-min-height` | `0.25` | 译文/解释面板自适应下限 | 仅 `translate` 且未挂 ETAF |
 | `seshat-reader-sidebar-max-height` | `0.8` | 自适应上限 | 与 min 共同夹紧；min > max 时以 max 为准 |
@@ -488,6 +495,7 @@ evil 用户同样可用上述单键（包内 `evil-define-key*` 补绑 normal st
 | `seshat-reader-panel-width` | `0.34` | child frame 宽度 = 父 frame 像素宽 × 本值 | 仅 `childframe` 生效 |
 | `seshat-reader-panel-height` | `0.45` | child frame 高度 = 父 frame 像素高 × 本值；**打开即固定、全程不 resize**，内容超出在面板内滚动 | 仅 `childframe` 生效 |
 | `seshat-reader-panel-margin` | `16` | child frame 距父 frame **右 / 上**边缘的像素间距 | 仅 `childframe` 生效 |
+| `seshat-reader-panel-truncate-lines` | `nil` | 面板正文是否**不折行**：`nil`（默认）= **折行**（`truncate-lines` 为 nil + 显式 `word-wrap`，可叠加 `visual-fill-column-mode`）；`t` = 不折行 + 横向滚动（`truncate-lines`/`auto-hscroll-mode` 为 t、`word-wrap` 为 nil） | 折行与 `visual-fill-column-mode` 互斥，`t` 时整体跳过；**2026-10-25 由 `t` 改为 `nil`** |
 | `seshat-reader-panel-follow-bottom` | `t` | 流式输出期间是否自动跟随底部（显示最新内容）；用户向上滚动后停止跟随、回到底部时恢复 | 仅 `childframe` 生效 |
 | `seshat-reader-panel-hide-on-buffer-change` | `t` | 当前 buffer 不再是阅读器 buffer 时关闭本包 child frame 面板；面板内容留在 buffer 里可 `M-o` 重开 | `nil` = 面板常驻 |
 
