@@ -1738,6 +1738,58 @@ window and never recovers."
   "<remap> <mouse-drag-region>"    #'ignore
   "<remap> <mouse-drag-secondary>" #'ignore)
 
+;;; Evil 兼容（软依赖）
+
+;; evil 是**软依赖**：本包不 `require'、不写进 `Package-Requires'，也不做任何
+;; 版本探测；evil 不在时下面的注册整体静默跳过（`fboundp' 守卫）。
+;;
+;; 为什么需要它：evil 把各 state 的 keymap（`evil-normal-state-map' →
+;; `evil-motion-state-map'）经 `emulation-mode-map-alists' 挂在 major-mode-map
+;; **之前**，而 `?' 在 normal state 是 `evil-search-backward'，于是上面
+;; `seshat-reader-mode-map' 里的 `?' 在 evil 用户手里按不到——实测 Emacs 31.1
+;; + evil：normal state 下 `(key-binding (kbd "?"))' 为 `evil-search-backward'
+;; 而不是 `seshat-reader-help'。
+;;
+;; **只接管 `?'**：evil 的 `/`（正向搜索）、`n` / `N`（下一/上一处）一律不动。
+;; 阅读器自己的搜索走 `C-s'（`seshat-reader-search'，全程基于页面坐标、与
+;; buffer 文本无关），evil 的 `?` 反向搜索在只读、单页位图的阅读 buffer 里没有
+;; 用武之地，故让给帮助页；想保留 evil 反向搜索的用户可在自己配置里覆盖本绑定
+;; （`(evil-define-key* 'normal seshat-reader-mode-map (kbd "?")
+;; #'evil-search-backward)'）——本包只在**加载时**注册一次，不会再次抢回。
+;;
+;; 为什么用 `evil-define-key*'：它是**函数**（evil-core.el，签名
+;; `(STATE KEYMAP KEY DEF &rest BINDINGS)'），把绑定写进 KEYMAP 关联的
+;; **auxiliary keymap**；`evil-normalize-keymaps' 装载时 auxiliary keymap 的
+;; 优先级高于 state 自身的 map，因此这条绑定只在本 mode 生效、压过
+;; `evil-motion-state-map'，且**不触碰** evil 的全局 map（传的 KEYMAP 是本 mode
+;; 的 map，不是 `global'）。`evil-define-key'（无星号）是宏、且会把绑定延迟到
+;; `after-load-functions'，不如函数版确定。
+;;
+;; 注册位置必须在**阅读器本身**、而不是帮助页模块（`seshat-reader-help'）里：
+;; 帮助页是 `?' 首次按下时才由 autoload 加载的，若把补绑写在那边，evil 用户
+;; 第一次按 `?' 走的仍是 `evil-search-backward'、永远不会加载帮助页，补绑也就
+;; 永远不生效。
+;;
+;; `M-o'（全部面板开合）**不需要**补绑：evil 的 normal state 未占该键（实测
+;; Emacs 31.1 + evil：normal state 下 `(key-binding (kbd "M-o"))' 已经是
+;; `seshat-reader-sidebar-toggle'）。将来若某个 evil 版本占了它，按同一模式在
+;; 本函数里加一对绑定即可。
+(defun seshat-reader--install-evil-bindings ()
+  "Install the reader's `?' binding for evil's normal state.
+
+Soft dependency: does nothing when evil (or `evil-define-key*') is absent, so
+loading this library never requires evil.  Extracted from the
+`with-eval-after-load' block below only so that it can be unit-tested."
+  (when (fboundp 'evil-define-key*)
+    (evil-define-key* 'normal seshat-reader-mode-map
+      (kbd "?") #'seshat-reader-help)))
+
+;; evil 可能在本文件之后才加载（用户把 evil 放在 init 更后面），故用
+;; `with-eval-after-load' 挂到 evil 上：evil 已加载时立即执行，未加载则等它加载
+;; 完再执行，两条路径都只注册一次。
+(with-eval-after-load 'evil
+  (seshat-reader--install-evil-bindings))
+
 ;;;###autoload
 (define-derived-mode seshat-reader-mode special-mode "Seshat Reader"
   "Major mode for viewing documents in The Seshat Reader.

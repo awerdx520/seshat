@@ -618,6 +618,7 @@ go-translate function `gt-buffer-render' 是该库中定义的**类名**（不�
 (defvar seshat-reader-translate-panel-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "q") #'seshat-reader-sidebar-quit)
+    (define-key map (kbd "M-o") #'seshat-reader-sidebar-toggle)
     (define-key map (kbd "C-c w") #'seshat-reader-sidebar-toggle-width)
     (define-key map (kbd "C-c C-s") 'seshat-reader-translate-save-as-annotation)
     (define-key map (kbd "C-c C-q") #'seshat-reader-translate-follow-up)
@@ -625,6 +626,10 @@ go-translate function `gt-buffer-render' 是该库中定义的**类名**（不�
   "面板 buffer 的键位.
 `q' 关闭面板（`seshat-reader-sidebar-quit'：只关本面板所在 kind，child frame
 承载时走 `delete-frame'，不会连带关掉其它 kind）；
+`M-o' **全部面板**开合（`seshat-reader-sidebar-toggle'：面板开着就全部关闭，
+关了重开最近一个——在面板里按 `M-o' 与在阅读 buffer 里按完全等价，不必先切回
+阅读 window；同一绑定写在阅读 buffer、批注列表、目录面板、搜索结果侧栏四个
+键表上）；
 `C-c w' 切换面板宽度（`seshat-reader-sidebar-toggle-width'：常态 ↔
 `seshat-reader-sidebar-expanded-width'，与阅读 buffer / 批注列表 / 目录面板
 同一键位）；

@@ -332,7 +332,7 @@ Emacs 端**只显示**手写（无笔事件、无压感，输入永远在 Androi
 - **去 mode-line**：child frame 的面板窗口设 window parameter `mode-line-format` 为 `none`，省掉一行无信息量的 modeline；`header-line` **保留**（仍显示「Seshat 译文」/「Seshat 解释」）。
 - **面板内 `q`（各面板统一）**：一律走 `seshat-reader-sidebar-quit`——按 buffer 名推断当前面板 kind（内置三种面板 + 注册表 `seshat-reader-sidebar-extra-kinds` 里的自建面板，如搜索结果侧栏 `search`），再按**承载单元**分派 `delete-window`（窗口）或 `delete-frame`（child frame），**只关当前这一个面板**，不连带关闭其它 kind 的面板；当前 buffer 不是面板时退回 `seshat-reader-sidebar-toggle`。目录面板与译文/解释面板直接绑该命令，批注列表（含 ETAF 渲染路径）也绑到它（`seshat-reader-etaf-quit` 委托同一命令），搜索结果侧栏经注册表同样命中它。
 - **per-kind 开合键（阅读窗口里）**：每个 kind 一个 toggle——`o` 目录（`seshat-reader-outline-toggle`）、`C-c C-l` 批注列表（`seshat-reader-annotation-toggle`）、`C-c C-t` / `C-c C-e` 译文与解释（`seshat-reader-translate-toggle` / `-explain-toggle`）。语义统一：**面板已显示则关闭，否则打开/生成**。「已显示」由 `seshat-reader-sidebar-panel-visible-p` 判定，与承载方式无关（side window / 底部窗口 / child frame 都算），因此 childframe 承载下同样能一键关闭。原命令（`-outline-show` / `-annotation-list` / `-translate-selection` / `-explain-selection`）保留不变，`M-x` 调用语义如旧。
-- **`M-o` 全部面板开合**：`seshat-reader-sidebar-toggle`（无参）——**面板开着就全部关闭，关了重开最近一个面板**。`C-c C-o` 已**解绑**，让给 org / `outline-minor-mode` 的结构操作。选 `M-o` 是因为单键、右手拇指可直接够到；它虽是 `global-map` 里 `facemenu-keymap` 的前缀，但本包把绑定写进 `seshat-reader-mode-map`（mode-map 优先），阅读器 buffer 内的 `M-o` 因此归本包，其它 buffer 的 `M-o` 行为不受影响。
+- **`M-o` 全部面板开合**：`seshat-reader-sidebar-toggle`（无参）——**面板开着就全部关闭，关了重开最近一个面板**。`C-c C-o` 已**解绑**，让给 org / `outline-minor-mode` 的结构操作。选 `M-o` 是因为单键、右手拇指可直接够到；它虽是 `global-map` 里 `facemenu-keymap` 的前缀，但本包把绑定写进 `seshat-reader-mode-map`（mode-map 优先），阅读器 buffer 内的 `M-o` 因此归本包，其它 buffer 的 `M-o` 行为不受影响。**`M-o` 在阅读 buffer 与所有面板内都可用**：译文/解释面板（`seshat-reader-translate-panel-map`）、批注列表、目录面板、搜索结果侧栏四个键表各自也绑了同一个命令（后三者由 `seshat-reader-sidebar` 用 `with-eval-after-load` 补注册，不改 `global-map`），故光标在面板里按 `M-o` 同样是「全部开合」，不必先切回阅读 window。「重开最近一个面板」时**位置与内容一致**：关闭时 buffer 与它的 kind 成对记下（`--last-buffer` / `--last-kind`），重开就按该 kind 的方位弹出（此前只记 buffer，`M-o` 关掉多 kind 面板后再按会弹到错误的一侧）。
 - **`C-c w` 面板宽度切换**：`seshat-reader-sidebar-toggle-width` —— 把当前面板从常态宽度（`seshat-reader-sidebar-width` 默认 `0.25`；目录栏为 `seshat-reader-outline-sidebar-width` 默认 `0.20`）扩到 `seshat-reader-sidebar-expanded-width`（默认 **`0.75`**），**再按一次恢复扩大前的宽度**。作用对象：在面板 buffer 里按作用于该面板，在阅读 buffer 里按作用于「最近的」本包面板（`seshat-reader-sidebar--windows` 的第一个，通常是最右侧的译文/批注面板）；没有面板时只提示、不报错。实现是水平 `window-resize` 差量调整——side window 与阅读区同属一个水平窗口组合，扩大面板会等量压缩阅读区、恢复时等量归还，不新建窗口。「扩大前宽度」按 **kind** 记在会话内哈希里（`seshat-reader-sidebar--width-memory`），所以面板关掉再打开也能恢复；扩大后的宽度本身不写配置，重启 Emacs 回到常态。**仅窗口承载 + 左右分栏**生效：childframe 承载（宽度由 `seshat-reader-panel-width` 决定）与底部模式（高度语义）只提示、不改布局。键位同时写在阅读 buffer、译文面板、批注列表、目录面板四个 keymap 上；ETAF 渲染的批注卡片走 ETAF 自己的 `:keys`、无对外 keymap 变量，故卡片里需用 `M-x seshat-reader-sidebar-toggle-width`。
 - **位置与复用**：每个 kind 的 side 由「kind → 位置」解析决定（目录默认左、译文/批注默认右），slot 按 kind 固定分配，故同一 kind 重开时**复用同一 side window**（不新建、不改侧）；运行中改方位才会重建该 kind 的窗口。
 - **译文/解释面板不抢光标**：面板显示后光标留在阅读窗口（`seshat-reader-translate--render-panel` / `--stream-init` 的 SELECT 传 `nil`）。需要时点进面板，或把 `seshat-reader-sidebar-select-window` 与调用点改回非 nil。批注列表面板保持原行为（内容就绪后跟随光标）。
@@ -434,9 +434,9 @@ Emacs 端**只显示**手写（无笔事件、无压感，输入永远在 Androi
 | `C-c C-r` | `seshat-reader-reference-insert` | 插入选区摘录 |
 | `C-c C-t` / `C-c C-e` | `seshat-reader-translate-toggle` / `-explain-toggle` | 译文 / 解释面板开合（已显示则关，否则翻译 / 解释选区并弹出） |
 | `C-c C-q` | `seshat-reader-translate-follow-up` | 对译文 / 解释继续追问（多轮上下文） |
-| `M-o` | `seshat-reader-sidebar-toggle` | **全部面板**开合：有面板就全部关闭，没有就重开最近一个 |
+| `M-o` | `seshat-reader-sidebar-toggle` | **全部面板**开合：有面板就全部关闭，没有就重开最近一个。同一键位在**所有面板**（译文/解释、批注列表、目录、搜索结果侧栏）内也生效——光标在面板里照样按得到，不必先切回阅读 window |
 | `C-c w` | `seshat-reader-sidebar-toggle-width` | 面板宽度**切换**：常态宽度（`seshat-reader-sidebar-width` / `seshat-reader-outline-sidebar-width`）↔ `seshat-reader-sidebar-expanded-width`（默认 `0.75`）；再按一次恢复原宽度。同一键位在译文面板 / 批注列表 / 目录面板内也生效 |
-| `?` | `seshat-reader-help` | 打开本帮助页：键位、功能简介与面板行为（`seshat-reader-help` 自带 autoload，无需 require，见「安装与加载」） |
+| `?` | `seshat-reader-help` | 打开本帮助页：键位、功能简介与面板行为（`seshat-reader-help` 自带 autoload，无需 require，见「安装与加载」）。**evil 用户同样可用**：包内用 `evil-define-key*` 把 normal state 的 `?` 补绑到本命令（evil 原绑的是 `evil-search-backward`），`/`、`n`、`N` 不被改动，见 §11 最后一条 |
 
 `C-c C-o` **已解绑**（让给 org / `outline-minor-mode` 的结构操作）：单个 kind 的开合改由各自
 的键承担（`o` 目录、`C-c C-l` 批注列表、`C-c C-t` / `C-c C-e` 译文与解释），全部开合统一走
@@ -454,6 +454,7 @@ Emacs 端**只显示**手写（无笔事件、无压感，输入永远在 Androi
 | `o` | `seshat-reader-outline-toggle` | 开合面板：已显示则关闭，未显示则重建内容后打开；`seshat-reader-outline-select-doc-window` 不再占 `o`，仅供 `RET` 跳页切回阅读窗口 |
 | `s` | `seshat-reader-outline-select-doc-window` | 切回阅读窗口（回跳当前文档；`o` 改为面板开合后它换绑到 `s`） |
 | `q` | `seshat-reader-sidebar-quit` | **只关当前面板**（child frame 承载时走 `delete-frame`，窗口承载走 `delete-window`；不连带关闭译文/批注面板） |
+| `M-o` | `seshat-reader-sidebar-toggle` | **全部面板**开合（与阅读 buffer 内同一个键：有面板就全部关闭，没有就重开最近一个） |
 | `C-c w` | `seshat-reader-sidebar-toggle-width` | 面板宽度切换（常态 ↔ `seshat-reader-sidebar-expanded-width`，再按一次恢复） |
 | `TAB` | `outline-mode` 自身 | 折叠 / 展开子树 |
 
@@ -467,6 +468,7 @@ evil 用户同样可用上述单键（包内 `evil-define-key*` 补绑 normal st
 | `d` | `seshat-reader-annotation-list-delete` | 删除该条批注 |
 | `C-c C-r` | `seshat-reader-reference-insert-annotation` | 插入该条批注的引用 |
 | `q` | `seshat-reader-sidebar-quit` | 只关当前（批注列表）面板，与目录 / 译文面板一致（ETAF 渲染路径同一语义，键由 `seshat-reader-etaf--annotation-keys` 绑到 `seshat-reader-etaf-quit`，后者委托 `sidebar-quit`） |
+| `M-o` | `seshat-reader-sidebar-toggle` | **全部面板**开合（与阅读 buffer 内同一个键） |
 | `C-c w` | `seshat-reader-sidebar-toggle-width` | 面板宽度切换：常态 ↔ `seshat-reader-sidebar-expanded-width`，再按一次恢复原宽度 |
 
 ### 9.4 译文/解释面板（`seshat-reader-translate-panel-mode-map`）
@@ -474,6 +476,7 @@ evil 用户同样可用上述单键（包内 `evil-define-key*` 补绑 normal st
 | 键位 | 命令 | 作用 |
 |---|---|---|
 | `q` | `seshat-reader-sidebar-quit` | 关面板（child frame 承载时 `delete-frame`） |
+| `M-o` | `seshat-reader-sidebar-toggle` | **全部面板**开合（与阅读 buffer 内同一个键） |
 | `C-c w` | `seshat-reader-sidebar-toggle-width` | 面板宽度切换（常态 ↔ 扩大值，再按一次恢复） |
 | `C-c C-q` | `seshat-reader-translate-follow-up` | 对当前原文继续追问 |
 | `C-c C-s` | `seshat-reader-translate-save-as-annotation` | 存为批注 |
@@ -481,13 +484,14 @@ evil 用户同样可用上述单键（包内 `evil-define-key*` 补绑 normal st
 ### 9.5 搜索结果侧栏（`seshat-reader-search--sidebar-map`）
 
 `C-s` 成功后光标落在左侧结果侧栏（`*Seshat Search*`，`special-mode` + 只读），键表以
-`special-mode-map` 为父表（滚动等基础键照旧可用），只覆盖下面四个键：
+`special-mode-map` 为父表（滚动等基础键照旧可用），只覆盖下面五个键：
 
 | 键位 | 命令 | 作用 |
 |---|---|---|
 | `RET` | `seshat-reader-search-sidebar-goto` | 跳到当前行命中所在页并高亮该命中（光标留在侧栏，便于继续挑结果） |
 | `n` / `p` | `seshat-reader-search-sidebar-next` / `-prev` | 移动下一条 / 上一条并跳转；首条 `p`、末条 `n` 只提示「已是第一个 / 最后一个结果」，不报错 |
 | `q` | `seshat-reader-sidebar-quit` | **只关搜索结果侧栏**（其它面板保留）。侧栏在 `seshat-reader-search.el` 加载末尾把自己登记进 `seshat-reader-sidebar-extra-kinds`（buffer 名 → kind `search`），故通用的关闭命令按 buffer 名就能推断出 `search`、只关自己；`seshat-reader-search-sidebar-quit` 保留为**委托同一命令**的兼容别名 |
+| `M-o` | `seshat-reader-sidebar-toggle` | **全部面板**开合（光标在侧栏里也按得到，不必先切回阅读 window；绑定由 `seshat-reader-sidebar` 在 search 模块加载后补注册） |
 
 **与其它面板一致**：搜索侧栏与其它面板一致（`q` 只关自己、`M-o` 可重开、换文档自动清理）——① `q` 走统一的 `seshat-reader-sidebar-quit`（不再是搜索模块的私有命令）；② `M-o`（`seshat-reader-sidebar-toggle`）的「重开最近面板」按 kind 记忆 buffer，侧栏关掉后同样能被重开；③ 换文档（同一 buffer 打开另一份 PDF）时 `seshat-reader-search--reset-state` 会清空侧栏内容与「行 → 命中」映射，并在面板显示时把它关掉，不再保留上一份文档的搜索结果。注册用一张 `buffer 名 → kind` 的注册表（`seshat-reader-sidebar-extra-kinds`）实现——`seshat-reader-sidebar` 是零依赖承载层，不 require `seshat-reader-search`，故由**创建 buffer 的模块**在加载末尾登记，不形成循环依赖。
 
@@ -636,6 +640,10 @@ M12 回归（strip 行破坏页面几何 + `--center-page` 在 `window-size-chan
 
 先确认键位与加载状态：在阅读 buffer 里 `(key-binding (kbd "?"))` 应为 `seshat-reader-help`、`(autoloadp (symbol-function 'seshat-reader-help))` 为 `t`（或 `(require 'seshat-reader-help nil t)` 返回非 nil，说明模块可加载——autoload 已注册，无需预先 require）。若手动管理 load-path，确认 `seshat-reader-help.el` 与 `seshat-reader.el` 在**同一目录**（autoloads 与 `require` 都按文件名找）。`?` 只在阅读 buffer 里被本包接管，其它 buffer 仍是 `describe-mode`——当前 buffer 不是 `seshat-reader-mode` 当然没反应。仍为 `nil` 说明加载的是旧 `.elc`（键位表里还没有这一行）：`make clean all` 后重启 Emacs。
 
+**evil 下按 `?` 变成了反向搜索（`evil-search-backward`）**
+
+已修：evil 的 normal state 把 `?` 绑在 `evil-normal-state-map`，而 state map 经 `emulation-mode-map-alists` 排在 major-mode map **之前**，所以 `seshat-reader-mode-map` 里的 `?` 被压掉。包内用 `evil-define-key*` 把 normal state 的 `?` 补绑到 `seshat-reader-help`（只写本 mode 的 auxiliary keymap，不动 evil 全局表，也不碰 `/`、`n`、`N`）。验证：evil 用户（已启用 `evil-local-mode`、normal state）在阅读 buffer 里 `(key-binding (kbd "?"))` 应为 `seshat-reader-help`；仍为 `evil-search-backward` 说明加载的是旧 `.elc`——`make clean all` 后重启 Emacs。阅读器里的搜索本来就走 `C-s`（基于页面坐标，不用 buffer 文本），故 `?` 让给帮助页；若确实想保留 evil 的反向搜索，在自己配置里覆盖即可：`(evil-define-key* 'normal seshat-reader-mode-map (kbd "?") #'evil-search-backward)`——本包只在加载时注册一次，不会抢回用户的覆盖。`M-o` 无需此类补绑（evil 未占该键），若将来某个 evil 版本占了它，用同一条 `evil-define-key*` 覆盖即可。
+
 ## 12. 已知限制
 
 以下条目全部出自 [`../openspec/tech-debt.md`](../openspec/tech-debt.md)，如实列出，未做美化。
@@ -724,9 +732,9 @@ GTROOT=$(dirname "$(find "$HOME" -maxdepth 6 -type d \
 echo "$GTROOT"
 ```
 
-现有套件：`seshat-reader-page-join-test.el`、`seshat-reader-sidebar-test.el`（**120 例**）、`seshat-reader-outline-test.el`、`seshat-reader-annotation-test.el`、`seshat-reader-annotation-queue-test.el`、`seshat-reader-annotation-v8-test.el`、`seshat-reader-annotation-decoration-test.el`（21 例）、`seshat-reader-annotation-ink-test.el`（24 例）、`seshat-reader-search-test.el`（**30 例**）、`seshat-reader-select-flash-test.el`、`seshat-reader-select-merge-test.el`（18 例）、`seshat-reader-select-scope-test.el`（7 例）、`seshat-reader-select-report-test.el`（**7 例**，M12 T8a 新增：框选回显只报行列数、`seshat-reader-select-message-limit` 已删除）、`seshat-reader-translate-test.el`（138 例）、`seshat-reader-reference-test.el`、`seshat-reader-resize-test.el`、`seshat-reader-etaf-test.el`、`seshat-rest-test.el`、`seshat-state-test.el`、`seshat-transport-test.el`、`seshat-conflict-test.el`（10 例）、`seshat-merge-test.el`（13 例）、`seshat-sync-cmd-test.el`（14 例）、`seshat-sync-test.el`（77 例）、`seshat-reading-test.el`（**45 例**）。**前置**：`seshat-render-core.so` 已构建，否则加载 `seshat-reader` 会触发交互式构建询问并阻塞 batch 运行。
+现有套件：`seshat-reader-page-join-test.el`、`seshat-reader-sidebar-test.el`（**126 例**）、`seshat-reader-outline-test.el`、`seshat-reader-annotation-test.el`、`seshat-reader-annotation-queue-test.el`、`seshat-reader-annotation-v8-test.el`、`seshat-reader-annotation-decoration-test.el`（21 例）、`seshat-reader-annotation-ink-test.el`（24 例）、`seshat-reader-search-test.el`（**30 例**）、`seshat-reader-select-flash-test.el`、`seshat-reader-select-merge-test.el`（18 例）、`seshat-reader-select-scope-test.el`（7 例）、`seshat-reader-select-report-test.el`（**7 例**，M12 T8a 新增：框选回显只报行列数、`seshat-reader-select-message-limit` 已删除）、`seshat-reader-translate-test.el`（138 例）、`seshat-reader-reference-test.el`、`seshat-reader-resize-test.el`、`seshat-reader-etaf-test.el`、`seshat-rest-test.el`、`seshat-state-test.el`、`seshat-transport-test.el`、`seshat-conflict-test.el`（10 例）、`seshat-merge-test.el`（13 例）、`seshat-sync-cmd-test.el`（14 例）、`seshat-sync-test.el`（77 例）、`seshat-reading-test.el`（**45 例**）。**前置**：`seshat-render-core.so` 已构建，否则加载 `seshat-reader` 会触发交互式构建询问并阻塞 batch 运行。
 
-**必须逐文件运行**：一次 `emacs --batch` 加载全部测试文件时，`seshat-reader-annotation-test.el` 与 `seshat-reader-annotation-queue-test.el` 各有 3 个列表渲染用例会失败——同时加载 `etaf` 测试后 `etaf-ui` 变为可用，批注列表改走 EBOX/ETAF 渲染，而那两个用例断言的是纯文本（如 `"没有批注"`）。这是**既有基线特性、不是回归**：全仓用例总数按逐文件求和计（当前 **25** 个文件合计 **966** 例，0 unexpected / 0 skipped；本轮「搜索侧栏纳入面板机制」带入 search 套件 28 → **30**、sidebar 套件 117 → **120**；translate 套件例数含 gt 预设隔离、解释质量并行改动与结果缓存（74 → **138**））。跑全仓脚本见下（`for` 循环逐文件执行，任一文件非零退出即整体失败）：
+**必须逐文件运行**：一次 `emacs --batch` 加载全部测试文件时，`seshat-reader-annotation-test.el` 与 `seshat-reader-annotation-queue-test.el` 各有 3 个列表渲染用例会失败——同时加载 `etaf` 测试后 `etaf-ui` 变为可用，批注列表改走 EBOX/ETAF 渲染，而那两个用例断言的是纯文本（如 `"没有批注"`）。这是**既有基线特性、不是回归**：全仓用例总数按逐文件求和计（当前 **25** 个文件合计 **972** 例，0 unexpected / 0 skipped；本轮「M-o 面板键位 / 重开位置 / evil 下 ? 补绑」带入 sidebar 套件 120 → **126**；上一轮「搜索侧栏纳入面板机制」带入 search 套件 28 → **30**、sidebar 套件 117 → **120**；translate 套件例数含 gt 预设隔离、解释质量并行改动与结果缓存（74 → **138**））。跑全仓脚本见下（`for` 循环逐文件执行，任一文件非零退出即整体失败）：
 
 ```bash
 cd /home/thomas/Workspace/seshat && rm -f emacs/seshat-reader/*.elc && \

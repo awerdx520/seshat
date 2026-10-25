@@ -489,6 +489,9 @@ T10 第 1 轮反馈的验收：用户要求译文面板也跟随光标。分两�
   "`toggle' 关闭窗口前先捕获其高度到 `seshat-reader-sidebar--state'."
   (let ((seshat-reader-sidebar--state nil)
         (seshat-reader-sidebar--last-buffer nil)
+        ;; 关闭分支同时写 `--last-kind'（与 buffer 成对），故一并 `let' 绑定，
+        ;; 避免把 kind 泄漏给后续用例。
+        (seshat-reader-sidebar--last-kind nil)
         ;; `--capture-state' 按该窗口 kind 的方位取宽或高；本用例断言高度语义，
         ;; 故固定底部模式（T3 起默认位置为 `right'）。
         (seshat-reader-sidebar-position 'below-selected)
@@ -2863,6 +2866,180 @@ kind 由 buffer 名推断；命令必须把 kind 交给 `--toggle-kind'（它按
     ;; 表里没有的名字仍回落到批注列表
     (should (eq (seshat-reader-sidebar--kind-for-buffer-name "*whatever*")
                 'annotations))))
+
+;;; `M-o' 在所有面板 keymap 内可用（2026-10-26 修复）
+
+;; 阅读 buffer 的 `M-o'（全部面板开合）此前只写在 `seshat-reader-mode-map' 上，
+;; 光标在面板里时按 `M-o' 是 `nil'（搜索侧栏）或被 `facemenu-keymap' 之外的表
+;; 吃掉。修复后四个面板键表都要解析到 `seshat-reader-sidebar-toggle'：
+;; 译文面板（translate 模块内绑）、批注列表 / 目录面板 / 搜索侧栏（sidebar 模块
+;; 用 `with-eval-after-load' 注册）。
+(ert-deftest seshat-reader-sidebar-test--meta-o-bound-in-all-panel-maps ()
+  "`M-o' 在阅读 buffer 与四个面板 keymap 里都解析为全部开合命令."
+  ;; 目录面板的键表要它自己的模块加载后才会被注册（`with-eval-after-load'）
+  (require 'seshat-reader-outline)
+  (require 'seshat-reader-annotation)
+  (require 'seshat-reader-search)
+  (dolist (map (list seshat-reader-mode-map
+                     seshat-reader-translate-panel-map
+                     seshat-reader-annotation-list-mode-map
+                     seshat-reader-outline-mode-map
+                     seshat-reader-search--sidebar-map))
+    (should (eq (lookup-key map (kbd "M-o")) 'seshat-reader-sidebar-toggle)))
+  ;; 只改各面板自己的键表，不碰 `global-map'（其它 buffer 的 `M-o' 行为不变；
+  ;; batch -Q 下 facemenu 未加载，故 `M-o' 在全局可能未绑定，这里只断言没被本包
+  ;; 占成面板开合命令）。
+  (should-not (eq (lookup-key global-map (kbd "M-o"))
+                  'seshat-reader-sidebar-toggle)))
+
+(ert-deftest seshat-reader-sidebar-test--toggle-close-records-paired-kind ()
+  "关闭全部面板时 buffer 与 kind **成对**写入（此前只写 buffer）.
+构造两个不同 kind 的面板，并故意预置一个与最终胜出 buffer 不匹配的
+`--last-kind'——修复前它会被原样留下，重开就会按错的 kind 弹到错误的一侧。"
+  (let* ((anno (get-buffer-create "*seshat-sidebar-test-paired-anno*"))
+         (outline (get-buffer-create "*seshat-sidebar-test-paired-outline*"))
+         (panels (list (cons 'annotations anno) (cons 'outline outline)))
+         (seshat-reader-sidebar--last-buffer nil)
+         (seshat-reader-sidebar--last-kind 'annotations))
+    (unwind-protect
+        (cl-letf (((symbol-function 'seshat-reader-sidebar--panels)
+                   (lambda () panels))
+                  ((symbol-function 'seshat-reader-sidebar--unit-kind)
+                   (lambda (panel) (car panel)))
+                  ((symbol-function 'seshat-reader-sidebar--unit-buffer)
+                   (lambda (panel) (cdr panel)))
+                  ((symbol-function 'seshat-reader-sidebar--panel-close)
+                   (lambda (_panel) nil))
+                  ((symbol-function 'message) (lambda (&rest _) nil)))
+          (seshat-reader-sidebar-toggle)
+          ;; 最后一个 panel（outline）胜出
+          (should (eq seshat-reader-sidebar--last-buffer outline))
+          (should (eq seshat-reader-sidebar--last-kind 'outline))
+          ;; 不变量：`--last-kind' 必须等于**该 buffer 自己的** kind
+          (should (eq (car (rassq seshat-reader-sidebar--last-buffer panels))
+                      seshat-reader-sidebar--last-kind))
+          ;; 单个面板时同样成对（回归：不能因为只有一个 panel 就不写 kind）
+          (let ((seshat-reader-sidebar--last-kind 'translate)
+                (single (list (cons 'annotations anno))))
+            (cl-letf (((symbol-function 'seshat-reader-sidebar--panels)
+                       (lambda () single)))
+              (seshat-reader-sidebar-toggle))
+            (should (eq seshat-reader-sidebar--last-kind 'annotations))))
+      (kill-buffer anno)
+      (kill-buffer outline))))
+
+(ert-deftest seshat-reader-sidebar-test--toggle-reopen-uses-paired-kind ()
+  "关闭全部面板后再按一次：`show' 收到的 kind 与该 buffer 匹配，且请求跟随光标."
+  (let* ((anno (get-buffer-create "*seshat-sidebar-test-reopen-anno*"))
+         (outline (get-buffer-create "*seshat-sidebar-test-reopen-outline*"))
+         (panels (list (cons 'annotations anno) (cons 'outline outline)))
+         ;; 先让 kind 记录停留在一个既不是最后一个 panel、也不是 buffer 的 kind 上
+         (seshat-reader-sidebar--last-buffer nil)
+         (seshat-reader-sidebar--last-kind 'translate)
+         (shown nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'seshat-reader-sidebar--panels)
+                   (lambda () panels))
+                  ((symbol-function 'seshat-reader-sidebar--unit-kind)
+                   (lambda (panel) (car panel)))
+                  ((symbol-function 'seshat-reader-sidebar--unit-buffer)
+                   (lambda (panel) (cdr panel)))
+                  ((symbol-function 'seshat-reader-sidebar--panel-close)
+                   (lambda (_panel) nil))
+                  ((symbol-function 'seshat-reader-sidebar-show)
+                   (lambda (buffer kind &optional select)
+                     (push (list buffer kind select) shown)
+                     'fake-panel))
+                  ((symbol-function 'message) (lambda (&rest _) nil)))
+          ;; 第一次：全部关闭（面板仍在 → 走关闭分支）
+          (seshat-reader-sidebar-toggle)
+          (should-not shown)
+          ;; 第二次：面板已关 → 按记忆重开，实参必须是 (最后一个 buffer, 其 kind, t)
+          (cl-letf (((symbol-function 'seshat-reader-sidebar--panels)
+                     (lambda () nil)))
+            (seshat-reader-sidebar-toggle))
+          (should (= 1 (length shown)))
+          (pcase-let ((`(,buffer ,kind ,select) (car shown)))
+            (should (eq buffer outline))
+            (should (eq kind 'outline))
+            (should (eq select t))))
+      (kill-buffer anno)
+      (kill-buffer outline))))
+
+(ert-deftest seshat-reader-sidebar-test--toggle-kind-close-records-paired-kind ()
+  "单 kind 关闭同样让 buffer 与 kind 成对（否则无参 toggle 重开会用旧 kind）."
+  (let* ((anno (get-buffer-create "*seshat-sidebar-test-kind-paired-anno*"))
+         (panel (cons 'annotations anno))
+         (seshat-reader-sidebar--last-buffer nil)
+         (seshat-reader-sidebar--last-kind 'outline)
+         (seshat-reader-sidebar--last-buffers nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'seshat-reader-sidebar--panels)
+                   (lambda () (list panel)))
+                  ((symbol-function 'seshat-reader-sidebar--unit-kind)
+                   (lambda (unit) (car unit)))
+                  ((symbol-function 'seshat-reader-sidebar--unit-buffer)
+                   (lambda (unit) (cdr unit)))
+                  ((symbol-function 'seshat-reader-sidebar--panel-close)
+                   (lambda (_unit) nil))
+                  ((symbol-function 'message) (lambda (&rest _) nil)))
+          (seshat-reader-sidebar-toggle 'annotations)
+          (should (eq seshat-reader-sidebar--last-buffer anno))
+          (should (eq seshat-reader-sidebar--last-kind 'annotations))
+          (should (eq (cdr (assq 'annotations seshat-reader-sidebar--last-buffers))
+                      anno)))
+      (kill-buffer anno))))
+
+;;; evil 下 `?' 的补绑（2026-10-26 修复）
+
+;; evil 的 normal state 把 `?' 绑成 `evil-search-backward'，压过
+;; `seshat-reader-mode-map'，导致帮助页在 evil 用户手里按不到。补绑写在
+;; **阅读器**（`seshat-reader'）里而不是帮助页模块里：帮助页是 `?' 首次按下时
+;; 才 autoload 的，补绑写在那边等于永远不生效。
+(ert-deftest seshat-reader-sidebar-test--evil-question-mark-binding ()
+  "evil 存在时把 `?' 补绑到 normal state，且只补这一键（不动 `/` `n` `N` `M-o`）."
+  ;; ① evil 不在（`evil-define-key*' 不可用）→ 静默跳过，不报错
+  (cl-letf (((symbol-function 'evil-define-key*) nil))
+    (should-not (fboundp 'evil-define-key*))
+    (should-not (seshat-reader--install-evil-bindings)))
+  ;; ② 桩替 `evil-define-key*'：断言实参是 (normal <阅读器 map> (kbd "?") 命令)
+  (let (calls)
+    (cl-letf (((symbol-function 'evil-define-key*)
+               (lambda (&rest args) (push args calls) nil)))
+      (seshat-reader--install-evil-bindings))
+    (should (= 1 (length calls)))
+    (let ((args (car calls)))
+      (should (eq (nth 0 args) 'normal))
+      (should (eq (nth 1 args) seshat-reader-mode-map))
+      (should (equal (nth 2 args) (kbd "?")))
+      (should (eq (nth 3 args) 'seshat-reader-help))
+      ;; 只有一对绑定：`/` / `n` / `N` 让给 evil，`M-o' 也无需补绑
+      (should (= 2 (length (cddr args))))))
+  ;; ③ 注册路径：`with-eval-after-load 'evil` 在 evil **已加载**时立即执行
+  (let ((calls nil)
+        (saved-features features)
+        (source (expand-file-name
+                 "seshat-reader.el"
+                 (file-name-directory (locate-library "seshat-reader")))))
+    (unwind-protect
+        (progn
+          ;; `featurep' 读的是 `features' 的全局值，故直接 push 伪造「evil 已
+          ;; 加载」，结束后原样还原，不真的加载 evil。
+          (push 'evil features)
+          (cl-letf (((symbol-function 'evil-define-key*)
+                     (lambda (&rest args) (push args calls) nil)))
+            (load source nil t))
+          (should (= 1 (length calls)))
+          (should (eq (nth 0 (car calls)) 'normal))
+          (should (eq (nth 1 (car calls)) seshat-reader-mode-map)))
+      (setq features saved-features))))
+
+(ert-deftest seshat-reader-sidebar-test--question-mark-without-evil ()
+  "无 evil 时 `?' 仍是 `seshat-reader-help'（补绑不得影响常规路径）."
+  (cl-letf (((symbol-function 'evil-define-key*) nil))
+    (seshat-reader--install-evil-bindings))
+  (should (eq (lookup-key seshat-reader-mode-map (kbd "?"))
+              #'seshat-reader-help)))
 
 (provide 'seshat-reader-sidebar-test)
 ;;; seshat-reader-sidebar-test.el ends here

@@ -100,12 +100,13 @@
 ;; `seshat-reader' 加载完成后才注册键位，故届时它必然已定义）。
 (defvar seshat-reader-mode-map)
 
-;; 同理：批注列表与目录面板的 keymap 定义在各自模块（本模块不 require 它们，
-;; 否则会毁掉「零依赖」这条边界）。声明只服务字节编译；运行时的绑定注册见文末
-;; `with-eval-after-load`——那时两个 map 已由 `define-derived-mode' /
-;; `defvar-keymap' 建好。
+;; 同理：批注列表、目录面板与搜索结果侧栏的 keymap 定义在各自模块（本模块不
+;; require 它们，否则会毁掉「零依赖」这条边界）。声明只服务字节编译；运行时的
+;; 绑定注册见文末 `with-eval-after-load`——那时三个 map 已由
+;; `define-derived-mode' / `defvar-keymap' 建好。
 (defvar seshat-reader-annotation-list-mode-map)
 (defvar seshat-reader-outline-mode-map)
+(defvar seshat-reader-search--sidebar-map)
 
 (defgroup seshat-reader-sidebar nil
   "阅读器信息面板的显示方式与参数."
@@ -1626,8 +1627,11 @@ frame 上最后一个非 side 窗口，或者承载单元已被删除）。
   记忆），再逐个 `seshat-reader-sidebar--panel-close'（窗口走 `delete-window'、
   frame 走 `delete-frame'）。关闭前把每个单元的 buffer 记入
   `seshat-reader-sidebar--last-buffers'（并刷新
-  `seshat-reader-sidebar--last-buffer'）——**frame 也必须记**，否则关掉 child
-  frame 面板后没有任何重开依据。
+  `seshat-reader-sidebar--last-buffer' 与**配对的**
+  `seshat-reader-sidebar--last-kind'）——**frame 也必须记**，否则关掉 child
+  frame 面板后没有任何重开依据；kind 也必须同刷，否则无参
+  `seshat-reader-sidebar-toggle' 重开时会用本 buffer 配上更早一次显示留下的
+  kind，弹到错误的一侧。
 - **打开**：无该 KIND 的承载单元时，用 `seshat-reader-sidebar--last-buffers' 中
   该 KIND 的记忆 buffer 重新显示；走 `seshat-reader-sidebar-show' 而非直接调某个
   后端——重开路径的后端（`--cf-show' / `--display-window'）由
@@ -1645,7 +1649,10 @@ frame 上最后一个非 side 窗口，或者承载单元已被删除）。
           (dolist (panel targets)
             (let ((buffer (seshat-reader-sidebar--unit-buffer panel)))
               (when (buffer-live-p buffer)
+                ;; buffer 与 kind 成对写入（理由见 docstring）：只刷 buffer 会让
+                ;; 无参 toggle 的重开路径拿旧 kind 弹错位置。
                 (setq seshat-reader-sidebar--last-buffer buffer
+                      seshat-reader-sidebar--last-kind kind
                       seshat-reader-sidebar--last-buffers
                       (cons (cons kind buffer)
                             (assq-delete-all
@@ -1674,8 +1681,10 @@ frame）时全部关闭，无面板时重开最近一个面板。KIND 非 nil（
 忆），再逐个 `seshat-reader-sidebar--panel-close'：窗口走 `delete-window'（左右
 分栏的 side window 同样可删——`delete-window' 只拒绝删除 frame 上最后一个非
 side 窗口），frame 走 `delete-frame'。关闭后提示「已关闭 %d 个面板」——不写
-「窗口」，因为承载单元可能含 child frame。buffer 记入
-`seshat-reader-sidebar--last-buffer' / `--last-buffers'；打开时按最近一次的类型
+「窗口」，因为承载单元可能含 child frame。buffer 与**配对的 kind** 一起记入
+`seshat-reader-sidebar--last-buffer' / `seshat-reader-sidebar--last-kind' 与
+per-kind 的 `--last-buffers'（只记 buffer 会让重开落到更早一次显示留下的 kind
+上，弹出到错误的一侧）；打开时按最近一次的类型
 （`seshat-reader-sidebar--last-kind'）重新显示（经 `seshat-reader-sidebar-show'
 按 carrier 分派，childframe 后端会重开 child frame），若无可恢复的 buffer 则提
 示先打开批注列表或译文。
@@ -1692,8 +1701,18 @@ side 窗口），frame 走 `delete-frame'。关闭后提示「已关闭 %d 个�
             (dolist (panel panels)
               (let ((buffer (seshat-reader-sidebar--unit-buffer panel)))
                 (when (buffer-live-p buffer)
-                  (setq seshat-reader-sidebar--last-buffer buffer)))
-              (seshat-reader-sidebar--panel-close panel))
+                  ;; BUFFER 与 KIND **必须成对**写入：重开时按
+                  ;; `seshat-reader-sidebar--last-kind' 决定弹在哪一侧，只记
+                  ;; BUFFER 会让它沿用更早一次 `--display' 留下的、与本 buffer
+                  ;; 不同 kind 的旧值，于是弹错位置（`M-o' 关掉多 kind 面板后
+                  ;; 再按一次即可复现）。多个面板时遍历中最后一个可写者胜出，
+                  ;; 即 `--panels' 顺序里的最后一项（窗口在前、child frame 在
+                  ;; 后）——与旧行为取「最后一个 panel 的 buffer」完全一致，只
+                  ;; 是补上了与之配对的 kind。
+                  (setq seshat-reader-sidebar--last-buffer buffer
+                        seshat-reader-sidebar--last-kind
+                        (seshat-reader-sidebar--unit-kind panel))))
+                (seshat-reader-sidebar--panel-close panel))
             (message "Seshat Reader sidebar: 已关闭 %d 个面板"
                      (length panels)))
         (if (and (bufferp seshat-reader-sidebar--last-buffer)
@@ -1916,6 +1935,26 @@ redisplay 之外的安全阶段，`selected-window' / `selected-frame' 语义明
 (with-eval-after-load 'seshat-reader-outline
   (define-key seshat-reader-outline-mode-map (kbd "C-c w")
     #'seshat-reader-sidebar-toggle-width))
+
+;; 面板内的 `M-o'（**全部面板**开合）：与 `C-c w' 同一套注册方式，但覆盖**四个**
+;; 面板键表——批注列表、目录面板、搜索结果侧栏（在本文件注册，见下）与译文面板
+;; （在 `seshat-reader-translate' 自己的 panel map 里绑，与该文件既有的 `q' /
+;; `C-c w' 写法一致）。语义与阅读 buffer 内的 `M-o' 完全一致：在面板里按 `M-o'
+;; 也是「有面板就全部关闭，没有就重开最近一个」，用户不必先切回阅读 window。
+;;
+;; 只存在于各面板自己的键表里，**不**改 `global-map'：`M-o' 在全局是
+;; `facemenu-keymap' 前缀，其它 buffer 的行为原样保留。搜索侧栏的键表
+;; `seshat-reader-search--sidebar-map' 由 `defvar-keymap' 在 search 模块内建立，
+;; 本模块不 require 它（零依赖边界），故同样用 `with-eval-after-load' 注册。
+(with-eval-after-load 'seshat-reader-annotation
+  (define-key seshat-reader-annotation-list-mode-map (kbd "M-o")
+    #'seshat-reader-sidebar-toggle))
+(with-eval-after-load 'seshat-reader-outline
+  (define-key seshat-reader-outline-mode-map (kbd "M-o")
+    #'seshat-reader-sidebar-toggle))
+(with-eval-after-load 'seshat-reader-search
+  (define-key seshat-reader-search--sidebar-map (kbd "M-o")
+    #'seshat-reader-sidebar-toggle))
 
 ;; 挂到**全局**的 `post-command-hook'（不传 LOCAL）：判定对象是「命令结束后选中
 ;; 窗口的 buffer 是否还是阅读器 buffer」，与「哪个 buffer 是 local 的」无关——阅读
