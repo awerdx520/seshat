@@ -1397,5 +1397,174 @@ DELETE-VAR 收集 `delete-window' 收到的窗口名（三元列表的 `car'）�
       (seshat-reader-sidebar-close-buffer-kind 'outline dead-name)
       (should-not delete-calls))))
 
+;;; 承载分派（window vs childframe）
+
+(defun seshat-reader-sidebar-test--graphic-p (value)
+  "把 `display-graphic-p' 桩成恒返回 VALUE 的 thunk，供 carrier 解析用例复用.
+batch 与终端 frame 下真实 `display-graphic-p' 恒为 nil，而默认 carrier 是
+`childframe'——不桩替就无法断言「图形终端下的默认解析结果」。"
+  (lambda (&optional _display) value))
+
+(ert-deftest seshat-reader-sidebar-test--carrier-for-kind-defaults ()
+  "图形终端下按默认配置解析：`annotations' 走 alist 覆盖，其余 kind 走全局默认.
+默认 `seshat-reader-panel-carrier' 为 `childframe'、
+`seshat-reader-panel-carrier-alist' 为 `((annotations . window))'，故批注列表
+回落窗口承载（需要长列表浏览），目录与译文改走 child frame 覆盖。"
+  (cl-letf (((symbol-function 'display-graphic-p)
+             (seshat-reader-sidebar-test--graphic-p t)))
+    (should (eq (seshat-reader-sidebar--carrier-for-kind 'annotations) 'window))
+    (should (eq (seshat-reader-sidebar--carrier-for-kind 'outline) 'childframe))
+    (should (eq (seshat-reader-sidebar--carrier-for-kind 'translate)
+                'childframe))
+    ;; 未在 alist 中的未知 kind 走全局默认（不是回退，也不是报错）
+    (should (eq (seshat-reader-sidebar--carrier-for-kind 'unknown)
+                'childframe))))
+
+(ert-deftest seshat-reader-sidebar-test--carrier-for-kind-global-window ()
+  "全局 carrier 设为 `window' 后，alist 未覆盖的 kind 全部回落窗口承载.
+这是计划里的完整回退开关：`(setq seshat-reader-panel-carrier \\='window)'
+只影响未被 alist 逐 kind 覆盖的 kind；批注列表本来就覆盖为 `window'，两项
+结果一致，说明回退路径与默认路径收敛到同一后端。"
+  (let ((seshat-reader-panel-carrier 'window))
+    (cl-letf (((symbol-function 'display-graphic-p)
+               (seshat-reader-sidebar-test--graphic-p t)))
+      (should (eq (seshat-reader-sidebar--carrier-for-kind 'outline) 'window))
+      (should (eq (seshat-reader-sidebar--carrier-for-kind 'translate)
+                  'window))
+      (should (eq (seshat-reader-sidebar--carrier-for-kind 'annotations)
+                  'window)))))
+
+(ert-deftest seshat-reader-sidebar-test--carrier-for-kind-non-graphic-fallback ()
+  "非图形终端（`display-graphic-p' 为 nil）强制回退 `window'，与配置无关.
+两个方向都验：全局默认 `childframe' 时 outline 仍是 `window'；即便 alist 把
+该 kind 覆盖成 `childframe' 也一样——终端里 child frame 永远不显示，返回值
+只能是窗口承载。"
+  (cl-letf (((symbol-function 'display-graphic-p)
+             (seshat-reader-sidebar-test--graphic-p nil)))
+    (should (eq (seshat-reader-sidebar--carrier-for-kind 'outline) 'window))
+    (should (eq (seshat-reader-sidebar--carrier-for-kind 'translate) 'window))
+    (let ((seshat-reader-panel-carrier-alist '((outline . childframe))))
+      (should (eq (seshat-reader-sidebar--carrier-for-kind 'outline)
+                  'window)))))
+
+(ert-deftest seshat-reader-sidebar-test--carrier-for-kind-invalid-falls-back ()
+  "非法 carrier 取值静默回落 `window'，不取 nil、不报错、不发 message.
+全局值与 alist 覆盖值两条路径都要回落：配置写错时最坏结果是回到既有窗口承载
+（必然可用），而不是让上层拿到一个非法符号去建不存在的承载单元。同时断言
+全程无 `message' 调用——回落是静默的，避免每次显示/刷新都刷警告。"
+  (let ((messages 0))
+    (cl-letf (((symbol-function 'display-graphic-p)
+               (seshat-reader-sidebar-test--graphic-p t))
+              ((symbol-function 'message)
+               (lambda (&rest _) (setq messages (1+ messages)))))
+      (let ((seshat-reader-panel-carrier 'bogus))
+        (should (eq (seshat-reader-sidebar--carrier-for-kind 'outline) 'window)))
+      (let ((seshat-reader-panel-carrier-alist '((translate . bogus))))
+        (should (eq (seshat-reader-sidebar--carrier-for-kind 'translate)
+                    'window)))
+      (should (zerop messages)))))
+
+(ert-deftest seshat-reader-sidebar-test--carrier-for-kind-alist-overrides-window ()
+  "全局为 `window' 时 alist 仍可把单个 kind 覆盖为 `childframe'.
+覆盖优先级高于全局默认（三层解析的第 2 层）：这是「默认 childframe、批注例外」
+之外的反向配置，说明 alist 是**双向覆盖**而非单向降级。"
+  (let ((seshat-reader-panel-carrier 'window)
+        (seshat-reader-panel-carrier-alist '((outline . childframe))))
+    (cl-letf (((symbol-function 'display-graphic-p)
+               (seshat-reader-sidebar-test--graphic-p t)))
+      (should (eq (seshat-reader-sidebar--carrier-for-kind 'outline)
+                  'childframe))
+      (should (eq (seshat-reader-sidebar--carrier-for-kind 'annotations)
+                  'window)))))
+
+;;; 承载单元访问器（window 后端；frame 后端的访问器同时用桩对象覆盖）
+
+(ert-deftest seshat-reader-sidebar-test--panels-window-backend ()
+  "`--panels' 在窗口后端返回与 `--windows' 完全一致的列表.
+本任务只实现窗口后端，故两者必须同源：child frame 后端接入前，任何上层逻辑
+经 `--panels' 得到的仍是「本包面板窗口」这一既有语义。"
+  (let ((panels (list 'w-outline 'w-annotations)))
+    (cl-letf (((symbol-function 'seshat-reader-sidebar--windows)
+               (lambda () panels)))
+      (should (equal (seshat-reader-sidebar--panels) panels)))))
+
+(ert-deftest seshat-reader-sidebar-test--panel-kind-window-and-frame ()
+  "`--panel-kind' 对窗口读 window parameter，对 frame 读 frame parameter.
+两类承载单元的 kind 标记名不同（`seshat-reader-sidebar-kind' /
+`seshat-reader-panel-kind'），访问器必须按类型选对来源；既非窗口也非 frame
+的对象返回 nil，而不是报错。"
+  (cl-letf (((symbol-function 'window-parameter)
+             (lambda (_win param)
+               (when (eq param 'seshat-reader-sidebar-kind) 'translate)))
+            ((symbol-function 'frame-parameter)
+             (lambda (_frame param)
+               (when (eq param 'seshat-reader-panel-kind) 'outline)))
+            ((symbol-function 'windowp) (lambda (obj) (eq obj 'fake-window)))
+            ((symbol-function 'framep) (lambda (obj) (eq obj 'fake-frame))))
+    (should (eq (seshat-reader-sidebar--panel-kind 'fake-window) 'translate))
+    (should (eq (seshat-reader-sidebar--panel-kind 'fake-frame) 'outline))
+    (should-not (seshat-reader-sidebar--panel-kind 'unknown-object))))
+
+(ert-deftest seshat-reader-sidebar-test--panel-buffer-window-and-frame ()
+  "`--panel-buffer' 窗口取窗口 buffer，frame 取选中窗口 buffer；死 frame 返回 nil.
+`(window-buffer nil)' 的语义是「当前选中窗口」，故 frame 无选中窗口时必须
+显式返回 nil——放任 nil 透传会把不相干 buffer 当成面板内容（这是本用例要锁死
+的坑）。"
+  (let ((buf (get-buffer-create " *seshat-sidebar-panel-buffer*")))
+    (unwind-protect
+        (cl-letf (((symbol-function 'window-buffer)
+                   (lambda (&optional win)
+                     (if (memq win '(fake-window frame-window)) buf nil)))
+                  ((symbol-function 'windowp)
+                   (lambda (obj) (memq obj '(fake-window frame-window))))
+                  ((symbol-function 'framep)
+                   (lambda (obj) (memq obj '(fake-frame dead-frame))))
+                  ((symbol-function 'frame-live-p)
+                   (lambda (frame) (not (eq frame 'dead-frame))))
+                  ((symbol-function 'frame-selected-window)
+                   (lambda (frame) (if (eq frame 'fake-frame) 'frame-window nil))))
+          (should (eq (seshat-reader-sidebar--panel-buffer 'fake-window) buf))
+          (should (eq (seshat-reader-sidebar--panel-buffer 'fake-frame) buf))
+          ;; frame 无选中窗口 → nil，而不是回落当前选中窗口
+          (let ((selected (current-buffer)))
+            (should-not (eq (seshat-reader-sidebar--panel-buffer
+                             'frame-without-selected-window)
+                            selected)))
+          ;; 死 frame → nil
+          (should-not (seshat-reader-sidebar--panel-buffer 'dead-frame)))
+      (kill-buffer buf))))
+
+(ert-deftest seshat-reader-sidebar-test--panel-for-kind-and-close ()
+  "`--panel-for-kind' 按 kind 取第一个单元，`--panel-close' 按类型选关闭原语.
+关闭路径是要点：窗口走 `delete-window'、frame 走 `delete-frame'，两者混用会
+要么删错对象、要么对 frame 调 `delete-window' 报错；`--panel-close' 必须按
+类型分流且吞掉「已被用户手工关掉」的错误。"
+  (let (delete-window-calls delete-frame-calls)
+    (cl-letf (((symbol-function 'seshat-reader-sidebar--windows)
+               (lambda () (list 'w-ann 'w-tr)))
+              ((symbol-function 'windowp)
+               (lambda (obj) (memq obj '(w-ann w-tr))))
+              ((symbol-function 'window-parameter)
+               (lambda (win param)
+                 (when (eq param 'seshat-reader-sidebar-kind)
+                   (pcase win ('w-ann 'annotations) ('w-tr 'translate)))))
+              ((symbol-function 'framep) (lambda (obj) (eq obj 'fake-frame)))
+              ((symbol-function 'delete-window)
+               (lambda (win) (push win delete-window-calls)))
+              ((symbol-function 'delete-frame)
+               (lambda (frame &optional _force) (push frame delete-frame-calls))))
+      ;; 按 kind 命中第一个匹配单元；不存在的 kind 返回 nil
+      (should (eq (seshat-reader-sidebar--panel-for-kind 'translate) 'w-tr))
+      (should (eq (seshat-reader-sidebar--panel-for-kind 'annotations) 'w-ann))
+      (should-not (seshat-reader-sidebar--panel-for-kind 'outline))
+      ;; 显式传 PANELS 时不读 `--panels'（该单元里没有 translate）
+      (should-not (seshat-reader-sidebar--panel-for-kind 'translate '(w-ann)))
+      (seshat-reader-sidebar--panel-close 'w-tr)
+      (seshat-reader-sidebar--panel-close 'fake-frame)
+      ;; 既非窗口也非 frame：两种原语都不调用
+      (seshat-reader-sidebar--panel-close 'unknown-object)
+      (should (equal delete-window-calls '(w-tr)))
+      (should (equal delete-frame-calls '(fake-frame))))))
+
 (provide 'seshat-reader-sidebar-test)
 ;;; seshat-reader-sidebar-test.el ends here

@@ -169,6 +169,55 @@ side 模式下的宽度由 `seshat-reader-outline-sidebar-width' 决定；目录
   :type 'number
   :group 'seshat-reader-sidebar)
 
+(defcustom seshat-reader-panel-carrier 'childframe
+  "面板承载方式（除 `seshat-reader-panel-carrier-alist' 逐 kind 覆盖外生效).
+`childframe'：以 child frame 覆盖在父 frame 右上角，不参与窗口树，故显示/刷新
+面板不会改变阅读窗口尺寸（阅读器版面与窗口像素尺寸耦合，压缩阅读窗口会触发
+重新适配）。`window'：沿用既有的 side window / 底部窗口承载，行为与
+`seshat-reader-sidebar-position' 一族变量完全一致。
+非图形环境（`display-graphic-p' 为 nil）强制回退 `window'：child frame 只存在
+于图形终端。"
+  :type '(choice (const :tag "child frame 覆盖（不改窗口布局）" childframe)
+                 (const :tag "窗口承载（side window / 底部）" window))
+  :group 'seshat-reader-sidebar)
+
+(defcustom seshat-reader-panel-carrier-alist '((annotations . window))
+  "逐 kind 覆盖 `seshat-reader-panel-carrier' 的承载方式.
+键是面板 kind（`outline' / `annotations' / `translate'），值是 carrier
+（`childframe' / `window`）。默认为批注列表保留窗口承载：批注条目多、需要长
+列表浏览与逐条跳转，覆盖浮层既遮挡正文又放不下。"
+  :type '(alist :key-type symbol :value-type symbol)
+  :group 'seshat-reader-sidebar)
+
+(defcustom seshat-reader-panel-width 0.34
+  "面板承载为 child frame 时的宽度比例（占父 frame 像素宽）."
+  :type 'number
+  :group 'seshat-reader-sidebar)
+
+(defcustom seshat-reader-panel-height 0.45
+  "面板承载为 child frame 时的高度比例（占父 frame 像素高）.
+面板尺寸**打开即固定、全程不 resize**：内容超出后在面板窗口内滚动，避免流式
+输出期间反复改变遮挡区域。"
+  :type 'number
+  :group 'seshat-reader-sidebar)
+
+(defcustom seshat-reader-panel-margin 16
+  "面板承载为 child frame 时距父 frame 右边缘与上边缘的像素间距."
+  :type 'natnum
+  :group 'seshat-reader-sidebar)
+
+(defcustom seshat-reader-panel-follow-bottom t
+  "非 nil 时流式输出期间面板自动跟随底部（显示最新内容）.
+用户向上滚动后停止跟随，回到底部时恢复。"
+  :type 'boolean
+  :group 'seshat-reader-sidebar)
+
+(defcustom seshat-reader-panel-hide-on-buffer-change t
+  "非 nil 时当前 buffer 不再是阅读器 buffer 就关闭本包 child frame 面板.
+面板内容仍留在 buffer 中，可用 `seshat-reader-sidebar-toggle' 重开。"
+  :type 'boolean
+  :group 'seshat-reader-sidebar)
+
 (defcustom seshat-reader-sidebar-height 0.35
   "信息面板高度，作为 `window-height' 参数（按比例）.
 **仅底部模式**（`seshat-reader-sidebar-position' 取 `below-selected' 或
@@ -569,6 +618,104 @@ slot 会被 `display-buffer-in-side-window' 拒绝而回落为普通窗口，此
       (setq slot (1+ slot))
       (setq kinds (cdr kinds)))
     slot))
+
+;;; 承载分派（window vs childframe）
+
+;; 面板有两种**承载单元**：window（side window / 底部窗口，参与窗口树）与
+;; child frame（覆盖在父 frame 右上角，不参与窗口树）。两类单元的 kind 标记、
+;; 内容 buffer、关闭原语各不相同，而上层逻辑（toggle / 关闭 / 生命周期）只关心
+;; 「有哪些面板、各自是什么 kind、显示的是哪个 buffer」，不关心底层是窗口还是
+;; frame。故本节的访问器把差异收敛到一处：上层只经
+;; `seshat-reader-sidebar--panels' 与它的三个访问器工作，新增或回退承载后端时
+;; 不必改动上层逻辑，也不会漏改某条关闭路径。
+
+(defun seshat-reader-sidebar--carrier-for-kind (kind)
+  "返回 KIND 实际使用的承载方式，取值为 `childframe' 或 `window'.
+三层优先级，从高到低：
+
+1. **非图形终端强制窗口**：`display-graphic-p' 为 nil（batch、终端 frame）时
+   一律返回 `window'——child frame 只存在于图形终端，此时若返回 `childframe'
+   会让上层去建一个永远不显示的 frame。
+2. **per-kind 覆盖**：`seshat-reader-panel-carrier-alist' 命中 KIND 时取其值
+   （批注列表默认走窗口承载，理由见该变量的 docstring）。
+3. **全局默认**：未命中时取 `seshat-reader-panel-carrier'。
+
+前两层任一层给出非法取值（不是 `childframe' / `window' 的符号）时**静默回落
+`window'**，不发 `message'：承载方式由用户配置决定，配置写错时每次显示/刷新都
+刷一条警告只会淹没真正的错误，而窗口承载是既有行为、必然可用。"
+  (cond
+   ((not (display-graphic-p)) 'window)
+   (t (let ((carrier (or (alist-get kind seshat-reader-panel-carrier-alist)
+                         seshat-reader-panel-carrier)))
+        (if (memq carrier '(childframe window)) carrier 'window)))))
+
+(defun seshat-reader-sidebar--panels ()
+  "返回本包当前全体**承载单元**（window 或 child frame）的列表.
+承载单元是「显示某个面板内容的那个东西」：窗口承载时是带
+`seshat-reader-sidebar' window parameter 的窗口（判定与
+`seshat-reader-sidebar-window-p' 一致），frame 承载时是带
+`seshat-reader-panel-kind' frame parameter 的 child frame。上层只经本函数与
+`seshat-reader-sidebar--panel-kind' / `--panel-buffer' / `--panel-close'
+访问承载单元，故「同 kind 是否已显示」「关掉这个 kind」这类判断不必各自区分
+两类承载单元，新增后端也只需扩展本函数与那几个访问器。
+
+当前只实现窗口后端（返回值与 `seshat-reader-sidebar--windows' 完全一致）；
+frame 后端尚未实现，故其承载单元暂时不在本列表中。"
+  (seshat-reader-sidebar--windows))
+
+(defun seshat-reader-sidebar--panel-kind (panel)
+  "返回承载单元 PANEL 的面板 kind（`outline' / `annotations' / `translate'）.
+窗口承载读 window parameter `seshat-reader-sidebar-kind'（由
+`seshat-reader-sidebar--display-params' 设置）；frame 承载读 frame parameter
+`seshat-reader-panel-kind'（由 childframe 后端在建 frame 时设置）。两个
+parameter 名不同是历史原因（window 侧的名字已被既有测试与配置依赖，不宜改
+名），本访问器负责屏蔽这一差异。PANEL 既非窗口也非 frame（含已死 frame 对象）
+时返回 nil，判据是 `windowp' / `framep'。"
+  (cond
+   ((windowp panel) (window-parameter panel 'seshat-reader-sidebar-kind))
+   ((framep panel) (frame-parameter panel 'seshat-reader-panel-kind))
+   (t nil)))
+
+(defun seshat-reader-sidebar--panel-buffer (panel)
+  "返回承载单元 PANEL 当前显示的面板 buffer，没有则返回 nil.
+窗口承载取该窗口的 buffer；frame 承载取该 frame 选中窗口的 buffer（child
+frame 只含一个窗口，即 `display-buffer-in-child-frame' 建出的那个）。frame 已
+死（`frame-live-p' 为 nil）或没有选中窗口时返回 nil——此处**必须**显式守卫：
+`(window-buffer nil)' 的含义是「当前选中窗口」，放任 nil 透传会把不相干 buffer
+当成面板内容。上层用本访问器替代「直接 `window-buffer'」，关闭判据与
+`--last-buffers' 记忆的刷新才能同时兼容两类承载单元。"
+  (cond
+   ((windowp panel) (window-buffer panel))
+   ((and (framep panel) (frame-live-p panel))
+    (let ((win (frame-selected-window panel)))
+      (and (windowp win) (window-buffer win))))
+   (t nil)))
+
+(defun seshat-reader-sidebar--panel-for-kind (kind &optional panels)
+  "返回承载单元列表中 kind 标记等于 KIND 的第一个单元，没有则返回 nil.
+PANELS 省略时取 `seshat-reader-sidebar--panels'；KIND 为 nil 时匹配 kind 标记
+为 nil 的单元。遍历与返回语义与 `seshat-reader-sidebar--window-for-kind' 逐字
+对应，区别只在于它作用于**两类**承载单元——「该 kind 的面板是否已显示」因此
+不再隐含「承载单元一定是窗口」的假设（childframe 承载时同样成立）。"
+  (let ((rest (or panels (seshat-reader-sidebar--panels)))
+        found)
+    (while (and rest (null found))
+      (when (eq (seshat-reader-sidebar--panel-kind (car rest)) kind)
+        (setq found (car rest)))
+      (setq rest (cdr rest)))
+    found))
+
+(defun seshat-reader-sidebar--panel-close (panel)
+  "关闭承载单元 PANEL，忽略关闭过程中的错误.
+窗口承载走 `delete-window'（与既有关闭路径一致：只删本包面板窗口，不动其它
+窗口）；frame 承载走 `delete-frame'（父 frame 被删除时其 child frame 由 Emacs
+自动清理，本函数无需额外处理）。两类原语都包 `ignore-errors'：面板可能已被
+用户手工关掉（`q' / `delete-other-frames'），此时关闭是幂等操作，不该把
+「窗口或 frame 已不存在」变成用户可见的错误。PANEL 既非窗口也非 frame 时什么
+也不做。"
+  (cond
+   ((windowp panel) (ignore-errors (delete-window panel)))
+   ((framep panel) (ignore-errors (delete-frame panel)))))
 
 (defun seshat-reader-sidebar--display-params (&optional kind select)
   "生成 `display-buffer' 的弹出 action list.
