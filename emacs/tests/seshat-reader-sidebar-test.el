@@ -3224,7 +3224,11 @@ kind 由 buffer 名推断；命令必须把 kind 交给 `--toggle-kind'（它按
 ;; 绑在 minor mode / local map 上的键失效。上一轮把面板 buffer 整块切到 emacs
 ;; state，副作用是 `hjkl' / `v' / `y' 一并消失；现在改为**保持 normal state**，
 ;; 在显示漏斗 `--display'（以及 `show' 的 `pop-to-buffer' 回退分支）里用
-;; `evil-define-key*' 给四个面板 map 的 normal state 补绑面板专用键。
+;; `evil-define-key*' 的 `'normal' + `'local' 在**面板 buffer 内**补绑面板专用键
+;; （`evil-normal-state-local-map' 是 buffer-local、排在 state keymap alist 最前，
+;; 直接改 `evil-mode-map-alist' 里同一个 keymap 对象，故补绑立即生效）。
+;; 传面板 keymap 对象（auxiliary keymap）的方案已弃用：它装入
+;; `evil-mode-map-alist' 的时机不可靠，`q' 会先进 macro 录制。
 
 (defmacro seshat-reader-sidebar-test--with-panel-evil-stub (recorder &rest body)
   "在桩替 `evil-define-key*' 的环境里求值 BODY，调用记进 RECORDER.
@@ -3239,24 +3243,22 @@ RECORDER 是变量名，块内为按调用顺序的 (STATE MAP KEY DEF) 列表�
        ,@body
        (setq ,recorder (nreverse ,recorder)))))
 
-(defun seshat-reader-sidebar-test--panel-evil-map-keys (captured map)
-  "Return the keys bound for MAP in CAPTURED (a `--with-panel-evil-stub' record).
-MAP is the **symbol** of the panel keymap.  The implementation passes
-`(symbol-value MAP)` to `evil-define-key*' — a symbol would signal
-`wrong-type-argument keymapp' (evil only special-cases `global' / `local') —
-so the recorded keymap is compared against the symbol's value, not the symbol."
-  (let ((object (and (boundp map) (symbol-value map))))
-    (mapcar (lambda (spec) (nth 2 spec))
-            (seq-filter (lambda (spec) (eq (nth 1 spec) object)) captured))))
+(defun seshat-reader-sidebar-test--panel-evil-bindings (captured)
+  "Return CAPTURED as a (KEY . DEF) alist, asserting STATE=normal and KEYMAP=local.
+用 `evil-define-key*' 的 `'normal' + `'local' 是本次修复的**不变量**：
+`'local' 解析成 buffer-local 的 `evil-normal-state-local-map'，它排在 evil
+state keymap alist 的**最前**、且 `evil-mode-map-alist' 里存的是同一个 keymap
+对象（`define-key' 立即生效，无需重新 normalize）。旧方案传面板 keymap 对象时
+绑定进 auxiliary keymap，装载时机不可靠——`q' 仍先落到 `evil-record-macro'。"
+  (mapcar (lambda (spec)
+            (should (eq 'normal (nth 0 spec)))
+            (should (eq 'local (nth 1 spec)))
+            (cons (nth 2 spec) (nth 3 spec)))
+          captured))
 
-(defun seshat-reader-sidebar-test--panel-evil-map-def (captured map key)
-  "Return the command bound to KEY in MAP in CAPTURED, or nil.
-MAP is the panel keymap symbol (see `--panel-evil-map-keys')."
-  (let ((object (and (boundp map) (symbol-value map))))
-    (nth 3 (seq-find (lambda (spec)
-                       (and (eq (nth 1 spec) object)
-                            (equal key (nth 2 spec))))
-                     captured))))
+(defun seshat-reader-sidebar-test--panel-evil-def (captured key)
+  "Return the command bound to KEY in CAPTURED (a `--with-panel-evil-stub' record)."
+  (cdr (assoc key (seshat-reader-sidebar-test--panel-evil-bindings captured))))
 
 (ert-deftest seshat-reader-sidebar-test--panel-no-longer-switches-emacs-state ()
   "面板显示不再切 emacs state：旧辅助函数已删除，`evil-emacs-state' 不被调用."
@@ -3304,66 +3306,99 @@ MAP is the panel keymap symbol (see `--panel-evil-map-keys')."
           (should-not emacs-state-calls))
       (when (buffer-live-p buffer) (kill-buffer buffer)))))
 
-(ert-deftest seshat-reader-sidebar-test--panel-evil-keys-four-keymaps ()
-  "四个面板 map 的 normal state 都补绑了 `q' / `M-o' / `C-c w'."
-  ;; 目录与批注的 map 由各自模块定义；本用例需要它们已加载
+(ert-deftest seshat-reader-sidebar-test--panel-evil-keys-use-normal-local ()
+  "补绑用 `'normal' + `'local'，且写进**面板 buffer 自己**的 local keymap."
+  (let ((buffer (get-buffer-create " *Seshat normal-local*"))
+        (records nil))
+    (unwind-protect
+        (progn
+          (cl-letf (((symbol-function 'evil-define-key*)
+                     (lambda (state keymap key def &rest _bindings)
+                       (push (list state keymap key def (current-buffer)) records)
+                       nil)))
+            (should (eq t (seshat-reader-sidebar--ensure-panel-evil-keys
+                           buffer 'search))))
+          (setq records (nreverse records))
+          (should records)
+          (dolist (rec records)
+            ;; 状态必须是 normal（面板保持 normal state，`hjkl' / `v' / `y' 照旧）
+            (should (eq 'normal (nth 0 rec)))
+            ;; KEYMAP 必须是符号 `local'，**不能**是面板 keymap 对象：
+            ;; 后者进 auxiliary keymap，装载时机不可靠，`q' 会先进 macro 录制
+            (should (eq 'local (nth 1 rec)))
+            ;; 绑定必须落在面板 buffer 里（buffer-local，不外溢到用户其它 buffer）
+            (should (eq buffer (nth 4 rec)))))
+      (when (buffer-live-p buffer) (kill-buffer buffer)))))
+
+(ert-deftest seshat-reader-sidebar-test--panel-evil-keys-per-kind ()
+  "四个面板 kind 各自绑到**正确**的键与命令集合（多绑或少绑都失败）."
   (require 'seshat-reader-outline)
   (require 'seshat-reader-annotation)
-  (seshat-reader-sidebar-test--with-panel-evil-stub captured
-    (seshat-reader-sidebar--ensure-panel-evil-keys)
-    ;; 全部走 normal state，且不碰 evil 的全局 map
-    (should captured)
-    (should (cl-every (lambda (spec) (eq 'normal (nth 0 spec))) captured))
-    (should-not (cl-some (lambda (spec) (eq 'global (nth 1 spec))) captured))
-    (dolist (map '(seshat-reader-translate-panel-map
-                   seshat-reader-annotation-list-mode-map
-                   seshat-reader-outline-mode-map
-                   seshat-reader-search--sidebar-map))
-      (let ((keys (seshat-reader-sidebar-test--panel-evil-map-keys captured map)))
-        (should (member "q" keys))
-        (should (member (kbd "M-o") keys))
-        (should (member (kbd "C-c w") keys))
-        ;; 键 → 命令对得上（不是随便绑了个别的命令）
-        (should (eq (seshat-reader-sidebar-test--panel-evil-map-def
-                     captured map "q")
-                    'seshat-reader-sidebar-quit))))
-    ;; 目录面板：`RET'（跳页）也要在 normal 下补绑
-    (should (member (kbd "RET")
-                    (seshat-reader-sidebar-test--panel-evil-map-keys
-                     captured 'seshat-reader-outline-mode-map)))
-    ;; 批注面板：`RET'（跳到批注页）与 `d'（删除）在 normal 下被
-    ;; `evil-ret' / `evil-delete' 抢走，必须补绑
-    (should (eq (seshat-reader-sidebar-test--panel-evil-map-def
-                 captured 'seshat-reader-annotation-list-mode-map (kbd "RET"))
-                'seshat-reader-annotation-list-goto))
-    (should (eq (seshat-reader-sidebar-test--panel-evil-map-def
-                 captured 'seshat-reader-annotation-list-mode-map "d")
-                'seshat-reader-annotation-list-delete))
-    ;; 搜索结果侧栏：`RET' / `n' / `p' 是主操作
-    (let ((keys (seshat-reader-sidebar-test--panel-evil-map-keys
-                 captured 'seshat-reader-search--sidebar-map)))
-      (should (member (kbd "RET") keys))
-      (should (member "n" keys))
-      (should (member "p" keys))
-      (should (eq (seshat-reader-sidebar-test--panel-evil-map-def
-                   captured 'seshat-reader-search--sidebar-map "n")
-                  'seshat-reader-search-sidebar-next)))))
+  ;; 期望表**独立于实现**硬写在测试里：键 → 命令，逐 kind 一份。
+  ;; 注意批注面板的 kind 是复数 `annotations'（与 `seshat-reader-sidebar-buffer-p'
+  ;; 的口径一致，`seshat-reader-annotation--render-list' 传的就是它）。
+  (let ((expected
+         `((translate ("q" . seshat-reader-sidebar-quit)
+                      (,(kbd "M-o") . seshat-reader-sidebar-toggle)
+                      (,(kbd "C-c w") . seshat-reader-sidebar-toggle-width))
+           (search ("q" . seshat-reader-sidebar-quit)
+                   (,(kbd "M-o") . seshat-reader-sidebar-toggle)
+                   (,(kbd "C-c w") . seshat-reader-sidebar-toggle-width)
+                   (,(kbd "RET") . seshat-reader-search-sidebar-goto)
+                   ("n" . seshat-reader-search-sidebar-next)
+                   ("p" . seshat-reader-search-sidebar-prev))
+           (annotations ("q" . seshat-reader-sidebar-quit)
+                        (,(kbd "M-o") . seshat-reader-sidebar-toggle)
+                        (,(kbd "C-c w") . seshat-reader-sidebar-toggle-width)
+                        (,(kbd "RET") . seshat-reader-annotation-list-goto)
+                        ("d" . seshat-reader-annotation-list-delete))
+           (outline ("q" . seshat-reader-sidebar-quit)
+                    (,(kbd "M-o") . seshat-reader-sidebar-toggle)
+                    (,(kbd "C-c w") . seshat-reader-sidebar-toggle-width)
+                    (,(kbd "RET") . seshat-reader-outline-visit-page)))))
+    (dolist (entry expected)
+      (let ((kind (car entry))
+            (buffer (get-buffer-create (format " *Seshat keys %s*" (car entry)))))
+        (unwind-protect
+            (seshat-reader-sidebar-test--with-panel-evil-stub captured
+              (seshat-reader-sidebar--ensure-panel-evil-keys buffer kind)
+              (let ((bindings
+                     (seshat-reader-sidebar-test--panel-evil-bindings captured)))
+                ;; 键的数量必须与期望完全一致（`q' / `M-o' / `C-c w' 三个共有键
+                ;; 每 kind 都在；各 kind 再另有自己的主操作键）
+                (should (= (length bindings) (length (cdr entry))))
+                (dolist (pair (cdr entry))
+                  (should (eq (cdr (assoc (car pair) bindings)) (cdr pair))))))
+          (when (buffer-live-p buffer) (kill-buffer buffer)))))))
+
+(ert-deftest seshat-reader-sidebar-test--panel-evil-keys-dead-buffer ()
+  "面板 buffer 已 kill（或名字不存在）时是空操作：不报错、不碰 `evil-define-key*'."
+  (let ((dead (generate-new-buffer " *Seshat dead panel*")))
+    (kill-buffer dead)
+    (seshat-reader-sidebar-test--with-panel-evil-stub captured
+      (should-not (seshat-reader-sidebar--ensure-panel-evil-keys dead 'search))
+      (should-not (seshat-reader-sidebar--ensure-panel-evil-keys
+                   " *Seshat nonexistent panel*" 'search))
+      (should-not captured))))
 
 (ert-deftest seshat-reader-sidebar-test--panel-evil-keys-keep-native-motion ()
   "本包不补绑 evil 原生键：`hjkl' / `v' / `y' 的移动与选取语义保留."
-  (require 'seshat-reader-outline)
-  (require 'seshat-reader-annotation)
-  (seshat-reader-sidebar-test--with-panel-evil-stub captured
-    (seshat-reader-sidebar--ensure-panel-evil-keys)
-    (let ((keys (mapcar (lambda (spec) (nth 2 spec)) captured)))
-      (dolist (native '("h" "j" "k" "l" "v" "y" "g" "G" "V" "\C-v" "u" "\C-r"))
-        (should-not (member native keys)))
-      ;; 只出现本包的面板键（白名单式断言：多绑一个键就失败）
-      (should (cl-every
-               (lambda (key)
-                 (member key (list "q" "n" "p" "d" (kbd "M-o") (kbd "C-c w")
-                                   (kbd "RET"))))
-               keys)))))
+  (let ((buffer (get-buffer-create " *Seshat native motion*")))
+    (unwind-protect
+        (dolist (kind '(translate search annotations outline))
+          (seshat-reader-sidebar-test--with-panel-evil-stub captured
+            (seshat-reader-sidebar--ensure-panel-evil-keys buffer kind)
+            (let ((keys (mapcar (lambda (spec) (nth 2 spec)) captured)))
+              (should captured)
+              (dolist (native '("h" "j" "k" "l" "v" "y" "g" "G" "V" "\C-v" "u" "\C-r"))
+                (should-not (member native keys)))
+              ;; 只出现本包的面板键（白名单式断言：多绑一个键就失败）
+              (should (cl-every
+                       (lambda (key)
+                         (member key (list "q" "n" "p" "d" (kbd "M-o")
+                                           (kbd "C-c w") (kbd "RET"))))
+                       keys)))))
+      (when (buffer-live-p buffer) (kill-buffer buffer)))))
 
 (ert-deftest seshat-reader-sidebar-test--panel-evil-keys-without-evil ()
   "没有 `evil-define-key*' 时补绑是空操作，面板显示与面板键位都不受影响."
@@ -3376,21 +3411,48 @@ MAP is the panel keymap symbol (see `--panel-evil-map-keys')."
              ((symbol-function 'evil-define-key*)
               (lambda (&rest _args) (error "无 evil 时不该调用 evil-define-key*"))))
     (should-not (fboundp 'evil-define-key*))
-    (should-not (seshat-reader-sidebar--ensure-panel-evil-keys))
-    ;; 面板自身的键位不依赖 evil
-    (should (eq (lookup-key seshat-reader-translate-panel-map (kbd "q"))
-                #'seshat-reader-sidebar-quit))
     (let ((buffer (get-buffer-create " *Seshat no-evil*"))
           (seshat-reader-sidebar--recent-kinds nil)
           (seshat-reader-sidebar--last-buffers nil))
       (unwind-protect
-          (cl-letf (((symbol-function 'seshat-reader-sidebar--display-window)
-                     (lambda (_buffer _kind &optional _select) 'fake-window))
-                    ((symbol-function 'seshat-reader-sidebar--carrier-for-kind)
-                     (lambda (_kind) 'window)))
-            (should (eq (seshat-reader-sidebar-show buffer 'annotations nil)
-                        'fake-window)))
+          (progn
+            ;; 补绑本身空操作（面板键位由各面板 map 自带，不依赖 evil）
+            (should-not (seshat-reader-sidebar--ensure-panel-evil-keys
+                         buffer 'translate))
+            (should (eq (lookup-key seshat-reader-translate-panel-map (kbd "q"))
+                        #'seshat-reader-sidebar-quit))
+            (cl-letf (((symbol-function 'seshat-reader-sidebar--display-window)
+                       (lambda (_buffer _kind &optional _select) 'fake-window))
+                      ((symbol-function 'seshat-reader-sidebar--carrier-for-kind)
+                       (lambda (_kind) 'window)))
+              (should (eq (seshat-reader-sidebar-show buffer 'annotations nil)
+                          'fake-window))))
         (when (buffer-live-p buffer) (kill-buffer buffer))))))
+
+(ert-deftest seshat-reader-sidebar-test--panel-evil-keys-call-sites ()
+  "显示漏斗与 `show' 的 `pop-to-buffer' 回退分支都把 (BUFFER KIND) 传下去."
+  (let ((calls nil)
+        (buffer (get-buffer-create " *Seshat call-site*"))
+        (seshat-reader-sidebar--recent-kinds nil)
+        (seshat-reader-sidebar--last-buffers nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'seshat-reader-sidebar--ensure-panel-evil-keys)
+                   (lambda (target kind) (push (list target kind) calls)))
+                  ((symbol-function 'seshat-reader-sidebar--display-window)
+                   (lambda (_buffer _kind &optional _select) 'fake-window))
+                  ((symbol-function 'seshat-reader-sidebar--carrier-for-kind)
+                   (lambda (_kind) 'window))
+                  ((symbol-function 'pop-to-buffer)
+                   (lambda (_buffer &rest _args) 'fake-window)))
+          ;; ① 显示漏斗 `--display'
+          (seshat-reader-sidebar-show buffer 'search t)
+          (should (equal (car calls) (list buffer 'search)))
+          ;; ② 面板禁用 → `show' 的 `pop-to-buffer' 回退分支
+          (let ((seshat-reader-sidebar-enabled nil))
+            (seshat-reader-sidebar-show buffer 'annotations nil)
+            (should (equal (car calls) (list buffer 'annotations))))
+          (should (= 2 (length calls))))
+      (when (buffer-live-p buffer) (kill-buffer buffer)))))
 
 (ert-deftest seshat-reader-sidebar-test--reader-normal-state-n-p-are-paging ()
   "阅读 buffer 的 normal state 下 `n' / `p' 是翻页，`hjkl' / `v' / `y' 不受影响."

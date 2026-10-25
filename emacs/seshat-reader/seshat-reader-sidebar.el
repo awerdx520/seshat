@@ -1445,89 +1445,118 @@ ACTION 实参——overriding-action 的优先级高于 `display-buffer-alist'�
 ;; 挑一段复制」的场景。故回退该方案：面板**保持 normal state**，只用
 ;; `evil-define-key*' 把**面板专用的单键**补绑到 normal state。
 ;;
-;; 为什么 `evil-define-key*' 能压过 evil 自己的键：它把绑定写进 KEYMAP 关联的
-;; **auxiliary keymap**（evil-core.el，实读签名
-;; `(STATE KEYMAP KEY DEF &rest BINDINGS)'），`evil-normalize-keymaps' 装载时该
-;; auxiliary keymap 的优先级高于 state 自身的 map，同时**不触碰** evil 的全局
-;; map（传的是各面板自己的 mode map，不是 `global'）。`hjkl' / `v' / `y' /
-;; `gg' / `G' 等原生键**一律不碰**，normal state 的移动与选取原样保留；被覆盖的
-;; 只有下面列出的面板专用键（`q' / `M-o' / `C-c w'，以及目录的 `RET'、搜索侧栏
-;; 的 `RET' / `n' / `p'）。
+;; **必须绑 `'local'`，不能绑各面板自己的 keymap 对象**（2026-10-26 真机实测）：
+;;
+;; - 传 keymap 对象时，`evil-define-key*' 把绑定写进该 map 关联的 **auxiliary
+;;   keymap**（`evil-set-auxiliary-keymap'：`(define-key MAP [normal-state] AUX)'）。
+;;   auxiliary keymap 只有在 `evil-normalize-keymaps' 之后才会进入 buffer-local
+;;   的 `evil-mode-map-alist'；而面板显示时用户**早已处于 normal state**，补绑
+;;   发生在此之后，`evil-mode-map-alist' 是**陈旧**的——实测四个面板里有三个的
+;;   auxiliary keymap 不在其中（`evil-define-key*' 不触发 normalize，它只被
+;;   `evil-local-mode' / `evil-change-state' / `use-local-map' 触发）。于是真实
+;;   按键仍落到 `evil-normal-state-map'：`q' 进 `evil-record-macro'（第一次按
+;;   `q' 开始录制宏、等寄存器，再按一次才有别的反应），`RET' / `n' / `p' / `d'
+;;   同理被 `evil-ret' / `evil-search-next' / `evil-paste-after' /
+;;   `evil-delete' 抢走。
+;; - 传 `'local'` 时，`evil-define-key*' 解析成
+;;   `(evil-state-property 'normal :local-keymap t)'，即 **buffer-local** 的
+;;   `evil-normal-state-local-map'。该 map 由 `evil-state-keymaps' **无条件**放进
+;;   state 的 keymap alist，且排在**最前**（evil-core.el 里结果顺序为
+;;   `intercept-maps → (local-map) → minor-mode-maps → aux-maps →
+;;   overriding-maps → (state-map)'），故它压过 state 自身的 map。更关键的是
+;;   `evil-mode-map-alist' 里存的是 `(evil-normal-state-local .
+;;   evil-normal-state-local-map)' 这对 **cons**，`define-key' 直接改的是同一个
+;;   keymap 对象——所以补绑**无需重新 normalize 就立即生效**，这正是本方案与
+;;   auxiliary keymap 方案的本质差别。
+;;
+;; `hjkl' / `v' / `y' / `gg' / `G' 等原生键**一律不碰**，normal state 的移动与
+;; 选取原样保留；被覆盖的只有下面列出的面板专用键（`q' / `M-o' / `C-c w'，以及
+;; 目录的 `RET'、搜索侧栏的 `RET' / `n' / `p'、批注的 `RET' / `d'）。
+;;
+;; 绑定写在**面板 buffer 自己的** local keymap 里（故函数必须拿到 buffer 对象）：
+;; 同一份绑定不会外溢到用户其它 buffer，面板 buffer 被 kill 时随 buffer 一起消失。
 ;;
 ;; KEY 的形式：`define-key' / `evil-define-key*' 对**字符串**不做 `kbd' 解析
 ;; （实测 Emacs 31.1：`"M-o"' 会被当成 M、-、o 三个键的序列），故特殊键一律传
-;; `(kbd "M-o")` 这样的向量，单字符键（`"q"' / `"n"' / `"p"'）可以直接用字符串。
+;; `(kbd "M-o")` 这样的向量，单字符键（`"q"' / `"n"' / `"p"' / `"d"'）可以直接
+;; 用字符串。
+
+(defconst seshat-reader-sidebar--panel-common-keys
+  `(("q" . seshat-reader-sidebar-quit)
+    (,(kbd "M-o") . seshat-reader-sidebar-toggle)
+    (,(kbd "C-c w") . seshat-reader-sidebar-toggle-width))
+  "四个面板（译文/解释、批注、目录、搜索侧栏）共有的面板专用键.
+
+`q' 关本面板（`seshat-reader-sidebar-quit'）、`M-o' 全部面板开合
+（`seshat-reader-sidebar-toggle'）、`C-c w' 切面板宽度
+（`seshat-reader-sidebar-toggle-width'）。三者都是「面板专用」语义，覆盖 evil
+的 `q'（`evil-record-macro'）等不会损失编辑能力。KEY 是 `(kbd ...)' 求值后的
+键序列——带修饰键的键**必须**走 `kbd'：`define-key' 不做 `kbd' 解析，写成字符串
+会被拆成多个单键（修饰前缀会被当成字面量的两个字符）。")
 
 (defconst seshat-reader-sidebar--panel-normal-key-specs
-  ;; 四个面板 map 共有的单键：`q' 关本面板、`M-o' 全部面板开合、`C-c w' 切宽度。
-  ;; 三者都是「面板专用」语义，覆盖 evil 的 `q'（宏录制）等不会损失编辑能力。
-  (let ((common (list (cons "q" 'seshat-reader-sidebar-quit)
-                      (cons (kbd "M-o") 'seshat-reader-sidebar-toggle)
-                      (cons (kbd "C-c w")
-                            'seshat-reader-sidebar-toggle-width)))
-        (specs nil))
-    (dolist (map '(seshat-reader-translate-panel-map
-                   seshat-reader-annotation-list-mode-map
-                   seshat-reader-outline-mode-map))
-      (dolist (pair common)
-        (push (list map (car pair) (cdr pair)) specs)))
-    ;; 目录面板：`RET' 是主操作（跳到该章首页），normal state 下被 `evil-ret'
-    ;; 抢走，故一并补绑。
-    (push (list 'seshat-reader-outline-mode-map (kbd "RET")
-                'seshat-reader-outline-visit-page)
-          specs)
-    ;; 批注面板：`RET'（跳到批注所在页）与 `d'（删除当前行批注）是主操作——
-    ;; normal state 下 `RET' 落到 `evil-ret'、`d' 落到 `evil-delete'（删除算子，
-    ;; 会吃掉后面的动作键），两个面板命令都按不到。
-    (dolist (pair (list (cons (kbd "RET") 'seshat-reader-annotation-list-goto)
-                        (cons "d" 'seshat-reader-annotation-list-delete)))
-      (push (list 'seshat-reader-annotation-list-mode-map (car pair) (cdr pair))
-            specs))
-    ;; 搜索结果侧栏：`RET' / `n' / `p' 都是主操作（跳页 / 下一个 / 上一个）。
-    (dolist (pair (list (cons (kbd "RET") 'seshat-reader-search-sidebar-goto)
-                        (cons "n" 'seshat-reader-search-sidebar-next)
-                        (cons "p" 'seshat-reader-search-sidebar-prev)))
-      (push (list 'seshat-reader-search--sidebar-map (car pair) (cdr pair))
-            specs))
-    (dolist (pair common)
-      (push (list 'seshat-reader-search--sidebar-map (car pair) (cdr pair))
-            specs))
-    (nreverse specs))
-  "四个面板 keymap 在 evil normal state 下要补绑的 (MAP KEY DEF) 三元组.
+  `((translate . ,seshat-reader-sidebar--panel-common-keys)
+    (search . (,@seshat-reader-sidebar--panel-common-keys
+               (,(kbd "RET") . seshat-reader-search-sidebar-goto)
+               ("n" . seshat-reader-search-sidebar-next)
+               ("p" . seshat-reader-search-sidebar-prev)))
+    (annotations . (,@seshat-reader-sidebar--panel-common-keys
+                    (,(kbd "RET") . seshat-reader-annotation-list-goto)
+                    ("d" . seshat-reader-annotation-list-delete)))
+    (outline . (,@seshat-reader-sidebar--panel-common-keys
+                (,(kbd "RET") . seshat-reader-outline-visit-page))))
+  "面板 KIND → 该面板在 evil normal state 下要补绑的 (KEY . DEF) 列表.
 
-MAP 是各面板自己的 mode map 符号（是 `evil-define-key*' 的 KEYMAP 实参，
-不是 `global'），KEY 是键序列（单字符用字符串、带修饰键用 `kbd' 向量），
-DEF 是命令符号。表里**只**出现面板专用键——`hjkl' / `v' / `y' 等 evil 原生
-键不在其中，故 normal state 的移动与选取语义不受影响。")
+`translate'（译文/解释）只有共有键；`search'（搜索结果侧栏）另有 `RET' / `n' /
+`p'（跳页 / 下一条 / 上一条）；`annotations'（批注列表，kind 名与
+`seshat-reader-sidebar-buffer-p' 的口径一致，是复数）另有 `RET'（跳到批注页）
+与 `d'（删除当前行批注）——normal state 下 `RET' 落到 `evil-ret'、`d' 落到
+`evil-delete'（删除算子，会吃掉后续动作键），两个主操作都按不到；`outline'
+（目录）另有 `RET'（跳到该章首页），同样被 `evil-ret' 抢走。
 
-(defun seshat-reader-sidebar--ensure-panel-evil-keys ()
-  "把面板专用的单键补绑进各面板 keymap 的 evil normal state.
-面板**保持 normal state**（`hjkl' 移动、`v' 选取、`y' 复制照旧可用），只在
-normal state 下补绑 `seshat-reader-sidebar--panel-normal-key-specs' 列出的面板
-专用键（`q' / `M-o' / `C-c w'，目录的 `RET'，批注的 `RET' / `d'，搜索侧栏的
-`RET' / `n' / `p'），使它们压过 `evil-normal-state-map' 里同名的
-`evil-record-macro' / `evil-search-next' / `evil-paste-after' / `evil-ret' /
-`evil-delete'。
+表里**只**出现面板专用键——`hjkl' / `v' / `y' 等 evil 原生键不在其中，故 normal
+state 的移动与选取语义不受影响。消费方是
+`seshat-reader-sidebar--ensure-panel-evil-keys'。")
+
+(defun seshat-reader-sidebar--panel-evil-keys-for-kind (kind)
+  "返回面板 KIND 在 evil normal state 下要补绑的 (KEY . DEF) 列表.
+KIND 见 `seshat-reader-sidebar--panel-normal-key-specs'；未知 KIND（或 nil）
+返回 nil（不绑任何键）。"
+  (cdr (assq kind seshat-reader-sidebar--panel-normal-key-specs)))
+
+(defun seshat-reader-sidebar--ensure-panel-evil-keys (buffer kind)
+  "在面板 BUFFER 里把面板专用键补绑到 evil normal state（按 KIND 取键集）.
+用 `evil-define-key*' 的 `'local'（即 buffer-local 的
+`evil-normal-state-local-map'）而不是面板 keymap 对象上的 auxiliary keymap：
+后者装入 `evil-mode-map-alist'（属于 `emulation-mode-map-alists'）的时机不可靠
+（见上方注释），`q'（evil 的宏录制键）仍会先进 `evil-record-macro'。`'local'
+排在该 state 的 keymap alist
+最前，且直接改 `evil-mode-map-alist' 里已有的 keymap 对象，补绑立即生效。
+
+面板**保持 normal state**：`hjkl' 移动、`v' 选取、`y' 复制照旧可用；
+`seshat-reader-sidebar--panel-normal-key-specs' 列出的键（`q' / `M-o' /
+`C-c w'，搜索侧栏的 `RET' / `n' / `p'，批注的 `RET' / `d'，目录的 `RET'）
+覆盖 evil 的 `evil-record-macro' / `evil-search-next' / `evil-paste-after' /
+`evil-ret' / `evil-delete'。
+
+BUFFER 可以是 buffer 对象或 buffer 名；已 kill（或不存在）时为**空操作**，返回
+nil——面板 buffer 可能在显示流程里被别的钩子关掉，本函数不因此报错。KIND
+未知时同样不绑任何键。
 
 evil 是**软依赖**：本包不 `require'、不写进 `Package-Requires'，`fboundp' 守卫
-保证没有 `evil-define-key*' 时整段静默跳过（零副作用）。
+保证没有 `evil-define-key*' 时整段静默跳过（零副作用），此时返回 nil。
 
-**MAP 必须传 keymap 对象，不能传符号**（实测：`evil-define-key*' 只对
-`global' / `local' 两个符号做特殊解析，其它符号会被当成 keymap 原值使用，
-于是报 `wrong-type-argument keymapp`）。故本函数取 `(symbol-value MAP)` 再传。
-
-幂等：`evil-define-key*' 只是往 auxiliary keymap 里写同一对 KEY → DEF，重复调用
-不叠加、不改变结果；故它可以放在每次显示都会经过的漏斗里，面板重渲染（切
-major mode 不重建 map）或重开（toggle / popper）时反复执行都安全。
-
-尚未加载的面板模块其 map 只是 `defvar' 的空声明（void），此时跳过；该模块加载
-后第一次显示面板时会重新经过本函数，绑定届时补上。"
-  (when (fboundp 'evil-define-key*)
-    (dolist (spec seshat-reader-sidebar--panel-normal-key-specs)
-      (let ((map (nth 0 spec)))
-        (when (and (boundp map) (keymapp (symbol-value map)))
-          (evil-define-key* 'normal (symbol-value map)
-            (nth 1 spec) (nth 2 spec)))))))
+幂等：`evil-define-key*' 只是往同一个 local keymap 里写同一对 KEY → DEF，重复
+调用不叠加、不改变结果；故它可以放在每次显示都会经过的漏斗里，面板重渲染或
+重开（toggle / popper）时反复执行都安全。"
+  (let ((target (cond ((bufferp buffer) buffer)
+                      ((stringp buffer) (get-buffer buffer)))))
+    (when (and (fboundp 'evil-define-key*)
+               (buffer-live-p target))
+      (with-current-buffer target
+        (dolist (pair (seshat-reader-sidebar--panel-evil-keys-for-kind kind))
+          (evil-define-key* 'normal 'local (car pair) (cdr pair)))
+        t))))
 
 (defun seshat-reader-sidebar--display (buffer kind &optional select)
   "把 BUFFER 显示到信息面板并返回承载单元的窗口.
@@ -1569,8 +1598,9 @@ SELECT 原样透传给选中的后端（`--cf-show' / `--display-window'），�
 `seshat-reader-sidebar--display-window' 内实现，本层不重复。"
   ;; 面板键位在 evil normal state 下补绑（面板保持 normal state，`hjkl' / `v' /
   ;; `y' 照旧可用；详见 `seshat-reader-sidebar--ensure-panel-evil-keys'）。放在
-  ;; 显示漏斗里，渲染与重开两条路径都覆盖。
-  (seshat-reader-sidebar--ensure-panel-evil-keys)
+  ;; 显示漏斗里，渲染与重开两条路径都覆盖。绑定落在**面板 buffer 自己**的
+  ;; `evil-normal-state-local-map' 上，故必须把 BUFFER 与 KIND 一起传进去。
+  (seshat-reader-sidebar--ensure-panel-evil-keys buffer kind)
   (setq seshat-reader-sidebar--last-kind kind
         seshat-reader-sidebar--last-buffer buffer)
   (when kind
@@ -1712,7 +1742,7 @@ SELECT 非 nil 表示「面板内容已就绪，可以跟随光标」：**批注
       (seshat-reader-sidebar--display buffer kind select)
     ;; 面板禁用时退回 `pop-to-buffer'：这条分支不经 `--display'，故单独补一次
     ;; normal state 下的面板键补绑（面板 buffer 同样要能 `q' 关掉）。
-    (seshat-reader-sidebar--ensure-panel-evil-keys)
+    (seshat-reader-sidebar--ensure-panel-evil-keys buffer kind)
     (pop-to-buffer buffer)))
 
 (defun seshat-reader-sidebar-close-buffer-kind (kind buffer)
