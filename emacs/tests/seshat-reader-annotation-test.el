@@ -561,20 +561,53 @@ ANNOTATIONS 为将作为服务端 JSON 响应返回的 Lisp 数据。"
     (should caught)
     (should (string-match-p "选区未记录文档文件" (error-message-string caught)))))
 
-(ert-deftest seshat-reader-annotation-test--create-empty-text-errors ()
-  "选区文本为空且无显式 BODY 时创建批注抛 `user-error'."
+(ert-deftest seshat-reader-annotation-test--create-blank-text-with-geometry-succeeds ()
+  "选区文本为空白但带几何时仍创建批注：highlight + 空 text + 无 selected_text.
+扫描版 / 无文本层区域没有字符可取，几何（`:rect'）是唯一可用的锚。"
   (seshat-reader-annotation-test--with-temp-dir dir
     (let* ((file (expand-file-name "book.pdf" dir))
            (seshat-reader-annotation-roots (list (cons "lib" dir)))
-           (seshat-reader-select-last (list :file file :page 1 :rect '(0 0 1 1)
-                                            :text "   "))
+           (seshat-reader-select-last (list :file file :page 1 :rect '(0 0 10 20)
+                                            :text "   ")))
+      (with-temp-file file)
+      (let* ((calls (seshat-reader-annotation-test--with-stub 201 "{\"id\":1}"
+                      (seshat-reader-annotation-create)))
+             (body (json-parse-string (nth 2 (car calls)) :object-type 'alist)))
+        (should (= 1 (length calls)))
+        (should (equal (alist-get 'kind body) "highlight"))
+        (should (equal (alist-get 'text body) ""))
+        (should (equal (alist-get 'location body)
+                       "page:1;rect:0.00,0.00,10.00,20.00"))
+        (should-not (alist-get 'selected_text body))))))
+
+(ert-deftest seshat-reader-annotation-test--create-scanned-page-without-text-succeeds ()
+  "扫描版回落路径：`:rects' nil、`:rect' 非 nil、`:text' nil → 不报错，location 单段 rect.
+`--selection-rects' 在 `:rects' 为 nil 时回落 `:rect'，因此「尚未选中任何
+文本」的空选区守卫**不应**拦住带几何的扫描页；产物是 kind=highlight、
+text 为空串、selected_text 为 nil 的标记批注（框住什么就标记什么）。"
+  (seshat-reader-annotation-test--with-temp-dir dir
+    (let* ((file (expand-file-name "scanned.pdf" dir))
+           (seshat-reader-annotation-roots (list (cons "lib" dir)))
+           (seshat-reader-select-last (list :file file :page 7
+                                            :rect '(11.5 20 200 300)
+                                            :rects nil :text nil))
            (caught nil))
       (with-temp-file file)
-      (condition-case err
-          (seshat-reader-annotation-create)
-        (user-error (setq caught err)))
-      (should caught)
-      (should (string-match-p "选区没有文本" (error-message-string caught))))))
+      (let* ((calls (seshat-reader-annotation-test--with-stub
+                        201 "{\"id\":2}"
+                      (condition-case err
+                          (seshat-reader-annotation-create)
+                        (user-error (setq caught err)))))
+             (body (when calls
+                     (json-parse-string (nth 2 (car calls))
+                                        :object-type 'alist))))
+        (should-not caught)
+        (should (= 1 (length calls)))
+        (should (equal (alist-get 'kind body) "highlight"))
+        (should (equal (alist-get 'text body) ""))
+        (should (equal (alist-get 'location body)
+                       "page:7;rect:11.50,20.00,200.00,300.00"))
+        (should-not (alist-get 'selected_text body))))))
 
 (ert-deftest seshat-reader-annotation-test--create-empty-selection-errors ()
   "无几何（`:rect' 与 `:rects' 皆 nil）且无文本时不落成页级锚，直接 `user-error'."

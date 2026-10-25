@@ -189,11 +189,15 @@ ETAF 渲染层是可选外部依赖：`Makefile` 先探测 `~/Workspace/emacs-ta
 - 把选区矩形投给 C 渲染层闪现高亮，时长 `seshat-reader-select-flash-duration`（默认 `2.0` 秒，`<= 0` 关闭）；
 - `seshat-reader-select-copy-to-kill-ring` 默认 `nil`；设 `t` 才把文本 `kill-new` 进 kill ring。
 
-**字级高亮（框选贴合文字，而不是一个大方块）**：C 模块的 `--rects-in-rect` 返回矩形内**每个命中字符**的 quad，elisp 侧的纯函数把它们合并成行条：
+**字级高亮（框选贴合文字，而不是一个大方块）**：选区几何由 `seshat-reader-select-highlight-scope` 决定取哪一段文字，再由 elisp 侧的纯函数整理成可画的横条。
 
-- `seshat-reader-select-highlight-granularity`（默认 `line`）：`line` = 按行合并（y 重叠聚成行 → 行内按 x 排序 → 相邻字符水平间隙小于阈值才连成一条）；`character` = 逐字符矩形，不合并。
-- `seshat-reader-select-highlight-gap-ratio`（默认 `0.8`）：把「水平间隙 / 行高」的比值作断点，超过就断开，双栏排版因此不会被一条横条横穿。中文正文实测约 **3.4 段/行**（字间空隙比西文大）；想让高亮更连贯可上调（如 `1.2`），想更贴字可下调。
-- `seshat-reader-select-highlight-shrink-ratio`（默认 `0.8`，`1.0` = 关闭）：字符 quad 的高度（实测 ≈11.7pt）大于行距（≈10.3pt），不收缩时相邻两行的横条垂直重叠（重叠量 = quad 高 − 行距，实测 ≈1.4pt），8 条拼起来视觉上仍是一整块。该比值在合并之后**围绕每条矩形自己的垂直中心**把高度乘以它（实测 `0.8` 留出 ≈0.94pt 白缝），只影响**垂直高度**：水平范围、`seshat-reader-select-last` 的 `:rect`（整体拖拽 bbox）、写入 `location` 的段数与 x 范围都不变，`line` / `character` 两种粒度都生效。有效范围 `0.3`–`1.0`，越界夹紧（`0.1`→`0.3`、`2.0`→`1.0`），非数字回落 `0.8`。
+- `seshat-reader-select-highlight-scope`（默认 `line`）：**整行吸附**。框只要碰到某一行（该行有任一字符的 quad 与框相交），该行**全部**文字都高亮——C 模块的 `--lines-in-rect` 返回**每行一条**矩形（该行字符 quad 的并集，阅读顺序）。窄框（只覆盖行中间几个字）因此会得到整行宽度：实测 `d2l-zh-pytorch.pdf` page 100 用 `(200,70)-(300,110)` 框 vs 同一框的整行吸附，x 范围从 **197.5–300.6**（23 个字符 quad）变成 **73.1–493.4**（1 条整行矩形），y 范围完全一致（96.2–105.2）。整行矩形**不再**经过「按行合并」这一步（它本来就是整行，合并只会把相邻两行连起来），但**垂直收缩照旧生效**。
+  设成 `region` 则回到旧行为：只高亮框内的字符（`--rects-in-rect` + 按行合并），适合要精确到字的场合。老版本动态模块没有 `--lines-in-rect` 时 `line` 会**静默回落**到 `region`，不报错。
+  **双栏不会被互相污染**：MuPDF 的 stext 把左右栏拆成不同的 line，判据是「**这一行自己**有字符被框碰到」，所以框只碰左栏时右栏的行不会出现在结果里。实测 `d2l-zh-pytorch.pdf` page 781 页脚：左侧行 `x 72.0–158.2` 与右侧页码 `x 524.2–540.0` 同 y（742.7 / 744.0），窄框 `(60,738)-(200,758)` 只返回左侧那 1 条，右侧页码未出现。
+- `seshat-reader-select-highlight-granularity`（默认 `line`）：**仅 `region` 作用域生效**。`line` = 按行合并（y 重叠聚成行 → 行内按 x 排序 → 相邻字符水平间隙小于阈值才连成一条）；`character` = 逐字符矩形，不合并。整行吸附给出的矩形本身就是整行，不会被拆开。
+- `seshat-reader-select-highlight-gap-ratio`（默认 `0.8`）：把「水平间隙 / 行高」的比值作断点，超过就断开，双栏排版因此不会被一条横条横穿（`region` 作用域）。中文正文实测约 **3.4 段/行**（字间空隙比西文大）；想让高亮更连贯可上调（如 `1.2`），想更贴字可下调。
+- `seshat-reader-select-highlight-shrink-ratio`（默认 `0.8`，`1.0` = 关闭）：字符 quad 的高度（实测 ≈11.7pt）大于行距（≈10.3pt），不收缩时相邻两行的横条垂直重叠（重叠量 = quad 高 − 行距，实测 ≈1.4pt），8 条拼起来视觉上仍是一整块。该比值在合并之后**围绕每条矩形自己的垂直中心**把高度乘以它（实测 `0.8` 留出 ≈0.94pt 白缝），只影响**垂直高度**：水平范围、`seshat-reader-select-last` 的 `:rect`（整体拖拽 bbox）、写入 `location` 的段数与 x 范围都不变，**`line` / `region` 两种作用域都生效**。
+有效范围 `0.3`–`1.0`，越界夹紧（`0.1`→`0.3`、`2.0`→`1.0`），非数字回落 `0.8`。
 - 选区结果写进 `seshat-reader-select-last`：`:rects` 是合并后的**多段**矩形（字级高亮与批注锚的几何真值），`:rect` 保留整体 bbox 以兼容既有消费方。
 - 多段矩形经 `seshat-reader-annotation--anchor` 写成**多段 location**（`page:<n>;rect:…;rect:…`），写入端上限 **500 段**（`seshat-reader-annotation--anchor-max-segments`）；解析端上限 2000 段（`seshat-reader-annotation--rect-max-segments`）。`character` 粒度下逐字符矩形可达数千条，会撞 500 段上限——此时**只写前 500 段**（页面下部因此没有高亮）并提示一次，见 §12。
 - 闪现与批注高亮共用一套投喂（一次 clear → 逐条 add → 一次 refresh），短语义见下节。
@@ -438,7 +442,8 @@ evil 用户同样可用上述单键（包内 `evil-define-key*` 补绑 normal st
 | `seshat-reader-annotation-highlight-alpha` | `0.35` | 高亮填充透明度 |
 | `seshat-reader-annotation-underline-color` / `-underline-alpha` / `-underline-thickness` | `(0.0 0.45 0.85)` / `1.0` / `1.5` | 下划线颜色、透明度与细条高度（pt） |
 | `seshat-reader-annotation-strikeout-color` / `-strikeout-alpha` / `-strikeout-thickness` | `(0.85 0.1 0.1)` / `1.0` / `1.5` | 删除线颜色、透明度与细条高度（pt） |
-| `seshat-reader-select-highlight-granularity` | `line` | 字级高亮粒度：`line`（按行合并）/ `character`（逐字符） |
+| `seshat-reader-select-highlight-scope` | `line` | 框选高亮的取字范围：`line`（整行吸附：框碰到某行任一字符即高亮整行）/ `region`（只高亮框内字符，旧行为） |
+| `seshat-reader-select-highlight-granularity` | `line` | 字级高亮粒度（仅 `region` 作用域）：`line`（按行合并）/ `character`（逐字符） |
 | `seshat-reader-select-highlight-gap-ratio` | `0.8` | 行内水平间隙断点（行高倍数）；中文正文实测约 3.4 段/行，想更连贯可上调 |
 | `seshat-reader-select-highlight-shrink-ratio` | `0.8` | 高亮矩形垂直高度收缩比（围绕各自中心，只改高度、不改 x 与 `:rect`）；`1.0` 关闭收缩，有效 `0.3`–`1.0` 越界夹紧 |
 | `seshat-reader-select-flash-duration` | `2.0` | 框选后闪现选区高亮的秒数，`<= 0` 关闭 |

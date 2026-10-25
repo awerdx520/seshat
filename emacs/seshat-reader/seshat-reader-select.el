@@ -64,15 +64,21 @@
 ;;     and overlay `display' properties do not compose.  A persistent
 ;;     highlight comes from creating an annotation (`C-c C-a'), which feeds
 ;;     the same C table through `seshat-reader-annotation'.
-;;   - The flashed (and annotated) geometry is a set of rectangles hugging
-;;     the selected characters, merged per line: the module reports one
-;;     rectangle per hit character and they are run together until the
-;;     horizontal gap exceeds
-;;     `seshat-reader-select-highlight-gap-ratio' times the line height (see
-;;     `seshat-reader-select--merge-char-rects'), which keeps two-column
-;;     text from being bridged by a single bar.  Set
+;;   - The flashed (and annotated) geometry snaps to whole text lines by
+;;     default: a rectangle that touches any character of a line selects
+;;     that entire line (`seshat-reader-select-highlight-scope', value
+;;     `line', answered by the module function
+;;     `seshat-reader-dyn--lines-in-rect').  Set the option to `region' to
+;;     fall back to highlighting only the characters inside the rectangle,
+;;     which is then merged per line: the module reports one rectangle per
+;;     hit character and they are run together until the horizontal gap
+;;     exceeds `seshat-reader-select-highlight-gap-ratio' times the line
+;;     height (see `seshat-reader-select--merge-char-rects').  Under either
+;;     scope the columns of a two-column layout stay separate — a line is
+;;     only selected when one of its own characters was touched.  Set
 ;;     `seshat-reader-select-highlight-granularity' to `character' for one
-;;     rectangle per character instead.  It is still not a text-shaping
+;;     rectangle per character instead (`region' scope only; whole-line
+;;     rectangles are never split).  It is still not a text-shaping
 ;;     highlight: rotated pages remain unsupported, as they are for the
 ;;     selection itself.
 ;;   - Only pages carrying a text layer can be read; scanned images
@@ -145,6 +151,39 @@ C renderer relies on for a stable result."
                  (const :tag "One rect per character" character))
   :group 'seshat-reader-select)
 
+(defcustom seshat-reader-select-highlight-scope 'line
+  "Which characters of a selection are highlighted.
+This decides *what the selection grabs*, before any merging happens:
+
+  `line'    (default) Line snapping.  As soon as the dragged rectangle
+            touches any character of a line, the whole of that line is
+            highlighted, from the line's first to its last glyph.  A
+            narrow drag across the middle of a paragraph therefore
+            highlights complete lines instead of a few characters,
+            which is what makes the feedback readable.
+  `region'  Only the characters intersecting the rectangle, i.e. the
+            behaviour before line snapping existed.
+
+Line snapping is done in the dynamic module
+\(`seshat-reader-dyn--lines-in-rect'), which reports one rectangle per
+whole line.  Those rectangles are *not* run through
+`seshat-reader-select--merge-char-rects' — they already span their line,
+and merging could only bridge two neighbouring lines together.  The
+vertical shrink (`seshat-reader-select-highlight-shrink-ratio') still
+applies, so the bars of adjacent lines keep their white gap.
+
+Two-column pages stay separated: MuPDF's structured text splits the left
+and right column into different lines, and a line is only reported when
+one of *its own* characters was touched, so a drag over the left column
+does not highlight the right one.
+
+Set this to `region' to get the old rectangle-exact highlight back; an
+older dynamic module without `seshat-reader-dyn--lines-in-rect' falls
+back to `region' silently as well."
+  :type '(choice (const :tag "Snap to whole lines" line)
+                 (const :tag "Only the characters in the rectangle" region))
+  :group 'seshat-reader-select)
+
 (defcustom seshat-reader-select-highlight-gap-ratio 0.8
   "Horizontal gap, relative to the line height, that splits a line run.
 Two neighbouring characters are merged into the same rectangle as long
@@ -213,6 +252,8 @@ pending clear, leaving its flash rectangle on the page forever.")
 (declare-function seshat-reader-dyn--add-highlight "seshat-render-core"
                   (page x0 y0 x1 y1))
 (declare-function seshat-reader-dyn--rects-in-rect "seshat-render-core"
+                  (page x0 y0 x1 y1))
+(declare-function seshat-reader-dyn--lines-in-rect "seshat-render-core"
                   (page x0 y0 x1 y1))
 (declare-function seshat-reader-dyn--clear-highlights "seshat-render-core" ())
 (declare-function seshat-reader-dyn--refresh-highlights "seshat-render-core" ())
@@ -562,11 +603,15 @@ The plist holds the keys
          the drag — kept for the consumers that only need a position
          (translate, reference) and for the annotation path of older
          versions;
-  :rects the per-line rectangles hugging the selected characters, as a
-         list of (X0 Y0 X1 Y1) lists, or nil when the module could not
-         report them (`seshat-reader-dyn--rects-in-rect' unavailable)
-         or the region held no text.  Consumers that draw geometry
-         should prefer this and fall back to :rect when it is nil;
+  :rects the selection rectangles to draw, as a list of
+         (X0 Y0 X1 Y1) lists, or nil when the module could not report
+         them (neither `seshat-reader-dyn--lines-in-rect' nor
+         `seshat-reader-dyn--rects-in-rect' available) or the region
+         held no text.  With `seshat-reader-select-highlight-scope'
+         at its default `line' these rectangles span whole text lines;
+         with `region' they hug the selected characters.  Consumers
+         that draw geometry should prefer this and fall back to :rect
+         when it is nil;
   :file  the file name of the selected document, taken from the
          variable `buffer-file-name' (nil for a buffer without a file).
 
@@ -665,15 +710,43 @@ are page coordinates — exactly the arguments given to
 `seshat-reader-dyn--text-in-rect' for the same rectangle, so the
 geometry matches the extracted text.
 
-The module reports one rectangle per hit character; they are merged by
-`seshat-reader-select--merge-char-rects' into per-line rectangles.
-Return nil when the module does not provide the function (an older
-build) or when the region holds no character: a region without text is
-a normal outcome, not an error, and must not produce a message."
-  (when (fboundp 'seshat-reader-dyn--rects-in-rect)
-    (seshat-reader-select--merge-char-rects
-     (ignore-errors
-       (seshat-reader-dyn--rects-in-rect page x0 y0 x1 y1)))))
+Which characters the geometry covers is decided by
+`seshat-reader-select-highlight-scope':
+
+  `line'    ask the module for whole lines
+            (`seshat-reader-dyn--lines-in-rect'): a line touched
+            anywhere by the rectangle is reported in full.  The result
+            is used as-is, without `seshat-reader-select--merge-char-rects':
+            the rectangles already span their line, so merging could
+            only join two neighbouring lines into one bar.
+  `region'  the historical path: one rectangle per hit character
+            (`seshat-reader-dyn--rects-in-rect'), run together into
+            per-line rectangles by `seshat-reader-select--merge-char-rects'.
+
+Either way the rectangles are finally shrunk vertically by
+`seshat-reader-select-highlight-shrink-ratio', and either way a `line'
+scope falls back to the `region' path without an error when the module
+does not export `seshat-reader-dyn--lines-in-rect' (an older build).
+
+Return nil when the module provides neither function or when the region
+holds no character: a region without text is a normal outcome, not an
+error, and must not produce a message."
+  (let ((scope seshat-reader-select-highlight-scope)
+        (lines-fn (and (fboundp 'seshat-reader-dyn--lines-in-rect)
+                       'seshat-reader-dyn--lines-in-rect)))
+    (cond
+     ((and (eq scope 'line) lines-fn)
+      (let ((lines (ignore-errors
+                     (seshat-reader-dyn--lines-in-rect page x0 y0 x1 y1))))
+        (when lines
+          (seshat-reader-select--shrink-rects-vertically
+           (seshat-reader-select--sort-rects
+            (delq nil (mapcar #'seshat-reader-select--normalize-rect lines)))
+           (seshat-reader-select--highlight-shrink-ratio)))))
+     ((fboundp 'seshat-reader-dyn--rects-in-rect)
+      (seshat-reader-select--merge-char-rects
+       (ignore-errors
+         (seshat-reader-dyn--rects-in-rect page x0 y0 x1 y1)))))))
 
 (defun seshat-reader-select-extract (start end)
   "Extract the text between the mouse positions START and END.
@@ -710,7 +783,8 @@ box when there are none."
                  ;; floats; the module function `seshat-reader-dyn--text-in-rect'
                  ;; does not accept integers.
                  (text (seshat-reader-dyn--text-in-rect page x0 y0 x1 y1))
-                 ;; 逐字符矩形 → 按行合并（纯函数）；模块缺失或无命中时为 nil
+                 ;; 选区几何：默认按 scope=line 由模块返回整行矩形；scope=region
+                 ;; 时退回逐字符矩形并按行合并（纯函数）；模块缺失或无命中时为 nil
                  (rects (seshat-reader-select--rects-in-rect page x0 y0 x1 y1))
                  (bbox (list x0 y0 x1 y1)))
             (setq seshat-reader-select-last

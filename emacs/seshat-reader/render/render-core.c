@@ -78,6 +78,17 @@ pthread_mutex_t g_mupdf_mutex[FZ_LOCK_MAX];
  * Elisp as a list, so it must not be unbounded. */
 #define RECTS_IN_RECT_MAX_COUNT 100000
 
+/* Ceiling on the number of *lines* `--lines-in-rect' will collect for one
+ * call.  Deliberately far below RECTS_IN_RECT_MAX_COUNT: that function
+ * reports one rectangle per character (thousands per page), while this one
+ * reports one rectangle per whole text line, so a page holds tens of lines,
+ * not thousands.  4096 lines is more than an entire book page can carry and
+ * still bounds the Elisp list handed back.  Exceeding it TRUNCATES the
+ * result (the first 4096 lines are returned, in reading order) instead of
+ * throwing, exactly like the quad collector above — a partial answer is
+ * useful for a highlight, a failed call is not. */
+#define LINES_IN_RECT_MAX_COUNT 4096
+
 /**
  * Convert an Emacs-facing rectangle into ordered MuPDF page space.
  *
@@ -1893,6 +1904,291 @@ stext_query_in_rect(emacs_env *env, DocState *doc_state, int page_number,
 }
 
 /**
+ * prepare_rect_query - Shared argument handling for the rect queries.
+ *
+ * The three rect-query entry points (`--text-in-rect', `--rects-in-rect'
+ * and `--lines-in-rect') differ only in the shape of their answer, so the
+ * whole front half of each call — reader state lookup, the reload/close
+ * early-outs, page-number range check and the coordinate validation — is
+ * factored out here.  Keeping it in one place is what makes "the same
+ * rectangle means the same thing" true across all three: they share one
+ * notion of page space (`rect_to_page_space') and one set of messages.
+ *
+ * All failures return false with no result to build; some of them emit a
+ * message (out-of-range page, non-finite coordinates) and some are
+ * deliberately silent (no reader state, reload/close window — the caller
+ * is in the middle of a redisplay and a message would be noise).
+ *
+ * @param env             Emacs module environment.
+ * @param args            Elisp args: page, x0, y0, x1, y1 (0-based page).
+ * @param doc_state_out   Receives the document on success.
+ * @param page_number_out Receives the 0-based, range-checked page index.
+ * @param rect_out        Receives the rectangle in MuPDF page space.
+ * Return:                true when the query may proceed.
+ */
+
+static bool
+prepare_rect_query(emacs_env *env, emacs_value *args, DocState **doc_state_out,
+		   int *page_number_out, fz_rect *rect_out)
+{
+	DocState *doc_state = NULL;
+	EmacsWinState *win_state = NULL;
+	emacs_value overlay = EMACS_NIL;
+
+	if (!get_reader_current_state(env, &doc_state, &win_state, &overlay))
+		return false;
+
+	/* Bail out during reload/close windows to avoid use-after-free. */
+	if (doc_state->is_reloading || win_state->closing)
+		return false;
+
+	int page_number = (int)env->extract_integer(env, args[0]);
+	float ax = env->extract_float(env, args[1]);
+	float ay = env->extract_float(env, args[2]);
+	float bx = env->extract_float(env, args[3]);
+	float by = env->extract_float(env, args[4]);
+
+	if (page_number < 0 || page_number >= doc_state->pagecount)
+		{
+			emacs_message(env, "Page number is out of range.");
+			return false;
+		}
+
+	/* Validate and normalize the rectangle through the same helper the
+	 * highlight painter uses, so both entry points share one notion of
+	 * page space (see rect_to_page_space).
+	 *
+	 * Rejecting non-finite corners matters here: fz_is_empty_rect()
+	 * treats every comparison against a NaN as false, so a NaN
+	 * rectangle would otherwise be classified as non-empty and would
+	 * wrongly match every character on the page. */
+	fz_rect rect;
+
+	if (!rect_to_page_space(ax, ay, bx, by, &rect))
+		{
+			emacs_message(env,
+				      "Invalid rectangle: coordinates must be finite.");
+			return false;
+		}
+
+	if (doc_state_out)
+		*doc_state_out = doc_state;
+	if (page_number_out)
+		*page_number_out = page_number;
+	if (rect_out)
+		*rect_out = rect;
+
+	return true;
+}
+
+/**
+ * stext_lines_in_rect - Return whole text lines that touch a rectangle.
+ *
+ * The line-snapped sibling of `stext_query_in_rect': same page/coordinate
+ * validation (its caller goes through `prepare_rect_query'), same
+ * cloned-context discipline, same "build the Elisp list AFTER the
+ * fz_try/fz_catch block" rule, but a different traversal.
+ *
+ * For every TEXT line the walk runs twice over that line's characters: the
+ * first pass asks whether ANY character quad intersects RECT (the very
+ * `fz_intersect_rect' + `fz_is_empty_rect' test the character query uses,
+ * so "touched" means exactly the same thing in both functions); only if it
+ * answers yes does the second pass union every character quad of that line
+ * and emit one rectangle.  A line the rectangle does not touch contributes
+ * nothing at all.
+ *
+ * Why line granularity works for a two-column layout: MuPDF's structured
+ * text already separates the left and right column into distinct lines, so
+ * the "does this line itself get touched" test keeps a rectangle over the
+ * left column from dragging the right column's lines along — they are
+ * different lines and nobody touched them.  (Should a build ever put both
+ * columns into one line, the columns would merge; that is a property of the
+ * stext tree, not something this walk could decide.)
+ *
+ * Emitted is the union of the line's char quads, i.e. the line's full
+ * extent in reading order — not just the part the rectangle covered.
+ *
+ * @param env         Emacs module environment.
+ * @param doc_state   Document owning the page.
+ * @param page_number 0-based page index (already range-checked).
+ * @param rect        Validated rectangle in page coordinates.
+ * Return:           Elisp list of (X0 Y0 X1 Y1) floats, or nil.
+ */
+
+static emacs_value
+stext_lines_in_rect(emacs_env *env, DocState *doc_state, int page_number,
+		    fz_rect rect)
+{
+	fz_context *ctx = fz_clone_context(doc_state->ctx);
+
+	if (!ctx)
+		return EMACS_NIL;
+
+	fz_page *page = NULL;
+	fz_stext_page *stext = NULL;
+
+	/* Collected line unions: plain malloc, so a failure truncates the
+	 * result instead of throwing.  Freed on every path below. */
+	fz_rect *lines = NULL;
+	int line_count = 0;
+	int line_cap = 0;
+
+	bool ok = false;
+
+	fz_try(ctx)
+		{
+			page = fz_load_page(ctx, doc_state->doc, page_number);
+			stext = fz_new_stext_page_from_page(ctx, page, NULL);
+
+			for (fz_stext_block *block = stext->first_block; block;
+			     block = block->next)
+				{
+					if (block->type != FZ_STEXT_BLOCK_TEXT)
+						continue;
+
+					for (fz_stext_line *line = block->u.t.first_line;
+					     line; line = line->next)
+						{
+							fz_stext_char *first
+								= line->first_char;
+							fz_rect union_rect;
+							bool touched = false;
+
+							if (!first)
+								continue;
+
+							/* First pass: does any character of
+							 * this line touch the selection? */
+							for (fz_stext_char *scan = first; scan;
+							     scan = scan->next)
+								{
+									fz_rect quad
+										= fz_rect_from_quad(
+											scan->quad);
+									fz_rect hit
+										= fz_intersect_rect(
+											quad, rect);
+
+									if (!fz_is_empty_rect(hit))
+										{
+											touched = true;
+											break;
+										}
+								}
+
+							if (!touched)
+								continue;
+
+							/* Second pass: the whole line.
+							 * Seeded with the first char so
+							 * the union never picks up the
+							 * origin (fz_empty_rect is a
+							 * zero-area rect at (0, 0), not
+							 * an absorbing empty value). */
+							union_rect
+								= fz_rect_from_quad(first->quad);
+
+							for (fz_stext_char *scan = first->next;
+							     scan; scan = scan->next)
+								union_rect = fz_union_rect(
+									union_rect,
+									fz_rect_from_quad(
+										scan->quad));
+
+							if (line_count
+							    >= LINES_IN_RECT_MAX_COUNT)
+								break;
+
+							if (fz_is_empty_rect(union_rect))
+								continue;
+
+							if (line_count == line_cap)
+								{
+									int new_cap;
+									fz_rect *grown;
+
+									new_cap = line_cap
+														  ? line_cap * 2
+														  : 32;
+									if (new_cap
+									    > LINES_IN_RECT_MAX_COUNT)
+										new_cap
+														  = LINES_IN_RECT_MAX_COUNT;
+
+									grown = realloc(
+										lines,
+										(size_t)new_cap
+														  * sizeof(
+															  fz_rect));
+
+									if (!grown)
+										break;
+
+									lines = grown;
+									line_cap = new_cap;
+								}
+
+							lines[line_count++]
+								= union_rect;
+						}
+				}
+
+			ok = true;
+		}
+	fz_always(ctx)
+		{
+			if (stext)
+				fz_drop_stext_page(ctx, stext);
+			if (page)
+				fz_drop_page(ctx, page);
+		}
+	fz_catch(ctx)
+		{
+			ok = false;
+		}
+
+	if (!ok)
+		{
+			free(lines);
+			fz_drop_context(ctx);
+
+			emacs_message(
+				env,
+				"Failed to extract the lines in the rectangle.");
+			return EMACS_NIL;
+		}
+
+	emacs_value result = EMACS_NIL;
+
+	/* Build the list back to front with cons so the result comes out in
+	 * reading order without a reverse pass. */
+	if (line_count > 0 && lines)
+		{
+			emacs_value Qlist = env->intern(env, "list");
+			emacs_value Qcons = env->intern(env, "cons");
+
+			for (int i = line_count - 1; i >= 0; --i)
+				{
+					emacs_value corners[4]
+						= { env->make_float(env, lines[i].x0),
+						    env->make_float(env, lines[i].y0),
+						    env->make_float(env, lines[i].x1),
+						    env->make_float(env, lines[i].y1) };
+					emacs_value one
+						= env->funcall(env, Qlist, 4, corners);
+					emacs_value cell_args[2] = { one, result };
+
+					result = env->funcall(env, Qcons, 2, cell_args);
+				}
+		}
+
+	free(lines);
+	fz_drop_context(ctx);
+
+	return result;
+}
+
+/**
  * emacs_text_in_rect - Extract the text intersecting a page rectangle.
  *
  * Loads PAGE, builds its structured-text representation and collects
@@ -1918,44 +2214,11 @@ emacs_text_in_rect(emacs_env *env, ptrdiff_t nargs, emacs_value *args,
 	(void)data;
 
 	DocState *doc_state = NULL;
-	EmacsWinState *win_state = NULL;
-	emacs_value overlay = EMACS_NIL;
-
-	if (!get_reader_current_state(env, &doc_state, &win_state, &overlay))
-		return EMACS_NIL;
-
-	/* Bail out during reload/close windows to avoid use-after-free. */
-	if (doc_state->is_reloading || win_state->closing)
-		return EMACS_NIL;
-
-	int page_number = (int)env->extract_integer(env, args[0]);
-	float ax = env->extract_float(env, args[1]);
-	float ay = env->extract_float(env, args[2]);
-	float bx = env->extract_float(env, args[3]);
-	float by = env->extract_float(env, args[4]);
-
-	if (page_number < 0 || page_number >= doc_state->pagecount)
-		{
-			emacs_message(env, "Page number is out of range.");
-			return EMACS_NIL;
-		}
-
-	/* Validate and normalize the rectangle through the same helper the
-	 * highlight painter uses, so both entry points share one notion of
-	 * page space (see rect_to_page_space).
-	 *
-	 * Rejecting non-finite corners matters here: fz_is_empty_rect()
-	 * treats every comparison against a NaN as false, so a NaN
-	 * rectangle would otherwise be classified as non-empty and would
-	 * wrongly match every character on the page. */
+	int page_number = 0;
 	fz_rect rect;
 
-	if (!rect_to_page_space(ax, ay, bx, by, &rect))
-		{
-			emacs_message(env,
-				      "Invalid rectangle: coordinates must be finite.");
-			return EMACS_NIL;
-		}
+	if (!prepare_rect_query(env, args, &doc_state, &page_number, &rect))
+		return EMACS_NIL;
 
 	return stext_query_in_rect(env, doc_state, page_number, rect,
 				   STEXT_QUERY_TEXT);
@@ -1991,39 +2254,57 @@ emacs_rects_in_rect(emacs_env *env, ptrdiff_t nargs, emacs_value *args,
 	(void)data;
 
 	DocState *doc_state = NULL;
-	EmacsWinState *win_state = NULL;
-	emacs_value overlay = EMACS_NIL;
-
-	if (!get_reader_current_state(env, &doc_state, &win_state, &overlay))
-		return EMACS_NIL;
-
-	/* Bail out during reload/close windows to avoid use-after-free. */
-	if (doc_state->is_reloading || win_state->closing)
-		return EMACS_NIL;
-
-	int page_number = (int)env->extract_integer(env, args[0]);
-	float ax = env->extract_float(env, args[1]);
-	float ay = env->extract_float(env, args[2]);
-	float bx = env->extract_float(env, args[3]);
-	float by = env->extract_float(env, args[4]);
-
-	if (page_number < 0 || page_number >= doc_state->pagecount)
-		{
-			emacs_message(env, "Page number is out of range.");
-			return EMACS_NIL;
-		}
-
+	int page_number = 0;
 	fz_rect rect;
 
-	if (!rect_to_page_space(ax, ay, bx, by, &rect))
-		{
-			emacs_message(env,
-				      "Invalid rectangle: coordinates must be finite.");
-			return EMACS_NIL;
-		}
+	if (!prepare_rect_query(env, args, &doc_state, &page_number, &rect))
+		return EMACS_NIL;
 
 	return stext_query_in_rect(env, doc_state, page_number, rect,
 				   STEXT_QUERY_RECTS);
+}
+
+/**
+ * emacs_lines_in_rect - Return the whole text lines a rectangle touches.
+ *
+ * "Line snapping" for the selection highlight: a rectangle that covers any
+ * character of a line selects that entire line.  Same page-number base as
+ * `--rects-in-rect' and `--text-in-rect' (0-based, they serve the same
+ * selection path), same page-space notion, same early-outs and messages
+ * (all shared through `prepare_rect_query'), same list shape — a list of
+ * `(X0 Y0 X1 Y1)' float quadruples in reading order, one per line.
+ *
+ * Differences from `--rects-in-rect': one rectangle per line instead of one
+ * per character, and a rectangle that no line touches yields `nil'
+ * silently — a selection over a blank area is an ordinary answer, not an
+ * error, so no message is emitted.
+ *
+ * The result is NOT merged by the caller: every rectangle already spans its
+ * whole line, so re-merging could only bridge neighbouring lines.  Vertical
+ * shrinking is still applied on the Lisp side.
+ *
+ * @param env    Emacs module environment.
+ * @param nargs  Number of Elisp args (5).
+ * @param args   Elisp arguments: page, x0, y0, x1, y1.
+ * @param data   Additional data (unused).
+ * Return:       Elisp list of quadruples, or nil.
+ */
+
+emacs_value
+emacs_lines_in_rect(emacs_env *env, ptrdiff_t nargs, emacs_value *args,
+		    void *data)
+{
+	(void)nargs;
+	(void)data;
+
+	DocState *doc_state = NULL;
+	int page_number = 0;
+	fz_rect rect;
+
+	if (!prepare_rect_query(env, args, &doc_state, &page_number, &rect))
+		return EMACS_NIL;
+
+	return stext_lines_in_rect(env, doc_state, page_number, rect);
 }
 
 /* Hit-count policy for `--search-page'.  LIMIT is an Elisp-facing knob
@@ -3050,6 +3331,16 @@ emacs_module_init(struct emacs_runtime *runtime)
 			     "coordinates, as a list of (X0 Y0 X1 Y1) "
 			     "float quadruples in reading order; nil when "
 			     "no character falls inside.");
+
+	register_module_func(env, emacs_lines_in_rect,
+			     "seshat-reader-dyn--lines-in-rect", 5, 5,
+			     "Returns the whole text lines that the "
+			     "rectangle (X0 Y0 X1 Y1) on PAGE touches, in "
+			     "page coordinates, as a list of (X0 Y0 X1 Y1) "
+			     "float quadruples in reading order. A line "
+			     "the rectangle does not touch is omitted; a "
+			     "touched line is reported in full. nil when "
+			     "nothing is touched.");
 
 	register_module_func(env, emacs_search_page,
 			     "seshat-reader-dyn--search-page", 3, 3,

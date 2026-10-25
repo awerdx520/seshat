@@ -375,10 +375,13 @@ UID 为 nil 时返回 nil。"
 - BODY 非空（`C-u' 输入了备注）→ 便签：`kind' = \"note\"，`text' = BODY，
   `selected_text' = 选区文本。
 
-选区文本（`seshat-reader-select-last' 的 :text）为空白且无 BODY 时
-`user-error'（没有可标记的原文，也没有备注）。选区既**无几何**（`:rects'
-与 `:rect' 皆为 nil）又无可用原文、也无 BODY 时同样 `user-error'——空选区
-不落成页级锚（`page:<n>` 只服务「有正文的页级批注」，见
+选区文本（`seshat-reader-select-last' 的 :text）为空白时**仍可创建**：只要
+选区带几何（`:rects' 或仅有 `:rect'），就落成 `kind' = \"highlight\"、
+`text' 为空串、`selected_text' 为 nil 的标记批注——扫描版 PDF 与无文本层
+区域（图片、矢量图）没有字符可匹配，几何是唯一可用的锚
+（`page:<n>;rect:...'）。只有**无任何几何**（`:rects' 与 `:rect' 皆为
+nil）**且**无可用原文、也无 BODY 时才 `user-error'——空选区不落成页级锚
+（`page:<n>` 只服务「有正文的页级批注」，见
 `seshat-reader-annotation--anchor'）。列表显示用
 `seshat-reader-annotation--display-text' 的回退链（text → selected_text →
 ink 聚合），故高亮条目的标题就是选区原文。
@@ -386,9 +389,10 @@ ink 聚合），故高亮条目的标题就是选区原文。
 交互调用：不带前缀参数时创建高亮，带前缀参数（`C-u'）时在迷你缓冲区读取
 备注正文。
 
-运行前置：必须先用鼠标拖拽选中页面文本，使 `seshat-reader-select-last'
-非 nil；该变量在创建成功后**不会被清除**，因此可对同一选区连续创建多条
-批注（这是有意的语义）。旋转页面上的选区不受支持。
+运行前置：必须先用鼠标拖拽选中页面区域（文本型 PDF 选中文字、扫描版 /
+无文本层区域直接框住目标位置），使 `seshat-reader-select-last' 非 nil；该
+变量在创建成功后**不会被清除**，因此可对同一选区连续创建多条批注（这是
+有意的语义）。旋转页面上的选区不受支持。
 
 服务端返回含 `id' 的结果时 `message' 报告该 `id'，并在本地队列非空时
 机会性地触发一次队列同步（同步失败不影响本次创建成功的结果）。服务端
@@ -417,14 +421,16 @@ ink 聚合），故高亮条目的标题就是选区原文。
              (text (or note ""))
              (document-id (seshat-reader-annotation--doc-id
                            file (seshat-reader-annotation--quiet-p file))))
-        ;; 空选区守卫：`:rects' 与 `:rect' 皆 nil（无几何）**且**无文本、无备注
-        ;; 时不许落成页级锚。`--anchor' 的 nil→「page:<n>」是给「有正文的页级
-        ;; 锚」准备的合法退化（如翻译面板只给页码），不该被「什么都没选中」借用
-        ;; ——否则一次空选区会静默产生一条只有页码、既无几何也无原文的批注。
+        ;; 空选区守卫：只在「无任何几何（`:rects' 与 `:rect' 皆 nil）且无文本、
+        ;; 无备注」时报错。**有几何但取不到文本是合法情形**——扫描版 PDF 与无
+        ;; 文本层区域（图片、矢量图）没有任何字符可匹配，`--selection-rects' 会
+        ;; 回落 `:rect' 的单段 bbox，锚即 `page:<n>;rect:...`（`kind` 仍为
+        ;; `highlight`、`text` 为空、`selected_text` 为 nil），也就是「框住什么
+        ;; 就标记什么」。`--anchor' 的 nil→「page:<n>」是给「有正文的页级锚」
+        ;; 准备的合法退化（如翻译面板只给页码），不该被「什么都没选中」借用——
+        ;; 否则一次空选区会静默产生一条只有页码、既无几何也无原文的批注。
         (when (and (null rects) (null selected) (null note))
           (user-error "Seshat Reader annotation: 尚未选中任何文本（选区没有文本与几何），可先用 C-u 输入批注正文"))
-        (unless (or note selected)
-          (user-error "Seshat Reader annotation: 选区没有文本，可先用 C-u 输入批注正文"))
         ;; 服务端身份在正文校验之后再解析：未登记时 `user-error' 直接冒泡给
         ;; 用户（服务端权威 uid 无法离线生成）。
         (let* ((location (seshat-reader-annotation--anchor page rects))

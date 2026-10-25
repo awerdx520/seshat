@@ -261,6 +261,9 @@ emacs_value
 emacs_rects_in_rect(emacs_env *env, ptrdiff_t nargs, emacs_value *args, void *data);
 
 emacs_value
+emacs_lines_in_rect(emacs_env *env, ptrdiff_t nargs, emacs_value *args, void *data);
+
+emacs_value
 emacs_search_page(emacs_env *env, ptrdiff_t nargs, emacs_value *args, void *data);
 
 emacs_value

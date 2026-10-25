@@ -206,6 +206,7 @@ M12 把 M11 的「单个底部面板」升级为「左目录 / 右信息 / 中�
   3. `--add-stroke`（`7,7`，`page r g b alpha width points`）——折线入口，`points` 是**扁平**列表 `(x0 y0 x1 y1 …)`（逐对 `car`/`cdr` 读取并 `numberp` 守卫，超过 1024 点截断，少于 2 个点返回 nil），点数组由 C 侧 `malloc`+`memcpy` 自持。自 2026-10-25 起由 ink 轨迹渲染调用（`seshat-reader-annotation--ink-strokes-from-location` 的解析结果）。
   4. `--search-page`（`3,3`，`page needle limit`）——只读，返回该页命中矩形的列表（`fz_search_page` → `fz_rect_from_quad`，与 `--text-in-rect` 同一条 `rect_to_page_space` 换算，故命中矩形喂给装饰入口落在文字原处）。**页号 1-based**（与三个装饰入口同口径）。
   另加只读入口 `--rects-in-rect`（`5,5`，`page x0 y0 x1 y1`）——返回矩形内每个命中字符的 quad 矩形列表，与 `--text-in-rect` 共享同一份 stext 遍历（`stext_query_in_rect`），空结果返回 nil 且**不发消息**（矩形内无文本是正常答案）。这两个只读入口的页号是**历史 0-based**（服务于选区代码），与装饰/搜索入口的 1-based 并存——基数见各函数注释首段。
+  另加只读入口 `--lines-in-rect`（`5,5`，`page x0 y0 x1 y1`）——**整行吸附**用：框碰到某行即返回该行**全部**字符 quad 的并集（双遍遍历，先判该行是否被碰到，命中才求并集；输出的是整行范围而非框内片段），每行一条矩形、按阅读顺序；无命中返回 nil 且**不发消息**；页号同为 **0-based**，与 `--rects-in-rect` 共享 `prepare_rect_query` 的参数校验/换算与全部消息文案。
 
 **框选闪现（M12 补）**：
 
