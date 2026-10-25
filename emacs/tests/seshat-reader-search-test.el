@@ -47,6 +47,9 @@
 ;; 覆盖降级路径。
 (require 'seshat-reader-annotation)
 (require 'seshat-reader-search)
+;; 结果侧栏的展示与关闭都走 sidebar 模块（kind → 位置/slot、per-kind 独立窗口），
+;; 故测试要能直接断言该模块的位置解析与 slot 分配。
+(require 'seshat-reader-sidebar)
 
 (defvar seshat-reader-search-test--pages nil
   "桩替的搜索结果表：`(PAGE . RECTS)' 的 alist，PAGE 为 1-based.")
@@ -110,7 +113,22 @@
                ((symbol-function 'seshat-reader-dyn--refresh-highlights)
                 (lambda ()
                   (push 'refresh seshat-reader-search-test--events)
-                  t)))
+                  t))
+               ;; 侧栏：显示入口桩替掉（batch 下不真的建 side window），只记录
+               ;; 调用参数，用于断言「SELECT 传 t（光标切到侧栏）」。
+               ((symbol-function 'seshat-reader-sidebar-show)
+                (lambda (buffer kind &optional select)
+                  (push (list 'sidebar-show kind select
+                              (if (bufferp buffer) (buffer-name buffer) buffer))
+                        seshat-reader-search-test--events)
+                  nil))
+               ;; 侧栏片段取文用的两个 rect 入口：模块真实存在时假页号会走到 C
+               ;; 侧并 `message' 报「页号越界」，污染 `--messages' 里最后一条；
+               ;; 桩成 nil 既切断了模块依赖，也让片段退化为「只有页号」。
+               ((symbol-function 'seshat-reader-dyn--lines-in-rect)
+                (lambda (&rest _args) nil))
+               ((symbol-function 'seshat-reader-dyn--text-in-rect)
+                (lambda (&rest _args) nil)))
        ,@body)))
 
 (defun seshat-reader-search-test--rects (n)
@@ -130,9 +148,13 @@
   (car seshat-reader-search-test--messages))
 
 (defun seshat-reader-search-test--event-names ()
-  "把事件记录归一成符号列表（正序）."
+  "把事件记录归一成符号列表（正序）.
+`sidebar-show' 事件**不计入**：它们记录的是侧栏面板的显示调用（独立的并存
+视图），混进来会让「装饰投喂顺序」这套断言多出一个与绘制无关的元素。"
   (mapcar (lambda (event) (if (consp event) (car event) event))
-          (reverse seshat-reader-search-test--events)))
+          (seq-filter (lambda (event)
+                        (not (eq (car-safe event) 'sidebar-show)))
+                      (reverse seshat-reader-search-test--events))))
 
 (defun seshat-reader-search-test--goto-pages ()
   "取出跳页事件的目标页号（正序）."
@@ -199,6 +221,7 @@
   "同页多命中：全部进入 `--matches'，当前页全部命中都被投喂."
   (seshat-reader-search-test--with-stubs
     (with-temp-buffer
+      (setq reader (current-buffer))
       (setq seshat-reader-search-test--total-pages 2)
       (setq seshat-reader-search-test--pages
             '((1 . ((1.0 2.0 3.0 4.0) (5.0 6.0 7.0 8.0) (9.0 10.0 11.0 12.0)))))
@@ -492,6 +515,206 @@
           (should (= 2 (length (seshat-reader-search-test--decos))))
           (should (equal (seshat-reader-search-test--event-names)
                          '(clear deco deco refresh))))))))
+
+;;; 搜索结果侧栏（kind 为 `search'）
+
+(defun seshat-reader-search-test--sidebar-entry-line-count ()
+  "数侧栏 buffer 里以「[p.N]」开头的行数（返回侧栏 buffer 缺失时的 0）."
+  (let ((count 0)
+        (buffer (get-buffer seshat-reader-search-sidebar-buffer-name)))
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (save-excursion
+          (goto-char (point-min))
+          (while (not (eobp))
+            (when (looking-at-p "\\[p\\.[0-9]+\\]")
+              (setq count (1+ count)))
+            (forward-line 1)))))
+    count))
+
+(defun seshat-reader-search-test--sidebar-show-events ()
+  "返回本用例内 `seshat-reader-sidebar-show' 的调用记录（正序，形如 (KIND SELECT NAME))."
+  (mapcar #'cdr
+          (seq-filter (lambda (event) (eq (car-safe event) 'sidebar-show))
+                      (reverse seshat-reader-search-test--events))))
+
+(ert-deftest seshat-reader-search-test--sidebar-render-writes-buffer ()
+  "`--render-sidebar' 写入标题 + 每条一行；只读、折行、行首为 [p.N]."
+  (seshat-reader-search-test--with-stubs
+    (with-temp-buffer
+      (setq seshat-reader-search--query "the")
+      (seshat-reader-search--render-sidebar
+       '((1 1.0 2.0 3.0 4.0) (2 5.0 6.0 7.0 8.0)))
+      (with-current-buffer seshat-reader-search-sidebar-buffer-name
+        (should (eq major-mode 'special-mode))
+        (should buffer-read-only)
+        ;; 折行：`special-mode' 默认不折行，侧栏必须显式置 nil
+        (should-not truncate-lines)
+        (let ((text (buffer-string)))
+          (should (string-match-p "搜索结果" text))
+          (should (string-match-p "the" text))
+          (should (string-match-p "2 条" text)))
+        ;; 标题在第 1 行，空行后第 3 行是第一条结果
+        (goto-char (point-min))
+        (should (looking-at-p "#"))
+        (forward-line 2)
+        (should (looking-at-p "\\[p\\.1\\]"))
+        (forward-line 1)
+        (should (looking-at-p "\\[p\\.2\\]"))))))
+
+(ert-deftest seshat-reader-search-test--sidebar-entries-match-lines ()
+  "`--sidebar-matches' 与侧栏结果行一一对应，且页码/下标/矩形都对得上."
+  (seshat-reader-search-test--with-stubs
+    (with-temp-buffer
+      (setq seshat-reader-search--query "x")
+      (seshat-reader-search--render-sidebar
+       '((1 1.0 2.0 3.0 4.0) (1 5.0 6.0 7.0 8.0) (3 9.0 10.0 11.0 12.0)))
+      (with-current-buffer seshat-reader-search-sidebar-buffer-name
+        (should (= 3 (length seshat-reader-search--sidebar-matches)))
+        (should (equal (mapcar #'car seshat-reader-search--sidebar-matches)
+                       '(1 1 3)))
+        (should (equal (mapcar #'cadr seshat-reader-search--sidebar-matches)
+                       '(0 1 2)))
+        (should (equal (nth 2 (car seshat-reader-search--sidebar-matches))
+                       '(1.0 2.0 3.0 4.0)))
+        ;; 行数与条目数一一对应
+        (should (= (length seshat-reader-search--sidebar-matches)
+                   (seshat-reader-search-test--sidebar-entry-line-count)))
+        ;; 点在第 k 条行上取到的就是第 k 条
+        (goto-char (point-min))
+        (forward-line 2)
+        (should (equal (seshat-reader-search--sidebar-entry-at-point)
+                       (nth 0 seshat-reader-search--sidebar-matches)))
+        (forward-line 1)
+        (should (equal (seshat-reader-search--sidebar-entry-at-point)
+                       (nth 1 seshat-reader-search--sidebar-matches)))
+        ;; 标题行没有条目
+        (goto-char (point-min))
+        (should-not (seshat-reader-search--sidebar-entry-at-point))))))
+
+(ert-deftest seshat-reader-search-test--sidebar-goto-jumps-to-line-page ()
+  "`sidebar-goto' 在阅读 buffer 里跳到当前行的页码并把它设为当前命中."
+  (seshat-reader-search-test--with-stubs
+    (with-temp-buffer
+      (setq seshat-reader-search--query "the")
+      (setq seshat-reader-search--matches
+            '((1 1.0 2.0 3.0 4.0) (2 5.0 6.0 7.0 8.0)))
+      (seshat-reader-search--render-sidebar seshat-reader-search--matches)
+      (with-current-buffer seshat-reader-search-sidebar-buffer-name
+        (goto-char (point-min))
+        (forward-line 2)                 ; 第一条（第 1 页）
+        (seshat-reader-search-sidebar-goto)
+        (should (equal (seshat-reader-search-test--goto-pages) '(1)))
+        (forward-line 1)                 ; 第二条（第 2 页）
+        (seshat-reader-search-sidebar-goto)
+        (should (equal (seshat-reader-search-test--goto-pages) '(1 2))))
+      ;; 跳转落在阅读 buffer：当前命中下标被写回源 buffer
+      (should (= 1 seshat-reader-search--index)))))
+
+(ert-deftest seshat-reader-search-test--sidebar-move-boundaries ()
+  "首条 `p'、末条 `n' 只提示不报错，point 不动."
+  (seshat-reader-search-test--with-stubs
+    (with-temp-buffer
+      (setq seshat-reader-search--query "the")
+      (seshat-reader-search--render-sidebar
+       '((1 1.0 2.0 3.0 4.0) (2 5.0 6.0 7.0 8.0)))
+      (with-current-buffer seshat-reader-search-sidebar-buffer-name
+        ;; 首条上按 `p'
+        (goto-char (point-min))
+        (forward-line 2)
+        (let ((start (point)))
+          (seshat-reader-search-sidebar-prev)
+          (should (= start (point)))
+          (should (string-match-p "已是第一个结果"
+                                  (seshat-reader-search-test--last-message))))
+        ;; 末条上按 `n'
+        (forward-line 1)
+        (let ((start (point)))
+          (seshat-reader-search-sidebar-next)
+          (should (= start (point)))
+          (should (string-match-p "已是最后一个结果"
+                                  (seshat-reader-search-test--last-message))))
+        ;; 边界上都没有触发跳页
+        (should-not (seshat-reader-search-test--goto-pages))))))
+
+(ert-deftest seshat-reader-search-test--sidebar-next-moves-and-jumps ()
+  "`n' 移动到下一条并跳页；`p' 回到上一条并跳页."
+  (seshat-reader-search-test--with-stubs
+    (with-temp-buffer
+      (setq seshat-reader-search--query "the")
+      (seshat-reader-search--render-sidebar
+       '((1 1.0 2.0 3.0 4.0) (2 5.0 6.0 7.0 8.0)))
+      (with-current-buffer seshat-reader-search-sidebar-buffer-name
+        (goto-char (point-min))
+        (forward-line 2)
+        (seshat-reader-search-sidebar-next)
+        (should (equal (seshat-reader-search-test--goto-pages) '(2)))
+        (should (seshat-reader-search--sidebar-entry-at-point))
+        (should (= 2 (nth 0 (seshat-reader-search--sidebar-entry-at-point))))
+        (seshat-reader-search-sidebar-prev)
+        (should (equal (seshat-reader-search-test--goto-pages) '(2 1)))))))
+
+(ert-deftest seshat-reader-search-test--sidebar-keybindings ()
+  "侧栏键表：`RET' 跳转、`n' / `p' 逐条、`q' 只关自己；其余继承 `special-mode-map'."
+  (should (eq (lookup-key seshat-reader-search--sidebar-map (kbd "RET"))
+              #'seshat-reader-search-sidebar-goto))
+  (should (eq (lookup-key seshat-reader-search--sidebar-map (kbd "n"))
+              #'seshat-reader-search-sidebar-next))
+  (should (eq (lookup-key seshat-reader-search--sidebar-map (kbd "p"))
+              #'seshat-reader-search-sidebar-prev))
+  (should (eq (lookup-key seshat-reader-search--sidebar-map (kbd "q"))
+              #'seshat-reader-search-sidebar-quit))
+  ;; 父键表仍是 `special-mode-map'（滚动等基础键不丢）
+  (should (eq (keymap-parent seshat-reader-search--sidebar-map)
+              special-mode-map)))
+
+(ert-deftest seshat-reader-search-test--sidebar-quit-closes-only-search ()
+  "`sidebar-quit' 只按 kind `search' 关面板，不走「全部开合」."
+  (let (kinds)
+    (cl-letf (((symbol-function 'seshat-reader-sidebar-toggle)
+               (lambda (kind) (push kind kinds))))
+      (seshat-reader-search-sidebar-quit)
+      (should (equal kinds '(search))))))
+
+(ert-deftest seshat-reader-search-test--search-opens-sidebar ()
+  "`C-s' 成功后侧栏被列出且**请求光标切过去**（SELECT 非 nil）."
+  (seshat-reader-search-test--with-stubs
+    (with-temp-buffer
+      (let ((reader (current-buffer)))
+        (setq seshat-reader-search-test--total-pages 2)
+        (setq seshat-reader-search-test--pages
+              '((1 . ((1.0 2.0 3.0 4.0))) (2 . ((5.0 6.0 7.0 8.0)))))
+        (seshat-reader-search "the")
+        ;; 页面高亮与状态行仍是原行为
+        (should (= 2 (length seshat-reader-search--matches)))
+        (should seshat-reader-search--active)
+        ;; 侧栏：kind 为 search、SELECT 为 t（光标切到侧栏）
+        (let ((shows (seshat-reader-search-test--sidebar-show-events)))
+          (should (= 1 (length shows)))
+          (should (eq (nth 0 (car shows)) 'search))
+          (should (nth 1 (car shows)))
+          (should (equal (nth 2 (car shows))
+                         seshat-reader-search-sidebar-buffer-name)))
+        ;; 侧栏内容与命中一一对应，且记录了源 buffer
+        (should (= 2 (seshat-reader-search-test--sidebar-entry-line-count)))
+        (with-current-buffer seshat-reader-search-sidebar-buffer-name
+          ;; 侧栏记下的源 buffer 就是发起搜索的那个阅读 buffer
+          (should (eq seshat-reader-search--sidebar-source reader))
+          (should (= 2 (length seshat-reader-search--sidebar-matches))))))))
+
+(ert-deftest seshat-reader-search-test--sidebar-entry-cap ()
+  "超出 `--sidebar-max-entries' 时只列前 N 条，标题写明显式条数."
+  (seshat-reader-search-test--with-stubs
+    (with-temp-buffer
+      (setq seshat-reader-search--query ".")
+      (let ((seshat-reader-search--sidebar-max-entries 2))
+        (seshat-reader-search--render-sidebar
+         '((1 1.0 2.0 3.0 4.0) (1 5.0 6.0 7.0 8.0) (2 9.0 10.0 11.0 12.0))))
+      (with-current-buffer seshat-reader-search-sidebar-buffer-name
+        (should (= 2 (length seshat-reader-search--sidebar-matches)))
+        (should (= 2 (seshat-reader-search-test--sidebar-entry-line-count)))
+        (should (string-match-p "3 条" (buffer-string)))
+        (should (string-match-p "仅列出前 2 条" (buffer-string)))))))
 
 (provide 'seshat-reader-search-test)
 ;;; seshat-reader-search-test.el ends here

@@ -752,7 +752,9 @@ KIND 为面板内容类型，CONTENT-LINES 为桩出的内容行数，INIT-HEIGH
     (should (equal (car params) '(display-buffer-in-side-window)))
     (should (eq (caar params) 'display-buffer-in-side-window))
     (should (eq (cdr (assq 'side params)) 'left))
-    (should (zerop (cdr (assq 'slot params))))
+    ;; 左侧同侧 kind 为 (outline search annotations …)：批注排在目录与搜索之后，
+    ;; 故 slot 为 1（右侧见右窗用例，仍是 0）。
+    (should (= 1 (cdr (assq 'slot params))))
     ;; 宽度语义：只带 window-width，不带 window-height
     (should (equal (cdr (assq 'window-width params)) 0.24))
     (should-not (assq 'window-height params))
@@ -764,9 +766,11 @@ KIND 为面板内容类型，CONTENT-LINES 为桩出的内容行数，INIT-HEIGH
                               (seshat-reader-sidebar--display-params 'outline)))
                    0.20))
     ;; T3 起按 kind 分槽：同一侧内按 `--kind-order' 从 0 编号。此处侧为 `left'
-    ;; 时同侧 kind 是 (outline translate)（translate 跟随全局 left）。
-    (should (zerop (seshat-reader-sidebar--slot-for-kind 'outline)))
-    (should (= 1 (seshat-reader-sidebar--slot-for-kind 'translate)))))
+    ;; 时同侧 kind 是 (search annotations translate)——目录被钉到右侧，故左侧
+    ;; 从搜索结果侧栏起编号：search 0、annotations 1、translate 2。
+    (should (= 1 (seshat-reader-sidebar--slot-for-kind 'annotations)))
+    (should (= 0 (seshat-reader-sidebar--slot-for-kind 'search)))
+    (should (= 2 (seshat-reader-sidebar--slot-for-kind 'translate)))))
 
 (ert-deftest seshat-reader-sidebar-test--display-params-right-side-window ()
   "`right' 时 side 为 `right'，且记忆尺寸优先于默认宽度."
@@ -1007,19 +1011,25 @@ KIND 为面板内容类型，CONTENT-LINES 为桩出的内容行数，INIT-HEIGH
   (let ((seshat-reader-sidebar-position 'right)
         (seshat-reader-outline-sidebar-position 'left))
     (should (= (seshat-reader-sidebar--slot-for-kind 'outline) 0))
+    (should (= (seshat-reader-sidebar--slot-for-kind 'search) 1))
     (should (= (seshat-reader-sidebar--slot-for-kind 'annotations) 0))
     (should (= (seshat-reader-sidebar--slot-for-kind 'translate) 1))
     ;; 稳定性：重复调用结果不变
     (should (= (seshat-reader-sidebar--slot-for-kind 'translate) 1))
-    (should (equal (seshat-reader-sidebar--kinds-on-side 'left) '(outline)))
+    ;; 左侧两 kind：目录（0）在前、搜索结果侧栏（1）在后
+    (should (equal (seshat-reader-sidebar--kinds-on-side 'left)
+                   '(outline search)))
     (should (equal (seshat-reader-sidebar--kinds-on-side 'right)
                    '(annotations translate))))
-  ;; 目录改到右侧：右侧三个 kind 依次 0 / 1 / 2
+  ;; 目录改到右侧：右侧四个 kind 依次 0 / 1 / 2 / 3（`search' 仍在左侧，
+  ;; 故右侧只有 outline / annotations / translate 三个）
   (let ((seshat-reader-sidebar-position 'right)
         (seshat-reader-outline-sidebar-position 'right))
     (should (= (seshat-reader-sidebar--slot-for-kind 'outline) 0))
     (should (= (seshat-reader-sidebar--slot-for-kind 'annotations) 1))
-    (should (= (seshat-reader-sidebar--slot-for-kind 'translate) 2)))
+    (should (= (seshat-reader-sidebar--slot-for-kind 'translate) 2))
+    ;; 搜索栏不跟随目录变量，仍留在左侧且 slot 为 0
+    (should (= (seshat-reader-sidebar--slot-for-kind 'search) 0)))
   ;; 未知 kind 排在已知 kind 之后，不与任何已知 kind 撞槽
   (let ((seshat-reader-sidebar-position 'right)
         (seshat-reader-outline-sidebar-position 'left))
@@ -2756,6 +2766,34 @@ kind 由 buffer 名推断；命令必须把 kind 交给 `--toggle-kind'（它按
             (should (= buffers-before (length (buffer-list))))
             (should (> (with-current-buffer second (buffer-size)) 0))))
       (when (buffer-live-p first) (kill-buffer first)))))
+
+;;; 搜索结果侧栏 kind `search'（左侧、slot 排在目录之后）
+
+(ert-deftest seshat-reader-sidebar-test--search-kind-order-and-slot ()
+  "`search' 在 kind 顺序表中，方位恒为 left，slot 为左侧 1（目录之后）."
+  (should (memq 'search seshat-reader-sidebar--kind-order))
+  (should (eq (seshat-reader-sidebar--position-for-kind 'search) 'left))
+  (should (eq (seshat-reader-sidebar--position-side 'search) 'left))
+  ;; 左侧两 kind 依次编号：outline 0 / search 1
+  (should (= 0 (seshat-reader-sidebar--slot-for-kind 'outline)))
+  (should (= 1 (seshat-reader-sidebar--slot-for-kind 'search)))
+  ;; 右侧不受影响：annotations 仍 0、translate 仍 1
+  (should (= 0 (seshat-reader-sidebar--slot-for-kind 'annotations)))
+  (should (= 1 (seshat-reader-sidebar--slot-for-kind 'translate))))
+
+(ert-deftest seshat-reader-sidebar-test--search-position-ignores-outline-variable ()
+  "搜索栏方位是字面量 left：用户把目录改到右侧也不带走搜索栏."
+  (should (eq (seshat-reader-sidebar--position-for-kind 'search) 'left))
+  (let ((seshat-reader-outline-sidebar-position 'right))
+    (should (eq (seshat-reader-sidebar--position-for-kind 'outline) 'right))
+    (should (eq (seshat-reader-sidebar--position-for-kind 'search) 'left))
+    ;; 同侧筛选因此只剩搜索栏一个，slot 回到 0
+    (should (equal (seshat-reader-sidebar--kinds-on-side 'left) '(search)))
+    (should (= 0 (seshat-reader-sidebar--slot-for-kind 'search))))
+  (let ((seshat-reader-sidebar-position 'below-selected))
+    ;; 信息栏改到底部不影响搜索栏
+    (should (eq (seshat-reader-sidebar--position-for-kind 'search) 'left))
+    (should (seshat-reader-sidebar--horizontal-p 'search))))
 
 (provide 'seshat-reader-sidebar-test)
 ;;; seshat-reader-sidebar-test.el ends here

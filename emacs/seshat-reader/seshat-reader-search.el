@@ -38,6 +38,21 @@
 ;; 停留 / `C-g' 取消并回到起始页），按任何其它键即退出临时键表，`n' / `p' 立刻
 ;; 恢复翻页语义。
 ;;
+;; 搜索结果侧栏
+;; ============
+;;
+;; `C-s' 除了原有的页面高亮与临时键表导航，还把同一批命中列进**左侧** side
+;; window（面板 kind 为 `search'，buffer 为 `seshat-reader-search-sidebar-buffer-name'），
+;; 每条一行「[p.N] 片段」。片段取该命中所在**整行**的文本（整行才看得出这句话
+;; 在讲什么），超过 80 字符截断。打开时光标切到侧栏：搜索已经结束，下一步是挑
+;; 结果而不是翻页；侧栏内的 `RET' 跳转、`n' / `p' 逐条移动、`q' 只关自己（与
+;; 其它面板一致）。侧栏与目录同侧（`left'），slot 排在目录之后，二者上下并存。
+;;
+;; 侧栏是**并存视图**，不是搜索会话的第二套状态：命中全集仍是阅读 buffer 的
+;; `--matches'，侧栏只记「行 → (PAGE INDEX RECTS)」映射；跳转时回到阅读 buffer
+;; 设置 `--index' 再走既有 `--goto-page' + `--redraw' 路径，故页面高亮、批注
+;; 共存与跨文档守卫全部复用，不存在第二条绘制链路。
+;;
 ;; 搜索范围与回绕
 ;; ==============
 ;;
@@ -87,6 +102,9 @@
 
 (require 'cl-lib)
 (require 'seshat-reader)
+;; 结果侧栏的显示/关闭一律经本模块（零依赖）完成：侧栏只用它做「按 kind 分配
+;; side window、per-kind 尺寸记忆、只关自己那个面板」，不自己 split-window。
+(require 'seshat-reader-sidebar)
 
 (declare-function seshat-reader-dyn--search-page "seshat-render-core"
                   (page needle limit))
@@ -94,6 +112,12 @@
 (declare-function seshat-reader-dyn--add-decoration "seshat-render-core"
                   (page x0 y0 x1 y1 r g b alpha))
 (declare-function seshat-reader-dyn--refresh-highlights "seshat-render-core" ())
+;; 侧栏片段取文用：两者都是 **0-based** 页号（与 `--search-page' 的 1-based
+;; 相反），故调用处一律 `(1- page)' 换算，见 `seshat-reader-search--snippet'。
+(declare-function seshat-reader-dyn--lines-in-rect "seshat-render-core"
+                  (page x0 y0 x1 y1))
+(declare-function seshat-reader-dyn--text-in-rect "seshat-render-core"
+                  (page x0 y0 x1 y1))
 
 ;; 该变量由 C 模块（`permanent_buffer_local_var'）注册为 buffer-local，编译期
 ;; 不可见；在此声明以消除 byte-compiler 的 free variable 警告。
@@ -511,6 +535,297 @@ NOTICE (a wrap-around message) follows after a dash."
   (seshat-reader-search--redraw)
   (seshat-reader-search--announce notice))
 
+;;;; 搜索结果侧栏
+
+;; 侧栏是**并存视图**：`C-s' 原有的页面高亮 + 临时键表导航一点都不变，只是把
+;; 同一批命中额外列进左侧 panel（kind 为 `search'），每条一行「[p.N] 片段」。
+;; 打开时光标切到侧栏（`--render-sidebar' 把 SELECT 传 t），于是接下来的
+;; `RET' / `n' / `p' 落在侧栏自己的键表上——阅读 buffer 的临时键表只管阅读
+;; buffer（其 keep 谓词要求 current-buffer 仍是原 buffer），两侧不抢键。
+
+(defconst seshat-reader-search-sidebar-buffer-name "*Seshat Search*"
+  "搜索结果侧栏的 buffer 名.
+侧栏里是只读 Markdown-ish 文本（标题 + 每条一行「[p.N] 片段」），供 side
+window 显示；本常量同时是「这个 buffer 是搜索结果侧栏」的唯一标识。")
+
+(defconst seshat-reader-search--sidebar-snippet-max 80
+  "侧栏单条片段的最大字符数.
+超出即截断并追加省略号：片段是用来**辨认**命中的，侧栏宽度只有 frame 的四分
+之一，长行会折成好几行、一屏放不下几条。")
+
+(defconst seshat-reader-search--sidebar-max-entries 200
+  "侧栏最多列出的命中条数.
+每条要取一次整行矩形与整行文本，都要进动态模块；像 `.` 这种在排版文本里遍地
+都是的串，几千条命中逐条取文会让 `C-s' 卡住数秒。故设上限，超出时标题写明显
+式条数（侧栏是「快速定位」视图，不是命中全集——全集仍在页面上与状态行里）。")
+
+(defvar-local seshat-reader-search--sidebar-matches nil
+  "侧栏 buffer 里每一行对应的匹配数据，按行序.
+每个元素是 (PAGE INDEX RECTS)：PAGE 为 1-based 页号，INDEX 为该命中在阅读
+buffer `--matches' 里的 0-based 下标，RECTS 是该命中的页面坐标矩形
+\(X0 Y0 X1 Y1)。本变量只存在于侧栏 buffer，是「侧栏行 ↔ 命中」映射的唯一来源
+（行上另挂同名 text property，用于按行取条目）。")
+
+(defvar-local seshat-reader-search--sidebar-source nil
+  "侧栏内容所属的阅读 buffer.
+`RET' / `n' / `p' 都必须回到**搜索所属的那个阅读 buffer**执行：侧栏 buffer
+自己没有页号窗口参数、也没有搜索会话状态（`--matches' / `--index' 都是阅读
+buffer 的 buffer-local）。该变量在 `seshat-reader-search--render-sidebar' 渲染
+时写入；为 nil 或已被 kill 时跳转只提示、不发信号。")
+
+(defun seshat-reader-search--one-line (text)
+  "Return TEXT collapsed onto one line, or an empty string.
+The native text extractor returns the page text verbatim, which contains the
+line breaks and indentation of the PDF layout.  A sidebar line has to stay a
+single line, so runs of whitespace are collapsed into one space and the ends
+trimmed.  Non-strings (the module is missing, the page has no text layer) come
+back as an empty string instead of nil, so callers never have to branch on
+the type."
+  (if (not (stringp text))
+      ""
+    (string-trim (replace-regexp-in-string "[ \t\n\r]+" " " text))))
+
+(defun seshat-reader-search--truncate-snippet (text)
+  "Return TEXT truncated to `seshat-reader-search--sidebar-snippet-max' chars.
+The ellipsis is appended only when something was actually cut, so a short
+snippet is left byte-identical and the caller's assertions stay readable."
+  (if (and (stringp text)
+           (> (length text) seshat-reader-search--sidebar-snippet-max))
+      (concat (substring text 0 seshat-reader-search--sidebar-snippet-max) "…")
+    (or text "")))
+
+(defun seshat-reader-search--snippet (page rect)
+  "Return the snippet shown for RECT on PAGE.
+PAGE is 1-based (the search convention) while RECT is a page-space rectangle
+\(X0 Y0 X1 Y1) as the native search returned it.  The snippet is the text of
+the **whole line** the hit sits on, not just the matched glyphs: a few
+characters around a highlight do not say what the sentence is about, and the
+search page hit is often a single short word.
+
+The module entry points used here (`--lines-in-rect' / `--text-in-rect') take a
+**0-based** PAGE — the opposite of `--search-page' — hence the single
+`(1- page)' conversion in this function.  Every failure degrades to an empty
+snippet: a build without those entry points, a page whose text cannot be read
+and a rectangle that covers no text all leave the sidebar line as just
+\"[p.N]\" instead of dropping the hit."
+  (let* ((index (1- page))
+         (lines (ignore-errors
+                  (when (fboundp 'seshat-reader-dyn--lines-in-rect)
+                    (seshat-reader-dyn--lines-in-rect
+                     index (nth 0 rect) (nth 1 rect)
+                     (nth 2 rect) (nth 3 rect)))))
+         (target (or (car-safe lines) rect))
+         (text (ignore-errors
+                 (when (and target (fboundp 'seshat-reader-dyn--text-in-rect))
+                   (seshat-reader-dyn--text-in-rect
+                    index (nth 0 target) (nth 1 target)
+                    (nth 2 target) (nth 3 target))))))
+    (seshat-reader-search--truncate-snippet
+     (seshat-reader-search--one-line text))))
+
+(defun seshat-reader-search--sidebar-entries (matches)
+  "Return the sidebar entries of MATCHES, capped at `--sidebar-max-entries'.
+Each entry is (PAGE INDEX RECTS): PAGE is the 1-based page of the hit, INDEX is
+its 0-based position in MATCHES (the same index the search session keeps in
+`seshat-reader-search--index', so a jump can restore the session's notion of
+\"current hit\") and RECTS is the (X0 Y0 X1 Y1) rectangle.
+
+MATCHES is walked in full so the INDEX values stay true even when the list is
+longer than the cap; only the entries themselves stop being collected once the
+cap is reached."
+  (let ((index 0)
+        entries)
+    (dolist (match matches)
+      (when (< (length entries) seshat-reader-search--sidebar-max-entries)
+        (push (list (nth 0 match) index (cdr match)) entries))
+      (setq index (1+ index)))
+    (nreverse entries)))
+
+(defun seshat-reader-search--sidebar-header (query total shown)
+  "Return the sidebar header line for QUERY with TOTAL hits, SHOWN listed.
+The header states whether the list is complete: a capped list that looks like
+the whole result set would send the reader scrolling for hits that were never
+written."
+  (let ((needle (if (stringp query) query "")))
+    (if (< shown total)
+        (format "# 搜索结果：%s（%d 条，仅列出前 %d 条）\n\n" needle total shown)
+      (format "# 搜索结果：%s（%d 条）\n\n" needle total))))
+
+(defun seshat-reader-search--sidebar-line (entry)
+  "Return the text of the sidebar line for ENTRY.
+The shape is \"[p.PAGE] snippet\"; when the snippet could not be extracted the
+line is just \"[p.PAGE]\" — a dangling separator with nothing after it reads
+like a rendering bug."
+  (let* ((page (nth 0 entry))
+         (snippet (seshat-reader-search--snippet page (nth 2 entry))))
+    (if (string-empty-p snippet)
+        (format "[p.%d]" page)
+      (format "[p.%d] %s" page snippet))))
+
+(defun seshat-reader-search--sidebar-entry-at (position)
+  "Return the sidebar entry recorded at POSITION, or nil.
+The mapping lives in a text property written by
+`seshat-reader-search--render-sidebar', so lookup is independent of how the
+line was rendered (wrapping, faces, a future prefix column) and works on any
+position inside the line, not only on its first column."
+  (get-text-property position 'seshat-reader-search-sidebar-entry))
+
+(defun seshat-reader-search--sidebar-entry-at-point ()
+  "Return the sidebar entry of the line at point, or nil.
+The property is attached to the whole line, so this works wherever point sits
+in it; positions outside any entry line (the header, the blank separator)
+return nil and the caller reports \"no hit on this line\"."
+  (or (seshat-reader-search--sidebar-entry-at (line-beginning-position))
+      (seshat-reader-search--sidebar-entry-at (point))))
+
+(defun seshat-reader-search--sidebar-entry-line (step)
+  "Return the position of the next entry line in direction STEP, or nil.
+STEP is +1 for forward and -1 for backward.  Lines without an entry (the
+header, the blank separator) are skipped, and running off either end returns
+nil instead of erroring — `n' on the last hit and `p' on the first are normal
+keystrokes, not failures."
+  (let (position)
+    (save-excursion
+      (while (and (not position) (zerop (forward-line step)))
+        (when (seshat-reader-search--sidebar-entry-at (line-beginning-position))
+          (setq position (line-beginning-position)))))
+    position))
+
+(defun seshat-reader-search--sidebar-jump-in (buffer page index)
+  "In BUFFER, display PAGE and make hit INDEX the session's current hit.
+The page is shown first so that the redraw reads the page number of the page
+that is now on screen, then the decorations are re-fed: the full redraw keeps
+annotations and the selection flash alive (see
+`seshat-reader-search--redraw') and swaps the search hits to the new page."
+  (with-current-buffer buffer
+    (setq seshat-reader-search--index index)
+    (seshat-reader-search--goto-page page)
+    (seshat-reader-search--redraw)))
+
+(defun seshat-reader-search--sidebar-jump (page index)
+  "Show PAGE and highlight hit INDEX in the reading buffer of the sidebar.
+The jump runs in the reader's own **window** when it is visible
+\(`with-selected-window'): `seshat-reader-goto-page' and the redraw path read
+the page and geometry of the selected window, so acting on the sidebar window
+would page a buffer that has no document.  Focus is deliberately **not**
+moved — the reader keeps clicking through results in the sidebar.
+
+A source buffer that is gone (document closed) only produces a message: a
+sidebar left over from a closed document must not signal on every RET."
+  (let ((source seshat-reader-search--sidebar-source)
+        (window (and (bufferp seshat-reader-search--sidebar-source)
+                     (get-buffer-window seshat-reader-search--sidebar-source t))))
+    (cond
+     ((not (buffer-live-p source))
+      (message "搜索结果：原阅读 buffer 已关闭"))
+     (window
+      (with-selected-window window
+        (seshat-reader-search--sidebar-jump-in source page index)))
+     (t
+      (seshat-reader-search--sidebar-jump-in source page index)))))
+
+(defun seshat-reader-search-sidebar-goto ()
+  "Jump to the page of the result on the current sidebar line and highlight it.
+The hit is identified by the line's text property, so the result is the same
+wherever point sits inside the line."
+  (interactive)
+  (let ((entry (seshat-reader-search--sidebar-entry-at-point)))
+    (if (not entry)
+        (message "搜索结果：当前行没有对应结果")
+      (seshat-reader-search--sidebar-jump (nth 0 entry) (nth 1 entry)))))
+
+(defun seshat-reader-search--sidebar-move (step)
+  "Move to the next (STEP positive) or previous entry line and jump there.
+Hitting either end only reports it; point stays on the current line so the
+reader can keep pressing `n' / `p' without the cursor wandering into the
+header."
+  (let ((position (seshat-reader-search--sidebar-entry-line step)))
+    (if (not position)
+        (message "%s" (if (> step 0) "已是最后一个结果" "已是第一个结果"))
+      (goto-char position)
+      (seshat-reader-search-sidebar-goto))))
+
+(defun seshat-reader-search-sidebar-next ()
+  "Jump to the next result listed in the search sidebar."
+  (interactive)
+  (seshat-reader-search--sidebar-move 1))
+
+(defun seshat-reader-search-sidebar-prev ()
+  "Jump to the previous result listed in the search sidebar."
+  (interactive)
+  (seshat-reader-search--sidebar-move -1))
+
+(defun seshat-reader-search-sidebar-quit ()
+  "Close the search sidebar, leaving every other panel open.
+Closing goes through `seshat-reader-sidebar-toggle' with KIND `search', i.e.
+`seshat-reader-sidebar--toggle-kind', which only touches panels whose kind is
+`search'.  `seshat-reader-sidebar-quit' is **not** used: it derives the kind
+from the buffer name, and \"*Seshat Search*\" is not one of the known panel
+names, so it would fall back to the all-panels toggle and close the
+annotation / translate panels as well."
+  (interactive)
+  (seshat-reader-sidebar-toggle 'search))
+
+(defvar-keymap seshat-reader-search--sidebar-map
+  :doc "Keymap of the search result sidebar buffer.
+Parented on `special-mode-map', so the usual read-only-buffer keys (scrolling
+with \\[scroll-up-command] / \\[scroll-down-command], \\[quit-window]) keep
+working; only the four keys that mean something here are overridden."
+  :parent special-mode-map
+  "q"   #'seshat-reader-search-sidebar-quit
+  "RET" #'seshat-reader-search-sidebar-goto
+  "n"   #'seshat-reader-search-sidebar-next
+  "p"   #'seshat-reader-search-sidebar-prev)
+
+(defun seshat-reader-search--render-sidebar (matches)
+  "Render MATCHES into the search sidebar buffer and show the panel.
+The sidebar is a **read-only text buffer** (\\`special-mode', `q' closes only
+this panel) listing one line per hit — \"[p.PAGE] snippet\" — under a header
+stating the query and how many hits were found.  Width comes from the panel
+machinery: kind `search' is pinned to the left side and takes the slot after
+`outline', so it coexists with the table of contents instead of replacing it.
+
+MATCHES is the search module's flat hit list (PAGE X0 Y0 X1 Y1 ...), i.e. the
+value of `seshat-reader-search--matches'.  Rendering happens **in the buffer of
+the caller**: that buffer is recorded as the sidebar's source
+\(`seshat-reader-search--sidebar-source') so the sidebar commands can act on
+the reading buffer even while point sits in the sidebar.
+
+The panel is displayed with SELECT non-nil (cursor moves into the sidebar at
+the end of the command) — the search is finished at that point and the next
+keystroke is expected to be a result choice, not a page turn.  Displaying never
+signals: a missing or failing panel backend must not break a search that
+already succeeded, so the call is wrapped in `ignore-errors'."
+  (let ((query seshat-reader-search--query)
+        (source (current-buffer))
+        (entries (seshat-reader-search--sidebar-entries matches))
+        (buffer (get-buffer-create seshat-reader-search-sidebar-buffer-name))
+        (index 0))
+    (with-current-buffer buffer
+      (special-mode)
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert (seshat-reader-search--sidebar-header
+                 query (length matches) (length entries)))
+        (dolist (entry entries)
+          (insert (propertize (concat (seshat-reader-search--sidebar-line entry)
+                                      "\n")
+                              'seshat-reader-search-sidebar-entry entry
+                              'seshat-reader-search-sidebar-index index))
+          (setq index (1+ index)))
+        (setq seshat-reader-search--sidebar-matches entries)
+        (setq seshat-reader-search--sidebar-source source)
+        (use-local-map seshat-reader-search--sidebar-map)
+        ;; 折行：侧栏很窄，片段必须折行而不是横向溢出（`special-mode' 默认
+        ;; 不折行，故显式置 nil）。
+        (setq truncate-lines nil)
+        (setq word-wrap t)
+        (goto-char (point-min))
+        (set-buffer-modified-p nil)
+        (setq buffer-read-only t)))
+    (ignore-errors (seshat-reader-sidebar-show buffer 'search t))
+    buffer))
+
 ;;;; 临时键表（n / p / RET / C-g）
 
 (defvar-keymap seshat-reader-search--map
@@ -589,7 +904,12 @@ stay), and leaves the page where the search ended unless PAGE is given."
 (defun seshat-reader-search--start (query)
   "Start a search session for QUERY, reporting the first hit at or after point.
 The scan is document-wide (so the status can show \"i of N\"), every page is
-cached, and the session is armed with `seshat-reader-search--map'.
+cached, and the session is armed with `seshat-reader-search--map'.  The same
+hits are rendered into the search sidebar as well, and the cursor is moved
+there at the end of the command (see
+`seshat-reader-search--render-sidebar') — page highlighting and the transient
+keymap of the reading buffer stay exactly as before, the sidebar is an
+additional view of the same result set.
 When nothing matches anywhere, no session is started and the user is told
 so."
   (setq seshat-reader-search--query query)
@@ -613,6 +933,10 @@ so."
     (setq seshat-reader-search--active t)
     (seshat-reader-search--install-hook)
     (seshat-reader-search--show)
+    ;; 并存视图：同一批命中同时列进左侧面板（光标在命令结束时切过去）。
+    ;; 放在 `--show' 之后——页面高亮与状态行先就位，侧栏只是附加视图；渲染
+    ;; 失败也不能影响已经成立的搜索会话。
+    (seshat-reader-search--render-sidebar seshat-reader-search--matches)
     (seshat-reader-search--arm-transient-map))))
 
 ;;;###autoload
@@ -629,7 +953,13 @@ global command `isearch-forward' is deliberately shadowed in reader buffers: the
 page is an image, so isearch cannot find body text anyway.  `n' / `p'
 remain paging outside the session.  A page whose hit count reaches the
 per-page ceiling (min of `seshat-reader-search-limit' and 1024) is reported
-as truncated instead of silently shortened."
+as truncated instead of silently shortened.
+
+The hits are also listed in the **search sidebar** (buffer
+`seshat-reader-search-sidebar-buffer-name', left side, one \"[p.N] snippet\"
+line per hit) and the cursor moves into it when the search finishes.  There
+`RET' jumps to the hit on the current line, `n' / `p' walk the list and `q'
+closes only this panel."
   (interactive (list (read-string "搜索: ")))
   (cond
    ((not (seshat-reader-search--available-p))

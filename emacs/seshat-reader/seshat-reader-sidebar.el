@@ -473,13 +473,19 @@ nil 时同样匹配 kind 标记为 nil 的面板窗口。供
 
 (defun seshat-reader-sidebar--position-for-kind (&optional kind)
   "返回 KIND 实际使用的弹出位置.
-KIND 为 `outline' 时取 `seshat-reader-outline-sidebar-position'，其余（含 nil
-与未知 kind）取 `seshat-reader-sidebar-position'。本函数是「kind → 位置」的
-**单一判据**：方向（宽/高）、side、slot、尺寸默认值全部经它派生，故要加新的
-per-kind 方位只需扩展本函数。"
-  (if (eq kind 'outline)
-      seshat-reader-outline-sidebar-position
-    seshat-reader-sidebar-position))
+KIND 为 `outline' 时取 `seshat-reader-outline-sidebar-position'，为 `search' 时
+**恒为 `left'**，其余（含 nil 与未知 kind）取 `seshat-reader-sidebar-position'。
+本函数是「kind → 位置」的**单一判据**：方向（宽/高）、side、slot、尺寸默认值
+全部经它派生，故要加新的 per-kind 方位只需扩展本函数。
+
+`search' 走**字面量 `left'** 而不是借道用户变量：搜索结果侧栏与目录同侧才有
+「左目录 + 左搜索 + 中间阅读区」的固定版式，若跟随
+`seshat-reader-outline-sidebar-position`，用户把目录改到右侧时搜索栏会被一并
+带走、与右侧信息栏挤在一起。想让搜索栏挪位只能改本函数（刻意不做成配置项）。"
+  (cond
+   ((eq kind 'search) 'left)
+   ((eq kind 'outline) seshat-reader-outline-sidebar-position)
+   (t seshat-reader-sidebar-position)))
 
 (defun seshat-reader-sidebar--horizontal-p (&optional kind)
   "判断 KIND 是否为**左右分栏**（宽度语义）.
@@ -691,10 +697,15 @@ WINDOW 的 `seshat-reader-sidebar-kind' window parameter），再以
                                (float frame-h)))
                       (assq-delete-all kind seshat-reader-sidebar--state))))))))
 
-(defconst seshat-reader-sidebar--kind-order '(outline annotations translate)
+(defconst seshat-reader-sidebar--kind-order '(outline search annotations translate)
   "面板 kind 的**稳定顺序**，决定同一侧内 side window 的 slot 编号.
 顺序本身只影响 slot 分配（`seshat-reader-sidebar--slot-for-kind'），不影响
-显示优先级；新增 kind 时追加到表尾即可（不影响已有 kind 的 slot）。")
+显示优先级；新增 kind 时追加到表尾即可（不影响已有 kind 的 slot）。
+
+`search'（搜索结果侧栏）排在 `outline' **之后**而不是表尾，因为它与目录同在
+左侧：左侧的 kind 依次拿到 slot 0（`outline'）、1（`search'），右侧的
+`annotations' / `translate' 仍各自 0 / 1，两套编号互不影响（同侧独立从 0 起
+编号，见 `seshat-reader-sidebar--slot-for-kind'）。")
 
 (defun seshat-reader-sidebar--kinds-on-side (side)
   "按 `seshat-reader-sidebar--kind-order' 顺序返回方位在 SIDE 侧的 kind 列表.
@@ -710,8 +721,9 @@ SIDE 为 `left' / `right' 时筛选该侧的 kind；为 nil（底部模式）时
 (defun seshat-reader-sidebar--slot-for-kind (kind)
   "返回 KIND 在 side window 上使用的 slot 号.
 同一侧内的 kind 按 `seshat-reader-sidebar--kind-order' 顺序编号（从 0 起），
-不同侧**各自从 0 开始**：默认方位（目录左、信息右）下 `outline' 为 0，
-`annotations' 为 0、`translate' 为 1。故**同一 kind 每次得到同一 slot**（重复
+不同侧**各自从 0 开始**：默认方位（目录与搜索在左、信息在右）下左侧
+`outline' 为 0、`search' 为 1，右侧 `annotations' 为 0、`translate' 为 1。故
+**同一 kind 每次得到同一 slot**（重复
 显示复用同一 side window，不重建、不影响用户手动调的尺寸），**不同 kind 得到
 不同 slot**（三 kind 共存、互不顶替；显示/关闭一个 kind 不会顶掉其它 kind 的
 窗口）。不在 kind 顺序表中的未知 kind 排在已知 kind 之后（slot = 该侧已知

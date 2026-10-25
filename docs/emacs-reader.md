@@ -13,7 +13,7 @@ Emacs 端文档阅读器（`emacs/seshat-reader/`）：MuPDF 负责栅格化、C
 | 目录导航 | `o`（开合） | 左侧目录面板：层级、页码、当前章高亮、TAB 折叠、`f` 单键跳转；再按一次 `o` 关闭 |
 | 框选取文 | 鼠标 `down-mouse-1` 拖拽 | 松手后取文本并闪现选区矩形 |
 | 批注 | `C-c C-a` / `C-c C-l` | 创建、列表开合（已显示则关）、跳页、删除、页面高亮刷新 |
-| 跨页文本搜索 | `C-s`（会话内 `n` / `p` / `RET` / `C-g`） | 整本扫描、跨页跳转与回绕、命中以橙色装饰投喂 |
+| 跨页文本搜索 | `C-s`（会话内 `n` / `p` / `RET` / `C-g`；左侧结果侧栏内 `RET` / `n` / `p` / `q`） | 整本扫描、跨页跳转与回绕、命中以橙色装饰投喂，同时列进左侧搜索结果侧栏 |
 | 手写轨迹显示 | 自动（`seshat-reader-annotation-ink-enabled`） | 把 Android 手写批注的 `ink:` 段渲染为页面笔迹（只显示，不输入） |
 | 翻译/解释 | `C-c C-t` / `C-c C-e` | 依赖 go-translate；结果显示在面板（或 posframe）。同一组键是**开合**：面板已显示则关闭，否则翻译/解释并弹出（不抢光标） |
 | 跨页衔接 | `seshat-reader-page-join-lines` | 默认关闭的 opt-in 特性 |
@@ -254,6 +254,7 @@ ETAF 渲染层是可选外部依赖：`Makefile` 先探测 `~/Workspace/emacs-ta
 - **双上限**（两者都不是缺陷，是防御）：
   - 单页 `seshat-reader-search-limit`（默认 `1024`）：C 侧把入参夹到 1..10000，但**实际收集**硬上限也是 1024（`SEARCH_PAGE_MAX_QUADS`）。某页返回条数达到 `min(limit, 1024)` 时状态行显式追加「（本页命中已达上限 1024，仅显示前 1024 条）」——否则用户会以为这页只有这么多命中（常见于目录页搜 `.`）。
   - 总量 `seshat-reader-search-max-matches`（默认 `20000`）：达到即**停止扫描**并提示「命中过多」。每条命中是一个五元素浮点列表，几十万条就是几十 MB，且每次跳转都要遍历一遍，故必须设总量闸。
+- **搜索结果侧栏（左侧）**：同一次搜索的命中同时列进左侧 side window（`*Seshat Search*`，面板 kind `search`，与目录同侧、排在目录之后的 slot）。每条一行「`[p.N] 片段`」，片段取该命中所在**整行**文本（整行才看得出这句话在讲什么），超过 80 字符截断。**打开时光标切到侧栏**——搜索已经结束，下一步是挑结果而不是翻页。侧栏内 `RET` 跳到该行命中所在页并高亮它，`n` / `p` 逐条移动，`q` **只关自己**（其它面板保留）。侧栏与页面高亮是**并存视图**：命中全集仍是阅读 buffer 的状态，侧栏只记「行 → (页号, 下标, 矩形)」，跳转复用既有的 `--goto-page` + 全量重投，不存在第二条绘制链路。为免几千条命中逐条取文卡住界面，侧栏最多列出 **200** 条（`seshat-reader-search--sidebar-max-entries`），超出时标题写明显式条数；命中全集仍在页面与状态行里。
 - **与批注装饰共存**：搜索命中走批注模块的扩展点 `seshat-reader-annotation-extra-decorations-function`，与批注 rect、框选闪现共用 C 侧**同一张**文档级装饰表，任何一方都不独占 `--clear-highlights`。批注模块未加载时降级为自投（`--clear-highlights` → `--add-decoration` → `--refresh-highlights`）。
 - **无文本层**的扫描页优雅退化为「本页无结果」，不报错；模块缺 `--search-page` 时提示「搜索不可用」。
 
@@ -429,7 +430,7 @@ Emacs 端**只显示**手写（无笔事件、无压感，输入永远在 Androi
 | `Q` | `seshat-reader-close-doc` | 关闭文档 |
 | `C-c C-a` / `C-c C-l` | `seshat-reader-annotation-create` / `-toggle` | 建批注 / 批注列表面板开合（已显示则关，否则拉取渲染） |
 | `C-c C-h` | `seshat-reader-annotation-refresh-highlights` | 刷新页面高亮 |
-| `C-s` | `seshat-reader-search` | 跨页文本搜索（会话内 `n` / `p` / `RET` / `C-g`；`n` / `p` 只在会话期间接管翻页键） |
+| `C-s` | `seshat-reader-search` | 跨页文本搜索（会话内 `n` / `p` / `RET` / `C-g`；`n` / `p` 只在会话期间接管翻页键）。搜索成功后同时打开**左侧搜索结果侧栏**并把光标切过去，侧栏键位见 §9.5 |
 | `C-c C-r` | `seshat-reader-reference-insert` | 插入选区摘录 |
 | `C-c C-t` / `C-c C-e` | `seshat-reader-translate-toggle` / `-explain-toggle` | 译文 / 解释面板开合（已显示则关，否则翻译 / 解释选区并弹出） |
 | `C-c C-q` | `seshat-reader-translate-follow-up` | 对译文 / 解释继续追问（多轮上下文） |
@@ -477,6 +478,17 @@ evil 用户同样可用上述单键（包内 `evil-define-key*` 补绑 normal st
 | `C-c C-q` | `seshat-reader-translate-follow-up` | 对当前原文继续追问 |
 | `C-c C-s` | `seshat-reader-translate-save-as-annotation` | 存为批注 |
 
+### 9.5 搜索结果侧栏（`seshat-reader-search--sidebar-map`）
+
+`C-s` 成功后光标落在左侧结果侧栏（`*Seshat Search*`，`special-mode` + 只读），键表以
+`special-mode-map` 为父表（滚动等基础键照旧可用），只覆盖下面四个键：
+
+| 键位 | 命令 | 作用 |
+|---|---|---|
+| `RET` | `seshat-reader-search-sidebar-goto` | 跳到当前行命中所在页并高亮该命中（光标留在侧栏，便于继续挑结果） |
+| `n` / `p` | `seshat-reader-search-sidebar-next` / `-prev` | 移动下一条 / 上一条并跳转；首条 `p`、末条 `n` 只提示「已是第一个 / 最后一个结果」，不报错 |
+| `q` | `seshat-reader-search-sidebar-quit` | **只关搜索结果侧栏**（其它面板保留）。刻意不走 `seshat-reader-sidebar-quit`：后者按 buffer 名推断 kind，`*Seshat Search*` 不在已知面板名里，会回落到「全部面板开合」 |
+
 ## 10. 配置速查
 
 ### 版式 / 面板
@@ -486,7 +498,7 @@ evil 用户同样可用上述单键（包内 `evil-define-key*` 补绑 normal st
 | `seshat-reader-sidebar-enabled` | `t` | 是否用面板展示批注列表与译文 | `nil` 时批注列表退回 `pop-to-buffer`，译文退回 posframe |
 | `seshat-reader-sidebar-position` | `right` | 信息栏位置：`right` / `left` / `below-selected` / `at-bottom` | **M12 破坏性变更**（原 `below-selected`）；`left`/`right` 为宽度语义 |
 | `seshat-reader-sidebar-width` | `0.24` | 信息栏宽度（小数=frame 比例，整数=列数） | 仅 side 模式；只对新建窗口生效 |
-| `seshat-reader-outline-sidebar-position` | `left` | 目录栏位置 | 只作用于 `outline` |
+| `seshat-reader-outline-sidebar-position` | `left` | 目录栏位置 | 只作用于 `outline`；**搜索结果侧栏（`search`）不跟随本变量**，恒在 `left`（`--position-for-kind` 里是字面量，避免改目录方位时把搜索栏带走） |
 | `seshat-reader-outline-sidebar-width` | `0.20` | 目录栏宽度 | 仅 side 模式 |
 | `seshat-reader-sidebar-expanded-width` | `0.75` | `C-c w`（`seshat-reader-sidebar-toggle-width`）把当前面板扩大到的宽度（占 frame 宽比例；整数=列数） | 仅窗口承载 + 左右分栏；childframe 与底部模式只提示、不改布局。再按一次恢复原宽度 |
 | `seshat-reader-sidebar-height` | `0.35` | 面板首次显示的初始高度 | 高度语义；批注列表固定用此值 |
@@ -665,7 +677,7 @@ M12 回归（strip 行破坏页面几何 + `--center-page` 在 `window-size-chan
 | `seshat-reader-select.el` | 鼠标框选取文 + 选区闪现 |
 | `seshat-reader-annotation.el` | 批注 CRUD、`document_id` / `location` 解析、页面高亮投喂、批注列表 |
 | `seshat-reader-annotation-queue.el` | 离线队列（读写、原子写、定时同步） |
-| `seshat-reader-search.el` | 跨页文本搜索：整本扫描、按页缓存、`n` / `p` 临时键表、命中装饰投喂 |
+| `seshat-reader-search.el` | 跨页文本搜索：整本扫描、按页缓存、`n` / `p` 临时键表、命中装饰投喂、左侧搜索结果侧栏（`kind=search`） |
 | `seshat-reader-sidebar.el` | 面板承载层（零依赖：位置、宽度/高度、slot、per-kind 尺寸记忆） |
 | `seshat-reader-outline.el` | 目录面板：行模型、渲染、avy 跳转、evil 补绑、关文档清理 |
 | `seshat-reader-translate.el` | 翻译/解释：gt 预设取用、面板 Markdown 渲染、存为批注 |
@@ -710,9 +722,9 @@ GTROOT=$(dirname "$(find "$HOME" -maxdepth 6 -type d \
 echo "$GTROOT"
 ```
 
-现有套件：`seshat-reader-page-join-test.el`、`seshat-reader-sidebar-test.el`（115 例）、`seshat-reader-outline-test.el`、`seshat-reader-annotation-test.el`、`seshat-reader-annotation-queue-test.el`、`seshat-reader-annotation-v8-test.el`、`seshat-reader-annotation-decoration-test.el`（21 例）、`seshat-reader-annotation-ink-test.el`（24 例）、`seshat-reader-search-test.el`（**19 例**）、`seshat-reader-select-flash-test.el`、`seshat-reader-select-merge-test.el`（18 例）、`seshat-reader-select-scope-test.el`（7 例）、`seshat-reader-select-report-test.el`（**7 例**，M12 T8a 新增：框选回显只报行列数、`seshat-reader-select-message-limit` 已删除）、`seshat-reader-translate-test.el`（138 例）、`seshat-reader-reference-test.el`、`seshat-reader-resize-test.el`、`seshat-reader-etaf-test.el`、`seshat-rest-test.el`、`seshat-state-test.el`、`seshat-transport-test.el`、`seshat-conflict-test.el`（10 例）、`seshat-merge-test.el`（13 例）、`seshat-sync-cmd-test.el`（14 例）、`seshat-sync-test.el`（77 例）、`seshat-reading-test.el`（**45 例**）。**前置**：`seshat-render-core.so` 已构建，否则加载 `seshat-reader` 会触发交互式构建询问并阻塞 batch 运行。
+现有套件：`seshat-reader-page-join-test.el`、`seshat-reader-sidebar-test.el`（**117 例**）、`seshat-reader-outline-test.el`、`seshat-reader-annotation-test.el`、`seshat-reader-annotation-queue-test.el`、`seshat-reader-annotation-v8-test.el`、`seshat-reader-annotation-decoration-test.el`（21 例）、`seshat-reader-annotation-ink-test.el`（24 例）、`seshat-reader-search-test.el`（**28 例**）、`seshat-reader-select-flash-test.el`、`seshat-reader-select-merge-test.el`（18 例）、`seshat-reader-select-scope-test.el`（7 例）、`seshat-reader-select-report-test.el`（**7 例**，M12 T8a 新增：框选回显只报行列数、`seshat-reader-select-message-limit` 已删除）、`seshat-reader-translate-test.el`（138 例）、`seshat-reader-reference-test.el`、`seshat-reader-resize-test.el`、`seshat-reader-etaf-test.el`、`seshat-rest-test.el`、`seshat-state-test.el`、`seshat-transport-test.el`、`seshat-conflict-test.el`（10 例）、`seshat-merge-test.el`（13 例）、`seshat-sync-cmd-test.el`（14 例）、`seshat-sync-test.el`（77 例）、`seshat-reading-test.el`（**45 例**）。**前置**：`seshat-render-core.so` 已构建，否则加载 `seshat-reader` 会触发交互式构建询问并阻塞 batch 运行。
 
-**必须逐文件运行**：一次 `emacs --batch` 加载全部测试文件时，`seshat-reader-annotation-test.el` 与 `seshat-reader-annotation-queue-test.el` 各有 3 个列表渲染用例会失败——同时加载 `etaf` 测试后 `etaf-ui` 变为可用，批注列表改走 EBOX/ETAF 渲染，而那两个用例断言的是纯文本（如 `"没有批注"`）。这是**既有基线特性、不是回归**：全仓用例总数按逐文件求和计（当前 **25** 个文件合计 **950** 例，0 unexpected / 0 skipped；translate 套件例数含 gt 预设隔离、解释质量并行改动与结果缓存（74 → **138**））。跑全仓脚本见下（`for` 循环逐文件执行，任一文件非零退出即整体失败）：
+**必须逐文件运行**：一次 `emacs --batch` 加载全部测试文件时，`seshat-reader-annotation-test.el` 与 `seshat-reader-annotation-queue-test.el` 各有 3 个列表渲染用例会失败——同时加载 `etaf` 测试后 `etaf-ui` 变为可用，批注列表改走 EBOX/ETAF 渲染，而那两个用例断言的是纯文本（如 `"没有批注"`）。这是**既有基线特性、不是回归**：全仓用例总数按逐文件求和计（当前 **25** 个文件合计 **961** 例，0 unexpected / 0 skipped；本轮搜索结果侧栏带入 search 套件 19 → **28**、sidebar 套件 115 → **117**；translate 套件例数含 gt 预设隔离、解释质量并行改动与结果缓存（74 → **138**））。跑全仓脚本见下（`for` 循环逐文件执行，任一文件非零退出即整体失败）：
 
 ```bash
 cd /home/thomas/Workspace/seshat && rm -f emacs/seshat-reader/*.elc && \
