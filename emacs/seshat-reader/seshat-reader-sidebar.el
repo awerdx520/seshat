@@ -850,25 +850,32 @@ buffer-local 变量，故同一 buffer 在别的窗口里显示时不受影响�
 任一步失败静默跳过（尺寸与定位是「更好看」，不该让面板显示整体失败），返回
 FRAME。
 
+**防御**：FRAME 不带 `seshat-reader-panel-kind' 参数时直接返回 nil，不设
+mode-line、不定位——那说明拿到的不是本包 child frame（例如 `display-buffer' 未
+经 child frame 动作创建、或意外返回了父 frame 的窗口）；此时若继续跑，会把父
+frame 自己的窗口 mode-line 关掉、还会按面板尺寸重排父 frame，破坏主界面。
+
 最后一步顺手抑制该 frame 窗口的 mode-line
 （`seshat-reader-sidebar--cf-suppress-mode-line'：window parameter
 `mode-line-format' 置 `none'，header-line 保留）——放在此处而非创建路径，
 是因为复用路径也必经本函数，故两个路径都得到同样的面板外观且幂等。"
-  (let* ((parent (frame-parameter frame 'parent-frame))
-         (size (and parent (seshat-reader-sidebar--cf-size parent kind)))
-         (others (delq frame (seshat-reader-sidebar--cf-frames)))
-         (heights (mapcar (lambda (other)
-                            (ignore-errors (frame-pixel-height other)))
-                          others))
-         (position (and parent
-                        (seshat-reader-sidebar--cf-position
-                         parent kind heights))))
-    (when size
-      (ignore-errors (set-frame-size frame (car size) (cdr size) t)))
-    (when position
-      (ignore-errors (set-frame-position frame (car position) (cdr position))))
-    (seshat-reader-sidebar--cf-suppress-mode-line frame)
-    frame))
+  (when (frame-parameter frame 'seshat-reader-panel-kind)
+    (let* ((parent (frame-parameter frame 'parent-frame))
+           (size (and parent (seshat-reader-sidebar--cf-size parent kind)))
+           (others (delq frame (seshat-reader-sidebar--cf-frames)))
+           (heights (mapcar (lambda (other)
+                              (ignore-errors (frame-pixel-height other)))
+                            others))
+           (position (and parent
+                          (seshat-reader-sidebar--cf-position
+                           parent kind heights))))
+      (when size
+        (ignore-errors (set-frame-size frame (car size) (cdr size) t)))
+      (when position
+        (ignore-errors (set-frame-position frame (car position)
+                                           (cdr position))))
+      (seshat-reader-sidebar--cf-suppress-mode-line frame)
+      frame)))
 
 (defun seshat-reader-sidebar--cf-show (buffer kind &optional select)
   "在选中 frame 的右上角以 child frame 覆盖显示 BUFFER，返回被显示的 window.
@@ -1299,28 +1306,23 @@ SELECT 非 nil 表示「面板内容已就绪，可以跟随光标」：批注�
     (pop-to-buffer buffer)))
 
 (defun seshat-reader-sidebar-close-buffer-kind (kind buffer)
-  "Close the sidebar panel of KIND that is displaying BUFFER.
-KIND is a panel content type (`outline' / `annotations' / `translate'), BUFFER
-is a buffer object or a buffer name.  Only **承载单元**（窗口或 child frame）
-whose `seshat-reader-sidebar--panel-kind' equals KIND **and** whose
-`seshat-reader-sidebar--panel-buffer' is BUFFER are handled: panels of other
-kinds are untouched, and neither is a panel of the same kind showing a
-different buffer.  Before closing, the dimensions of the matching windows are
-captured by `seshat-reader-sidebar--capture-state' (so a user resize
-survives; child frames are skipped there — their size is fixed and not
-remembered), then `seshat-reader-sidebar--panel-close' runs inside
-`ignore-errors' (the window may be the frame's last non-side window, or the
-unit may already be deleted).
+  "关闭 KIND 面板中正在显示 BUFFER 的那个承载单元.
+KIND 是面板内容类型（`outline' / `annotations' / `translate'），BUFFER 是 buffer
+对象或 buffer 名。只处理 `seshat-reader-sidebar--panel-kind' 等于 KIND **且**
+`seshat-reader-sidebar--panel-buffer' 等于 BUFFER 的**承载单元**（窗口或 child
+frame）：其它 kind 的面板不动，同 kind 但显示别的 buffer 的面板也不动。关闭前由
+`seshat-reader-sidebar--capture-state' 捕获命中窗口的尺寸（用户 resize 的结果因
+此不丢；child frame 在那里被跳过——它的尺寸固定、不参与记忆），随后的
+`seshat-reader-sidebar--panel-close' 包在 `ignore-errors' 里执行（该窗口可能是
+frame 上最后一个非 side 窗口，或者承载单元已被删除）。
 
-The KIND entry is also dropped from `seshat-reader-sidebar--last-buffers'
-\(and from `seshat-reader-sidebar--last-buffer' / `--last-kind') when it
-points at BUFFER, so `seshat-reader-sidebar-toggle' (\\[seshat-reader-sidebar-toggle-outline])
-cannot resurrect the removed panel by re-displaying a buffer whose document
-is gone.
+当 `seshat-reader-sidebar--last-buffers'（以及
+`seshat-reader-sidebar--last-buffer' / `--last-kind'）指向 BUFFER 时也一并清
+掉，使得 `seshat-reader-sidebar-toggle'（\\[seshat-reader-sidebar-toggle-outline]）
+无法通过重新显示一个文档已消失的 buffer 来复活被移除的面板。
 
-Deliberately **not** implemented on top of `seshat-reader-sidebar-toggle':
-`toggle' re-opens a panel when no window of that kind exists, which is the
-opposite of what a cleanup needs."
+**刻意不**基于 `seshat-reader-sidebar-toggle' 实现：`toggle' 在该 kind 没有窗口
+时会重新打开面板，与清理所需的语义正好相反。"
   (let ((buffer (if (bufferp buffer) buffer (get-buffer buffer))))
     (when (buffer-live-p buffer)
       (let (targets)
@@ -1464,36 +1466,50 @@ child frame：关闭统一经 `seshat-reader-sidebar--toggle-kind'（它按承�
 ;; 在右上角，挡住真正要看的窗口。故这里补一条「不再是阅读器 buffer 就关掉 child
 ;; frame 面板」的生命周期规则；面板内容留在 buffer 里，随时可 toggle 重开。
 
-(defun seshat-reader-sidebar--hide-cf-on-buffer-change (&optional window)
-  "当前 buffer 不再是阅读器 buffer 时隐藏本包 child frame 面板.
+(defun seshat-reader-sidebar--hide-cf-on-buffer-change ()
+  "命令结束后若当前 buffer 不再是阅读器 buffer，则隐藏本包 child frame 面板.
 `seshat-reader-panel-hide-on-buffer-change' 为 nil 时不做事（用户可以要求面板
-常驻）。否则按以下三个**早期返回**判定（本函数挂在全局
-`window-buffer-change-functions' 上，每次窗口换 buffer 都会跑，故必须廉价、不得
-做重活）：
+常驻）。否则按以下**早期返回**判定（本函数挂在全局 `post-command-hook' 上，每条
+命令结束都跑一次，故必须廉价、不得做重活）：
 
 1. 本包没有任何 child frame 面板 → 直接返回（**先**判这条：没有面板时连
-   `derived-mode-p' 都不算，正常的 buffer 切换因此零开销）；
-2. 当前 buffer（WINDOW 的 buffer，省略 WINDOW 时取当前 buffer）派生自
-   `seshat-reader-mode' → 返回（仍在阅读器里，例如从 PDF 切到它自己的目录
-   buffer）；
-3. 其余情况 → 逐个 `seshat-reader-sidebar--cf-close' 关掉本包 child frame，并
+   `minibufferp' 与 `derived-mode-p' 都不算，绝大多数命令因此只花一次
+   `frame-list' 过滤）；
+2. 在 minibuffer 里 → 返回（追问/过滤在 minibuffer 输入时不能把面板误关）；
+3. 选中 frame 带 `seshat-reader-panel-kind' 参数 → 返回（用户正聚焦在本包
+   child frame 内操作，例如在译文面板里选词、滚动，不能误关）；
+4. 选中窗口的 buffer 派生自 `seshat-reader-mode' 或 `seshat-reading-mode' →
+   返回（仍在阅读器里，例如从 PDF 切到它自己的目录 buffer）。两个 mode 都判是
+   **冗余保险**：`seshat-reading-mode' 当前派生自 `seshat-reader-mode'，故前者
+   已足以命中；将来若派生关系变化，这里仍不会误关；
+5. 其余情况 → 逐个 `seshat-reader-sidebar--cf-close' 关掉本包 child frame，并
    `message' 一句提示（**只提示一次**，不管关了几个面板）。
 
-**为什么用 `window-buffer-change-functions' 而不是 post-command-hook**：这个
-hook 在**窗口 buffer 真正变化的那一刻**触发，不需要等到命令结束再回头比较
-`current-buffer'，因此不会出现「命令执行中面板已失效、界面已经闪一下」的中间
-态；也不受 `this-command` 类判据的干扰。代价是它对**每个**窗口的每次换 buffer
-都调用，所以上面三条早期返回是硬要求，不是优化。
+**为什么用 `post-command-hook' 而不是 `window-buffer-change-functions'**：本函数
+要 `delete-frame'，而 window change functions 属于 redisplay 流程，`(elisp)
+Window Hooks' 明确规定其内**不得删除窗口或 frame**（会让其它 hook 拿到不一致
+状态）；它们也**不保存/恢复 `current-buffer'**，其内做 major-mode 判断不可靠；此
+外 default value 上的 window change function 收到的是 **frame** 而不是 window，
+那里 `windowp' 恒为 nil。改用 `post-command-hook' 后：① 判定发生在命令与
+redisplay 之外的安全阶段，`selected-window' / `selected-frame' 语义明确；②
+`seshat-reader-sidebar--cf-show' 新建 child frame 不会被下一次 redisplay 里它自
+己引起的 window change 当成「切换走了」，从而把**刚显示的面板**立刻关掉。
 
-WINDOW 参数由 hook 传入（也可能是手工调用，省略时按当前 buffer 判定）。"
+判定 4 显式取 `(window-buffer (selected-window))` 再用 `with-current-buffer' 求
+值，不依赖 `current-buffer'：post-command 阶段二者通常一致，但显式取更稳（命令
+可能留下别的 `current-buffer'）。
+
+语义仍是「切走即隐藏、内容留在 buffer 里」：面板只是不再浮在父 frame 上，随时可
+用 `seshat-reader-sidebar-toggle' 重开。"
   (when seshat-reader-panel-hide-on-buffer-change
     (let ((frames (seshat-reader-sidebar--cf-frames)))
       (when (and frames
-                 (not (ignore-errors
-                        (with-current-buffer (if (windowp window)
-                                                 (window-buffer window)
-                                               (current-buffer))
-                          (derived-mode-p 'seshat-reader-mode)))))
+                 (not (minibufferp))
+                 (null (frame-parameter (selected-frame)
+                                        'seshat-reader-panel-kind))
+                 (not (with-current-buffer (window-buffer (selected-window))
+                        (or (derived-mode-p 'seshat-reader-mode)
+                            (derived-mode-p 'seshat-reading-mode)))))
         (dolist (frame frames)
           (seshat-reader-sidebar--cf-close frame))
         (message "Seshat 面板已随阅读器隐藏")))))
@@ -1511,11 +1527,16 @@ WINDOW 参数由 hook 传入（也可能是手工调用，省略时按当前 buf
   (define-key seshat-reader-mode-map (kbd "C-c C-o")
     #'seshat-reader-sidebar-toggle))
 
-;; 挂到**全局**的 `window-buffer-change-functions'（不传 LOCAL）：阅读器 buffer
-;; 退出后当前 buffer 已不是阅读器 buffer，buffer-local 的钩子绑在谁身上都不对，
-;; 只有全局钩子能在「切走的那一刻」看到新 buffer。`add-hook' 本身幂等（同一个
-;; 函数符号不会重复入表），故文件被重新加载时不会叠加调用。
-(add-hook 'window-buffer-change-functions
+;; 挂到**全局**的 `post-command-hook'（不传 LOCAL）：判定对象是「命令结束后选中
+;; 窗口的 buffer 是否还是阅读器 buffer」，与「哪个 buffer 是 local 的」无关——阅读
+;; 器 buffer 已不是当前 buffer 时，buffer-local 的钩子挂在谁身上都不会跑。只有全
+;; 局钩子能在切走之后看到新 buffer。`add-hook' 本身幂等（同一个函数符号不会重复
+;; 入表），故文件被重新加载时不会叠加调用。
+;;
+;; 不用 `window-buffer-change-functions'：本函数要 `delete-frame'，而 window
+;; change functions 不得删除窗口/frame，也不保存 `current-buffer'（详见函数
+;; docstring）。
+(add-hook 'post-command-hook
           #'seshat-reader-sidebar--hide-cf-on-buffer-change)
 
 (provide 'seshat-reader-sidebar)
