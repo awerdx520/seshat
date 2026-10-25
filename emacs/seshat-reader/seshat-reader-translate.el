@@ -48,6 +48,20 @@
 ;; - `pop'/`pin'：回退 posframe（`gt-posframe-pop-render' 弹出、失焦即消失 /
 ;;   `gt-posframe-pin-render' 常驻），可在配置侧切回。
 ;;
+;; 预设来源与解释的 prompt 装配（2026-10-25）：
+;;
+;; - 预设查表先查 `seshat-reader-translate-presets'（seshat 自有表），再回落
+;;   gt 全局的 `gt-preset-translators'。自有表优先，故 `reader' /
+;;   `reader-explain' 不必进 gt 全局表——否则它们会出现在 `gt-translate' 的
+;;   预设选择列表里，污染用户其它 gt 用法。
+;; - 解释的 prompt 与上下文**全部装配进 taker 的 `:text'**，引擎槽零改动
+;;   （`gt-single' 的 class 级实例缓存使「克隆引擎再改槽」可能根本没克隆，
+;;   会污染全局引擎实例）；配置侧把预设引擎的 `prompt' 槽设为纯透传
+;;   `"{{text}}"' 即可。
+;; - 相关开关：`-presets' / `-explain-prompt' / `-explain-max-chars' /
+;;   `-context-enabled' / `-context-lines' / `-context-max-chars' /
+;;   `-strip-chatter'（变量前缀均为 `seshat-reader-translate-'）。
+;;
 ;; 多引擎来源标注（`seshat-reader-translate-engines-pick'，默认 `all'）：多引擎
 ;; 预设本就是为了一眼比对各家译文，故默认展示**全部成功结果**，每条前标
 ;; `【引擎名】'、段间用 Markdown 分隔线 `---'（`--format-engine-results'）；
@@ -126,7 +140,12 @@
   (put 'stream 'slot-name t)
   ;; 追问（T5）要改写 `gt-chatgpt-engine' 的 `prompt' 槽（换成返回 messages
   ;; 列表的函数），同样登记槽名消除告警。
-  (put 'prompt 'slot-name t))
+  (put 'prompt 'slot-name t)
+  ;; 可观测（T4）要读 `gt-chatgpt-engine' 的 `model' / `host' 槽（解释失败的
+  ;; 引擎标识，见 `seshat-reader-translate--engine-label'），同样登记槽名。
+  ;; **只登记这两个非敏感槽**：key 类槽（key / auth / token）永不读取。
+  (put 'model 'slot-name t)
+  (put 'host 'slot-name t))
 
 (declare-function eieio-oset "eieio-core" (obj slot value))
 (declare-function eieio-oref "eieio-core" (obj slot))
@@ -258,9 +277,10 @@ TITLE 参数）。")
 
 (defcustom seshat-reader-translate-preset 'reader
   "翻译时使用的 gt 预设名（符号）.
-取值应是 `gt-preset-translators' 中某个预设的键。命中该预设时本模块会
-克隆它（见 `seshat-reader-translate--translator'）；未命中时 `message'
-提示并回退到内置的 youdao/google 翻译器。"
+取值应是 `seshat-reader-translate-presets' 或 `gt-preset-translators' 中
+某个预设的键（前者优先）。命中该预设时本模块会克隆它（见
+`seshat-reader-translate--translator'）；未命中时 `message' 提示并回退到
+内置的 youdao/google 翻译器。"
   :type 'symbol
   :group 'seshat-reader-translate)
 
@@ -270,6 +290,96 @@ TITLE 参数）。")
 用途使用；该预设需用户在自己的 gt 配置中提供，未提供时回退到内置的
 youdao/google 翻译器。"
   :type 'symbol
+  :group 'seshat-reader-translate)
+
+(defcustom seshat-reader-translate-presets nil
+  "Seshat 专用的 gt 预设表：名字 → gt-translator 对象，或名字 → thunk.
+thunk 是无参函数，调用后返回 `gt-translator' 对象；用它可以把预设构造推迟到
+gt 真正加载之后（`use-package gt :config' 里定义的预设就是这种情况）。
+
+查表顺序见 `seshat-reader-translate--preset-translator'：**本表优先**，未命中
+回落 gt 的全局表 `gt-preset-translators'。因此 seshat 的预设不必再 `push'
+进 gt 的全局表，也就不会出现在 gt 自己的预设选择列表里。"
+  :type '(alist :key-type symbol :value-type (choice (function :tag "thunk") sexp))
+  :group 'seshat-reader-translate)
+
+(defcustom seshat-reader-translate-context-enabled t
+  "解释选区时是否把同页邻近文本作为上下文注入 prompt.
+nil 时 `seshat-reader-translate--context-text' 直接返回 nil，完全不触碰 C 模块。"
+  :type 'boolean
+  :group 'seshat-reader-translate)
+
+(defcustom seshat-reader-translate-context-lines 2
+  "上下文向选区上下各扩的行数.
+上下文取自「选区上方块 + 下方块」两个矩形，各向选区外扩此行数：实现见
+`seshat-reader-translate--expand-rect'（按选区触达的行矩形估算行高后外扩）
+与 `seshat-reader-translate--context-text'。"
+  :type 'natnum
+  :group 'seshat-reader-translate)
+
+(defcustom seshat-reader-translate-context-max-chars 1200
+  "上下文文本的字符数上限.
+上限由 `seshat-reader-translate--context-window' 落实：矩形路径拿到的
+「上方块 + 下方块」不含选区，定位不到选区，因此只保留前 MAX-CHARS 个字符
+（矩形路径失败、降级到整页文本时才以选区为中心取窗口）。"
+  :type 'natnum
+  :group 'seshat-reader-translate)
+
+(defcustom seshat-reader-translate-explain-prompt
+  "## 任务
+
+解释下文「需要解释的原文」，读者是一位正在读专业书的中文读者。不要翻译，不要复述原文。
+
+## 要求
+
+1. 首行用一句话概括这段在说什么（≤30 字，加粗）。
+2. 随后用 2-4 个要点展开：关键概念/术语的准确含义、它在本文语境中的作用、读者容易误解的地方。
+3. 术语首次出现时给出「英文原词（中文释义）」。
+4. 若原文含代词指代、代码、公式，明确指出它指代/对应什么。
+5. 全文不超过 200 字；信息不足时直说「仅凭本段无法确定」，不要编造。
+6. 输出 Markdown，不要用代码围栏包裹整段。
+
+## 上下文（仅供理解，不要解释）
+
+{{context}}
+
+## 需要解释的原文
+
+{{text}}
+"
+  "解释 prompt 模板；nil 表示不装配（只发送纯选区，由引擎 `:root` 决定行为）.
+nil 的真实语义：不装配 → 只发送纯选区文本，由引擎的 `:root`（system
+prompt）决定行为。注意 `reader-explain` 预设的 `:prompt' 已改为纯透传
+\"{{text}}\"（解释指令改由 seshat 装配），因此 nil **不等于**恢复此前的旧
+中文长 prompt——需要那种效果请在配置侧把 `:prompt' 改回长指令。
+
+占位符：`{{text}}' 选区原文、`{{context}}' 上下文（可能为空）、`{{doc}}' 文档名
+（无则替换为「未知文档」）、`{{lang}}' 语言对（如 \"en → zh\"，可能为空）。
+输入值里的 `{{' 会被转义，原样保留在结果中，不参与替换。
+
+**每个标题行后必须留一个空行**：thomas-emacs 的软换行归一化
+（`+thomas/normalize-soft-wraps'）只在空行处分段；`## ' 开头的行虽是保护行，
+但它只保留**自身之前**的换行，紧随其后的普通正文行会被并入它。"
+  :type '(choice (const :tag "不装配（沿用预设 prompt）" nil) string)
+  :group 'seshat-reader-translate)
+
+(defcustom seshat-reader-translate-explain-max-chars 2000
+  "解释时送模型的选区原文字符上限，超出则截断并标注.
+只影响送引擎的文本（见 `seshat-reader-translate--truncate-selection'），
+不影响面板原文引用块与追问的原文来源（两者都取
+`seshat-reader-translate--selection-source-text'，即**完整**选区）。取值
+非正整数时关闭截断。"
+  :type 'natnum
+  :group 'seshat-reader-translate)
+
+(defcustom seshat-reader-translate-strip-chatter t
+  "是否去掉模型输出正文前的寒暄首行（如「好的，以下是…：」）.
+作用于 `seshat-reader-translate--record-result'（见
+`seshat-reader-translate--strip-chatter'），因此对翻译与解释、面板与
+posframe 四条组合都生效；流式增量路径（`seshat-reader-translate--stream-sync'）
+不经过该函数，故流式期间首行仍可见，收尾后的 `last-result' 已净化。
+设为 nil 即恢复「原样输出」。"
+  :type 'boolean
   :group 'seshat-reader-translate)
 
 (defcustom seshat-reader-translate-fallback-langs '(en zh)
@@ -613,7 +723,10 @@ CONTEXT 选定模板（`explain' 用 `seshat-reader-translate-explain-template'�
   "从中转 buffer 提取面板译文并写入 `seshat-reader-translate-last-result'.
 定位 `seshat-reader-translate--gt-buffer-name' 指定的隐藏中转 buffer，在其中
 调 `seshat-reader-translate--extract-result' 取 `(TEXT . FAILED)'，再交
-`seshat-reader-translate--record-result' 写入（保留 error face 的失败判定）。
+`seshat-reader-translate--record-result' 写入（保留 error face 的失败判定，
+并按 `seshat-reader-translate-strip-chatter' 净化后写入）。本函数把
+`--record-result' 的**返回值**（净化后文本）原样透出，`:then' 回调据此重绘
+面板，故面板正文与 `last-result' 内容一致。
 
 写入后无论成功失败都调 `seshat-reader-translate--stream-complete' 收尾流式渲染
 （把面板 header-line 从「生成中…」改成「已完成」并清骨架状态）；面板内容**不
@@ -685,10 +798,391 @@ CONTEXT 同样由 `seshat-reader-translate--translator' 传入（`translate' 或
        (gt-posframe-pop-render)))
     (_ (gt-posframe-pop-render))))
 
-(defun seshat-reader-translate--translator (preset text langs &optional context)
+;; --- 解释上下文：行矩形扩行 → 页面文本降级 ---
+;;
+;; 上下文提取要调动态模块（`render/render-core.c'）导出的三个查询函数。此处
+;; 只声明签名以免字节编译告警；运行时一律 `fboundp' 守卫（未构建 `.so' 或模块
+;; 未加载时它们 unbound），任何失败都静默返回 nil——批处理 / 无模块是常态。
+(declare-function seshat-reader-dyn--lines-in-rect "seshat-render-core"
+                  (page x0 y0 x1 y1))
+(declare-function seshat-reader-dyn--text-in-rect "seshat-render-core"
+                  (page x0 y0 x1 y1))
+(declare-function seshat-reader-dyn--page-text "seshat-render-core"
+                  (&optional page))
+
+(defun seshat-reader-translate--expand-rect (rects lines)
+  "Return RECTS grown by LINES lines above and below, as one rectangle.
+RECTS is what `seshat-reader-dyn--lines-in-rect' returns: one
+\(X0 Y0 X1 Y1) float quadruple per whole text line the selection
+touches, in reading order.  The result is a single (X0 Y0 X1 Y1)
+quadruple: horizontally the union of every rectangle, vertically the
+union grown by LINES times an estimated line height, the latter being
+\(max Y1 - min Y0) divided by the number of rectangles (a page's lines
+are assumed evenly spaced, which is what makes a line-metric guess
+possible at all without asking the module for font metrics).
+
+Return nil when RECTS is not a non-empty list, when an element is not a
+four-number list, or when the estimated line height is not positive
+\(all rectangles share the same vertical span, so the line height cannot
+be told apart from zero) — callers then fall back to the whole-page
+text instead of growing the rectangle by a meaningless amount.
+
+Pure: reads no global variable and never calls the dynamic module."
+  (let ((n (if (natnump lines) lines 0))
+        (count 0)
+        (x0 nil)
+        (y0 nil)
+        (x1 nil)
+        (y1 nil)
+        (valid t))
+    (when (listp rects)
+      (dolist (rect rects)
+        (if (and (listp rect)
+                 (= 4 (length rect))
+                 (numberp (nth 0 rect))
+                 (numberp (nth 1 rect))
+                 (numberp (nth 2 rect))
+                 (numberp (nth 3 rect)))
+            (setq count (1+ count)
+                  x0 (if x0 (min x0 (nth 0 rect)) (nth 0 rect))
+                  y0 (if y0 (min y0 (nth 1 rect)) (nth 1 rect))
+                  x1 (if x1 (max x1 (nth 2 rect)) (nth 2 rect))
+                  y1 (if y1 (max y1 (nth 3 rect)) (nth 3 rect)))
+          (setq valid nil))))
+    (when (and valid (> count 0))
+      (let ((line-height (/ (- y1 y0) count)))
+        (when (> line-height 0)
+          (list x0 (- y0 (* n line-height)) x1 (+ y1 (* n line-height))))))))
+
+(defun seshat-reader-translate--context-window (page-text selection max-chars)
+  "Return at most MAX-CHARS characters of PAGE-TEXT around SELECTION.
+SELECTION is located in PAGE-TEXT by a literal search; when it is found
+the window runs from `half' characters before it to `half' characters
+after it, where `half' is (/ MAX-CHARS 2), then shrunk from the left
+when the result would still be longer than MAX-CHARS (a long SELECTION
+eats into the same budget).  When SELECTION is nil, empty or absent from
+PAGE-TEXT the first MAX-CHARS characters of PAGE-TEXT are returned
+instead — a page-level context is better than none, and the caller has
+already given up on the tighter rectangle query by then.
+
+The window is then cleaned up for prompt embedding: runs of spaces and
+tabs collapse to a single space (PDF extraction inserts one per glyph
+gap), three or more consecutive newlines collapse to a paragraph break
+and surrounding whitespace is trimmed.  A window that cleans up to the
+empty string yields nil.
+
+Return nil when PAGE-TEXT is not a non-empty string or MAX-CHARS is not a
+positive integer.  Pure: reads no global variable and never calls the
+dynamic module."
+  (when (and (stringp page-text)
+             (not (string-empty-p page-text))
+             (natnump max-chars)
+             (> max-chars 0))
+    (let* ((length (length page-text))
+           (beg (and (stringp selection)
+                     (not (string-empty-p selection))
+                     (string-match (regexp-quote selection) page-text)))
+           (raw (if beg
+                    (let* ((half (/ max-chars 2))
+                           (start (max 0 (- beg half)))
+                           (end (min length (+ beg (length selection) half)))
+                           ;; 两侧各扩 half 后总长可能超过 MAX-CHARS（选区自身也
+                           ;; 占预算）：从左端收缩以守住上限，且优先保住选区起点。
+                           (start (if (> (- end start) max-chars)
+                                      (max 0 (min beg (- end max-chars)))
+                                    start)))
+                      (substring page-text start (min end (+ start max-chars))))
+                  (substring page-text 0 (min length max-chars))))
+           (spaces (replace-regexp-in-string "[ \t]+" " " raw))
+           (breaks (replace-regexp-in-string "\n\\{3,\\}" "\n\n" spaces))
+           (trimmed (string-trim breaks)))
+      (unless (string-empty-p trimmed)
+        trimmed))))
+
+(defun seshat-reader-translate--context-text ()
+  "Return the neighbouring text of the last selection, or nil.
+Used to feed the explain prompt with the page context around the
+selection (see `seshat-reader-translate-context-lines' and
+`seshat-reader-translate-context-max-chars').
+
+The preferred path grows the selection to whole lines and then by
+`seshat-reader-translate-context-lines' lines: the selection's `:page'
+\(1-based) is turned into the module's 0-based PAGE, the rectangles of
+the touched lines come from `seshat-reader-dyn--lines-in-rect' and the
+grown rectangle from `seshat-reader-translate--expand-rect'.  The
+context is then the text of the block **above** the selection (the
+grown rectangle's X span, Y from the grown top to the selection top)
+plus the text of the block **below** it (same X span, Y from the
+selection bottom to the grown bottom), both from
+`seshat-reader-dyn--text-in-rect' and joined by a blank line.  Nothing
+is deleted from the extracted strings: the module inserts no line break
+between text lines of one paragraph, so cutting the selection out with
+a literal search would never match a selection that crosses lines — the
+selection simply is not part of either rectangle.  The joined text then
+goes through `seshat-reader-translate--context-window' with no
+SELECTION, i.e. whitespace is cleaned up and only the first MAX-CHARS
+characters are kept.
+
+When the rectangle path is unavailable or yields nothing (no `:rect',
+no line rectangles, or both blocks empty) the whole page text
+\(`seshat-reader-dyn--page-text', again with the explicit 0-based PAGE —
+the omitted-argument form depends on the selected window and is not
+reliable in batch) goes through the same window function, this time
+with the selection so that the window is centred on it.
+
+Everything happens inside `condition-case' and no failure is reported:
+the dynamic module is often missing (batch runs, an unbuilt `.so') and
+a missing context must never break the explain command.
+`seshat-reader-translate-context-enabled' being nil returns nil before
+the module is touched at all."
+  (when seshat-reader-translate-context-enabled
+    (condition-case nil
+        (let ((page (plist-get seshat-reader-select-last :page))
+              (rect (plist-get seshat-reader-select-last :rect))
+              (text (plist-get seshat-reader-select-last :text)))
+          (when (and (integerp page)
+                     (> page 0)
+                     (listp rect)
+                     (= 4 (length rect))
+                     (stringp text)
+                     (not (string-empty-p (string-trim text))))
+            (let* ((index (1- page))
+                   (x0 (nth 0 rect))
+                   (y0 (nth 1 rect))
+                   (x1 (nth 2 rect))
+                   (y1 (nth 3 rect))
+                   (max-chars seshat-reader-translate-context-max-chars)
+                   ;; ①②③ 行矩形路径：触达整行 → 按行高外扩 → 分成上下两块取文本。
+                   ;; 每一步都用 `ignore-errors' 兜住：模块缺失、结果为空都只是
+                   ;; 「这一步没拿到」，交给下面的 `or' 继续降级。
+                   (grown (ignore-errors
+                            (when (fboundp 'seshat-reader-dyn--lines-in-rect)
+                              (seshat-reader-translate--expand-rect
+                               (seshat-reader-dyn--lines-in-rect
+                                index x0 y0 x1 y1)
+                               seshat-reader-translate-context-lines))))
+                   (ctx (ignore-errors
+                          (when (and grown
+                                     (fboundp 'seshat-reader-dyn--text-in-rect))
+                            (let* ((bx0 (nth 0 grown))
+                                   (by0 (nth 1 grown))
+                                   (bx1 (nth 2 grown))
+                                   (by1 (nth 3 grown))
+                                   ;; 选区矩形：`:rect' 的坐标已是 1-based 页上的
+                                   ;; float，与行矩形同一坐标系，无需换算。
+                                   (sy0 y0)
+                                   (sy1 y1)
+                                   (above (when (< by0 sy0)
+                                            (seshat-reader-dyn--text-in-rect
+                                             index bx0 by0 bx1 sy0)))
+                                   (below (when (> by1 sy1)
+                                            (seshat-reader-dyn--text-in-rect
+                                             index bx0 sy1 bx1 by1))))
+                              (when (or above below)
+                                (string-join (delq nil (list above below))
+                                             "\n\n")))))))
+              (or
+               ;; 矩形路径：上下文 = 选区上方块 + 下方块，不做「删除选区原文」的
+               ;; 字符串操作（跨行选区与 raw 切片永不相等，剥离命中率恒为 0）。
+               (and (stringp ctx)
+                    (seshat-reader-translate--context-window
+                     ctx nil max-chars))
+               ;; ④ 整页降级：显式传 0-based 页号（省略参数时依赖 selected window）
+               (ignore-errors
+                 (when (fboundp 'seshat-reader-dyn--page-text)
+                   (let ((page-text (seshat-reader-dyn--page-text index)))
+                     (when (stringp page-text)
+                       (seshat-reader-translate--context-window
+                        page-text
+                        text
+                        max-chars)))))))))
+      (error nil))))
+
+(defun seshat-reader-translate--document-title ()
+  "返回最近一次选区所属文档的名字，取不到时返回 nil.
+名字取选区 `:file' 的 `file-name-base'（basename 去掉扩展名），**不输出
+完整路径**：目录层级与文档内容无关，只会白占 prompt 预算，还可能把用户的
+家目录结构带给远端引擎。`seshat-reader-select-last' 没有 `:file'、或它
+不是非空字符串时返回 nil，由调用方替换为「未知文档」。
+
+非纯函数：读全局变量 `seshat-reader-select-last'（不改状态、不调用动态
+模块）。"
+  (let ((file (plist-get seshat-reader-select-last :file)))
+    (when (and (stringp file) (not (string-empty-p (string-trim file))))
+      (file-name-base file))))
+
+(defconst seshat-reader-translate--explain-placeholders
+  '("{{text}}" "{{context}}" "{{doc}}" "{{lang}}")
+  "模板里受支持的占位符列表（逐个完整匹配，不做前缀/大小写放宽）.")
+
+(defconst seshat-reader-translate--explain-brace-sentinel "\0{"
+  "输入值中转义 `{{' 用的哨兵：NUL 后跟 `{'.
+输入值（选区、上下文、文档名、语言对）里的 `{{' 先换成本哨兵，四个占位符
+替换完成后再还原为 `{{'，因此输入值中形如 `{{foo}}' 的片段既不会被替换、
+也不会触发未知占位符判定。NUL 不会出现在模板与 PDF 文本里。")
+
+(defun seshat-reader-translate--explain-escape-value (value)
+  "把输入值 VALUE 里的 `{{' 换成哨兵，返回转义后的字符串；nil 视为空串.
+只转义 `{{'：单个 `{' 不参与占位符语法，无需处理。"
+  (string-replace "{{" seshat-reader-translate--explain-brace-sentinel
+                  (or value "")))
+
+(defun seshat-reader-translate--explain-unknown-placeholder (template)
+  "扫描 TEMPLATE（字符串）里的 `{{[^{}]*}}'，返回首个未知占位符或 nil.
+`{{text}}' / `{{context}}' / `{{doc}}' / `{{lang}}' 视为已知而跳过；只看
+模板本身，**不**判断任何输入值。"
+  (let ((start 0)
+        (unknown nil))
+    (while (and (not unknown)
+                (string-match "{{[^{}]*}}" template start))
+      (let ((placeholder (match-string 0 template)))
+        (if (member placeholder seshat-reader-translate--explain-placeholders)
+            (setq start (match-end 0))
+          (setq unknown placeholder))))
+    unknown))
+
+(defun seshat-reader-translate--explain-request-text (text context title &optional langs)
+  "把 TEXT / CONTEXT / TITLE 装配成送引擎的完整 prompt 文本.
+`seshat-reader-translate-explain-prompt' 为 nil 时原样返回 TEXT：此时不装配，
+只发送纯选区文本，由引擎的 `:root'（system prompt）决定行为。注意
+`reader-explain' 预设的 `:prompt' 已改为纯透传 \"{{text}}\"（解释指令改由
+seshat 装配），因此 nil **不等于**恢复此前的旧中文长 prompt——需要那种效果
+请在配置侧把 `:prompt' 改回长指令。
+
+装配分**两个阶段**，顺序不可颠倒：
+
+1. **先校验模板**：对 `seshat-reader-translate-explain-prompt' 本身扫描
+   `{{[^{}]*}}'，扣掉四个已知占位符后仍有剩余 → 视为未知占位符：`message'
+   警告（文案含「未知占位符」）并**回退返回 TEXT**，绝不把未解析的模板送进
+   引擎。此阶段只读模板，**不对任何输入值做判断**。
+2. **再替换，且输入值必须转义**：四个输入值里的 `{{' 先换成哨兵
+   （`seshat-reader-translate--explain-brace-sentinel'），替换完成后还原为
+   `{{'。这样输入值里的 `{{foo}}' 会原样保留在结果中，既不参与替换、也不
+   触发第 1 阶段的未知占位符判定。
+
+替换用 `string-replace' **逐个替换**，不用 `format-spec'：占位符是
+`{{name}}' 风格，而 `format-spec' 以 `%' 为占位语法，遇到中文与 Markdown
+正文里常见的 `%' 会直接报错。替换顺序：先 `{{context}}'（CONTEXT，nil 视为
+空串）、`{{doc}}'（TITLE，nil 填「未知文档」）、`{{lang}}'（LANGS 经
+`seshat-reader-translate--format-langs' 转成 \"en → zh\"；LANGS 为 nil 时
+取 `seshat-reader-translate-fallback-langs'，仍无法格式化则留空），最后才
+换 `{{text}}'（TEXT）。
+
+除未知占位符那条 warning 外无副作用：不读选区、不调用动态模块。"
+  (let ((template seshat-reader-translate-explain-prompt))
+    (cond
+     ((null template) text)
+     ((seshat-reader-translate--explain-unknown-placeholder template)
+      (message "Seshat Reader translate: 解释 prompt 存在未知占位符（未解析的 `{{'），回退纯选区")
+      text)
+     (t
+      (let* ((lang-str (seshat-reader-translate--format-langs
+                        (or langs seshat-reader-translate-fallback-langs)))
+             (assembled template))
+        (setq assembled
+              (string-replace "{{context}}"
+                              (seshat-reader-translate--explain-escape-value context)
+                              assembled))
+        (setq assembled
+              (string-replace "{{doc}}"
+                              (seshat-reader-translate--explain-escape-value
+                               (or title "未知文档"))
+                              assembled))
+        (setq assembled
+              (string-replace "{{lang}}"
+                              (seshat-reader-translate--explain-escape-value
+                               (or lang-str ""))
+                              assembled))
+        (setq assembled
+              (string-replace "{{text}}"
+                              (seshat-reader-translate--explain-escape-value text)
+                              assembled))
+        (string-replace seshat-reader-translate--explain-brace-sentinel
+                        "{{" assembled))))))
+
+(defconst seshat-reader-translate--chatter-regexp
+  "\\`\\(?:好的\\|以下是\\|下面\\|这段\\|该段\\)[^\n]*[：:]\\s-*\n"
+  "寒暄首行的识别正则：首行以常见寒暄词开头、且以冒号结尾.
+锚定在文本开头（`\\\\='），`[^\\n]*[：:]' 要求冒号是该行最后一个非空白
+字符，因此「这段代码做了什么：说明…」这类正文不会被误判（冒号不在行尾）。")
+
+(defun seshat-reader-translate--strip-chatter (text)
+  "去掉模型输出 TEXT 正文前的寒暄首行，其余情况原样返回.
+仅当**首行**以「好的 / 以下是 / 下面 / 这段 / 该段」开头、且该行以全角
+`：'或半角 `:' 结尾时，删掉该行与其后的空行，返回 `string-trim' 后的
+剩余文本；不做任何其它清洗（缩进、编号、多余空行一律保留），以免误删正文。
+删掉寒暄后剩余内容为空（模型只回了一行寒暄）时仍原样返回 TEXT——宁可留着
+寒暄，也不把整段回答抹成空。
+
+TEXT 为 nil 或非字符串时原样返回。本函数是纯函数，不读写任何全局状态；
+开关 `seshat-reader-translate-strip-chatter' 由调用方
+（`seshat-reader-translate--record-result'）判断。"
+  (if (not (stringp text))
+      text
+    (if (string-match seshat-reader-translate--chatter-regexp text)
+        (let ((remainder (string-trim (substring text (match-end 0)))))
+          (if (string-empty-p remainder) text remainder))
+      text)))
+
+(defun seshat-reader-translate--truncate-selection (text)
+  "按 `seshat-reader-translate-explain-max-chars' 截断解释用的选区原文 TEXT.
+长度未超上限、上限非正整数（关闭截断）、或 TEXT 非字符串时原样返回；
+超限时保留前上限个字符并追加标注 `（选区过长，以上为节选）'。
+只用于**送引擎**的文本：面板原文引用块与追问来源仍取完整选区
+（`seshat-reader-translate--selection-source-text'）。纯函数。"
+  (let ((max seshat-reader-translate-explain-max-chars))
+    (if (or (not (stringp text))
+            (not (integerp max))
+            (< max 1)
+            (<= (length text) max))
+        text
+      (concat (substring text 0 max) "\n\n（选区过长，以上为节选）"))))
+
+(defun seshat-reader-translate--engine-label (translator)
+  "返回 TRANSLATOR 首个引擎的「模型 @ 主机」描述，取不到时返回空串.
+从 `(oref translator engines)' 取**第一个**引擎，只读 `model' 与 `host'
+两个槽（`slot-exists-p' 守卫，槽不存在或值为空则省略），拼成如
+「（deepseek-chat @ api.deepseek.com）」的字符串；两者都读不到时返回空串，
+便于调用方直接拼进 `message'。
+
+**绝不读取 `key' / `auth' / `token' 一类凭据槽**：本函数的返回值会进
+`message' 与 `*Messages*'，只允许出现模型名与主机名。纯函数（只读对象
+槽，不修改任何状态）。"
+  (let ((engines (and (eieio-object-p translator)
+                      (slot-exists-p translator 'engines)
+                      (oref translator engines)))
+        parts)
+    (let ((engine (car-safe (and (listp engines) engines))))
+      (when (eieio-object-p engine)
+        ;; 槽名以字面量给出（`oref' 是宏，槽名不能走变量）；两个槽名已在
+        ;; 文件头 `eval-when-compile' 里登记为 `slot-name'，编译期不会报
+        ;; 「Unknown slot」。只读 model / host，**不读任何 key 类槽**。
+        (let ((model (and (slot-exists-p engine 'model)
+                          (oref engine model)))
+              (host (and (slot-exists-p engine 'host)
+                         (oref engine host))))
+          (dolist (value (list model host))
+            (when (and (stringp value) (not (string-empty-p (string-trim value))))
+              (push (string-trim value) parts))))))
+    (if parts
+        (format "（%s）" (mapconcat #'identity (nreverse parts) " @ "))
+      "")))
+
+(defun seshat-reader-translate--preset-translator (preset)
+  "按 PRESET 名返回对应的 gt-translator.
+先查 `seshat-reader-translate-presets'，未命中再查 `gt-preset-translators'
+（后者经 `gt-ensure-plain' 归一化）。值为函数时按 thunk 调用一次取结果。
+两表都未命中、或 thunk 返回 nil 时返回 nil。"
+  (let ((value (or (alist-get preset seshat-reader-translate-presets)
+                   (alist-get preset (gt-ensure-plain gt-preset-translators)))))
+    (if (functionp value) (funcall value) value)))
+
+(defun seshat-reader-translate--translator (preset text langs &optional context request-text)
   "为 PRESET、TEXT 与 LANGS 构造一个可供 gt 使用的翻译器对象.
-PRESET 是 `gt-preset-translators' 中的预设名（符号）；命中时**克隆**该
-预设（`clone'），未命中时 `message' 提示并回退到内置的 youdao/google
+PRESET 是预设名（符号）：先查 `seshat-reader-translate-presets'，未命中
+再查 `gt-preset-translators'（见
+`seshat-reader-translate--preset-translator'）；命中时**克隆**该预设
+（`clone'），未命中时 `message' 提示并回退到内置的 youdao/google
 翻译器。预设对象是 gt 的单例缓存，直接改写其槽会污染其他使用者，因此
 一律只把改动施加在克隆结果上。
 
@@ -697,6 +1191,13 @@ TEXT 为待翻译的纯文本；LANGS 为目标语言列表（如 (en zh)）。�
 `gt-taker-pick' 按段落切分传入的字符串。渲染方式取自
 `seshat-reader-translate-render'。返回设置好 taker 与 render 的
 translator 对象；调用前会先确保 gt 已加载。
+
+REQUEST-TEXT 为调用方**已装配好的** prompt 文本（解释路径用，见
+`seshat-reader-translate--explain-request-text'），非 nil 时填入 taker 的
+`:text'，nil 时用 TEXT —— 本函数自身不读选区、不调动态模块、不装配模板。
+注意只有 taker 的 `:text' 用它；追问状态（
+`seshat-reader-translate--follow-up-reset-state'）与面板原文引用块（`%q'）
+仍取纯选区 TEXT。
 
 CONTEXT 用于区分预设缺失时的提示文案，并决定面板模板，取 `translate'
 （默认，纯翻译）或 `explain'（解释）：前者提示回退到内置翻译器并用
@@ -708,7 +1209,7 @@ CONTEXT 用于区分预设缺失时的提示文案，并决定面板模板，取
 标题 / 语言对 / 语境与 translator 身份（供
 `seshat-reader-translate--stream-sync' 的守卫与骨架创建使用）。"
   (seshat-reader-translate--ensure-gt)
-  (let* ((preset-trans (alist-get preset (gt-ensure-plain gt-preset-translators)))
+  (let* ((preset-trans (seshat-reader-translate--preset-translator preset))
          (title (if (eq context 'explain) "Seshat 解释" "Seshat 译文"))
          (trans (if preset-trans
                     (clone preset-trans)
@@ -718,7 +1219,7 @@ CONTEXT 用于区分预设缺失时的提示文案，并决定面板模板，取
                            preset)
                   (gt-translator :engines (list (gt-youdao-dict-engine)
                                                 (gt-google-engine))))))
-    (oset trans taker (gt-taker :text text :pick nil :langs langs))
+    (oset trans taker (gt-taker :text (or request-text text) :pick nil :langs langs))
     (oset trans render (seshat-reader-translate--render-object
                         seshat-reader-translate-render title langs context))
     (when seshat-reader-translate-stream
@@ -915,7 +1416,14 @@ TEXT。posframe 路径与面板路径（`seshat-reader-translate--panel-result'�
 共用本函数以保证失败语义一致。注意调用本函数的翻译/解释命令在 `gt-start'
 之前已把该变量清为 nil，故端到端表现为「失败后变量为 nil」，而面板 buffer
 的显示内容仍保留上一次的渲染结果（两层语义详见
-`seshat-reader-translate-last-result' 的文档）。"
+`seshat-reader-translate-last-result' 的文档）。
+
+成功分支写入的是**净化后**的文本：`seshat-reader-translate-strip-chatter'
+非 nil（默认）时先经 `seshat-reader-translate--strip-chatter' 去掉寒暄
+首行，并返回净化后的文本——面板路径与本函数的返回值因此一致，四条
+「翻译/解释 × 面板/posframe」组合都生效。流式增量路径
+（`seshat-reader-translate--stream-sync'）不经过本函数，其面板内容保持
+模型原样输出。"
   (let ((text (car extracted))
         (failed (cdr extracted)))
     (cond
@@ -926,7 +1434,10 @@ TEXT。posframe 路径与面板路径（`seshat-reader-translate--panel-result'�
       (message "Seshat Reader translate: 翻译失败（在渲染缓冲区中未找到译文）。")
       nil)
      (t
-      (setq seshat-reader-translate-last-result text)))))
+      (setq seshat-reader-translate-last-result
+            (if seshat-reader-translate-strip-chatter
+                (seshat-reader-translate--strip-chatter text)
+              text))))))
 
 (defun seshat-reader-translate--capture-result ()
   "从当前缓冲区捕获纯译文并写入 `seshat-reader-translate-last-result'.
@@ -1326,11 +1837,12 @@ eieio 对象时返回 nil，不报错。"
 
 (defun seshat-reader-translate--preset-chatgpt-engine (preset)
   "返回 PRESET 预设翻译器中的第一个 ChatGPT 引擎**原对象**，没有则 nil.
-PRESET 是 `gt-preset-translators' 的键。预设缺失、或其中只有 youdao/google
-这类纯翻译引擎时返回 nil——调用方据此报 `user-error'（**不做文本拼接降级**：
-翻译引擎没有对话语义，降级只会产出误导性答案）。返回的是预设里的原对象，
-调用方必须 `clone' 后再改槽。"
-  (when-let* ((trans (alist-get preset (gt-ensure-plain gt-preset-translators))))
+PRESET 先查 `seshat-reader-translate-presets'，未命中再查
+`gt-preset-translators'（见 `seshat-reader-translate--preset-translator'）。
+预设缺失、或其中只有 youdao/google 这类纯翻译引擎时返回 nil——调用方据此
+报 `user-error'（**不做文本拼接降级**：翻译引擎没有对话语义，降级只会产出
+误导性答案）。返回的是预设里的原对象，调用方必须 `clone' 后再改槽。"
+  (when-let* ((trans (seshat-reader-translate--preset-translator preset)))
     (cl-find-if #'seshat-reader-translate--chatgpt-engine-p
                 (ensure-list (gt-ensure-plain (oref trans engines))))))
 
@@ -1570,29 +2082,41 @@ youdao/google 翻译器。呈现方式见 `seshat-reader-translate-render'：默
 直接冒泡（Emacs 显示提示且不打印 backtrace）；构建翻译器与启动翻译阶段
 （`seshat-reader-translate--translator' / `gt-start'）的一般错误被
 `condition-case' 捕获并以 `message' 明确提示，`user-error' 仍原样冒泡。
+错误文案形如 `翻译失败（模型 @ 主机）：<原因>'——引擎标识取
+`seshat-reader-translate--engine-label'，只含模型名与主机名，不含任何
+凭据。
 
 本命令在启动翻译前会把 `seshat-reader-translate-last-result' 清为 nil，
 并记录启动时间到 `seshat-reader-translate--active'，以启用
 `seshat-reader-translate--capture-result' 的捕获窗口守卫（避免旧译文被
-误存，也避免其它 go-translate 用法污染结果）。"
+误存，也避免其它 go-translate 用法污染结果）。
+
+翻译路径不做长度截断（选区通常只有几个词）；解释路径的长度护栏见
+`seshat-reader-translate-explain-selection'。"
   (interactive (list (when current-prefix-arg (read-string "目标语言: "))))
   (let* ((text (seshat-reader-translate--selection-text))
          (langs (if (and (stringp target-lang)
                          (not (string-empty-p (string-trim target-lang))))
                     (seshat-reader-translate--target-langs target-lang)
                   seshat-reader-translate-fallback-langs)))
-    (condition-case err
-        (let ((trans (seshat-reader-translate--translator
-                      seshat-reader-translate-preset text langs 'translate)))
-          (seshat-reader-translate--install-capture-hook-for-mode)
-          (setq seshat-reader-translate-last-result nil)
-          (setq seshat-reader-translate--active (float-time))
-          (gt-start trans))
-      (user-error
-       (signal (car err) (cdr err)))
-      (error
-       (message "Seshat Reader translate: 翻译失败：%s"
-                (error-message-string err))))))
+    ;; `trans' 在 `condition-case' 之外绑定：错误分支要靠它取引擎标识
+    ;; （见 `seshat-reader-translate--engine-label'），绑定在受保护体内部
+    ;; 的 `let' 里时 handler 看不到。
+    (let (trans)
+      (condition-case err
+          (progn
+            (setq trans (seshat-reader-translate--translator
+                         seshat-reader-translate-preset text langs 'translate))
+            (seshat-reader-translate--install-capture-hook-for-mode)
+            (setq seshat-reader-translate-last-result nil)
+            (setq seshat-reader-translate--active (float-time))
+            (gt-start trans))
+        (user-error
+         (signal (car err) (cdr err)))
+        (error
+         (message "Seshat Reader translate: 翻译失败%s：%s"
+                  (if trans (seshat-reader-translate--engine-label trans) "")
+                  (error-message-string err)))))))
 
 (defun seshat-reader-translate-explain-selection (&optional target-lang)
   "解释（而非纯翻译）最近一次鼠标选区，译文经信息面板展示（默认）或 posframe 弹出.
@@ -1612,28 +2136,66 @@ buffer（不再弹 posframe），面板可用 `q'
 `seshat-reader-translate-selection'（面板路径在 `:then' 回调内写入），可用
 `seshat-reader-translate-save-as-annotation' 把结果存为批注。错误处理与
 `seshat-reader-translate-selection' 一致：`user-error' 冒泡，其余一般
-错误捕获后 `message'。本命令同样会在启动前清空
-`seshat-reader-translate-last-result' 并记录启动时间到
+错误捕获后 `message'，文案形如 `解释失败（模型 @ 主机）：<原因>'
+（引擎标识见 `seshat-reader-translate--engine-label'，不含凭据）。本命令
+同样会在启动前清空 `seshat-reader-translate-last-result' 并记录启动时间到
 `seshat-reader-translate--active'（预设缺失时按 `explain' 语境提示回退
-为普通翻译）。"
+为普通翻译）。
+
+解释的输入是「上下文 + 原文 + 指令」的**装配串**（由
+`seshat-reader-translate--explain-request-text' 与
+`seshat-reader-translate-explain-prompt' 生成），经
+`seshat-reader-translate--translator' 的第 5 参（REQUEST-TEXT）只填进
+taker 的 `:text'；面板原文引用块（`%q'）与 `last-result' 语义不变，仍取
+纯选区。上下文取不到（无动态模块、无 `:rect'、结果为空）时静默退化为
+「原文 + 指令」；把 `seshat-reader-translate-explain-prompt' 设为 nil 则
+退回纯选区（旧行为），同时**跳过上下文提取**（不装配就用不上它）。
+上下文提取在 `condition-case' 之外执行：它自身静默降级，不该被「解释
+失败」捕获后误报。
+
+长度护栏：装配前先用 `seshat-reader-translate--truncate-selection' 按
+`seshat-reader-translate-explain-max-chars' 截断**送模型的选区原文**，
+超限时尾部追加「（选区过长，以上为节选）」；面板引用块与追问来源仍取
+完整选区文本。"
   (interactive (list (when current-prefix-arg (read-string "目标语言: "))))
   (let* ((text (seshat-reader-translate--selection-text))
          (langs (if (and (stringp target-lang)
                          (not (string-empty-p (string-trim target-lang))))
                     (seshat-reader-translate--target-langs target-lang)
-                  seshat-reader-translate-fallback-langs)))
-    (condition-case err
-        (let ((trans (seshat-reader-translate--translator
-                      seshat-reader-translate-explain-preset text langs 'explain)))
-          (seshat-reader-translate--install-capture-hook-for-mode)
-          (setq seshat-reader-translate-last-result nil)
-          (setq seshat-reader-translate--active (float-time))
-          (gt-start trans))
-      (user-error
-       (signal (car err) (cdr err)))
-      (error
-       (message "Seshat Reader translate: 解释失败：%s"
-                (error-message-string err))))))
+                  seshat-reader-translate-fallback-langs))
+         ;; 送模型的是**截断后**的 `send-text'（长度护栏见
+         ;; `seshat-reader-translate-explain-max-chars'）；`text' 未截断，
+         ;; 仍供面板 `%q'、`last-result' 语义与追问来源使用。
+         (send-text (seshat-reader-translate--truncate-selection text))
+         ;; 上下文提取失败一律静默（见 `seshat-reader-translate--context-text'），
+         ;; 故放在 `condition-case' 之外：不让「解释失败」把它一并报出。
+         ;; 模板为 nil 时不装配 prompt，也就不需要上下文——省掉一次整页文本
+         ;; 提取（每次都要走动态模块）。
+         (context-text (when seshat-reader-translate-explain-prompt
+                         (seshat-reader-translate--context-text)))
+         (request-text (seshat-reader-translate--explain-request-text
+                        send-text context-text
+                        (seshat-reader-translate--document-title)
+                        langs)))
+    ;; `trans' 在 `condition-case' 之外绑定：错误分支要靠它取引擎标识
+    ;; （见 `seshat-reader-translate--engine-label'），绑定在受保护体内部
+    ;; 的 `let' 里时 handler 看不到。
+    (let (trans)
+      (condition-case err
+          (progn
+            (setq trans (seshat-reader-translate--translator
+                         seshat-reader-translate-explain-preset text langs 'explain
+                         request-text))
+            (seshat-reader-translate--install-capture-hook-for-mode)
+            (setq seshat-reader-translate-last-result nil)
+            (setq seshat-reader-translate--active (float-time))
+            (gt-start trans))
+        (user-error
+         (signal (car err) (cdr err)))
+        (error
+         (message "Seshat Reader translate: 解释失败%s：%s"
+                  (if trans (seshat-reader-translate--engine-label trans) "")
+                  (error-message-string err)))))))
 
 (defun seshat-reader-translate-save-as-annotation ()
   "把最近一次译文存为服务端批注（**侧车**，不写回文档）.

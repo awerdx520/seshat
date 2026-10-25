@@ -716,3 +716,43 @@ refit 按当前窗口尺寸做一次几何适配 + 重渲染，一次到位。
 **代价与约束**：① 想知道选中的具体文字必须另取（`seshat-reader-select-last` / kill ring），回显层不再提供摘要；② `seshat-reader-select-message-limit` 删除后配置侧残留的 `setq` 不报错但**静默失效**（已在 `CHANGELOG.md`「移除」与 `docs/configuration.md` 写明）；③ `all` 的输出更长，多引擎 + 长原文时面板内容显著变长（由固定尺寸 + 内部滚动承接）；④ 失败引擎必须跳过（`gt-buffer-render-error-face`），否则错误块也会被标上来源，且 `first` 需**顺延**到下一个成功片段。
 
 **影响**：`seshat-reader-select.el`（回显两分支、删常量）、`seshat-reader-translate.el`（`--format-engine-results`）、新增测试 `emacs/tests/seshat-reader-select-report-test.el`（7 例，含 `(should-not (boundp 'seshat-reader-select-message-limit))`）；`docs/emacs-reader.md` §5「框选取文」与 §6「多引擎结果」、`docs/configuration.md`、`CHANGELOG.md` 同步。
+
+## 2026-10-25 · 阅读器 gt 预设归属改为 seshat 自有表（含回落）
+
+**决策**：seshat 的两个 gt 预设（`reader` / `reader-explain`）改存 **seshat 自有的 `seshat-reader-translate-presets`**（元素 `(NAME . TRANSLATOR)` 或 `(NAME . THUNK)`），**不再 push 进 gt 的全局 `gt-preset-translators`**。查表统一走 `seshat-reader-translate--preset-translator`，顺序为 **seshat 表 → `gt-preset-translators`**（自有表命中优先，未命中回落全局表）。配套：`reader-explain` 的引擎 `:prompt` 改为纯透传 `"{{text}}"`；DeepSeek key 由配置侧引擎子类 `thomas-seshat-chatgpt-engine` 覆写 `gt-resolve-key` 从 `DEEPSEEK_API_KEY` 取，**删除** `(setq gt-chatgpt-key …)`。
+
+**理由**：`gt-preset-translators` 是 gt **自用**的全局预设表，`gt-translate`（前缀选预设）与 `gt-setup` 都读它——把 seshat 的两个预设 push 进去，等于让 `reader` / `reader-explain` 出现在用户**所有** gt 用法的预设选择列表里，这是纯粹的命名空间污染：用户按 `M-x gt-translate` 看到「reader」不会知道那是阅读器专用、更不知道它取 `DEEPSEEK_API_KEY`。同理 `(setq gt-chatgpt-key (getenv "DEEPSEEK_API_KEY"))` 会让**任意** chatgpt 引擎（含用户自己对 OpenAI 的用法）拿着 DeepSeek key 打各自端点，属于跨功能副作用。**保留回落**而不是硬切，是为了让旧配置（预设仍在全局表里）继续工作、零迁移成本，也让既有大量引用 `gt-preset-translators` 的 ERT 无需改动。
+
+**代价与约束**：① 查表变成两处（`--translator` 与追问路径 `--preset-chatgpt-engine` 必须共用同一辅助函数，否则迁出全局表后追问立刻 `user-error`，该坑在 T1.5 已修）；② 新增一层「thunk 形态」，因为配置加载时 gt 可能尚未加载、不能直接 `make-instance`；③ 隔离靠**配置侧不再 push** 保证，属跨仓库不变量，故在 thomas-emacs `AGENTS.md` 登记机械检查（`(assq 'reader gt-preset-translators)` 应为 nil、配置文本不得含 `(setq gt-chatgpt-key`）。
+
+**影响**：`seshat-reader-translate.el` 新增 `seshat-reader-translate-presets` + `--preset-translator`，`--translator` / `--preset-chatgpt-engine` 各改一行查表；`thomas-emacs/lisp/init-tools.el` 两个预设的 push 目标改表并新增引擎子类；`test/init-smoke-test.el` 新增两条文件级断言；`docs/configuration.md` / `docs/llm.md` / `docs/emacs-reader.md` / 两仓 `CHANGELOG.md` 同步。
+
+## 2026-10-25 · 不克隆、不改 gt 引擎槽：解释 prompt 走 taker text
+
+**决策**：解释需要的结构化指令与上下文**全部装配成一段字符串，塞进 `gt-taker` 的 `:text`**（`--translator` 新增可选第 5 参 `request-text`，只做 `(oset trans taker (gt-taker :text (or request-text text) …))`），**不新建、不 `oset`、不克隆任何 gt 引擎实例的槽**；预设引擎的 `prompt` 槽由配置侧设为纯透传 `"{{text}}"`。
+
+**理由**：① gt 的 engine / parser / render 都继承 `gt-single`，其 `make-instance` 以「槽参数的 sha1」为键做 **class 级实例缓存**——`eieio` 的 `clone` 是否绕过该缓存**未实测**（`describe-function clone` 只说是 generic 并带 PARAMS），一旦命中缓存，`(oset copy prompt …)` 改的就是**全局共享的那个引擎实例**，把 seshat 的解释指令泄漏给用户其它 gt 用法，且不会报错、只会「莫名多出一段中文指令」。② 新建引擎实例要求 seshat 硬编码引擎类与厂商参数（host / model / key），违反「seshat 只做桥接」的职责边界。③ 已验证安全的路径是 **translator 层克隆**：`gt-translator` 的类定义是 `(defclass gt-translator ())`，**不继承 `gt-single`**，故现有「克隆 translator 后只 `oset` `taker` / `render` 两个槽」不经过实例缓存，无污染风险——保留这条路径、把 prompt 需求也压进它的 `taker` 槽，是不动引擎的唯一自洽解法。④ `gt-chatgpt-engine` 的 `prompt` 支持字符串模板 + `{{text}}` 占位是公开用法，配置侧一行透传即可，不构成 hack。
+
+**代价与约束**：① prompt 只能以 put-string 方式进入，无法使用引擎级多轮 `messages`（首轮解释不是 messages 形式，追问才用）；② 配置侧**必须**把 `reader-explain` 的 `:prompt` 写成 `"{{text}}"`，写长 prompt 会变成双层指令（已在 `docs/configuration.md` 与配置仓注释里显式约定）；③ 与 childframe 计划的 T4/T5（流式 / 追问）在 `--translator` 上有接口重叠，只能加**可选**参数、不得重排既有参数。
+
+**影响**：`seshat-reader-translate.el` 新增 `seshat-reader-translate-explain-prompt` / `--document-title` / `--explain-request-text`，`--translator` 追加可选第 5 参 `request-text`；面板 `%q` 与 `last-result` 语义不变（仍取纯选区 / 模型输出）。
+
+## 2026-10-25 · 解释上下文取「行矩形扩行」，带两级降级
+
+**决策**：解释的上下文优先用「**选区触达的整行矩形 → 纵向按行高均值上下各扩 N 行 → 取该矩形 → 拆成「选区上方块」与「下方块」两次 `--text-in-rect`（天然不含选区，不做字符串剥离）→ 窗口截断**」这条链（`--expand-rect` / `--context-window` / `--context-text`），失败时降级为「**整页文本 + 以选区为中心的窗口截取**」，再失败返回 `nil`（退化为「纯选区 + 指令」）。页号取 `seshat-reader-select-last` 的 `:page`（1-based）后**转 0-based** 再喂 C 模块。总长上限 `seshat-reader-translate-context-max-chars`（默认 `1200`）。（修订 2026-10-25：初版用精确字符串删除选区原文，因 `--text-in-rect` 同段落内不插换行分隔导致剥离命中率为 0，真实 PDF 复验后改为上下块取法。）
+
+**理由**：解释质量的瓶颈是「模型看不到上文」，而**同页邻近段落**是性价比最高的一档上下文——它把代词指代、术语首次定义、公式引用都带进来了，代价只有一页内的几百字符。选「行矩形扩行」而不是「整页文本」是因为整页文本在双栏 / 表格 / 脚注混杂的页面上是噪声，且长页会轻易吃掉几千字符；行矩形已经由 C 侧 `--lines-in-rect` 按行边界求出（整行宽度），扩行只是把一个紧贴选区的窄矩形变成「选区上下几行」的块，语义与阅读者的视野一致。降级链的两级是必要的：`--lines-in-rect` 在无文本层页面或旧 `.so` 上不可用，而 `--page-text`（按页取全文）几乎总可用——**没有它，用户机器上的行为会因是否构建了最新 `.so` 而分裂**。
+
+**代价与约束**：① 行高取均值外扩是**启发式**（旋转页 / 竖排 / 极端行距下扩出的范围可能偏大或偏小），无法保证恰好「N 行」；② 每步都可能触碰 C 模块，全程 `condition-case` + 静默返回 `nil`——批处理与未构建 `.so` 是常态，**不得** `message` 报错；③ 上下文文本依赖 `--page-text` / `--text-in-rect` 的软换行粘接（行间无 `\n`），所以送模型前还要过上游 `gt-source-text-transformer` 归一化（见 `openspec/tech-debt.md`）；④ 隐私面扩大（见下条「影响」与 `docs/llm.md`）。
+
+**影响**：`seshat-reader-translate.el` 新增 `seshat-reader-translate-context-enabled` / `-context-lines` / `-context-max-chars` 与 `--expand-rect` / `--context-window` / `--context-text`；`--context-text` 是**唯一**读 C 模块的新入口（内部把 `:page` 转 0-based）。隐私影响：解释发送数据由「仅选区」变为「选区 + 同页邻近上下文（≤1200 字符）」，`docs/llm.md`「隐私提示」与 `CHANGELOG.md`「变更」同步写明；关闭开关 `seshat-reader-translate-context-enabled` 可退回仅选区。
+
+## 2026-10-25 · 与 childframe 计划的接口承接（T4/T5 已落地）
+
+**决策**：本计划（预设隔离 + 解释质量）**不改造**流式（`--enable-stream` / `seshat-reader-translate-stream`）与多轮追问（`--follow-up-*`），二者由并行计划 `2026-10-24-emacs-reader-panel-childframe-and-ux` 的 T4/T5 实现并已随 commit `8d43480` 落地。两计划的接口约定为：① 追问首轮 user message **复用 `seshat-reader-translate--explain-request-text` 的产物**（即已装配好的「指令 + 上下文 + 原文」），不再另拼一份首轮提示；② 任何一方要改成「克隆引擎再改槽」的方案，**必须先做 `eieio clone` vs `gt-single` 实例缓存的行为 spike**，否则按本条 D2 一律禁止；③ `--translator` 的签名只能**追加可选参数**，不得重排或重命名既有参数（childframe 侧为 4 参调用，本计划加了可选第 5 参）。
+
+**理由**：两计划在 `--translator`、`--render-object`、`--record-result` 三处必然交汇，各自独立演进会互相打脸；把「首轮 request-text 由谁生产」定成单向依赖（childframe 消费、本计划生产），可以避免出现两份首轮 prompt 定义。而「先 spike 再克隆」是 D2 的直接推论：`gt-single` 的 class 级实例缓存未验证时，克隆可能就是原地改全局对象——流式需要 `stream` 槽、追问需要 `prompt` 槽，两者都只能改引擎槽，因此这条前置对 childframe 侧是**阻断性**的，不是建议。
+
+**代价与约束**：① childframe 侧的既有实现（`8d43480`）确实用了 `(clone engine)` + `oset stream` / `oset prompt`，该路径**至今无测试支撑**，属已知未验证面积（记 `openspec/tech-debt.md` 第 1 条）；② 追问的首轮消息来源被固定到 `--explain-request-text`，若将来该函数的契约（纯字符串、nil 模板时原样返回选区）变更，追问侧必须同步；③ 两条计划并行期曾出现「查表有两处」的冲突面（`--translator` 与 `--preset-chatgpt-engine`），已在 T1.5 统一为 `--preset-translator`。
+
+**影响**：`seshat-reader-translate--translator` 保持兼容签名；`openspec/tech-debt.md` 新增「`eieio clone` vs `gt-single` 缓存未验证」条；本文档 D2 与本条共同构成「不克隆引擎」的决策依据。

@@ -186,12 +186,41 @@ SM-2 易度因子下限 1.3、默认 2.5，判定「答对」的最低评分为 
 | `seshat-reader-translate-save-as-annotation` | `M-x` / 面板内 `C-c C-s` | 把最近一次译文 / 解释存为服务端批注（复用 M11.3 链路） |
 
 **引擎**：翻译走 youdao-dict + google（gt 预设 `reader`）；解释走 `gt-chatgpt-engine`
-（gt 预设 `reader-explain`，可指向任意 OpenAI 兼容端点，如 DeepSeek）。两个预设**定义在
-用户配置侧**（`thomas-emacs/lisp/init-tools.el`），阅读器按预设名取用、缺失时回退内置默认。
+（gt 预设 `reader-explain`，可指向任意 OpenAI 兼容端点，如 DeepSeek）。
 
-**隐私提示**：**选中的文本会发送到所配置的引擎 / 端点**（翻译默认的 youdao/google 与解释
-默认的 OpenAI 兼容端点均可能为云端服务）。如需本地处理，可改用本地模型端点（例如把
-`reader-explain` 预设指向本机 Ollama 的 OpenAI 兼容接口）。
+**预设来源与隔离**：两个预设定义在用户配置侧（`thomas-emacs/lisp/init-tools.el`），但
+**不再进 gt 的全局预设表 `gt-preset-translators`**，而是放进 seshat 自有的
+`seshat-reader-translate-presets`。查表顺序是 **seshat 表 → `gt-preset-translators`**：
+自有表命中优先，落到全局表时行为与改造前一致，故把预设留在全局表里的旧配置**无需迁移**。
+这样做的目的是 `reader` / `reader-explain` 不出现在 `M-x gt-translate` 的预设选择列表里、
+不影响用户其它 gt 用法；预设缺失时阅读器回退内置默认。
+
+**解释的 prompt 由 seshat 装配（引擎槽零改动）**：送模型的完整文本由 seshat 组装后交给 gt
+的 taker（结构化指令 + 同页上下文 + 选区原文），预设引擎的 `:prompt` 因此必须是**纯透传**
+`"{{text}}"`——引擎侧再写长 prompt 会变成双层指令。这样做的原因是 gt 的 engine / parser /
+render 都继承 `gt-single`，其 `make-instance` 以槽参数为键做 **class 级实例缓存**，
+「克隆引擎再改槽」可能根本没克隆、会污染全局引擎实例；而 `gt-translator` 不继承
+`gt-single`，故只在 translator 层克隆（`taker` / `render` 两个槽）是安全的。
+
+**key 的来源**：DeepSeek key 由 `thomas-emacs` 侧的引擎子类 `thomas-seshat-chatgpt-engine`
+覆写 `gt-resolve-key` 从 `DEEPSEEK_API_KEY` 环境变量取（取不到时回退 gt 默认链
+authinfo → `gt-chatgpt-key` → `OPENAI_API_KEY`）。配置侧**不再** `setq gt-chatgpt-key`——
+改全局变量会让用户其它 gt chatgpt 用法也用 DeepSeek key 打各自端点。
+
+**长度护栏与输出净化**：解释送模型的选区原文截断到 `seshat-reader-translate-explain-max-chars`
+（默认 `2000`，超出时尾部加「（选区过长，以上为节选）」）；模型输出的寒暄首行由
+`seshat-reader-translate-strip-chatter`（默认 `t`）去掉。解释 / 翻译失败时 `message` 会追加
+引擎标识 `（model @ host）`，**不含任何 key**。
+
+**隐私提示**：**解释时发送到引擎的数据不再只是选区**——而是「**选区原文 + 同一页的邻近
+上下文**」，其中上下文 = **选区上方块 + 选区下方块**（各向外扩
+`seshat-reader-translate-context-lines` 行，默认 `2`；两块分别取矩形文本后拼接，**不含选区
+本身**；上下文总长上限 `seshat-reader-translate-context-max-chars`，默认 `1200` 字符）。
+翻译仍只发送选区文本。
+默认的 youdao/google 与解释默认的 OpenAI 兼容端点**均可能为云端服务**，即同页邻近正文也会
+离开本机。**缩小暴露面**：`(setq seshat-reader-translate-context-enabled nil)` 只送选区，
+或调小 `seshat-reader-translate-context-lines` / `-context-max-chars` 降低数据量。如需本地
+处理，可改用本地模型端点（例如把 `reader-explain` 预设指向本机 Ollama 的 OpenAI 兼容接口）。
 
 **后续计划**：待服务端补齐 LLM HTTP 端点后，可把阅读器翻译 / 解释切换为「服务端统一入口 +
 本地节点路由」（见 [`openspec/tech-debt.md`](../openspec/tech-debt.md)「服务端 LLM 端点缺口」条）。

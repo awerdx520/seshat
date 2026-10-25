@@ -2,11 +2,15 @@
 
 ## 当前状态
 
-- 阶段：Phase 3（Implement）· 进行中
-- 已确认：方案 ✅（用户 2026-10-25 确认；Q1 独立计划 / Q2 seshat 默认 prompt 且可覆盖 / Q3 子类 override）
+- 阶段：Phase 4（Review & Document）· 已完成
+- 已确认：方案 ✅（用户 2026-10-25 确认：Q1 独立计划 / Q2 seshat 默认 prompt 且可覆盖 / Q3 子类 override）
 - 已确认：计划 ✅（用户 2026-10-25 确认）
-- 独立审查：plan-reviewer ⚠️ 需修订（4 major / 7 minor）→ 19 处修订 + 2 处补强 → 复审余 2 处 → 已修，无剩余 blocking
-- 下一步：T0 进行中（安全点 + 基线）；T0 完成后依序 T1 → T2 → T3 → T4 → T5 → T6
+- 独立审查：plan-reviewer 需修订（4 major / 7 minor）→ 全部修订 → 复审余 2 处 → 已修
+- 代码审查：code-reviewer ✅ 通过（0 blocking / 0 major / 5 minor）→ 4 项已修（T6d），1 项记 tech-debt
+- T0 ✅ / T1 ✅ / T1.5 ✅ / T2 ✅ / T3 ✅ / T4 ✅ / T5 ✅ / T6a ✅ / T6b ✅ / T6b-3 ✅ / T6d ✅ / T6c ✅（归档）
+- 验证：L1 ✅（make all exit 0、translate.el 0 警告、checkdoc 0）· L2 ✅（25 文件 / 896 例 / 0 unexpected / 0 skipped）· L3a ✅（真实 PDF 页顶/中部选区、gt 隔离阻断项）
+- L3b（用户真机目视）：真实 LLM 回复质量与面板观感待用户验收
+- 归档：本文件已移入 `openspec/completed/`
 
 ## 目标
 
@@ -15,7 +19,7 @@
 
 ## 非目标
 
-- 不做流式渲染、追问、面板 childframe —— 属 active 计划 `2026-10-24-emacs-reader-panel-childframe-and-ux` 的 T4/T5，本计划在其之上先行落地，实施时不得改动该计划的渲染分支。
+- 不做流式渲染、追问的**改造** —— 它们已由并发会话在 commit `8d43480` 落地（属 active 计划 `2026-10-24` 的 T4/T5）；本计划只在其之上追加「预设隔离 + 解释上下文/prompt」，**不得改动其流式与追问代码**（`--enable-stream` / `--follow-up-*` / `--stream-sync`）。
 - 不改 C 模块（`emacs/seshat-reader/render/`）、不改 `seshat-reader-select.el` / `seshat-reader-sidebar.el` / `seshat-reader-etaf.el`。
 - **不克隆、不新建、不 `oset` 任何 gt 引擎实例的槽**（原因见 D2）。
 - 不改 go-translate（gt）源码。
@@ -32,7 +36,9 @@
 | F6 | 取上下文的能力已具备：`seshat-reader-dyn--page-text`（0/1 参：可按页）、`seshat-reader-dyn--text-in-rect`（5 参）、`seshat-reader-dyn--lines-in-rect`（5 参，返回选区触达的**整行**矩形） | `render/render-core.c` 的 `register_module_func` 段 |
 | F7 | 选区的 `seshat-reader-select-last` 含 `:text` / `:page`（1-based）/ `:rect`（bbox）/ `:file` | `seshat-reader-select.el` 的 `seshat-reader-select-extract` |
 | F8 | thomas-emacs 的 `gt-source-text-transformer`（`+thomas/gt-normalize-source-text`）对每个送引擎的 text 做软换行归一化；**保护行正则**（`#`/`>`/`-`/`1.`/```/≥2 空格缩进）的行保留换行，段落间空行保留 | `thomas-emacs/site-lisp/thomas-text-normalize.el` |
-| F9 | childframe 计划的 T1–T3.6 已落地（`seshat-reader-panel-carrier` / `seshat-reader-sidebar-quit` 存在），T4（流式）/T5（追问）未做；`2026-10-25-pdf-text-line-separators` 只改 C 层且明确「不改 elisp 侧」 | 代码 grep + 两份 active 计划 |
+| F9 | childframe 计划的 T1–T3.6 已落地；**T4（流式）/T5（追问）已由并发会话在 commit `8d43480` 实现**（`seshat-reader-translate-stream` / `--follow-up-*` / `--enable-stream`） | `git log` + 代码 grep |
+| F10 | commit `8d43480` 的实现在 stream / follow-up 上采用「`(clone engine)` 后 `oset copy stream t` / `oset engine-copy prompt`」；该路径依赖「eieio `clone` 对 `gt-single` 子类能产出副本」，而这一点**至今无测试支撑**（本计划 D2 因此选择不动引擎） | `seshat-reader-translate.el` 的 `--enable-stream` / `--follow-up-translator` |
+| F11 | `seshat-reader-translate--translator` 现为 **4 参** `(preset text langs &optional context)`，本计划追加可选第 5 参不冲突 | 代码 |
 
 ## 设计
 
@@ -227,6 +233,7 @@ RECTS 为空、非列表或行高无法计算（≤0）时返回 nil。")
 - seshat 建 tag：`git tag pre-translate-preset-isolation`。
 - 基线：按 `docs/emacs-reader.md` §「构建与测试」逐文件跑 ERT，记录 `seshat-reader-translate-test.el` 的用例数与全仓总数到 `/tmp/baseline-ert-translate.txt`（前置：`make -C emacs/seshat-reader all` 已成功，`.so` 存在）。
 - 验收：tag 存在；基线数字被记录；两仓 git 状态如实报告。
+- **实测结果（2026-10-25）**：`make -C emacs/seshat-reader all` exit 0、警告 33 条（`seshat-reader-translate.el` 0 条）；`seshat-reader-translate-test.el` **74 passed**；全仓 **25 文件 / 849 passed / 0 unexpected / 0 skipped**（重打 tag 前为 24 文件 / 839 passed）；逐文件日志 `/tmp/baseline-ert-final.txt`（1134 行）+ `/tmp/ert-final/*.log`。tag 已重打到 `8fdf434`（当前 HEAD；原 `8d43480`）。
 
 ### T1 seshat：预设表 + 查表顺序 + thunk（依赖：T0）
 
@@ -261,8 +268,8 @@ RECTS 为空、非列表或行高无法计算（≤0）时返回 nil。")
 
 ### T6 验证、文档与归档（依赖：T0–T5）
 
-- L1：`make -C emacs/seshat-reader all`（check-parens + byte-compile + autoloads + checkdoc），警告集与基线逐条 diff，不得新增；thomas-emacs 侧按该仓既有入口（Makefile / 字节编译）验证。
-- L2：seshat 全仓 23 个测试文件逐文件 ERT，0 unexpected / 0 skipped，总数 ≥ 基线 + 新增；thomas-emacs 冒烟全绿。
+- L1：`make -C emacs/seshat-reader all`（**实测只含** `.so` + autoloads + `.elc` + checkdoc，**不含 check-parens**），另需单独对改动文件跑 `check-parens`；警告集与基线（**33 条**）逐条 diff，不得新增；thomas-emacs 侧按该仓既有入口（Makefile / 字节编译）验证。
+- L2：seshat 全仓 **25 个**测试文件逐文件 ERT，0 unexpected / 0 skipped，总数 ≥ **874**（本次实测基线 **849**；`docs/emacs-reader.md` 的「23 文件 / 773 例」已过时）；thomas-emacs 冒烟全绿。
 - L3（`verify` 实例 + **GUI frame**：daemon 的 selected-frame 是 terminal frame，须显式 `(make-frame '((window-system . pgtk)))`）：
   1. 打开 `d2l-zh-pytorch.pdf`，拖选一段 → `C-c C-e`：面板出现解释，首行是加粗一句话，含 2–4 要点，长度 ≤200 字量级。
   2. 解释的输入含上下文（用 `gt-debug-p` 或桩引擎捕获 request-text 目视核对），且上下文来自同页邻近文本而非整页复制。
@@ -290,8 +297,8 @@ RECTS 为空、非列表或行高无法计算（≤0）时返回 nil。")
 
 ## 验证标准
 
-- **L1**：`make -C emacs/seshat-reader all` 通过，check-parens 0 错，byte-compile 警告集与基线逐条 diff 无新增，checkdoc 0 告警；thomas-emacs 侧字节编译新增文件无警告。
-- **L2**：seshat 全仓 ERT 逐文件 0 unexpected / 0 skipped，总数 ≥ 基线 + 25；thomas-emacs 冒烟全绿。
+- **L1**：`make -C emacs/seshat-reader all` 通过（`.so` + autoloads + `.elc` + checkdoc）；**另单独**对改动文件跑 `check-parens`（`make all` 不含该步）判 0 错；byte-compile 警告集与基线（33 条）逐条 diff 无新增；thomas-emacs 侧字节编译无新警告。
+- **L2**：seshat 全仓 25 个测试文件逐文件 ERT，0 unexpected / 0 skipped，总数 ≥ **874**（实测基线 849，其中 `seshat-reader-translate-test.el` 74 例）；thomas-emacs 冒烟全绿。
 - **L3**：上节 6 项全部通过；其中第 5 项（gt 侧预设列表干净、key 未被接管）为**阻断性不变量**，不通过即视为任务失败并回滚。
 - **回归**：`seshat-reader-translate-render` 取 `pop` / `pin` 两条 posframe 路径的既有 ERT 全绿；`seshat-reader-translate-preset` 回退路径（预设缺失 → youdao/google）行为不变。
 
@@ -302,6 +309,7 @@ RECTS 为空、非列表或行高无法计算（≤0）时返回 nil。")
 - **上下文获取必须在 `condition-case` 内且不得 `message` 报错**：无 C 模块（批处理 / 未构建 `.so`）是常态，静默降级。
 - **不得回显 key**：任何 message / 测试断言都只判类型与长度，禁止把 `DEEPSEEK_API_KEY` 的值打进日志或报告（见 `rules/secrets-protection.md`）。
 - **测试逐文件运行**：一次 `emacs --batch` 加载全部测试文件会因 `etaf-ui` 可用性差异导致既有 3 例失败（既有基线特性）。
+- **ERT 前必须清字节码**：`rm -f emacs/seshat-reader/*.elc`（实测陷阱：`.el` 比 `.elc` 新时 Emacs 默认 `load-prefer-newer=nil` 会加载旧 `.elc`，测到的是旧代码）。
 - **thomas-emacs 的 `defclass` 必须懒加载**：放在 thunk 或 `with-eval-after-load 'gt` 内，避免配置启动时报 `gt-chatgpt-engine is void`。
 - **HACK 注释规范**：`cl-defmethod gt-resolve-key` 的覆写必须带 `;; HACK: <改了什么 + 为什么>`。
 
@@ -314,3 +322,4 @@ RECTS 为空、非列表或行高无法计算（≤0）时返回 nil。")
 | 解释仍像翻译（H1 部分失败） | L3 第 1 项目视 | 调 prompt 模板措辞（defcustom 层）；`seshat-reader-translate-explain-max-chars` 收紧到 800 抑制长篇复述 |
 | 子类 key 不生效（H4 失败） | T5 断言失败 | 回退 authinfo 方案（`machine api.deepseek.com login apikey password …`），追加一条任务并改 decisions.md |
 | 既有测试回归（H6 失败） | T1 全文件 ERT 失败 | 回落顺序改为「全局优先」（`gt-preset-translators` 先查），并记 decisions.md 说明与后续清理计划 |
+| 并发写者已在 `translate.el` 实现流式/追问（`8d43480`） | 本计划 T1/T3 改动 `--translator` 与其代码重叠 | 只做**追加式**改动（加可选第 5 参、改查表那一行），不重排/删除其逻辑；若冲突则保留其流式与追问分支后再合并 |

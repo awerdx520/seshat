@@ -1640,6 +1640,731 @@ STATE 为 plist（可含 `:source' `:answer' `:langs' `:kind' `:round' `:turns'
   (should-not (eq (lookup-key seshat-reader-mode-map (kbd "C-c C-a"))
                   #'seshat-reader-translate-follow-up)))
 
+;;; 预设表：seshat 自有表优先 + thunk 回落顺序
+
+(ert-deftest seshat-reader-translate-test--presets-seshat-table-wins ()
+  "两表同名时取 seshat 自有表里的预设，而不是全局表那个."
+  (let* ((seshat-trans (gt-translator :engines (list (gt-google-engine))))
+         (global-trans (gt-translator :engines (list (gt-youdao-dict-engine))))
+         (seshat-reader-translate-presets (list (cons 'x seshat-trans)))
+         (gt-preset-translators (list (cons 'x global-trans)))
+         (seshat-reader-translate-render 'pop)
+         (seshat-reader-translate-stream nil)
+         (gt-posframe-pop-render-output-hook nil)
+         (gt-posframe-pin-render-output-hook nil)
+         (messages nil))
+    (cl-letf (((symbol-function 'message)
+               (lambda (fmt &rest args) (push (apply #'format fmt args) messages))))
+      (let ((trans (seshat-reader-translate--translator 'x "hello" '(en zh))))
+        (should-not messages)
+        ;; 仍按「克隆预设」的既有语义：不改写预设本体
+        (should-not (eq trans seshat-trans))
+        (should-not (eq trans global-trans))
+        ;; 引擎来自 seshat 表那个预设（浅克隆共享引擎对象）
+        (should (eq (car (slot-value trans 'engines))
+                    (car (slot-value seshat-trans 'engines))))
+        (should (eq (eieio-object-class (car (slot-value trans 'engines)))
+                    'gt-google-engine))))))
+
+(ert-deftest seshat-reader-translate-test--presets-falls-back-to-global ()
+  "seshat 自有表未命中时回落到 gt 的全局表 `gt-preset-translators'."
+  (let* ((global-trans (gt-translator :engines (list (gt-youdao-dict-engine))))
+         (seshat-reader-translate-presets nil)
+         (gt-preset-translators (list (cons 'x global-trans)))
+         (seshat-reader-translate-render 'pop)
+         (seshat-reader-translate-stream nil)
+         (gt-posframe-pop-render-output-hook nil)
+         (gt-posframe-pin-render-output-hook nil)
+         (messages nil))
+    (cl-letf (((symbol-function 'message)
+               (lambda (fmt &rest args) (push (apply #'format fmt args) messages))))
+      (let ((trans (seshat-reader-translate--translator 'x "hello" '(en zh))))
+        (should-not messages)
+        (should-not (eq trans global-trans))
+        (should (eq (car (slot-value trans 'engines))
+                    (car (slot-value global-trans 'engines))))
+        (should (eq (eieio-object-class (car (slot-value trans 'engines)))
+                    'gt-youdao-dict-engine))))))
+
+(ert-deftest seshat-reader-translate-test--presets-thunk-called ()
+  "自有表的值是 thunk 时被调用一次，用其返回的 translator."
+  (let* ((called 0)
+         (built (gt-translator :engines (list (gt-google-engine))))
+         (seshat-reader-translate-presets
+          (list (cons 'x (lambda () (setq called (1+ called)) built))))
+         (gt-preset-translators nil)
+         (seshat-reader-translate-render 'pop)
+         (seshat-reader-translate-stream nil)
+         (gt-posframe-pop-render-output-hook nil)
+         (gt-posframe-pin-render-output-hook nil))
+    (cl-letf (((symbol-function 'message) (lambda (&rest _) nil)))
+      (let ((trans (seshat-reader-translate--translator 'x "hello" '(en zh))))
+        (should (= called 1))
+        (should-not (eq trans built))
+        (should (eq (car (slot-value trans 'engines))
+                    (car (slot-value built 'engines))))
+        (should (eq (eieio-object-class (car (slot-value trans 'engines)))
+                    'gt-google-engine))))))
+
+(ert-deftest seshat-reader-translate-test--presets-thunk-nil-falls-back ()
+  "thunk 返回 nil 时不崩溃，回退到内置 youdao/google 翻译器."
+  (let ((seshat-reader-translate-presets (list (cons 'x (lambda () nil))))
+        (gt-preset-translators nil)
+        (seshat-reader-translate-render 'pop)
+        (seshat-reader-translate-stream nil)
+        (gt-posframe-pop-render-output-hook nil)
+        (gt-posframe-pin-render-output-hook nil)
+        (messages nil))
+    (cl-letf (((symbol-function 'message)
+               (lambda (fmt &rest args) (push (apply #'format fmt args) messages))))
+      (let* ((trans (seshat-reader-translate--translator 'x "hello" '(en zh)))
+             (engines (slot-value trans 'engines)))
+        (should (= (length engines) 2))
+        (should (eq (eieio-object-class (car engines)) 'gt-youdao-dict-engine))
+        (should (eq (eieio-object-class (cadr engines)) 'gt-google-engine))))
+    ;; 与「预设缺失」同一条提示，且只提示一次
+    (should (= (length messages) 1))))
+
+(ert-deftest seshat-reader-translate-test--presets-both-empty-falls-back ()
+  "两表都查不到时查表函数返回 nil，`--translator' 回退内置且不崩溃."
+  (let ((seshat-reader-translate-presets nil)
+        (gt-preset-translators nil)
+        (seshat-reader-translate-render 'pop)
+        (seshat-reader-translate-stream nil)
+        (gt-posframe-pop-render-output-hook nil)
+        (gt-posframe-pin-render-output-hook nil)
+        (messages nil))
+    (should-not (seshat-reader-translate--preset-translator 'x))
+    (cl-letf (((symbol-function 'message)
+               (lambda (fmt &rest args) (push (apply #'format fmt args) messages))))
+      (let* ((trans (seshat-reader-translate--translator 'x "hello" '(en zh)))
+             (engines (slot-value trans 'engines)))
+        (should (= (length engines) 2))
+        (should (eq (eieio-object-class (car engines)) 'gt-youdao-dict-engine))
+        (should (equal (slot-value (slot-value trans 'taker) 'text) "hello"))))
+    (should (= (length messages) 1))))
+
+(ert-deftest seshat-reader-translate-test--preset-translator-thunk-not-cached ()
+  "查表函数每次调用都执行 thunk（不缓存），thunk 返回 nil 时不回落全局表."
+  (let* ((calls 0)
+         (seshat-reader-translate-presets
+          (list (cons 'x (lambda () (setq calls (1+ calls)) 'built))))
+         (gt-preset-translators nil))
+    (should (eq (seshat-reader-translate--preset-translator 'x) 'built))
+    (should (= calls 1))
+    (should (eq (seshat-reader-translate--preset-translator 'x) 'built))
+    (should (= calls 2)))
+  ;; 两表都未命中 → nil
+  (let ((seshat-reader-translate-presets nil)
+        (gt-preset-translators nil))
+    (should-not (seshat-reader-translate--preset-translator 'missing)))
+  ;; 自有表的 thunk 返回 nil 时返回 nil（此时不再看全局表，与 docstring 一致）
+  (let ((seshat-reader-translate-presets (list (cons 'y (lambda () nil))))
+        (gt-preset-translators (list (cons 'y 'global))))
+    (should-not (seshat-reader-translate--preset-translator 'y))))
+
+;;; 追问路径取引擎也走统一查表（seshat 表优先 → 全局表回落）
+
+(ert-deftest seshat-reader-translate-test--preset-chatgpt-engine-from-seshat-table ()
+  "`--preset-chatgpt-engine' 从 seshat 自有表取到 ChatGPT 引擎."
+  (skip-unless (require 'gt nil t))
+  (let* ((engine (gt-chatgpt-engine))
+         (seshat-reader-translate-presets
+          (list (cons 'x (gt-translator :engines (list engine)))))
+         (gt-preset-translators nil))
+    (let ((found (seshat-reader-translate--preset-chatgpt-engine 'x)))
+      (should found)
+      (should (eq found engine))
+      (should (object-of-class-p found 'gt-chatgpt-engine)))))
+
+(ert-deftest seshat-reader-translate-test--preset-chatgpt-engine-falls-back-to-global ()
+  "seshat 自有表未命中时回落全局表 `gt-preset-translators' 取到 ChatGPT 引擎."
+  (skip-unless (require 'gt nil t))
+  (let* ((engine (gt-chatgpt-engine))
+         (seshat-reader-translate-presets nil)
+         (gt-preset-translators
+          (list (cons 'x (gt-translator :engines (list engine))))))
+    (let ((found (seshat-reader-translate--preset-chatgpt-engine 'x)))
+      (should found)
+      (should (eq found engine))
+      (should (object-of-class-p found 'gt-chatgpt-engine)))))
+
+(ert-deftest seshat-reader-translate-test--preset-chatgpt-engine-returns-nil ()
+  "预设缺失、或预设里只有纯翻译引擎时 `--preset-chatgpt-engine' 返回 nil."
+  (skip-unless (require 'gt nil t))
+  ;; 两表都查不到该预设
+  (let ((seshat-reader-translate-presets nil)
+        (gt-preset-translators nil))
+    (should-not (seshat-reader-translate--preset-chatgpt-engine 'x)))
+  ;; 预设存在，但引擎只有 youdao/google（无语义对话能力，不做拼接降级）
+  (let ((seshat-reader-translate-presets
+         (list (cons 'x (gt-translator :engines (list (gt-google-engine))))))
+        (gt-preset-translators nil))
+    (should-not (seshat-reader-translate--preset-chatgpt-engine 'x))))
+
+;;; 解释上下文：纯函数（行矩形扩行 / 窗口截断）与 IO 包装
+
+(ert-deftest seshat-reader-translate-test--expand-rect-nil ()
+  "`--expand-rect' 对 nil、非列表、残缺矩形一律返回 nil."
+  (should-not (seshat-reader-translate--expand-rect nil 2))
+  (should-not (seshat-reader-translate--expand-rect "rect" 2))
+  (should-not (seshat-reader-translate--expand-rect '(1.0 2.0 3.0) 2))
+  (should-not (seshat-reader-translate--expand-rect '((1.0 2.0 3.0)) 2))
+  (should-not (seshat-reader-translate--expand-rect '(("a" 2.0 3.0 4.0)) 2)))
+
+(ert-deftest seshat-reader-translate-test--expand-rect-single-line ()
+  "单矩形扩 LINES 行：行高取 (Y1 - Y0)，上下各外扩 LINES 倍."
+  ;; 单行 y0=100 y1=110 → 行高 10；扩 2 行 → y0'=80 y1'=130
+  (should (equal (seshat-reader-translate--expand-rect
+                  '((0.0 100.0 10.0 110.0)) 2)
+                 '(0.0 80.0 10.0 130.0)))
+  ;; LINES 为 0 时不外扩（横向仍取并集）
+  (should (equal (seshat-reader-translate--expand-rect
+                  '((0.0 100.0 10.0 110.0)) 0)
+                 '(0.0 100.0 10.0 110.0))))
+
+(ert-deftest seshat-reader-translate-test--expand-rect-multi-line ()
+  "多矩形：横向取并集，纵向按行高均值（(最大 Y1 − 最小 Y0) / 行数）外扩."
+  ;; y0=100/112、y1=110/122 → 行高 (122-100)/2 = 11；扩 1 行 → y0'=89 y1'=133
+  (should (equal (seshat-reader-translate--expand-rect
+                  '((0.0 100.0 10.0 110.0)
+                    (2.0 112.0 20.0 122.0))
+                  1)
+                 '(0.0 89.0 20.0 133.0))))
+
+(ert-deftest seshat-reader-translate-test--expand-rect-zero-line-height ()
+  "估算行高为 0（矩形零高度）时返回 nil，避免无意义外扩."
+  (should-not (seshat-reader-translate--expand-rect
+               '((0.0 100.0 10.0 100.0)) 2))
+  (should-not (seshat-reader-translate--expand-rect
+               '((0.0 100.0 10.0 100.0)
+                 (2.0 100.0 20.0 100.0))
+               1)))
+
+(ert-deftest seshat-reader-translate-test--context-window-locates-selection ()
+  "能定位选区时窗口包含选区且总长不超过 MAX-CHARS."
+  (let* ((selection "TARGET")
+         (page-text (concat (make-string 40 ?a) selection (make-string 40 ?b)))
+         (window (seshat-reader-translate--context-window page-text selection 20)))
+    (should (stringp window))
+    (should (<= (length window) 20))
+    (should (string-match-p (regexp-quote selection) window))))
+
+(ert-deftest seshat-reader-translate-test--context-window-falls-back-to-prefix ()
+  "定位不到选区（或无选区）时取 PAGE-TEXT 前 MAX-CHARS 个字符."
+  (let ((page-text (concat (make-string 100 ?a) "x")))
+    (should (string= (seshat-reader-translate--context-window page-text "zzz" 20)
+                     (substring page-text 0 20)))
+    ;; SELECTION 为 nil 同样走前缀
+    (should (string= (seshat-reader-translate--context-window page-text nil 20)
+                     (substring page-text 0 20)))
+    ;; MAX-CHARS 超过长度时取全串
+    (should (string= (seshat-reader-translate--context-window "short" "zzz" 200)
+                     "short"))))
+
+(ert-deftest seshat-reader-translate-test--context-window-invalid-input ()
+  "PAGE-TEXT 非字符串/空串、MAX-CHARS 非正数时返回 nil."
+  (should-not (seshat-reader-translate--context-window nil "abc" 20))
+  (should-not (seshat-reader-translate--context-window "" "abc" 20))
+  (should-not (seshat-reader-translate--context-window "abc" "abc" 0))
+  (should-not (seshat-reader-translate--context-window "abc" "abc" -5)))
+
+(ert-deftest seshat-reader-translate-test--context-window-normalizes-whitespace ()
+  "窗口内连续空格/制表符折叠为单空格，三段以上换行折叠为两段，并去首尾空白."
+  (let ((page-text "Alpha    beta\tgamma\n\n\n\nDelta   epsilon"))
+    (should (string= (seshat-reader-translate--context-window page-text nil 200)
+                     "Alpha beta gamma\n\nDelta epsilon")))
+  ;; 清洗后为空（纯空白）时返回 nil
+  (should-not (seshat-reader-translate--context-window "  \t \n \n " "zzz" 100)))
+
+(ert-deftest seshat-reader-translate-test--context-text-disabled-touches-nothing ()
+  "`context-enabled' 为 nil 时立即返回 nil，三个模块函数零调用."
+  (let ((seshat-reader-translate-context-enabled nil)
+        (seshat-reader-select-last (list :page 1
+                                        :rect '(0.0 0.0 10.0 10.0)
+                                        :text "abc"))
+        (calls 0))
+    (cl-letf (((symbol-function 'seshat-reader-dyn--lines-in-rect)
+               (lambda (&rest _) (setq calls (1+ calls)) '((0.0 0.0 10.0 10.0))))
+              ((symbol-function 'seshat-reader-dyn--text-in-rect)
+               (lambda (&rest _) (setq calls (1+ calls)) "rect text"))
+              ((symbol-function 'seshat-reader-dyn--page-text)
+               (lambda (&rest _) (setq calls (1+ calls)) "page text")))
+      (should-not (seshat-reader-translate--context-text))
+      (should (= calls 0)))))
+
+(ert-deftest seshat-reader-translate-test--context-text-swallows-errors ()
+  "模块函数全部抛错时静默返回 nil（`condition-case' 兜住，不外抛）."
+  (let ((seshat-reader-translate-context-enabled t)
+        (seshat-reader-select-last (list :page 1
+                                        :rect '(0.0 0.0 10.0 10.0)
+                                        :text "abc")))
+    (cl-letf (((symbol-function 'seshat-reader-dyn--lines-in-rect)
+               (lambda (&rest _) (error "boom")))
+              ((symbol-function 'seshat-reader-dyn--text-in-rect)
+               (lambda (&rest _) (error "boom")))
+              ((symbol-function 'seshat-reader-dyn--page-text)
+               (lambda (&rest _) (error "boom"))))
+      (should-not (seshat-reader-translate--context-text)))))
+
+(ert-deftest seshat-reader-translate-test--context-text-page-is-zero-based ()
+  "选区 `:page'（1-based）为 1 时，三个模块函数收到的 PAGE 参数必须是 0."
+  (let ((seshat-reader-translate-context-enabled t)
+        (seshat-reader-translate-context-lines 1)
+        (seshat-reader-translate-context-max-chars 100)
+        (seshat-reader-select-last (list :page 1
+                                        :rect '(0.0 100.0 10.0 110.0)
+                                        :text "abc"))
+        (seen nil))
+    (cl-letf (((symbol-function 'seshat-reader-dyn--lines-in-rect)
+               (lambda (page &rest _)
+                 (push (cons 'lines page) seen)
+                 '((0.0 100.0 10.0 110.0))))
+              ((symbol-function 'seshat-reader-dyn--text-in-rect)
+               (lambda (page &rest _)
+                 (push (cons 'rect page) seen)
+                 ;; 空串 → 矩形路径无结果，继续降级到整页
+                 ""))
+              ((symbol-function 'seshat-reader-dyn--page-text)
+               (lambda (page &rest _)
+                 (push (cons 'page page) seen)
+                 "Leading text before abc and trailing text after.")))
+      (should (string= (seshat-reader-translate--context-text)
+                       "Leading text before abc and trailing text after.")))
+    ;; lines ×1 + text-in-rect ×2（上方块 / 下方块）+ page-text ×1
+    (should (= (length seen) 4))
+    ;; `push' 倒序：page → text-in-rect(下) → text-in-rect(上) → lines
+    (should (equal (mapcar #'car seen) '(page rect rect lines)))
+    (dolist (item seen)
+      (should (= (cdr item) 0)))))
+
+(ert-deftest seshat-reader-translate-test--context-text-above-and-below-blocks ()
+  "上下文按「上方块 + 下方块」两次调用 `--text-in-rect'，Y 范围不含选区。
+第一次是 [外扩顶, 选区顶]，第二次是 [选区底, 外扩底]，X 范围取外扩矩形的。"
+  (let ((seshat-reader-translate-context-enabled t)
+        (seshat-reader-translate-context-lines 2)
+        (seshat-reader-translate-context-max-chars 1200)
+        ;; 选区跨两行：Y 从 100 到 120
+        (seshat-reader-select-last (list :page 1
+                                        :rect '(0.0 100.0 10.0 120.0)
+                                        :text "AlphaBeta"))
+        (calls nil))
+    (cl-letf (((symbol-function 'seshat-reader-dyn--lines-in-rect)
+               (lambda (&rest _)
+                 '((0.0 100.0 10.0 110.0) (0.0 110.0 10.0 120.0))))
+              ;; 行高 10，外扩 2 行 → 大矩形 Y 从 80 到 140
+              ((symbol-function 'seshat-reader-dyn--text-in-rect)
+               (lambda (page x0 y0 x1 y1)
+                 (push (list page x0 y0 x1 y1) calls)
+                 (if (= (length calls) 1) "ABOVE TEXT" "BELOW TEXT")))
+              ((symbol-function 'seshat-reader-dyn--page-text)
+               (lambda (&rest _) (error "不该降级到整页"))))
+      (should (string= (seshat-reader-translate--context-text)
+                       "ABOVE TEXT\n\nBELOW TEXT")))
+    (should (= (length calls) 2))
+    ;; calls 是倒序（push）：第一条是下块，第二条是上块
+    (should (equal (nth 1 calls) '(0 0.0 80.0 10.0 100.0)))
+    (should (equal (nth 0 calls) '(0 0.0 120.0 10.0 140.0)))))
+
+(ert-deftest seshat-reader-translate-test--context-text-above-only-no-blank-line ()
+  "下方块为空（nil）时上下文只含上方块，`string-join' 不产生多余空行。"
+  (let ((seshat-reader-translate-context-enabled t)
+        (seshat-reader-translate-context-lines 1)
+        (seshat-reader-translate-context-max-chars 1200)
+        (seshat-reader-select-last (list :page 1
+                                        :rect '(0.0 100.0 10.0 110.0)
+                                        :text "abc"))
+        (calls nil))
+    (cl-letf (((symbol-function 'seshat-reader-dyn--lines-in-rect)
+               (lambda (&rest _) '((0.0 100.0 10.0 110.0))))
+              ((symbol-function 'seshat-reader-dyn--text-in-rect)
+               (lambda (page x0 y0 x1 y1)
+                 (push (list page x0 y0 x1 y1) calls)
+                 ;; 上块 [90, 100] 有值，下块 [110, 120] 无值
+                 (unless (= y0 110.0) "ONLY ABOVE")))
+              ((symbol-function 'seshat-reader-dyn--page-text)
+               (lambda (&rest _) (error "不该降级到整页"))))
+      (let ((ctx (seshat-reader-translate--context-text)))
+        (should (string= ctx "ONLY ABOVE"))
+        (should-not (string-match-p "\n" ctx))))
+    (should (= (length calls) 2))
+    (should (equal (nth 1 calls) '(0 0.0 90.0 10.0 100.0)))
+    (should (equal (nth 0 calls) '(0 0.0 110.0 10.0 120.0)))))
+
+(ert-deftest seshat-reader-translate-test--context-text-excludes-selection ()
+  "上下文天然不含选区原文：模块在段落内不插换行，跨行选区已不落在上下块中。
+（旧实现「取大矩形再精确删除选区字符串」在此场景命中率恒为 0。）"
+  (let ((seshat-reader-translate-context-enabled t)
+        (seshat-reader-translate-context-lines 1)
+        (seshat-reader-translate-context-max-chars 1200)
+        ;; 选区在第 1 行末尾 "Alpha" 换到第 2 行开头 "Beta"
+        (seshat-reader-select-last (list :page 1
+                                        :rect '(0.0 100.0 10.0 120.0)
+                                        :text "AlphaBeta"))
+        (calls 0))
+    (cl-letf (((symbol-function 'seshat-reader-dyn--lines-in-rect)
+               (lambda (&rest _)
+                 '((0.0 100.0 10.0 110.0) (0.0 110.0 10.0 120.0))))
+              ((symbol-function 'seshat-reader-dyn--text-in-rect)
+               (lambda (&rest _)
+                 (setq calls (1+ calls))
+                 (if (= calls 1)
+                     "Header line one Header line two"
+                   "Tail line one Tail line two")))
+              ((symbol-function 'seshat-reader-dyn--page-text)
+               (lambda (&rest _) (error "不该降级到整页"))))
+      (let ((ctx (seshat-reader-translate--context-text)))
+        (should (stringp ctx))
+        (should-not (string-match-p (regexp-quote "AlphaBeta") ctx))
+        ;; 上块与下块都在，顺序为「先上后下」
+        (should (string-match-p "Header" ctx))
+        (should (string-match-p "Tail" ctx))
+        (should (< (string-match-p "Header" ctx) (string-match-p "Tail" ctx)))
+        (should (string= ctx
+                         (concat "Header line one Header line two"
+                                 "\n\n"
+                                 "Tail line one Tail line two")))))))
+
+;;; 解释 prompt 装配（模板 → request-text）与 explain 接线
+
+(defun seshat-reader-translate-test--occurrences (needle haystack)
+  "返回 NEEDLE 在 HAYSTACK 中按字面匹配出现的次数."
+  (let ((start 0)
+        (count 0))
+    (while (string-match (regexp-quote needle) haystack start)
+      (setq count (1+ count)
+            start (match-end 0)))
+    count))
+
+(ert-deftest seshat-reader-translate-test--document-title-basename-only ()
+  "`--document-title' 只取 basename 去扩展名；未记录 `:file' 时返回 nil."
+  (let ((seshat-reader-select-last
+         (list :text "x" :file "/home/u/books/d2l-zh-pytorch.pdf")))
+    (should (equal (seshat-reader-translate--document-title) "d2l-zh-pytorch"))
+    ;; 不得输出完整路径
+    (should-not (string-match-p "/" (seshat-reader-translate--document-title))))
+  (let ((seshat-reader-select-last (list :text "x")))
+    (should-not (seshat-reader-translate--document-title)))
+  (let ((seshat-reader-select-last nil))
+    (should-not (seshat-reader-translate--document-title))))
+
+(ert-deftest seshat-reader-translate-test--explain-request-text-nil-template ()
+  "模板为 nil 时 `--explain-request-text' 原样返回纯选区（不装配）."
+  (let ((seshat-reader-translate-explain-prompt nil))
+    (should (equal (seshat-reader-translate--explain-request-text
+                    "PLAIN TEXT" "CTX TEXT" "docname" '(en zh))
+                   "PLAIN TEXT"))
+    ;; 上下文、文档名、指令行都不该出现在结果里
+    (let ((request (seshat-reader-translate--explain-request-text
+                    "PLAIN TEXT" "CTX TEXT" "docname" '(en zh))))
+      (should-not (string-match-p "CTX TEXT" request))
+      (should-not (string-match-p "docname" request))
+      (should-not (string-match-p "## 任务" request)))))
+
+(ert-deftest seshat-reader-translate-test--explain-request-text-fills-placeholders ()
+  "模板含四个占位符时逐字替换：选区、上下文、文档名、语言对各出现一次."
+  (let* ((seshat-reader-translate-explain-prompt
+          "## 任务\n\n解释 {{doc}}（{{lang}}）。\n\n## 上下文\n\n{{context}}\n\n## 原文\n\n{{text}}\n")
+         (assembled (seshat-reader-translate--explain-request-text
+                     "SELECTED ORIGINAL" "CTX-A CTX-B" "docname" '(en zh))))
+    (should (stringp assembled))
+    (should (= 1 (seshat-reader-translate-test--occurrences
+                  "SELECTED ORIGINAL" assembled)))
+    (should (= 1 (seshat-reader-translate-test--occurrences "CTX-A CTX-B" assembled)))
+    (should (= 1 (seshat-reader-translate-test--occurrences "docname" assembled)))
+    (should (= 1 (seshat-reader-translate-test--occurrences "en → zh" assembled)))
+    ;; 占位符全部解析：结果里不含未替换的双花括号
+    (should-not (string-match-p "{{" assembled))
+    (should (= 0 (seshat-reader-translate-test--occurrences "{{text}}" assembled)))))
+
+(ert-deftest seshat-reader-translate-test--explain-request-text-default-structure ()
+  "默认模板装配后每个 `## ' 标题行都紧跟空行（软换行归一化分段的前提）."
+  ;; 不绑定 `seshat-reader-translate-explain-prompt'：批处理 `emacs --batch -Q'
+  ;; 下它就是 defcustom 默认值，本用例正是要钉住这个默认值的结构。
+  (let* ((text "SELECTED ORIGINAL")
+         (context "CTX BEFORE\n\nCTX AFTER")
+         (assembled (seshat-reader-translate--explain-request-text
+                     text context "docname" '(en zh)))
+         (start 0)
+         (headings 0))
+    (should (string-match-p "^## 任务$" assembled))
+    (should (string-match-p "## 任务\n\n" assembled))
+    (should (string-match-p "## 需要解释的原文\n\n" assembled))
+    (should (string-match-p (regexp-quote context) assembled))
+    (should (= 1 (seshat-reader-translate-test--occurrences text assembled)))
+    (should-not (string-match-p "{{" assembled))
+    ;; 逐个标题断言「行自身独立成行且紧跟空行」
+    (while (string-match "^## [^\n]*\n" assembled start)
+      (setq headings (1+ headings))
+      (should (= ?\n (aref assembled (match-end 0))))
+      (setq start (match-end 0)))
+    (should (>= headings 3))))
+
+(ert-deftest seshat-reader-translate-test--explain-request-text-unknown-placeholder ()
+  "模板含未知占位符时 `message' 警告并回退纯选区."
+  (let ((seshat-reader-translate-explain-prompt
+         "## 任务\n\n{{bogus}}\n\n{{text}}\n")
+        (messages nil))
+    (cl-letf (((symbol-function 'message)
+               (lambda (fmt &rest args) (push (apply #'format fmt args) messages))))
+      (should (equal (seshat-reader-translate--explain-request-text
+                      "SELECTED" "CTX" "docname" '(en zh))
+                     "SELECTED")))
+    (should (= 1 (length messages)))
+    (should (string-match-p "未知占位符" (car messages)))))
+
+(ert-deftest seshat-reader-translate-test--explain-request-text-escapes-input-braces ()
+  "输入值里的 `{{' 被转义：原样保留在结果中，且不触发未知占位符警告."
+  (let ((seshat-reader-translate-explain-prompt
+         "## 任务\n\n解释 {{doc}}。\n\n## 原文\n\n{{text}}\n")
+        (messages nil))
+    (cl-letf (((symbol-function 'message)
+               (lambda (fmt &rest args) (push (apply #'format fmt args) messages))))
+      (let ((assembled (seshat-reader-translate--explain-request-text
+                        "{{foo}} bar" "CTX" "docname" '(en zh))))
+        (should (stringp assembled))
+        ;; 输入值原样保留：`{{foo}} bar' 一字不差地出现在结果里
+        (should (= 1 (seshat-reader-translate-test--occurrences
+                      "{{foo}} bar" assembled)))
+        ;; 不得残留转义哨兵（NUL）
+        (should-not (string-match-p "\0" assembled))
+        ;; 模板占位符依然被正确替换
+        (should (= 1 (seshat-reader-translate-test--occurrences "docname" assembled)))
+        (should (string-match-p "## 原文\n\n{{foo}} bar" assembled))))
+    ;; 输入值里的 `{{' 不应被误判为未知占位符：`message' 一次都没调
+    (should (= 0 (length messages)))))
+
+(ert-deftest seshat-reader-translate-test--explain-request-text-unknown-placeholder-beside-known ()
+  "已知占位符与未知占位符并存时：警告一次并回退纯选区（不装配半成品）."
+  (let ((seshat-reader-translate-explain-prompt "{{text}} {{bogus}}")
+        (messages nil))
+    (cl-letf (((symbol-function 'message)
+               (lambda (fmt &rest args) (push (apply #'format fmt args) messages))))
+      (should (equal (seshat-reader-translate--explain-request-text
+                      "SELECTED" "CTX" "docname" '(en zh))
+                     "SELECTED")))
+    (should (= 1 (length messages)))
+    (should (string-match-p "未知占位符" (car messages)))))
+
+(ert-deftest seshat-reader-translate-test--translator-request-text-fills-taker ()
+  "`--translator' 第 5 参（REQUEST-TEXT）填入 taker 的 `:text'，其余参数不变."
+  (let ((seshat-reader-translate-presets nil)
+        (gt-preset-translators nil)
+        (seshat-reader-translate-render 'pop)
+        (seshat-reader-translate-stream nil)
+        (gt-posframe-pop-render-output-hook nil)
+        (gt-posframe-pin-render-output-hook nil))
+    (cl-letf (((symbol-function 'message) (lambda (&rest _) nil)))
+      (let ((trans (seshat-reader-translate--translator
+                    'x "AAA" '(en zh) 'explain "REQ")))
+        (should (equal (oref (oref trans taker) text) "REQ"))
+        (should (null (oref (oref trans taker) pick)))
+        (should (equal (oref (oref trans taker) langs) '(en zh)))))))
+
+(ert-deftest seshat-reader-translate-test--translator-without-request-text ()
+  "不传第 5 参时 taker 的 `:text' 仍是纯选区文本（回归）."
+  (let ((seshat-reader-translate-presets nil)
+        (gt-preset-translators nil)
+        (seshat-reader-translate-render 'pop)
+        (seshat-reader-translate-stream nil)
+        (gt-posframe-pop-render-output-hook nil)
+        (gt-posframe-pin-render-output-hook nil))
+    (cl-letf (((symbol-function 'message) (lambda (&rest _) nil)))
+      (dolist (kind '(nil translate explain))
+        (let ((trans (seshat-reader-translate--translator
+                      'x "AAA" '(en zh) kind)))
+          (should (equal (oref (oref trans taker) text) "AAA")))))))
+
+(ert-deftest seshat-reader-translate-test--quote-block-uses-pure-selection ()
+  "面板原文引用块仍取纯选区，不含 prompt 指令行."
+  (let ((seshat-reader-select-last
+         (list :text "Hello world" :page 3
+               :rect '(10.0 20.0 30.0 40.0)
+               :file "/tmp/d2l-zh-pytorch.pdf"))
+        (seshat-reader-translate-show-source t))
+    (let ((block (seshat-reader-translate--quote-block)))
+      (should (stringp block))
+      (should (string-match-p "> \\*\\*原文\\*\\*" block))
+      (should (string-match-p "Hello world" block))
+      (should-not (string-match-p "## 任务" block))
+      (should-not (string-match-p "需要解释的原文" block))
+      (should-not (string-match-p "{{" block)))))
+
+(ert-deftest seshat-reader-translate-test--explain-selection-sends-assembled-text ()
+  "`seshat-reader-translate-explain-selection' 把装配串送进 taker，纯选区保持原样."
+  (let ((seshat-reader-select-last
+         (list :text "Hello world" :page 1
+               :rect '(0.0 0.0 10.0 10.0)
+               :file "/tmp/d2l.pdf"))
+        (seshat-reader-translate-context-enabled t)
+        (seshat-reader-translate-explain-prompt
+         "## 任务\n\n解释。\n\n{{context}}\n\n{{text}}\n")
+        (seshat-reader-translate-explain-preset 'reader-explain)
+        (seshat-reader-translate-fallback-langs '(en zh))
+        (seshat-reader-translate-render 'pop)
+        (seshat-reader-translate-stream nil)
+        (seshat-reader-translate-last-result "旧结果")
+        (gt-preset-translators nil)
+        (gt-posframe-pop-render-output-hook nil)
+        (gt-posframe-pin-render-output-hook nil)
+        (captured nil))
+    (cl-letf (((symbol-function 'gt-start)
+               (lambda (translator) (setq captured translator)))
+              ((symbol-function 'message) (lambda (&rest _) nil))
+              ((symbol-function 'seshat-reader-dyn--lines-in-rect)
+               (lambda (&rest _) (error "no module")))
+              ((symbol-function 'seshat-reader-dyn--page-text)
+               (lambda (&rest _) "page before Hello world page after")))
+      (seshat-reader-translate-explain-selection))
+    (should captured)
+    (let ((sent (oref (oref captured taker) text)))
+      (should (string-match-p "^## 任务$" sent))
+      (should (string-match-p "page before" sent))
+      (should (string-match-p "Hello world" sent)))
+    ;; 既有语义不变：启动前清 `last-result'，纯选区仍在选区变量里
+    (should-not seshat-reader-translate-last-result)
+    (should (equal (plist-get seshat-reader-select-last :text) "Hello world"))))
+
+;;; 长度护栏（`seshat-reader-translate-explain-max-chars'）
+
+(ert-deftest seshat-reader-translate-test--truncate-selection-over-limit ()
+  "超长选区被截断到上限，并在尾部追加「（选区过长，以上为节选）」."
+  (let* ((seshat-reader-translate-explain-max-chars 10)
+         (text (make-string 50 ?x))
+         (result (seshat-reader-translate--truncate-selection text)))
+    (should (stringp result))
+    (should (string-suffix-p "（选区过长，以上为节选）" result))
+    ;; 前半段原样保留前 MAX 个字符，长度 = MAX + 标注串长度
+    (should (equal (substring result 0 10) (make-string 10 ?x)))
+    (should (= (length result)
+               (+ 10 (length "\n\n（选区过长，以上为节选）"))))
+    ;; 超限部分被真的丢掉（50 个 x 只剩 10 个）
+    (should (= 10 (seshat-reader-translate-test--occurrences "x" result)))))
+
+(ert-deftest seshat-reader-translate-test--truncate-selection-within-limit ()
+  "未超限、上限非正整数或文本非字符串时原样返回（同一个对象）."
+  (let ((seshat-reader-translate-explain-max-chars 2000)
+        (text "short selection"))
+    (should (eq (seshat-reader-translate--truncate-selection text) text))
+    ;; 恰好等于上限也不截断
+    (let ((exact (make-string 2000 ?y)))
+      (should (eq (seshat-reader-translate--truncate-selection exact) exact))))
+  ;; 上限非正整数 → 关闭截断
+  (dolist (max '(0 -1))
+    (let ((seshat-reader-translate-explain-max-chars max))
+      (should (equal (seshat-reader-translate--truncate-selection
+                      "abcdefghijklmn")
+                     "abcdefghijklmn"))))
+  ;; 非字符串 → 原样（含 nil）
+  (let ((seshat-reader-translate-explain-max-chars 1))
+    (should-not (seshat-reader-translate--truncate-selection nil))
+    (should (= 42 (seshat-reader-translate--truncate-selection 42)))))
+
+;;; 输出净化（`seshat-reader-translate-strip-chatter'）
+
+(ert-deftest seshat-reader-translate-test--strip-chatter-removes-chatter-line ()
+  "首行为「好的，以下是…：」时删掉该行与其后的空行，返回正文."
+  (should (equal (seshat-reader-translate--strip-chatter
+                  "好的，以下是这段的解释：\n\n正文")
+                 "正文"))
+  ;; 半角冒号同样识别
+  (should (equal (seshat-reader-translate--strip-chatter
+                  "以下是原文要点:\n\n- 第一条")
+                 "- 第一条"))
+  ;; 多个前导空行一并吃掉
+  (should (equal (seshat-reader-translate--strip-chatter
+                  "下面给出要点：\n\n\n\n正文一\n正文二")
+                 "正文一\n正文二"))
+  ;; 只剩寒暄行时原样返回（不把回答抹成空）
+  (should (equal (seshat-reader-translate--strip-chatter "好的，以下是：")
+                 "好的，以下是："))
+  ;; nil / 非字符串原样
+  (should-not (seshat-reader-translate--strip-chatter nil))
+  (should (= 7 (seshat-reader-translate--strip-chatter 7))))
+
+(ert-deftest seshat-reader-translate-test--strip-chatter-keeps-body-line ()
+  "非寒暄首行原样返回（同一个对象），不做任何其它清洗."
+  (let ((text "这是一段正文。\n第二行"))
+    (should (eq (seshat-reader-translate--strip-chatter text) text)))
+  ;; 冒号不在行尾 → 不是寒暄行，正文不得被删
+  (let ((text "这段代码做了什么：说明在下一段\n第二行"))
+    (should (eq (seshat-reader-translate--strip-chatter text) text))))
+
+(ert-deftest seshat-reader-translate-test--record-result-skips-strip-when-disabled ()
+  "`strip-chatter' 为 nil 时 `--record-result' 不净化；为 t 时写入净化后文本."
+  (let* ((chatter "好的，以下是：\n\n正文")
+         (seshat-reader-translate--active (float-time))
+         (seshat-reader-translate-last-result nil))
+    (cl-letf (((symbol-function 'seshat-reader-translate--extract-result)
+               (lambda (&rest _) (cons chatter nil))))
+      ;; 开关 nil：寒暄保留，返回值与 `last-result' 都是原文
+      (let ((seshat-reader-translate-strip-chatter nil))
+        (should (equal (seshat-reader-translate--capture-result) chatter))
+        (should (equal seshat-reader-translate-last-result chatter)))
+      ;; 开关 t（默认）：寒暄被去掉
+      (setq seshat-reader-translate-last-result nil)
+      (let ((seshat-reader-translate-strip-chatter t))
+        (should (equal (seshat-reader-translate--capture-result) "正文"))
+        (should (equal seshat-reader-translate-last-result "正文"))))))
+
+;;; 可观测（`seshat-reader-translate--engine-label'）
+
+(ert-deftest seshat-reader-translate-test--engine-label-shows-model-and-host ()
+  "引擎标识含 model 与 host，且**绝不**含 key 槽里的哨兵字符串."
+  (skip-unless (require 'gt nil t))
+  (let* ((sentinel "SENTINEL-KEY-DO-NOT-LEAK")
+         (engine (gt-chatgpt-engine :host "api.deepseek.com"
+                                    :model "deepseek-chat"
+                                    :key sentinel))
+         (translator (gt-translator :engines (list engine)))
+         (label (seshat-reader-translate--engine-label translator)))
+    (should (stringp label))
+    (should (string-match-p "deepseek-chat" label))
+    (should (string-match-p "api\\.deepseek\\.com" label))
+    ;; 形如「（model @ host）」
+    (should (string-match-p "（deepseek-chat @ api\\.deepseek\\.com）" label))
+    (should-not (string-match-p sentinel label))
+    ;; translator 为 nil / 无引擎 / 非对象 → 空串
+    (should (equal (seshat-reader-translate--engine-label nil) ""))
+    (should (equal (seshat-reader-translate--engine-label
+                    (gt-translator :engines nil))
+                   ""))
+    (should (equal (seshat-reader-translate--engine-label "not-a-translator") ""))))
+
+(ert-deftest seshat-reader-translate-test--explain-error-message-shows-engine-no-key ()
+  "解释失败的 `message' 含引擎 model/host，且不含 key 哨兵."
+  (skip-unless (require 'gt nil t))
+  (let* ((sentinel "SENTINEL-KEY-DO-NOT-LEAK")
+         (seshat-reader-translate-presets
+          (list (cons 'reader-explain
+                      (gt-translator
+                       :engines (list (gt-chatgpt-engine
+                                       :host "api.deepseek.com"
+                                       :model "deepseek-chat"
+                                       :key sentinel))))))
+         (seshat-reader-translate-explain-preset 'reader-explain)
+         (seshat-reader-translate-explain-prompt nil)
+         (seshat-reader-translate-stream nil)
+         (seshat-reader-translate-render 'pop)
+         (seshat-reader-translate-fallback-langs '(en zh))
+         (seshat-reader-select-last (list :text "Hello world"))
+         (seshat-reader-translate-last-result nil)
+         (gt-posframe-pop-render-output-hook nil)
+         (gt-posframe-pin-render-output-hook nil)
+         (messages nil))
+    (cl-letf (((symbol-function 'gt-start)
+               (lambda (&rest _) (error "boom-500")))
+              ((symbol-function 'message)
+               (lambda (fmt &rest args)
+                 (push (apply #'format fmt args) messages))))
+      (seshat-reader-translate-explain-selection))
+    (should (= 1 (length messages)))
+    (let ((msg (car messages)))
+      (should (string-match-p "解释失败" msg))
+      (should (string-match-p "deepseek-chat" msg))
+      (should (string-match-p "api\\.deepseek\\.com" msg))
+      (should-not (string-match-p sentinel msg)))))
+
 (provide 'seshat-reader-translate-test)
 ;;; seshat-reader-translate-test.el ends here
 

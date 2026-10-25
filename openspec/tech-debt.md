@@ -1395,4 +1395,46 @@
   `--translator` 会让追问（`C-c C-q`）取不到 ChatGPT 引擎，直接 `user-error`。
 - 影响：多轮追问功能立刻失效（且错误信息只提示"预设引擎不支持多轮"）。
 - 来源：本计划 T5 实现与上述并行计划的 T1 冲突面（2026-10-25 代码审查发现）。
-- 解除条件：两处查表统一为一个辅助函数（如 `--preset-translator`），或迁移时同时改两处并补一条 ERT 断言「预设迁出后 `--preset-chatgpt-engine` 仍能取到引擎」。
+- 解除条件：两处查表统一为一个辅助函数（如 `--preset-translator`），或迁移时同时改两处并补一条 ERT 断言「预设迁出后 `--preset-chatgpt-engine` 仍能取到引擎」。（**2026-10-25 已解除**：`--translator` 与 `--preset-chatgpt-engine` 现共用 `seshat-reader-translate--preset-translator`，并有「自有表优先 / 回落全局表 / thunk」三条 ERT。）
+
+## `eieio clone` vs `gt-single` 实例缓存未验证（2026-10-25 预设隔离与解释质量批次）
+
+- 现象：gt 的 engine / parser / render 均继承 `gt-single`，其 `make-instance` 以「槽参数的 sha1」为键做 **class 级实例缓存**（`gt-core.el`）。`describe-function clone` 只说它是 generic 且带 PARAMS，**不保证**不经 `make-instance`，因此「`(clone engine)` 后 `oset` 改槽」是否真的产出独立副本**至今无测试支撑**。目前该路径被两处依赖：`seshat-reader-translate--enable-stream`（`oset copy stream t`）与 `--follow-up-translator`（`oset engine-copy prompt`，commit `8d43480` 引入）。
+- 影响：若 `clone` 命中缓存，改的就是**全局共享的引擎实例**——流式开关会污染其它 gt 用法，追问的 messages 函数会顶替用户预设里原本的 prompt（表现为「某次追问之后，普通翻译也开始输出问答格式」），且**不报错**、只能靠行为异常发现。本批次因此**不克隆引擎**（解释 prompt 全走 taker text，见 `openspec/decisions.md` 2026-10-25 D2 条）。
+- 来源：`openspec/active/2026-10-25-reader-translate-preset-isolation-and-explain-quality.md`（F3 / D2）；`seshat-reader-translate.el` 的 `--enable-stream` / `--follow-up-translator`。
+- 解除条件：写一个 spike——对同一预设连续 `(clone engine)` 两次，断言两次的 `eq` 为 nil（不同对象）、`oset` 其中一个的槽后另一个与原预设的该槽不变（`eql` 相等），并覆盖「槽参数完全相同」（最易命中缓存）与「参数不同」两种情形。结论若为「clone 不绕缓存」，则流式 / 追问必须改为「在 taker text / messages 层实现」或「显式 `make-instance` 新引擎」，并把该 spike 固化为 ERT。
+
+## `--page-text` / `--text-in-rect` 的软换行粘连（解释上下文受其影响）
+
+- 现象：C 侧两个取文入口把 stext 的 run 拼成一整串，**行与行之间不插 `\n`**（PDF 文本层本无换行概念），实测同一段落跨行处的中英文会直接粘成 `…the modelisto…` / `…模型的输入是…`。上游 `thomas-emacs` 的 `gt-source-text-transformer`（`+thomas/normalize-soft-wraps`）在**段落内**能把排版硬换行合并成空格，但它依赖文本里**存在**换行，无法还原从未写入的分隔。
+- 影响：解释的上下文文本（`--context-text` 走 `--text-in-rect` 或降级 `--page-text`）会出现单词/词块粘连，语种混杂处的粘接可能让模型误读术语边界；同时上游的「保护行」（列表 / 标题 / 代码围栏）识别也会因为缺少换行而失效——全部内容被视为一个超长段落。
+- 来源：`openspec/active/2026-10-25-reader-translate-preset-isolation-and-explain-quality.md`（D3 上下文链）；依赖 active 计划 `2026-10-25-pdf-text-line-separators.md`（C 层按行边界补分隔符）。
+- 解除条件：该 C 层计划落地后，`--text-in-rect` / `--page-text` 的返回按行边界插入 `\n`（需同时核对既有 ERT 对取文结果的逐字断言与 `seshat-reader-select` 的选区文本语义），本批次无需改 elisp；解除前不建议调大 `seshat-reader-translate-context-lines`（粘连会随行数放大）。
+
+## 流式增量路径不经过 `--strip-chatter`
+
+- 现象：输出净化（`seshat-reader-translate-strip-chatter`）挂在 `--record-result` 之前，而流式增量由 `gt-buffer-render-output-hook` 直接写入面板正文区、**不经过** `--record-result`——因此 `seshat-reader-translate-stream` 为 `t`（默认）时，面板上仍会先出现「好的，以下是……：」这一行，只有收尾文本（`last-result` / 存为批注 / 后续追问引用的文本）是净化后的。
+- 影响：观感不一致——同一次解释，面板首行是寒暄、存成批注却没有；关闭流式（`(setq seshat-reader-translate-stream nil)`）时两者一致。功能无碍，属显示层瑕疵。
+- 来源：`openspec/active/2026-10-25-reader-translate-preset-isolation-and-explain-quality.md`（D5 明示「流式增量过程不经过」）。
+- 解除条件：在增量同步的**首次**替换时对已到达文本做一次前缀净化（需处理「首行尚未接收完」的边界：冒号可能落在第二个增量里），或流式期间只在骨架里留占位、完成时统一净化重写正文（代价是失去增量观感）。改前先确认 `gt-buffer-render-translate-translator` 身份守卫仍成立。
+
+## `with-eval-after-load` 重载 `init-tools.el` 会重复 push 预设
+
+- 现象：`thomas-emacs/lisp/init-tools.el` 用 `(with-eval-after-load 'seshat-reader-translate (push … seshat-reader-translate-presets) …)` 注册两个预设。`with-eval-after-load` 的钩子在**每次** feature 加载时执行一次；正常启动只加载一次，但用户在运行中 `M-x load-file init-tools.el`（或重新 `require 'seshat-reader-translate` 前后重放）会把 `(reader . …)` / `(reader-explain . …)` 再 `push` 一遍。
+- 影响：`seshat-reader-translate-presets` 出现同名重复项。**行为无害**——`--preset-translator` 用 `alist-get` 取**首个**命中，新 push 的项在表头、取到的仍是同一个预设；唯一可见后果是变量内容变长（每重载一次 +2 项）。
+- 来源：`openspec/active/2026-10-25-reader-translate-preset-isolation-and-explain-quality.md`（T5 配置迁移）。
+- 解除条件：配置侧改成幂等的 `(setf (alist-get 'reader seshat-reader-translate-presets) …)`（或 push 前先 `assq-delete-all`），或把两个预设包进 `(unless (assq 'reader seshat-reader-translate-presets) …)`。改后需在 `test/init-smoke-test.el` 补一条「重载两次后表内无重复键」的断言。**2026-10-25 已解决**：`init-tools.el` 的两个 push 已加 `(unless (assq …))`，连续重载 3 次表长度恒为 2。
+
+## 解释上下文超上限时只保留前缀，下方块可能被整块截掉（minor，2026-10-25 T6b-3）
+
+- 现象：`--context-text` 的矩形路径把「选区上方块 + 下方块」拼成一个**不含选区**的串后交给 `--context-window`；该函数在其中定位不到选区（字符串里本就没有选区），于是走「取前 MAX-CHARS 个字符」分支。当上方块本身较长、两块合计超过 `seshat-reader-translate-context-max-chars`（默认 1200）时，**下方块会被整体截掉**，模型只看得到选区之前的正文。真实 PDF 实测（`d2l-zh-pytorch.pdf` 第 21 页，矩形 `(0.0 150.0 400.0 250.0)`）两块合计仅 179 字符，未触发；触发条件是「选区上方还有长段正文」。
+- 影响：解释质量而非正确性——上下文偏向选区之前、缺少后文承接；不报错，长度上限仍被守住。
+- 来源：`openspec/active/2026-10-25-reader-translate-preset-isolation-and-explain-quality.md`（T6b-3：上下文改为取选区上下块）。
+- 解除条件：矩形路径改为「按块分配预算」（各占 `max-chars / 2`，任一块不足时把余量让给另一块），或在拼接前对各块分别截断；改动需补一条 ERT（「上方块超长时下方块仍保留部分」）并同步 `docs/configuration.md` 的 `-context-max-chars` 说明。
+
+## `--strip-chatter` 可能误删以「下面 / 这段」开头的正文首行（minor，2026-10-25 审查残余）
+
+- 现象：`seshat-reader-translate--chatter-regexp` 只要求「首行以寒暄词开头 + 该行以冒号结尾」，因此正文本身以「下面 / 这段」开头且以冒号收尾时（如「下面这段代码做了什么：」作为正文首行）会被当成寒暄整行删掉。
+- 影响：输出内容被削掉一行；强特征（行尾冒号）+ 可关开关（`seshat-reader-translate-strip-chatter` 设 `nil`）使风险可控，不报错。
+- 来源：`openspec/active/2026-10-25-reader-translate-preset-isolation-and-explain-quality.md`（D5 输出净化的审查 minor）。
+- 解除条件：收紧词表（只保留「好的 / 以下是」这类纯寒暄词），或要求更长的寒暄短语（如「好的，以下是」整串匹配）以降低对正文首行的命中率。

@@ -169,7 +169,7 @@ Emacs 端通过 `seshat-reader-annotation` 采集 PDF 页面选区并同步为�
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `seshat-reader-translate-preset` | `reader` | 「翻译」使用的 gt 预设名（阅读器按名从 `gt-preset-translators` 取用） |
+| `seshat-reader-translate-preset` | `reader` | 「翻译」使用的 gt 预设名（阅读器按名从 `seshat-reader-translate-presets` → `gt-preset-translators` 依次取用） |
 | `seshat-reader-translate-explain-preset` | `reader-explain` | 「解释」使用的 gt 预设名（通常指向 `gt-chatgpt-engine`） |
 | `seshat-reader-translate-fallback-langs` | `(en zh)` | 语言回退：源语言取本列表首项，目标语言由此推导（可由命令前缀参数覆盖） |
 | `seshat-reader-translate-render` | `sidebar` | 译文/解释呈现方式：`sidebar`（默认，写入**底部面板内的 Markdown 文本 buffer**——`gfm-view-mode` → `markdown-view-mode` → `text-mode` 降级链，原生折行/滚动/复制/isearch 可用，**不经 ETAF 排版**）、`pop`（posframe 弹出，超时自动消失）或 `pin`（posframe 固定停留）。取 `sidebar` 但 `seshat-reader-sidebar-enabled` 为 nil 时退回 `pop` 式 posframe |
@@ -180,11 +180,21 @@ Emacs 端通过 `seshat-reader-annotation` 采集 PDF 页面选区并同步为�
 | `seshat-reader-translate-stream` | `t` | 译文/解释**流式增量输出**：为克隆后的引擎设 `stream` 槽，把 `gt-buffer-render-output-hook` 的增量同步到面板——模板骨架只写一次（正文 `%t` 为空）并记正文起点 marker，后续只替换 marker 之后的正文区，完成时只更新 `header-line` 不再 `erase-buffer`（避免完成瞬间整块跳变）。引擎不支持流式或取 `nil` 时退回「完成即整体渲染」的旧路径 |
 | `seshat-reader-translate-engines-pick` | `all` | 多引擎结果的展示方式：`all`（**默认**，展示全部**成功**结果，每条前标注 `【引擎名】`、段间用 Markdown 分隔线 `---`）/ `first`（只展示第一个成功结果）/ `last`（只展示最后一个成功结果）——`first` / `last` **不带**来源标签。带 `gt-buffer-render-error-face` 的片段视为失败跳过；来源取不到时退化为纯译文（不加标签不加分隔线）。改成「拼接后不可区分」的旧观感请显式设 `first` |
 | `seshat-reader-translate-follow-up-max-rounds` | `6` | 追问（`C-c C-q`）历史保留的**轮数上限**（一轮 = 问 + 答两条 messages）；超出时**丢弃最早的轮次**，但首轮的原文与首轮解释（messages 前两条）**始终保留**。取 `0` 表示不带任何历史轮次（每次追问只看原文与首轮解释）。轮数越多每次请求的上下文越长、费用越高 |
+| `seshat-reader-translate-presets` | `nil` | **seshat 专用的 gt 预设表**，元素为 `(NAME . TRANSLATOR)` 或 `(NAME . THUNK)`（THUNK 是无参函数，调用后返回 `gt-translator`，用于避开「配置加载时 gt 尚未加载」的顺序问题）。查表顺序：**本表 → `gt-preset-translators`**，本表命中优先，故 seshat 的预设不必再进 gt 全局表 |
+| `seshat-reader-translate-explain-prompt` | 结构化中文模板（含 `## 任务` / `## 要求` / `## 上下文` / `## 需要解释的原文` 四节，每个标题后有空行） | 「解释」的 prompt 模板；`nil` 表示**不装配**：只发送纯选区文本，由引擎的 `:root`（system prompt）决定行为。注意 `reader-explain` 预设的 `:prompt` 已改为纯透传 `"{{text}}"`（解释指令改由 seshat 装配），因此 `nil` **不等于**恢复此前的旧中文长 prompt——需要那种效果请在配置侧把 `:prompt` 改回长指令。占位符：`{{text}}` 选区原文、`{{context}}` 上下文（可能为空行）、`{{doc}}` 文档名（无则替换为「未知文档」）、`{{lang}}` 目标语言；输入值里的 `{{` 会被转义（原样保留，不参与替换）。**每个标题行后必须留一个空行**：`gt-source-text-transformer` 只在空行处分段，否则标题会与紧随的正文行合并 |
+| `seshat-reader-translate-explain-max-chars` | `2000` | 送模型的**选区原文字符上限**（超出截断并在尾部加「（选区过长，以上为节选）」）；只作用于送模型的文本，**不影响**面板原文引用块与追问的来源文本 |
+| `seshat-reader-translate-strip-chatter` | `t` | 去掉模型输出的**寒暄首行**（首行以「好的 / 以下是 / 下面 / 这段 / 该段」开头且以冒号结尾时，删掉该行与其前导空行）；在 `--record-result` 处统一执行，故**翻译与解释、面板与 posframe 四条组合都生效**；流式增量过程不经过该净化 |
+| `seshat-reader-translate-context-enabled` | `t` | 解释时是否注入**同页邻近上下文**（= 选区**上方块 + 下方块**）；设 `nil` 时不触碰 C 模块（只送纯选区） |
+| `seshat-reader-translate-context-lines` | `2` | 上下文向选区上下各扩的**行数**：上方块取「外扩顶 → 选区顶」，下方块取「选区底 → 外扩底」，两块**分别**取文本后拼接（选区原文不在任一块内，不做字符串剥离） |
+| `seshat-reader-translate-context-max-chars` | `1200` | 上下文文本的**字符上限**（超出时截断：矩形路径只保留前 N 个字符，整页降级路径以选区为中心取窗口）。这也是解释时随原文一起离开本机的额外数据量上限 |
 
 说明：
 
-- `reader` / `reader-explain` 两个 gt 预设**需在用户配置侧定义**（示例见 `thomas-emacs/lisp/init-tools.el`）；阅读器侧只按预设名取用，缺失时回退内置默认（翻译回退 youdao/google，解释需显式配置端点）。
-- gt 的 key（如 `gt-chatgpt-key`）**一律走 authinfo / 环境变量**（本项目经 `DEEPSEEK_API_KEY` 环境变量注入），**禁止写入配置文件**。
+- `reader` / `reader-explain` 两个 gt 预设**推荐定义在 `seshat-reader-translate-presets`**（示例见 `thomas-emacs/lisp/init-tools.el`）——该表是 seshat 自有的，**不进** gt 全局 `gt-preset-translators`，因此不会出现在 `M-x gt-translate` 的预设选择列表里，也不影响用户其它 gt 用法；查表仍回落 `gt-preset-translators`，**把预设留在全局表的旧配置继续可用**，无需迁移。预设缺失时回退内置默认（翻译回退 youdao/google，解释需显式配置端点）。
+- `reader-explain` 的引擎 `:prompt` 应为**纯透传** `"{{text}}"`：解释的结构化指令由 seshat 装配（见 `seshat-reader-translate-explain-prompt`），配置侧再写长 prompt 会变成**双层指令**。
+- **解释的输入已从「纯选区」变为「结构化指令 + 同页上下文 + 选区原文」**：上下文取选区所在页、按选区触发行上下各扩 `seshat-reader-translate-context-lines` 行，然后**分上块与下块两次**取矩形文本（上块 = 外扩顶 → 选区顶，下块 = 选区底 → 外扩底），用空行拼接——选区原文天然不在任一块内，因此**不做任何「删除选区原文」的字符串操作**；取不到时降级「整页文本 + 窗口截取」，再失败则退化为「纯选区 + 指令」。**一键回退**：`explain-prompt` 设 `nil` → 只发送纯选区、由引擎 `:root` 决定（**不等于**旧中文长 prompt，需要旧效果请把预设 `:prompt` 改回长指令）；`context-enabled` 设 `nil` → 无上下文；`strip-chatter` 设 `nil` → 原样输出。
+- 解释 / 翻译失败时 `message` 会在原因前追加引擎标识 `（model @ host）`，便于判断是哪条链路出错；**不含任何 key**。
+- gt 的 key（如 `gt-chatgpt-key`）**一律走 authinfo / 环境变量**（本项目经 `DEEPSEEK_API_KEY` 环境变量注入），**禁止写入配置文件**。seshat 的 DeepSeek 引擎由 `thomas-emacs` 侧的 `thomas-seshat-chatgpt-engine` 子类覆写 `gt-resolve-key` 从 `DEEPSEEK_API_KEY` 取 key，**不再** `setq gt-chatgpt-key`（改全局变量会让用户其它 gt chatgpt 用法也用 DeepSeek key 打各自端点）。
 - **多引擎与追问的配置前提（M12 T8a，2026-10-25）**：① `seshat-reader-translate-engines-pick` 默认 `all`，多引擎预设（如 `reader` = youdao-dict + google）的输出改为逐条 `【引擎名】` 标注 + `---` 分隔；想要单条输出（旧观感）设 `first` / `last`。② `C-c C-q` 追问（`seshat-reader-translate-follow-up`）要求预设里**含 `gt-chatgpt-engine`**（如 `reader-explain`）——引擎克隆后把 `prompt` 槽换成「返回 messages 列表的函数」，由 `gt-chatgpt-send` 按 `messages` 数组发送；预设只有 youdao / google 这类纯翻译引擎时**报 `user-error` 并提示改配置**，不做文本拼接降级（翻译引擎没有对话语义）。追问历史轮数由 `seshat-reader-translate-follow-up-max-rounds`（默认 `6`）限制。
 
 ### 批注离线队列（服务不可用时的本地暂存）
