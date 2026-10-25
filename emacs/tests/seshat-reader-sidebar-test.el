@@ -1405,24 +1405,41 @@ DELETE-VAR 收集 `delete-window' 收到的窗口名（三元列表的 `car'）�
 
 (defun seshat-reader-sidebar-test--graphic-p (value)
   "把 `display-graphic-p' 桩成恒返回 VALUE 的 thunk，供 carrier 解析用例复用.
-batch 与终端 frame 下真实 `display-graphic-p' 恒为 nil，而默认 carrier 是
-`childframe'——不桩替就无法断言「图形终端下的默认解析结果」。"
+batch 与终端 frame 下真实 `display-graphic-p' 恒为 nil，不桩替就无法断言「图形
+终端下的解析结果」。"
   (lambda (&optional _display) value))
 
-(ert-deftest seshat-reader-sidebar-test--carrier-for-kind-defaults ()
-  "图形终端下按默认配置解析：`annotations' 走 alist 覆盖，其余 kind 走全局默认.
-默认 `seshat-reader-panel-carrier' 为 `childframe'、
-`seshat-reader-panel-carrier-alist' 为 `((annotations . window))'，故批注列表
-回落窗口承载（需要长列表浏览），目录与译文改走 child frame 覆盖。"
+(ert-deftest seshat-reader-sidebar-test--default-carrier-is-window ()
+  "`seshat-reader-panel-carrier' 的**定义默认值**为 `window'，且各 kind 实际解析为窗口承载.
+默认值读 `standard-value' 而非 `default-value'：后者会被运行时 `setq' /
+`set-default' 改写，断言会随用户配置漂移；本用例要钉的是 defcustom 里写死的
+那个默认。选 `window' 的理由是 childframe 满高时无法避让 frame 底部的
+minibuffer 与 `*Completions*'（不在窗口树内），会遮挡候选列表与回显。
+`translate' 单列一条，是因为 M12 T8a 时期它走 childframe——默认切换后它必须回到
+窗口承载（右侧 side window）。"
+  (should (eq (eval (car (get 'seshat-reader-panel-carrier 'standard-value)))
+              'window))
   (cl-letf (((symbol-function 'display-graphic-p)
              (seshat-reader-sidebar-test--graphic-p t)))
-    (should (eq (seshat-reader-sidebar--carrier-for-kind 'annotations) 'window))
-    (should (eq (seshat-reader-sidebar--carrier-for-kind 'outline) 'childframe))
-    (should (eq (seshat-reader-sidebar--carrier-for-kind 'translate)
-                'childframe))
+    (should (eq (seshat-reader-sidebar--carrier-for-kind 'translate) 'window))
+    (should (eq (seshat-reader-sidebar--carrier-for-kind 'outline) 'window))
+    (should (eq (seshat-reader-sidebar--carrier-for-kind 'annotations)
+                'window))
     ;; 未在 alist 中的未知 kind 走全局默认（不是回退，也不是报错）
-    (should (eq (seshat-reader-sidebar--carrier-for-kind 'unknown)
-                'childframe))))
+    (should (eq (seshat-reader-sidebar--carrier-for-kind 'unknown) 'window))))
+
+(ert-deftest seshat-reader-sidebar-test--default-sidebar-width ()
+  "`seshat-reader-sidebar-width' 的**定义默认值**为 0.25（占 frame 宽度比例）.
+同样读 `standard-value'：断言 defcustom 默认，不受运行时改写影响。该值只在
+side window 承载下生效，childframe 承载改用 `seshat-reader-panel-width'。"
+  (should (= (eval (car (get 'seshat-reader-sidebar-width 'standard-value)))
+             0.25))
+  ;; 宽度语义下 `--default-size' 直接取该默认值（信息栏两类 kind 都是它）
+  (let ((seshat-reader-sidebar-position 'right)
+        (seshat-reader-sidebar--state nil))
+    (should (= (seshat-reader-sidebar--size-for-kind 'translate)
+               (eval (car (get 'seshat-reader-sidebar-width
+                               'standard-value)))))))
 
 (ert-deftest seshat-reader-sidebar-test--carrier-for-kind-global-window ()
   "全局 carrier 设为 `window' 后，alist 未覆盖的 kind 全部回落窗口承载.
@@ -1440,15 +1457,15 @@ batch 与终端 frame 下真实 `display-graphic-p' 恒为 nil，而默认 carri
 
 (ert-deftest seshat-reader-sidebar-test--carrier-for-kind-non-graphic-fallback ()
   "非图形终端（`display-graphic-p' 为 nil）强制回退 `window'，与配置无关.
-两个方向都验：全局默认 `childframe' 时 outline 仍是 `window'；即便 alist 把
-该 kind 覆盖成 `childframe' 也一样——终端里 child frame 永远不显示，返回值
-只能是窗口承载。"
-  (cl-letf (((symbol-function 'display-graphic-p)
-             (seshat-reader-sidebar-test--graphic-p nil)))
-    (should (eq (seshat-reader-sidebar--carrier-for-kind 'outline) 'window))
-    (should (eq (seshat-reader-sidebar--carrier-for-kind 'translate) 'window))
-    (let ((seshat-reader-panel-carrier-alist '((outline . childframe))))
-      (should (eq (seshat-reader-sidebar--carrier-for-kind 'outline)
+两个来源都验：全局 carrier 设为 `childframe' 时 outline 仍是 `window'；即便
+alist 把该 kind 覆盖成 `childframe' 也一样——终端里 child frame 永远不显示，
+返回值只能是窗口承载。"
+  (let ((seshat-reader-panel-carrier 'childframe)
+        (seshat-reader-panel-carrier-alist '((outline . childframe))))
+    (cl-letf (((symbol-function 'display-graphic-p)
+               (seshat-reader-sidebar-test--graphic-p nil)))
+      (should (eq (seshat-reader-sidebar--carrier-for-kind 'outline) 'window))
+      (should (eq (seshat-reader-sidebar--carrier-for-kind 'translate)
                   'window)))))
 
 (ert-deftest seshat-reader-sidebar-test--carrier-for-kind-invalid-falls-back ()
@@ -1470,8 +1487,9 @@ batch 与终端 frame 下真实 `display-graphic-p' 恒为 nil，而默认 carri
 
 (ert-deftest seshat-reader-sidebar-test--carrier-for-kind-alist-overrides-window ()
   "全局为 `window' 时 alist 仍可把单个 kind 覆盖为 `childframe'.
-覆盖优先级高于全局默认（三层解析的第 2 层）：这是「默认 childframe、批注例外」
-之外的反向配置，说明 alist 是**双向覆盖**而非单向降级。"
+覆盖优先级高于全局默认（三层解析的第 2 层）：默认全局值本身已是 `window'，本
+用例把它固定住再逐 kind 改成 `childframe'，说明 alist 是**双向覆盖**而非单向
+降级——想只让译文走浮层不必改全局值。"
   (let ((seshat-reader-panel-carrier 'window)
         (seshat-reader-panel-carrier-alist '((outline . childframe))))
     (cl-letf (((symbol-function 'display-graphic-p)

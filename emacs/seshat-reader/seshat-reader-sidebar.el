@@ -161,12 +161,17 @@ side 模式下的宽度由 `seshat-reader-outline-sidebar-width' 决定；目录
                  (const :tag "frame 底部整宽" at-bottom))
   :group 'seshat-reader-sidebar)
 
-(defcustom seshat-reader-sidebar-width 0.24
-  "左右分栏时**信息栏**（kind 为 `annotations' / `translate'）的宽度比例.
-仅在 `seshat-reader-sidebar-position' 取 `left' 或 `right' 时生效，作为
-`display-buffer' 的 `(window-width . WIDTH)'：**小数**按 frame 根窗口总宽的
-比例换算为列数（`window--display-buffer' 的语义），整数则直接作为列数。
-目录栏（kind 为 `outline'）用 `seshat-reader-outline-sidebar-width'。
+(defcustom seshat-reader-sidebar-width 0.25
+  "左/右 **side window** 上**信息栏**（kind 为 `annotations' / `translate'）的宽度比例.
+即占 frame 宽度的比例。仅在 `seshat-reader-sidebar-position' 取 `left' 或
+`right' 时生效，作为 `display-buffer' 的 `(window-width . WIDTH)'：**小数**
+按 frame 根窗口总宽的比例换算为列数（`window--display-buffer' 的语义），整数
+则直接作为列数。目录栏（kind 为 `outline'）用
+`seshat-reader-outline-sidebar-width'。
+
+**仅窗口承载生效**：`childframe' 承载（`seshat-reader-panel-carrier' 或
+`seshat-reader-panel-carrier-alist' 指定）时面板是独立 frame，宽度由
+`seshat-reader-panel-width' 决定，本变量不参与计算。
 
 改动仅对**新建**面板窗口生效（已显示的窗口不自动重排，需重开或手动
 `window-resize'）。底部模式（`below-selected' / `at-bottom'）不使用本值，见
@@ -186,12 +191,18 @@ side 模式下的宽度由 `seshat-reader-outline-sidebar-width' 决定；目录
   :type 'number
   :group 'seshat-reader-sidebar)
 
-(defcustom seshat-reader-panel-carrier 'childframe
+(defcustom seshat-reader-panel-carrier 'window
   "面板承载方式（除 `seshat-reader-panel-carrier-alist' 逐 kind 覆盖外生效).
+`window'（默认）：沿用既有的 **side window** / 底部窗口承载，行为与
+`seshat-reader-sidebar-position' 一族变量完全一致。默认取它的**理由**：
+child frame 不在窗口树内，满高显示时无法避让 frame 底部的 minibuffer 与
+`M-x' 补全列表（`*Completions*'），会遮挡用户的候选与回显；side window 天然
+参与窗口树布局，满高也只会挤压阅读区、不会盖住 minibuffer。
 `childframe'：以 child frame 覆盖在父 frame 右上角，不参与窗口树，故显示/刷新
 面板不会改变阅读窗口尺寸（阅读器版面与窗口像素尺寸耦合，压缩阅读窗口会触发
-重新适配）。`window'：沿用既有的 side window / 底部窗口承载，行为与
-`seshat-reader-sidebar-position' 一族变量完全一致。
+重新适配）。需要「浮层覆盖、不挤占阅读区」时把它设为 `childframe'，并注意它
+**无法避让底部 minibuffer**（可配 `seshat-reader-panel-full-height' 为 nil 或
+减小 `seshat-reader-panel-height' 让它变矮）。
 非图形环境（`display-graphic-p' 为 nil）强制回退 `window'：child frame 只存在
 于图形终端。"
   :type '(choice (const :tag "child frame 覆盖（不改窗口布局）" childframe)
@@ -201,8 +212,10 @@ side 模式下的宽度由 `seshat-reader-outline-sidebar-width' 决定；目录
 (defcustom seshat-reader-panel-carrier-alist '((annotations . window))
   "逐 kind 覆盖 `seshat-reader-panel-carrier' 的承载方式.
 键是面板 kind（`outline' / `annotations' / `translate'），值是 carrier
-（`childframe' / `window`）。默认为批注列表保留窗口承载：批注条目多、需要长
-列表浏览与逐条跳转，覆盖浮层既遮挡正文又放不下。"
+（`childframe' / `window`）。默认只有批注列表一条：批注条目多、需要长列表浏览
+与逐条跳转，覆盖浮层既遮挡正文又放不下，故显式钉在窗口承载上——全局默认已是
+`window'，本条与之等价，保留它只为把这一意图写进配置：用户把全局 carrier 改
+为 `childframe' 后，批注列表仍留在窗口承载。"
   :type '(alist :key-type symbol :value-type symbol)
   :group 'seshat-reader-sidebar)
 
@@ -692,8 +705,9 @@ slot 会被 `display-buffer-in-side-window' 拒绝而回落为普通窗口，此
    一律返回 `window'——child frame 只存在于图形终端，此时若返回 `childframe'
    会让上层去建一个永远不显示的 frame。
 2. **per-kind 覆盖**：`seshat-reader-panel-carrier-alist' 命中 KIND 时取其值
-   （批注列表默认走窗口承载，理由见该变量的 docstring）。
-3. **全局默认**：未命中时取 `seshat-reader-panel-carrier'。
+   （默认只有批注列表一条 `window'，理由见该变量的 docstring）。
+3. **全局默认**：未命中时取 `seshat-reader-panel-carrier'（默认 `window'，
+   childframe 满高会遮挡 minibuffer，故不作默认）。
 
 前两层任一层给出非法取值（不是 `childframe' / `window' 的符号）时**静默回落
 `window'**，不发 `message'：承载方式由用户配置决定，配置写错时每次显示/刷新都
