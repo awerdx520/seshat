@@ -2365,6 +2365,58 @@ STATE 为 plist（可含 `:source' `:answer' `:langs' `:kind' `:round' `:turns'
       (should (string-match-p "api\\.deepseek\\.com" msg))
       (should-not (string-match-p sentinel msg)))))
 
+;;; 边界规范化（`seshat-reader-translate--as-string'）
+;;
+;; gt 的 translator `text' 槽永远是**分段列表**（一个选区是单元素列表
+;; `("文本")'）。上游把它当字符串传给字符串函数时报
+;; `Wrong type argument: stringp, ("…")'；本包在边界处统一规范化。
+
+(ert-deftest seshat-reader-translate-test--as-string-normalizes ()
+  "字符串原样、nil 为空串、纯字符串列表换行拼接、其它值 `format' 成串."
+  (should (equal (seshat-reader-translate--as-string "abc") "abc"))
+  (should (equal (seshat-reader-translate--as-string nil) ""))
+  (should (equal (seshat-reader-translate--as-string '("a" "b")) "a\nb"))
+  (should (equal (seshat-reader-translate--as-string '("only")) "only"))
+  (should (equal (seshat-reader-translate--as-string 42) "42"))
+  ;; 非字符串元素的列表走 `format'，不抛错
+  (should (stringp (seshat-reader-translate--as-string '(1 2)))))
+
+(ert-deftest seshat-reader-translate-test--explain-request-text-accepts-segment-list ()
+  "TEXT 为 gt 的单元素分段列表时不抛错，返回含该文本的字符串."
+  (let* ((text '("Kademlia: A Peer-to-Peer Information SyBased on the XOR Metric?"))
+         (assembled (seshat-reader-translate--explain-request-text
+                     text "CTX" "docname" '(en zh))))
+    (should (stringp assembled))
+    (should (string-match-p "Kademlia" assembled))))
+
+(ert-deftest seshat-reader-translate-test--apply-template-accepts-segment-list ()
+  "TEXT 为单元素列表时返回字符串，且不把 prin1 括号形态写进面板."
+  (let ((seshat-reader-select-last nil))
+    (let ((rendered (seshat-reader-translate--apply-template
+                     '("Kademlia: A Peer-to-Peer Information System")
+                     "Seshat 译文" '(en zh) 'translate)))
+      (should (stringp rendered))
+      (should (string-match-p "Kademlia" rendered))
+      ;; 关键断言：不能出现列表的 prin1 形态 `("Kademlia' / `(Kademlia'
+      (should-not (string-match-p "(Kademlia" rendered))
+      (should-not (string-match-p "(\"" rendered)))
+    ;; 模板为 nil 的早退分支同样返回字符串形态
+    (let ((seshat-reader-translate-template nil)
+          (seshat-reader-select-last nil))
+      (should (equal (seshat-reader-translate--apply-template
+                      '("纯正文") "T" nil 'translate)
+                     "纯正文")))))
+
+(ert-deftest seshat-reader-translate-test--record-result-accepts-segment-list ()
+  "EXTRACTED 的 TEXT 是分段列表时 `last-result' 仍是字符串."
+  (let ((seshat-reader-translate-strip-chatter t)
+        (seshat-reader-translate-last-result nil))
+    (should (equal (seshat-reader-translate--record-result
+                    '(("某段译文") . nil))
+                   "某段译文"))
+    (should (stringp seshat-reader-translate-last-result))
+    (should (equal seshat-reader-translate-last-result "某段译文"))))
+
 (provide 'seshat-reader-translate-test)
 ;;; seshat-reader-translate-test.el ends here
 

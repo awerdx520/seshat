@@ -615,6 +615,18 @@ major mode 调用失败（如 autoload 指向的库缺失）时回退 `text-mode
       (when (get-buffer-window (current-buffer))
         (visual-fill-column-mode -1)))))
 
+(defun seshat-reader-translate--as-string (value)
+  "把 VALUE 规范成字符串，用于防御「上游把 gt 的分段列表当字符串传入」.
+字符串原样返回；nil 返回空串；全部元素都是字符串的 list 用换行拼接（gt 的
+translator `text' 槽就是这个形状，一个选区是单元素列表）；其它值用 `format'。
+诊断依据：用户环境中曾出现 `Wrong type argument: stringp, (\"选区文本\")'，
+来自 gt 异步渲染路径把整表喂给字符串函数；本包边界处统一规范化可避免同类崩溃。"
+  (cond
+   ((stringp value) value)
+   ((null value) "")
+   ((and (listp value) (cl-every #'stringp value)) (string-join value "\n"))
+   (t (format "%s" value))))
+
 (defun seshat-reader-translate--format-langs (langs)
   "把 LANGS 列表格式化为 \"源 → 目标...\" 字符串；无法格式化时返回 nil.
 例如 (en zh) 返回 \"en → zh\"，(en zh ja) 返回 \"en → zh → ja\"。
@@ -643,15 +655,20 @@ nil 时各自退回纯正文，互不借用——这是用 CONTEXT 而非「模�
 
 TITLE 填 `%k'，LANGS 经 `--format-langs' 转成 \"en → zh\" 后包成斜体填 `%l'
 （如 `*en → zh*'；LANGS 为空时该占位符留空，不会留下空的 `**'），原文
-引用块填 `%q'，TEXT 填 `%t'。所选模板为 nil 时原样返回 TEXT。渲染后压缩
+引用块填 `%q'，TEXT 填 `%t'。所选模板为 nil 时原样返回 TEXT（仍经
+`seshat-reader-translate--as-string' 规范成字符串）。渲染后压缩
 占位符为空造成的连续空行（`\\n{3,}' → `\\n\\n'）并补一个尾换行。仅
 `format-spec' 调用包在 `condition-case' 内：模板非法时 `message' 警告并
-原样返回 TEXT。"
+原样返回 TEXT。
+
+TEXT 在进入 `format-spec' 之前经 `seshat-reader-translate--as-string' 规范
+成字符串：gt 的 translator `text' 槽可能是**分段列表**（一个选区是单元素
+列表），直接喂给 `format-spec' 会把它 prin1 成 `(\"…\")' 静默写进面板。"
   (let ((template (if (eq context 'explain)
                       seshat-reader-translate-explain-template
                     seshat-reader-translate-template)))
     (if (null template)
-        text
+        (seshat-reader-translate--as-string text)
       (let* ((lang-str (seshat-reader-translate--format-langs langs))
              (quote-block (or (seshat-reader-translate--quote-block) ""))
              (lang-line (if lang-str (concat "*" lang-str "*") ""))
@@ -662,13 +679,14 @@ TITLE 填 `%k'，LANGS 经 `--format-langs' 转成 \"en → zh\" 后包成斜体
                                (list (cons ?k title)
                                      (cons ?l lang-line)
                                      (cons ?q quote-block)
-                                     (cons ?t text)))
+                                     (cons ?t (seshat-reader-translate--as-string
+                                               text))))
                 (error
                  (message "Seshat Reader translate: 模板渲染失败（%s），回退纯正文"
                           (error-message-string err))
                  nil)))
         (if (null rendered)
-            text
+            (seshat-reader-translate--as-string text)
           (concat (string-trim
                    (replace-regexp-in-string "\n\\{3,\\}" "\n\n" rendered))
                   "\n"))))))
@@ -1023,9 +1041,13 @@ the module is touched at all."
 
 (defun seshat-reader-translate--explain-escape-value (value)
   "把输入值 VALUE 里的 `{{' 换成哨兵，返回转义后的字符串；nil 视为空串.
-只转义 `{{'：单个 `{' 不参与占位符语法，无需处理。"
+只转义 `{{'：单个 `{' 不参与占位符语法，无需处理。
+
+VALUE 先经 `seshat-reader-translate--as-string' 规范成字符串：gt 的
+translator `text' 槽可能是**分段列表**，直接传给 `string-replace' 会抛
+`Wrong type argument: stringp, (\"…\")'。"
   (string-replace "{{" seshat-reader-translate--explain-brace-sentinel
-                  (or value "")))
+                  (seshat-reader-translate--as-string value)))
 
 (defun seshat-reader-translate--explain-unknown-placeholder (template)
   "扫描 TEMPLATE（字符串）里的 `{{[^{}]*}}'，返回首个未知占位符或 nil.
@@ -1116,7 +1138,8 @@ seshat 装配），因此 nil **不等于**恢复此前的旧中文长 prompt—
 
 TEXT 为 nil 或非字符串时原样返回。本函数是纯函数，不读写任何全局状态；
 开关 `seshat-reader-translate-strip-chatter' 由调用方
-（`seshat-reader-translate--record-result'）判断。"
+（`seshat-reader-translate--record-result'）判断，且该调用方在调用本函数
+**之前**已用 `seshat-reader-translate--as-string' 把文本规范成字符串。"
   (if (not (stringp text))
       text
     (if (string-match seshat-reader-translate--chatter-regexp text)
@@ -1129,7 +1152,9 @@ TEXT 为 nil 或非字符串时原样返回。本函数是纯函数，不读写�
 长度未超上限、上限非正整数（关闭截断）、或 TEXT 非字符串时原样返回；
 超限时保留前上限个字符并追加标注 `（选区过长，以上为节选）'。
 只用于**送引擎**的文本：面板原文引用块与追问来源仍取完整选区
-（`seshat-reader-translate--selection-source-text'）。纯函数。"
+（`seshat-reader-translate--selection-source-text'）。纯函数。
+调用方（`seshat-reader-translate--record-result' 一侧）已在边界处用
+`seshat-reader-translate--as-string' 规范化文本。"
   (let ((max seshat-reader-translate-explain-max-chars))
     (if (or (not (stringp text))
             (not (integerp max))
@@ -1423,7 +1448,13 @@ TEXT。posframe 路径与面板路径（`seshat-reader-translate--panel-result'�
 首行，并返回净化后的文本——面板路径与本函数的返回值因此一致，四条
 「翻译/解释 × 面板/posframe」组合都生效。流式增量路径
 （`seshat-reader-translate--stream-sync'）不经过本函数，其面板内容保持
-模型原样输出。"
+模型原样输出。
+
+成功分支在净化前先经 `seshat-reader-translate--as-string' 规范成字符串：
+gt 的 translator `text' 槽可能是**分段列表**，直接写进
+`seshat-reader-translate-last-result' 会让后续
+`seshat-reader-translate-save-as-annotation' 的 `string-trim' 崩溃（同源
+第二现场）。"
   (let ((text (car extracted))
         (failed (cdr extracted)))
     (cond
@@ -1434,10 +1465,11 @@ TEXT。posframe 路径与面板路径（`seshat-reader-translate--panel-result'�
       (message "Seshat Reader translate: 翻译失败（在渲染缓冲区中未找到译文）。")
       nil)
      (t
-      (setq seshat-reader-translate-last-result
-            (if seshat-reader-translate-strip-chatter
-                (seshat-reader-translate--strip-chatter text)
-              text))))))
+      (let ((clean (seshat-reader-translate--as-string text)))
+        (setq seshat-reader-translate-last-result
+              (if seshat-reader-translate-strip-chatter
+                  (seshat-reader-translate--strip-chatter clean)
+                clean)))))))
 
 (defun seshat-reader-translate--capture-result ()
   "从当前缓冲区捕获纯译文并写入 `seshat-reader-translate-last-result'.

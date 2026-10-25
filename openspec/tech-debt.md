@@ -1438,3 +1438,19 @@
 - 影响：输出内容被削掉一行；强特征（行尾冒号）+ 可关开关（`seshat-reader-translate-strip-chatter` 设 `nil`）使风险可控，不报错。
 - 来源：`openspec/active/2026-10-25-reader-translate-preset-isolation-and-explain-quality.md`（D5 输出净化的审查 minor）。
 - 解除条件：收紧词表（只保留「好的 / 以下是」这类纯寒暄词），或要求更长的寒暄短语（如「好的，以下是」整串匹配）以降低对正文首行的命中率。
+
+## gt 异步渲染路径把分段 text 列表当字符串（2026-10-25 加固，gt 侧仍存隐患）
+
+- 现象：gt 的 translator `text' 槽永远是**分段列表**（一个选区 = `("文本")`）。gt 的异步渲染路径（`gt-word-p` / `gt-buffer-insert-source-text` / overlay 与 insert 两类渲染）在部分预设下会把整表当字符串交给 `string-trim` 一类函数，报 `Wrong type argument: stringp, ("…")`；用户在主实例实测命中（`[unhandled error] Wrong type argument: stringp, ("Kademlia: …")`）。触发条件多为 `word` / overlay 类预设或旧版 gt 代码路径。
+- 本包已做的加固（`seshat-reader-translate.el`）：新增 `seshat-reader-translate--as-string`（字符串原样 / nil → 空串 / 纯字符串列表换行拼接 / 其它 `format'），在三处边界接线——`--explain-escape-value`（避免 `string-replace' 崩）、`--apply-template`（避免把 `("…")` 的 prin1 形态静默写进面板）、`--record-result`（避免把 list 写进 `last-result`，否则后续 `--save-as-annotation' 的 `string-trim' 在同源第二现场崩溃）。
+- 剩余隐患：**gt 侧未改**（本仓库不 vendored gt，也不得改 thomas-emacs）。因此 `word`/overlay 类预设、以及上游 gt 升级后新出现的字符串假设，仍可能在渲染阶段抛 `stringp` 错误——本包的规范化只保证「错误不落在 seshat 自己的边界函数上」。
+- 来源：2026-10-25 逐函数探针（HEAD 上 `--explain-escape-value` 收到单元素 list 必抛错；`--apply-template` / `--record-result` 静默污染）。
+- 解除条件：gt 上游在渲染路径入口统一 `(mapconcat #'identity text ""/ "\n")`；或本包改用自建渲染器（放弃 gt 的 overlay/word 渲染）。在此之前不建议把 `seshat-reader-translate-preset' 切到 `word`/overlay 预设。
+
+## 流式开启时 gt 的 `:then` 回调不触发（`--stream` 与 sidebar 组合）
+
+- 现象：`seshat-reader-translate-stream` 为 `t`（默认）时，`gt-finalize` 的 stream 分支不调 `gt-update`，因此渲染器的 `:then` 回调**不触发**——纯流式下侧栏面板的内容依赖 `gt-buffer-render-output-hook` 的增量；而 `gt-posframe-*` 类渲染会在局部改写该 hook（`gt-posframe-pop-render-output-hook` / `gt-posframe-pin-render-output-hook`），流式 + sidebar 组合下增量与收尾可能同时失效（面板停在骨架或停在最后一段增量）。
+- 影响：显示层，不报错；`last-result` 与面板内容可能不一致（面板缺收尾更新）。
+- 临时规避：`(setq seshat-reader-translate-stream nil)`——退回「完成时一次性渲染」，`:then` 路径恢复。
+- 来源：2026-10-25 主实例诊断（`gt-finalize' 的 stream 分支与 `gt-update' 调用链）；与上方「流式增量路径不经过 `--strip-chatter`」同属流式分支的 gt 契约缺口。
+- 解除条件：gt 在 stream 收尾路径补调 `gt-update`（或提供独立的「流式完成」回调）；或本包在 `gt-buffer-render-output-hook` 里自行判定「translator state = 3」并收尾，不依赖 `:then`。
