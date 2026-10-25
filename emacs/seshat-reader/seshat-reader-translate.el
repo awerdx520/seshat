@@ -292,6 +292,19 @@ marker 停在插入文本之前，正好指向正文起点。")
 而非只知道后缀，故在此记下标题（`--panel-result' 拿不到 `:then' 闭包里的
 TITLE 参数）。")
 
+(defvar-local seshat-reader-translate--panel-context nil
+  "面板 buffer 当前承载的语境（buffer-local）：`translate' 或 `explain'.
+翻译与解释共用同一个面板 buffer 与同一个面板 kind（`translate'），故
+`seshat-reader-sidebar-panel-visible-p' 只能回答「面板是否显示」，回答不了
+「显示的是译文还是解释」。两个 toggle（`-toggle' / `-explain-toggle'）要做到
+一一对应（面板里是译文时按「解释」键应**替换**成解释、而不是关掉面板），就
+必须另有语境记录，本变量即该记录。
+
+写入点：`--render-panel'（非流式与缓存重绘）与 `--stream-init'（流式骨架）——
+两者都必须在 `--prepare-view' **之后**设置，因为切 major mode 会
+`kill-all-local-variables'。读取走 `--panel-context'（读面板 buffer 的这一份，
+不是当前 buffer 的）。")
+
 (defconst seshat-reader-translate--follow-up-buffer-name " *Seshat gt follow-up*"
   "追问请求的 go-translate 中转 buffer 名.
 与首轮的 `seshat-reader-translate--gt-buffer-name' 分开，避免追问的增量输出
@@ -598,6 +611,38 @@ go-translate function `gt-buffer-render' 是该库中定义的**类名**（不�
 不匹配它。gt 渲染完成后由 `:then' 回调（`--panel-result'）从这里提取纯译文，
 再写入真正的展示 buffer `seshat-reader-sidebar-translate-buffer-name'。")
 
+(defun seshat-reader-translate--hidden-gt-buffer-names ()
+  "返回两个 gt 中转（隐藏）buffer 的名字列表.
+`seshat-reader-translate--gt-buffer-name'（首轮翻译/解释）与
+`seshat-reader-translate--follow-up-buffer-name'（追问）各自独立，避免互相
+覆盖输出。两者都必须永不显示窗口，故在此集中成一处，供
+`seshat-reader-translate--ensure-hidden-gt-buffers' 与测试共用。"
+  (list seshat-reader-translate--gt-buffer-name
+        seshat-reader-translate--follow-up-buffer-name))
+
+(defun seshat-reader-translate--ensure-hidden-gt-buffers ()
+  "把两个 gt 中转 buffer 名登记进 `display-buffer-alist'：一律不显示窗口.
+`:window-config' 槽只影响 `gt-init' 里的**那一次** `display-buffer'；
+`gt-buffer-render' 的输出方法在 translator 完成时（state = 3）**另有一次**
+`(display-buffer buf)'——不带 action，直接落到 `display-buffer-alist' 的默认
+动作，于是追问的中转 buffer（名字两侧带空格的那个 ` *Seshat gt follow-up*'）
+会在答案到达的瞬间被弹出来挤占阅读窗口（实测：PDF 被挤到左半边）。用户配置里给
+`\\*Seshat gt\\*' 写过一条 no-window 的条目，恰好只盖住首轮那个名字，追问的
+名字带 ` follow-up' 后缀，正则匹配不到，因此暴露了这条缺口。
+
+本函数给两个名字各注册一条 `(display-buffer-no-window)' +
+`(allow-no-window . t)'，使两次显示都落空（缺 `allow-no-window' 时
+`display-buffer' 会报 \"No window\"）。幂等：已存在同 REGEXP 的条目时不再重复
+插入；只在缺失时补一条**精确匹配**（`\\`` + `regexp-quote' + `\\''），不会
+误伤其它 buffer，返回 t。"
+  (dolist (name (seshat-reader-translate--hidden-gt-buffer-names))
+    (let ((regexp (concat "\\`" (regexp-quote name) "\\'")))
+      (unless (assoc regexp display-buffer-alist)
+        (push (list regexp '(display-buffer-no-window)
+                    '(allow-no-window . t))
+              display-buffer-alist))))
+  t)
+
 (defconst seshat-reader-translate--loading-text "Loading..."
   "中转 buffer 里占位文本的字面值（gt 结果位置的初值）.
 `gt-buffer-render-init' 先把 `Loading...' 写进每个结果位置，`gt-extract-data'
@@ -827,6 +872,10 @@ CONTEXT 选定模板（`explain' 用 `seshat-reader-translate-explain-template'�
       ;; 必须在 `--prepare-view' 之后——它切换 major mode 会
       ;; `kill-all-local-variables'，把 buffer-local 状态一并清掉。
       (seshat-reader-translate--follow-up-reset-state text langs context)
+      ;; 语境（译文 / 解释）另记一份 buffer-local 值，供两个 toggle 判断
+      ;; 「面板显示的是哪一份」（见 `seshat-reader-translate--panel-context'）。
+      (setq seshat-reader-translate--panel-context
+            (if (eq context 'explain) 'explain 'translate))
       (setq-local header-line-format title)
       (seshat-reader-translate-panel-mode 1)
       (goto-char (point-min)))
@@ -905,6 +954,7 @@ CACHE-KEY 由 `--translator' 传入（`--cache-key' 构造的键，或 nil）：
      (if seshat-reader-sidebar-enabled
          (progn
            (seshat-reader-translate--ensure-gt-buffer-render)
+           (seshat-reader-translate--ensure-hidden-gt-buffers)
            (gt-buffer-render
             :name seshat-reader-translate--gt-buffer-name
             :window-config '((display-buffer-no-window)
@@ -1753,6 +1803,21 @@ nil。供 `seshat-reader-translate--capture-result'（posframe 捕获）与
   "返回译文面板 buffer，不存在时返回 nil（**不创建**）."
   (get-buffer seshat-reader-sidebar-translate-buffer-name))
 
+(defun seshat-reader-translate--panel-context ()
+  "返回面板当前承载的语境：`translate' / `explain'，无法判定时 nil.
+读的是**面板 buffer** 的 buffer-local
+`seshat-reader-translate--panel-context'（`buffer-local-value'），故在阅读
+buffer 里调用也成立。面板不存在、或该变量尚未设置（例如面板由旧版代码渲染、
+或面板内容已被外部改写）时退回追问状态里的 `:kind'（同一份语境的另一处记录，
+见 `--follow-up-reset-state'）；两处都没有则返回 nil——此时两个 toggle 按
+「语境不匹配」处理，即重新执行对应命令替换内容，不会误关面板。"
+  (let ((buffer (seshat-reader-translate--panel-buffer)))
+    (when (buffer-live-p buffer)
+      (or (buffer-local-value 'seshat-reader-translate--panel-context buffer)
+          (plist-get (buffer-local-value 'seshat-reader-translate--follow-up-state
+                                         buffer)
+                     :kind)))))
+
 (defun seshat-reader-translate--panel-streamed-p ()
   "面板 buffer 是否已写入流式骨架（读 buffer-local 标志）.
 `seshat-reader-translate--panel-skeleton' 是 buffer-local 的，而流式同步执行在
@@ -1848,6 +1913,12 @@ major mode，markdown 视图只对真正变化的正文重算 font-lock。"
     ;; 若只在那里记录，流式场景下追问会因「无状态」而报错。
     (seshat-reader-translate--follow-up-reset-state
      text seshat-reader-translate--stream-langs seshat-reader-translate--stream-context)
+    ;; 与 `--render-panel' 同口径：流式骨架路径也要记下语境，否则流式渲染
+    ;; 出来的面板在 toggle 眼里「语境未知」，`C-c C-e' 会把译文面板关掉。
+    (setq seshat-reader-translate--panel-context
+          (if (eq seshat-reader-translate--stream-context 'explain)
+              'explain
+            'translate))
     (setq seshat-reader-translate--panel-body-marker (copy-marker (point-max)))
     (seshat-reader-translate--stream-insert-body text)
     (setq-local header-line-format
@@ -2158,6 +2229,10 @@ STATE）；引擎克隆自 ENGINE 后构造，保证不改用户预设单例。�
     ;; 『生成中…』」。故此处必须显式置 nil，不能沿用首轮的
     ;; `seshat-reader-translate-stream' 开关。
     (oset engine-copy stream nil)
+    ;; `:window-config' 只挡 `gt-init' 那一次显示，完成时 gt 还会再
+    ;; `display-buffer' 一次（见 `--ensure-hidden-gt-buffers'），故这里补登记
+    ;; 隐藏规则——否则答案到达的瞬间中转 buffer 会被弹出来挤占阅读窗口。
+    (seshat-reader-translate--ensure-hidden-gt-buffers)
     (gt-translator
      :engines (list engine-copy)
      :taker (gt-taker :text question :pick nil :langs langs)
@@ -2614,7 +2689,7 @@ taker 的 `:text'；面板原文引用块（`%q'）与 `last-result' 语义不�
              (message "Seshat Reader translate: 存批注失败：%s"
                       (error-message-string err)))))))))
 
-;;; per-kind 开合（面板已显示则关闭，否则照常翻译/解释并弹出）
+;;; per-kind 开合（语境匹配才关闭，否则照常翻译/解释并替换面板内容）
 
 ;; 两个 `-toggle' 包装是 `C-c C-t' / `C-c C-e' 的新落点：阅读界面里同一组键
 ;; 既要能「开」也要能「关」。关面板的其它途径都不顺手——面板内 `q'
@@ -2623,35 +2698,49 @@ taker 的 `:text'；面板原文引用块（`%q'）与 `last-result' 语义不�
 ;; （`seshat-reader-sidebar-toggle'）同样是全部开关。原命令
 ;; （`seshat-reader-translate-selection' / `-explain-selection'）**保留不变**，
 ;; 脚本化调用（`M-x'、用户配置里的 `define-key'）语义不受影响，永远执行翻译。
+;;
+;; **语境一一对应**（2026-10-26）：译文与解释共用同一个面板 buffer 与同一个
+;; kind（`translate'），早期两键都只判 `panel-visible-p'，于是「面板已显示」就
+;; 一律关闭——面板里是译文时按 `C-c C-e' 会把面板关掉，得再按一次才出解释。
+;; 现在两键都要求「已显示 **且** 面板语境匹配」
+;; （`seshat-reader-translate--panel-context'），不匹配则重新执行对应命令覆
+;; 盖内容：译文 ↦ `C-c C-e' 换解释、解释 ↦ `C-c C-t' 换译文，各按一次即到。
 
 (defun seshat-reader-translate-toggle (&optional target-lang force)
-  "译文面板开合：已显示则关闭，否则翻译选区并弹出.
-「已显示」由 `seshat-reader-sidebar-panel-visible-p' 判定（承载无关：side
-window / 底部窗口 / child frame 一律算已显示），关闭走
-`seshat-reader-sidebar--toggle-kind'——只关 `translate' 这一 kind，批注列表与
-目录面板不受影响，且关闭前捕获尺寸、记住 buffer 供 `M-o' 重开。
+  "译文面板开合：面板显示的是**译文**则关闭，否则生成译文（替换现有内容）.
+「显示的是译文」= `seshat-reader-sidebar-panel-visible-p' 判为已显示 **且**
+`seshat-reader-translate--panel-context' 为 `translate'。只判前者不够：译文与
+解释共用同一个面板 buffer 与同一个 kind（`translate'），面板里放的是解释时
+前者同样为真，若照旧关闭，想「换成译文」就会变成「先关面板再按一次」——两个
+toggle 必须与语境一一对应。
 
-未显示时原样调用 `seshat-reader-translate-selection'（TARGET-LANG 与 FORCE
-语义都与它完全一致，`C-u' 前缀参数既读目标语言也强制重新生成、跳过缓存）。
+关闭走 `seshat-reader-sidebar--toggle-kind'——只关 `translate' 这一 kind，
+批注列表与目录面板不受影响，且关闭前捕获尺寸、记住 buffer 供 `M-o' 重开。
+语境不匹配（或面板未显示）时原样调用
+`seshat-reader-translate-selection'（TARGET-LANG 与 FORCE 语义都与它完全
+一致，`C-u' 前缀参数既读目标语言也强制重新生成、跳过缓存），新结果覆盖面板
+现有内容。
+
 渲染方式取 `pop' / `pin'（posframe）时面板不是承载单元，本命令恒判「未显示」
 → 行为与原命令一致（每次都翻译），无需特判。"
   (interactive (list (when current-prefix-arg (read-string "目标语言: "))
                      current-prefix-arg))
-  (if (seshat-reader-sidebar-panel-visible-p 'translate)
+  (if (and (seshat-reader-sidebar-panel-visible-p 'translate)
+           (eq (seshat-reader-translate--panel-context) 'translate))
       (seshat-reader-sidebar--toggle-kind 'translate)
     (seshat-reader-translate-selection target-lang force)))
 
 (defun seshat-reader-translate-explain-toggle (&optional target-lang force)
-  "解释面板开合：已显示则关闭，否则解释选区并弹出.
+  "解释面板开合：面板显示的是**解释**则关闭，否则生成解释（替换现有内容）.
 TARGET-LANG 与 FORCE 语义与 `seshat-reader-translate-toggle' 完全相同（`C-u'
-前缀参数既读目标语言也强制重新生成）。与它同构，区别只在「未显示」分支调用
-`seshat-reader-translate-explain-selection'（解释而非纯翻译）。译文与解释共用
-同一个面板 kind（`translate'）与同一个展示 buffer，故两者**互为开合**：译文
-面板开着时再触发解释会关掉同一个面板，而不会生成一份新解释——这是刻意的，一个
-面板只承载一份最新结果，否则两个命令会争同一个 buffer。"
+前缀参数既读目标语言也强制重新生成）。与它同构，区别在语境判据：只在面板
+**已经显示解释**时关闭，面板显示译文时按本键是「换成解释」（调
+`seshat-reader-translate-explain-selection' 覆盖面板内容），反之亦然——两个
+键因此与语境一一对应，不再互相误关。"
   (interactive (list (when current-prefix-arg (read-string "目标语言: "))
                      current-prefix-arg))
-  (if (seshat-reader-sidebar-panel-visible-p 'translate)
+  (if (and (seshat-reader-sidebar-panel-visible-p 'translate)
+           (eq (seshat-reader-translate--panel-context) 'explain))
       (seshat-reader-sidebar--toggle-kind 'translate)
     (seshat-reader-translate-explain-selection target-lang force)))
 

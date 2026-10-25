@@ -1426,6 +1426,34 @@ ACTION 实参——overriding-action 的优先级高于 `display-buffer-alist'�
       (seshat-reader-sidebar--fit-height-for-content window kind)
       window)))
 
+(defun seshat-reader-sidebar--ensure-panel-emacs-state (buffer)
+  "在面板 BUFFER 内切到 evil 的 **Emacs state**，无 evil 时零副作用.
+面板（译文/解释、搜索结果、批注列表、目录）都是**只读展示视图**，用户在里面
+需要的只有滚动、复制与 `q' 关闭；但 evil 的 normal state 会把单键先吃掉——
+`q' 变成 `evil-record-macro'（宏录制）、`n' / `p' 走 evil 的搜索/粘贴、
+`RET' 由 `evil-ret' 处理，于是面板自己绑在 minor mode / local map 上的
+`q' / `n' / `p' / `RET' 全部失效（实测：译文面板 `q' 关不掉，搜索侧栏
+`n' / `p' / `RET' / `q' 全无反应）。normal state 的编辑语义对只读面板毫无
+价值，故整块切到 Emacs state：evil 的 normal map 不再参与键解析，面板自身的
+键位直接生效。
+
+用 `evil-emacs-state'（state 对应的 minor mode，每个 buffer 独立）而**不是**
+`evil-local-mode -1'：后者让 evil 在本 buffer 完全退出，连 `C-v' 之类的
+evil 键与 state 语义一并消失，且用户无法再从 evil 侧观察/切换状态。
+
+`fboundp' 守卫保证未装 evil（或 evil 未加载）时什么都不做；`ignore-errors'
+兜住「evil 版本差异导致 state 切换报错」——面板显示不能因为键位增强而失败。
+重复调用幂等（已经很安全的 state 切换）。
+
+调用点在「面板显示的**唯一**漏斗」`seshat-reader-sidebar--display'（以及
+`seshat-reader-sidebar-show' 的 `pop-to-buffer' 回退分支）：面板每次重新渲染
+（`--prepare-view' 切 major mode 会 `kill-all-local-variables'，state 随之
+复位）与每次重开（toggle / popper）都会重新经过这里，故不需要在每个模块的
+视图设置函数里各写一遍。"
+  (when (and (buffer-live-p buffer) (fboundp 'evil-emacs-state))
+    (with-current-buffer buffer
+      (ignore-errors (evil-emacs-state 1)))))
+
 (defun seshat-reader-sidebar--display (buffer kind &optional select)
   "把 BUFFER 显示到信息面板并返回承载单元的窗口.
 本函数是面板显示的**分派层**，两层语义：
@@ -1464,6 +1492,10 @@ SELECT 原样透传给选中的后端（`--cf-show' / `--display-window'），�
 
 其余语义（幂等显示、per-kind 独立、per-kind 尺寸记忆）由窗口后端在
 `seshat-reader-sidebar--display-window' 内实现，本层不重复。"
+  ;; 面板内切 evil emacs state：normal state 会吃掉面板自己的 q / n / p / RET
+  ;; （详见 `seshat-reader-sidebar--ensure-panel-emacs-state'）。放在显示漏斗
+  ;; 里，渲染与重开两条路径都覆盖。
+  (seshat-reader-sidebar--ensure-panel-emacs-state buffer)
   (setq seshat-reader-sidebar--last-kind kind
         seshat-reader-sidebar--last-buffer buffer)
   (when kind
@@ -1603,6 +1635,9 @@ SELECT 非 nil 表示「面板内容已就绪，可以跟随光标」：**批注
 2026-10-25 按真机使用感受改回「不抢光标」。"
   (if seshat-reader-sidebar-enabled
       (seshat-reader-sidebar--display buffer kind select)
+    ;; 面板禁用时退回 `pop-to-buffer'：这条分支不经 `--display'，故单独补一次
+    ;; state 切换（面板 buffer 同样要能 `q' 关掉）。
+    (seshat-reader-sidebar--ensure-panel-emacs-state buffer)
     (pop-to-buffer buffer)))
 
 (defun seshat-reader-sidebar-close-buffer-kind (kind buffer)

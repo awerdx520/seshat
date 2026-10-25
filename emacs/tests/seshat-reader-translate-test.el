@@ -2665,11 +2665,13 @@ STATE 为 plist（可含 `:source' `:answer' `:langs' `:kind' `:round' `:turns'
   (should (commandp 'seshat-reader-translate-explain-selection)))
 
 (ert-deftest seshat-reader-translate-test--toggle-closes-when-visible ()
-  "译文面板已显示时 `translate-toggle' 只关该 kind，不再发起翻译."
+  "面板显示的**就是译文**时 `translate-toggle' 只关该 kind，不再发起翻译."
   (let ((toggles nil)
         (translated nil))
     (cl-letf (((symbol-function 'seshat-reader-sidebar-panel-visible-p)
                (lambda (kind) (eq kind 'translate)))
+              ((symbol-function 'seshat-reader-translate--panel-context)
+               (lambda () 'translate))
               ((symbol-function 'seshat-reader-sidebar--toggle-kind)
                (lambda (kind) (push kind toggles)))
               ((symbol-function 'seshat-reader-translate-selection)
@@ -2693,12 +2695,14 @@ STATE 为 plist（可含 `:source' `:answer' `:langs' `:kind' `:round' `:turns'
     (should (equal langs '("ja")))))
 
 (ert-deftest seshat-reader-translate-test--explain-toggle-behaviour ()
-  "解释 toggle 与译文 toggle 同构：已显示则关该 kind，否则解释选区."
-  ;; ① 已显示 → 关闭同一个 translate kind 面板，不发起解释
+  "解释 toggle：面板里是**解释**则关闭，面板未显示则解释选区."
+  ;; ① 已显示且语境为解释 → 关闭同一个 translate kind 面板，不发起解释
   (let ((toggles nil)
         (explained nil))
     (cl-letf (((symbol-function 'seshat-reader-sidebar-panel-visible-p)
                (lambda (kind) (eq kind 'translate)))
+              ((symbol-function 'seshat-reader-translate--panel-context)
+               (lambda () 'explain))
               ((symbol-function 'seshat-reader-sidebar--toggle-kind)
                (lambda (kind) (push kind toggles)))
               ((symbol-function 'seshat-reader-translate-explain-selection)
@@ -2722,6 +2726,123 @@ STATE 为 plist（可含 `:source' `:answer' `:langs' `:kind' `:round' `:turns'
     (should-not toggles)
     (should (equal explained '("ja")))
     (should-not translated)))
+
+(ert-deftest seshat-reader-translate-test--toggle-context-mismatch-replaces ()
+  "面板里是**另一种**语境时，两个 toggle 都替换内容而**不**关面板.
+这是「一一对应」的核心：译文与解释共用同一个面板 buffer 与同一个 kind，
+只判 `panel-visible-p' 会让 `C-c C-e' 把译文面板直接关掉。"
+  ;; ① 面板显示译文 + `C-c C-e' → 调解释命令（替换），不关闭
+  (let ((toggles nil)
+        (explained nil)
+        (translated nil))
+    (cl-letf (((symbol-function 'seshat-reader-sidebar-panel-visible-p)
+               (lambda (_kind) t))
+              ((symbol-function 'seshat-reader-translate--panel-context)
+               (lambda () 'translate))
+              ((symbol-function 'seshat-reader-sidebar--toggle-kind)
+               (lambda (kind) (push kind toggles)))
+              ((symbol-function 'seshat-reader-translate-explain-selection)
+               (lambda (&optional lang _force) (push lang explained)))
+              ((symbol-function 'seshat-reader-translate-selection)
+               (lambda (&optional _lang _force) (push 'translated translated))))
+      (seshat-reader-translate-explain-toggle "ja"))
+    (should-not toggles)
+    (should (equal explained '("ja")))
+    (should-not translated))
+  ;; ② 面板显示解释 + `C-c C-t' → 调翻译命令（替换），不关闭
+  (let ((toggles nil)
+        (explained nil)
+        (translated nil))
+    (cl-letf (((symbol-function 'seshat-reader-sidebar-panel-visible-p)
+               (lambda (_kind) t))
+              ((symbol-function 'seshat-reader-translate--panel-context)
+               (lambda () 'explain))
+              ((symbol-function 'seshat-reader-sidebar--toggle-kind)
+               (lambda (kind) (push kind toggles)))
+              ((symbol-function 'seshat-reader-translate-explain-selection)
+               (lambda (&optional _lang _force) (push 'explained explained)))
+              ((symbol-function 'seshat-reader-translate-selection)
+               (lambda (&optional lang _force) (push lang translated))))
+      (seshat-reader-translate-toggle "ja"))
+    (should-not toggles)
+    (should (equal translated '("ja")))
+    (should-not explained))
+  ;; ③ 语境未知（`--panel-context' 返回 nil）与「不匹配」同口径：替换内容
+  (let ((toggles nil)
+        (translated nil))
+    (cl-letf (((symbol-function 'seshat-reader-sidebar-panel-visible-p)
+               (lambda (_kind) t))
+              ((symbol-function 'seshat-reader-translate--panel-context)
+               (lambda () nil))
+              ((symbol-function 'seshat-reader-sidebar--toggle-kind)
+               (lambda (kind) (push kind toggles)))
+              ((symbol-function 'seshat-reader-translate-selection)
+               (lambda (&optional _lang _force) (push 'translated translated))))
+      (seshat-reader-translate-toggle))
+    (should-not toggles)
+    (should (equal translated '(translated)))))
+
+;;; 面板语境记录（2026-10-26）：`--panel-context' 决定 toggle 一一对应
+
+(ert-deftest seshat-reader-translate-test--panel-context-from-stream-init ()
+  "流式骨架路径（`--stream-init'）同样按 CONTEXT 记录语境."
+  (skip-unless (require 'gt nil t))
+  (let* ((seshat-reader-sidebar-translate-buffer-name "*Seshat Test Panel*")
+         (seshat-reader-translate-show-source nil)
+         (seshat-reader-translate-template nil)
+         (seshat-reader-translate-explain-template nil)
+         (seshat-reader-panel-truncate-lines nil)
+         (seshat-reader-select-last nil)
+         (seshat-reader-translate--stream-title "Seshat 解释")
+         (seshat-reader-translate--stream-langs '(en zh))
+         (seshat-reader-translate--stream-context 'explain)
+         (buf nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'seshat-reader-sidebar-show)
+                   (lambda (b &rest _args) b)))
+          (setq buf (get-buffer-create seshat-reader-sidebar-translate-buffer-name))
+          (with-current-buffer buf
+            (seshat-reader-translate--stream-init "解释正文"))
+          ;; 骨架路径也必须记下语境，否则流式渲染出的解释面板会被
+          ;; `C-c C-t' 误关（而不是换成译文）
+          (should (eq (seshat-reader-translate--panel-context) 'explain))
+          (with-current-buffer buf
+            (should seshat-reader-translate--panel-skeleton)
+            (should (string-match-p "解释正文" (buffer-string)))))
+      (when (buffer-live-p buf) (kill-buffer buf)))))
+
+(ert-deftest seshat-reader-translate-test--panel-context-tracks-render ()
+  "`--panel-context' 随 `--render-panel' 的 CONTEXT 更新，无面板时为 nil."
+  (skip-unless (require 'gt nil t))
+  (let* ((seshat-reader-sidebar-translate-buffer-name "*Seshat Test Panel*")
+         (seshat-reader-translate-show-source nil)
+         ;; 关掉模板，只关心语境记录
+         (seshat-reader-translate-template nil)
+         (seshat-reader-translate-explain-template nil)
+         (seshat-reader-panel-truncate-lines nil)
+         (seshat-reader-select-last nil)
+         (buf nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'seshat-reader-sidebar-show)
+                   (lambda (b &rest _args) b)))
+          ;; ① 还没有面板 buffer → nil（toggle 按「未显示」处理）
+          (should-not (seshat-reader-translate--panel-context))
+          ;; ② 渲染译文 → translate
+          (setq buf (seshat-reader-translate--render-panel
+                     "译文" "Seshat 译文" nil 'translate))
+          (should (eq (seshat-reader-translate--panel-context) 'translate))
+          ;; ③ 同一 buffer 改渲染解释 → explain（面板复用，语境跟着换）
+          (seshat-reader-translate--render-panel "解释" "Seshat 解释" nil 'explain)
+          (should (eq (seshat-reader-translate--panel-context) 'explain))
+          ;; ④ buffer-local 变量被清掉（旧版渲染 / 外部改写）时退回追问状态的
+          ;;    `:kind'——两处记录同一语境，互为兜底
+          (with-current-buffer buf
+            (kill-local-variable 'seshat-reader-translate--panel-context))
+          (should (eq (seshat-reader-translate--panel-context) 'explain))
+          ;; ⑤ CONTEXT 为 nil 时按翻译算（与模板选择、追问 `:kind' 同口径）
+          (seshat-reader-translate--render-panel "译文" "Seshat 译文")
+          (should (eq (seshat-reader-translate--panel-context) 'translate)))
+      (when (buffer-live-p buf) (kill-buffer buf)))))
 
 ;;; 翻译/解释结果缓存（2026-10-26）
 
@@ -2900,6 +3021,70 @@ buffer（未显示则为 nil）。"
       (seshat-reader-translate-clear-cache))
     (should (= 0 (hash-table-count seshat-reader-translate--cache)))
     (should (cl-some (lambda (msg) (string-match-p "缓存已清空" msg)) messages))))
+
+;;; 追问中转 buffer 不弹窗（2026-10-26）
+
+;; 现象：追问（`C-c C-q'）的答案到达瞬间，` *Seshat gt follow-up*' 被弹出来
+;; 挤占阅读窗口。根因不在 `:window-config' 槽（那是已有的），而在 gt 的输出
+;; 路径：`gt-buffer-render' 的 `gt-init' 用 `:window-config' 显示一次（不弹窗），
+;; 但 translator 完成时（state = 3）`gt-output' 又**裸调** `(display-buffer buf)'
+;; 一次，落到 `display-buffer-alist' 的默认动作。用户配置只挡住了首轮的名字
+;; （正则 `\\*Seshat gt\\*'），追问的名字带 ` follow-up' 后缀匹配不到。
+;; 修法：两个名字都登记 no-window 规则（见
+;; `seshat-reader-translate--ensure-hidden-gt-buffers'）。
+
+(ert-deftest seshat-reader-translate-test--follow-up-translator-hides-buffer ()
+  "追问渲染对象指向追问中转 buffer，并自带 `display-buffer-no-window' 窗口配置."
+  (skip-unless (require 'gt nil t))
+  (skip-unless (require 'gt-render-buffer nil t))
+  (let* ((panel (get-buffer-create " *Seshat follow-up render test*"))
+         (state (list :source "原文" :answer "首轮答案" :turns nil :langs '(en zh)))
+         (trans (seshat-reader-translate--follow-up-translator
+                 panel "为什么？" state (gt-chatgpt-engine)))
+         (render (slot-value trans 'render))
+         (window-config (slot-value render 'window-config)))
+    (unwind-protect
+        (progn
+          (should (eq (eieio-object-class render) 'gt-buffer-render))
+          (should (equal (slot-value render 'name)
+                         seshat-reader-translate--follow-up-buffer-name))
+          ;; 与首轮 sidebar 分支同款窗口配置：`allow-no-window' 缺了会回退默认动作
+          (should (equal '(display-buffer-no-window) (car window-config)))
+          (should (member '(allow-no-window . t) window-config))
+          ;; `:then' 仍指向完成回调（隐藏 buffer 里的答案靠它写进面板）
+          (should (functionp (slot-value render 'then))))
+      (when (buffer-live-p panel) (kill-buffer panel)))))
+
+(ert-deftest seshat-reader-translate-test--hidden-gt-buffers-registered ()
+  "两个 gt 中转 buffer 名都登记了 no-window 规则：精确匹配、幂等、可关闭显示."
+  (let ((display-buffer-alist nil))
+    (should (eq t (seshat-reader-translate--ensure-hidden-gt-buffers)))
+    (should (= 2 (length display-buffer-alist)))
+    (dolist (name (seshat-reader-translate--hidden-gt-buffer-names))
+      (let ((entry (assoc (concat "\\`" (regexp-quote name) "\\'")
+                          display-buffer-alist)))
+        (should entry)
+        (should (equal (nth 1 entry) '(display-buffer-no-window)))
+        (should (equal (nth 2 entry) '(allow-no-window . t)))))
+    ;; 精确匹配：首轮的 REGEXP 不匹配追问的名字（用户配置里的正则正是在这里
+    ;; 漏掉了「 follow-up」后缀，才让追问 buffer 弹出来）
+    (should (string-match-p
+             (concat "\\`"
+                     (regexp-quote seshat-reader-translate--gt-buffer-name) "\\'")
+             seshat-reader-translate--gt-buffer-name))
+    (should-not (string-match-p
+                 (concat "\\`"
+                         (regexp-quote seshat-reader-translate--gt-buffer-name) "\\'")
+                 seshat-reader-translate--follow-up-buffer-name))
+    ;; 幂等：再调一次不会重复插入
+    (seshat-reader-translate--ensure-hidden-gt-buffers)
+    (should (= 2 (length display-buffer-alist)))
+    ;; 行为：命中规则时 `display-buffer' 什么也不显示（返回 nil、不报错）
+    (let ((buffer (get-buffer-create
+                   seshat-reader-translate--follow-up-buffer-name)))
+      (unwind-protect
+          (should-not (display-buffer buffer))
+        (when (buffer-live-p buffer) (kill-buffer buffer))))))
 
 (provide 'seshat-reader-translate-test)
 ;;; seshat-reader-translate-test.el ends here

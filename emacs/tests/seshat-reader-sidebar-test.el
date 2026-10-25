@@ -3212,5 +3212,76 @@ kind 由 buffer 名推断；命令必须把 kind 交给 `--toggle-kind'（它按
   (should (eq (lookup-key seshat-reader-search--sidebar-map (kbd "C-c w"))
               #'seshat-reader-sidebar-toggle-width)))
 
+;;; 面板内切 evil emacs state（2026-10-26 修复）
+
+;; 面板是只读展示视图，但 evil 的 normal state 会先吃掉单键（`q' →
+;; `evil-record-macro'、`n' / `p' → 搜索/粘贴、`RET' → `evil-ret'），面板自己
+;; 绑在 minor mode / local map 上的 `q' / `n' / `p' / `RET' 全部失效。修法是在
+;; 显示漏斗 `--display'（以及 `show' 的 `pop-to-buffer' 回退分支）里把面板
+;; buffer 切到 emacs state。
+
+(ert-deftest seshat-reader-sidebar-test--panel-emacs-state ()
+  "面板显示时在面板 buffer 内调 `evil-emacs-state'，且对全部 kind 生效."
+  (dolist (kind '(translate search annotations outline))
+    (let ((calls nil)
+          (buffer (get-buffer-create
+                   (format " *Seshat evil-state-test %s*" kind)))
+          (seshat-reader-sidebar--recent-kinds nil)
+          (seshat-reader-sidebar--last-buffers nil))
+      (unwind-protect
+          (cl-letf (((symbol-function 'evil-emacs-state)
+                     (lambda (&optional arg)
+                       (push (list (buffer-name) arg) calls)
+                       nil))
+                    ((symbol-function 'seshat-reader-sidebar--display-window)
+                     (lambda (_buffer _kind &optional _select) 'fake-window))
+                    ((symbol-function 'seshat-reader-sidebar--carrier-for-kind)
+                     (lambda (_kind) 'window)))
+            (seshat-reader-sidebar-show buffer kind nil)
+            ;; 桩记录的是**调用时**的 `(buffer-name)'：即 `evil-emacs-state'
+            ;; 恰在面板 buffer 内被调用（不是调用方 buffer）
+            (should (equal calls (list (list (buffer-name buffer) 1))))
+            (setq calls nil)
+            ;; 重开路径（popper 的 display-function）同样经过漏斗
+            (seshat-reader-sidebar-display-buffer buffer nil)
+            (should (equal calls (list (list (buffer-name buffer) 1)))))
+        (when (buffer-live-p buffer) (kill-buffer buffer)))))
+  ;; 面板禁用时 `show' 走 `pop-to-buffer' 回退分支，也必须切 state
+  (let ((calls nil)
+        (buffer (get-buffer-create " *Seshat evil-state fallback*"))
+        (seshat-reader-sidebar-enabled nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'evil-emacs-state)
+                   (lambda (&optional arg) (push arg calls) nil))
+                  ((symbol-function 'pop-to-buffer)
+                   (lambda (_buffer &rest _args) 'fake-window)))
+          (seshat-reader-sidebar-show buffer 'translate nil)
+          (should (equal calls '(1))))
+      (when (buffer-live-p buffer) (kill-buffer buffer)))))
+
+(ert-deftest seshat-reader-sidebar-test--panel-emacs-state-without-evil ()
+  "没有 `evil-emacs-state' 时面板显示不报错，也不影响 `q' 的绑定."
+  (cl-letf (((symbol-function 'evil-emacs-state) nil))
+    (should-not (fboundp 'evil-emacs-state))
+    (with-temp-buffer
+      ;; 直接调辅助函数：无 evil 时是空操作
+      (should-not (seshat-reader-sidebar--ensure-panel-emacs-state
+                   (current-buffer))))
+    ;; 面板键位不依赖 evil：`q' 仍是 `seshat-reader-sidebar-quit'
+    (should (eq (lookup-key seshat-reader-translate-panel-map (kbd "q"))
+                #'seshat-reader-sidebar-quit))
+    ;; `show' 全链路也不报错（桩 `--display'，避免真的开窗口）
+    (let ((buffer (get-buffer-create " *Seshat evil-state absent*"))
+          (seshat-reader-sidebar--recent-kinds nil)
+          (seshat-reader-sidebar--last-buffers nil))
+      (unwind-protect
+          (cl-letf (((symbol-function 'seshat-reader-sidebar--display-window)
+                     (lambda (_buffer _kind &optional _select) 'fake-window))
+                    ((symbol-function 'seshat-reader-sidebar--carrier-for-kind)
+                     (lambda (_kind) 'window)))
+            (should (eq (seshat-reader-sidebar-show buffer 'annotations nil)
+                        'fake-window)))
+        (when (buffer-live-p buffer) (kill-buffer buffer))))))
+
 (provide 'seshat-reader-sidebar-test)
 ;;; seshat-reader-sidebar-test.el ends here
