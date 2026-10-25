@@ -323,7 +323,8 @@ Section 1.2 5 / Chapter 2 7 / Part II 10.")
     (unwind-protect
         (progn
           ;; 预置面板窗口：带 `seshat-reader-sidebar' 参数 + kind 为 outline，
-          ;; 正是 `seshat-reader-sidebar--window-for-kind' 的判据（沿用
+          ;; 正是 `seshat-reader-sidebar--panel-for-kind'（承载单元 = 面板窗口 +
+          ;; child frame）只看窗口一侧时的判据（沿用
           ;; `seshat-reader-sidebar-test--toggle-closes-package-windows' 的
           ;; 「直接给 `selected-window' 设参数」做法，batch 下无真实 GUI 侧窗）。
           (set-window-parameter win 'seshat-reader-sidebar t)
@@ -381,7 +382,7 @@ Section 1.2 5 / Chapter 2 7 / Part II 10.")
         (seshat-reader-outline-mode)
         (let ((inhibit-read-only t))
           (insert "* stale entry\n")))
-      (should-not (seshat-reader-sidebar--window-for-kind 'outline))
+      (should-not (seshat-reader-sidebar--panel-for-kind 'outline))
       (seshat-reader-outline-test--with-stubs
         (cl-letf (((symbol-function 'erase-buffer)
                    (lambda (&rest _)
@@ -986,6 +987,122 @@ Emacs 31 的 `outline-hide-subtree' 用 **overlay**（`invisible' = `outline'）
             (should-not seshat-reader-outline--doc-buffername)))
       (dolist (buf (list panel reader))
         (when (buffer-live-p buf) (kill-buffer buf))))))
+
+;;; 5d. childframe 承载（M12 T6）：已显示判断经承载单元抽象 / 跨 frame 回窗口
+
+(ert-deftest seshat-reader-outline-test--outline-show-detects-childframe-panel ()
+  "childframe 承载下 `show' 仍判「已显示」并走关闭分支.
+
+桩替 `seshat-reader-sidebar--panel-for-kind' 返回一个 fake frame（窗口承载时
+该函数返回窗口，childframe 承载时返回 frame），并断言
+`seshat-reader-sidebar--window-for-kind' **不再被调用**：它只看窗口，
+childframe 下恒为 nil，已显示会被误判成未显示而重复建面板."
+  (let* ((doc "seshat-outline-test-doc-cf-panel.pdf")
+         (reader (seshat-reader-outline-test--make-reader-buffer
+                  doc seshat-reader-outline-test--outline-a))
+         (fake-frame (list 'fake-child-frame))
+         (toggles nil)
+         (panel-queries nil)
+         (window-queries 0)
+         (shows nil))
+    (seshat-reader-outline-test--with-cleanup (list reader)
+      (cl-letf (((symbol-function 'seshat-reader-sidebar--panel-for-kind)
+                 (lambda (kind &optional _panels)
+                   (push kind panel-queries)
+                   (and (eq kind 'outline) fake-frame)))
+                ((symbol-function 'seshat-reader-sidebar--window-for-kind)
+                 (lambda (&rest _) (cl-incf window-queries) nil))
+                ((symbol-function 'seshat-reader-sidebar--toggle-kind)
+                 (lambda (kind) (push kind toggles)))
+                ((symbol-function 'seshat-reader-sidebar-show)
+                 (lambda (&rest args) (push args shows) 'fake-panel-window)))
+        (with-current-buffer reader
+          (seshat-reader-outline-show)))
+      ;; ① 已显示 → 关闭分支（per-kind toggle，kind 为 outline，只调一次）
+      (should (equal toggles '(outline)))
+      ;; ② 判据经 `--panel-for-kind'，参数为 outline
+      (should (equal panel-queries '(outline)))
+      ;; ③ 不再调用只看窗口的 `--window-for-kind'
+      (should (zerop window-queries))
+      ;; ④ 不重复建面板：承载层显示入口未被调用
+      (should-not shows))))
+
+(ert-deftest seshat-reader-outline-test--outline-select-doc-window-cross-frame ()
+  "阅读窗口在父 frame、选中 frame 是子 frame 时先 `select-frame' 再 `select-window'."
+  (let* ((doc "seshat-outline-test-doc-cross-frame.pdf")
+         (reader (seshat-reader-outline-test--make-reader-buffer
+                  doc seshat-reader-outline-test--outline-a))
+         (win (selected-window))
+         (orig-buffer (window-buffer win))
+         (calls nil))
+    (unwind-protect
+        (progn
+          (set-window-buffer win reader)
+          (with-current-buffer reader
+            (setq seshat-reader-outline--doc-buffername doc)
+            (setq seshat-reader-outline--doc-window win)
+            ;; 第一段：`win' 属于父 frame，当前选中 frame 是子 frame（childframe
+            ;; 承载时光标在子 frame 里）——必须先切 frame 再选窗口。
+            (cl-letf (((symbol-function 'window-frame)
+                       (lambda (&rest _) 'parent-frame))
+                      ((symbol-function 'selected-frame)
+                       (lambda (&rest _) 'child-frame))
+                      ((symbol-function 'select-frame)
+                       (lambda (frame &optional _norecord)
+                         (push (list 'frame frame) calls)))
+                      ((symbol-function 'select-window)
+                       (lambda (window &optional _norecord)
+                         (push (list 'window window) calls))))
+              (seshat-reader-outline-select-doc-window))
+            ;; `calls' 是 push 出来的逆序：reverse 后第一项即最早的调用
+            (should (equal (reverse calls)
+                           (list (list 'frame 'parent-frame)
+                                 (list 'window win))))
+            ;; 第二段：`win' 与选中 frame 相同时不得多切一次 frame
+            (setq calls nil)
+            (cl-letf (((symbol-function 'window-frame)
+                       (lambda (&rest _) 'same-frame))
+                      ((symbol-function 'selected-frame)
+                       (lambda (&rest _) 'same-frame))
+                      ((symbol-function 'select-frame)
+                       (lambda (frame &optional _norecord)
+                         (push (list 'frame frame) calls)))
+                      ((symbol-function 'select-window)
+                       (lambda (window &optional _norecord)
+                         (push (list 'window window) calls))))
+              (seshat-reader-outline-select-doc-window))
+            (should (equal (reverse calls) (list (list 'window win))))))
+      (set-window-buffer win orig-buffer)
+      (when (buffer-live-p reader) (kill-buffer reader)))))
+
+(ert-deftest seshat-reader-outline-test--outline-goto-entry-forces-redisplay ()
+  "`goto-entry' 调 `(redisplay t)'——强制重绘所有 frame，不只当前 frame."
+  (let ((buf (get-buffer-create "*seshat-outline-test-goto-redisplay*"))
+        (redisplay-args nil)
+        (pages nil))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf
+            (insert-text-button "Chapter 1" 'seshat-reader-page 3)
+            ;; `next-button' 的 COUNT-CURRENT 必须传 t：按钮正好从 `point-min'
+            ;; 起，默认行为是跳过 POS 处的按钮。
+            (let ((button (next-button (point-min) t)))
+              (should button)
+              (cl-letf (((symbol-function
+                          'seshat-reader-outline-select-doc-window)
+                         (lambda (&rest _) nil))
+                        ((symbol-function 'redisplay)
+                         (lambda (&optional force &rest _)
+                           (push force redisplay-args)
+                           t))
+                        ((symbol-function 'seshat-reader-goto-page)
+                         (lambda (page) (push page pages))))
+                (seshat-reader-outline-goto-entry button))))
+          ;; ① 重绘参数为 t（强制全 frame 重绘），且只调一次
+          (should (equal redisplay-args '(t)))
+          ;; ② 跳页仍按按钮的 1-based 页号
+          (should (equal pages '(3))))
+      (when (buffer-live-p buf) (kill-buffer buf)))))
 
 (provide 'seshat-reader-outline-test)
 ;;; seshat-reader-outline-test.el ends here

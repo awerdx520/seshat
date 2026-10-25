@@ -125,7 +125,9 @@ Just wraps `seshat-reader-goto-page' for imenu compatibility."
   "Toggle the document outline panel.
 
 When the outline panel is already displayed (a panel window whose
-`seshat-reader-sidebar-kind' is `outline' exists), this command **closes**
+`seshat-reader-sidebar-kind' is `outline', or — with the childframe
+carrier — a child frame whose `seshat-reader-panel-kind' is `outline'
+exists), this command **closes**
 it through `seshat-reader-sidebar--toggle-kind', i.e. exactly the way
 `seshat-reader-sidebar-toggle-outline' does (that command is no longer
 key-bound, it is only reachable through
@@ -200,7 +202,11 @@ outline."
     ;; 关闭走 sidebar 的 per-kind toggle：先捕获尺寸再 delete-window，并记住
     ;; buffer 供下次重开；不在这里自己 delete-window，避免与 sidebar 的
     ;; kind/slot/尺寸记忆逻辑分叉。
-    (if (seshat-reader-sidebar--window-for-kind 'outline)
+    ;; 「已显示」的判据必须经 sidebar 的**承载单元**抽象
+    ;; `seshat-reader-sidebar--panel-for-kind'（= 面板窗口 + child frame），
+    ;; 不能用只看窗口的 `--window-for-kind'：childframe 承载时面板是 frame 而
+    ;; 不是窗口，后者恒返回 nil，于是这里会误判「未显示」而重复建面板。
+    (if (seshat-reader-sidebar--panel-for-kind 'outline)
         (seshat-reader-sidebar--toggle-kind 'outline)
       (let* ((outline-data seshat-reader-current-doc-outline)
              (source-buffer (current-buffer))
@@ -598,7 +604,13 @@ this command any more: it is carried by `seshat-reader-outline-show', which
 toggles the panel open/closed and closes it when point is inside the panel
 \(pressing this command there would instead move point back into the reading
 window, so the user had to press twice).  This command remains the
-jump-back primitive used by `seshat-reader-outline-goto-entry'."
+jump-back primitive used by `seshat-reader-outline-goto-entry'.
+
+With the childframe carrier, point may be inside the child frame while the
+reading window belongs to the parent frame, so the frame owning the reading
+window is selected first (`select-frame') and the window afterwards
+\(`select-window') — selecting a window of a non-selected frame does not
+bring the cursor back to that frame."
   (interactive)
   (let ((buf (get-buffer seshat-reader-outline--doc-buffername)))
     (unless (buffer-live-p buf)
@@ -608,8 +620,15 @@ jump-back primitive used by `seshat-reader-outline-goto-entry'."
 			seshat-reader-outline--doc-window)
 		   (get-buffer-window buf))))
       (if win
-	  (select-window win)
-	(pop-to-buffer buf))
+          (progn
+            ;; childframe 承载下光标可能在子 frame，必须先回父 frame：`win' 属于
+            ;; 父 frame 而当前选中 frame 是子 frame 时，直接 `select-window' 要么
+            ;; 报「不是选中 frame 的窗口」，要么把光标留在子 frame 里——目录面板
+            ;; 仍是前台，用户看起来「没切回阅读窗口」。所以先切 frame 再选窗口。
+            (unless (eq (window-frame win) (selected-frame))
+              (select-frame (window-frame win)))
+            (select-window win))
+        (pop-to-buffer buf))
       (setq seshat-reader-outline--doc-window (selected-window)))))
 
 (defvar-keymap seshat-reader-outline-mode-map
@@ -635,13 +654,22 @@ annotation panels are left alone, and a childframe carrier is removed with
   (use-local-map seshat-reader-outline-mode-map))
 
 (defun seshat-reader-outline-goto-entry (button)
-  "Shared logic to jump to an outline BUTTON."
+  "Shared logic to jump to an outline BUTTON.
+
+The redisplay after switching windows is forced for **all** frames
+\(`redisplay' with t) on purpose: with the childframe carrier the jump
+starts inside the child frame, and a plain `redisplay' would only update
+that frame, leaving the reading window in the parent frame stale until the
+next natural redraw."
   (let ((page (button-get button 'seshat-reader-page)))
     (unless (numberp page)
       (user-error "Invalid outline entry: no page info"))
     (seshat-reader-outline-select-doc-window)
     ;; activates `window-buffer-change-functions' and `window-configuration-change-hook'
-    (redisplay)
+    ;; 参数 t = 强制重绘**所有** frame：childframe 承载时跳转从子 frame 发起，
+    ;; 无参 `redisplay' 只刷当前（子）frame，父 frame 里的阅读窗口不会立即更新，
+    ;; 用户看到「跳了但页面没变」，要等下一次自然重绘。
+    (redisplay t)
     (seshat-reader-goto-page page)))
 
 (defun seshat-reader-outline-visit-page ()
