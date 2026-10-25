@@ -1834,5 +1834,208 @@ width/height 是字符单位，无法精确等于像素比例）。"
              (lambda () '(f1))))
     (should (equal (seshat-reader-sidebar--panels) '(f1)))))
 
+;;; 承载接入与生命周期（T3）
+
+(ert-deftest seshat-reader-sidebar-test--display-dispatches-to-window ()
+  "carrier 解析为 `window' 时 `--display' 只走窗口后端，完全不碰 `--cf-show'。
+分派层同时负责 `--last-*' 记忆（childframe 分支靠它重开），故一并断言。"
+  (let ((buf (get-buffer-create " *seshat-dispatch-window*"))
+        (seshat-reader-sidebar--last-buffer nil)
+        (seshat-reader-sidebar--last-kind nil)
+        (seshat-reader-sidebar--last-buffers nil)
+        (window-calls nil)
+        (cf-calls 0))
+    (unwind-protect
+        (cl-letf (((symbol-function 'seshat-reader-sidebar--carrier-for-kind)
+                   (lambda (_kind) 'window))
+                  ((symbol-function 'seshat-reader-sidebar--display-window)
+                   (lambda (b k &optional s)
+                     (push (list b k s) window-calls) 'w-panel))
+                  ((symbol-function 'seshat-reader-sidebar--cf-show)
+                   (lambda (&rest _) (setq cf-calls (1+ cf-calls)) 'cf-window)))
+          (should (eq (seshat-reader-sidebar--display buf 'outline t) 'w-panel))
+          (should (equal window-calls (list (list buf 'outline t))))
+          (should (zerop cf-calls))
+          (should (eq seshat-reader-sidebar--last-buffer buf))
+          (should (eq seshat-reader-sidebar--last-kind 'outline))
+          (should (eq (cdr (assq 'outline seshat-reader-sidebar--last-buffers))
+                      buf)))
+      (kill-buffer buf))))
+
+(ert-deftest seshat-reader-sidebar-test--display-dispatches-to-childframe ()
+  "carrier 解析为 `childframe' 时 `--display' 走 `--cf-show' 并返回其窗口。
+返回值语义是「承载单元的窗口」：childframe 分支返回 frame 的选中窗口，调用方
+不需要知道自己拿到的是哪一种后端。"
+  (let ((buf (get-buffer-create " *seshat-dispatch-cf*"))
+        (seshat-reader-sidebar--last-buffer nil)
+        (seshat-reader-sidebar--last-kind nil)
+        (seshat-reader-sidebar--last-buffers nil)
+        (cf-calls nil)
+        (window-calls 0))
+    (unwind-protect
+        (cl-letf (((symbol-function 'seshat-reader-sidebar--carrier-for-kind)
+                   (lambda (_kind) 'childframe))
+                  ((symbol-function 'seshat-reader-sidebar--cf-show)
+                   (lambda (b k &optional s)
+                     (push (list b k s) cf-calls) 'cf-window))
+                  ((symbol-function 'seshat-reader-sidebar--display-window)
+                   (lambda (&rest _) (cl-incf window-calls) 'w-panel)))
+          (should (eq (seshat-reader-sidebar--display buf 'translate)
+                      'cf-window))
+          (should (equal cf-calls (list (list buf 'translate nil))))
+          (should (zerop window-calls))
+          ;; child frame 的 buffer 也必须记进 per-kind 记忆，否则关掉后无法重开
+          (should (eq (cdr (assq 'translate seshat-reader-sidebar--last-buffers))
+                      buf)))
+      (kill-buffer buf))))
+
+(ert-deftest seshat-reader-sidebar-test--display-falls-back-to-window-when-cf-fails ()
+  "child frame 建不出来（`--cf-show' 返回 nil）时回退窗口承载并返回窗口。
+回退是分派层的职责：终端 frame / 父 frame 像素尺寸取不到 / 创建失败都表现为
+nil，此时**必须**仍然给调用方一个窗口，而不是让面板显示整体失败。"
+  (let ((buf (get-buffer-create " *seshat-dispatch-fallback*"))
+        (seshat-reader-sidebar--last-buffer nil)
+        (seshat-reader-sidebar--last-kind nil)
+        (seshat-reader-sidebar--last-buffers nil)
+        (cf-calls 0)
+        (window-calls nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'seshat-reader-sidebar--carrier-for-kind)
+                   (lambda (_kind) 'childframe))
+                  ((symbol-function 'seshat-reader-sidebar--cf-show)
+                   (lambda (&rest _) (cl-incf cf-calls) nil))
+                  ((symbol-function 'seshat-reader-sidebar--display-window)
+                   (lambda (b k &optional s)
+                     (push (list b k s) window-calls) 'w-fallback)))
+          (should (eq (seshat-reader-sidebar--display buf 'translate t)
+                      'w-fallback))
+          (should (= cf-calls 1))
+          (should (equal window-calls (list (list buf 'translate t)))))
+      (kill-buffer buf))))
+
+(ert-deftest seshat-reader-sidebar-test--toggle-kind-closes-frame-panel ()
+  "`--toggle-kind' 关闭 childframe 面板：走 `--panel-close'，buffer 仍记入记忆。
+frame 面板的 buffer 必须一并记录——否则关掉 child frame 后 toggle 无从重开
+（窗口能靠「窗口还在」判断，frame 关掉就什么都不剩）。"
+  (let ((buf (get-buffer-create " *seshat-toggle-frame*"))
+        (seshat-reader-sidebar--last-buffers nil)
+        (seshat-reader-sidebar--last-buffer nil)
+        (seshat-reader-sidebar--last-kind nil)
+        (seshat-reader-sidebar--state nil)
+        (closed nil)
+        (messages nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'seshat-reader-sidebar--panels)
+                   (lambda () (list 'cf-panel)))
+                  ((symbol-function 'seshat-reader-sidebar--panel-kind)
+                   (lambda (_panel) 'translate))
+                  ((symbol-function 'seshat-reader-sidebar--panel-buffer)
+                   (lambda (_panel) buf))
+                  ((symbol-function 'seshat-reader-sidebar--panel-close)
+                   (lambda (panel) (push panel closed)))
+                  ((symbol-function 'seshat-reader-sidebar--cf-show)
+                   (lambda (&rest _) 'should-not-be-called))
+                  ((symbol-function 'message)
+                   (lambda (fmt &rest args)
+                     (push (apply #'format fmt args) messages))))
+          (seshat-reader-sidebar-toggle 'translate)
+          (should (equal closed '(cf-panel)))
+          (should (eq (cdr (assq 'translate seshat-reader-sidebar--last-buffers))
+                      buf))
+          (should (eq seshat-reader-sidebar--last-buffer buf))
+          (should (cl-some (lambda (m) (string-match-p "已关闭" m)) messages)))
+      (kill-buffer buf))))
+
+(ert-deftest seshat-reader-sidebar-test--toggle-kind-reopens-childframe ()
+  "无该 kind 面板但有记忆 buffer 时，重开经分派层落到 `--cf-show'。
+重开路径不直接选后端，而是交 `seshat-reader-sidebar--display' 按 carrier 分派：
+这样 `seshat-reader-sidebar-enabled' 的回退语义与 select 契约与首次显示完全一致。"
+  (let* ((buf (get-buffer-create " *seshat-toggle-cf-reopen*"))
+         (seshat-reader-sidebar--last-buffers (list (cons 'outline buf)))
+         (seshat-reader-sidebar--last-kind nil)
+         (seshat-reader-sidebar--last-buffer nil)
+         (seshat-reader-sidebar-enabled t)
+         (cf-calls nil)
+         (window-calls 0))
+    (unwind-protect
+        (cl-letf (((symbol-function 'seshat-reader-sidebar--panels)
+                   (lambda () nil))
+                  ((symbol-function 'seshat-reader-sidebar--carrier-for-kind)
+                   (lambda (_kind) 'childframe))
+                  ((symbol-function 'seshat-reader-sidebar--cf-show)
+                   (lambda (b k &optional s)
+                     (push (list b k s) cf-calls) 'cf-window))
+                  ((symbol-function 'seshat-reader-sidebar--display-window)
+                   (lambda (&rest _) (cl-incf window-calls) 'w-panel))
+                  ((symbol-function 'message) (lambda (&rest _) nil)))
+          (seshat-reader-sidebar-toggle 'outline)
+          (should (equal cf-calls (list (list buf 'outline t))))
+          (should (zerop window-calls)))
+      (kill-buffer buf))))
+
+(ert-deftest seshat-reader-sidebar-test--capture-state-ignores-frame ()
+  "`--capture-state' 只记窗口单元的尺寸：frame 单元不写入 `--state'。
+child frame 的尺寸由父 frame 像素 × 比例固定决定，用户无法 resize，记忆它既无
+意义也无恢复路径；函数把 `--panels' 的混合列表原样传进来时也必须过滤掉 frame。"
+  (let ((seshat-reader-sidebar--state nil)
+        (seshat-reader-sidebar-position 'below-selected))
+    (cl-letf (((symbol-function 'framep)
+               (lambda (obj) (eq obj 'cf-panel)))
+              ((symbol-function 'window-parameter)
+               (lambda (unit param)
+                 (when (eq param 'seshat-reader-sidebar-kind)
+                   (pcase unit
+                     ('w-panel 'annotations)
+                     ('cf-panel 'translate)))))
+              ((symbol-function 'window-total-height) (lambda (&rest _) 20))
+              ((symbol-function 'frame-height) (lambda (&rest _) 40)))
+      (seshat-reader-sidebar--capture-state (list 'w-panel 'cf-panel))
+      (should (equal (nth 2 (assq 'annotations seshat-reader-sidebar--state))
+                     0.5))
+      (should-not (assq 'translate seshat-reader-sidebar--state)))))
+
+(ert-deftest seshat-reader-sidebar-test--hide-cf-on-buffer-change ()
+  "生命周期：仅当「开启开关 + 有 child frame 面板 + 已不在阅读器」三者同时成立才关闭.
+三条早期返回是本函数挂在全局 `window-buffer-change-functions' 上仍然廉价的前提
+（每次窗口换 buffer 都会调用它）；关闭时对每个 frame 调一次 `--cf-close'、只
+`message' 一次，且本函数确实挂在全局 hook 上（不带 LOCAL）。"
+  (let ((closed nil)
+        (messages nil)
+        (frames '(cf-1 cf-2))
+        (in-reader nil)
+        (seshat-reader-panel-hide-on-buffer-change t))
+    (cl-letf (((symbol-function 'seshat-reader-sidebar--cf-frames)
+               (lambda () frames))
+              ((symbol-function 'seshat-reader-sidebar--cf-close)
+               (lambda (frame) (push frame closed)))
+              ((symbol-function 'derived-mode-p)
+               (lambda (&rest _modes) in-reader))
+              ((symbol-function 'message)
+               (lambda (fmt &rest args)
+                 (push (apply #'format fmt args) messages))))
+      ;; hook 必须挂在全局值上（不传 LOCAL），否则切走 buffer 时无从触发
+      (should (memq 'seshat-reader-sidebar--hide-cf-on-buffer-change
+                    window-buffer-change-functions))
+      ;; ① 开关为 nil → 一个都不关
+      (setq seshat-reader-panel-hide-on-buffer-change nil)
+      (seshat-reader-sidebar--hide-cf-on-buffer-change)
+      (should-not closed)
+      ;; ② 没有 child frame 面板 → 不关、也不提示（连 mode 都不判）
+      (setq seshat-reader-panel-hide-on-buffer-change t
+            frames nil)
+      (seshat-reader-sidebar--hide-cf-on-buffer-change)
+      (should-not closed)
+      (should-not messages)
+      ;; ③ 仍在阅读器里（`derived-mode-p' 命中）→ 不关
+      (setq frames '(cf-1 cf-2)
+            in-reader t)
+      (seshat-reader-sidebar--hide-cf-on-buffer-change)
+      (should-not closed)
+      ;; ④ 切到非阅读 buffer → 逐个关闭，且只提示一次
+      (setq in-reader nil)
+      (seshat-reader-sidebar--hide-cf-on-buffer-change)
+      (should (equal closed '(cf-2 cf-1)))
+      (should (= (length messages) 1)))))
+
 (provide 'seshat-reader-sidebar-test)
 ;;; seshat-reader-sidebar-test.el ends here
