@@ -1447,13 +1447,20 @@
 - 来源：2026-10-25 逐函数探针（HEAD 上 `--explain-escape-value` 收到单元素 list 必抛错；`--apply-template` / `--record-result` 静默污染）。
 - 解除条件：gt 上游在渲染路径入口统一 `(mapconcat #'identity text ""/ "\n")`；或本包改用自建渲染器（放弃 gt 的 overlay/word 渲染）。在此之前不建议把 `seshat-reader-translate-preset' 切到 `word`/overlay 预设。
 
-## 流式开启时 gt 的 `:then` 回调不触发（`--stream` 与 sidebar 组合）
+## 流式开启时 gt 的 `:then` 回调不触发（`--stream` 与 sidebar 组合）——已定位并规避（2026-10-25）
 
 - 现象：`seshat-reader-translate-stream` 为 `t`（默认）时，`gt-finalize` 的 stream 分支不调 `gt-update`，因此渲染器的 `:then` 回调**不触发**——纯流式下侧栏面板的内容依赖 `gt-buffer-render-output-hook` 的增量；而 `gt-posframe-*` 类渲染会在局部改写该 hook（`gt-posframe-pop-render-output-hook` / `gt-posframe-pin-render-output-hook`），流式 + sidebar 组合下增量与收尾可能同时失效（面板停在骨架或停在最后一段增量）。
 - 影响：显示层，不报错；`last-result` 与面板内容可能不一致（面板缺收尾更新）。
 - 临时规避：`(setq seshat-reader-translate-stream nil)`——退回「完成时一次性渲染」，`:then` 路径恢复。
 - 来源：2026-10-25 主实例诊断（`gt-finalize' 的 stream 分支与 `gt-update' 调用链）；与上方「流式增量路径不经过 `--strip-chatter`」同属流式分支的 gt 契约缺口。
-- 解除条件：gt 在 stream 收尾路径补调 `gt-update`（或提供独立的「流式完成」回调）；或本包在 `gt-buffer-render-output-hook` 里自行判定「translator state = 3」并收尾，不依赖 `:then`。
+- 实测根因（2026-10-25 verify 实例真实 DeepSeek 流式请求 + 逐函数探针，比上面的推测更靠前，且更正「增量可用」这一判断）：
+  ① `gt-finalize' 的 stream 分支只调 `(gt-output render task)'，**不调** `gt-update'，translator `state' 停在 2，`:then' 永不触发（实测 `(oref translator state)` = 2）；
+  ② task 级 `gt-output' 走 `gt-insert-text-at-marker'，**不调**渲染器的 output 函数，因此 `gt-buffer-render-output' 根本不执行、`gt-buffer-render-output-hook' 不会 run——`--stream-sync' 挂在该 hook 上，**从未被调用**（探针无输出，而 hook 列表里确实有它，`gt-buffer-render-translator' 也与本次 translator `eq`，即不是守卫失败）；
+  ③ 结果是面板的两条创建路径（`:then' 与非流式渲染）全部失效，而增量只写进 `(display-buffer-no-window)' 隐藏的中转 buffer ` *Seshat gt*`（实测其中确有完整增量文本）——面板既不出现也不报错。
+- 修复（同 commit）：新增 `seshat-reader-translate--stream-wanted-p'——面板路径（`sidebar' + 侧栏启用）恒返回 nil，`--translator' 据此不再给引擎开流式，退回「完成时一次性渲染」，面板必现；posframe 路径维持原行为。`gt-buffer-render-output-hook' 的安装保留（当前不触发，为 gt 未来补回调预留）。
+- 遗留：sidebar 下「边生成边显示」能力因此暂时不可用（`--stream-sync' / `--stream-init' / `--stream-render' 与追问流式渲染成为无调用路径的实现），需 gt 提供流式完成或增量回调后重新接线。
+- 复验：verify 实例真实请求下 `stream=t' 与 `stream=nil' 两种设置面板均出现（49 / 48 行，`last-result' 343 / 438 字符）。
+- 解除条件：gt 在 stream 收尾路径补调 `gt-update'（或提供独立的「流式完成」回调）、且流式增量也走渲染器的 output 函数；届时把 `--stream-wanted-p' 的面板分支改回允许流式并删除本规避。
 
 ## gt 在引擎 `stream` 为 t 时跳过 `delimit` 的 join（2026-10-25 修复，gt 侧组合仍不安全）
 

@@ -499,7 +499,15 @@ Markdown 分隔线（`---`）分隔——多引擎预设能让用户一眼比对
 **只对 `delimit' 为 nil 的引擎生效（LLM 类）**：gt 在引擎 `stream' 为 t 时
 跳过 `delimit' 的 join（`gt-core.el' 的 `gt-execute'），引擎会拿到分段列表
 而非字符串；youdao / google 等依赖 join 的引擎（`delimit' 非 nil）自动跳过，
-翻译仍然一次性返回。"
+翻译仍然一次性返回。
+
+**面板（`sidebar'）渲染下本开关不生效**：gt 的纯流式既不调 `gt-update'
+（translator `state' 停在 2，渲染对象 `:then' 永不触发），也不调渲染器的
+output 函数（`gt-buffer-render-output-hook' 永不触发），而面板路径的
+markers 位于 `(display-buffer-no-window)' 隐藏的 buffer 里——开了流式就只有
+「增量写进没人看得到的 buffer」，面板不出现也不报错。故
+`seshat-reader-translate--stream-wanted-p' 在面板路径返回 nil，强制走非流式。
+本开关因此只对 posframe 渲染（`pop'/`pin'，或面板被禁用时的回退路径）有意义。"
   :type 'boolean
   :group 'seshat-reader-translate)
 
@@ -1240,9 +1248,10 @@ CONTEXT 用于区分预设缺失时的提示文案，并决定面板模板，取
 `seshat-reader-translate-template'，后者提示回退为普通翻译、建议在配置侧
 定义解释预设，并用 `seshat-reader-translate-explain-template'。
 
-`seshat-reader-translate-stream' 非 nil 时末尾经
-`seshat-reader-translate--enable-stream' 为各引擎开启流式，并登记本次请求的
-标题 / 语言对 / 语境与 translator 身份（供
+`seshat-reader-translate--stream-wanted-p' 为真时（`seshat-reader-translate-stream'
+非 nil **且**当前渲染方式能承接 gt 的流式增量；面板路径恒为 nil，原因见该谓词的
+文档）末尾经 `seshat-reader-translate--enable-stream' 为各引擎开启流式，并登记本次
+请求的标题 / 语言对 / 语境与 translator 身份（供
 `seshat-reader-translate--stream-sync' 的守卫与骨架创建使用）。"
   (seshat-reader-translate--ensure-gt)
   (let* ((preset-trans (seshat-reader-translate--preset-translator preset))
@@ -1258,7 +1267,7 @@ CONTEXT 用于区分预设缺失时的提示文案，并决定面板模板，取
     (oset trans taker (gt-taker :text (or request-text text) :pick nil :langs langs))
     (oset trans render (seshat-reader-translate--render-object
                         seshat-reader-translate-render title langs context))
-    (when seshat-reader-translate-stream
+    (when (seshat-reader-translate--stream-wanted-p)
       (setq seshat-reader-translate--stream-title title
             seshat-reader-translate--stream-langs langs
             seshat-reader-translate--stream-context context)
@@ -1531,6 +1540,37 @@ nil。供 `seshat-reader-translate--capture-result'（posframe 捕获）与
          (<= (- (float-time) started)
              seshat-reader-translate-capture-window))))
 
+(defun seshat-reader-translate--stream-wanted-p ()
+  "本次请求是否真的为引擎开启流式（`seshat-reader-translate-stream' 之外的第二道判据）.
+`seshat-reader-translate-stream' 非 nil，**且**当前渲染方式能承接 gt 的流式
+增量时返回 t；否则 nil。
+
+面板（`sidebar' + `seshat-reader-sidebar-enabled'）路径**不能**承接，因此在
+那里强制不开启引擎流式。原因是 gt 纯流式的输出链路（实测 gt 2026-10 版，
+`gt-core.el' / `gt-render-buffer.el'）：
+
+1. `gt-finalize' 的 `(oref engine stream)' 分支只调 `(gt-output render task)'
+   ——**不调** `gt-update'，translator 的 `state' 永远停在 2，`gt-output' 的
+   `(= state 3)' 判定因此永不成立，渲染对象的 `:then' 回调（本包创建面板的
+   唯一入口 `seshat-reader-translate--panel-result' + `--render-panel'）
+   永不触发；
+2. task 级 `gt-output' 走 `gt-insert-text-at-marker' 把增量插进 task 的
+   markers，**不调**渲染器的 output 函数，因此
+   `gt-buffer-render-output'（以及它末尾的
+   `(run-hooks \\='gt-buffer-render-output-hook)'）根本不执行——
+   `seshat-reader-translate--stream-sync' 挂在该 hook 上，同样永不触发。
+
+面板路径把 gt 的 buffer 以 `(display-buffer-no-window)' 隐藏
+（`seshat-reader-translate--render-object'），markers 就在那个隐藏 buffer 里，
+于是「增量写进去了但没人看得到，完成时也没有任何回调」——面板既无增量也无
+最终渲染，表现为面板不弹出且无报错。故此处对面板路径关掉流式，退回「完成后
+一次性渲染」，面板一定出现；posframe 路径（`pop'/`pin'，或 `sidebar' 但面板
+被禁用而退回 posframe）的显示 buffer 就是 markers 所在 buffer，增量可见，
+维持原有行为。"
+  (and seshat-reader-translate-stream
+       (not (and (eq seshat-reader-translate-render 'sidebar)
+                 seshat-reader-sidebar-enabled))))
+
 (defun seshat-reader-translate--enable-stream (translator)
   "在 TRANSLATOR 的引擎上开启流式，并登记本次请求的 translator 身份.
 引擎必须**再克隆一次**：eieio 的 `clone' 是浅拷贝，translator 的 `engines'
@@ -1718,6 +1758,13 @@ gt 每次流式输出后都在**隐藏中转 buffer 内**运行该 hook，故本
 整体套 `ignore-errors'：hook 抛错会被 gt 的 `gt-output :around' 捕获并把
 translator state 置 4（整次翻译中止）；流式是增强功能，绝不能因为它让翻译失败。
 
+**当前挂载点不会被触发（gt 侧缺口）**：gt 纯流式下 `gt-finalize' 只调 task 级
+`gt-output'（`gt-insert-text-at-marker'），不调渲染器的 output 函数，故
+`gt-buffer-render-output-hook' 不会 run；面板路径因此由
+`seshat-reader-translate--stream-wanted-p' 直接关掉引擎流式，本函数只在
+「渲染方式切到 posframe 类、gt 补上回调」等场景才有机会被调用。保留它是为了
+增量实现不随开关一起消失（详见 `--stream-wanted-p' 的文档）。
+
 **追问分支**：当面板 buffer 的追问状态里 `:answer-start' 为真（本轮追问仍在
 生成）时，增量改写「当前轮答案区」（`:answer-marker' 之后到 buffer 末尾），
 不触碰首轮骨架与此前各轮问答；否则走首轮的骨架 + 正文区逻辑。"
@@ -1768,6 +1815,9 @@ nil 而回退 posframe）挂两个 posframe 输出 hook
 重复调用幂等。"
   (if (and (eq seshat-reader-translate-render 'sidebar)
            seshat-reader-sidebar-enabled)
+      ;; 面板路径不会为引擎开启流式（见 `seshat-reader-translate--stream-wanted-p'），
+      ;; 故这个 hook 目前不会被触发；保留挂载是为了让「用户把渲染方式从面板切成
+      ;; posframe 再切回」以及 gt 将来补上完成回调时无需再改这段安装逻辑。
       (when seshat-reader-translate-stream
         (seshat-reader-translate--install-stream-hook))
     (seshat-reader-translate--install-capture-hooks)))

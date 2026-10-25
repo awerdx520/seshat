@@ -1464,6 +1464,54 @@ LOADING 非 nil 时给片段加 `gt-buffer-render-loading-face'（模拟 gt 的
       (should (oref (nth 1 engines) stream))
       (should-not (eq (nth 1 engines) chatgpt)))))
 
+(ert-deftest seshat-reader-translate-test--stream-wanted-p ()
+  "面板路径不给引擎开流式；开关关闭或退回 posframe 的判定见各分支."
+  ;; ① 面板渲染 + 面板启用：绝不流式（即便开关为 t）
+  (let ((seshat-reader-translate-render 'sidebar)
+        (seshat-reader-sidebar-enabled t)
+        (seshat-reader-translate-stream t))
+    (should-not (seshat-reader-translate--stream-wanted-p)))
+  ;; ② 开关关闭：任何渲染方式都不流式
+  (let ((seshat-reader-translate-render 'pop)
+        (seshat-reader-sidebar-enabled t)
+        (seshat-reader-translate-stream nil))
+    (should-not (seshat-reader-translate--stream-wanted-p)))
+  ;; ③ posframe 渲染 + 开关打开：维持流式
+  (let ((seshat-reader-translate-render 'pop)
+        (seshat-reader-sidebar-enabled t)
+        (seshat-reader-translate-stream t))
+    (should (seshat-reader-translate--stream-wanted-p)))
+  ;; ④ 渲染方式为面板但面板被禁用（实际退回 posframe）：仍允许流式
+  (let ((seshat-reader-translate-render 'sidebar)
+        (seshat-reader-sidebar-enabled nil)
+        (seshat-reader-translate-stream t))
+    (should (seshat-reader-translate--stream-wanted-p))))
+
+(ert-deftest seshat-reader-translate-test--translator-panel-disables-stream ()
+  "面板路径下 `--translator' 不开引擎流式（gt 纯流式下 `:then' 与
+`gt-buffer-render-output-hook' 都不触发，开了只会让面板彻底不出现）."
+  (skip-unless (require 'gt nil t))
+  (skip-unless (require 'gt-render-buffer nil t))
+  (skip-unless (require 'gt-render-posframe nil t))
+  (let* ((preset (gt-translator :engines (list (gt-chatgpt-engine))))
+         (seshat-reader-translate-presets (list (cons 'diag-preset preset))))
+    ;; ① 面板渲染：即便 `seshat-reader-translate-stream' 为 t 也不开流式
+    (let ((seshat-reader-translate-render 'sidebar)
+          (seshat-reader-sidebar-enabled t)
+          (seshat-reader-translate-stream t))
+      (should-not (oref (car (oref (seshat-reader-translate--translator
+                                    'diag-preset "AAA" '(en zh))
+                                   engines))
+                        stream)))
+    ;; ② posframe 渲染：开关为 t 时照旧开流式（行为不变）
+    (let ((seshat-reader-translate-render 'pop)
+          (seshat-reader-sidebar-enabled t)
+          (seshat-reader-translate-stream t))
+      (should (oref (car (oref (seshat-reader-translate--translator
+                                'diag-preset "AAA" '(en zh))
+                               engines))
+                    stream)))))
+
 ;;; 追问（多轮 messages）
 
 (defconst seshat-reader-translate-test--panel-name "*Seshat Test Follow-up Panel*"
