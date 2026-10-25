@@ -1412,6 +1412,234 @@ LOADING 非 nil 时给片段加 `gt-buffer-render-loading-face'（模拟 gt 的
     ;; 登记了本次请求的 translator（守卫用）
     (should (eq seshat-reader-translate--current-translator trans))))
 
+;;; 追问（多轮 messages）
+
+(defconst seshat-reader-translate-test--panel-name "*Seshat Test Follow-up Panel*"
+  "追问用例使用的面板 buffer 名（与生产名区分，用例结束即杀掉）.")
+
+(defun seshat-reader-translate-test--follow-up-panel (state)
+  "重建追问测试面板 buffer 并把追问状态 STATE 写成它的 buffer-local 值.
+STATE 为 plist（可含 `:source' `:answer' `:langs' `:kind' `:round' `:turns'
+`:answer-marker' `:answer-start'），nil 表示「面板存在但还没有追问状态」。
+返回该 buffer；用例负责在结束时杀掉它。"
+  (let ((panel (get-buffer-create seshat-reader-translate-test--panel-name)))
+    (with-current-buffer panel
+      (erase-buffer)
+      (insert "> **原文**\n>\n> 原文片段\n\n---\n首轮解释\n")
+      (setq-local seshat-reader-translate--panel-title "Seshat 解释")
+      (setq-local header-line-format "Seshat 解释（已完成）")
+      (setq seshat-reader-translate--follow-up-state state))
+    panel))
+
+(ert-deftest seshat-reader-translate-test--follow-up-messages-order ()
+  "messages 顺序为「原文 user → 首轮 assistant → 历史轮 → 本次追问」."
+  (let* ((turns '(("问题甲" . "答案甲")))
+         (messages (seshat-reader-translate--follow-up-messages
+                    "原文" "首轮解释" turns "本次追问" 6)))
+    (should (= 5 (length messages)))
+    (should (equal (mapcar (lambda (message) (alist-get 'role message)) messages)
+                   '(user assistant user assistant user)))
+    (let ((first (alist-get 'content (nth 0 messages))))
+      (should (string-match-p "请解释下面的文本" first))
+      (should (string-suffix-p "原文" first)))
+    (should (equal (alist-get 'content (nth 1 messages)) "首轮解释"))
+    (should (equal (alist-get 'content (nth 2 messages)) "问题甲"))
+    (should (equal (alist-get 'content (nth 3 messages)) "答案甲"))
+    (should (equal (alist-get 'content (nth 4 messages)) "本次追问"))
+    ;; 元素形态与 `gt-chatgpt-send' 期望的 `((role . x) (content . y))' 一致
+    (should (equal (nth 1 messages)
+                   '((role . assistant) (content . "首轮解释"))))))
+
+(ert-deftest seshat-reader-translate-test--follow-up-messages-limit ()
+  "历史轮超过 LIMIT 时只保留最近 LIMIT 轮（最早的问题不进入 messages）."
+  (let* ((turns '(("最早问题" . "最早答案")
+                  ("中期问题" . "中期答案")
+                  ("最近问题" . "最近答案")))
+         (messages (seshat-reader-translate--follow-up-messages
+                    "原文" "首轮解释" turns "本次追问" 2))
+         (contents (mapcar (lambda (message) (alist-get 'content message)) messages)))
+    ;; 1（原文）+ 1（首轮答案）+ 2 轮 × 2 + 1（本次追问）
+    (should (= 7 (length messages)))
+    (should-not (cl-some (lambda (content) (string-match-p "最早" content)) contents))
+    (should (cl-some (lambda (content) (equal content "中期问题")) contents))
+    (should (cl-some (lambda (content) (equal content "最近问题")) contents))
+    (should (equal (car (last contents)) "本次追问"))))
+
+(ert-deftest seshat-reader-translate-test--follow-up-messages-missing-source ()
+  "SOURCE 为 nil 时不产生首轮解释请求，但本次追问仍必须有."
+  (let* ((messages (seshat-reader-translate--follow-up-messages
+                    nil "首轮解释" nil "本次追问" 6)))
+    (should (= 1 (length messages)))
+    (should (equal (alist-get 'role (car messages)) 'user))
+    (should (equal (alist-get 'content (car messages)) "本次追问")))
+  ;; SOURCE 是纯空白时按「没有原文」处理（与空白 ANSWER 同理）
+  (let ((messages (seshat-reader-translate--follow-up-messages
+                   "  \n\t" "  " nil "只有追问" 6)))
+    (should (= 1 (length messages)))
+    (should (equal (alist-get 'content (car messages)) "只有追问"))))
+
+(ert-deftest seshat-reader-translate-test--follow-up-requires-state ()
+  "面板不存在、没有追问状态、没有原文或问题为空时命令抛 `user-error'."
+  (let ((seshat-reader-sidebar-translate-buffer-name
+         seshat-reader-translate-test--panel-name))
+    (when (get-buffer seshat-reader-translate-test--panel-name)
+      (kill-buffer seshat-reader-translate-test--panel-name))
+    ;; 情形 1：面板不存在
+    (should-error (seshat-reader-translate-follow-up "问题") :type 'user-error)
+    (let ((panel (seshat-reader-translate-test--follow-up-panel nil)))
+      (unwind-protect
+          (progn
+            ;; 情形 2：面板存在但还没有追问状态（尚未翻译/解释）
+            (should-error (seshat-reader-translate-follow-up "问题") :type 'user-error)
+            ;; 情形 3：有状态但没记录原文
+            (with-current-buffer panel
+              (setq seshat-reader-translate--follow-up-state
+                    (list :source nil :answer "首轮解释" :langs '(en zh)
+                          :kind 'explain :round 0 :turns nil
+                          :answer-marker nil :answer-start nil)))
+            (should-error (seshat-reader-translate-follow-up "问题") :type 'user-error)
+            ;; 情形 4：问题为空或纯空白
+            (should-error (seshat-reader-translate-follow-up " \n ") :type 'user-error))
+        (when (buffer-live-p panel) (kill-buffer panel))))))
+
+(ert-deftest seshat-reader-translate-test--follow-up-rejects-non-chatgpt-engine ()
+  "预设里没有 `gt-chatgpt-engine' 时抛 `user-error'，不发起请求、不做文本拼接降级."
+  (skip-unless (require 'gt nil t))
+  (let* ((seshat-reader-sidebar-translate-buffer-name
+          seshat-reader-translate-test--panel-name)
+         (seshat-reader-translate-explain-preset 'reader-explain)
+         (gt-preset-translators
+          (list (cons 'reader-explain
+                      (gt-translator :engines (list (gt-google-engine))))))
+         (started nil)
+         (panel (seshat-reader-translate-test--follow-up-panel
+                 (list :source "原文片段" :answer "首轮解释" :langs '(en zh)
+                       :kind 'explain :round 0 :turns nil
+                       :answer-marker nil :answer-start nil))))
+    (unwind-protect
+        (cl-letf (((symbol-function 'gt-start)
+                   (lambda (&rest _args) (setq started t))))
+          (should-error (seshat-reader-translate-follow-up "问题") :type 'user-error)
+          (should-not started)
+          ;; 面板内容不受影响（没有追加任何轮次）
+          (with-current-buffer panel
+            (should-not (string-match-p "### 追问" (buffer-string)))))
+      (when (buffer-live-p panel) (kill-buffer panel)))))
+
+(ert-deftest seshat-reader-translate-test--follow-up-appends-round ()
+  "追问在面板末尾追加「### 追问 1 / **问：** / **答：**」，记录答案区 marker 并递增轮次."
+  (skip-unless (require 'gt nil t))
+  (skip-unless (require 'gt-render-buffer nil t))
+  (let* ((seshat-reader-sidebar-translate-buffer-name
+          seshat-reader-translate-test--panel-name)
+         (seshat-reader-translate-explain-preset 'reader-explain)
+         (preset-engine (gt-chatgpt-engine))
+         (gt-preset-translators
+          (list (cons 'reader-explain
+                      (gt-translator :engines (list preset-engine)))))
+         (seshat-reader-translate-stream t)
+         (gt-buffer-render-output-hook nil)
+         (seshat-reader-translate--current-translator nil)
+         (seshat-reader-translate--active nil)
+         (captured nil)
+         (panel (seshat-reader-translate-test--follow-up-panel
+                 (list :source "原文片段" :answer "首轮解释" :langs '(en zh)
+                       :kind 'explain :round 0 :turns nil
+                       :answer-marker nil :answer-start nil))))
+    (unwind-protect
+        (progn
+          (cl-letf (((symbol-function 'gt-start)
+                     (lambda (translator) (setq captured translator))))
+            (seshat-reader-translate-follow-up "  测试追问  "))
+          (should captured)
+          (with-current-buffer panel
+            (should (string-match-p "### 追问 1" (buffer-string)))
+            (should (string-match-p "\\*\\*问：\\*\\* 测试追问" (buffer-string)))
+            ;; 问题被 `string-trim' 处理（前后空白不进面板）
+            (should-not (string-match-p "  测试追问" (buffer-string)))
+            (should (string-suffix-p "**答：**\n\n" (buffer-string)))
+            (let ((state seshat-reader-translate--follow-up-state))
+              (should (= 1 (plist-get state :round)))
+              (should (eq (plist-get state :answer-start) t))
+              (should (markerp (plist-get state :answer-marker)))
+              (should (= (marker-position (plist-get state :answer-marker))
+                         (point-max))))
+            (should (string-match-p "追问 1 生成中" header-line-format)))
+          ;; 引擎克隆体带函数型 prompt，调用它得到多轮 messages
+          (let* ((engine (car (slot-value captured 'engines)))
+                 (prompt (slot-value engine 'prompt)))
+            (should (functionp prompt))
+            ;; H5：克隆体不是预设里的那个引擎对象
+            (should-not (eq engine preset-engine))
+            (should-not (eq (slot-value preset-engine 'prompt) prompt))
+            (let ((messages (funcall prompt "ignored" 'zh)))
+              (should (equal (mapcar (lambda (m) (alist-get 'role m)) messages)
+                             '(user assistant user)))
+              (should (string-match-p "原文片段"
+                                      (alist-get 'content (car messages))))
+              (should (equal (alist-get 'content (nth 1 messages)) "首轮解释"))
+              (should (equal (alist-get 'content (car (last messages)))
+                             "测试追问"))))
+          ;; 登记了本次 translator（流式守卫用）
+          (should (eq seshat-reader-translate--current-translator captured)))
+      (when (buffer-live-p panel) (kill-buffer panel)))))
+
+(ert-deftest seshat-reader-translate-test--follow-up-complete-records-turn ()
+  "完成回调替换答案区、追加历史轮、清 `:answer-start'，header-line 报已完成轮数."
+  (skip-unless (require 'gt nil t))
+  (let* ((seshat-reader-sidebar-translate-buffer-name
+          seshat-reader-translate-test--panel-name)
+         (seshat-reader-translate-last-result nil)
+         (seshat-reader-translate--current-translator 'fake-translator)
+         (gt-buffer (get-buffer-create
+                     seshat-reader-translate--follow-up-buffer-name))
+         (panel (seshat-reader-translate-test--follow-up-panel nil)))
+    (unwind-protect
+        (progn
+          (with-current-buffer panel
+            (let ((inhibit-read-only t))
+              (goto-char (point-max))
+              (insert "\n\n---\n\n### 追问 1\n\n**问：** 测试追问\n\n**答：**\n\n"))
+            (setq seshat-reader-translate--follow-up-state
+                  (list :source "原文片段" :answer "首轮解释" :langs '(en zh)
+                        :kind 'explain :round 1 :turns nil
+                        :answer-marker (copy-marker (point-max))
+                        :answer-start t)))
+          (with-current-buffer gt-buffer
+            (erase-buffer)
+            (insert (propertize "本轮答案" 'gt-result t)))
+          (should (equal (seshat-reader-translate--follow-up-complete panel "测试追问")
+                         "本轮答案"))
+          (with-current-buffer panel
+            (let ((state seshat-reader-translate--follow-up-state))
+              (should (equal (plist-get state :turns)
+                             '(("测试追问" . "本轮答案"))))
+              (should-not (plist-get state :answer-start))
+              (should-not (plist-get state :answer-marker))
+              (should (= 1 (plist-get state :round))))
+            (should (string-suffix-p "**答：**\n\n本轮答案\n" (buffer-string)))
+            (goto-char (point-min))
+            (should (= 1 (how-many "### 追问")))
+            (should (string-match-p "已完成 · 1 轮追问" header-line-format)))
+          ;; 存批注口径：记录整面板纯文本（含首轮解释与本轮答案）
+          (should seshat-reader-translate-last-result)
+          (should (string-match-p "首轮解释" seshat-reader-translate-last-result))
+          (should (string-match-p "本轮答案" seshat-reader-translate-last-result))
+          ;; 收尾后清掉 translator 登记，防止迟到增量误写首轮正文区
+          (should-not seshat-reader-translate--current-translator))
+      (when (buffer-live-p panel) (kill-buffer panel))
+      (when (buffer-live-p gt-buffer) (kill-buffer gt-buffer)))))
+
+(ert-deftest seshat-reader-translate-test--follow-up-key-binding ()
+  "`C-c C-q' 在阅读器键位表与面板键位表上都绑到追问命令."
+  (should (eq (lookup-key seshat-reader-mode-map (kbd "C-c C-q"))
+              #'seshat-reader-translate-follow-up))
+  (should (eq (lookup-key seshat-reader-translate-panel-map (kbd "C-c C-q"))
+              #'seshat-reader-translate-follow-up))
+  ;; `C-c C-a' 已被批注命令占用，追问不得复用它
+  (should-not (eq (lookup-key seshat-reader-mode-map (kbd "C-c C-a"))
+                  #'seshat-reader-translate-follow-up)))
+
 (provide 'seshat-reader-translate-test)
 ;;; seshat-reader-translate-test.el ends here
 

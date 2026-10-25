@@ -176,6 +176,8 @@ pick 格式化：`all` → 每段 `【来源】\n译文`，段间 `\n\n---\n\n`�
 
 - 文件：同上。新增 `seshat-reader-translate-follow-up`、纯函数 `seshat-reader-translate--follow-up-messages`、buffer-local 历史状态、`seshat-reader-translate-follow-up-max-rounds`、降级分支、`C-c C-q` 键位（reader-mode + panel-mode）。
 - 验收：ERT ≥6 例——messages 顺序与角色正确；超过轮次上限丢弃最早轮；非 `gt-chatgpt-engine` 引擎走文本拼接降级且标注；无面板/无原文时报 `user-error`；键位绑定正确（`lookup-key`）；clone 后预设槽未被污染（H5）。
+- **降级边界修正**：预设引擎不是 `gt-chatgpt-engine` 时**不做文本拼接降级**，而是 `user-error` 明确提示配置问题——youdao/google 等翻译引擎不具备对话语义，静默降级只会产出误导性结果。
+- **追问渲染**：追问走独立隐藏中转 buffer（` *Seshat gt follow-up*`），增量/完成结果只替换「当前轮答案区」（marker），不触碰骨架与此前问答；历史保留最近 `seshat-reader-translate-follow-up-max-rounds` 轮。
 
 ### T6 outline 适配（依赖：T3）
 
