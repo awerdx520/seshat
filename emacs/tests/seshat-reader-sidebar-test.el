@@ -1603,27 +1603,181 @@ batch 与终端 frame 下真实 `display-graphic-p' 恒为 nil，而默认 carri
 
 (ert-deftest seshat-reader-sidebar-test--cf-size-ratio-and-invalid-parent ()
   "像素尺寸 = 父 frame 像素尺寸 × 比例；父尺寸异常时返回 nil.
-1000 × 800 的父 frame 按默认比例 0.34 / 0.45 得 (340 . 360)。返回 nil 而非
+1000 × 800 的父 frame 按默认宽度比例 0.25 得宽 250；高度默认**满高**
+（`seshat-reader-panel-full-height' 为 t）→ 800 − 2×16 = 768。返回 nil 而非
 (0 . 0) 是要点：调用方靠 nil 判定「本环境建不出 child frame」，返回 0 尺寸会
 让它去建一个不可见的 frame。"
-  (cl-letf (((symbol-function 'frame-pixel-width)
-             (lambda (&optional _frame) 1000))
-            ((symbol-function 'frame-pixel-height)
-             (lambda (&optional _frame) 800)))
-    (should (equal (seshat-reader-sidebar--cf-size 'parent 'translate)
-                   '(340 . 360)))
-    ;; 比例可配置，且与 kind 无关（kind 目前只作签名占位）
-    (let ((seshat-reader-panel-width 0.5)
-          (seshat-reader-panel-height 0.25))
-      (should (equal (seshat-reader-sidebar--cf-size 'parent 'outline)
-                     '(500 . 200))))
-    ;; 父尺寸非数值 / 非正 → nil
+  (let ((seshat-reader-panel-margin 16))
     (cl-letf (((symbol-function 'frame-pixel-width)
-               (lambda (&optional _frame) nil)))
-      (should-not (seshat-reader-sidebar--cf-size 'parent 'translate)))
-    (cl-letf (((symbol-function 'frame-pixel-height)
-               (lambda (&optional _frame) 0)))
-      (should-not (seshat-reader-sidebar--cf-size 'parent 'translate)))))
+               (lambda (&optional _frame) 1000))
+              ((symbol-function 'frame-pixel-height)
+               (lambda (&optional _frame) 800)))
+      (should (equal (seshat-reader-sidebar--cf-size 'parent 'translate)
+                     '(250 . 768)))
+      ;; 比例可配置，且与 kind 无关（kind 目前只作签名占位）；关掉满高才走
+      ;; `seshat-reader-panel-height' 的比例路径。800×0.25 = 200 低于「父高
+      ;; 30%」保底 240，故高度被夹到 240（见 `--cf-size-for-side'）。
+      (let ((seshat-reader-panel-width 0.5)
+            (seshat-reader-panel-height 0.25)
+            (seshat-reader-panel-full-height nil))
+        (should (equal (seshat-reader-sidebar--cf-size 'parent 'outline)
+                       '(500 . 240))))
+      ;; 父尺寸非数值 / 非正 → nil
+      (cl-letf (((symbol-function 'frame-pixel-width)
+                 (lambda (&optional _frame) nil)))
+        (should-not (seshat-reader-sidebar--cf-size 'parent 'translate)))
+      (cl-letf (((symbol-function 'frame-pixel-height)
+                 (lambda (&optional _frame) 0)))
+        (should-not (seshat-reader-sidebar--cf-size 'parent 'translate))))))
+
+;;; 面板贴边（左右侧）、满高与同侧堆叠
+
+(ert-deftest seshat-reader-sidebar-test--panel-side-for-kind-defaults ()
+  "默认配置下目录贴左、译文/解释贴右（`seshat-reader-panel-position-alist'）."
+  (should (eq (seshat-reader-sidebar--panel-side-for-kind 'outline) 'left))
+  (should (eq (seshat-reader-sidebar--panel-side-for-kind 'translate) 'right))
+  ;; alist 可自定义：改表即改侧，不必动 kind 逻辑
+  (let ((seshat-reader-panel-position-alist '((outline . right)
+                                             (translate . left))))
+    (should (eq (seshat-reader-sidebar--panel-side-for-kind 'outline) 'right))
+    (should (eq (seshat-reader-sidebar--panel-side-for-kind 'translate) 'left))))
+
+(ert-deftest seshat-reader-sidebar-test--panel-side-for-kind-fallback ()
+  "未命中 alist 的 kind 回落到 `seshat-reader-sidebar-position'.
+取 `left' 时得 `left'；取底部模式（`below-selected' / `at-bottom'，以及规范中
+举例的 `bottom`）这类**非左右**取值时按 `right' 处理——child frame 是覆盖浮层，
+没有「底部」概念。"
+  (let ((seshat-reader-panel-position-alist nil))
+    (let ((seshat-reader-sidebar-position 'left))
+      (should (eq (seshat-reader-sidebar--panel-side-for-kind 'annotations) 'left)))
+    (let ((seshat-reader-sidebar-position 'below-selected))
+      (should (eq (seshat-reader-sidebar--panel-side-for-kind 'annotations) 'right)))
+    (let ((seshat-reader-sidebar-position 'bottom))
+      (should (eq (seshat-reader-sidebar--panel-side-for-kind 'unknown-kind) 'right)))
+    (let ((seshat-reader-sidebar-position 'right))
+      (should (eq (seshat-reader-sidebar--panel-side-for-kind nil) 'right)))))
+
+(ert-deftest seshat-reader-sidebar-test--cf-position-for-side-left-and-right ()
+  "`--cf-position-for-side' 贴左边时 LEFT=margin、贴右边时 LEFT=父宽−面板宽−margin.
+父宽 1200 / 面板宽 300 / margin 16：左 → LEFT 16，右 → 1200−300−16 = 884；
+无同侧已有面板时 TOP = margin = 16。"
+  (should (equal (seshat-reader-sidebar--cf-position-for-side
+                  1200 300 16 'left nil)
+                 '(16 . 16)))
+  (should (equal (seshat-reader-sidebar--cf-position-for-side
+                  1200 300 16 'right nil)
+                 '(884 . 16))))
+
+(ert-deftest seshat-reader-sidebar-test--cf-position-for-side-stacking ()
+  "同侧已有面板把 TOP 往下推「该面板高度 + margin」，空表等同 nil."
+  (should (equal (seshat-reader-sidebar--cf-position-for-side
+                  1200 300 16 'left '(400))
+                 '(16 . 432)))
+  ;; 两个同侧面板：16 + (300+16) + (200+16)
+  (should (equal (seshat-reader-sidebar--cf-position-for-side
+                  1200 300 16 'right '(300 200))
+                 '(884 . 548)))
+  (should (equal (seshat-reader-sidebar--cf-position-for-side
+                  1200 300 16 'left '())
+                 '(16 . 16)))
+  ;; 非数值 / 非正项不占位（调用方可能从 `frame-pixel-height' 拿到 nil）
+  (should (equal (seshat-reader-sidebar--cf-position-for-side
+                  1200 300 16 'left '(nil 0 -5))
+                 '(16 . 16))))
+
+(ert-deftest seshat-reader-sidebar-test--cf-position-for-side-invalid-args ()
+  "参数异常（nil / 非正数 / 非法 side）时 `--cf-position-for-side' 返回 nil."
+  (should-not (seshat-reader-sidebar--cf-position-for-side
+               nil 300 16 'left nil))
+  (should-not (seshat-reader-sidebar--cf-position-for-side
+               0 300 16 'left nil))
+  (should-not (seshat-reader-sidebar--cf-position-for-side
+               1200 nil 16 'left nil))
+  (should-not (seshat-reader-sidebar--cf-position-for-side
+               1200 0 16 'right nil))
+  (should-not (seshat-reader-sidebar--cf-position-for-side
+               1200 300 nil 'left nil))
+  (should-not (seshat-reader-sidebar--cf-position-for-side
+               1200 300 -1 'left nil))
+  (should-not (seshat-reader-sidebar--cf-position-for-side
+               1200 300 16 'bottom nil)))
+
+(ert-deftest seshat-reader-sidebar-test--cf-size-for-side-full-height ()
+  "满高时高度 = 父高 − 2×margin，与 `seshat-reader-panel-height' 无关."
+  (let ((seshat-reader-panel-width 0.25)
+        (seshat-reader-panel-height 0.45)
+        (seshat-reader-panel-margin 16)
+        (seshat-reader-panel-full-height t))
+    (cl-letf (((symbol-function 'frame-pixel-width)
+               (lambda (&optional _frame) 1200))
+              ((symbol-function 'frame-pixel-height)
+               (lambda (&optional _frame) 800)))
+      (should (equal (seshat-reader-sidebar--cf-size-for-side
+                      'parent 'translate nil)
+                     '(300 . 768)))
+      ;; 换高度比例不影响满高结果
+      (let ((seshat-reader-panel-height 0.1))
+        (should (equal (seshat-reader-sidebar--cf-size-for-side
+                        'parent 'translate nil)
+                       '(300 . 768)))))))
+
+(ert-deftest seshat-reader-sidebar-test--cf-size-for-side-subtracts-existing ()
+  "同侧已有面板时从可用高度里扣掉其高度（含 margin），且不低于父高 30%."
+  (let ((seshat-reader-panel-width 0.25)
+        (seshat-reader-panel-margin 16)
+        (seshat-reader-panel-full-height t))
+    (cl-letf (((symbol-function 'frame-pixel-width)
+               (lambda (&optional _frame) 1200))
+              ((symbol-function 'frame-pixel-height)
+               (lambda (&optional _frame) 800)))
+      ;; 768 − (400 + 16) = 352
+      (should (equal (seshat-reader-sidebar--cf-size-for-side
+                      'parent 'translate '(400))
+                     '(300 . 352)))
+      ;; 挤压过度：768 − (700+16) = 52 < 30%×800=240 → 取 240（允许超出）
+      (should (equal (seshat-reader-sidebar--cf-size-for-side
+                      'parent 'translate '(700))
+                     '(300 . 240)))
+      ;; 非数值 / 非正项不扣减
+      (should (equal (seshat-reader-sidebar--cf-size-for-side
+                      'parent 'translate '(nil 0))
+                     '(300 . 768))))))
+
+(ert-deftest seshat-reader-sidebar-test--cf-size-for-side-ratio-when-not-full ()
+  "`seshat-reader-panel-full-height' 为 nil 时按 `seshat-reader-panel-height' 比例."
+  (let ((seshat-reader-panel-width 0.25)
+        (seshat-reader-panel-height 0.45)
+        (seshat-reader-panel-margin 16)
+        (seshat-reader-panel-full-height nil))
+    (cl-letf (((symbol-function 'frame-pixel-width)
+               (lambda (&optional _frame) 1200))
+              ((symbol-function 'frame-pixel-height)
+               (lambda (&optional _frame) 800)))
+      (should (equal (seshat-reader-sidebar--cf-size-for-side
+                      'parent 'translate nil)
+                     '(300 . 360)))
+      ;; 同侧已有面板同样扣减：360 − (100+16) = 244 ≥ 240
+      (should (equal (seshat-reader-sidebar--cf-size-for-side
+                      'parent 'translate '(100))
+                     '(300 . 244)))
+      ;; 扣到低于 30% 时仍保底 240
+      (should (equal (seshat-reader-sidebar--cf-size-for-side
+                      'parent 'translate '(300))
+                     '(300 . 240))))))
+
+(ert-deftest seshat-reader-sidebar-test--cf-position-uses-side-from-alist ()
+  "`--cf-position' 薄包装按 kind 的侧定位：目录在左、译文在右."
+  (let ((seshat-reader-panel-width 0.25)
+        (seshat-reader-panel-margin 16)
+        (seshat-reader-panel-full-height t))
+    (cl-letf (((symbol-function 'frame-pixel-width)
+               (lambda (&optional _frame) 1200))
+              ((symbol-function 'frame-pixel-height)
+               (lambda (&optional _frame) 800)))
+      (should (equal (seshat-reader-sidebar--cf-position 'parent 'outline nil)
+                     '(16 . 16)))
+      (should (equal (seshat-reader-sidebar--cf-position 'parent 'translate nil)
+                     '(884 . 16))))))
 
 (ert-deftest seshat-reader-sidebar-test--cf-position-right-edge-and-stacking ()
   "面板贴父 frame 右边缘、多面板纵向堆叠时按「高度 + margin」逐层下移.
@@ -1786,9 +1940,10 @@ width/height 是字符单位，无法精确等于像素比例）。"
                                  (alist-get 'child-frame-parameters
                                             (cdr captured-action))))
                       'translate))
-          ;; 像素级收口：340 × 360 @ (644, 16)
-          (should (equal sized '((cf-new 340 360 t))))
-          (should (equal positioned '((cf-new 644 16)))))
+          ;; 像素级收口：默认宽度 0.25 × 1000 = 250、满高 800 − 2×16 = 768；
+          ;; 译文默认贴右 → LEFT = 1000 − 250 − 16 = 734
+          (should (equal sized '((cf-new 250 768 t))))
+          (should (equal positioned '((cf-new 734 16)))))
       (kill-buffer buf))))
 
 (ert-deftest seshat-reader-sidebar-test--cf-show-non-graphic-returns-nil ()

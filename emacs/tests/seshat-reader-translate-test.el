@@ -490,6 +490,10 @@ ENTRIES 是 `(TEXT FAILED SOURCE)' 列表。gt 的 `gt-buffer-render-init' 把�
          (seshat-reader-translate-show-source nil)
          ;; 本用例只验证「写入 + 视图」，把模板关掉以免与模板渲染耦合
          (seshat-reader-translate-template nil)
+         ;; 折行模式（`seshat-reader-panel-truncate-lines' 为 nil）下的视图断言；
+         ;; 不折行 + 横向滚动的新默认行为在
+         ;; `seshat-reader-translate-test--prepare-view-truncate-lines' 里单独测。
+         (seshat-reader-panel-truncate-lines nil)
          (seshat-reader-select-last nil)
          (shown nil)
          (text "**粗体**\n\n- 列表项一\n- 列表项二")
@@ -563,10 +567,13 @@ ENTRIES 是 `(TEXT FAILED SOURCE)' 列表。gt 的 `gt-buffer-render-init' 把�
       (when (buffer-live-p buf) (kill-buffer buf)))))
 
 (ert-deftest seshat-reader-translate-test--prepare-view-enables-visual-fill-column ()
-  "`--prepare-view' 在 `seshat-reader-translate-visual-fill-column' 为 t 时启用 vfc."
+  "`--prepare-view' 在 `seshat-reader-translate-visual-fill-column' 为 t 时启用 vfc.
+须同时把 `seshat-reader-panel-truncate-lines' 设为 nil：折行与 vfc 互斥，不折行
+模式（默认）下 vfc 被整体跳过。"
   (skip-unless (require 'visual-fill-column nil t))
   (with-temp-buffer
-    (let ((seshat-reader-translate-visual-fill-column t))
+    (let ((seshat-reader-translate-visual-fill-column t)
+          (seshat-reader-panel-truncate-lines nil))
       (seshat-reader-translate--prepare-view)
       (should visual-fill-column-mode))))
 
@@ -575,9 +582,32 @@ ENTRIES 是 `(TEXT FAILED SOURCE)' 列表。gt 的 `gt-buffer-render-init' 把�
 测试 buffer 无窗口，故 `-1' 守卫分支也不会执行。"
   (skip-unless (require 'visual-fill-column nil t))
   (with-temp-buffer
-    (let ((seshat-reader-translate-visual-fill-column nil))
+    (let ((seshat-reader-translate-visual-fill-column nil)
+          (seshat-reader-panel-truncate-lines nil))
       (seshat-reader-translate--prepare-view)
       (should-not visual-fill-column-mode))))
+
+(ert-deftest seshat-reader-translate-test--prepare-view-truncate-lines-on ()
+  "`seshat-reader-panel-truncate-lines' 非 nil：不折行 + 允许横向滚动，并跳过 vfc."
+  (with-temp-buffer
+    (let ((seshat-reader-panel-truncate-lines t)
+          (seshat-reader-translate-visual-fill-column t))
+      (seshat-reader-translate--prepare-view)
+      (should truncate-lines)
+      (should-not word-wrap)
+      ;; 横向滚动开关：长行超出面板宽度后 `scroll-left' / `C-x <' 才有效
+      (should auto-hscroll-mode)
+      (should buffer-read-only)
+      ;; 互斥：不折行模式下即使 vfc 开关为 t 也不启用它
+      (should-not (bound-and-true-p visual-fill-column-mode)))))
+
+(ert-deftest seshat-reader-translate-test--prepare-view-word-wrap-when-disabled ()
+  "`seshat-reader-panel-truncate-lines' 为 nil 时保持折行（原行为）。"
+  (with-temp-buffer
+    (let ((seshat-reader-panel-truncate-lines nil))
+      (seshat-reader-translate--prepare-view)
+      (should-not truncate-lines)
+      (should word-wrap))))
 
 (ert-deftest seshat-reader-translate-test--prepare-view-tolerates-missing-visual-fill-column ()
   "`visual-fill-column' 软依赖缺失时 `--prepare-view' 静默跳过、不报错.
@@ -587,6 +617,8 @@ ENTRIES 是 `(TEXT FAILED SOURCE)' 列表。gt 的 `gt-buffer-render-init' 把�
 `markdown-view-mode'，不透传会破坏视图 mode 的降级链。"
   (with-temp-buffer
     (let ((seshat-reader-translate-visual-fill-column t)
+          ;; 折行模式才有 vfc 路径（不折行模式下整体跳过）
+          (seshat-reader-panel-truncate-lines nil)
           ;; 先取出原函数对象，避免桩内部递归调用自身
           (orig-fboundp (symbol-function 'fboundp))
           (orig-require (symbol-function 'require)))
@@ -1042,6 +1074,8 @@ M 为链路上 `message' 的文本。
          (gt-preset-translators nil)
          (seshat-reader-sidebar-translate-buffer-name "*Seshat T6 Panel*")
          (seshat-reader-translate--gt-buffer-name " *Seshat T6 gt*")
+         ;; 折行模式下的视图断言（见 `--prepare-view-truncate-lines'）
+         (seshat-reader-panel-truncate-lines nil)
          (gt-posframe-pop-render-output-hook nil)
          (gt-posframe-pin-render-output-hook nil)
          (seshat-reader-translate-last-result nil)

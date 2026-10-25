@@ -607,25 +607,44 @@ go-translate function `gt-buffer-render' 是该库中定义的**类名**（不�
 (defun seshat-reader-translate--prepare-view ()
   "把当前 buffer 设为译文面板的只读 Markdown 视图.
 先调 `seshat-reader-translate--view-mode-function' 选出的 major mode（隐藏
-Markdown 标记、标题分级、列表缩进、代码块），再显式设 `truncate-lines' 为
-nil 与 `word-wrap' 为 t——`gfm-view-mode' 实测不设 `word-wrap'，不显式设置
-就只能按字符边界硬折行，CJK 折行效果差——最后设 `buffer-read-only' 为 t。
+Markdown 标记、标题分级、列表缩进、代码块），再按
+`seshat-reader-panel-truncate-lines' 设置折行与横向滚动：
+
+- 非 nil（默认）：不折行——`truncate-lines' 为 t、`word-wrap' 为 nil、
+  `auto-hscroll-mode' 为 t（面板宽度固定且较窄，长行必须能横向滚动，否则
+  超出宽度的内容既看不见也到不了）；此时**跳过** `visual-fill-column-mode`，
+  二者互斥（按列宽折行与横向滚动不能并存），跳过时不 `message' 提示；
+- nil：保持原来的折行行为（`truncate-lines' 为 nil、`word-wrap' 为 t）——
+  `gfm-view-mode' 实测不设 `word-wrap'，不显式设置就只能按字符边界硬折行，
+  CJK 折行效果差。
+
+最后设 `buffer-read-only' 为 t。
 
 major mode 调用失败（如 autoload 指向的库缺失）时回退 `text-mode'，保证
 面板渲染不因软依赖缺失而报错。
 
-末尾按 `seshat-reader-translate-visual-fill-column' 启停
+**折行模式**下，末尾按 `seshat-reader-translate-visual-fill-column' 启停
 `visual-fill-column-mode'（软依赖 `visual-fill-column'，未安装时静默跳过），
 让面板正文按 `visual-fill-column-width'（nil 时回退 `fill-column'）缩窄/居中。"
   (let ((mode (seshat-reader-translate--view-mode-function)))
     (condition-case nil
         (funcall mode)
       (error (text-mode))))
-  (setq-local truncate-lines nil)
-  (setq-local word-wrap t)
+  (if seshat-reader-panel-truncate-lines
+      (progn
+        ;; 不折行 + 允许横向滚动：长行超出面板宽度时可 hscroll（`scroll-left'
+        ;; / `C-x <' 可用），否则被截断的右半部分永远看不到。
+        (setq-local truncate-lines t)
+        (setq-local word-wrap nil)
+        (setq-local auto-hscroll-mode t))
+    (setq-local truncate-lines nil)
+    (setq-local word-wrap t))
   (setq-local buffer-read-only t)
-  (when (or (fboundp 'visual-fill-column-mode)
-            (require 'visual-fill-column nil t))
+  ;; 折行与 visual-fill-column 互斥：后者按列宽硬折行，与 truncate-lines 为 t
+  ;; 的横向滚动冲突，故不折行模式下整体跳过（不提示，属正常语义）。
+  (when (and (not seshat-reader-panel-truncate-lines)
+             (or (fboundp 'visual-fill-column-mode)
+                 (require 'visual-fill-column nil t)))
     ;; 启用时立即设 margin；关闭时仅当面板已显示（窗口可能残留旧 margin）
     ;; 才传 -1 清理——面板未显示时 selected-window 是阅读器窗口，传 -1 会
     ;; 误清它的 margin/fringe。

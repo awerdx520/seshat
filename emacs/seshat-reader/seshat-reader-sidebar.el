@@ -76,12 +76,14 @@
 ;;
 ;; **两类承载后端**：显示前经 `seshat-reader-panel-carrier' 与逐 kind 覆盖表
 ;; `seshat-reader-panel-carrier-alist' 解析承载方式后分派。child frame **打开
-;; 即固定尺寸**（父 frame 宽高之比 `seshat-reader-panel-width' / `-height'，
-;; 距右上边缘 `seshat-reader-panel-margin' 像素），覆盖在父 frame 右上角且
-;; **不参与窗口树**——显示 / 刷新 / 滚动都不改变阅读窗口尺寸，多面板经
-;; `--cf-position' 纵向堆叠；非图形环境（`display-graphic-p' 为 nil）强制回退
-;; 窗口承载。`seshat-reader-sidebar-quit' 按**承载单元**关闭：窗口走
-;; `delete-window'、child frame 走 `delete-frame'。
+;; 即固定尺寸**（宽为父 frame 宽的 `seshat-reader-panel-width'，高默认铺满父
+;; frame——见 `seshat-reader-panel-full-height'；距边缘
+;; `seshat-reader-panel-margin' 像素），按侧覆盖在父 frame 上（默认目录贴左、
+;; 译文/解释贴右，见 `seshat-reader-panel-position-alist'）且**不参与窗口树**
+;; ——显示 / 刷新 / 滚动都不改变阅读窗口尺寸，同侧多面板经 `--cf-position'
+;; 纵向堆叠；非图形环境（`display-graphic-p' 为 nil）强制回退窗口承载。
+;; `seshat-reader-sidebar-quit' 按**承载单元**关闭：窗口走 `delete-window'、
+;; child frame 走 `delete-frame'。
 ;;
 ;; 本文件是**本仓库自研扩展**：从上游 vendor 重拷 seshat-reader 时应保留本
 ;; 文件、不得覆盖（vendor 边界见同目录 VENDORED.md）。
@@ -204,17 +206,44 @@ side 模式下的宽度由 `seshat-reader-outline-sidebar-width' 决定；目录
   :type '(alist :key-type symbol :value-type symbol)
   :group 'seshat-reader-sidebar)
 
-(defcustom seshat-reader-panel-width 0.34
-  "面板承载为 child frame 时的宽度比例（占父 frame 像素宽）."
+(defcustom seshat-reader-panel-width 0.25
+  "面板承载为 child frame 时的宽度比例（占父 frame 像素宽）.
+默认与侧边栏宽度一致（约 1/4 屏宽）；调大时注意面板会遮挡更多正文。"
   :type 'number
   :group 'seshat-reader-sidebar)
 
 (defcustom seshat-reader-panel-height 0.45
   "面板承载为 child frame 时的高度比例（占父 frame 像素高）.
+仅在 `seshat-reader-panel-full-height' 为 nil 时生效；为 t（默认）时高度取
+「父 frame 像素高 − 2 × `seshat-reader-panel-margin'」，与本比例无关。
+
 面板尺寸**打开即固定、全程不 resize**：内容超出后在面板窗口内滚动，避免流式
 输出期间反复改变遮挡区域。"
   :type 'number
   :group 'seshat-reader-sidebar)
+
+(defcustom seshat-reader-panel-position-alist '((outline . left) (translate . right))
+  "各 kind 面板贴父 frame 的哪一侧：left 或 right.
+未命中的 kind 回落到 `seshat-reader-sidebar-position'（取其 left/right；
+该变量取 below-selected / at-bottom 等非左右值时按 right 处理）。"
+  :type '(alist :key-type symbol :value-type (choice (const left) (const right)))
+  :group 'seshat-reader)
+
+(defcustom seshat-reader-panel-full-height t
+  "面板是否占满父 frame 高度（上下各留 `seshat-reader-panel-margin'）.
+非 nil 时高度 = 父 frame 像素高 − 2×margin；同侧已有其它面板时按剩余空间分配
+（至少保留父 frame 高的 30%，不足则允许超出，极端情况记 tech-debt）。
+nil 时回落到 `seshat-reader-panel-height' 的比例。"
+  :type 'boolean
+  :group 'seshat-reader)
+
+(defcustom seshat-reader-panel-truncate-lines t
+  "面板正文是否不折行（nil 表示折行）.
+非 nil 时不折行、内容超过面板宽度可横向滚动（`truncate-lines' 为 t、`word-wrap'
+为 nil、`auto-hscroll-mode' 为 t）；同时禁用 `visual-fill-column-mode'——两者
+互斥，折行与横向滚动不能并存。nil 时保持原来的折行行为。"
+  :type 'boolean
+  :group 'seshat-reader)
 
 (defcustom seshat-reader-panel-margin 16
   "面板承载为 child frame 时距父 frame 右边缘与上边缘的像素间距."
@@ -684,56 +713,138 @@ slot 会被 `display-buffer-in-side-window' 拒绝而回落为普通窗口，此
 ;; 口并触发重新适配，观感就是「跳一下」。本节只提供**机制**（几何计算、创建、
 ;; 幂等复用、关闭），分派到本后端的逻辑由上层的 carrier 判断决定。
 
-(defun seshat-reader-sidebar--cf-size (parent kind)
-  "返回 KIND 面板在父 frame PARENT 下的应有尺寸，形式为像素 (WIDTH . HEIGHT).
-宽度 = `seshat-reader-panel-width' × PARENT 的像素宽，高度 =
-`seshat-reader-panel-height' × PARENT 的像素高，均四舍五入为整数像素。
+(defun seshat-reader-sidebar--cf-min-height (parent-height)
+  "返回面板高度下限：父 frame 像素高 PARENT-HEIGHT 的 30%（四舍五入，至少 1）.
+同侧已有面板把可用高度挤到不足本值时**允许超出**（面板之间宁可部分重叠也不
+缩成一条细缝）；极端情况（父 frame 极矮或同侧面板极多）记入 tech-debt。"
+  (max 1 (round (* parent-height 0.3))))
+
+(defun seshat-reader-sidebar--cf-size-for-side (parent kind existing)
+  "返回 KIND 面板的像素尺寸，计入同侧已占的 EXISTING 高度.
+形式为 (WIDTH . HEIGHT)：
+  WIDTH  = `seshat-reader-panel-width' × PARENT 像素宽（四舍五入）
+  HEIGHT = max(30% × PARENT 像素高,
+               (满高 ? PARENT 高 − 2×margin
+                     : `seshat-reader-panel-height' × PARENT 高)
+               − Σ(EXISTING 中每个高度 + margin))
+
+即满高（`seshat-reader-panel-full-height' 非 nil，默认）时面板上下各留一个
+`seshat-reader-panel-margin'、纵向铺满父 frame；同一侧已有其它面板时把它们占据
+的高度（含各自的 margin）从可用高度里扣掉，使同侧堆叠的面板互不遮挡。下限恒
+为父 frame 高的 30%：空间不足时不把面板压成细缝，允许超出（见
+`seshat-reader-sidebar--cf-min-height'）。
+
+EXISTING 是**同侧已存在面板的像素高度列表**（纯数据，便于 batch 下断言），
+非数值与非正项被跳过（调用方从 `frame-pixel-height' 取值，个别 frame 会得到
+nil）。
+
 PARENT 的像素尺寸取不到或非正（`frame-pixel-width' / `frame-pixel-height'
-返回 nil / 0，终端 frame 即如此）时返回 nil——调用方据此放弃创建 child
-frame 并回退窗口承载，而不是拿 nil 去算坐标。
+返回 nil / 0，终端 frame 即如此）时返回 nil——调用方据此放弃创建 child frame
+并回退窗口承载，而不是拿 nil 去算坐标。
 
 **面板尺寸固定、不做内容自适应**：内容长度差异极大（一行译文 vs 几十行解
 释），若按内容调高，面板每次刷新都会改变遮挡区域，正好制造本方案要消除的观感
 跳动；固定尺寸 + 面板窗口内部滚动可让遮挡区域全程恒定。
 
-KIND 目前不参与计算（比例由两个全局变量决定），保留该参数只为将来支持
-per-kind 比例时不必改调用点；故此处显式 `ignore' 它，避免字节编译器报「未使用
-的语汇参数」。"
+KIND 目前不参与计算（宽度比例与满高开关都是全局变量），保留该参数只为将来
+支持 per-kind 比例时不必改调用点；故此处显式 `ignore' 它，避免字节编译器报
+「未使用的语汇参数」。"
   (ignore kind)                         ; 见 docstring：仅为将来 per-kind 比例预留
   (let ((width (ignore-errors (frame-pixel-width parent)))
         (height (ignore-errors (frame-pixel-height parent))))
     (when (and (numberp width) (> width 0)
                (numberp height) (> height 0))
-      (cons (round (* width seshat-reader-panel-width))
-            (round (* height seshat-reader-panel-height))))))
+      (let* ((margin seshat-reader-panel-margin)
+             (used 0))
+        (dolist (other existing)
+          (when (and (numberp other) (> other 0))
+            (setq used (+ used other margin))))
+        (cons (round (* width seshat-reader-panel-width))
+              (max (seshat-reader-sidebar--cf-min-height height)
+                   (- (if seshat-reader-panel-full-height
+                          (- height (* 2 margin))
+                        (round (* height seshat-reader-panel-height)))
+                      used)))))))
 
-(defun seshat-reader-sidebar--cf-position (parent kind existing)
-  "返回 KIND 面板相对父 frame PARENT 左上角的像素位置，形式为 (LEFT . TOP).
-EXISTING 是**已存在面板的像素高度列表**（整数列表，不是 frame 对象——纯数据
-入参才能在无 GUI 的 batch 下断言）。计算公式：
+(defun seshat-reader-sidebar--cf-size (parent kind)
+  "返回 KIND 面板在父 frame PARENT 下的应有像素尺寸，形式为 (WIDTH . HEIGHT).
+本函数是 `seshat-reader-sidebar--cf-size-for-side' 的薄包装（EXISTING 传 nil），
+即「同侧还没有其它面板」时的尺寸；保留它只为不破坏既有调用点与测试。真正摆放
+面板的 `seshat-reader-sidebar--cf-place' 用带 EXISTING 的那个，故同侧多面板
+时尺寸会按剩余空间收缩。计算细节（满高、30% 下限、nil 语义）见
+`seshat-reader-sidebar--cf-size-for-side' 的 docstring。"
+  (seshat-reader-sidebar--cf-size-for-side parent kind nil))
 
-  LEFT = PARENT 像素宽 - 面板像素宽 - `seshat-reader-panel-margin'
-  TOP  = margin + Σ(EXISTING 中每个高度 + margin)
+(defun seshat-reader-sidebar--panel-side-for-kind (kind)
+  "返回 KIND 面板应贴的侧（left / right），见 `seshat-reader-panel-position-alist'.
+先查该 alist（命中且取值合法即为结果，默认「目录左、译文/解释右」）；未命中或
+取值非法时回落到 `seshat-reader-sidebar--position-for-kind'——其取 `left' 时
+得 `left'，其余（`right' 以及 `below-selected' / `at-bottom' 这类**非左右**
+的底部取值）一律按 `right' 处理。
 
-即所有面板都贴父 frame **右边缘**、从上往下纵向堆叠：最上面一个只留 margin
-作上边距，每多一个已存在面板就再下移「该面板高度 + margin」，故多个 kind 的
-面板（目录 + 译文）同时显示时**互不遮挡**——这是多面板共存的前提，否则后来者
-会完全盖住先来者。EXISTING 为 nil 时 TOP 就是 margin。
+child frame 是**覆盖式浮层**、不参与窗口树，故「底部模式」对它没有意义：非左右
+方位一律落在右侧，与既有行为（贴右上角）一致。未知 kind 也走回落分支。"
+  (let ((side (cdr (assq kind seshat-reader-panel-position-alist))))
+    (cond
+     ((memq side '(left right)) side)
+     ((eq (seshat-reader-sidebar--position-for-kind kind) 'left) 'left)
+     (t 'right))))
+
+(defun seshat-reader-sidebar--cf-position-for-side
+    (parent-width panel-width margin side existing)
+  "返回面板相对父 frame 左上角的像素位置 (LEFT . TOP).
+PARENT-WIDTH 为父 frame 像素宽、PANEL-WIDTH 为面板像素宽、MARGIN 为间距、
+SIDE 取 `left' / `right'、EXISTING 为**同侧**已存在面板的像素高度列表。
+计算公式：
+
+  left  → LEFT = MARGIN
+  right → LEFT = PARENT-WIDTH − PANEL-WIDTH − MARGIN
+  TOP   = MARGIN + Σ(EXISTING 中每个高度 + MARGIN)
+
+即面板贴父 frame 的**指定一侧**、从顶部往下依次堆叠：最上面一个只留 MARGIN
+作上边距，每多一个同侧已有面板就再下移「该面板高度 + MARGIN」，故同侧多个 kind
+的面板互不遮挡。EXISTING 为 nil 时 TOP 就是 MARGIN。
 
 EXISTING 中的非数值与非正项被跳过（不占位）：调用方从 `frame-pixel-height'
 取值，个别 frame 取不到时会得到 nil，不能让它把 TOP 算成 NaN。
 
-PARENT 尺寸异常或面板尺寸算不出（见 `seshat-reader-sidebar--cf-size'）时返回
-nil，调用方跳过定位、让 frame 停在创建时的默认位置。"
+参数异常（PARENT-WIDTH / PANEL-WIDTH 非正数或非数值、MARGIN 为负或非数值、
+SIDE 不是 `left' / `right'）时返回 nil，调用方跳过定位、让 frame 停在创建时的
+默认位置。"
+  (when (and (numberp parent-width) (> parent-width 0)
+             (numberp panel-width) (> panel-width 0)
+             (numberp margin) (>= margin 0)
+             (memq side '(left right)))
+    (let ((top margin))
+      (dolist (height existing)
+        (when (and (numberp height) (> height 0))
+          (setq top (+ top height margin))))
+      (cons (if (eq side 'left)
+                margin
+              (- parent-width panel-width margin))
+            top))))
+
+(defun seshat-reader-sidebar--cf-position (parent kind existing)
+  "返回 KIND 面板相对父 frame PARENT 左上角的像素位置，形式为 (LEFT . TOP).
+本函数是 `seshat-reader-sidebar--cf-position-for-side' 的薄包装：侧由
+`seshat-reader-sidebar--panel-side-for-kind' 解析（默认目录贴左、译文/解释贴
+右），面板宽由 `seshat-reader-sidebar--cf-size-for-side' 算出（与摆尺寸时同一
+公式，故位置与尺寸必然一致）。
+
+EXISTING 是**同侧已存在面板的像素高度列表**（整数列表，不是 frame 对象——纯
+数据入参才能在无 GUI 的 batch 下断言）；跨侧的已有面板不影响本侧坐标，过滤由
+调用方（`seshat-reader-sidebar--cf-place'）负责。EXISTING 为 nil 时 TOP 就是
+margin。
+
+PARENT 尺寸异常或面板尺寸算不出（见 `seshat-reader-sidebar--cf-size-for-side'）
+时返回 nil，调用方跳过定位、让 frame 停在创建时的默认位置。"
   (let ((parent-width (ignore-errors (frame-pixel-width parent)))
-        (size (seshat-reader-sidebar--cf-size parent kind)))
+        (size (seshat-reader-sidebar--cf-size-for-side parent kind existing)))
     (when (and (numberp parent-width) (> parent-width 0) size)
-      (let ((margin seshat-reader-panel-margin)
-            (top seshat-reader-panel-margin))
-        (dolist (height existing)
-          (when (and (numberp height) (> height 0))
-            (setq top (+ top height margin))))
-        (cons (- parent-width (car size) margin) top)))))
+      (seshat-reader-sidebar--cf-position-for-side
+       parent-width (car size) seshat-reader-panel-margin
+       (seshat-reader-sidebar--panel-side-for-kind kind)
+       existing))))
 
 (defun seshat-reader-sidebar--cf-parameters (parent kind)
   "构造 KIND 面板 child frame 的 frame parameters（alist，元素为 cons）.
@@ -832,8 +943,9 @@ buffer-local 变量，故同一 buffer 在别的窗口里显示时不受影响�
     window))
 
 (defun seshat-reader-sidebar--cf-place (frame kind)
-  "把已创建的 child frame FRAME 精确设置为 KIND 面板的像素尺寸与右上角位置.
-父 frame 取 FRAME 的 `parent-frame' frame parameter（由
+  "把已创建的 child frame FRAME 精确设置为 KIND 面板的像素尺寸与贴边位置.
+贴哪一侧由 `seshat-reader-sidebar--panel-side-for-kind' 解析（默认目录贴左、
+译文/解释贴右）；父 frame 取 FRAME 的 `parent-frame' frame parameter（由
 `seshat-reader-sidebar--cf-parameters' 设置）。
 
   ;; HACK: 为什么创建后还要再摆一次位置，而不是全靠 frame parameters：
@@ -843,17 +955,20 @@ buffer-local 变量，故同一 buffer 在别的窗口里显示时不受影响�
   ;; `set-frame-size' 的第三参数 PIXELWISE 非 nil 时宽高按**像素**解释，
   ;; `set-frame-position' 本身就是像素坐标。
 
-其它本包 child frame 的像素高度作为 EXISTING 传给
-`seshat-reader-sidebar--cf-position'，使多面板纵向堆叠不重叠；定位前先从列表
-里排除 FRAME 自身（它此刻已带 kind 参数、已在 `--cf-frames' 中）。
+尺寸与位置都走「带同侧已有面板」的 `seshat-reader-sidebar--cf-size-for-side'
+/ `seshat-reader-sidebar--cf-position'：EXISTING 只统计**与本 KIND 同侧**的
+其它本包面板像素高度（跨侧面板不影响本侧坐标，故先按
+`seshat-reader-panel-position-alist' 过滤），使同侧多面板纵向堆叠不重叠、且
+共享剩余高度；默认配置下目录在左、译文/解释在右，两侧各占满高度，互不干涉。
+定位前先从列表里排除 FRAME 自身（它此刻已带 kind 参数、已在 `--cf-frames' 中）。
 
 任一步失败静默跳过（尺寸与定位是「更好看」，不该让面板显示整体失败），返回
 FRAME。
 
 **防御**：FRAME 不带 `seshat-reader-panel-kind' 参数时直接返回 nil，不设
 mode-line、不定位——那说明拿到的不是本包 child frame（例如 `display-buffer' 未
-经 child frame 动作创建、或意外返回了父 frame 的窗口）；此时若继续跑，会把父
-frame 自己的窗口 mode-line 关掉、还会按面板尺寸重排父 frame，破坏主界面。
+经 child frame 动作创建、或意外返回了父 frame 的窗口）；此时若继续跑，会
+把父 frame 自己的窗口 mode-line 关掉、还会按面板尺寸重排父 frame，破坏主界面。
 
 最后一步顺手抑制该 frame 窗口的 mode-line
 （`seshat-reader-sidebar--cf-suppress-mode-line'：window parameter
@@ -861,16 +976,44 @@ frame 自己的窗口 mode-line 关掉、还会按面板尺寸重排父 frame，
 是因为复用路径也必经本函数，故两个路径都得到同样的面板外观且幂等。"
   (when (frame-parameter frame 'seshat-reader-panel-kind)
     (let* ((parent (frame-parameter frame 'parent-frame))
-           (size (and parent (seshat-reader-sidebar--cf-size parent kind)))
+           (side (seshat-reader-sidebar--panel-side-for-kind kind))
            (others (delq frame (seshat-reader-sidebar--cf-frames)))
-           (heights (mapcar (lambda (other)
-                              (ignore-errors (frame-pixel-height other)))
-                            others))
-           (position (and parent
+           ;; 只统计**同侧**的已有面板：跨侧面板不影响本侧坐标与可用高度。
+           (heights
+            (let (result)
+              (dolist (other others)
+                (when (eq (seshat-reader-sidebar--panel-side-for-kind
+                           (frame-parameter other 'seshat-reader-panel-kind))
+                          side)
+                  (push (ignore-errors (frame-pixel-height other)) result)))
+              (nreverse result)))
+           (size (and parent
+                      (seshat-reader-sidebar--cf-size-for-side
+                       parent kind heights)))
+           (position (and parent size
                           (seshat-reader-sidebar--cf-position
                            parent kind heights))))
       (when size
-        (ignore-errors (set-frame-size frame (car size) (cdr size) t)))
+        (ignore-errors (set-frame-size frame (car size) (cdr size) t))
+        ;; `set-frame-size' 的 PIXELWISE 尺寸是**文本区**尺寸，不含 internal
+        ;; border 与 fringe：实测 pgtk（internal-border 8）下 `frame-pixel-width'
+        ;; 读回值恒比请求值宽 32、高 16（2×internal-border 2×+ fringe 2×8），
+        ;; 且随请求值线性变化。故按实测差值再调一次，让**整框**像素尺寸精确
+        ;; 等于目标（否则面板会比「父 frame 宽 × 比例」宽 3%，贴边时外溢）。
+        ;; 只对真实图形 frame 校准：纯函数测试用替身符号承载 frame，`framep'
+        ;; 为 nil 时跳过，避免把 stub 的常量返回值当成真实读数。
+        (when (and (framep frame) (frame-live-p frame)
+                   (display-graphic-p frame))
+          (let ((actual-w (ignore-errors (frame-pixel-width frame)))
+                (actual-h (ignore-errors (frame-pixel-height frame))))
+            (when (and (numberp actual-w) (numberp actual-h)
+                       (or (/= actual-w (car size))
+                           (/= actual-h (cdr size))))
+              (ignore-errors
+                (set-frame-size frame
+                                (max 1 (+ (car size) (- (car size) actual-w)))
+                                (max 1 (+ (cdr size) (- (cdr size) actual-h)))
+                                t))))))
       (when position
         (ignore-errors (set-frame-position frame (car position)
                                            (cdr position))))
@@ -878,7 +1021,7 @@ frame 自己的窗口 mode-line 关掉、还会按面板尺寸重排父 frame，
       frame)))
 
 (defun seshat-reader-sidebar--cf-show (buffer kind &optional select)
-  "在选中 frame 的右上角以 child frame 覆盖显示 BUFFER，返回被显示的 window.
+  "在选中 frame 的指定侧以 child frame 覆盖显示 BUFFER，返回被显示的 window.
 返回 nil 表示**本环境无法用 child frame 承载**（选中 frame 不是图形 frame）或
 创建失败，调用方据此回退窗口承载。步骤：
 
