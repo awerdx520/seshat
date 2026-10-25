@@ -387,15 +387,21 @@ buffer（见 `seshat-reader-sidebar-buffer-p'）。")
 只是**包含**该片段的普通 buffer 被误判为目录面板。")
 
 (defvar seshat-reader-sidebar--last-kind nil
-  "最近一次经 `seshat-reader-sidebar-show' 显示的内容类型.
-取值为 `annotations'、`translate' 或 `outline'。
+  "最近一次写入的「重开候选」内容类型.
+取值为 `annotations'、`translate'、`outline' 或 `search'。
+由 `seshat-reader-sidebar--display' 在每次显示时写入，关闭全部面板时
+`seshat-reader-sidebar-toggle' 会把它覆盖成「最近**显示**的那个」kind
+（见 `seshat-reader-sidebar--recent-kinds' 与
+`seshat-reader-sidebar--recent-panel-buffer'），故它恒与
+`seshat-reader-sidebar--last-buffer' 成对。
 供 `seshat-reader-sidebar-toggle' 重新打开时恢复。译文/解释面板现在也经
 `seshat-reader-sidebar-show' 显示（`seshat-reader-translate--render-panel' 调用
 并传 kind 为 `translate'），故关闭译文面板后 toggle 可原样重开。")
 
 (defvar seshat-reader-sidebar--last-buffer nil
-  "最近一次显示的面板 buffer.
-供 `seshat-reader-sidebar-toggle' 重新打开时恢复。")
+  "最近一次写入的「重开候选」面板 buffer.
+与 `seshat-reader-sidebar--last-kind' 恒成对写入（关闭全部面板时取
+「最近**显示**的那个」）；供 `seshat-reader-sidebar-toggle' 重新打开时恢复。")
 
 (defvar seshat-reader-sidebar--last-buffers nil
   "**Per-kind** 最近显示的面板 buffer，形式为 alist（KIND -> buffer）.
@@ -404,6 +410,18 @@ buffer（见 `seshat-reader-sidebar-buffer-p'）。")
 板后再按 \\[seshat-reader-sidebar-toggle-outline] 恢复原目录 buffer）。与
 `seshat-reader-sidebar--last-buffer' 并存：后者是「最近一个面板」的全局记忆，
 本变量是**每个 kind 各自**的记忆。仅会话内记忆，不持久化。")
+
+(defvar seshat-reader-sidebar--recent-kinds nil
+  "面板 kind 的最近显示顺序，头部最新.
+由 `seshat-reader-sidebar--display' 在每次成功显示后更新（child frame 与窗口
+两条承载路径都经过该分派层，故只在这一处更新即可）；供
+`seshat-reader-sidebar-toggle' 关闭全部时挑选「重开哪一个」。
+只记 kind（不记 buffer），buffer 从 `seshat-reader-sidebar--last-buffers' 按
+kind 取。`outline' / `translate' / `outline' 这样交替显示后表里只有两个元素、
+头部是最后显示的那个——重复显示同一 kind 只把它提到头部，不留重复项。
+与「内部遍历顺序」无关：`seshat-reader-sidebar--panels' 的顺序是「窗口在前、
+child frame 在后」，用它挑「最近」会让 child frame 面板恒压过窗口面板，与用
+户实际最后显示的那个面板不一致。仅会话内记忆，不持久化。")
 
 (defvar seshat-reader-sidebar--state nil
   "Per-kind 面板**尺寸**记忆，形式为 alist（KIND -> (DIRECTION RATIO)）.
@@ -1434,6 +1452,12 @@ popper 的 `display-function'）只在极少数地方用到返回值，两种形
 `seshat-reader-sidebar--last-buffers'。**child frame 的 buffer 同样必须记**——
 否则关掉 frame 面板后没有任何重开依据。
 
+同时把 KIND 提到 `seshat-reader-sidebar--recent-kinds' 头部（先 `delq' 去重
+再 `cons'），即维护「最近**显示**顺序」。关闭全部面板时
+`seshat-reader-sidebar-toggle' 按这个顺序挑「重开哪一个」，而不是按
+`seshat-reader-sidebar--panels' 的遍历顺序——后者是内部结构顺序（窗口在前、
+child frame 在后），会让 child frame 面板恒压过窗口面板。
+
 SELECT 原样透传给选中的后端（`--cf-show' / `--display-window'），语义不变：
 非 nil 表示「面板内容已就绪，可以跟随光标」，是否真正移动光标仍由后端按
 `seshat-reader-sidebar-select-window' 决定。本层**不**按 KIND 猜测 SELECT。
@@ -1445,7 +1469,11 @@ SELECT 原样透传给选中的后端（`--cf-show' / `--display-window'），�
   (when kind
     (setq seshat-reader-sidebar--last-buffers
           (cons (cons kind buffer)
-                (assq-delete-all kind seshat-reader-sidebar--last-buffers))))
+                (assq-delete-all kind seshat-reader-sidebar--last-buffers)))
+    ;; 「最近」= 最近**显示**顺序：每次显示都把该 kind 提到头部；`delq' 先去掉
+    ;; 旧位置的同名项，故表内不会出现重复项。
+    (setq seshat-reader-sidebar--recent-kinds
+          (cons kind (delq kind seshat-reader-sidebar--recent-kinds))))
   (if (eq (seshat-reader-sidebar--carrier-for-kind kind) 'childframe)
       (or (seshat-reader-sidebar--cf-show buffer kind select)
           ;; child frame 建不出来（非图形 / 父 frame 异常 / 创建失败）→ 回退窗口承载
@@ -1667,6 +1695,39 @@ frame 上最后一个非 side 窗口，或者承载单元已被删除）。
             (seshat-reader-sidebar-show buffer kind t)
           (message "Seshat Reader sidebar: %s 面板还没有可恢复的内容" kind))))))
 
+(defun seshat-reader-sidebar--recent-panel-buffer (panels)
+  "在即将关闭的承载单元 PANELS 中按「最近**显示**顺序」挑出重开候选.
+返回形如 (KIND . BUFFER) 的配对，或 nil（无可用候选）。
+
+顺序取 `seshat-reader-sidebar--recent-kinds'（头部最新，由
+`seshat-reader-sidebar--display' 在每次显示后维护）；**只在该顺序里挑 PANELS
+中确实存在的 kind**——只有正在被关闭的面板才是「重开」的合理对象，历史 kind 的
+残留记忆不参与。对命中的 kind 取 buffer：先查
+`seshat-reader-sidebar--last-buffers' 的 per-kind 记忆，记忆缺失或其 buffer 已
+kill 时回落到 PANELS 里该 kind 的存活单元 buffer。**buffer 与 kind 恒成对**，
+调用方据此同时写 `--last-kind' 与 `--last-buffer'，不会因错配弹到错误一侧。
+
+`--recent-kinds' 为空（本会话没走过 `--display'、或状态被外部清空）、表内 kind
+都不在 PANELS 里、或命中的 kind 全无 live buffer 时返回 nil——调用方据此回退到
+「遍历 PANELS 取最后一项」的旧逻辑，保持兼容。"
+  (let ((panel-kinds nil)
+        (live (make-hash-table :test #'eq))
+        found)
+    (dolist (panel panels)
+      (let ((kind (seshat-reader-sidebar--unit-kind panel))
+            (buffer (seshat-reader-sidebar--unit-buffer panel)))
+        (unless (memq kind panel-kinds) (push kind panel-kinds))
+        (when (and (buffer-live-p buffer) (not (gethash kind live)))
+          (puthash kind buffer live))))
+    (dolist (kind seshat-reader-sidebar--recent-kinds)
+      (when (and (not found) (memq kind panel-kinds))
+        (let ((buffer (cdr (assq kind seshat-reader-sidebar--last-buffers))))
+          (unless (buffer-live-p buffer)
+            (setq buffer (gethash kind live)))
+          (when (buffer-live-p buffer)
+            (setq found (cons kind buffer))))))
+    found))
+
 (defun seshat-reader-sidebar-toggle (&optional kind)
   "开或关本包的信息面板.
 KIND 为 nil 时保持**全部开合**语义（向后兼容）：有本包面板（窗口或 child
@@ -1688,6 +1749,16 @@ per-kind 的 `--last-buffers'（只记 buffer 会让重开落到更早一次显�
 （`seshat-reader-sidebar--last-kind'）重新显示（经 `seshat-reader-sidebar-show'
 按 carrier 分派，childframe 后端会重开 child frame），若无可恢复的 buffer 则提
 示先打开批注列表或译文。
+
+「最近一个」= 最近**显示**的那个，不是内部遍历顺序：关闭前先
+`seshat-reader-sidebar--recent-panel-buffer' 在本批 PANELS 里按
+`seshat-reader-sidebar--recent-kinds'（`--display' 维护的显示顺序）挑出第一个
+仍有 live buffer 的 kind，用它覆盖遍历中写下的 buffer / kind。此前取的是
+`--panels' 遍历里的最后一个可写者，而该顺序是「窗口在前、child frame 在后」，
+于是同一次关合中 child frame 面板恒压过窗口面板，与「用户最后显示的那个」不一
+致。`--recent-kinds' 为空、表内 kind 都不在本批面板里、或全无 buffer 时**回退**
+到遍历结果（旧行为，兼容）。
+
 **不使用 `window-toggle-side-windows'**：
 它是 frame 级全量开关，会连带删除/恢复 eca-chat 与 which-key 的侧窗，跨包
 副作用不可接受；且它对 child frame 面板完全无效。"
@@ -1698,21 +1769,28 @@ per-kind 的 `--last-buffers'（只记 buffer 会让重开落到更早一次显�
       (if panels
           (progn
             (seshat-reader-sidebar--capture-state panels)
-            (dolist (panel panels)
-              (let ((buffer (seshat-reader-sidebar--unit-buffer panel)))
-                (when (buffer-live-p buffer)
-                  ;; BUFFER 与 KIND **必须成对**写入：重开时按
-                  ;; `seshat-reader-sidebar--last-kind' 决定弹在哪一侧，只记
-                  ;; BUFFER 会让它沿用更早一次 `--display' 留下的、与本 buffer
-                  ;; 不同 kind 的旧值，于是弹错位置（`M-o' 关掉多 kind 面板后
-                  ;; 再按一次即可复现）。多个面板时遍历中最后一个可写者胜出，
-                  ;; 即 `--panels' 顺序里的最后一项（窗口在前、child frame 在
-                  ;; 后）——与旧行为取「最后一个 panel 的 buffer」完全一致，只
-                  ;; 是补上了与之配对的 kind。
-                  (setq seshat-reader-sidebar--last-buffer buffer
-                        seshat-reader-sidebar--last-kind
-                        (seshat-reader-sidebar--unit-kind panel))))
-                (seshat-reader-sidebar--panel-close panel))
+            ;; 「最近」按**显示**顺序挑：必须在关闭之前取（此时
+            ;; `--last-buffers' 与 `--panels' 都还是关闭前的状态）。
+            (let ((recent (seshat-reader-sidebar--recent-panel-buffer panels)))
+              (dolist (panel panels)
+                (let ((buffer (seshat-reader-sidebar--unit-buffer panel)))
+                  (when (buffer-live-p buffer)
+                    ;; BUFFER 与 KIND **必须成对**写入：重开时按
+                    ;; `seshat-reader-sidebar--last-kind' 决定弹在哪一侧，只记
+                    ;; BUFFER 会让它沿用更早一次 `--display' 留下的、与本 buffer
+                    ;; 不同 kind 的旧值，于是弹错位置（`M-o' 关掉多 kind 面板后
+                    ;; 再按一次即可复现）。这里是**兜底**写入：`recent' 非 nil 时
+                    ;; 随后会被「最近显示的那个」覆盖。
+                    (setq seshat-reader-sidebar--last-buffer buffer
+                          seshat-reader-sidebar--last-kind
+                          (seshat-reader-sidebar--unit-kind panel))))
+                  (seshat-reader-sidebar--panel-close panel))
+              ;; 覆盖为「最近**显示**的那个」；`recent' 为 nil 表示没有显示顺序
+              ;; 可依（`--recent-kinds' 为空或表内 kind 全无 live buffer）→ 保持
+              ;; 遍历结果，兼容旧行为。
+              (when recent
+                (setq seshat-reader-sidebar--last-kind (car recent)
+                      seshat-reader-sidebar--last-buffer (cdr recent))))
             (message "Seshat Reader sidebar: 已关闭 %d 个面板"
                      (length panels)))
         (if (and (bufferp seshat-reader-sidebar--last-buffer)
@@ -1915,8 +1993,8 @@ redisplay 之外的安全阶段，`selected-window' / `selected-frame' 语义明
   ;; `C-c w'：面板宽度在常态与 `seshat-reader-sidebar-expanded-width'（0.75）
   ;; 之间切换。`C-c` + 单字母是用户保留前缀，本包只用到 `C-c C-x' 形态
   ;; （`C-c C-t/e/q/s/r/a/l/h`），`C-c w' 既不与它们重叠，也便于「w = width」
-  ;; 记忆；同一绑定还写在译文面板、批注列表、目录面板三个 keymap 上（见下），
-  ;; 故从哪个面板里按都生效。
+  ;; 记忆；同一绑定还写在译文面板、批注列表、目录面板、搜索结果侧栏四个 keymap
+  ;; 上（见下），故从哪个面板里按都生效。
   (define-key seshat-reader-mode-map (kbd "C-c w")
     #'seshat-reader-sidebar-toggle-width))
 
@@ -1934,6 +2012,11 @@ redisplay 之外的安全阶段，`selected-window' / `selected-frame' 语义明
     #'seshat-reader-sidebar-toggle-width))
 (with-eval-after-load 'seshat-reader-outline
   (define-key seshat-reader-outline-mode-map (kbd "C-c w")
+    #'seshat-reader-sidebar-toggle-width))
+;; 搜索结果侧栏也补上 `C-c w'（此前遗漏，从侧栏里按不到宽度切换）。侧栏在左侧、
+;; 与目录栏同为宽度语义，扩大/恢复的差量调整同样有效。
+(with-eval-after-load 'seshat-reader-search
+  (define-key seshat-reader-search--sidebar-map (kbd "C-c w")
     #'seshat-reader-sidebar-toggle-width))
 
 ;; 面板内的 `M-o'（**全部面板**开合）：与 `C-c w' 同一套注册方式，但覆盖**四个**

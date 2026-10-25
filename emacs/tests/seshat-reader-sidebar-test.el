@@ -2895,11 +2895,15 @@ kind 由 buffer 名推断；命令必须把 kind 交给 `--toggle-kind'（它按
 (ert-deftest seshat-reader-sidebar-test--toggle-close-records-paired-kind ()
   "关闭全部面板时 buffer 与 kind **成对**写入（此前只写 buffer）.
 构造两个不同 kind 的面板，并故意预置一个与最终胜出 buffer 不匹配的
-`--last-kind'——修复前它会被原样留下，重开就会按错的 kind 弹到错误的一侧。"
+`--last-kind'——修复前它会被原样留下，重开就会按错的 kind 弹到错误的一侧。
+`--recent-kinds' 绑成 nil：本用例验证的是「无显示顺序可依」时的兜底路径（遍历
+最后一个 panel），有显示顺序时的挑选由
+`seshat-reader-sidebar-test--toggle-close-picks-most-recent-kind' 覆盖。"
   (let* ((anno (get-buffer-create "*seshat-sidebar-test-paired-anno*"))
          (outline (get-buffer-create "*seshat-sidebar-test-paired-outline*"))
          (panels (list (cons 'annotations anno) (cons 'outline outline)))
          (seshat-reader-sidebar--last-buffer nil)
+         (seshat-reader-sidebar--recent-kinds nil)
          (seshat-reader-sidebar--last-kind 'annotations))
     (unwind-protect
         (cl-letf (((symbol-function 'seshat-reader-sidebar--panels)
@@ -2935,6 +2939,7 @@ kind 由 buffer 名推断；命令必须把 kind 交给 `--toggle-kind'（它按
          (panels (list (cons 'annotations anno) (cons 'outline outline)))
          ;; 先让 kind 记录停留在一个既不是最后一个 panel、也不是 buffer 的 kind 上
          (seshat-reader-sidebar--last-buffer nil)
+         (seshat-reader-sidebar--recent-kinds nil)
          (seshat-reader-sidebar--last-kind 'translate)
          (shown nil))
     (unwind-protect
@@ -3040,6 +3045,172 @@ kind 由 buffer 名推断；命令必须把 kind 交给 `--toggle-kind'（它按
     (seshat-reader--install-evil-bindings))
   (should (eq (lookup-key seshat-reader-mode-map (kbd "?"))
               #'seshat-reader-help)))
+
+;;; 重开按「最近**显示**顺序」（2026-10-26）
+
+;; 背景：`seshat-reader-sidebar-toggle' 关闭全部时，此前取 `--panels' 遍历中
+;; 最后一个可写者，而该顺序是「窗口在前、child frame 在后」——child frame 面板
+;; 因此恒压过窗口面板，与「用户最后显示的那个」不一致。修复后由
+;; `--recent-kinds'（`--display' 维护的显示顺序）决定，`--panels' 顺序只作兜底。
+
+(ert-deftest seshat-reader-sidebar-test--display-updates-recent-kinds ()
+  "`--display' 每次显示把 kind 提到 `--recent-kinds' 头部，且不留重复项."
+  (let* ((outline (get-buffer-create "*Outline of recent-kinds-test.pdf*"))
+         (translate (get-buffer-create "*seshat-sidebar-test-recent-tr*"))
+         (seshat-reader-sidebar--recent-kinds nil)
+         (seshat-reader-sidebar--last-buffers nil)
+         (seshat-reader-sidebar--last-kind nil)
+         (seshat-reader-sidebar--last-buffer nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'seshat-reader-sidebar--carrier-for-kind)
+                   (lambda (_kind) 'window))
+                  ((symbol-function 'seshat-reader-sidebar--display-window)
+                   (lambda (_buffer _kind &optional _select) 'fake-window))
+                  ((symbol-function 'seshat-reader-sidebar--cf-show)
+                   (lambda (&rest _) 'fake-frame-window)))
+          ;; ① 首次显示 → 表里只有它
+          (seshat-reader-sidebar--display outline 'outline)
+          (should (equal seshat-reader-sidebar--recent-kinds '(outline)))
+          ;; ② 显示另一个 kind → 它成为最新
+          (seshat-reader-sidebar--display translate 'translate)
+          (should (equal seshat-reader-sidebar--recent-kinds
+                         '(translate outline)))
+          ;; ③ 再次显示第一个 → 提到头部，且**没有重复项**
+          (seshat-reader-sidebar--display outline 'outline)
+          (should (equal seshat-reader-sidebar--recent-kinds
+                         '(outline translate)))
+          ;; ④ child frame 承载也必须记（记录在分派层，不在窗口后端里）
+          (cl-letf (((symbol-function 'seshat-reader-sidebar--carrier-for-kind)
+                     (lambda (_kind) 'childframe)))
+            (seshat-reader-sidebar--display translate 'translate))
+          (should (equal seshat-reader-sidebar--recent-kinds
+                         '(translate outline)))
+          (should (= 2 (length seshat-reader-sidebar--recent-kinds))))
+      (kill-buffer outline)
+      (kill-buffer translate))))
+
+(ert-deftest seshat-reader-sidebar-test--toggle-close-picks-most-recent-kind ()
+  "先 outline 后 translate（translate 更近）→ 关闭全部后重开 translate.
+`--panels' 顺序故意让 annotations 收尾（旧逻辑会选它），以区分「内部遍历顺序」
+与「最近显示顺序」。"
+  (let* ((anno (get-buffer-create "*seshat-sidebar-test-recent-anno*"))
+         (outline (get-buffer-create "*Outline of recent-toggle.pdf*"))
+         (translate (get-buffer-create "*seshat-sidebar-test-recent-panel*"))
+         (panels (list (cons 'outline outline)
+                       (cons 'translate translate)
+                       (cons 'annotations anno)))
+         (seshat-reader-sidebar--recent-kinds '(translate outline))
+         (seshat-reader-sidebar--last-buffers
+          (list (cons 'translate translate) (cons 'outline outline)))
+         (seshat-reader-sidebar--last-kind 'annotations)
+         (seshat-reader-sidebar--last-buffer anno))
+    (unwind-protect
+        (cl-letf (((symbol-function 'seshat-reader-sidebar--panels)
+                   (lambda () panels))
+                  ((symbol-function 'seshat-reader-sidebar--unit-kind)
+                   (lambda (panel) (car panel)))
+                  ((symbol-function 'seshat-reader-sidebar--unit-buffer)
+                   (lambda (panel) (cdr panel)))
+                  ((symbol-function 'seshat-reader-sidebar--panel-close)
+                   (lambda (_panel) nil))
+                  ((symbol-function 'message) (lambda (&rest _) nil)))
+          (seshat-reader-sidebar-toggle)
+          (should (eq seshat-reader-sidebar--last-kind 'translate))
+          (should (eq seshat-reader-sidebar--last-buffer translate)))
+      (kill-buffer anno)
+      (kill-buffer outline)
+      (kill-buffer translate))))
+
+(ert-deftest seshat-reader-sidebar-test--toggle-close-picks-most-recent-reversed ()
+  "反序：先 translate 后 outline（outline 更近）→ 关闭全部后重开 outline."
+  (let* ((anno (get-buffer-create "*seshat-sidebar-test-recent-anno2*"))
+         (outline (get-buffer-create "*Outline of recent-toggle2.pdf*"))
+         (translate (get-buffer-create "*seshat-sidebar-test-recent-panel2*"))
+         (panels (list (cons 'outline outline)
+                       (cons 'translate translate)
+                       (cons 'annotations anno)))
+         (seshat-reader-sidebar--recent-kinds '(outline translate))
+         (seshat-reader-sidebar--last-buffers
+          (list (cons 'translate translate) (cons 'outline outline)))
+         (seshat-reader-sidebar--last-kind 'annotations)
+         (seshat-reader-sidebar--last-buffer anno))
+    (unwind-protect
+        (cl-letf (((symbol-function 'seshat-reader-sidebar--panels)
+                   (lambda () panels))
+                  ((symbol-function 'seshat-reader-sidebar--unit-kind)
+                   (lambda (panel) (car panel)))
+                  ((symbol-function 'seshat-reader-sidebar--unit-buffer)
+                   (lambda (panel) (cdr panel)))
+                  ((symbol-function 'seshat-reader-sidebar--panel-close)
+                   (lambda (_panel) nil))
+                  ((symbol-function 'message) (lambda (&rest _) nil)))
+          (seshat-reader-sidebar-toggle)
+          (should (eq seshat-reader-sidebar--last-kind 'outline))
+          (should (eq seshat-reader-sidebar--last-buffer outline)))
+      (kill-buffer anno)
+      (kill-buffer outline)
+      (kill-buffer translate))))
+
+(ert-deftest seshat-reader-sidebar-test--toggle-close-skips-dead-recent-kind ()
+  "最近显示顺序里的 kind 若无 live buffer（且无承载单元）→ 跳过它，取下一个."
+  (let* ((outline (get-buffer-create "*Outline of recent-dead.pdf*"))
+         (dead (generate-new-buffer "*seshat-sidebar-test-recent-dead*"))
+         (panels (list (cons 'outline outline)))
+         (seshat-reader-sidebar--recent-kinds '(translate outline))
+         (seshat-reader-sidebar--last-buffers (list (cons 'translate dead)))
+         (seshat-reader-sidebar--last-kind nil)
+         (seshat-reader-sidebar--last-buffer nil))
+    (kill-buffer dead)
+    (unwind-protect
+        (cl-letf (((symbol-function 'seshat-reader-sidebar--panels)
+                   (lambda () panels))
+                  ((symbol-function 'seshat-reader-sidebar--unit-kind)
+                   (lambda (panel) (car panel)))
+                  ((symbol-function 'seshat-reader-sidebar--unit-buffer)
+                   (lambda (panel) (cdr panel)))
+                  ((symbol-function 'seshat-reader-sidebar--panel-close)
+                   (lambda (_panel) nil))
+                  ((symbol-function 'message) (lambda (&rest _) nil)))
+          (seshat-reader-sidebar-toggle)
+          ;; translate 的 buffer 已 kill 且没有 translate 承载单元 → 跳过
+          (should (eq seshat-reader-sidebar--last-kind 'outline))
+          (should (eq seshat-reader-sidebar--last-buffer outline)))
+      (when (buffer-live-p dead) (kill-buffer dead))
+      (kill-buffer outline))))
+
+(ert-deftest seshat-reader-sidebar-test--toggle-close-falls-back-without-recent ()
+  "`--recent-kinds' 为空时回退到「遍历 panels 取最后一个」，且 kind 与 buffer 成对."
+  (let* ((anno (get-buffer-create "*seshat-sidebar-test-fallback-anno*"))
+         (outline (get-buffer-create "*Outline of fallback.pdf*"))
+         (panels (list (cons 'annotations anno) (cons 'outline outline)))
+         (seshat-reader-sidebar--recent-kinds nil)
+         (seshat-reader-sidebar--last-buffers nil)
+         (seshat-reader-sidebar--last-kind nil)
+         (seshat-reader-sidebar--last-buffer nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'seshat-reader-sidebar--panels)
+                   (lambda () panels))
+                  ((symbol-function 'seshat-reader-sidebar--unit-kind)
+                   (lambda (panel) (car panel)))
+                  ((symbol-function 'seshat-reader-sidebar--unit-buffer)
+                   (lambda (panel) (cdr panel)))
+                  ((symbol-function 'seshat-reader-sidebar--panel-close)
+                   (lambda (_panel) nil))
+                  ((symbol-function 'message) (lambda (&rest _) nil)))
+          (seshat-reader-sidebar-toggle)
+          ;; 旧逻辑：遍历最后一项（outline）胜出，不报错
+          (should (eq seshat-reader-sidebar--last-kind 'outline))
+          (should (eq seshat-reader-sidebar--last-buffer outline))
+          ;; 不变量：kind 必须与 buffer 成对（不得留下与 buffer 无关的旧 kind）
+          (should (eq (car (rassq seshat-reader-sidebar--last-buffer panels))
+                      seshat-reader-sidebar--last-kind)))
+      (kill-buffer anno)
+      (kill-buffer outline))))
+
+(ert-deftest seshat-reader-sidebar-test--toggle-width-bound-in-search-sidebar ()
+  "搜索结果侧栏里按 `C-c w' 同样是 `seshat-reader-sidebar-toggle-width'."
+  (should (eq (lookup-key seshat-reader-search--sidebar-map (kbd "C-c w"))
+              #'seshat-reader-sidebar-toggle-width)))
 
 (provide 'seshat-reader-sidebar-test)
 ;;; seshat-reader-sidebar-test.el ends here
