@@ -702,7 +702,11 @@ location 含 `page:<n>' 时用 `seshat-reader-goto-page' 跳到该 1-based 页
   (let ((page (seshat-reader-annotation--page-from-location
                (plist-get parsed :location))))
     (when page
-      (seshat-reader-goto-page page))))
+      ;; P1：`seshat-reader-goto-page' → `seshat-reader--multipage-goto'，落点
+      ;; 恒为**页首**（页内像素偏移清零）；多页布局下一屏多页，回报页码让用户
+      ;; 知道跳到了哪一页。
+      (seshat-reader-goto-page page)
+      (message "Seshat Reader reference: 跳到第 %d 页" page))))
 
 (defun seshat-reader-reference--fetch-library (uid)
   "按需下载 UID 对应的书，返回本地绝对路径；失败时 `user-error'.

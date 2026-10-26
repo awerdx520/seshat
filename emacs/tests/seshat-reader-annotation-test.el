@@ -895,7 +895,7 @@ CELL 是一个 (LIST) 形态的 cons 表达式，`(car CELL)' 收集按调用顺
                   (lambda (page x0 y0 x1 y1)
                     (push (list 'add page x0 y0 x1 y1) (car ,var))
                     t))
-                 ((symbol-function 'seshat-reader-dyn--refresh-highlights)
+                 ((symbol-function 'seshat-reader--multipage-refresh-decorations)
                   (lambda () (push 'refresh (car ,var)) t)))
          ,@body))))
 
@@ -943,7 +943,7 @@ CELL 是一个 (LIST) 形态的 cons 表达式，`(car CELL)' 收集按调用顺
              (lambda () (error "Module function not available")))
             ((symbol-function 'seshat-reader-dyn--add-highlight)
              (lambda (&rest _) (error "Module function not available")))
-            ((symbol-function 'seshat-reader-dyn--refresh-highlights)
+            ((symbol-function 'seshat-reader--multipage-refresh-decorations)
              (lambda () (error "Module function not available"))))
     (should (= 0 (seshat-reader-annotation--apply-highlights
                   (list (list :id 1 :location "page:2;rect:1,2,3,4")))))))
@@ -959,7 +959,7 @@ CELL 是一个 (LIST) 形态的 cons 表达式，`(car CELL)' 收集按调用顺
                (lambda () nil))
               ((symbol-function 'seshat-reader-dyn--clear-highlights)
                (lambda () (error "Module function not available")))
-              ((symbol-function 'seshat-reader-dyn--refresh-highlights)
+              ((symbol-function 'seshat-reader--multipage-refresh-decorations)
                (lambda () (error "Module function not available")))
               ((symbol-function 'message)
                (lambda (format-string &rest args)

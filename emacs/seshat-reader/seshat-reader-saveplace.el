@@ -54,6 +54,10 @@ To be added to `save-place-after-find-file-hook'.  See also `seshat-reader--save
 
 Used for advice around `save-place-to-alist'.  See also
 `seshat-reader--saveplace-find-file'."
+  ;; P1：记录内容完全由 `seshat-reader-bookmark-make-record' 决定，即
+  ;; page / offset（页内像素偏移，取代单页时代的 vscroll）/ hscroll / scale /
+  ;; fit-mode；恢复走 `seshat-reader-bookmark-jump'，旧记录里的 `vscroll' 由
+  ;; `seshat-reader-bookmark--entry-offset' 迁移为页内偏移。
   (when-let* ((filename buffer-file-name)
 	      (bookmark-record (seshat-reader-bookmark-make-record))
 	      (bookmark (cons "seshat-reader-saveplace" bookmark-record)))

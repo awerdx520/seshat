@@ -119,7 +119,6 @@
 (declare-function seshat-reader-dyn--clear-highlights "seshat-render-core" ())
 (declare-function seshat-reader-dyn--add-decoration "seshat-render-core"
                   (page x0 y0 x1 y1 r g b alpha))
-(declare-function seshat-reader-dyn--refresh-highlights "seshat-render-core" ())
 ;; 侧栏片段取文用：两者都是 **0-based** 页号（与 `--search-page' 的 1-based
 ;; 相反），故调用处一律 `(1- page)' 换算，见 `seshat-reader-search--snippet'。
 (declare-function seshat-reader-dyn--lines-in-rect "seshat-render-core"
@@ -526,8 +525,9 @@ module may not be loaded at all, hence the `fboundp' guards and
         (seshat-reader-dyn--clear-highlights)
         (dolist (decoration (seshat-reader-search--active-decorations))
           (seshat-reader-search--feed-decoration decoration))
-        (when (fboundp 'seshat-reader-dyn--refresh-highlights)
-          (seshat-reader-dyn--refresh-highlights)))))))
+        ;; P1：装饰烘在渲染出来的位图里，最后一步是重渲染驻留页（而不是刷新
+        ;; 单页 overlay 的 `--refresh-highlights'）。
+        (seshat-reader--multipage-refresh-decorations))))))
 
 ;;;; 会话：显示与提示
 

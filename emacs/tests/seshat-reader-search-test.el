@@ -110,7 +110,7 @@
                   (push (list 'deco page x0 y0 x1 y1 r g b alpha)
                         seshat-reader-search-test--events)
                   t))
-               ((symbol-function 'seshat-reader-dyn--refresh-highlights)
+               ((symbol-function 'seshat-reader--multipage-refresh-decorations)
                 (lambda ()
                   (push 'refresh seshat-reader-search-test--events)
                   t))

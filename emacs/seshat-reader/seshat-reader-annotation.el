@@ -738,7 +738,6 @@ HTTP 非 2xx（如 401 鉴权失败、400 uid 非法、500 服务端错误）时
 (declare-function seshat-reader-dyn--add-stroke "seshat-render-core"
                   (page r g b alpha width points))
 (declare-function seshat-reader-dyn--clear-highlights "seshat-render-core" ())
-(declare-function seshat-reader-dyn--refresh-highlights "seshat-render-core" ())
 
 (defcustom seshat-reader-annotation-highlight-enabled t
   "是否把批注 location 中的 `rect:' 段绘制为页面高亮.
@@ -1374,8 +1373,9 @@ nil 时同样回落到缓存（`seshat-reader-annotation--cached-annotation-stro
 
 流程固定为 `seshat-reader-dyn--clear-highlights' → 逐条投喂（批注 rect 在前、
 闪现其次、第三方附加装饰再其次、ink 笔迹最后）→
-`seshat-reader-dyn--refresh-highlights'：全量重投、不做增量，避免 C 侧表与
-elisp 侧缓存在删除/离线同步后漂移。三次 C 调用都包在 `ignore-errors' 里
+`seshat-reader--multipage-refresh-decorations'：全量重投、不做增量，避免 C 侧
+表与 elisp 侧缓存在删除/离线同步后漂移（P1 起装饰是在渲染时烘进位图的，所以
+最后一步是重渲染驻留页，而不是刷新单页 overlay）。三次 C 调用都包在 `ignore-errors' 里
 （模块未加载、没有载入文档时不打断调用方）；elisp 侧的解析错误**不**吞掉。
 批注按 kind 走 `seshat-reader-annotation--feed-decoration'（highlight 走 5 参
 `--add-highlight'，细条走 9 参 `--add-decoration'）；笔迹走 7 参
@@ -1435,7 +1435,10 @@ y 向下，见 `docs/api.md' §4.5.1）。
                  (nth 0 stroke) (nth 1 stroke) (nth 2 stroke)
                  (nth 3 stroke) (nth 4 stroke) (nth 5 stroke) (nth 6 stroke))
           (setq failed (1+ failed)))))
-    (ignore-errors (seshat-reader-dyn--refresh-highlights))
+    ;; P1：装饰在渲染时烘进位图，C 侧表本身不再改变画面 —— 投喂完之后要
+    ;; 「清 spec 缓存 + 重渲染驻留页」，见
+    ;; `seshat-reader--multipage-refresh-decorations'。
+    (ignore-errors (seshat-reader--multipage-refresh-decorations))
     (when unavailable
       (seshat-reader-annotation--warn-highlight-unavailable))
     ;; 单条失败与「模块不可用」分开归因：默认只计数，见

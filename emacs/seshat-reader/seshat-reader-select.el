@@ -259,7 +259,6 @@ pending clear, leaving its flash rectangle on the page forever.")
 (declare-function seshat-reader-dyn--lines-in-rect "seshat-render-core"
                   (page x0 y0 x1 y1))
 (declare-function seshat-reader-dyn--clear-highlights "seshat-render-core" ())
-(declare-function seshat-reader-dyn--refresh-highlights "seshat-render-core" ())
 (declare-function seshat-reader-annotation--redraw-highlights
                   "seshat-reader-annotation" (&optional rects))
 
@@ -522,7 +521,8 @@ flash are fed through a single code path (and neither clobbers the
 other: a redraw always clears the C table first).
 
 When that function is not available, the flash is fed alone: clear,
-add every rectangle of `seshat-reader-select--flash-rects', refresh.
+add every rectangle of `seshat-reader-select--flash-rects', then re-render
+the resident pages so the baked-in decorations are redrawn.
 The C module may not be loaded at all, so every call is inside
 `ignore-errors' and guarded by `fboundp' — the flash is optional
 feedback and must never break text extraction."
@@ -537,8 +537,11 @@ feedback and must never break text extraction."
         (seshat-reader-dyn--add-highlight (nth 0 rect) (nth 1 rect)
                                           (nth 2 rect) (nth 3 rect)
                                           (nth 4 rect)))
-      (when (fboundp 'seshat-reader-dyn--refresh-highlights)
-        (seshat-reader-dyn--refresh-highlights))))))
+      ;; P1：装饰在渲染时**烘进位图**，C 侧那张表本身不再改变画面，故投喂完
+      ;; 之后要「清 spec 缓存 + 重渲染驻留页」（见
+      ;; `seshat-reader--multipage-refresh-decorations'），不再是刷新单页
+      ;; overlay 的 `--refresh-highlights'。
+      (seshat-reader--multipage-refresh-decorations)))))
 
 (defun seshat-reader-select--clear-flash (buffer)
   "Clear the flash of BUFFER and redraw the page highlights.
@@ -642,6 +645,28 @@ there and is passed through."
   (let ((scale (ignore-errors (seshat-reader-current-doc-scale-value window))))
     (and (numberp scale) (> scale 0) (float scale))))
 
+(defun seshat-reader-select-posn-page (posn &optional window)
+  "Return the 1-based page number POSN points into, or nil.
+
+POSN is a position list as returned by `event-start' or `event-end';
+WINDOW defaults to the window of POSN.
+
+The page is looked up from the **buffer position** of the event
+\(`posn-point') through `seshat-reader--multipage-page-at-pos', i.e. from the
+page row the click landed on, not from the page at the top of the viewport:
+the multi-page layout shows several pages at once, so the top page says
+nothing about which page a click belongs to.  The top page
+\(`seshat-reader-current-doc-pagenumber') is used as a fallback when the
+position cannot be mapped to a row — a click in the gap between two pages, a
+buffer whose rows are gone, or a batch frame without redisplay information.
+
+nil is returned when neither source yields a page number."
+  (let ((win (or window (posn-window posn))))
+    (when (windowp win)
+      (or (when (fboundp 'seshat-reader--multipage-page-at-pos)
+            (seshat-reader--multipage-page-at-pos (posn-point posn)))
+          (ignore-errors (seshat-reader-current-doc-pagenumber win))))))
+
 (defun seshat-reader-select-posn->page (posn &optional window)
   "Convert the mouse position POSN into page coordinates.
 POSN is a position list as returned by `event-start' or `event-end'.
@@ -661,7 +686,14 @@ already accounts for window scrolling and page centering), the
 frame scale from `frame-scale-factor' and the page scale from
 `seshat-reader-current-doc-scale-value'.  The result is valid only for an
 unrotated page and is meant to be passed, over the rectangle formed
-by two such positions, to `seshat-reader-dyn--text-in-rect'."
+by two such positions, to `seshat-reader-dyn--text-in-rect'.
+
+The result is **page-local**: `posn-object-x-y' reports the offset inside the
+image under the mouse, so the coordinates already belong to the page the click
+landed on, whatever page the viewport starts at.  The page that owns them is
+`seshat-reader-select-posn-page', which `seshat-reader-select-extract' uses to
+reject a drag that spans two pages (P1 shows several pages per screen, so a
+drag across a page boundary is a real case, not an edge case)."
   (let ((window (or window (posn-window posn))))
     (cond
      ((not (windowp window))
@@ -770,6 +802,13 @@ Return the extracted text, or nil when the two positions are not in
 the same window, when either of them cannot be converted to page
 coordinates, or when the corresponding rectangle contains no text.
 
+The two positions must belong to the **same page**: with the multi-page
+layout a drag can start on one page and end on the next, which cannot be
+mapped to one rectangle, so `user-error' is signalled with “暂不支持跨页选择”
+\(decision D7) instead of silently extracting half the selection.  The page of
+each position is `seshat-reader-select-posn-page', i.e. looked up from the row
+the event landed on.
+
 Besides reporting the text, the selection is recorded in
 `seshat-reader-select-last': the drag's bounding box under :rect and
 the per-line rectangles hugging the selected characters under :rects
@@ -783,13 +822,23 @@ box when there are none."
       nil)
      (t
       (let ((start-page (seshat-reader-select-posn->page start window))
-            (end-page (seshat-reader-select-posn->page end window)))
+            (end-page (seshat-reader-select-posn->page end window))
+            ;; 两端各落在哪一页（按 posn 的 buffer 位置反查，不是视口顶页）。
+            (start-page-number (seshat-reader-select-posn-page start window))
+            (end-page-number (seshat-reader-select-posn-page end window)))
+        (when (and start-page end-page
+                   start-page-number end-page-number
+                   (/= start-page-number end-page-number))
+          ;; 决策 D7：一屏多页之后「一次拖拽横跨两页」是常见操作，但把它映射
+          ;; 成「跨页文本」需要跨页排序与拼接，本批不做，明确拒绝而不是悄悄
+          ;; 只取一半。T9 再补实现。
+          (user-error "暂不支持跨页选择"))
         (when (and start-page end-page)
           (let* ((x0 (min (car start-page) (car end-page)))
                  (x1 (max (car start-page) (car end-page)))
                  (y0 (min (cdr start-page) (cdr end-page)))
                  (y1 (max (cdr start-page) (cdr end-page)))
-                 (page (1- (or (seshat-reader-current-doc-pagenumber window) 1)))
+                 (page (1- (or start-page-number end-page-number 1)))
                  ;; The four coordinates already come from (min ...) /
                  ;; (max ...) applied to float coordinates, so they are
                  ;; floats; the module function `seshat-reader-dyn--text-in-rect'
@@ -804,7 +853,8 @@ box when there are none."
                         ;; :page must be the 1-based page number reported by
                         ;; seshat-reader; the local `page' above is 0-based (for
                         ;; the module) and therefore must not be reused here.
-                        :page (seshat-reader-current-doc-pagenumber window)
+                        :page (or start-page-number
+                                  (seshat-reader-current-doc-pagenumber window))
                         :rect bbox
                         :rects rects
                         :file (buffer-file-name (window-buffer window))))
@@ -827,10 +877,13 @@ delegating to `mouse-drag-track', so that neither point nor mark is
 moved: `seshat-reader-mode' uses the cursor as the page border and it must
 not be placed outside of the page.
 
-When the drag starts, the window the drag started in is selected
-\(without being recorded in the window order) so that the C side,
-which resolves the current document through the selected window,
-addresses the document displayed in that window.
+The whole gesture runs with the **buffer** of the window the drag started in
+current, because the native text extraction resolves the document through the
+buffer-local `seshat-reader-current-doc-state-ptr'.  P1 changed this: the
+single-page code had to select that window, since the C side resolved the
+document through `(selected-window)'; selecting a window during a drag would
+now move point and disturb the pixel scroll position the viewport is sitting
+at, so the selected window, point and `window-start' are left untouched.
 
 When the button is released, the selection rectangle is converted
 to page coordinates and its text is reported by
@@ -841,33 +894,34 @@ to page coordinates and its text is reported by
          (end start)
          (moved nil)
          (finished nil))
-    ;; `seshat-reader-dyn--text-in-rect' resolves the current document through
-    ;; the *selected* window (C side uses `(selected-window)'), so make
-    ;; sure the window the drag started in is selected.  `norecord'
-    ;; avoids disturbing the `other-window' ordering.
-    (when (windowp window)
-      (select-window window 'norecord))
-    (let ((track-mouse t))
-      (while (not finished)
-        (let ((event (read-event)))
-          (cond
-           ((mouse-movement-p event)
-            (let ((posn (event-start event)))
-              (when (eq (posn-window posn) window)
-                (setq end posn
-                      moved t))))
-           ;; Release events come both as clicks (mouse-1, double-/triple-mouse-1) and as drags (drag-mouse-1); handling the latter here avoids relying on seshat-reader-mode-map's mouse-set-region remap to swallow it.
-           ((memq (car-safe event) '(mouse-1 double-mouse-1 triple-mouse-1 drag-mouse-1))
-            (let ((e (event-end event)))
-              (when (eq (posn-window e) window)
-                (setq end e)))
-            (setq finished t))
-           (t
-            (setq finished t)
-            (push event unread-command-events))))))
-    (if moved
-        (seshat-reader-select-extract start end)
-      nil)))
+    ;; 整段手势在**被拖窗口的 buffer** 里执行：C 侧的文本抽取按
+    ;; buffer-local 的 `seshat-reader-current-doc-state-ptr' 解析文档，故只需
+    ;; 当前 buffer 正确。不 `select-window'：那会移动 point 并打断像素滚动
+    ;; 停留的位置（见本函数 docstring）。
+    (with-current-buffer (if (windowp window)
+                             (window-buffer window)
+                           (current-buffer))
+      (let ((track-mouse t))
+        (while (not finished)
+          (let ((event (read-event)))
+            (cond
+             ((mouse-movement-p event)
+              (let ((posn (event-start event)))
+                (when (eq (posn-window posn) window)
+                  (setq end posn
+                        moved t))))
+             ;; Release events come both as clicks (mouse-1, double-/triple-mouse-1) and as drags (drag-mouse-1); handling the latter here avoids relying on seshat-reader-mode-map's mouse-set-region remap to swallow it.
+             ((memq (car-safe event) '(mouse-1 double-mouse-1 triple-mouse-1 drag-mouse-1))
+              (let ((e (event-end event)))
+                (when (eq (posn-window e) window)
+                  (setq end e)))
+              (setq finished t))
+             (t
+              (setq finished t)
+              (push event unread-command-events))))))
+      (if moved
+          (seshat-reader-select-extract start end)
+        nil))))
 
 (defun seshat-reader-select-describe-posn (event)
   "Report the raw and converted coordinates of the mouse EVENT.

@@ -1486,6 +1486,36 @@ without a row."
          page (seshat-reader--multipage-page-should-center-p page window)))
       spec)))
 
+(defun seshat-reader--multipage-refresh-decorations (&optional window)
+  "Re-render every resident page of WINDOW so its decorations are up to date.
+
+WINDOW defaults to the selected one and must be displaying the current
+buffer.  Every page row of the buffer (the viewport plus
+`seshat-reader--multipage-preload' pages on each side, see
+`seshat-reader--multipage-page-numbers') is rendered again through
+`seshat-reader--multipage-rerender-page', which drops the cached spec of the
+page first: no row is inserted or removed and no scale is touched.
+
+Why a re-render and not a repaint: since P1 the decorations (annotation
+rectangles, the selection flash, search hits and ink strokes) are **baked into
+the page bitmap while it is rendered**, so the C side table alone no longer
+changes what is on screen.  Feeding the table and calling the old
+`seshat-reader-dyn--refresh-highlights' repainted a single-page overlay that
+does not exist any more; the cached spec has to be dropped and the page drawn
+again instead.  See `VENDORED.md', decoration layer.
+
+Each page is rendered inside `ignore-errors': a decoration refresh is optional
+feedback and must never break the command that triggered it (a page that fails
+to render simply keeps the bitmap it had).  The number of pages that were
+re-rendered is returned."
+  (let ((win (or window (selected-window)))
+        (count 0))
+    (when (eq (window-buffer win) (current-buffer))
+      (dolist (page (seshat-reader--multipage-page-numbers))
+        (when (ignore-errors (seshat-reader--multipage-rerender-page page win))
+          (setq count (1+ count)))))
+    count))
+
 (defconst seshat-reader--refit-scale-tolerance 0.005
   "Largest difference between two scales that still counts as the same one.
 

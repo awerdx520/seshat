@@ -305,7 +305,7 @@ STUBS 中 FUNCTION 为 nil 的条目表示**临时取消定义**（模拟「旧�
          (cons 'seshat-reader-dyn--add-decoration
                (lambda (page x0 y0 x1 y1 r g b alpha)
                  (push (list 'deco page x0 y0 x1 y1 r g b alpha) (car cell)) t))
-         (cons 'seshat-reader-dyn--refresh-highlights
+         (cons 'seshat-reader--multipage-refresh-decorations
                (lambda () (push 'refresh (car cell)) t)))
    (if without-stroke
        (list (cons 'seshat-reader-dyn--add-stroke nil))
