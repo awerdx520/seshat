@@ -1295,13 +1295,16 @@ buffer themselves, which is why this is separate from
   (setq seshat-reader--pages nil
         seshat-reader--multipage-last-range nil))
 
-(defun seshat-reader--multipage-render-page (page)
+(defun seshat-reader--multipage-render-page (page &optional force)
   "Make sure PAGE has a row displaying its image spec and return the spec.
 
 PAGE is a 1-based page number.  A page without a row gets one built from
 `seshat-reader--page-spec', a page whose row exists but carries no spec gets
 the spec filled in, and an already rendered page is left alone, so calling
-this on every scroll step is cheap.
+this on every scroll step is cheap.  FORCE non-nil renders the page again
+even when its row already carries a spec, which is what a re-render at a new
+resolution needs: the row keeps the spec object it had, so without FORCE the
+early return would answer with the stale bitmap.
 
 The page is rendered at its target scale
 \(`seshat-reader--multipage-target-scale'), so a page that is scrolled into
@@ -1310,7 +1313,8 @@ afterwards.  Because the target scale needs the native size of the page,
 which is only known after the first render, the very first render of a page
 uses the base scale and the spec is then resized in place, without a second
 render."
-  (if (and (assq page seshat-reader--pages)
+  (if (and (not force)
+           (assq page seshat-reader--pages)
            (seshat-reader--multipage-page-spec page))
       (seshat-reader--multipage-page-spec page)
     (let* ((scale (seshat-reader--multipage-target-scale page))
@@ -1331,13 +1335,14 @@ render."
   "Render PAGE again at its target scale and update its row.
 
 PAGE is a 1-based page number and WINDOW defaults to the selected one.  The
-cached spec of the page is dropped first, so the rows of a page whose
-bitmap became invalid -- dark mode inverted the document, the page was
-rotated, the window was resized -- are rebuilt at the resolution the
-current geometry asks for.  Nothing is done for a page without a row."
+cached spec of the page is dropped first and the render is forced, so the
+rows of a page whose bitmap became invalid -- dark mode inverted the
+document, the page was rotated, the window was resized -- are rebuilt at the
+resolution the current geometry asks for.  Nothing is done for a page
+without a row."
   (when (assq page seshat-reader--pages)
     (seshat-reader--multipage-forget-specs page)
-    (let ((spec (seshat-reader--multipage-render-page page)))
+    (let ((spec (seshat-reader--multipage-render-page page t)))
       (when spec
         (seshat-reader--multipage-set-page-centered
          page (seshat-reader--multipage-page-should-center-p page window)))
@@ -2888,11 +2893,14 @@ painted into the bitmap by the native module consistent."
     (seshat-reader-dyn--doc-invert (if seshat-reader-dark-mode 1 0))
     (seshat-reader--redisplay-all-windows)))
 
-(defvar-local seshat-reader--presentation-fit-mode nil
-  "Fit mode the buffer had before `seshat-reader-presentation-mode' was entered.
+(defvar-local seshat-reader--presentation-state nil
+  "Zoom and fit mode the buffer had before presentation view was entered.
 
-Restored on exit, so leaving the presentation view returns to the zoom the
-reader was opened with instead of keeping the height fitting.")
+A cons (FIT-MODE . BASE-SCALE).  Both are restored on exit, so leaving the
+presentation view returns to the zoom the reader was opened with instead of
+keeping the height fitting: re-deriving the base scale from the current fit
+mode would keep the scale presentation view had set, because the reference
+page no longer has its original size by then.")
 
 (define-minor-mode seshat-reader-presentation-mode
   "Toggle presentation view for current seshat-reader document.
@@ -2900,23 +2908,29 @@ reader was opened with instead of keeping the height fitting.")
 Presentation view keeps the existing semantics: the mode line is hidden and
 every page is fitted to the window height.  In the multi-page layout that
 naturally means \"about one page per screen\", without a second layout of its
-own (decision 4).  The fit mode the buffer had is remembered and restored on
-exit, together with the mode line."
+own (decision 4).
+
+The fit mode and the base scale the buffer had are remembered on entry and
+restored on exit, together with the mode line, so leaving the presentation
+view puts the pages back where they were."
   :lighter ""
   (when (derived-mode-p 'seshat-reader-mode)
     (cond (seshat-reader-presentation-mode
-           (setq seshat-reader--presentation-fit-mode
-                 (seshat-reader--multipage-current-fit-mode))
+           (setq seshat-reader--presentation-state
+                 (cons (seshat-reader--multipage-current-fit-mode)
+                       (or seshat-reader--multipage-base-scale 1.0)))
 	   (setq-local mode-line-format nil)
 	   (seshat-reader-fit-to-height))
 	  (t
            (kill-local-variable 'mode-line-format)
-           (let ((mode (or seshat-reader--presentation-fit-mode
-                            (seshat-reader--window-fit-mode))))
-             (setq seshat-reader--multipage-fit-mode mode)
+           (let* ((state seshat-reader--presentation-state)
+                  (mode (or (car-safe state)
+                            (seshat-reader--window-fit-mode)))
+                  (scale (or (cdr-safe state)
+                             (seshat-reader--fit-scale))))
+             (setq seshat-reader--presentation-state nil)
              (set-window-parameter nil 'fit-mode mode)
-             (let ((scale (seshat-reader--fit-scale)))
-               (seshat-reader--multipage-set-scale scale 'fit mode)))))))
+             (seshat-reader--multipage-set-scale scale 'fit mode))))))
 
 ;;;###autoload
 (dolist (pattern seshat-reader-supported-formats)
