@@ -299,12 +299,6 @@ M12 把 M11 的「单个底部面板」升级为「左目录 / 右信息 / 中�
 - **buffer-local**：`--flash-timer` 与 `--flash-rects` **都是** buffer-local。两份文档几乎同时框选时，第二次 `cancel-timer` 只取消自己那份 timer，前一文档的闪现不会被「取消 + 遗留」——全局变量正是本补丁修掉的缺陷。
 - **与批注高亮的关系**：闪现**不受** `seshat-reader-annotation-highlight-enabled` 约束（它是框选的即时反馈，不是批注），时长由 `seshat-reader-select-flash-duration` 决定，`<= 0` 关闭。
 
-**跨页衔接**：
-
-- **buffer 结构**：`[strip 行]` + `[页面 image]`。strip 是上一页底部若干像素，由页面 image spec 上的 `:slice` 裁出——`:slice` 是 **`display` 属性的包装**（`(slice X Y W H)` 与 image 同处一份 `display` 规格），不是 image 关键字，故不能当作 image plist 的键使用。
-- **起点对齐**：`line-prefix` 必须由 **buffer 级 overlay** 承载（`seshat-reader--center-overlay` 覆盖整个可访问区）。若只用行内属性，strip 行与页面 image 行的前缀不一致，横向居中会差出一个前缀宽度（实测 84 px）。
-- **三态落点**：向下翻页 = 「上页末行可见 + 新页顶部紧接」；向上翻页 = 落到上一页底部；`fit-to-height` 等整页操作是第三态（整页适配，不叠加 strip 偏移）。三者分别处理，不共用同一 vscroll 公式。
-
 **防御上限**（针对不可信输入，全部在实现侧硬夹紧）：
 
 | 对象 | 上限 | 越界行为 |
@@ -336,6 +330,17 @@ M12 把 M11 的「单个底部面板」升级为「左目录 / 右信息 / 中�
 - **缓存上限 8 的理由**：spec 的 `:data` 是 PNM 字节的**一份 Lisp 堆副本**，C 侧 `CachedPage.img_data` 与 MuPDF image cache 各自另存——**一张页位图在内存里至少两份**。实测（72 dpi，612×792）单页 `:data` 1.42 MB，150 dpi 时 6.16 MB；`--page-spec-cache-limit` 因此固定为 8（`defvar`，不是 defcustom，不暴露给用户），使常驻增量落在 11–50 MB 量级而非无界。实测 20 页连测的 `VmRSS` 增量 ≈ 0.9 MB/页（首轮），这是 C 侧与 Lisp 侧叠加后的可观测值。
 - **边界（P0 明确不做）**：**不接入任何显示 / 滚动 / redisplay 路径**，只供显式调用与测量。同步阻塞主线程，实测 0.7–11 ms/页（72 dpi，与既有 `wait_for_cached_page` 同量级，见 `openspec/completed/2026-10-26-reader-multipage-p0-page-spec-api.md` 的「实测数据」）。另外**顺序扫超过 8 页时缓存命中率为 0**（上限 8 + 先进先出淘汰，第二轮开始前槽位已被后 8 页占满）——P1 的虚拟化必须让视口驻留页数 ≤ 上限，否则要先换淘汰策略。
 - **未改变的既有结构**：per-window 11 槽缓存、`--refresh-highlights` 的刷新范围、hscroll 的窗口级语义、多窗口各自的页号都**原样保留**；这些是多页布局落地时要处理的缺口，已登记在 `openspec/tech-debt.md`。
+
+## 多页连续布局（P1，2026-10-27）
+
+单页 overlay 模型已退役：elisp 侧**没有任何** `(window-parameter … 'overlay)` 读取点，C 侧仅保留 `--window-close`（释放 `EmacsWinState`）与 `--refresh-highlights`（兼容入口，elisp 已不再调用）。
+
+- **buffer 结构**：**每页一行**。行 = 引导空格（`display` 取 `(space :align-to (+ center (-0.5 . SPEC)))`，让页面在窗口里居中且随 redisplay 求值）+ 图像空格（`display` 取页面 image spec）+ 换行；页与页之间按 `seshat-reader-page-gap-lines`（默认 `0`）插入空行。页表 `seshat-reader--pages` 是升序 alist，元素 `(PAGE MARKER . SPEC)`，marker 指向**行首**（插入/删除页行时自动跟随，故页号永远由 marker 反查而不是由行号推算）。
+- **可见集与虚拟化**：驻留集 = 视口顶页 − `seshat-reader--multipage-preload` .. 视口底页 + 同值（默认 `2`）；越界页 recycle（删行 + 释放 spec），相邻一页保留 spec 缓存。spec 缓存 `seshat-reader--page-spec-cache` 上限 = `min 16 (2K+2)`（K = preload，下限 4），**视口外优先淘汰**；`--multipage-prefetch` 按滚动方向预热**一页**（只暖缓存、不插行）。内存：`--multipage-check-memory` 按 `:data` 长度 ×2 估算，超 `seshat-reader-multipage-memory-warning-mb`（默认 75）时每 buffer `message` 一次。
+- **页号派生**：`seshat-reader-current-doc-pagenumber` = **视口顶页**（`window-start` 经 `--multipage-page-at-pos` 反查页行），不再读窗口参数 `page`；`goto-page`（及 `n` / `p` / `M-<` / `M->` / 搜索跳转 / 引用跳转）= 把目标页行设为 `window-start` 并把 `window-vscroll` 归零，故整页跳转恒停在页首。
+- **滚动原语**：一页一行、行高 = 整页位图高，因此**内置行滚动等于翻页**。滚动由 `seshat-reader--multipage-scroll` 实现：「页内用 `window-vscroll` 的像素偏移，跨页时改 `set-window-start` 到相邻页行，余量成为新页的偏移」；步长 = `seshat-reader-scroll-step-pixels`（绝对像素，优先）或 `scroll-step-ratio`（默认 `0.15`）× `(window-body-height WIN t)`，再退回一行（`frame-char-height`）。首尾由「页内偏移夹到 `[0, 高−1]`」自然截止，每轮必前进一页，占位页（spec 为 nil）不会死循环。
+- **几何**：`base-scale` 由**打开文档那一页**的 native 尺寸锚定（`seshat-reader--multipage-reference-native`，reload / rotate 时清空），保证 `W` / `H` / `0` 的基准稳定。每页 target 由分模式表给出：`contain` = `min(base, 该页 width-fit)`、`width` = 该页 width-fit、`height` = 该页 height-fit（**不裁剪**，可横向滚动）、`manual` = base；`contain` / `width` 下任一可见页宽度 ≤ 窗口宽。refit 闸门 `seshat-reader--refit-scale-tolerance`（`0.005`）：已渲染 scale 与目标 scale 差小于该值即视为「已清晰」，避免反复重渲染。
+- **装饰刷新**：装饰（批注 rect、选区闪现、搜索命中、ink 笔迹）在**渲染时烘进位图**，所以「刷新高亮」= 清掉目标页的 spec 缓存并把**全部驻留页**重渲染一次（`seshat-reader--multipage-refresh-decorations`），不再走 C 侧 overlay 重绘入口。代价是每次刷新 O(驻留页) 次重渲染（实测 0.7–11 ms/页）。
 
 ## 搜索与 ink 渲染流程（2026-10-25）
 

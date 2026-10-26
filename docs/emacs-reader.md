@@ -1,6 +1,6 @@
 # Emacs 阅读器使用手册
 
-> 本文对应 M12 版本（2026-10-22），并在 2026-10-25 补入跨页文本搜索（`C-s`）与手写轨迹（`ink:`）显示。适用 Emacs 29.1 及以上，本仓库在 Emacs 31.1 实测。
+> 本文对应 **P1 多页连续布局**（2026-10-27，一屏多页 + 像素级滚动），此前补入的跨页文本搜索（`C-s`）、手写轨迹（`ink:`）、暗色配色预设仍然有效。适用 Emacs 29.1 及以上，本仓库在 Emacs 31.1 实测。
 
 Emacs 端文档阅读器（`emacs/seshat-reader/`）：MuPDF 负责栅格化、C 动态模块出图、elisp 负责版式与交互，并把**批注 / 译文 / 引用**接到 seshat 服务端。侧车（sidecar）性质——批注不写回 PDF 文件。上游来源、改名映射与本地改动见包内 [`VENDORED.md`](../emacs/seshat-reader/VENDORED.md)，展示层设计见 [`architecture.md`](architecture.md) 的「Emacs 阅读器：展示层与渲染层（M12）」节。
 
@@ -9,17 +9,17 @@ Emacs 端文档阅读器（`emacs/seshat-reader/`）：MuPDF 负责栅格化、C
 | 能力 | 入口 | 说明 |
 |---|---|---|
 | 打开文档 | `find-file` / `M-x seshat-reader-open-doc` | PDF/EPUB 等格式由 `auto-mode-alist` 关联到 `seshat-reader-mode` |
-| 逐页阅读 | `n` / `p` / `SPC` / `M-g g` | 翻页、滚动、跳页、缩放、旋转、适配、演示模式、暗色模式 |
+| 连续阅读 | `j` / `k` / `SPC` / `n` / `p` / `M-g g` | 像素级滚动（步长可配）、整页跳转（停在页首）、缩放、旋转、适配、演示模式、暗色模式 |
 | 目录导航 | `o`（开合） | 左侧目录面板：层级、页码、当前章高亮、TAB 折叠、`f` 单键跳转；再按一次 `o` 关闭 |
 | 框选取文 | 鼠标 `down-mouse-1` 拖拽 | 松手后取文本并闪现选区矩形 |
 | 批注 | `C-c C-a` / `C-c C-l` | 创建、列表开合（已显示则关）、跳页、删除、页面高亮刷新 |
 | 跨页文本搜索 | `C-s`（会话内 `n` / `p` / `RET` / `C-g`；左侧结果侧栏内 `RET` / `n` / `p` / `q`） | 整本扫描、跨页跳转与回绕、命中以橙色装饰投喂，同时列进左侧搜索结果侧栏 |
 | 手写轨迹显示 | 自动（`seshat-reader-annotation-ink-enabled`） | 把 Android 手写批注的 `ink:` 段渲染为页面笔迹（只显示，不输入） |
 | 翻译/解释 | `C-c C-t` / `C-c C-e` | 依赖 go-translate；结果显示在面板（或 posframe）。同一组键是**开合**，且与语境一一对应：面板里显示的就是**译文**时 `C-c C-t` 关闭、否则翻译并替换内容；显示的是**解释**时 `C-c C-e` 关闭、否则解释并替换内容（不抢光标） |
-| 跨页衔接 | `seshat-reader-page-join-lines` | 默认关闭的 opt-in 特性 |
+| 多页连续布局 | 自动（P1） | 一屏可见相邻两页、滚动连续跨页；页间空行由 `seshat-reader-page-gap-lines`（默认 `0`）控制 |
 | 引用闭环 | `C-c C-r` / `M-x org-store-link` | `seshat:` 链接、摘录写入、`:complete` 补全、`:export` 导出 |
 | 离线队列 | 自动 | 服务端不可用时本地暂存批注，恢复后自动同步 |
-| 位置记忆 | saveplace / bookmark | 按文件记住页码，重启 Emacs 后可回到原页 |
+| 位置记忆 | saveplace / bookmark | 按文件记住「页号 + 页内像素偏移 + 横向位置 + 缩放 + fit 模式」，重启 Emacs 后回到同一位置 |
 
 ## 2. 安装与加载
 
@@ -111,7 +111,7 @@ ETAF 渲染层是可选外部依赖：`Makefile` 先探测 `~/Workspace/emacs-ta
 |---|---|---|
 | `C-f` / `C-b` | 滚一屏（`seshat-reader-scroll-down-screen` / `-scroll-up-screen`） | 横向滚动（`seshat-reader-scroll-right` / `-scroll-left`） |
 | `g` / `gg` / `C-l` | `gg` 首页、`G` 末页、`C-l` 重渲染当前页；`g` 不绑 | `g` 重渲染当前页（上游行为）；无 `gg` / `G` / `C-l` |
-| `j` / `k` | 下/上滚一行，越界翻页 | 不绑 |
+| `j` / `k` | 按步长下/上滚动（默认约 1/7 屏，跨页连续） | 不绑 |
 | `h` / `l` | 横向左 / 右滚 | 不绑 |
 | `^` / `$` | 横向最左 / 最右 | 不绑 |
 
@@ -145,8 +145,8 @@ ETAF 渲染层是可选外部依赖：`Makefile` 先探测 `~/Workspace/emacs-ta
 | 操作 | 键位 | 备注 |
 |---|---|---|
 | 下一页 / 上一页 | `n` / `p` | 队列化命令，可连续快速按键 |
-| 下/上一行则越界翻页 | `j` / `k` | **vim 预设**新增；同一命令也绑在 `C-n` / `C-p`（remap 了 `next-line` / `previous-line`） |
-| 下/上滚一屏到底则翻页 | `SPC` / `DEL`、`S-SPC` | 步长 = 窗口正文高 − `seshat-reader-screen-context-lines` 行（默认 1，即留 1 行重叠） |
+| 按步长下/上滚动（连续跨页、不再翻页） | `j` / `k` | **vim 预设**新增；同一命令也绑在 `C-n` / `C-p`（remap 了 `next-line` / `previous-line`），滚轮每档也走它 |
+| 下/上滚一屏 | `SPC` / `DEL`、`S-SPC` | 步长 = 窗口文本区像素高 − `seshat-reader-screen-context-lines` 行（默认 1，即留 1 行重叠）；连续滚动，不再「到底翻页」 |
 | 下一屏 / 上一屏 | `C-v` / `M-v` | 屏幕级滚动，不翻页；步长同上 |
 | 滚一屏 / 横向滚动 | `C-f` / `C-b` | **语义随 `seshat-reader-keymap-preset` 变**：`vim` = 滚一屏；`emacs` = 横向滚动 |
 | 横向左 / 右滚 | `h` / `l` | **vim 预设** |
@@ -427,18 +427,24 @@ Emacs 端**只显示**手写（无笔事件、无压感，输入永远在 Androi
 - **引擎限制**：预设里必须有 `gt-chatgpt-engine`（如 `reader-explain`），否则 `user-error` 并提示改配置——**不做文本拼接降级**：youdao / google 这类纯翻译引擎没有对话语义，拼进去只会产出误导性答案。
 - **状态生命周期**：追问状态是面板 buffer 的 buffer-local plist（原文、首轮答案、语言对、kind、轮次），**新一次翻译 / 解释会重置**全部追问历史。
 
-## 7. 跨页衔接
+## 7. 多页连续布局（2026-10-27）
 
-`seshat-reader-page-join-lines` 控制当前页上方的衔接条高度，**单位是页面文本行高**（允许小数），翻页时在当前页 image 上方插入一行显示上一页底部，形成阅读上下文。
+P1 起阅读器不再「一次只显示一页 + 翻页」，而是把整本排成一条连续竖列：**一屏可以同时看到相邻两页**，滚动自然跨页，没有整页跳变。
 
-| 取值 | 行为 |
+| 项 | 行为 |
 |---|---|
-| `0`（**默认**） | 完全关闭，翻页行为与 M12 之前一致 |
-| `1` 或小数 | 插入对应高度的衔接条；改动在**下次翻页**生效 |
+| 一屏多页 | 视口里通常能看到 2~3 页（取决于窗口高与缩放）。页与页之间由 `seshat-reader-page-gap-lines`（默认 `0`）决定留不留空行：`0` = 紧贴，与 Android 连续滚动一致 |
+| 滚动 | 像素级、连续：`j` / `k`（及 `C-n` / `C-p`、remap 的 `next-line` / `previous-line`）与**滚轮每档**都按 `seshat-reader-scroll-step-ratio`（默认 `0.15` ≈ 1/7 屏）移动；`SPC` / `DEL`、`C-v` / `M-v` 滚一屏（= 窗口文本区高 − `seshat-reader-screen-context-lines` 行）。想要固定手感时用 `seshat-reader-scroll-step-pixels` 把步长钉成绝对像素 |
+| 滚轮 / 触控板 | 每档一步、双击 2 步、三击 3 步。由 `pixel-scroll-precision` 的命令 **remap** 到本 mode（`pixel-scroll-precision-mode` 是全局 minor mode，键表优先级高于本 mode 的局部键表，故用 remap 而非局部绑定） |
+| 整页跳转 | `n` / `p` / `M-<` / `M->` / `M-g g` **停在页首**（页内像素偏移归零），不继承上一页滚到一半的位置 |
+| 缩放 | `+` / `-`（`=` 同 `+`）= 当前**基准** × `seshat-reader-enlarge-factor`(1.25) / `seshat-reader-shrink-factor`(0.75)；`W` / `H` = 按**打开文档那一页**（基准页）的宽度 / 高度适配；`0` = 重新首屏适配（回到 `seshat-reader-default-fit` 的模式与比例）。缩放后同步重渲染，**首屏即清晰** |
+| 拖窗口 | 松手后**所有可见页**重新渲染到新分辨率（同步 refit，实测 0.7–11 ms/页）；拖动过程中只做几何缩放、不重渲染，避免卡顿 |
+| 页号 | 「当前页」= **视口顶页**；状态行 `[当前页/总页]` 同理 |
+| 横向滚动 | `S-<wheel-up>` / `S-<wheel-down>`、`C-a` / `C-e`（以及 emacs 预设的 `C-f` / `C-b`）。**只在页面宽于窗口时可用**（`W` 或手动放大到超宽时），且**整栏会一起平移**——见 §12 已知限制 |
 
-默认关闭的原因不是懒得开：strip 行插在 `point-min` 之前，破坏了页面 overlay 的几何假设（`--set-window-vscroll` 的上限与落点按「strip 高 + 图高」算，而页面 image 并不含 strip），`fit-to-height` 下任何正 vscroll 都会把页顶挤出窗口、造成裁切；缩放/旋转后缓存的上一页 spec 仍是旧尺寸，衔接条比例也会不匹配。详见 §12 与 [`../openspec/tech-debt.md`](../openspec/tech-debt.md)。
+**多窗口不再同步页码**：同一文档在两个窗口里各自有独立的滚动位置（页号从每个窗口自己的视口派生），这是 P1 的设计选择，不是回归；需要「两边看同一处」时各自 `M-g g` 跳同一页。
 
-衔接条高度还参与垂直滚动上限的计算：`seshat-reader--page-max-vscroll-pixels` 按「图高 + strip 高 − 窗口像素高」夹紧，而窗口尺寸变化时的 `seshat-reader--clamp-window-vscroll` 也走同一上限。因此 strip 开着时缩放或改变窗口尺寸不会把上一页条带挤出窗口（配合默认的 `seshat-reader-page-join-lines` = `0`，默认配置下这条路径不涉及 strip）。
+**位置记忆**：书签与 saveplace 保存的是「页号 + **页内像素偏移** + 横向位置 + 缩放 + fit 模式」。旧记录只有单页时代的 `vscroll`，读取时按「页号 + 该值近似为页内偏移」迁移；读不到就落到页首，不会报错。
 
 ## 8. 引用闭环
 
@@ -490,12 +496,12 @@ uid 形态本身**不可读**，可读性由 org 链接描述承担（`[[seshat:
 | 键位 | 命令 | 作用 |
 |---|---|---|
 | `n` / `p` | `seshat-reader-next-page` / `-previous-page` | 下/上一页 |
-| `j` / `k`（**vim 预设**） | `seshat-reader-scroll-down-or-next-page` / `-scroll-up-or-prev-page` | 下/上一行，越界翻页 |
+| `j` / `k`（**vim 预设**） | `seshat-reader-scroll-down-or-next-page` / `-scroll-up-or-prev-page` | 按 `scroll-step-ratio` / `scroll-step-pixels` 的**像素步长**下/上滚动（连续跨页，**不再翻页**） |
 | `C-n` / `C-p` | `seshat-reader-scroll-down-or-next-page` / `-scroll-up-or-prev-page` | 与 `j` / `k` 同一命令（同时 remap 了 `next-line` / `previous-line`） |
-| `SPC` | `seshat-reader-scroll-down-screen-or-next-page` | 下滚一屏，到底翻页 |
-| `DEL` / `S-SPC` | `seshat-reader-scroll-up-screen-or-prev-page` | 上滚一屏，到顶翻页 |
+| `SPC` | `seshat-reader-scroll-down-screen-or-next-page` | 下滚一屏（= 窗口文本区高 − `screen-context-lines` 行），连续滚动 |
+| `DEL` / `S-SPC` | `seshat-reader-scroll-up-screen-or-prev-page` | 上滚一屏，连续滚动 |
 | `C-v` / `M-v` | `seshat-reader-scroll-down-screen` / `-scroll-up-screen` | 下/上滚一屏，不翻页；步长 = `window-body-height` − `seshat-reader-screen-context-lines` 行 |
-| `<wheel-up>` / `<wheel-down>` | `seshat-reader-mwheel-scroll-up` / `-down` | 滚轮纵向 |
+| `<wheel-up>` / `<wheel-down>` | `seshat-reader-mwheel-scroll-up` / `-down` | 滚轮纵向：每档一步、双击 2 步、三击 3 步（`pixel-scroll-precision` 的命令由 remap 收到这里） |
 | `S-<wheel-up>` / `S-<wheel-down>` | `seshat-reader-mwheel-scroll-left` / `-right` | 滚轮横向 |
 | `C-f` / `C-b` | **vim 预设**：`seshat-reader-scroll-down-screen` / `-scroll-up-screen`（滚一屏）；**emacs 预设**：`seshat-reader-scroll-right` / `-scroll-left`（横向滚动） | 语义随 `seshat-reader-keymap-preset` 变，见「evil 与键位预设」 |
 | `h` / `l`（**vim 预设**） | `seshat-reader-scroll-left` / `-scroll-right` | 横向左/右滚 |
@@ -625,7 +631,9 @@ uid 形态本身**不可读**，可读性由 org 链接描述承担（`[[seshat:
 | `seshat-reader-enlarge-factor` | `1.25` | 放大倍率 |
 | `seshat-reader-shrink-factor` | `0.75` | 缩小倍率 |
 | `seshat-reader-default-fit` | `contain` | 新窗口 / 新文档的**初始适配模式**：`contain`（整页可见）/ `width`（填满宽度）/ `height`（填满高度）；`W` / `H` 只覆盖当前窗口且不跨会话；旧值 `seshat-reader-fit-to-width` / `-fit-to-height` 仍被接受（分别归一为 `width` / `contain`） |
-| `seshat-reader-page-join-lines` | `0` | 跨页衔接条高度（页面文本行高倍数），`0` 关闭 |
+| `seshat-reader-page-gap-lines` | `0` | 页间空行数（连续布局）：`0` = 相邻页紧贴 |
+| `seshat-reader-scroll-step-ratio` | `0.15` | 一次滚动步长 = 窗口文本区像素高 × 该比例（`j`/`k`、滚轮每档） |
+| `seshat-reader-scroll-step-pixels` | `nil` | 非 nil 时覆盖比例，步长钉死为绝对像素 |
 
 ### 批注 / 选区
 
@@ -794,7 +802,7 @@ uid 形态本身**不可读**，可读性由 org 链接描述承担（`[[seshat:
 
 **页面不居中 / 只显示页面一部分**
 
-M12 回归（strip 行破坏页面几何 + `--center-page` 在 `window-size-change-functions` 里拿到 frame 而非 window）已修。确认加载的是新代码：`(boundp 'seshat-reader--window-size-change)` 应为 `t`；再看 `seshat-reader-page-join-lines` 是否为 `0`（非 0 时 `fit-to-height` 下仍可能裁切，见 §12）。窗口尺寸变化后仍不居中，先 `g` 重渲染，再 `H` 重新适配。
+M12 回归（居中函数在 `window-size-change-functions` 里拿到 frame 而非 window）已在 P1 前修掉；P1 起窗口尺寸变化后**可见页会同步 refit**，不再有「先模糊后清晰」的等待。确认加载的是新代码：`(fboundp 'seshat-reader--multipage-refresh-decorations)` 应为 `t`（P1/T8 新增）。窗口尺寸变化后仍不居中或页面尺寸异常，先 `g` 重渲染，再按 `0` 重新首屏适配（`W` / `H` 只重置适配模式）。
 
 **框选没反应 / 建了批注但页面上没高亮**
 
@@ -858,12 +866,12 @@ evil 是 globalized minor mode，会在 mode body 之后重新启用自己，所
 1. **旋转页的高亮可能错位**：选区采集明确不支持旋转页，`rect` 是未旋转页面坐标而 C 侧按含 `rotate` 的 `ctm` 绘制，两者对同一 `rect` 解释不一致。
 2. **ink 笔迹只做了数值级坐标对照，未做真机肉眼确认**：ink 与 `rect:` 同为页面 pt、原点左上、y 向下，实测同一形状的差异行中心 `80.0` vs `80.0`，因此实现**不做 y 翻转**；但「同一形状在 Android 与 Emacs 上看起来一致」仍需真机对照（见 tech-debt）。另外单笔超过 1024 点会被截断为前 1024 点（不丢整笔），超长笔迹在页面上显示不完整。
 3. **颜色与 alpha 可配但只在 Lisp 侧**：颜色/透明度/细条粗细是 defcustom（见 §10），改配色后走 9 参 `--add-decoration`；C 侧编译期常量仅作默认值，不读用户配置。
-4. **多窗口下高亮刷新与 strip 缓存有局限**：`C-c C-h` 只重建当前窗口的 ±5 页缓存；strip 的上一页 spec 缓存是 buffer 级、按当前选中窗口记录页号。
+4. **装饰刷新只覆盖驻留页、多窗口不共享页码**：批注 / 搜索 / 选区的装饰是在渲染时烘进位图的，故刷新 = 清 spec 缓存 + 重渲染**当前 buffer 的驻留页**（视口 ± `seshat-reader--multipage-preload`）；不在驻留集里的页要等再次进入视口才更新。同一文档在多个窗口各自有独立滚动位置（P1 的设计选择）。
 5. **目录折叠符号不与 `TAB` 联动**：行模型的 `collapsed` 集合恒传 `nil`，`TAB` 折叠后符号仍停在 `▾`（折叠本身有效，只是符号不刷新）。
 6. **大纲页号乱序时当前章标记可能错**：`--current-path` 隐含「页号单调不减」的假设，乱序目录下标记会指错节点（跳转本身正确）。
 7. **面板高度只在新建窗口时生效**：改 `seshat-reader-sidebar-height` 不会让已显示面板重排；译文/解释重新执行即按内容自适应，批注列表需关闭再打开；per-kind 尺寸仅会话内记忆，重启 Emacs 回到默认值。
-8. **缩放/旋转后 strip 的上一页 spec 是旧尺寸**：不清空 `seshat-reader--page-image-specs`，衔接条比例与新页不匹配；设 `page-join-lines` 为 0 可规避。
-9. **`page-join-lines` 非 0 时 `fit-to-height` 可能裁切页面**：strip 插在 `point-min` 前破坏页面几何，这是默认值取 0 的原因。
+8. **横向滚动是整栏平移（已知缺陷）**：页面宽于窗口时，`S-<wheel>` / `C-a` / `C-e` 只平移整行的横向偏移，**页间空行、相邻页与图片的相对位置一起动**，看起来像「整条竖列被拖动」；按页独立横向对齐尚未实现（每页一张 spec、共享同一个 `window-hscroll`）。
+9. **跨页拖选暂不支持**：一次拖拽横跨两页时直接 `user-error`「暂不支持跨页选择」（首期决策 D7）——把这框映射成跨页文本需要跨页排序与拼接，尚未实现；需要跨页内容时请分两次框选，或用 `C-s` 搜索。
 10. **ETAF 只用内置双色板**：不读用户主题变量，切换明暗主题后需重新打开面板；终端 frame 下可能挂起。
 11. **批注列表全量渲染无虚拟化**：条目数很大（数百条以上）时首次渲染成本线性增长。
 12. **底部单窗口模式下批注与译文互斥**：`below-selected` / `at-bottom` 仍是单窗口「后显示者接管」（M11 语义，非缺陷）。
@@ -878,7 +886,7 @@ evil 是 globalized minor mode，会在 mode body 之后重新启用自己，所
 21. **反复缩放会让旧尺寸的位图滞留在 image cache**：cache 以 spec 内容（含 `:width` / `:height`）为键，改写尺寸后旧键条目到 `image-cache-eviction-delay`（默认 300s）才回收；拖分割线可在数秒内造出几十个 A4 级条目。已在改写前 `image-flush` 缓解，长时间拖拽的峰值内存仍缺真机观测（见 tech-debt「image cache 条目累积」）。
 22. **manual 窗口在极端情形下会多一次重渲染**：`--refit-window` 的清晰度闸（比较已渲染分辨率 `render-scale` 与目标 `scale`）写在 `unless manual` 守卫之外；manual 窗口正常不改 `scale`、两者恒相等故不触发，但若将来 manual 路径写入不同值，会出现一次隐蔽的额外重渲染（见 tech-debt「image cache 条目累积」的附记）。
 23. **居中机制两套并存**：页面能完整放下时由 redisplay 求值居中（`before-string` + `:align-to`）；页面比窗口宽时仍走旧的 `line-prefix` + 横向滚动，只能**左对齐**、不居中。两套机制由 `--center-page` 的几何判定选择，`--centered-p` 与它各有判据（见 tech-debt）。
-24. **跨页衔接 strip 与新的居中方式未验证**：strip 行靠 center overlay 的 `line-prefix` 获得缩进，而「页面放得下」的分支会主动清空该 prefix；`page-join-lines` 默认 `0`（关闭）因此默认配置不受影响，一旦开启 strip 可能比页面左移半个余量（见 tech-debt）。
+24. **没有异步渲染**：滚动进入尚未驻留的页时，该页在主线程上**同步**渲染（实测 0.7–11 ms/页），快速滚动或大页文档上会有可感停顿；预取只暖 1 页（滚动方向那一页）、且只暖缓存不插行。真正异步渲染未做。
 25. **首次打开的首帧位图是显示层缩放**：`--first-fit` 先把 image spec 改到最终几何（不重渲染），在 idle 重渲染前位图是插值放大的旧分辨率——表现为「尺寸一开始就正确、但略模糊，约 0.15 秒后转清晰」，不再有原先的「先小后大」两次变化。
 26. **`character` 粒度会撞 500 段锚上限**：逐字符矩形可达数千条，`--anchor` 按写入端上限只写前 500 段（并提示一次），页面下部因此**没有高亮**；批注本身仍可创建。`line` 粒度（默认）每页通常几十段，不受影响。解除条件见 tech-debt（先按行合并再写入，或提高上限并重估 64 KB location 长度）。
 27. **同一处多段高亮不会叠深**：装饰按颜色分组进同一 path 一次填充，因此多段重叠仍是一个透明度——这是有意的（避免出现深浅不匀的色块），不是渲染缺陷。
@@ -892,7 +900,7 @@ evil 是 globalized minor mode，会在 mode body 之后重新启用自己，所
 
 | 文件 | 职责 |
 |---|---|
-| `seshat-reader.el` | major mode、键位表、翻页/滚动/缩放/旋转/适配、页面 overlay 与几何、跨页 strip、C 模块加载与构建 |
+| `seshat-reader.el` | major mode、键位表、多页连续布局（页行 / 驻留集 / 像素滚动 / 逐页居中与缩放）、C 模块加载与构建 |
 | `seshat-reader-help.el` | `?` 帮助页：按运行时 keymap 解析键位、功能简介与面板行为（零依赖，autoload 懒加载） |
 | `seshat-reader-select.el` | 鼠标框选取文 + 选区闪现 |
 | `seshat-reader-annotation.el` | 批注 CRUD、`document_id` / `location` 解析、页面高亮投喂、批注列表 |

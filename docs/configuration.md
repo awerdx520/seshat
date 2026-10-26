@@ -288,13 +288,16 @@ Emacs 端通过 `seshat-reader-annotation` 采集 PDF 页面选区并同步为�
 - **面板默认承载改回 side window（2026-10-25）**：`seshat-reader-panel-carrier` 默认值由 `childframe` 改为 **`window`**，`seshat-reader-sidebar-width` 由 `0.24` 改为 `0.25`。**原因**：childframe 不在窗口树内，满高显示时无法避让 frame 底部的 minibuffer 与 `M-x` 补全列表（`*Completions*`），会盖住候选与回显——改用 side window 承载后它天然参与布局，满高也只挤压阅读区。**改后版式**：目录在左（`seshat-reader-outline-sidebar-position` 默认 `left`）、译文/解释在右（`seshat-reader-sidebar-position` 默认 `right`），两者都是满高 side window（贴边、纵向滚动，横向滚动由 `seshat-reader-panel-truncate-lines` 控制），minibuffer 与补全窗口始终可见。**代价**（已接受）：阅读区被挤占约 1/4 宽度，开关面板会触发页面重新适配（窗口尺寸变化 → 阅读器 refit）。**回退到浮层**：`(setq seshat-reader-panel-carrier 'childframe)`（并注意它无法避让底部 minibuffer）。
 - **已删除的变量（M12 T8a，2026-10-25）**：`seshat-reader-select-message-limit`（原「框选回显摘要上限 200 字符」的截断阈值）**已删除**——框选回显改为只报 `已复制 N 行 · M 字` / `已选中 N 行 · M 字`（取决于 `seshat-reader-select-copy-to-kill-ring`），不再回显正文。配置里残留的 `setq` 不报错但**不再有效**，删掉即可。
 
-### 阅读器版式、跨页衔接与批注高亮（M12）
+### 阅读器版式、连续布局与批注高亮（P1 起）
 
 > 客户端侧配置（分别由 `seshat-reader` / `seshat-reader-annotation` 读取），与服务端无关。版式类变量（`seshat-reader-sidebar-position` / `-width` / `seshat-reader-outline-sidebar-position` / `-width`）见上一节表格。
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `seshat-reader-page-join-lines` | `0` | 跨页衔接 strip 的高度，**单位是页面文本行高**（允许小数）。翻页时在当前页 image 上方插入一行显示上一页底部，形成阅读上下文；设 `0` 完全关闭，翻页行为与 M12 之前一致。改动在下次翻页生效。**默认关闭**：strip 行与页面 overlay 的几何存在已知冲突，开启后 `fit-to-height` 等整页操作可能裁切页面（见 `openspec/tech-debt.md`「跨页衔接（M12 strip）在 fit-to-height 下裁切页面」） |
+| `seshat-reader-page-gap-lines` | `0` | **页间空行数**（P1 连续布局）：`0` = 相邻页紧贴（与 Android 连续滚动一致），正整数则在上一页底部与下一页顶部之间留这么多空行。改动在下次重建版式（重开文档 / `g` / 改缩放）后生效 |
+| `seshat-reader-scroll-step-ratio` | `0.15` | **一次滚动步长** = 窗口文本区像素高 × 比例。`j` / `k`（以及 remap 的 `next-line` / `previous-line`、`C-n` / `C-p`）与滚轮每档都按它移动，默认约 1/7 屏；比例非正数、或取整后不足 1 像素时回退「一行」= `frame-char-height`（绝不出现「按了没反应」） |
+| `seshat-reader-scroll-step-pixels` | `nil` | 非 nil 时**覆盖**上面的比例，把步长钉死为绝对像素（不随窗口大小变化，适合想要固定手感的人）；非正数视同 `nil`，仍走比例 |
+| `seshat-reader-multipage-memory-warning-mb` | `75` | 驻留 spec 的**内存估算告警线**（MB）：按每份缓存 spec 的 `:data` 字符串长度 ×2 估算（Lisp 堆一份 + C 侧一份），超过时 `message` 一次（每个 buffer 只报一次，重载 / 清缓存后重新武装）；`nil` 关闭告警 |
 | `seshat-reader-annotation-highlight-enabled` | `t` | 是否把批注 `location` 的 `rect:` 段绘制为页面上的半透明高亮。`nil` 时只清空已有高亮并重绘（不添加矩形）；高亮由 C 渲染层绘制，与页面共用同一 `ctm`，故缩放/旋转自动对齐。改动后按 `C-c C-h` 立即刷新 |
 | `seshat-reader-annotation-ink-enabled` | `t` | 是否把批注 `location` 的 `ink:` 段绘制为页面手写笔迹（2026-10-25 起）。与 `annotation-highlight-enabled` **互相独立**：关掉它只影响 ink，rect 类装饰照常；ink 的坐标与 `rect:` 同 page space（页面 pt），不翻转 y。改动后按 `C-c C-h` 立即刷新 |
 | `seshat-reader-select-flash-duration` | `2.0` | 框选松手后闪现选区高亮的时长（秒），`<= 0` 关闭；不受 `annotation-highlight-enabled` 约束 |
@@ -302,6 +305,8 @@ Emacs 端通过 `seshat-reader-annotation` 采集 PDF 页面选区并同步为�
 | `seshat-reader-search-max-matches` | `20000` | 整次搜索保留的命中总数上限，达到即停止扫描并提示「命中过多」；`nil` 表示不限制（不推荐，可能占几十 MB） |
 | `seshat-reader-search-color` | `(1.0 0.45 0.0)` | 搜索命中的填充色 RGB（默认橙，与批注黄 / 下划线蓝可区分） |
 | `seshat-reader-search-alpha` | `0.55` | 搜索命中的填充透明度（比批注 highlight 的 `0.35` 更实，便于叠在已有高亮之上辨认） |
+
+> **已移除（2026-10-27）**：连续布局取代跨页 strip，`seshat-reader-page-join-lines` 不再存在。旧配置里的这一项会成为 free variable（`custom-set-variables` 里留着它不会报错，但**静默无效**），需从 `custom-set-variables` 中删除；同时把 `seshat-reader--page-join-pixels` 一类旧辅助函数的引用一并清掉（它们也已删除）。
 
 说明：
 
