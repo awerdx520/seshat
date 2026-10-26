@@ -1438,14 +1438,139 @@ jumping outside the resident set works, and the pages around it are pulled
 in afterwards by `seshat-reader--multipage-sync'.  The window is positioned
 again after the sync, because the sync inserts or recycles rows in front of
 the viewport: the markers follow the text, but a window start that sits at
-`point-min' would be left before the freshly inserted rows.  The buffer
-position of the row is returned."
+`point-min' would be left before the freshly inserted rows.
+
+The vertical scroll of the window is reset to 0, so a page jump always lands
+on the top of the page: the scrolling commands
+\(`seshat-reader--multipage-scroll') keep a pixel offset inside the page they
+show, and that offset would otherwise be inherited by the target page.  The
+buffer position of the row is returned."
   (let ((target (seshat-reader--multipage-clamp-page page)))
     (when target
       (seshat-reader--multipage-render-page target)
       (seshat-reader--multipage--show-page target)
       (seshat-reader--multipage-sync)
-      (seshat-reader--multipage--show-page target))))
+      (let ((pos (seshat-reader--multipage--show-page target)))
+        ;; 页内滚动偏移不得被目标页继承：整页跳转一律停在页首。
+        (when (eq (window-buffer (selected-window)) (current-buffer))
+          (set-window-vscroll (selected-window) 0 t))
+        pos))))
+
+(defun seshat-reader--multipage-page-pixel-height (page)
+  "Return the pixel height of the row of PAGE, or 0 when it has no image.
+
+PAGE is a 1-based page number.  A placeholder row (a page whose render failed)
+has no spec and therefore no height, which the scroll code treats as an empty
+page rather than dividing by an unknown."
+  (let ((spec (seshat-reader--multipage-page-spec page)))
+    (or (and spec (image-property spec :height)) 0)))
+
+(defun seshat-reader--multipage-page-gap-pixels ()
+  "Return the pixel height of the gap lines that follow a page row.
+
+The gap is `seshat-reader-page-gap-lines' empty lines, whose height is taken
+from `line-pixel-height' because an empty line has the frame's default line
+height.  The value is 0 — the default configuration — when the option is 0."
+  (let ((lines (max 0 seshat-reader-page-gap-lines)))
+    (if (> lines 0) (* lines (line-pixel-height)) 0)))
+
+(defun seshat-reader--multipage-page-span (page)
+  "Return the pixel distance from the top of PAGE's row to the next row.
+
+That is the page height plus the gap that follows it, floored at 1 so that the
+scrolling loop always advances: a page without a rendered spec has a span of
+0 pixels otherwise, and stepping through it would never move the target."
+  (max 1 (+ (seshat-reader--multipage-page-pixel-height page)
+            (seshat-reader--multipage-page-gap-pixels))))
+
+(defun seshat-reader--multipage-page-max-offset (page)
+  "Return the largest vertical scroll, in pixels, that PAGE allows.
+
+One pixel less than the page height, so the page never scrolls completely off
+the top of the window; 0 for a page without a rendered spec.  Clamping to this
+value is what stops the scroll loop when there is no page left to cross."
+  (max 0 (1- (seshat-reader--multipage-page-pixel-height page))))
+
+(defun seshat-reader--multipage-page-neighbour (page delta)
+  "Return the page DELTA pages away from PAGE, or nil when there is none.
+
+DELTA is -1 or 1.  The result is clamped to the document, so the caller can
+use a nil answer to stop scrolling at the first or the last page."
+  (let ((target (seshat-reader--multipage-clamp-page (+ page delta))))
+    (and target (/= target page) target)))
+
+(defun seshat-reader--multipage--scroll-to-page (window page)
+  "Put the row of PAGE at the top of WINDOW without touching its vscroll.
+
+PAGE is a 1-based page number and the row is rendered first when it is not
+resident yet, so scrolling into a page the resident set has not reached works.
+`seshat-reader--multipage-goto' is not used on purpose: it resets the vertical
+scroll, and the caller is about to set that scroll to the remainder of the
+scrolling distance.  The row position is returned, or nil when PAGE has no row."
+  (unless (assq page seshat-reader--pages)
+    (seshat-reader--multipage-render-page page))
+  (when-let* ((entry (assq page seshat-reader--pages))
+              (pos (marker-position (cadr entry))))
+    (set-window-start window pos)
+    (when (eq (window-buffer window) (current-buffer))
+      ;; 阅读 buffer 里 point 就是页面边框的落点，视口换页后要跟到页首。
+      (with-selected-window window (goto-char pos)))
+    pos))
+
+(defun seshat-reader--multipage-scroll (pixels &optional window)
+  "Scroll WINDOW vertically by PIXELS, continuing across page boundaries.
+
+WINDOW defaults to the selected window.  A positive PIXELS scrolls the view
+down (towards later pages), a negative one up.
+
+Every page is one buffer line whose height is the page image, so the built-in
+line scrolling (`scroll-up' / `scroll-down') jumps a whole page at a time and
+makes in-page scrolling impossible.  This function therefore moves the window
+in two steps: the vertical scroll of the window is used for the part of the
+distance that stays inside the current page, and when the distance leaves the
+page the window start is moved to the neighbouring page row and the remainder
+becomes the new vertical scroll.  That is what makes the scrolling continuous:
+reaching the bottom of a page continues into the next one instead of resetting.
+
+The vertical scroll is always pixelwise (Emacs measures `window-vscroll' in
+lines otherwise) and clamped to [0, height - 1] of the page at the top of the
+window, so a page can never be scrolled past its own end and the clamp — not
+the loop condition — is what stops at the first and the last page.  Every
+iteration advances the page, so a page without a spec cannot loop forever.
+The resident rows are synchronised afterwards, which pulls in the pages the
+new viewport asks for."
+  (let ((win (if (window-live-p window) window (selected-window))))
+    (when (and (eq (window-buffer win) (current-buffer))
+               seshat-reader--pages
+               (numberp pixels)
+               (/= pixels 0))
+      (let ((page (or (seshat-reader--multipage-page-at-pos (window-start win))
+                      (car (car seshat-reader--pages))))
+            (distance (+ (window-vscroll win t) pixels))
+            (moved nil))
+        (if (> pixels 0)
+            ;; 向下：跨越整页时把该页的行高（+页后 gap）从距离里扣掉
+            (while (and (>= distance (seshat-reader--multipage-page-span page))
+                        (seshat-reader--multipage-page-neighbour page 1))
+              (setq distance (- distance (seshat-reader--multipage-page-span page))
+                    page (1+ page)
+                    moved t)
+              (unless (assq page seshat-reader--pages)
+                (seshat-reader--multipage-render-page page)))
+          ;; 向上：对称，补上上一页的行高（+gap）后才成为该页的页内偏移
+          (while (and (< distance 0)
+                      (seshat-reader--multipage-page-neighbour page -1))
+            (setq page (1- page)
+                  moved t)
+            (unless (assq page seshat-reader--pages)
+              (seshat-reader--multipage-render-page page))
+            (setq distance (+ distance (seshat-reader--multipage-page-span page)))))
+        (when moved
+          (seshat-reader--multipage--scroll-to-page win page))
+        (set-window-vscroll
+         win (max 0 (min distance (seshat-reader--multipage-page-max-offset page))) t)
+        (seshat-reader--multipage-sync win)
+        (window-vscroll win t)))))
 
 (defun seshat-reader--multipage-window-start-page (&optional window)
   "Return the number of the page shown at the top of WINDOW.
@@ -2152,53 +2277,80 @@ windows from being refitted."
                     (buffer-name) err)))))))
 
 
-;; Scrolling is ordinary line scrolling now: a page is one buffer line whose
-;; height is the page image, so redisplay scrolls through it and the next page
-;; simply follows.  Nothing here turns a page, and nothing here touches the
-;; vertical scroll of the window directly -- the page rows carry the content
-;; and `set-window-start' is used for page jumps only.
+;; Scrolling is pixel based, not line based: a page is one buffer line whose
+;; height is the page image, so the built-in line scrolling (`scroll-up' /
+;; `scroll-down' / `scroll-up-command') jumps a whole page per call and leaves
+;; no way to scroll inside a page.  The commands below therefore ask
+;; `seshat-reader--multipage-scroll' for a pixel distance, which moves the
+;; window start to the neighbouring page row when the distance leaves the page
+;; and keeps the remainder as the window's pixel vertical scroll.  Nothing
+;; here turns a page: `n' / `p' stay on `seshat-reader--multipage-goto'.
+
+(defun seshat-reader--scroll-line-pixels ()
+  "Return the pixel height of one buffer line in the selected window.
+
+`line-pixel-height' measures the line at point, which is the page row the
+reader's point sits on.  A plain text line is used as the unit of a one-line
+scroll, exactly like the line scrolling this replaces."
+  (max 1 (line-pixel-height)))
+
+(defun seshat-reader--scroll-screen-pixels (&optional window)
+  "Return the pixel distance of one screen scroll of WINDOW.
+
+WINDOW defaults to the selected window.  The distance is the pixel body height
+of the window minus `next-screen-context-lines' lines, so a line of context
+stays visible; it is clamped to at least one pixel so that a tiny window still
+scrolls instead of doing nothing."
+  (let ((window (if (window-live-p window) window (selected-window))))
+    (max 1 (- (window-body-height window t)
+              (* (max 0 next-screen-context-lines)
+                 (seshat-reader--scroll-line-pixels))))))
 
 (defun seshat-reader-scroll-up (&optional amount)
   "Scroll the view upward by AMOUNT lines, one line by default.
 
-The text moves down and the content above comes into view.  The resident
-page rows are synchronised afterwards, so scrolling into a page that was
-not rendered yet renders it on the spot."
+The text moves down and the content above comes into view, one pixel line at a
+time and continuously across the page boundary: a page is one buffer line, so
+the built-in line scrolling would jump a whole page.
+`seshat-reader--multipage-scroll' moves the view instead and synchronises the
+resident page rows afterwards, so scrolling into a page that was not rendered
+yet renders it on the spot."
   (interactive "p")
-  (condition-case nil
-      (scroll-down (or amount 1))
-    ((beginning-of-buffer end-of-buffer) nil))
-  (seshat-reader--multipage-sync))
+  (seshat-reader--multipage-scroll
+   (- (* (or amount 1) (seshat-reader--scroll-line-pixels)))))
 
 (defun seshat-reader-scroll-down (&optional amount)
   "Scroll the view downward by AMOUNT lines, one line by default.
 
-The text moves up and the content below comes into view.  The resident page
-rows are synchronised afterwards, so scrolling into a page that was not
-rendered yet renders it on the spot."
+The text moves up and the content below comes into view, continuously across
+the page boundary, for the reason given in `seshat-reader-scroll-up'."
   (interactive "p")
-  (condition-case nil
-      (scroll-up (or amount 1))
-    ((beginning-of-buffer end-of-buffer) nil))
-  (seshat-reader--multipage-sync))
+  (seshat-reader--multipage-scroll
+   (* (or amount 1) (seshat-reader--scroll-line-pixels))))
 
 (defun seshat-reader-scroll-up-screen (&optional amount)
   "Scroll the view upward by one screen, or by AMOUNT lines.
 
-One screen is the window body height minus `next-screen-context-lines', so a
-line of context stays visible.  Switching pages stays on `n' / `p'."
+One screen is the pixel body height of the window minus
+`next-screen-context-lines' lines, so a line of context stays visible.
+Switching pages stays on `n' / `p'."
   (interactive "P")
-  (seshat-reader-scroll-up (or amount (- (window-body-height)
-					 next-screen-context-lines))))
+  (if amount
+      (seshat-reader-scroll-up amount)
+    (seshat-reader--multipage-scroll
+     (- (seshat-reader--scroll-screen-pixels)))))
 
 (defun seshat-reader-scroll-down-screen (&optional amount)
   "Scroll the view downward by one screen, or by AMOUNT lines.
 
-One screen is the window body height minus `next-screen-context-lines', so a
-line of context stays visible.  Switching pages stays on `n' / `p'."
+One screen is the pixel body height of the window minus
+`next-screen-context-lines' lines, so a line of context stays visible.
+Switching pages stays on `n' / `p'."
   (interactive "P")
-  (seshat-reader-scroll-down (or amount (- (window-body-height)
-					   next-screen-context-lines))))
+  (if amount
+      (seshat-reader-scroll-down amount)
+    (seshat-reader--multipage-scroll
+     (seshat-reader--scroll-screen-pixels))))
 
 (defun seshat-reader-scroll-left (&optional amount)
   "Scroll to the left of the current page by AMOUNT.

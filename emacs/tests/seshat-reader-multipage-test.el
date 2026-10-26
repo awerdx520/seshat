@@ -832,6 +832,344 @@ comes back at a different rotation."
                              (seshat-reader--multipage-native-size 1))))))
       (kill-buffer buffer))))
 
+;;;; T4-fix（像素级连续滚动）：一页一行的布局下 `scroll-up' 会整页跳，改为像素滚动
+
+;; 每个用例都把「窗口」桩成：页高 500px、行高 10px、窗口体高 800px，并用一层
+;; cl-letf 替掉 `window-start' / `set-window-start' / `window-vscroll' /
+;; `set-window-vscroll' / `line-pixel-height' / `--multipage-sync'，这样滚动结果
+;; （视口在第几页、页内偏移多少像素）可以精确断言，且不需要真实 redisplay。
+
+(defun seshat-reader-multipage-test--row-position (page)
+  "Return the buffer position of the row of PAGE in the current buffer."
+  (seshat-reader-multipage-test--row-start page))
+
+(defconst seshat-reader-multipage-test--scroll-line-height 10
+  "Stubbed pixel height of one buffer line in the scroll tests.")
+
+(defvar seshat-reader-multipage-test--scroll-offset 0
+  "Simulated pixel vertical scroll of the window in the scroll tests.")
+
+(defvar seshat-reader-multipage-test--scroll-start nil
+  "Simulated `window-start' of the window in the scroll tests.")
+
+(defvar seshat-reader-multipage-test--scroll-starts nil
+  "Positions `set-window-start' was called with, newest first.")
+
+(defvar seshat-reader-multipage-test--scroll-vscrolls nil
+  "Values `set-window-vscroll' was called with, newest first.")
+
+(defvar seshat-reader-multipage-test--scroll-syncs 0
+  "How many times `--multipage-sync' was called.")
+
+(defmacro seshat-reader-multipage-test--with-scroll-stubs (&rest body)
+  "Run BODY with a stubbed window: no redisplay, recorded scroll calls.
+
+The simulated window is described by the `--scroll-*' variables above; the
+macro records the calls instead of applying them, so a test can assert both
+\"which page the viewport moved to\" (via `set-window-start') and \"how many
+pixels inside that page\" (via `set-window-vscroll')."
+  (declare (indent 0) (debug t))
+  `(let ((seshat-reader-multipage-test--scroll-starts nil)
+         (seshat-reader-multipage-test--scroll-vscrolls nil)
+         (seshat-reader-multipage-test--scroll-syncs 0))
+     (cl-letf (((symbol-function 'window-start)
+                (lambda (&optional _window)
+                  seshat-reader-multipage-test--scroll-start))
+               ((symbol-function 'set-window-start)
+                (lambda (_window pos &optional _noforce)
+                  (push pos seshat-reader-multipage-test--scroll-starts)
+                  (setq seshat-reader-multipage-test--scroll-start pos)
+                  pos))
+               ((symbol-function 'window-vscroll)
+                (lambda (&optional _window _pixels-p)
+                  seshat-reader-multipage-test--scroll-offset))
+               ((symbol-function 'set-window-vscroll)
+                (lambda (_window value &optional _pixels-p)
+                  (push value seshat-reader-multipage-test--scroll-vscrolls)
+                  (setq seshat-reader-multipage-test--scroll-offset value)
+                  value))
+               ((symbol-function 'line-pixel-height)
+                (lambda () seshat-reader-multipage-test--scroll-line-height))
+               ((symbol-function 'seshat-reader--multipage-sync)
+                (lambda (&optional _window)
+                  (setq seshat-reader-multipage-test--scroll-syncs
+                        (1+ seshat-reader-multipage-test--scroll-syncs))
+                  nil)))
+       ,@body)))
+
+(defun seshat-reader-multipage-test--scroll-fixture (pages)
+  "Create a geometry buffer of PAGES 400x500 pages, ready for scrolling.
+
+The document page count is set to the number of pages so that
+`--multipage-page-neighbour' stops at the last page instead of clamping to a
+page number the document does not have."
+  (let* ((fixture (seshat-reader-multipage-test--geometry-buffer pages 400 500))
+         (buffer (car fixture)))
+    (with-current-buffer buffer
+      (setq-local seshat-reader-current-doc-pagecount (length pages)))
+    buffer))
+
+;;;; 用例
+
+(ert-deftest seshat-reader-multipage-test--geometry-scroll-down-stays-inside-page ()
+  "A scroll shorter than the rest of the page only moves the pixel offset.
+
+No page change means no `set-window-start': moving the window start would land
+the viewport on a line start, which cannot express \"half a page\"."
+  (let ((buffer (seshat-reader-multipage-test--scroll-fixture '(1 2))))
+    (unwind-protect
+        (seshat-reader-multipage-test--window-pixels 1000 800
+          (seshat-reader-multipage-test--with-window-buffer buffer
+            (with-current-buffer buffer
+              (setq seshat-reader-multipage-test--scroll-start
+                    (seshat-reader-multipage-test--row-position 1)
+                    seshat-reader-multipage-test--scroll-offset 100)
+              (seshat-reader-multipage-test--with-scroll-stubs
+                (should (= 130 (seshat-reader--multipage-scroll 30)))
+                (should (= 130 seshat-reader-multipage-test--scroll-offset))
+                (should-not seshat-reader-multipage-test--scroll-starts)
+                ;; 滚动后必须同步一次驻留页
+                (should (= 1 seshat-reader-multipage-test--scroll-syncs))))))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-scroll-down-crosses-one-page ()
+  "Scrolling past the bottom of a page moves the viewport to the next page row.
+
+The remainder of the distance becomes the pixel offset of the new page, which
+is what makes the transition continuous instead of a jump to the page top."
+  (let ((buffer (seshat-reader-multipage-test--scroll-fixture '(1 2))))
+    (unwind-protect
+        (seshat-reader-multipage-test--window-pixels 1000 800
+          (seshat-reader-multipage-test--with-window-buffer buffer
+            (with-current-buffer buffer
+              (setq seshat-reader-multipage-test--scroll-start
+                    (seshat-reader-multipage-test--row-position 1)
+                    seshat-reader-multipage-test--scroll-offset 450)
+              (seshat-reader-multipage-test--with-scroll-stubs
+                ;; 450 + 100 = 550 → 跨过 500px 的第 1 页，余 50px
+                (should (= 50 (seshat-reader--multipage-scroll 100)))
+                (should (= 50 seshat-reader-multipage-test--scroll-offset))
+                (should (equal (list (seshat-reader-multipage-test--row-position 2))
+                               seshat-reader-multipage-test--scroll-starts))
+                (should (= (seshat-reader-multipage-test--row-position 2)
+                           seshat-reader-multipage-test--scroll-start))))))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-scroll-down-crosses-two-pages ()
+  "A long scroll crosses several pages in one call, keeping the last remainder.
+
+1100px from 400px into page 1 lands 100px into page 3: the loop subtracts one
+page span per iteration instead of stopping at the first page change."
+  (let ((buffer (seshat-reader-multipage-test--scroll-fixture '(1 2 3))))
+    (unwind-protect
+        (seshat-reader-multipage-test--window-pixels 1000 800
+          (seshat-reader-multipage-test--with-window-buffer buffer
+            (with-current-buffer buffer
+              (setq seshat-reader-multipage-test--scroll-start
+                    (seshat-reader-multipage-test--row-position 1)
+                    seshat-reader-multipage-test--scroll-offset 400)
+              (seshat-reader-multipage-test--with-scroll-stubs
+                (should (= 100 (seshat-reader--multipage-scroll 700)))
+                (should (= 100 seshat-reader-multipage-test--scroll-offset))
+                (should (= (seshat-reader-multipage-test--row-position 3)
+                           seshat-reader-multipage-test--scroll-start))))))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-scroll-down-clamps-at-last-page ()
+  "Scrolling far past the last page clamps instead of walking off the document.
+
+The clamp is also what terminates the loop when there is no page left to
+cross: without it the target would keep growing and the scroll would show the
+blank space below the last page."
+  (let ((buffer (seshat-reader-multipage-test--scroll-fixture '(1 2))))
+    (unwind-protect
+        (seshat-reader-multipage-test--window-pixels 1000 800
+          (seshat-reader-multipage-test--with-window-buffer buffer
+            (with-current-buffer buffer
+              (setq seshat-reader-multipage-test--scroll-start
+                    (seshat-reader-multipage-test--row-position 2)
+                    seshat-reader-multipage-test--scroll-offset 450)
+              (seshat-reader-multipage-test--with-scroll-stubs
+                ;; 页高 500 → 页内最大偏移 499
+                (should (= 499 (seshat-reader--multipage-scroll 5000)))
+                (should (= 499 seshat-reader-multipage-test--scroll-offset))
+                (should (= (seshat-reader-multipage-test--row-position 2)
+                           seshat-reader-multipage-test--scroll-start))
+                (should-not seshat-reader-multipage-test--scroll-starts)
+                ;; 不越界：没有第 3 页行，也没有多出来的占位页
+                (should (equal '(1 2)
+                               (seshat-reader-multipage-test--page-numbers)))))))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-scroll-up-stays-inside-page ()
+  "A short upward scroll only reduces the pixel offset.
+
+The page does not change, so `set-window-start' stays untouched and the view
+does not snap to the page top."
+  (let ((buffer (seshat-reader-multipage-test--scroll-fixture '(1 2))))
+    (unwind-protect
+        (seshat-reader-multipage-test--window-pixels 1000 800
+          (seshat-reader-multipage-test--with-window-buffer buffer
+            (with-current-buffer buffer
+              (setq seshat-reader-multipage-test--scroll-start
+                    (seshat-reader-multipage-test--row-position 2)
+                    seshat-reader-multipage-test--scroll-offset 200)
+              (seshat-reader-multipage-test--with-scroll-stubs
+                (should (= 170 (seshat-reader--multipage-scroll -30)))
+                (should (= 170 seshat-reader-multipage-test--scroll-offset))
+                (should-not seshat-reader-multipage-test--scroll-starts)))))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-scroll-up-crosses-to-previous-page ()
+  "Scrolling above the top of a page lands inside the previous page.
+
+Going up by 60px from 10px into page 2 lands 450px into page 1 (500 - 50), not
+at the top of page 1: the distance crosses the page boundary by 50px and the
+remainder is measured from the *bottom* of the previous page."
+  (let ((buffer (seshat-reader-multipage-test--scroll-fixture '(1 2))))
+    (unwind-protect
+        (seshat-reader-multipage-test--window-pixels 1000 800
+          (seshat-reader-multipage-test--with-window-buffer buffer
+            (with-current-buffer buffer
+              (setq seshat-reader-multipage-test--scroll-start
+                    (seshat-reader-multipage-test--row-position 2)
+                    seshat-reader-multipage-test--scroll-offset 10)
+              (seshat-reader-multipage-test--with-scroll-stubs
+                (should (= 450 (seshat-reader--multipage-scroll -60)))
+                (should (= 450 seshat-reader-multipage-test--scroll-offset))
+                (should (equal (list (seshat-reader-multipage-test--row-position 1))
+                               seshat-reader-multipage-test--scroll-starts))
+                (should (= (seshat-reader-multipage-test--row-position 1)
+                           seshat-reader-multipage-test--scroll-start))))))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-scroll-up-clamps-at-first-page ()
+  "Scrolling above the first page clamps the offset at 0.
+
+There is no previous page row to move to, so the clamp — not a page change —
+stops the scroll; the viewport stays on page 1 with no pixel offset."
+  (let ((buffer (seshat-reader-multipage-test--scroll-fixture '(1 2))))
+    (unwind-protect
+        (seshat-reader-multipage-test--window-pixels 1000 800
+          (seshat-reader-multipage-test--with-window-buffer buffer
+            (with-current-buffer buffer
+              (setq seshat-reader-multipage-test--scroll-start
+                    (seshat-reader-multipage-test--row-position 1)
+                    seshat-reader-multipage-test--scroll-offset 10)
+              (seshat-reader-multipage-test--with-scroll-stubs
+                (should (= 0 (seshat-reader--multipage-scroll -100)))
+                (should (= 0 seshat-reader-multipage-test--scroll-offset))
+                (should-not seshat-reader-multipage-test--scroll-starts)))))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-screen-scroll-pixels ()
+  "One screen is the window body height minus the context lines, in pixels.
+
+`SPC' / `DEL' must scroll a screen, not a line and not a whole page: the
+distance is computed from the pixel body height so the reader never scrolls
+past more than one screen at a time."
+  (let ((buffer (seshat-reader-multipage-test--scroll-fixture '(1 2)))
+        (captured nil)
+        (next-screen-context-lines 1))
+    (unwind-protect
+        (seshat-reader-multipage-test--window-pixels 1000 800
+          (seshat-reader-multipage-test--with-window-buffer buffer
+            (with-current-buffer buffer
+              (cl-letf (((symbol-function 'line-pixel-height)
+                         (lambda () 10))
+                        ((symbol-function 'seshat-reader--multipage-scroll)
+                         (lambda (pixels &optional _window)
+                           (push pixels captured) pixels)))
+                (seshat-reader-scroll-down-screen)
+                (seshat-reader-scroll-up-screen)
+                ;; 800 - 1 * 10 = 790
+                (should (equal '(790 -790) (reverse captured)))
+                (should (= 790 (seshat-reader--scroll-screen-pixels
+                                (selected-window))))))))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-mwheel-scrolls-one-two-three-lines ()
+  "One wheel notch scrolls a line, a double or triple notch two or three.
+
+The wheel must not turn the page either: the notch count is converted to lines
+and then to pixels, and the sign follows the wheel direction."
+  (let ((buffer (seshat-reader-multipage-test--scroll-fixture '(1 2)))
+        (captured nil)
+        (window (selected-window)))
+    (unwind-protect
+        (seshat-reader-multipage-test--window-pixels 1000 800
+          (seshat-reader-multipage-test--with-window-buffer buffer
+            (with-current-buffer buffer
+              (cl-letf (((symbol-function 'line-pixel-height)
+                         (lambda () 10))
+                        ((symbol-function 'seshat-reader--multipage-scroll)
+                         (lambda (pixels &optional _window)
+                           (push pixels captured) pixels)))
+                (dolist (type '(wheel-down double-wheel-down triple-wheel-down))
+                  (seshat-reader--non-queue-mwheel-scroll-down
+                   (list type (list window 1 (list 1 1) nil 0))))
+                (dolist (type '(wheel-up double-wheel-up triple-wheel-up))
+                  (seshat-reader--non-queue-mwheel-scroll-up
+                   (list type (list window 1 (list 1 1) nil 0))))
+                (should (equal '(10 20 30 -10 -20 -30) (reverse captured)))))))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-goto-resets-vscroll ()
+  "A page jump lands on the top of the page, whatever offset was left.
+
+Scrolling leaves a pixel offset inside the page it shows; `n' / `p' / `M-g g'
+must not inherit it, otherwise jumping to a page would show it already
+scrolled by however far the previous page was scrolled."
+  (let ((buffer (seshat-reader-multipage-test--scroll-fixture '(1 2 3))))
+    (unwind-protect
+        (seshat-reader-multipage-test--window-pixels 1000 800
+          (seshat-reader-multipage-test--with-window-buffer buffer
+            (with-current-buffer buffer
+              (setq seshat-reader-multipage-test--scroll-start
+                    (seshat-reader-multipage-test--row-position 1)
+                    seshat-reader-multipage-test--scroll-offset 321)
+              (seshat-reader-multipage-test--with-scroll-stubs
+                (should (= (seshat-reader-multipage-test--row-position 3)
+                           (seshat-reader--multipage-goto 3)))
+                (should (= 0 seshat-reader-multipage-test--scroll-offset))
+                (should (equal '(0) seshat-reader-multipage-test--scroll-vscrolls))
+                (should (= (seshat-reader-multipage-test--row-position 3)
+                           seshat-reader-multipage-test--scroll-start))))))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-scroll-uses-pixel-vscroll ()
+  "Every vertical scroll is set in pixel mode, never in lines.
+
+`set-window-vscroll' measures lines unless the PIXELS argument is non-nil, so a
+scroll that forgot it would be applied on a completely different scale (a
+\"1\" would mean one whole line, i.e. a whole page here)."
+  (let ((buffer (seshat-reader-multipage-test--scroll-fixture '(1 2)))
+        (calls nil))
+    (unwind-protect
+        (seshat-reader-multipage-test--window-pixels 1000 800
+          (seshat-reader-multipage-test--with-window-buffer buffer
+            (with-current-buffer buffer
+              (setq seshat-reader-multipage-test--scroll-start
+                    (seshat-reader-multipage-test--row-position 1)
+                    seshat-reader-multipage-test--scroll-offset 0)
+              (cl-letf (((symbol-function 'window-start)
+                         (lambda (&optional _window)
+                           seshat-reader-multipage-test--scroll-start))
+                        ((symbol-function 'set-window-start)
+                         (lambda (&rest _args) nil))
+                        ((symbol-function 'window-vscroll)
+                         (lambda (&optional _window _pixels-p) 0))
+                        ((symbol-function 'set-window-vscroll)
+                         (lambda (_window value &optional pixels-p)
+                           (push (cons value pixels-p) calls)
+                           value))
+                        ((symbol-function 'line-pixel-height) (lambda () 10))
+                        ((symbol-function 'seshat-reader--multipage-sync)
+                         (lambda (&optional _window) nil)))
+                (seshat-reader--multipage-scroll 25))
+              (should (equal '((25 . t)) calls)))))
+      (kill-buffer buffer))))
+
 (provide 'seshat-reader-multipage-test)
 
 ;;; seshat-reader-multipage-test.el ends here
