@@ -933,6 +933,12 @@ is enough: `2 * preload + 2` -- 6 with the default preload of 2, which is the
 Two hard bounds apply on top: `seshat-reader--page-spec-cache-limit' (the knob
 P0 measured) and 16 (the ceiling registered in `decisions.md', because every
 entry pins a Lisp copy of the bitmap while the native module keeps its own).
+
+The 16 is a **historical** hard ceiling: since the preload is clamped to
+`seshat-reader--multipage-preload-max' (3, see m5 of the P1 review) the formula
+tops out at `2 * 3 + 2 = 8`, so 16 can never be the binding bound today.  It is
+kept as a guard for the day the preload ceiling is raised -- without it, a
+larger preload would silently multiply the pinned bitmaps.
 The smallest of the three wins, so a configuration that raises the preload
 cannot push the cache past what memory allows."
   (min 16

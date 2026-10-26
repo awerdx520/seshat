@@ -3,13 +3,13 @@
 > 已归档（2026-10-27）：T1–T10 全部完成；实现与偏差见文末「## 执行记录」。
 
 ## 当前状态
-- 阶段：Phase 4（Review & Document）· T1–T10 全部完成，待代码审查（code-reviewer）与最终提交
+
+- 阶段：**已完成并归档（2026-10-27）**：T1–T10 全部完成，code-reviewer 三轮结论「可合入」（0 blocking / 0 major，2 个 nit 已修）
 - 已确认：路线 3 ✅、缩放基准 A ✅、缩放公式分模式 ✅、计划 v3 终审 ✅、D3 修正为像素级滚动 ✅、滚动步长可配置 ✅、跨页选区首期禁用（D7）✅
-- 执行状态：批次 1–8 全部完成（commit `d7ef467` / `12d8911` / `4590f0b` / `19a5a91` / `80eb582` / `c6caf85` / `4751929` / `27bdbbe` / `78b273a` / `b82e03d` / `f83bb64` / `e27dd78` / `365198a` / `e2c6f02`）
-- 验证基线：`make -C emacs/seshat-reader clean all` EXIT 0、warning **24**（P0 基线 33 → T7 后 24，零新增）、checkdoc 0；`make -C emacs/tests ert` → **31 文件 / 1213 例 / 0 unexpected / 0 skipped**
-- 现象：多页连续像素级滚动 + 逐页居中 + 宽页裁剪 + `W`/`H`/`+`/`-`/`0` 缩放（首屏即清晰）+ 视口缓存/预取 + 选区页号反查 + 书签页内偏移
-- 下一步：code-reviewer 审查 → 修复 blocking → 归档本计划到 `openspec/completed/`
-- dark-mode 相关：存储粒度与配色预设由 `openspec/active/2026-10-27-reader-dark-tint-presets.md` 接管（D2 已定为 A（进程级，2026-10-27））；T4 的「反色后重渲染全部可见页」语义不变，但 T4 已落地的 dark-mode body 将是该计划的编辑点，两计划需串行合并。
+- 执行状态：批次 1–8 全部完成；代码审查修复轮（3 major：gap 滚动死区 / ERT 判据子串误匹配 / 多窗口缩放坐标）+ 2 nit 已修
+- 验证基线：`make -C emacs/seshat-reader clean all` EXIT 0、warning **24**、checkdoc 0；`make -C emacs/tests ert` → **31 文件 / 1219 例 / 0 unexpected / 0 skipped**；`make -C emacs/tests check-criteria` PASS
+- 剩余：**L3 真机十五项由用户最终确认**（清单见「## 验证标准 · L3」）；已知限制见 `openspec/tech-debt.md`「2026-10-27 阅读器多页布局（P1）遗留」
+- 提交区间：`d7ef467` … `05fdcf7`（详见各批次执行记录）
 
 ## 目标
 
@@ -288,3 +288,11 @@
 - **产出**：`docs/architecture.md`（多页布局整章）、`docs/emacs-reader.md`（键位语义 / 多窗口 / 跨页选区限制 / 已知限制）、`docs/configuration.md`（`page-gap-lines`、`scroll-step-ratio`、`scroll-step-pixels`、删除 `page-join-lines` 并给迁移说明）、`emacs/seshat-reader/VENDORED.md`、`CHANGELOG.md`（变更 + 破坏性）、`openspec/decisions.md`（P1 落地记录）、`openspec/tech-debt.md`（勾销失效条目 + 登记 P1 遗留）、`openspec/active/roadmap.md`（P1 ✅）；本计划归档到 `openspec/completed/`。
 - **验证（文档侧）**：`make -C emacs/seshat-reader clean all` EXIT 0、`make -C emacs/tests ert` 31 文件 / 1213 例 / 双零；文档中的命令与键位均可直接复制执行。
 - **遗留**：L3 真机全套项由用户在最终提交前确认（计划「验证标准」的 L3 十五项）。
+
+### 代码审查与修复（2026-10-27，commit `05fdcf7`）
+
+- code-reviewer 首轮：**无 blocking**、3 major（① `page-gap-lines>0` 时页底滚动死区——`max-offset` 不含 gap 而跨页判据含 gap，vscroll 被夹在上限与判据之间；② `emacs/tests/Makefile` 用 `grep "0 unexpected"` 判据，`10 unexpected` 会子串误匹配成假绿；③ 多窗口缩放后 `current-doc-scale-value` 读窗口参数 stale 镜像，选区坐标差一个缩放比）+ 3 minor（bookmark `fit-mode` 存而不读、preload 无上限、relayout 未清 modified）。
+- 修复：`max-offset = span - 1`（与跨页判据同源）；判据抽成 `emacs/tests/ert-judge.sh`（数值 `-eq 0` + `Ran [1-9]` + 无 skipped）并新增 `check-criteria` 自检（`10 unexpected` / `Ran 0 tests` / `skipped` 三例必须判失败）；`current-doc-scale-value` 优先 buffer-local `--multipage-base-scale`、set-scale 同步所有窗口镜像；bookmark 消费 `fit-mode`；preload 夹到 3（`--multipage-preload-max`）；relayout 补 `set-buffer-modified-p nil`。
+- 新增 6 例回归（gap 跨页 2、多窗口 scale 2、bookmark fit 模式 1、preload 夹紧 1），M1 变异自检 2/2 红。
+- code-reviewer 复核：**可合入**（0 blocking / 0 major / 2 nit，nit 已修）。
+- 最终基线：**31 文件 / 1219 例 / 0 unexpected / 0 skipped**；warning 24 零新增；checkdoc 0。
