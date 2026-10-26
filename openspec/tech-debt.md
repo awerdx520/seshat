@@ -1562,3 +1562,17 @@
   2. **表格宽度感知**：渲染前测最宽行（按 `window-text-pixel-size` 或字符宽度估算），超过面板可用宽时**临时不启用** valign，只对该份内容退回非对齐渲染。代价是同一面板内对齐策略不一致（有的表格对齐、有的不对齐），需要用户裁定「对齐 vs 完整可见」谁优先——这是产品取舍，不宜由实现单方面决定。
   3. **渲染侧重排**：对超宽表格做单元格换行（多行单元格），使表格永不溢出。属**渲染语义变更**（Markdown 表格从「一行一记录」变成可能多行），会影响复制/搜索/`valign` 自身行为，需单独立项评估。
 - 约束：**任何方案都不得改 `seshat-reader-panel-truncate-lines` 的默认值**——该默认值（`nil` = 折行）是 2026-10-25 按用户真实阅读习惯定的，为了迁就表格而改回不折行会让长段落阅读体验整体倒退。
+
+## 多页连续布局（路线 3）落地前必须处理（P0 后，2026-10-26）
+
+- 现状：P0 已交付「渲染任意页返回 image spec」的纯查询接口（C `seshat-reader-dyn--page-image-spec` + elisp `seshat-reader--page-spec`，见 `openspec/completed/2026-10-26-reader-multipage-p0-page-spec-api.md`），但**没有任何显示路径使用它**，既有的 per-window 缓存 / 刷新范围 / hscroll / 多窗口页号语义全部原样未动。下列 7 项在多页 buffer 连续布局（P1 起）落地前必须逐条处理：
+  1. **per-window 11 槽缓存无法表达多页**：`PAGE_CACHE_SIZE`（`render/render-core.h`）的键是「窗口 + 当前 scale/rotate」，**不含页号维度**，且 `resolution` / `rotate` 一变整窗失效。要在一个窗口同时持有 N 页，必须先把键扩成 `(page, resolution, rotate, decoration-version)` 并处理 `decoration-version` 变化时的批量失效。
+  2. **`--refresh-highlights` 只重建当前窗口 ±5 页**：多页布局下视口可跨更多页，装饰（批注 / 框选闪现 / 搜索命中 / ink）刷新范围必须按视口实际页数重算，否则刚滚入视口的页会显示旧装饰。
+  3. **hscroll 是窗口级**：整页横向滚动会让整栏（含相邻页）一起移动，宽页（如 A0 图纸）在多页布局下会把邻页推出视野。需改为按页对齐或按页单独横向偏移。
+  4. **多窗口「各看不同页」的能力将丢失**：路线 3 的决策是「页号由视口顶页派生」，不再用 window 参数 `page` 作真相来源；同一文档在两个窗口停在不同位置后，依赖 `page` 参数同步的功能（书签恢复、`--centered-p`、侧栏跳转回写）都要改成按窗口各自派生。
+  5. **整页位图约 2 MB/张（实测 72 dpi 1.42 MB、150 dpi 6.16 MB），`--page-spec` 缓存 8 条即 Lisp 堆 ~11–50 MB + C 侧同量级**：C 侧 `CachedPage.img_data` 与 MuPDF image cache 各自另存一份，所以「一张位图在内存里至少两份」。实测 20 页连测的 `VmRSS` 增量 ≈ 0.9 MB/页；且顺序访问超过缓存上限（8）时命中率**跌到 0**（先进先出淘汰）——P1 必须先定「视口驻留页数上限 + 淘汰策略」，再谈上限值。
+  6. **`snapshot_page_decorations` 与 `submit_render_job` 渲染路径重复未合并**：P0 新增的静态 `snapshot_page_decorations`（`render/render-core.c`）与 `render/render-threads.c` 的 `submit_render_job` 内联的装饰快照逻辑**语义等价但是两份代码**（deep copy 规则、`pts` 逐条拷贝、失败降级策略），任一处修改都会让「屏幕上的位图」与「`--page-spec` 返回的位图」装饰不一致。合并时必须保证 `free_draw_thread_args` 仍是 worker 路径的唯一释放漏斗。
+  7. **batch 下第二次渲染撞 `image-flush`**：`emacs --batch` 里连续多次渲染/写 overlay `display` 时 C 侧 `image-flush` 抛 `Window system frame should be used`，因此 P0 的 ERT 夹具必须 `(fset 'image-flush #'ignore)`。**GUI 侧未验证**是否有图像库警告或缓存行为差异——若 GUI 下 `image-flush` 被反复调用（例如每页替换 spec），可能有性能影响，需在 P1 的 GUI 冒烟里观察。
+- 影响：①②③ 是布局**正确性**前置（不处理会画错位置 / 显示旧装饰 / 邻页被推出视野）；④ 是**能力回退**（用户当前依赖的多窗口各看不同页会消失）；⑤ 是**内存上限**，处理不当会让打开大文档直接吃满内存；⑥⑦ 是**一致性与可测试性**债，短期不致命但会让「两条渲染路径取到不同位图」这类 bug 极难定位。
+- 建议：按 ①→⑦ 顺序处理；①③ 与 P1 的布局改造同一批（它们都在渲染/滚动的几何层），②④ 在 P1 收尾时统一改（都涉及「页号真相来源」），⑤ 在 P1 设计视口时先定量（用 P0 的实测口径复测目标缩放档），⑥ 作为独立的纯重构提交（用 PNM sha256 守门），⑦ 随 P1 的 GUI 冒烟一并验证。
+- 约束：**不得靠「提高 `--page-spec` 缓存上限」掩盖 ⑤**（上限 8 是双份内存的折中，16 是硬上限）；**不得为多页布局再引入第二套渲染路径**（⑥ 的合并方向是「一份快照逻辑」，不是「两套各修各的」）；跨页选区仍按 2026-10-26 决策禁掉，不在本轮技术债里提前解禁。

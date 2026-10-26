@@ -2,10 +2,10 @@
 
 ## 当前状态
 
-- 阶段：M8 计划 C（多根分流收尾 / `seshat:` uid 稳定跟随 / 透明性验证）已完成并归档（Phase 4 收尾，2026-10-26）；M12 及其后续（尺寸自适应重贴合、平滑适配 + `W`/`H` 持久模式）均已归档；`openspec/active/` 另有并发会话创建的计划；`2026-10-26-reader-panel-width-follow-and-valign.md` 已归档到 `openspec/completed/`，由本路线图跟踪
+- 阶段：M8 计划 C（多根分流收尾 / `seshat:` uid 稳定跟随 / 透明性验证）已完成并归档（Phase 4 收尾，2026-10-26）；M12 及其后续（尺寸自适应重贴合、平滑适配 + `W`/`H` 持久模式）均已归档；`openspec/active/` 下的「阅读器多页连续布局 P0」计划已完成并归档到 `openspec/completed/2026-10-26-reader-multipage-p0-page-spec-api.md`（P1 待启动，由本路线图跟踪）；`2026-10-26-reader-panel-width-follow-and-valign.md` 已归档到 `openspec/completed/`，由本路线图跟踪
 - 已确认：整体方案 ✅（用户 2026-10-12 确认）、路线图 ✅（用户 2026-10-12 确认）；M7 方案 ✅ 与计划 ✅（用户 2026-10-18 确认）
 - 加密：维持现有 TLS（反向代理终止）；**不做应用层加密**（用户已取消该需求）
-- 下一步：M8 计划 C 已完成并归档（`openspec/completed/2026-10-26-m8c-ondemand-library-and-uid-links.md`，含 Phase 4 安全加固）；其 L3 端到端六项需服务端可用后人工复核；`openspec/active/` 下另有并发会话创建的「阅读器多页连续布局 P0」计划（本路线图不负责跟踪）
+- 下一步：M8 计划 C 已完成并归档（`openspec/completed/2026-10-26-m8c-ondemand-library-and-uid-links.md`，含 Phase 4 安全加固）；其 L3 端到端六项需服务端可用后人工复核；`openspec/active/` 下另有并发会话创建的「阅读器多页连续布局 P0」计划（现已完成并归档到 `openspec/completed/2026-10-26-reader-multipage-p0-page-spec-api.md`，由本路线图「M12 后续：PDF 多页连续布局」跟踪）
 - 2026-10-19 进展：**M10.7 真机验收通过并归档**（七项全过；同步修 2 处缺陷：渲染页 toolbar 标题不随内容更新、笔记列表不读 `#+FILETAGS:`；新增 5 条 tech-debt，单测 562 → 566）；M9.1 / M9.2（设置项·连续滚动）/ M10.5（手写·点击翻页·横屏）/ M10.6-B1（服务端可选）已完成并归档；M10.6-B2（阅读器交互：浮层显隐·SeekBar·目录）、M10.6-B3（书架：封面网格·进度徽标·过滤排序·点击打开）、M10.6-B4（Notes：树列表·搜索·编辑页·GTD 并入 + `NotesSync` 抽取与数据源统一）代码/单测/文档完成（**真机验证通过**，2026-10-18/19，见 openspec/completed/2026-10-18-m10.6-reader-books-notes-alignment.md「B1~B4 全部完成（真机全通过）」）；M9.2 B 批（文件同步：接入 `ResourceIndex`/`SyncEngine`、服务端书架数据源、按需下载、本地导入上传（≤32 MiB）、元数据回填、`move` 跟随）代码/单测/文档完成（2026-10-19，真机验证通过，单测 566 → 641）；M7 服务端已完成（待提交）
 - 2026-10-20 进展：**M10.8（阅读器 UX 重排与手写增强，7 项需求）与 M10.9（目录树形左侧抽屉）均已实现并归档**（代码已提交 `e50a23a` / `8c14494` / `0361faf` / `bb759f1` / `9e7ffd8` / `cd55316` / `c4a76d3`；单测 649 → **721** → **754**，含 1 例 skipped），**✅ 真机验证通过（2026-10-20，设备 24091RPADC / Android 16，EPUB 与 PDF 两个阅读器）**；`c4a76d3` 追加两项：进入阅读默认沉浸、手写参数面板移到屏幕右侧竖排浮条；文档已同步 `docs/android.md` §6 / `CHANGELOG.md` / `openspec/decisions.md` / `openspec/tech-debt.md`（新增 4 条未通过项）；破例引入 `com.tom-roush:pdfbox-android:2.0.27.0`（用户 2026-10-20 授权的唯一例外，见 decisions.md）
 - 下一步：**M12 已完成并归档（openspec/completed/2026-10-22-m12-reader-ux-layout-and-highlight.md，残余视觉项待用户目视）；下一个里程碑已确定为 M8 计划 C（已于 2026-10-26 完成并归档，见下方 2026-10-26 进展）；M10.3/M10.4 已归档，L3 真机待验；emacs-reader 尺寸自适应计划已归档（`openspec/completed/2026-10-22-emacs-reader-resize-refit.md`，2026-10-23；机制已由后续 `2026-10-23-emacs-reader-smooth-fit.md` 演进）**（M10.6 B2/B3/B4、M9.2 B 批、M10.8、M10.9 均已验收通过并归档）
@@ -13,6 +13,8 @@
 - 未决问题（阻塞后续里程碑，不阻塞本文件）：收录目录清单、GTD 深度、Reader 功能清单、EPUB location 约定
 - 2026-10-26 进展：**M8 计划 C 开工于 2026-10-26**（计划文件（现已归档）`openspec/completed/2026-10-26-m8c-ondemand-library-and-uid-links.md`），范围三子项：M8.4 书架 + 按需取书（含显式刷新）、M8.5 `seshat:` 改由 uid 承载身份且**全部插入路径统一**、M8.6 透明性反向断言；审查过程：plan-reviewer 四轮（前三轮不通过/仅剩 major，第四轮终审通过）→ 用户确认计划（门禁 2 通过）；批次 1（T1 数据层 / T3a uid 解析 / T5 透明性测试）已完成：T1 21 例、T3a 19 例（累计 69）、T5 9 例（含 5 组变异自检）全绿，T5 的两处变异自检结论已回写计划 D6；批次 2（T2 书架 UI / T3b 全路径 uid 接入）完成：T2 38 例、T3b 86 例全绿，两处执行期偏差（`d`/`u` 零网络、`--description` 裸 uid 判据）已回写计划 D3 / D4；T6 文档沉淀（emacs-reader / configuration / sync-protocol / architecture / CHANGELOG / decisions / tech-debt 七处同步）已完成；**计划外范围扩大（用户 2026-10-26 确认）**：服务端 `registry.Resolve` 补识别 `seshat:uid:<uid>` 前缀（与 Emacs 客户端对齐，Android 不涉及），新增 T8/T9；原「服务端零改动」口径作废；**计划 C 已完成并归档（2026-10-26）**：L1 `make all` EXIT 0、警告集 **33 条 = 基线零新增**、`make checkdoc` 0 报错、顶层 6 个 `.el` 与 4 个测试文件字节编译 0 warning 0 error、`go build ./...` / `go vet ./...` 干净；L2 全仓 ERT **28 个文件 1110 例**（Phase 4 安全加固新增 20 例后为 **1130** 例）逐文件全绿（0 unexpected / 0 skipped）+ Go **13 包全 PASS / 0 SKIP**；L3 **未验证**（服务端未运行，且六项中 ②③④⑤⑥ 需交互式 Emacs → 需人工）；归档路径 `openspec/completed/2026-10-26-m8c-ondemand-library-and-uid-links.md`（T1–T9 共 10 项全 `[x]`）；**M8 计划 C 已完成并归档**：全量验证 28 个测试文件 / **1130 例** 0 unexpected / 0 skipped、Go 13 包 PASS、`make all` warning 33 = 基线、checkdoc 0；Phase 4 代码审查（code-reviewer）✅ 通过，安全审查（security-reviewer）首轮判「需修复后合入」（1 high：uid 归属根 mode 未校验，可删/覆盖 `mirror` 根笔记）→ 已修复并复核「可合入」（含下载超时与大小上限、分页上限、uid 形态守卫等 6 项加固）；**L3 端到端仍未验证**（服务端未运行），六项需人工复核；归档路径 `openspec/completed/2026-10-26-m8c-ondemand-library-and-uid-links.md`
 - 2026-10-26 进展（阅读器面板宽度）：**译文/解释面板正文宽度跟随窗口 + valign** 实施完成并归档（计划 `openspec/completed/2026-10-26-reader-panel-width-follow-and-valign.md`，T1–T6 全部完成）：新增 defcustom `seshat-reader-translate-visual-fill-column-ratio`（默认 `0.94`，`nil` = 回退旧行为即正文固定全局 `fill-column`）与 `seshat-reader-translate-valign`（默认 `t`）；新增内部函数 `--vfcm-available-width`（与 vfcm `--window-max-text-width` 同源：`window-width` 取 `remap` 单位 → 扣左右 margin → 按 `text-scale` 折减，**不用 `window-body-width`**）、`--vfcm-follow-window`（设 buffer-local `visual-fill-column-width` = 可用宽 × ratio，再调公开命令 `visual-fill-column-adjust`）、`--vfcm-refresh`（hook 入口，`ignore-errors`）；`--prepare-view` 以 **prepend** 注册 buffer-local `window-state-change-functions`（vfcm 自身 `append`，顺序颠倒会退化为「第一次 resize 不变、第二次才变」），`--render-panel` 在显示之后补一次 refresh 收口首帧；valign 仅折行模式生效、非图形环境静默跳过；vfcm 的 `visual-fill-column-center-text` 不设，默认左对齐、右侧约 6% 留白；`seshat-reader-sidebar.el` 的承载分派 / 宽度记忆 / 差量算法**零改动**，仅补一处正文刷新兜底（新增 `--refresh-panel-text-width`，在 `--resize-width` 的两个成功出口显式调 `--vfcm-refresh`，`fboundp` 守卫、不 require translate）。L1 `make -C emacs/seshat-reader clean all` EXIT 0、warning **33** = 基线、checkdoc 0 报错；L2 translate **159** / sidebar **143** / 全仓 **28** 个测试文件 **1150** 例、0 unexpected / 0 skipped；文档八处同步（`docs/emacs-reader.md` / `docs/configuration.md` / `docs/architecture.md` / `emacs/seshat-reader/VENDORED.md` / `CHANGELOG.md` / `openspec/decisions.md` / `openspec/tech-debt.md` / 本路线图）；**T6 已完成，计划已归档（`openspec/completed/2026-10-26-reader-panel-width-follow-and-valign.md`）；L3 六项由用户真机实测通过（含扩大/恢复同步变宽收窄、阅读 buffer 中按 `w`、表格列对齐）；另修 `w` 的正文跟随不再依赖 hook（resize 出口显式 refresh）**。
+
+- 2026-10-26 进展（PDF 多页连续布局 P0）：**按页渲染查询接口 P0 已完成并归档**（计划 `openspec/completed/2026-10-26-reader-multipage-p0-page-spec-api.md`，T0–T8 全部完成）：新增 C 入口 `seshat-reader-dyn--page-image-spec`（arity `2..3`，1-based 页号，同步、零副作用；从 `draw_page_thread` 抽出 `render_page_to_buffer` 且 PNM 字节 sha256 与改造前一致）与 elisp 包装 `seshat-reader--page-spec`（含上限 8 的会话内缓存 + 两处清理挂点）；**零用户可见行为变更**（不接入任何显示/滚动路径）。L1 `make -C emacs/seshat-reader all` EXIT 0、warning **33** = 基线、checkdoc 0 报错；L2 全仓 ERT **29** 个测试文件 **1163** 例、0 unexpected / 0 skipped（新增 `seshat-reader-page-spec-test.el` 13 例，真实 `.so` + 真实 PDF）；L3 由既有翻页/缩放/批注冒烟覆盖（C 侧行为逐字节等价）。实测数据（单页 0.7–11 ms、缓存收益仅在工作集 ≤ 8 页时成立、`VmRSS` ≈ 0.9 MB/页）已写入计划的「## 实测数据」小节，并据此登记 P1 的 7 项前置技术债。**下一步：P1（buffer 多页布局 + 页号派生 + 删 strip 全族）待启动。**
 
 ## 背景与起点
 
@@ -217,6 +219,18 @@ M0–M6 已完成并归档，见 `openspec/completed/personal-notes-system.md`�
 | 子项 | 内容 | 状态 |
 |---|---|---|
 | — | 面板正文宽度跟随窗口（ratio 0.94）+ valign 表格列对齐 | ✅ 已归档（2026-10-26）；见 openspec/completed/2026-10-26-reader-panel-width-follow-and-valign.md |
+
+### M12 后续：PDF 多页连续布局（路线 3）
+
+计划与执行记录：**P0** `openspec/completed/2026-10-26-reader-multipage-p0-page-spec-api.md`（**已归档，2026-10-26**；T0–T8 全部完成）。目标是把「一个窗口一张位图、翻页即换图」的单页模型改为多页 buffer 纵向连续布局（决策见 `openspec/decisions.md` 2026-10-26 条，缺口见 `openspec/tech-debt.md`「多页连续布局（路线 3）落地前必须处理」）。
+
+| 阶段 | 内容 | 状态 |
+|---|---|---|
+| P0 | 按页渲染返回 spec 的 C 接口 + elisp 缓存 | ✅ 完成（2026-10-26）；见 openspec/completed/2026-10-26-reader-multipage-p0-page-spec-api.md |
+| P1 | buffer 多页布局 + 页号派生 + 删 strip 全族 | ⏳ 待启动 |
+
+- **P0 已交付**：C 入口 `seshat-reader-dyn--page-image-spec`（arity `2..3`，1-based，同步、零副作用）+ elisp `seshat-reader--page-spec`（上限 8 的会话内缓存）+ 13 例 ERT（真实 `.so` + 真实 PDF）。**零用户可见行为变更**：不接入任何显示/滚动路径。
+- **P0 实测结论（决定 P1 设计）**：单页 0.7–11 ms（72 dpi，与既有 `wait_for_cached_page` 同量级）；缓存收益只在工作集 ≤ 8 页时成立（8 页第二轮 22.3 → 0.0 ms），顺序扫 20 页命中率 **0**（先进先出淘汰）；`VmRSS` 增量 ≈ 0.9 MB/页（首轮 20 页 +17.9 MB），Lisp 侧 `gcs-done` / `memory-info` 不具备分辨力。数据见 P0 计划「## 实测数据」。
 
 ## 风险登记
 
