@@ -178,6 +178,11 @@
 ;; visual-fill-column 同样是软依赖（只在 `--prepare-view' 内按需加载），
 ;; 编译期不加载其库，故显式声明签名以消除「not known to be defined」告警。
 (declare-function visual-fill-column-mode "visual-fill-column" (&optional arg))
+;; `visual-fill-column-adjust' 是 vfcm 的**公开**命令（改宽度后立即重算 margin，
+;; 避免依赖其私有 `--set-margins'）；同样按软依赖处理，运行期再用 `fboundp' 守卫。
+(declare-function visual-fill-column-adjust "visual-fill-column" (&optional inc))
+;; valign-mode 同样是软依赖（只在 `--prepare-view' 内按需 `require'）。
+(declare-function valign-mode "valign" (&optional arg))
 ;; 译文面板开启时关闭 evil（`seshat-reader--disable-evil'，定义在
 ;; `seshat-reader'）。这里的 `require' 只在运行时执行，字节编译期不加载，
 ;; 故显式声明签名以消除「not known to be defined」告警。
@@ -522,6 +527,49 @@ nil 关闭——仅当面板已显示时传 -1 清理窗口 margin（面板未�
   :safe #'booleanp
   :group 'seshat-reader-translate)
 
+(defcustom seshat-reader-translate-visual-fill-column-ratio 0.94
+  "面板正文宽度占面板窗口可用宽度的比例.
+非 nil 时，`seshat-reader-translate--vfcm-follow-window' 把
+`visual-fill-column-width'（buffer-local）设为「窗口可用文本宽度 × 本值」，
+让正文宽度随面板窗口同步变化：按 `w' / `C-c w' 加宽面板或手动拖拽窗口时，
+新增宽度用于**正文**而不是留白。vfcm 默认 `visual-fill-column-center-text' 为
+nil → 正文**左对齐**、未占用的约 6% 集中在**右侧**（若用户把该项设为 t，则
+左右各约 3%）；本包**不**设置该变量，尊重用户全局配置。
+
+**`nil` = 恢复旧行为（正文固定为全局 `fill-column'，扩宽面板后仍只增留白）**：
+此时不设置 `visual-fill-column-width'，vfcm 回落到
+`(or visual-fill-column-width fill-column)' 的 `fill-column' 分支，即 M11.14
+引入的「正文宽度恒定」语义。
+
+只在 `seshat-reader-translate-visual-fill-column' 非 nil 且处于折行模式时
+有意义（vfcm 未启用时本值不起作用）；取值建议在 `(0, 1]` 区间，非正数会被
+上方 `max 1' 夹到 1 列。"
+  :type '(choice (const :tag "沿用全局 fill-column（旧行为）" nil) number)
+  :safe #'numberp
+  :group 'seshat-reader-translate)
+
+(defcustom seshat-reader-translate-valign t
+  "译文/解释面板是否启用 `valign-mode'.
+非 nil 时在 `seshat-reader-translate--prepare-view' 末尾启用 `valign-mode'，
+让面板里的 Markdown 表格按列视觉对齐（CJK 宽字符与 ASCII 混排时尤其明显）。
+
+**译文与解释共用同一 buffer**（`seshat-reader-sidebar-translate-buffer-name'，
+只有 header-line 不同），故本开关**无法只对解释生效**——两者要么都开、要么
+都关。
+
+`valign' 为**软依赖**：未安装时静默跳过（不报错、不提示），面板照常渲染。
+**非图形环境静默跳过（不提示）**：`display-graphic-p' 为 nil（batch / 终端）
+时不调用 `valign-mode'——它自身在非图形环境下只会 `message' 一句
+\"Valign mode has no effect in non-graphical display\"，本包提前拦掉以免面板
+每次渲染都刷一条无意义提示。
+
+只在折行模式下生效（与 `seshat-reader-translate-visual-fill-column' 同条件）；
+关闭面板宽度跟随（`...-visual-fill-column-ratio' 设为 nil）不影响本开关，
+两者互不耦合。"
+  :type 'boolean
+  :safe #'booleanp
+  :group 'seshat-reader-translate)
+
 (defcustom seshat-reader-translate-capture-window 120
   "捕获译文的时间窗口，单位为秒.
 `seshat-reader-translate--capture-result' 仅在距最近一次本包翻译/解释的
@@ -713,6 +761,95 @@ evil 的 normal state 同名键位一致，故面板开启时关闭 evil，见
         ((fboundp 'markdown-view-mode) 'markdown-view-mode)
         (t 'text-mode)))
 
+(defun seshat-reader-translate--vfcm-available-width (window)
+  "返回 WINDOW 的可用文本宽度（与 vfcm 同源，含 text-scale 因子）.
+`visual-fill-column--window-max-text-width' 的口径是「remap 换算后的窗口宽度
++ 左右 margin × remap 比例」，再按 text-scale 折算，即排除 fringes /
+scroll-bar / 右侧 divider 之后的可用列数。**不得**改用 `window-body-width'：
+它比 vfcm 的口径少 2–4 列，会让实际正文比
+`seshat-reader-translate-visual-fill-column-ratio' 算出的比例更窄。
+
+remap 比例 `remap-scale = (window-width WINDOW \\='remap) / (window-width WINDOW)'`
+用于把 margin 的列数折算到 remap 坐标（Emacs 29+ 起 remap 与逻辑列可能不同）。
+
+text-scale 因子与 vfcm 的 `visual-fill-column-adjust-for-text-scale' 分支同源：
+该选项非 nil（默认）时取 WINDOW 的 buffer 内
+`(expt text-scale-mode-step text-scale-mode-amount)'，并作为**除数**（放大字体
+后一个「列」更宽，有效列数相应变少）；因子取不到或非正数时回退 1.0。
+
+WINDOW 非 live、任一取值为 nil 或非正数时返回 nil（交调用方静默跳过）。"
+  (when (and (windowp window) (window-live-p window))
+    (let ((remap (window-width window 'remap))
+          (plain (window-width window))
+          (margins (window-margins window)))
+      (when (and (integerp remap) (> remap 0)
+                 (integerp plain) (> plain 0))
+        (let* ((remap-scale (/ (float remap) plain))
+               (left (or (car margins) 0))
+               (right (or (cdr margins) 0))
+               ;; text-scale 是 buffer-local，必须在 WINDOW 的 buffer 内取值。
+               (raw-scale (if (and (bound-and-true-p visual-fill-column-adjust-for-text-scale)
+                                   (boundp 'text-scale-mode-step)
+                                   (boundp 'text-scale-mode-amount))
+                              (with-current-buffer (window-buffer window)
+                                (expt text-scale-mode-step text-scale-mode-amount))
+                            1.0))
+               (scale (if (or (not (numberp raw-scale)) (<= raw-scale 0))
+                          1.0
+                        raw-scale))
+               (avail (truncate (/ (+ remap
+                                      (* left remap-scale)
+                                      (* right remap-scale))
+                                   (float scale)))))
+          (when (> avail 0) avail))))))
+
+(defun seshat-reader-translate--vfcm-follow-window (&optional window)
+  "把正文宽度设为 WINDOW 可用宽的 `...-visual-fill-column-ratio'，并重算 margin.
+WINDOW 缺省取当前 buffer 所在的可见窗口；取不到（nil 或非 live）时静默返回 nil。
+
+仅在 WINDOW 的 buffer 已启用 `visual-fill-column-mode' 时生效——vfcm 未启用时
+`visual-fill-column-width' 没有任何消费者，设置它只会留下无意义的 buffer-local
+残留值。
+
+`seshat-reader-translate-visual-fill-column-ratio' 为 nil 时**直接返回**（nil
+语义是「沿用全局 `fill-column'」；把 nil 传进乘法会报
+`wrong-type-argument'）。
+
+设置宽度后用 `visual-fill-column-adjust'（vfcm 的公开命令，非私有
+`--set-margins'）在 WINDOW 内立即重算 margin：窗口尺寸变化时 vfcm 自己也会
+（以 `'append' 注册在 `window-state-change-functions'），但那里要等 hook 轮到
+它才执行，且首次显示时算的是 selected window；本函数主动调一次作为双保险。
+
+留白落点由 vfcm 的 `visual-fill-column-center-text' 决定（默认 nil）：正文
+左对齐，未占用的约 6% 全部落在**右侧**；该项为 t 时左右各约 3%。本包不
+`setq-local' 该变量。
+
+返回设置后的 `visual-fill-column-width'（便于测试断言）；未生效时返回 nil。"
+  (let ((window (or window (get-buffer-window (current-buffer) t))))
+    (when (and (windowp window) (window-live-p window))
+      (with-current-buffer (window-buffer window)
+        (when (bound-and-true-p visual-fill-column-mode)
+          (when (numberp seshat-reader-translate-visual-fill-column-ratio)
+            (let* ((ratio seshat-reader-translate-visual-fill-column-ratio)
+                   (avail (seshat-reader-translate--vfcm-available-width window)))
+              (when avail
+                (setq-local visual-fill-column-width
+                            (max 1 (round (* avail ratio))))
+                (when (fboundp 'visual-fill-column-adjust)
+                  (ignore-errors
+                    (with-selected-window window
+                      (visual-fill-column-adjust))))
+                visual-fill-column-width))))))))
+
+(defun seshat-reader-translate--vfcm-refresh (&optional window)
+  "窗口状态变化 / 面板显示后刷新正文宽度的入口.
+转调 `seshat-reader-translate--vfcm-follow-window'，整体用 `ignore-errors'
+包裹：本函数被注册为 `window-state-change-functions' 的 hook 函数，hook 里
+抛错会打断同一 hook 上后续函数（包括 vfcm 自己的 margin 调整），故必须静默。
+WINDOW 缺省交由 `seshat-reader-translate--vfcm-follow-window' 自行解析。"
+  (ignore-errors
+    (seshat-reader-translate--vfcm-follow-window window)))
+
 (defun seshat-reader-translate--prepare-view ()
   "把当前 buffer 设为译文面板的只读 Markdown 视图.
 先调 `seshat-reader-translate--view-mode-function' 选出的 major mode（隐藏
@@ -762,7 +899,32 @@ major mode 调用失败（如 autoload 指向的库缺失）时回退 `text-mode
     (if seshat-reader-translate-visual-fill-column
         (visual-fill-column-mode 1)
       (when (get-buffer-window (current-buffer))
-        (visual-fill-column-mode -1)))))
+        (visual-fill-column-mode -1))))
+  ;; 正文宽度跟随面板窗口 + valign：都只在折行模式下接线（不折行模式下
+  ;; 按列宽折行与横向滚动互斥，vfcm 整体被跳过，跟随宽度自然也不该生效）。
+  (unless seshat-reader-panel-truncate-lines
+    (if seshat-reader-translate-visual-fill-column
+        ;; **不加 append**：vfcm 在 Emacs 28+ 用
+        ;; `(add-hook 'window-state-change-functions
+        ;;            #'visual-fill-column--adjust-window 'append 'local)'
+        ;; 注册 margin 调整；这里 prepend 才能保证「先按新窗口宽度改
+        ;; `visual-fill-column-width'、再由 vfcm 算 margin」。顺序是外部包契约，
+        ;; 不要改成 append 或手动重排。
+        (add-hook 'window-state-change-functions
+                  #'seshat-reader-translate--vfcm-refresh nil 'local)
+      ;; 防御性冗余：本函数每次都以 `funcall mode' 换 major mode，那会
+      ;; `kill-all-local-variables' 清掉 buffer-local 宽度，故这里多半是空操作；
+      ;; 真正的语义是「旧行为 = 不设宽度、由 vfcm 回退 fill-column」。
+      (when (boundp 'visual-fill-column-width)
+        (kill-local-variable 'visual-fill-column-width)))
+    ;; valign 与 vfcm 同条件：折行模式下让 Markdown 表格列视觉对齐。软依赖，
+    ;; 缺失静默跳过。非图形环境直接跳过——`valign-mode' 自身只会 `message'
+    ;; 「Valign mode has no effect in non-graphical display」，每渲染一次就刷
+    ;; 一条无意义提示；`ignore-errors' 挡不住 `message'，故显式判 `display-graphic-p'。
+    (when (and seshat-reader-translate-valign
+               (display-graphic-p)
+               (or (fboundp 'valign-mode) (require 'valign nil t)))
+      (ignore-errors (valign-mode 1)))))
 
 (defun seshat-reader-translate--as-string (value)
   "把 VALUE 规范成字符串，用于防御「上游把 gt 的分段列表当字符串传入」.
@@ -898,6 +1060,11 @@ CONTEXT 选定模板（`explain' 用 `seshat-reader-translate-explain-template'�
       (goto-char (point-min)))
     ;; SELECT 传 nil：阅读场景不抢光标（详见本函数 docstring）。
     (seshat-reader-sidebar-show buffer 'translate nil)
+    ;; 显示后按**面板窗口**（不是阅读窗口）再算一次正文宽度：`--prepare-view'
+    ;; 里 `(visual-fill-column-mode 1)' 是以 selected window 计算首次 margin 的
+    ;; （M11.14 已记录的已知副作用），此时面板刚显示、宽度与 margin 都可能
+    ;; 算到别处，故在显示之后收口一次。
+    (seshat-reader-translate--vfcm-refresh (get-buffer-window buffer t))
     buffer))
 
 (defun seshat-reader-translate--panel-result ()
@@ -1924,6 +2091,13 @@ major mode，markdown 视图只对真正变化的正文重算 font-lock。"
     ;; 顺序要紧：切视图 major mode 会 `kill-all-local-variables'，把下面要设的
     ;; buffer-local 状态（skeleton 标志、正文 marker、面板标题、追问状态）一并清掉。
     (seshat-reader-translate--prepare-view)
+    ;; 本路径与 `--render-panel' **不同**：这里没有「显示之后」的
+    ;; `seshat-reader-translate--vfcm-refresh'，`(visual-fill-column-mode 1)' 与
+    ;; 刷新 hook 都是在 buffer 尚未显示时接线的，首次 margin 可能按
+    ;; selected-window（阅读窗口）算出。当前面板渲染**不走流式**
+    ;; （`seshat-reader-translate--stream-wanted-p' 对面板路径返回 nil），故本
+    ;; 函数对 `sidebar' 渲染不可达；若将来恢复面板流式渲染，必须在此（或显示
+    ;; 之后）补一次 `--vfcm-refresh'，否则首次正文宽度会按 selected-window 算错。
     (setq seshat-reader-translate--panel-skeleton t)
     (setq seshat-reader-translate--panel-title title)
     ;; 追问状态同样在此建立：流式骨架路径不经过 `--render-panel'，

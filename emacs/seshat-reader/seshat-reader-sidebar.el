@@ -105,6 +105,11 @@
 ;; 声明只为消除字节编译的「reference to free function」告警。
 (declare-function seshat-reader--disable-evil "seshat-reader" ())
 
+;; 面板宽度调整后刷新正文宽度（`--vfcm-refresh'，定义在 `seshat-reader-translate'）。
+;; 同理只为字节编译声明：本模块**不 require** 译文模块（零依赖边界），运行时用
+;; `fboundp' 守卫，未加载时静默跳过。
+(declare-function seshat-reader-translate--vfcm-refresh "seshat-reader-translate" (&optional window))
+
 ;; 同理：批注列表、目录面板与搜索结果侧栏的 keymap 定义在各自模块（本模块不
 ;; require 它们，否则会毁掉「零依赖」这条边界）。声明只服务字节编译；运行时的
 ;; 绑定注册见文末 `with-eval-after-load`——那时三个 map 已由
@@ -1878,6 +1883,14 @@ buffer 的键位复用。面板可能是窗口，也可能是 child frame：关�
         (and (seshat-reader-sidebar-window-p window) window))
       (car (seshat-reader-sidebar--windows))))
 
+(defun seshat-reader-sidebar--refresh-panel-text-width (window)
+  "让面板正文宽度跟随 WINDOW 的新尺寸（软依赖，未加载时静默跳过）.
+`seshat-reader-translate--vfcm-refresh' 定义在译文模块，本模块零依赖不 require
+它，故只按 `fboundp' 判定：未加载时静默返回（不提示、不报错）。整体再包一层
+`ignore-errors'——刷新是「锦上添花」，任何异常都不该让宽度调整这个用户动作失败。"
+  (when (and (windowp window) (fboundp 'seshat-reader-translate--vfcm-refresh))
+    (ignore-errors (seshat-reader-translate--vfcm-refresh window))))
+
 (defun seshat-reader-sidebar--resize-width (window columns)
   "把 WINDOW 的宽度**差量**调整到 COLUMNS 列；调整不了时返回 nil.
 调用形式是 `(window-resize WINDOW DELTA HORIZONTAL)'——Emacs 29+ 的第三参就是
@@ -1886,12 +1899,25 @@ HORIZONTAL（非 nil 表示按列调宽），DELTA 为目标列数减当前 `win
 会**等量压缩**阅读区、恢复时等量归还，不会新建窗口。差量为 0 时直接返回 t
 （不必触发一次布局重算）；目标超出 frame 能给的范围（例如 `window-min-width'
 不再满足）时 `window-resize' 会报错，此处吞掉并返回 nil，由调用方按实测宽度
-决定提示文案——面板宽度调整失败不该让按键抛错。"
+决定提示文案——面板宽度调整失败不该让按键抛错。
+
+调整成功后（含差量为 0 的空操作路径）还会显式调一次面板正文宽度刷新
+（`seshat-reader-sidebar--refresh-panel-text-width' → 译文模块的
+`seshat-reader-translate--vfcm-refresh'，软依赖），**不依赖**
+`window-state-change-functions' 是否已注册——该 hook 缺失时正文不会跟随，且
+不会报错。集中在本函数出口做，扩大与恢复两条路径都自动覆盖，调用点无须重复。"
   (let ((delta (- columns (window-total-width window))))
     (if (zerop delta)
-        t
+        (progn
+          ;; 差量为 0 也刷新：刷新是幂等的（`setq-local' + margin 重算），统一走
+          ;; 同一出口更不容易漏。
+          (seshat-reader-sidebar--refresh-panel-text-width window)
+          t)
       (condition-case nil
-          (progn (window-resize window delta t) t)
+          (progn
+            (window-resize window delta t)
+            (seshat-reader-sidebar--refresh-panel-text-width window)
+            t)
         (error nil)))))
 
 (defun seshat-reader-sidebar-toggle-width ()
@@ -1909,7 +1935,13 @@ HORIZONTAL（非 nil 表示按列调宽），DELTA 为目标列数减当前 `win
 
 只在「窗口承载 + 左右分栏」下有效：childframe 承载的面板是独立 frame（宽度由
 `seshat-reader-panel-width' 决定，`window-resize' 无从下手），底部模式的面板
-是**高度**语义（宽度由 frame 决定、不可调），这两种情况一律只提示、不改布局。"
+是**高度**语义（宽度由 frame 决定、不可调），这两种情况一律只提示、不改布局。
+
+调整成功后还会显式调一次面板正文宽度刷新（`--refresh-panel-text-width' →
+译文模块的 `seshat-reader-translate--vfcm-refresh'，软依赖），**不依赖**
+`window-state-change-functions` 是否已注册——该 hook 缺失时正文不会跟随，且
+不会报错。刷新统一由 `--resize-width' 的出口负责（扩大与恢复两条路径都覆盖），
+本函数不重复调用。"
   (interactive)
   (let ((window (seshat-reader-sidebar--width-target-window)))
     (if (null window)
@@ -1925,6 +1957,8 @@ HORIZONTAL（非 nil 表示按列调宽），DELTA 为目标列数减当前 `win
            (concat "Seshat Reader sidebar: 底部模式的面板宽度不可调"
                    "（高度见 seshat-reader-sidebar-height）")))
          (remembered
+          ;; 正文宽度刷新由 `--resize-width' 出口统一完成（本恢复路径也走它），
+          ;; 故此处不再重复调用，避免同一动作算两次 margin。
           (seshat-reader-sidebar--resize-width window remembered)
           (remhash kind seshat-reader-sidebar--width-memory)
           (message "Seshat Reader sidebar: %s 面板已恢复原宽度（%s 列）"
