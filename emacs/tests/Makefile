@@ -67,16 +67,18 @@ ert:
 	echo "FILES=$$files TOTAL=$$total UNEXPECTED=$$bad"; \
 	[ $$bad -eq 0 ]
 
-# 判据自检：喂三条**假汇总行**，检查判定器是否按预期工作。
-# 三条都符合预期才 EXIT 0 —— 这条目标本身是「判据不会假绿」的回归测试。
+# 判据自检：喂四条**假汇总行**，检查判定器是否按预期工作。
+# 四条都符合预期才 EXIT 0（含「0 用例」这条假绿） —— 这条目标本身是「判据不会假绿」的回归测试。
 check-criteria:
 	@echo "check-criteria: 判据自检（不跑 ERT）"; fail=0; \
 	one="Ran 3 tests, 3 results as expected, 0 unexpected (2026-10-27 12:00:00+0800, 0.10 sec)"; \
 	two="Ran 20 tests, 10 results as expected, 10 unexpected (2026-10-27 12:00:00+0800, 0.20 sec)"; \
 	three="Ran 3 tests, 2 results as expected, 0 unexpected, 1 skipped (2026-10-27 12:00:00+0800, 0.10 sec)"; \
+	four="Ran 0 tests, 0 results as expected, 0 unexpected (2026-10-27 12:00:00+0800, 0.10 sec)"; \
 	if $(JUDGE) "$$one";   then echo "  [期望通过→通过] $$one";   else echo "  [期望通过→失败] $$one";   fail=1; fi; \
 	if $(JUDGE) "$$two";   then echo "  [期望失败→通过] $$two";   fail=1; else echo "  [期望失败→失败] $$two"; fi; \
 	if $(JUDGE) "$$three"; then echo "  [期望失败→通过] $$three"; fail=1; else echo "  [期望失败→失败] $$three"; fi; \
+	if $(JUDGE) "$$four";  then echo "  [期望失败→通过] $$four";  fail=1; else echo "  [期望失败→失败] $$four"; fi; \
 	if [ $$fail -eq 0 ]; then echo "check-criteria: PASS"; else echo "check-criteria: FAIL"; fi; \
 	exit $$fail
 

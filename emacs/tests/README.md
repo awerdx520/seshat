@@ -40,8 +40,9 @@ load 失败，日志在 `/tmp/seshat-reader-ert/<文件>.log`）。
 ### 判据实现与自检（`ert-judge.sh` + `check-criteria`）
 
 判定逻辑单独放在同目录的 `ert-judge.sh` 里（`ert` 与自检共用同一段代码，避免
-「自检用一套、真实运行用另一套」）。三条判据：行以 `Ran ` 开头、`unexpected`
-**数值**为 0、行内不含 `skipped`。
+「自检用一套、真实运行用另一套」）。三条判据：行的形状是 `Ran <n> tests` 且
+**n ≥ 1**（`Ran [1-9][0-9]*`，「0 用例」也是假绿）、`unexpected` **数值**为 0、
+行内不含 `skipped`。
 
 **注意不要用子串匹配**：`grep "0 unexpected"` 会把 `10 unexpected` 判成通过
 （`10 unexpected` 里含 `0 unexpected`）。这正是 M2 修掉的缺陷 —— 现在用
@@ -55,10 +56,13 @@ make -C emacs/tests check-criteria
 #   [期望通过→通过] Ran 3 tests, 3 results as expected, 0 unexpected (...)
 #   [期望失败→失败] Ran 20 tests, 10 results as expected, 10 unexpected (...)
 #   [期望失败→失败] Ran 3 tests, 2 results as expected, 0 unexpected, 1 skipped (...)
+#   [期望失败→失败] Ran 0 tests, 0 results as expected, 0 unexpected (...)
 #   check-criteria: PASS
 ```
 
-三条假汇总行的期望都成立才 EXIT 0；改判据（或换 shell）后先跑它，再信 `ert` 的绿。
+四条假汇总行的期望都成立才 EXIT 0（第 4 条钉的就是「0 用例」这种假绿：它同样
+让 `ert-run-tests-batch-and-exit` 返回 0，只能靠 `Ran <n≥1>` 判据拦下）；改判据
+（或换 shell）后先跑它，再信 `ert` 的绿。
 
 ## 为什么必须 `-Q` 与这些 `-L`
 
