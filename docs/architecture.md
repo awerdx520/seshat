@@ -265,6 +265,16 @@ M12 把 M11 的「单个底部面板」升级为「左目录 / 右信息 / 中�
 | 搜索单页命中 | 1024（`SEARCH_PAGE_MAX_QUADS`；`limit` 另被夹到 1..10000） | 截断为前 1024 条，状态行提示「仅显示前 1024 条」 |
 | 搜索整次命中 | 20000（`seshat-reader-search-max-matches`） | 达到即停止扫描并提示「命中过多」 |
 
+### 按页渲染查询接口（P0，2026-10-26）
+
+面向「PDF 多页连续布局」（路线 3，见 `openspec/decisions.md` 2026-10-26 条）的**前置地基**：本仓库第一次提供「渲染任意页并把 image spec 交回 Lisp」的通道。
+
+- **为什么需要**：改造前渲染结果**只**由 C 直接写进 per-window overlay（`display_img_to_overlay` → `overlay-put overlay 'display spec`），调用方拿不到 spec；所有翻页入口都走同一条 `wait_for_win_jobs` → `build_cache_window` → `wait_for_cached_page` → `display_cached_page` 模板并写 `selected-window` 的 `page` 参数。要做多页纵向布局，必须有「给定页号 → 得到该页位图」的纯查询能力，否则只能借「隐藏窗口预渲染」（每窗口独占 11 张位图，且会被 `--manage-window-overlays` 反复重建），代价过高。
+- **接口形态**：C 入口 `seshat-reader-dyn--page-image-spec`（arity `2..3`，`PAGE SCALE [ROTATE]`），页号 **1-based**、`SCALE` 为 72 dpi 的倍数并按既有 `MINRES/MAXRES` clamp、`ROTATE` 只接受 0/90/180/270；非法参数、页越界、`is_reloading` 一律**静默 nil**。elisp 包装 `seshat-reader--page-spec`。**同步**执行、**显式**给 scale / rotate、**不读写**任何窗口参数 / overlay / per-window 缓存槽——即调用前后显示状态逐项不变（ERT 有专门用例守门）。渲染段由 `draw_page_thread` 抽出的 `render_page_to_buffer` 承担，故新旧两条路径的 PNM 字节 sha256 一致；装饰走文档装饰表的深拷贝快照，渲染后 `free_decoration_table`。
+- **缓存上限 8 的理由**：spec 的 `:data` 是 PNM 字节的**一份 Lisp 堆副本**，C 侧 `CachedPage.img_data` 与 MuPDF image cache 各自另存——**一张页位图在内存里至少两份**。实测（72 dpi，612×792）单页 `:data` 1.42 MB，150 dpi 时 6.16 MB；`--page-spec-cache-limit` 因此固定为 8（`defvar`，不是 defcustom，不暴露给用户），使常驻增量落在 11–50 MB 量级而非无界。实测 20 页连测的 `VmRSS` 增量 ≈ 0.9 MB/页（首轮），这是 C 侧与 Lisp 侧叠加后的可观测值。
+- **边界（P0 明确不做）**：**不接入任何显示 / 滚动 / redisplay 路径**，只供显式调用与测量。同步阻塞主线程，实测 0.7–11 ms/页（72 dpi，与既有 `wait_for_cached_page` 同量级，见 `openspec/completed/2026-10-26-reader-multipage-p0-page-spec-api.md` 的「实测数据」）。另外**顺序扫超过 8 页时缓存命中率为 0**（上限 8 + 先进先出淘汰，第二轮开始前槽位已被后 8 页占满）——P1 的虚拟化必须让视口驻留页数 ≤ 上限，否则要先换淘汰策略。
+- **未改变的既有结构**：per-window 11 槽缓存、`--refresh-highlights` 的刷新范围、hscroll 的窗口级语义、多窗口各自的页号都**原样保留**；这些是多页布局落地时要处理的缺口，已登记在 `openspec/tech-debt.md`。
+
 ## 搜索与 ink 渲染流程（2026-10-25）
 
 两条能力的共同点：**装饰只有一个出口**——文档级装饰表 + `seshat-reader-annotation--redraw-highlights` 的全量重投。因此新增能力不新建渲染管线，只往同一次投喂里加一路几何。
