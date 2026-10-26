@@ -2,7 +2,7 @@
 
 ## 当前状态
 
-- 阶段：M8 计划 C（多根分流收尾 / `seshat:` uid 稳定跟随 / 透明性验证）已完成并归档（Phase 4 收尾，2026-10-26）；M12 及其后续（尺寸自适应重贴合、平滑适配 + `W`/`H` 持久模式）均已归档；`openspec/active/` 除本路线图外另有并发会话创建的计划（不归本路线图跟踪）
+- 阶段：M8 计划 C（多根分流收尾 / `seshat:` uid 稳定跟随 / 透明性验证）已完成并归档（Phase 4 收尾，2026-10-26）；M12 及其后续（尺寸自适应重贴合、平滑适配 + `W`/`H` 持久模式）均已归档；`openspec/active/` 另有并发会话创建的计划；`2026-10-26-reader-panel-width-follow-and-valign.md` 已归档到 `openspec/completed/`，由本路线图跟踪
 - 已确认：整体方案 ✅（用户 2026-10-12 确认）、路线图 ✅（用户 2026-10-12 确认）；M7 方案 ✅ 与计划 ✅（用户 2026-10-18 确认）
 - 加密：维持现有 TLS（反向代理终止）；**不做应用层加密**（用户已取消该需求）
 - 下一步：M8 计划 C 已完成并归档（`openspec/completed/2026-10-26-m8c-ondemand-library-and-uid-links.md`，含 Phase 4 安全加固）；其 L3 端到端六项需服务端可用后人工复核；`openspec/active/` 下另有并发会话创建的「阅读器多页连续布局 P0」计划（本路线图不负责跟踪）
@@ -12,6 +12,7 @@
 - 2026-10-23 进展：阅读器**尺寸变化即时适配 + `W` / `H` 适配模式持久化**实施完成并归档（`openspec/completed/2026-10-23-emacs-reader-smooth-fit.md`）：L1 `make all` EXIT=0、警告集 33 条零新增（逐条 diff）；L2 全仓 ERT **379** 例全绿 / 0 unexpected / 0 skipped（resize 测试 30 → **67** 例）；**真机验收通过**（开关目录第一帧即居中、`W` / `H` 后仍居中、打开文档无「先小后大」；隔离实例逐帧测量 Δ≤0.5px）；文档已同步（CHANGELOG / decisions ×5 / tech-debt / VENDORED 第 ⑧+⑨ 项 / `docs/emacs-reader.md` §3+§12）。
 - 未决问题（阻塞后续里程碑，不阻塞本文件）：收录目录清单、GTD 深度、Reader 功能清单、EPUB location 约定
 - 2026-10-26 进展：**M8 计划 C 开工于 2026-10-26**（计划文件（现已归档）`openspec/completed/2026-10-26-m8c-ondemand-library-and-uid-links.md`），范围三子项：M8.4 书架 + 按需取书（含显式刷新）、M8.5 `seshat:` 改由 uid 承载身份且**全部插入路径统一**、M8.6 透明性反向断言；审查过程：plan-reviewer 四轮（前三轮不通过/仅剩 major，第四轮终审通过）→ 用户确认计划（门禁 2 通过）；批次 1（T1 数据层 / T3a uid 解析 / T5 透明性测试）已完成：T1 21 例、T3a 19 例（累计 69）、T5 9 例（含 5 组变异自检）全绿，T5 的两处变异自检结论已回写计划 D6；批次 2（T2 书架 UI / T3b 全路径 uid 接入）完成：T2 38 例、T3b 86 例全绿，两处执行期偏差（`d`/`u` 零网络、`--description` 裸 uid 判据）已回写计划 D3 / D4；T6 文档沉淀（emacs-reader / configuration / sync-protocol / architecture / CHANGELOG / decisions / tech-debt 七处同步）已完成；**计划外范围扩大（用户 2026-10-26 确认）**：服务端 `registry.Resolve` 补识别 `seshat:uid:<uid>` 前缀（与 Emacs 客户端对齐，Android 不涉及），新增 T8/T9；原「服务端零改动」口径作废；**计划 C 已完成并归档（2026-10-26）**：L1 `make all` EXIT 0、警告集 **33 条 = 基线零新增**、`make checkdoc` 0 报错、顶层 6 个 `.el` 与 4 个测试文件字节编译 0 warning 0 error、`go build ./...` / `go vet ./...` 干净；L2 全仓 ERT **28 个文件 1110 例**（Phase 4 安全加固新增 20 例后为 **1130** 例）逐文件全绿（0 unexpected / 0 skipped）+ Go **13 包全 PASS / 0 SKIP**；L3 **未验证**（服务端未运行，且六项中 ②③④⑤⑥ 需交互式 Emacs → 需人工）；归档路径 `openspec/completed/2026-10-26-m8c-ondemand-library-and-uid-links.md`（T1–T9 共 10 项全 `[x]`）；**M8 计划 C 已完成并归档**：全量验证 28 个测试文件 / **1130 例** 0 unexpected / 0 skipped、Go 13 包 PASS、`make all` warning 33 = 基线、checkdoc 0；Phase 4 代码审查（code-reviewer）✅ 通过，安全审查（security-reviewer）首轮判「需修复后合入」（1 high：uid 归属根 mode 未校验，可删/覆盖 `mirror` 根笔记）→ 已修复并复核「可合入」（含下载超时与大小上限、分页上限、uid 形态守卫等 6 项加固）；**L3 端到端仍未验证**（服务端未运行），六项需人工复核；归档路径 `openspec/completed/2026-10-26-m8c-ondemand-library-and-uid-links.md`
+- 2026-10-26 进展（阅读器面板宽度）：**译文/解释面板正文宽度跟随窗口 + valign** 实施完成并归档（计划 `openspec/completed/2026-10-26-reader-panel-width-follow-and-valign.md`，T1–T6 全部完成）：新增 defcustom `seshat-reader-translate-visual-fill-column-ratio`（默认 `0.94`，`nil` = 回退旧行为即正文固定全局 `fill-column`）与 `seshat-reader-translate-valign`（默认 `t`）；新增内部函数 `--vfcm-available-width`（与 vfcm `--window-max-text-width` 同源：`window-width` 取 `remap` 单位 → 扣左右 margin → 按 `text-scale` 折减，**不用 `window-body-width`**）、`--vfcm-follow-window`（设 buffer-local `visual-fill-column-width` = 可用宽 × ratio，再调公开命令 `visual-fill-column-adjust`）、`--vfcm-refresh`（hook 入口，`ignore-errors`）；`--prepare-view` 以 **prepend** 注册 buffer-local `window-state-change-functions`（vfcm 自身 `append`，顺序颠倒会退化为「第一次 resize 不变、第二次才变」），`--render-panel` 在显示之后补一次 refresh 收口首帧；valign 仅折行模式生效、非图形环境静默跳过；vfcm 的 `visual-fill-column-center-text` 不设，默认左对齐、右侧约 6% 留白；`seshat-reader-sidebar.el` 的承载分派 / 宽度记忆 / 差量算法**零改动**，仅补一处正文刷新兜底（新增 `--refresh-panel-text-width`，在 `--resize-width` 的两个成功出口显式调 `--vfcm-refresh`，`fboundp` 守卫、不 require translate）。L1 `make -C emacs/seshat-reader clean all` EXIT 0、warning **33** = 基线、checkdoc 0 报错；L2 translate **159** / sidebar **143** / 全仓 **28** 个测试文件 **1150** 例、0 unexpected / 0 skipped；文档八处同步（`docs/emacs-reader.md` / `docs/configuration.md` / `docs/architecture.md` / `emacs/seshat-reader/VENDORED.md` / `CHANGELOG.md` / `openspec/decisions.md` / `openspec/tech-debt.md` / 本路线图）；**T6 已完成，计划已归档（`openspec/completed/2026-10-26-reader-panel-width-follow-and-valign.md`）；L3 六项由用户真机实测通过（含扩大/恢复同步变宽收窄、阅读 buffer 中按 `w`、表格列对齐）；另修 `w` 的正文跟随不再依赖 hook（resize 出口显式 refresh）**。
 
 ## 背景与起点
 
@@ -208,6 +209,14 @@ M0–M6 已完成并归档，见 `openspec/completed/personal-notes-system.md`�
 | 子项 | 内容 | 状态 |
 |---|---|---|
 | — | **阅读器面板 childframe 覆盖承载 + 流式 + 多轮追问 + 复制回显** | ✅ 已归档（2026-10-25）；见 `openspec/completed/2026-10-25-emacs-reader-panel-childframe-and-ux.md` |
+
+### M12 后续：译文/解释面板正文宽度跟随窗口 + valign
+
+计划与执行记录：`openspec/completed/2026-10-26-reader-panel-width-follow-and-valign.md`（**已归档，2026-10-26**；T1–T6 全部完成，L3 六项由用户真机实测通过）。
+
+| 子项 | 内容 | 状态 |
+|---|---|---|
+| — | 面板正文宽度跟随窗口（ratio 0.94）+ valign 表格列对齐 | ✅ 已归档（2026-10-26）；见 openspec/completed/2026-10-26-reader-panel-width-follow-and-valign.md |
 
 ## 风险登记
 
