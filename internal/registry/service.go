@@ -218,11 +218,30 @@ func (s *Service) applyEvent(e Event) (int64, error) {
 	return s.Apply(e)
 }
 
+// uidRefPrefix 是**客户端协议形态**的引用前缀：Emacs 客户端产出的 seshat 链接写作
+// `seshat:uid:<uid>`，故交给 Resolve 的引用 key 形如 `uid:<uid>`。
+//
+// 与裸 uid 形态（引用 key 直接是 26 位 uid，服务端既有的写法）并存：裸 uid 用于
+// 服务端内部与既有测试，`uid:` 前缀形态给客户端用，两者解析到同一 uid、同一套
+// 墓碑语义。保留裸 uid 而不强制前缀，是因为前缀并非「更正确」，只是客户端为了在
+// org 文本里与 tag:path / 纯 path 形态无歧义地区分而选定的协议约定。
+const uidRefPrefix = "uid:"
+
 // Resolve 把引用 key 解析为 uid。
 //
-// 优先级：① uid 形态直接按 uid 查（墓碑视为 not found）；② 含 ':' 时首个冒号前为
-// 根 tag、其后为路径；③ 否则用 SetRoots 记录的首个根作为默认根。未调用过 SetRoots
-// 时纯路径形态返回 ErrInvalidArgument（消息含「未设置默认根」），不猜测根。
+// 优先级（顺序固定，四段）：
+//  1. 去空白后为空 → ErrInvalidArgument「引用 key 不能为空」；
+//  2. 裸 uid 形态（26 位 Crockford Base32，见 IsUID）直接按 uid 查（墓碑视为 not found）；
+//  3. 显式 uid 形态 `uid:<uid>`（客户端协议形态，前缀见 uidRefPrefix）——前缀之后
+//     是合法 uid 时走与第 2 段完全相同的 uid 分支（同一个 Entry 查询、同样的墓碑语义）；
+//  4. 否则按路径形态解析：含 ':' 时首个冒号前为根 tag、其后为路径；不含 ':' 时用
+//     SetRoots 记录的首个根作为默认根。未调用过 SetRoots 时纯路径形态返回
+//     ErrInvalidArgument（消息含「未设置默认根」），不猜测根。
+//
+// 第 3 段是**有条件**的一跳：只有 `uid:` 之后确实是合法 uid 才生效。否则（长度不对、
+// 含 Crockford 之外的字符、前缀后为空）一律回落到第 4 段，把 "uid" 当作普通根 tag 去
+// 查路径，**不返回 ErrInvalidArgument**——这条回落规则保证「根标签恰好叫 uid」的部署
+// 仍然可用（否则该根的文档会永远解析不到，且报错信息会误导人去查 uid 格式）。
 func (s *Service) Resolve(key string) (string, error) {
 	trimmed := strings.TrimSpace(key)
 	if trimmed == "" {
@@ -235,6 +254,17 @@ func (s *Service) Resolve(key string) (string, error) {
 			return "", err
 		}
 		return e.UID, nil
+	}
+
+	// 客户端显式 uid 形态：仅当前缀之后是合法 uid 时才算命中，否则继续走路径分支。
+	if strings.HasPrefix(trimmed, uidRefPrefix) {
+		if uid := strings.TrimPrefix(trimmed, uidRefPrefix); IsUID(uid) {
+			e, err := s.Entry(uid)
+			if err != nil {
+				return "", err
+			}
+			return e.UID, nil
+		}
 	}
 
 	root, p := "", trimmed

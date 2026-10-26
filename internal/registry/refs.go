@@ -13,8 +13,15 @@
 //   - 禁止在事务内做文件 IO：先读内容 → 解析 → 再一次 ReplaceRefs。DB 是单连接
 //     （SetMaxOpenConns(1)），长事务会阻塞全部读写。
 //
-// 链接形态（C2）：seshat:<uid>#<loc> 与 seshat:<doc-id>#<loc>，doc-id 为 tag:path 或纯
-// path。解析优先级由 Service.Resolve 保证：uid → tag:path → 纯 path（默认根）。
+// 链接形态（C2 起两种，M8-C T8 起四种）：
+//   - seshat:<uid>#<loc>          裸 uid（服务端权威身份）；
+//   - seshat:uid:<uid>#<loc>      显式前缀形态，客户端（Emacs 端）产出；
+//   - seshat:<tag>:<path>#<loc>   人类可读的 doc-id（首个冒号前为根 tag）；
+//   - seshat:<path>#<loc>         纯 path，走默认根。
+//
+// 解析优先级（四段，由 Service.Resolve 承担 —— 本文件只是调用方）：空 key 报错 → 裸 uid
+// → `uid:` + 合法 uid → tag:path / 默认根纯路径；`uid:` 之后不是合法 uid 时回落
+// tag:path（因此根 tag 名为 uid 的部署仍可用）。
 package registry
 
 import (
@@ -23,6 +30,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	"seshat/internal/logging"
 	"seshat/internal/storage"
@@ -43,6 +51,27 @@ var seshatLinkPattern = regexp.MustCompile(`seshat:([^#\s)\]]+)(#[^)\]\s]+)?`)
 // 截断而非拒绝——写本身应当成功，引用图只保留前 maxRefsPerDocument 条（顺序为
 // 文本中首次出现的顺序，故结果对同一份内容稳定可复现）。
 const maxRefsPerDocument = 2000
+
+// maxTargetLogBytes 是日志里单个 target 的最大字节数。
+//
+// 日志**不是**内容通道：org 文件上限 32MiB，一条链接的 target 可以长到接近该
+// 上限（无空白的超长串），原样 `%q' 打进日志既污染日志文件，也可能把用户内容
+// 无谓地带进运维视线。因此只记前缀，超出部分以省略号收尾。
+const maxTargetLogBytes = 120
+
+// truncateForLog 把 s 截断到最多 limit 字节并补省略号；未超限时原样返回。
+//
+// 截断点回退到 UTF-8 字符边界，避免日志里出现半个多字节字符（写出来是乱码）。
+func truncateForLog(s string, limit int) string {
+	if limit <= 0 || len(s) <= limit {
+		return s
+	}
+	cut := limit
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…"
+}
 
 // Link 是解析后的引用（target 已解析为 uid），对外/内部共用。
 type Link struct {
@@ -168,7 +197,8 @@ func (s *Service) resolveLinks(sourceUID, content string) []storage.Ref {
 	for _, link := range parsed {
 		targetUID, err := s.Resolve(link.Target)
 		if err != nil {
-			log.Printf("registry: 引用目标无法解析，已忽略: source=%s target=%q", sourceUID, link.Target)
+			log.Printf("registry: 引用目标无法解析，已忽略: source=%s target=%q",
+				sourceUID, truncateForLog(link.Target, maxTargetLogBytes))
 			continue
 		}
 		key := targetUID + "#" + link.Location

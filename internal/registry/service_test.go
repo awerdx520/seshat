@@ -4,7 +4,8 @@
 //   - Apply 是「upsert 资源登记 + 追加变更事件」的单事务入口，op 语义边界明确：
 //     create 已存在视为 update（幂等重放）、update 不存在先 create、
 //     rename 保持 uid 不变且目标被占用报冲突、delete 写墓碑。
-//   - Resolve 接受三种 key 形态，优先级 uid > tag:path > 纯 path（默认根）。
+//   - Resolve 接受四种 key 形态，优先级：裸 uid > 显式 uid:<uid>（客户端形态）>
+//     tag:path > 纯 path（默认根）；"uid:" 之后不是合法 uid 时回落到 tag:path 分支。
 package registry
 
 import (
