@@ -500,7 +500,7 @@ ITEMS 的每项是 plist，键为 `:uid :root :path :kind :blob :rev :size :mtim
 
 (defun seshat-rest-get-resource (uid)
   "取单个资源的元数据（`GET /api/resources/{uid}'）。
-UID 为服务端权威身份，只含 `[0-9A-Z]'（26 位 Crockford Base32），因此直接拼进
+UID 为服务端权威身份，只含 `[0-9A-HJKMNP-TV-Z]'（26 位 Crockford Base32），因此直接拼进
 路径、无需 URL 编码。
 
 成功（200）返回 plist `(:status 200 :resource PLIST)'：PLIST 的字段与
@@ -661,46 +661,77 @@ TARGET 的父目录不存在时递归创建（`make-directory' DIR t）。
 
 ;;; 文件下载
 
-(cl-defun seshat-rest-download-file (path target &key root if-none-match)
+(defun seshat-rest--content-length (headers)
+  "取响应头 HEADERS 里 `Content-Length' 的整数值；缺失或非数字时返回 nil.
+只认纯数字（首尾空白会被去掉）：该头也可能在分段响应或异常网关返回里出现成
+无法解析的值，此时返回 nil，让调用方**跳过**大小检查而不是拒写。"
+  (let* ((raw (seshat-transport-header headers "Content-Length"))
+         (trimmed (and (stringp raw) (string-trim raw))))
+    (and trimmed
+         (string-match-p "\\`[0-9]+\\'" trimmed)
+         (string-to-number trimmed))))
+
+(cl-defun seshat-rest-download-file (path target &key root if-none-match
+                                          timeout max-bytes)
   "把远端文件 PATH 下载到本地 TARGET（`GET /api/files/{path}'）。
 PATH 为根内逻辑相对路径（可含 `/`，逐段编码后保留分隔符）；ROOT 为根 tag
 （nil 用服务端默认根，读对所有根开放）；IF-NONE-MATCH 为本地已知的 ETag，
 非 nil 时附加 `If-None-Match' 头做条件下载（命中时服务端回 304，省一次传输）。
 
+TIMEOUT 为单次请求的超时秒数（透传给 `seshat-transport-request' 的 `:timeout'，
+两个后端各自的口径见传输层；nil 表示不限）。MAX-BYTES 为允许的最大字节数（nil
+表示不限）：**落盘之前**先看响应的 `Content-Length'，数字且大于 MAX-BYTES 时
+**不写盘**、返回 `:too-large t'（并在结果里带 `:size'）——先写满磁盘再报「文件
+太大」毫无意义。`Content-Length' 取不到（无该头 / 非数字，如分段响应）时
+**跳过**检查，绝不因「不知道大小」就拒写。
+
 **落盘语义**：
 - 先把响应体（原始字节）写入 TARGET 同目录的临时文件，再 `rename-file' 替换
   TARGET——中途失败不会留下半截文件；父目录不存在时递归创建。
-- 2xx 才写盘。`304` / `416` / `403` / `404` 一律**不触碰 TARGET**（既不新建也不
-  清空/重写），调用方保留原有本地副本即可。
+- 2xx 且未超限才写盘。`304` / `416` / `403` / `404` / 超限一律**不触碰 TARGET**
+  （既不新建也不清空/重写），调用方保留原有本地副本即可。
 - 响应体按二进制安全方式写出（unibyte 缓冲区 + `write-region'），不经 UTF-8
   往返；且请求时传 `:binary t' 让传输层**跳过 UTF-8 解码**，因此两个后端都
   字节保真——EPUB / PDF / 附件经 `ondemand' 根（只走 REST）下载不会被改写。
 
-返回 plist `(:status :etag :content-type :not-modified-p :not-found
-:read-only-root :range-not-satisfiable :error …)'：`:status' 为整数状态码
-（传输失败为 nil），`:etag' / `:content-type' 取自响应头——`:etag' **带双引号**
-（服务端原样），可直接作为下次 `seshat-rest-upload-file' 的 IF-MATCH 使用。
+返回 plist `(:status :etag :content-type :size :too-large :not-modified-p
+:not-found :read-only-root :range-not-satisfiable :error …)'：`:status' 为整数
+状态码（传输失败为 nil），`:etag' / `:content-type' 取自响应头——`:etag' **带双
+引号**（服务端原样），可直接作为下次 `seshat-rest-upload-file' 的 IF-MATCH
+使用。`:size' 为 `Content-Length' 的整数值（取不到时没有该字段）。
 304 → `:not-modified-p t'；416 → `:range-not-satisfiable t'（响应体是纯文本，
-不解析 JSON）；403 → `:read-only-root t'；404 → `:not-found t'。任何状态都不
-抛错。"
+不解析 JSON）；403 → `:read-only-root t'；404 → `:not-found t'；超限 →
+`:too-large t'。任何状态都不抛错。"
   (let* ((response (seshat-transport-request
                     "GET"
                     (seshat-rest--file-url path root)
                     ;; 文件内容是原始字节（EPUB / PDF / 附件），必须让传输层
                     ;; 跳过 UTF-8 解码，否则非 UTF-8 字节会被改写。
                     :binary t
+                    :timeout timeout
                     :headers (seshat-rest--headers
                               (seshat-rest--condition-headers nil if-none-match))))
          (base (seshat-rest--file-response-base response))
          (headers (plist-get base :headers))
-         (success (seshat-rest--2xx-p (plist-get base :status))))
-    (when success
+         (success (seshat-rest--2xx-p (plist-get base :status)))
+         (size (and success (seshat-rest--content-length headers)))
+         (too-large (and success
+                         ;; 判据用 `numberp' 而不是 `integerp'：上限允许配浮点
+                         ;; （如 `1.5e8'），写成 `integerp' 会让浮点配置**静默
+                         ;; 失效**——用户以为设了闸，实际一道都没有。
+                         (numberp max-bytes)
+                         (integerp size)
+                         (> size max-bytes))))
+    (when (and success (not too-large))
       (seshat-rest--write-binary-file target (or (plist-get response :body) "")))
     (seshat-rest--result
      base
-     (list :etag (and success (seshat-transport-header headers "ETag"))
-           :content-type (and success
-                              (seshat-transport-header headers "Content-Type"))))))
+     (append (list :etag (and success (seshat-transport-header headers "ETag"))
+                   :content-type (and success
+                                      (seshat-transport-header
+                                       headers "Content-Type")))
+             (when (integerp size) (list :size size))
+             (when too-large (list :too-large t))))))
 
 
 ;;; 文件上传（条件写）
@@ -773,7 +804,7 @@ ROOT 为根 tag——只有 `mirror' 根可写，否则 403（不重试）。
 
 (defun seshat-rest-move-resource (uid to)
   "把 UID 对应的资源移动到同一根内的新路径 TO（`POST /api/resources/{uid}/move'）。
-UID 为服务端权威身份（26 位 Crockford Base32，只含 `[0-9A-Z]'），直接拼进路径；
+UID 为服务端权威身份（26 位 Crockford Base32，只含 `[0-9A-HJKMNP-TV-Z]'），直接拼进路径；
 TO 为目标相对路径（相对**同一个根**，不允许 `..` 逃逸、不允许 `.git' 或点段），
 以 JSON 请求体 `{\"to\": \"…\"}' 发送。移动后 uid 不变，事件为 `rename'。
 

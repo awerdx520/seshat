@@ -24,11 +24,30 @@
 
 ;; 阅读器（seshat-reader）与笔记（denote org）之间的双向引用通道。
 ;;
-;; 链接协议：`seshat:<doc-id>#<location>'，`#<location>' 可省略。
+;; 链接协议（两种形态，解析端都支持，构造端各有一个函数）：
+;;
+;;   `seshat:<doc-id>#<location>'          —— doc-id 形态（历史形态，路径派生身份）
+;;   `seshat:uid:<uid>#<location>'         —— uid 形态（服务端权威身份，改名稳定）
+;;
+;; 两种形态的 `#<location>' 都可省略。
+;;
+;; 构造端**单一入口**是 `seshat-reader-reference--link-for'：它先问
+;; `seshat-reader-reference--identity'（零网络查 uid），能解析出 uid 就产 uid
+;; 形态，否则回落 doc-id 形态。全部产链接的路径（`:store' / 摘录块
+;; `--format-block'（被 `insert' 与 `insert-annotation' 复用）/ `copy-link'）都
+;; 经它，不再各自拼 doc-id；`--link' / `--uid-link' 只负责各形态的字符串拼装。
+;; `:complete' 是唯一例外——补全候选仍是人类可读的 doc-id（换 uid 会让补全不可用）。
+;; `:export' 与 `--description' 对两种形态都必须给出**可读且非空**的描述，
+;; uid 取不到本地路径时回落 `uid:<前 8 位>…'（见 `--uid-fallback-label'）。
 ;; `doc-id' 与批注模块的 `document_id' 同源（\"<根标签>:<相对路径>\"，未命中
 ;; 任何已配置根时降级为 \"local:<绝对路径>\"）；`location' 与批注的
 ;; `location' 同源同构（\"page:<n>;rect:...\"），故链接片段可直接复用批注的
 ;; 位置字符串，不新增解析器。解析时只按**最后一个** `#' 分割。
+;;
+;; uid 形态的判别靠字符集白名单而不是「有没有 `uid:' 前缀」：`uid:' 之后到
+;; 第一个 `#' 之前的部分必须是 26 位 Crockford Base32
+;; （`[0-9A-HJKMNP-TV-Z]'，排除 I/L/O/U；服务端 `internal/registry/uid.go:29'）
+;; 才判 uid 形态，否则回落 doc-id 形态——这样把根标签取名为 `uid' 仍是合法的。
 ;;
 ;; 转义不变量：`document_id' **不得包含 `#' 与 `%'**。本模块禁用任何百分号
 ;; 转义（`url-hexify-string' 会连 `:'、`/' 一起转义、破坏 doc-id 可读性，
@@ -69,6 +88,21 @@
 (declare-function org-back-to-heading "org" (&optional invisible-ok))
 (declare-function org-outline-level "org" ())
 (declare-function outline-next-heading "outline" ())
+
+;; 项目层（`seshat-state' / `seshat-sync'）对本模块是**软依赖**：本文件**不
+;; require** 它们（vendored reader 包对项目层保持单向软依赖；反向 require 会
+;; 成环，也会把状态库拖进 reader 的加载链）。调用处一律 `fboundp' 守卫 +
+;; `funcall'，此处只声明签名——`make' 的编译命令含 `-L ..'，签名可见故不产生
+;; 「函数未定义」告警。
+(declare-function seshat-state-path-for-uid "seshat-state" (uid))
+(declare-function seshat-state-uid-for-path "seshat-state" (root path))
+(declare-function seshat-state-roots "seshat-state" ())
+(declare-function seshat-sync--local-path "seshat-sync" (root-dir path))
+;; 按需下载的软依赖：`seshat-library-fetch'（项目层 `seshat-library'）。同样
+;; **只声明不 require**——reader 包对项目层是单向软依赖（见 D7），反向 require
+;; 会成环。`seshat-library-fetch' 内部自带六步取书事务与 `user-error' 报错，
+;; 本模块只负责「本地没有就请求它」。
+(declare-function seshat-library-fetch "seshat-library" (uid &optional force))
 
 (defgroup seshat-reader-reference nil
   "笔记与阅读器之间的 `seshat:' 链接协议与摘录插入."
@@ -116,6 +150,69 @@ visiting buffer 时无从得知「当前 headline」与光标，一并回退为
 
 ;;; 纯函数层
 
+(defconst seshat-reader-reference--uid-format-regexp
+  "\\`[0-9A-HJKMNP-TV-Z]\\{26\\}\\'"
+  "服务端 uid 的权威形态：26 位 Crockford Base32，排除 I / L / O / U.
+字符集逐字取自服务端 `internal/registry/uid.go:29' 的
+`^[0-9A-HJKMNP-TV-Z]{26}$'（依据见 `docs/adr/0003-uid-identity-model.md:18'）；
+`seshat-rest.el' 里既有的 `[0-9A-Z]' 写法是不精确的，一律以服务端代码为准。
+本常量只做**形态校验**（解析判别与构造前置条件），不提供生成能力。
+
+**匹配时必须绑定 `case-fold-search` 为 nil**（见
+`seshat-reader-reference--uid-string-p'）：`string-match-p' 默认受
+`case-fold-search'（默认 t）影响，会让 `[A-Z]' 连小写字母一起匹配，从而把
+小写串误判为合法 uid。")
+
+(defun seshat-reader-reference--uid-string-p (string)
+  "判断 STRING 是否为服务端 uid 形态（26 位 Crockford Base32），大小写敏感.
+`string-match-p' 默认受 `case-fold-search'（默认值为 t）影响，`[A-Z]' 会连
+小写字母一起匹配；uid 是**全大写**的权威形态，小写串必须判为不合法（否则
+`uid:01j8zkq2...' 这类错拼会被当成 uid 形态静默接受），故此处显式把
+`case-fold-search' 绑为 nil。
+
+STRING 非字符串时返回 nil，不抛错。"
+  (and (stringp string)
+       (let ((case-fold-search nil))
+         (string-match-p seshat-reader-reference--uid-format-regexp string))))
+
+(defun seshat-reader-reference--uid-fallback-label (uid)
+  "返回 UID 的回落可读标识，**绝不返回空串**.
+格式（与 `docs/emacs-reader.md' 的说明、ERT 断言三处逐字一致）：UID 长度大于
+8 时取前 8 位再加省略号 `…'（如 `uid:01J8ZKQ2…'），不大于 8 时原样输出
+`uid:<uid>'；UID 非字符串或为空串时返回 \"（未知文档）\"。
+
+为什么需要它：uid 形态的 `seshat:' 链接**不可读**，可读性由链接描述承担
+（`[[seshat:uid:X][书名 第 3 页]]'）。本地状态库查不到该 uid 时（尚未下载、
+状态库被清、跨机同步未到）仍必须给出**可辨识、非空**的标识，否则 org 导出与
+摘录块会出现空描述。"
+  (cond
+   ((not (stringp uid)) "（未知文档）")
+   ((string-empty-p uid) "（未知文档）")
+   ((> (length uid) 8) (concat "uid:" (substring uid 0 8) "…"))
+   (t (concat "uid:" uid))))
+
+(defun seshat-reader-reference--uid-like-p (string)
+  "判断 STRING 是否应按 uid 处理（供 `--description' / `:export' 选择分支）.
+两条判据**任一**成立：
+
+1. 权威 uid 形态：26 位 Crockford Base32（见 `--uid-string-p'）。
+2. 「裸 uid 串」：非空、不含 `:' / `#' / `%'，且全部字符属 Crockford Base32
+   字符集 `[0-9A-HJKMNP-TV-Z]'。
+
+判据 2 为什么必要：doc-id 必含 `:'（\"<标签>:<相对路径>\" 或
+\"local:<绝对路径>\"），因此**不含 `:' 的串不可能是合法 doc-id**；把这类串按
+uid 处理，才能对「形态不全 / 被截断」的 uid 也给出可辨识的回落标识
+（`--uid-fallback-label'），并让「uid 长度不大于 8」这一回落分支可达。
+
+判据 2 **不放宽** `--parse-link' 的判别：链接形态仍要求权威 26 位 uid，否则
+根标签取名为 `uid' 的 doc-id 会被误判（见 `--parse-link' 的 docstring）。"
+  (and (stringp string)
+       (not (string-empty-p string))
+       (let ((case-fold-search nil))
+         (or (string-match-p seshat-reader-reference--uid-format-regexp string)
+             (and (not (string-match-p "[:#%]" string))
+                  (string-match-p "\\`[0-9A-HJKMNP-TV-Z]+\\'" string))))))
+
 (defun seshat-reader-reference--doc-id-check-encodable (doc-id)
   "校验 DOC-ID 可承载于 `seshat:' 链接，通过时原样返回.
 DOC-ID 为 nil、空串、非字符串或含 `#'/`%' 时以 `user-error' 报错：消息含
@@ -142,28 +239,113 @@ DOC-ID 先经 `seshat-reader-reference--doc-id-check-encodable' 校验。LOCATIO
         (concat base "#" location)
       base)))
 
-(defun seshat-reader-reference--parse-link (link)
-  "把 LINK 解析为 plist `(:doc-id DOC :location LOC)'，非法时返回 nil.
-LINK 可带或不带 \"seshat:\" 前缀；剥掉前缀后按**最后一个** `#' 分割为
-doc-id 与 location（`#' 本身不接受转义，见 Commentary）。无 `#'' 时
-`:location' 为 nil，但该键仍然存在，便于调用方用 `plist-get' 判定。
-LINK 非字符串、剥前缀后为空、或 `#' 之前的 doc-id 为空时返回 nil。
+(defun seshat-reader-reference--link-for (doc-id &optional location)
+  "为 DOC-ID 与可选 LOCATION 构造 `seshat:' 链接，形态由身份入口决定.
+`--identity' 给出 `(:uid UID)' 时用 `--uid-link' 产 uid 形态
+（\"seshat:uid:<uid>[#LOCATION]\"）；给出 `(:doc-id DOC)' 时用 `--link' 产
+doc-id 形态（与引入本函数前的行为**逐字一致**）。DOC-ID 为 nil 时返回 nil——
+调用方据此不产链接（`--identity' 对 nil 返回 `:doc-id` 为 nil 的 plist，若继续走
+`--link' 会抛 `user-error' 把整条命令打崩）。
 
-尾部裸 `#'（location 为空串，如 \"seshat:ebook:a.pdf#\"）归一为 nil：空
-location 与「无 location」语义相同，两种写法解析结果一致。"
+本函数是**全部产链接路径的单一构造入口**：`:store'（`org-store-link'）、摘录块
+（`--format-block'，被 `insert' 与 `insert-annotation' 复用）与 `copy-link' 都经
+它决定形态，不再各自拼 doc-id；`:complete' **不**经它（候选仍是人类可读的
+doc-id，换成 uid 会让补全不可用，见 `--complete-link'）。
+
+软依赖口径（设计行为，非降级补丁）：`seshat-state' 未加载、或路径未登记时
+`--identity' 返回 `(:doc-id ...)'，本函数据此产 doc-id 形态而**不报错**——产链接
+不能因为查不到 uid 就失败。"
+  (when doc-id
+    (let* ((identity (seshat-reader-reference--identity doc-id))
+           (uid (plist-get identity :uid))
+           (doc (plist-get identity :doc-id)))
+      (cond
+       ((and (stringp uid) (not (string-empty-p uid)))
+        (seshat-reader-reference--uid-link uid location))
+       ((and (stringp doc) (not (string-empty-p doc)))
+        (seshat-reader-reference--link doc location))))))
+
+(defun seshat-reader-reference--uid-link (uid &optional location)
+  "由 UID 与可选 LOCATION 构造 uid 形态的 `seshat:' 链接字符串.
+返回 \"seshat:uid:<uid>\"；LOCATION 非空（非 nil 且非空串）时追加
+\"#<location>\"，否则只返回整篇文档的链接。
+
+UID 必须是 26 位 Crockford Base32（见
+`seshat-reader-reference--uid-format-regexp'），否则 `error'——uid 来自状态库
+或服务端，不该由用户手填，故这属**编程错误**而不是用户输入错误，不用
+`user-error'。
+
+与 `seshat-reader-reference--link' **分成两个函数**（不复用同一签名）：两者
+参数语义不同——doc-id 形态要先过 `#'/`%' 的转义不变量校验，uid 的字符集天然
+不含 `#'；合并会让调用方无法从签名判断该产哪种形态。"
+  (unless (seshat-reader-reference--uid-string-p uid)
+    (error "Seshat Reader reference: %S 不是 26 位 Crockford Base32 uid，无法构造 uid 形态链接"
+           uid))
+  (let ((base (concat "seshat:uid:" uid)))
+    (if (and (stringp location) (not (string-empty-p location)))
+        (concat base "#" location)
+      base)))
+
+(defun seshat-reader-reference--parse-doc-id (s)
+  "把已剥掉 \"seshat:\" 前缀的字符串 S 解析为 doc-id 形态 plist.
+返回 `(:uid nil :doc-id DOC :location LOC)'：`:uid' 恒为 nil（本函数只处理
+doc-id 形态），`:doc-id' 与 `:location' 按**最后一个** `#' 分割得出，无 `#'
+时 `:location' 为 nil。空 location（尾部裸 `#'）归一为 nil，与「无 location」
+语义一致。`#' 之前的 doc-id 为空时返回 nil。
+
+抽成独立函数是为了让 uid 形态的回落分支（`uid:' 之后不是合法 26 位串）与
+普通 doc-id 形态**共用同一份**分割逻辑，避免两处口径漂移。"
+  (cond
+   ((string-match "#\\([^#]*\\)\\'" s)
+    (let ((doc-id (substring s 0 (match-beginning 0)))
+          (loc (match-string 1 s)))
+      (unless (string-empty-p doc-id)
+        (list :uid nil
+              :doc-id doc-id
+              :location (and (not (string-empty-p loc)) loc)))))
+   (t (list :uid nil :doc-id s :location nil))))
+
+(defun seshat-reader-reference--parse-link (link)
+  "把 LINK 解析为 plist `(:uid UID :doc-id DOC :location LOC)'，非法时返回 nil.
+LINK 可带或不带 \"seshat:\" 前缀。三形态的判别顺序**固定**：
+
+1. 剥前缀后以 `uid:' 开头，**且** `uid:' 之后到第一个 `#' 之前的部分匹配
+   `seshat-reader-reference--uid-format-regexp'（26 位 Crockford Base32，
+   排除 I/L/O/U）→ **uid 形态**：`:uid' 为该串、`:doc-id' 为 nil。
+2. 以 `uid:' 开头但后半不匹配上述正则 → **回落 doc-id 形态**：把 `uid' 当作
+   普通根标签，`:doc-id' 为 \"uid:...\"、`:uid' 为 nil。因此根标签取名为 `uid'
+   仍然合法；只有「根标签是 `uid' 且相对路径恰好是 26 位大写字母数字」这一
+   极端组合会被误判为 uid 形态（已知取舍，见计划「已知取舍」）。
+3. 其余形态（`local:' / `tag:path' / 无前缀）→ 交给
+   `seshat-reader-reference--parse-doc-id'，行为与引入 uid 形态前**逐字一致**。
+
+三个键**始终存在**：非 uid 形态下 `:uid' 为 nil，调用方可统一 `plist-get'
+而无需 `plist-member' 判定。LINK 非字符串、剥前缀后为空、或 `#' 之前的
+doc-id 为空时返回 nil。尾部裸 `#'（location 为空串）归一为 nil：空 location
+与「无 location」语义相同。"
   (when (stringp link)
-    (let ((s (if (string-prefix-p "seshat:" link)
-                 (substring link (length "seshat:"))
-               link)))
+    (let* ((s (if (string-prefix-p "seshat:" link)
+                  (substring link (length "seshat:"))
+                link))
+           ;; `case-fold-search' 绑 nil：`uid:' 前缀与 uid 形态都是严格大写的
+           ;; 协议串，小写 `UID:' / 小写 uid 一律不算 uid 形态（否则错拼会被
+           ;; 静默接受成 uid 形态）。
+           (uid-match (let ((case-fold-search nil))
+                        (string-match
+                         "\\`uid:\\([^#]*\\)\\(?:#\\(.*\\)\\)?\\'" s))))
       (cond
        ((string-empty-p s) nil)
-       ((string-match "#\\([^#]*\\)\\'" s)
-        (let ((doc-id (substring s 0 (match-beginning 0)))
-              (loc (match-string 1 s)))
-          (unless (string-empty-p doc-id)
-            (list :doc-id doc-id
-                  :location (and (not (string-empty-p loc)) loc)))))
-       (t (list :doc-id s :location nil))))))
+       (uid-match
+        (let ((candidate (match-string 1 s))
+              (loc (match-string 2 s)))
+          (if (seshat-reader-reference--uid-string-p candidate)
+              (list :uid candidate
+                    :doc-id nil
+                    :location (and (stringp loc)
+                                   (not (string-empty-p loc))
+                                   loc))
+            (seshat-reader-reference--parse-doc-id s))))
+       (t (seshat-reader-reference--parse-doc-id s))))))
 
 (defun seshat-reader-reference--file-from-doc-id (doc-id)
   "把 DOC-ID 反解析为本地绝对文件路径；无法解析时返回 nil.
@@ -183,6 +365,106 @@ location 与「无 location」语义相同，两种写法解析结果一致。"
                               seshat-reader-annotation-roots)))
         (when entry
           (expand-file-name rel (expand-file-name (cdr entry)))))))))
+
+;;; uid → 本地路径（零网络，软依赖项目层）
+
+(defun seshat-reader-reference--sync-root-dir (root)
+  "返回根 tag ROOT 在 `seshat-state-roots' 里配置的本地目录（带结尾斜杠）.
+`seshat-state-roots'（元素形如 `(TAG DIR MODE)'）是**软依赖**：函数不存在
+（`seshat-state' 未加载）时返回 nil；ROOT 未配置、或配置的 DIR 不是非空字符串
+时同样返回 nil。返回 nil 时 `seshat-reader-reference--file-from-uid' 直接给出
+nil，**不凭空拼路径**——根与本地目录的对应关系只有用户配置说得清。"
+  (when (and (stringp root) (fboundp 'seshat-state-roots))
+    (let ((dir (nth 1 (assoc root (funcall 'seshat-state-roots)))))
+      (when (and (stringp dir) (not (string-empty-p dir)))
+        (file-name-as-directory (expand-file-name dir))))))
+
+(defvar seshat-reader-reference--uid-path-warned nil
+  "回落分支的警告是否已发出（**只警告一次**，避免每次 follow 都刷满 echo area）.")
+
+(defun seshat-reader-reference--uid-local-path (root-dir path)
+  "把 ROOT-DIR 与相对路径 PATH 拼成绝对路径并做越界校验；无法安全校验时返回 nil.
+**只走软依赖** `seshat-sync--local-path'（`seshat-sync' 已加载时口径与同步引擎
+完全一致：拒绝绝对路径 / `~' 前缀 / Windows 盘符前缀 / `..' 穿越，并用
+`file-truename' 覆盖符号链接逃逸）。
+
+该函数不可用时**不回落任何自写弱校验**，直接返回 nil 并 `display-warning'
+一次（用 `seshat-reader-reference--uid-path-warned' 保证幂等）：原先那份
+「`expand-file-name' 归一后判前缀」的校验缺 `file-truename' 双校验，符号链接
+指向根外时判不出来，且 PATH 为 \".\" 时会返回根目录本身——安全优先，宁可解析
+失败（`--file-from-uid' 因此返回 nil，调用方会提示需加载 `seshat-sync'）也不猜
+路径。"
+  (if (fboundp 'seshat-sync--local-path)
+      (funcall 'seshat-sync--local-path root-dir path)
+    (unless seshat-reader-reference--uid-path-warned
+      (setq seshat-reader-reference--uid-path-warned t)
+      (display-warning
+       'seshat-reader-reference
+       "需加载 seshat-sync 才能安全解析 uid 路径"
+       :warning))
+    nil))
+
+(defun seshat-reader-reference--file-from-uid (uid)
+  "把 UID 反解析为本地绝对文件路径；取不到时返回 nil（**零网络**、不抛错）.
+路径来源全部是本地状态库：`seshat-state-path-for-uid'（软依赖，零网络）给出
+`(ROOT . PATH)'，再用 `seshat-state-roots' 里 ROOT 的 DIR 拼绝对路径，并做
+越界校验（见 `seshat-reader-reference--uid-local-path'）。
+
+下列任一情形返回 nil：UID 不是非空字符串、`seshat-state' 未加载、UID 未登记
+（墓碑 / 孤儿条目已由 `seshat-state-path-for-uid' 排除）、ROOT 未配置 DIR、
+PATH 越界、**`seshat-sync--local-path' 不可用**（此时无法做 `file-truename'
+双校验，安全优先一律返回 nil，见 `seshat-reader-reference--uid-local-path'）。
+**不抛错**：调用方（`:follow'）据此给用户提示，不该因状态库缺项就让整条 org
+链接命令崩掉。
+
+与 `seshat-reader-reference--file-from-doc-id' 的分工：本函数给 uid 形态用，
+那个给 doc-id 形态用；两者都是零网络纯查表，不发起任何请求。"
+  (when (and (stringp uid) (not (string-empty-p uid))
+             (fboundp 'seshat-state-path-for-uid))
+    (let ((loc (funcall 'seshat-state-path-for-uid uid)))
+      (when (and (consp loc) (stringp (cdr loc)))
+        (let ((dir (seshat-reader-reference--sync-root-dir (car loc))))
+          (when dir
+            (seshat-reader-reference--uid-local-path dir (cdr loc))))))))
+
+(defun seshat-reader-reference--identity (doc-id)
+  "把 DOC-ID 解析为权威身份 plist：查得到 uid 时 `(:uid UID)'，否则 `(:doc-id DOC)'.
+DOC-ID 为 nil 或非字符串时返回 `(:doc-id nil)'——调用方据此什么都不产（不报错、
+不产空链接）。
+
+解析链**全程零网络**：`seshat-reader-reference--file-from-doc-id' 得本地绝对
+路径 → `seshat-reader-annotation--root-match' 得 `(TAG . DIR)' →
+`file-relative-name' 得相对路径 → **软依赖** `seshat-state-uid-for-path' 查
+uid。查到 uid 返回 `(:uid UID)'；查不到（`seshat-state' 未加载 / uid 未登记 /
+文档不在任何已配置根下）回落 `(:doc-id DOC)'，**不报错**——产链接的路径不能
+因为查不到 uid 就失败。
+
+为什么查 uid 要先过 `seshat-reader-annotation-roots'：`seshat-state' 的路径索引
+键是 `(ROOT . PATH)'，ROOT 是**服务端根标签**，而 DOC-ID 的标签来自批注模块的
+根配置。两套根配置并存是既知取舍（见 `docs/emacs-reader.md' 与 tech-debt），
+这里按 DOC-ID 的标签口径反查路径再求相对名，因此两套配置必须能映射到同一
+路径才查得到 uid；查不到就回落 doc-id 形态。
+
+本函数是**产链接路径的单一身份入口**：`:store' / 摘录 / 批注引用 / `copy-link'
+都应经它决定形态，不各自拼 doc-id。"
+  (if (not (stringp doc-id))
+      (list :doc-id nil)
+    (let* ((file (seshat-reader-reference--file-from-doc-id doc-id))
+           (truename (and file
+                          (ignore-errors
+                            (file-truename (expand-file-name file)))))
+           (match (and truename
+                       (ignore-errors
+                         (seshat-reader-annotation--root-match truename))))
+           (uid (and match
+                     (fboundp 'seshat-state-uid-for-path)
+                     (ignore-errors
+                       (funcall 'seshat-state-uid-for-path
+                                (car match)
+                                (file-relative-name truename (cdr match)))))))
+      (if (and (stringp uid) (not (string-empty-p uid)))
+          (list :uid uid)
+        (list :doc-id doc-id)))))
 
 ;;; 链接补全候选（`:complete' 的数据层）
 
@@ -238,17 +520,49 @@ location 与「无 location」语义相同，两种写法解析结果一致。"
           (cons current (delete current sorted))
         sorted))))
 
+(defun seshat-reader-reference--uid-file-name (uid)
+  "零网络取 UID 对应文档的文件名；取不到时返回 nil.
+经 `seshat-reader-reference--file-from-uid'（纯查本地状态库，不发起任何请求）
+得到绝对路径后取 `file-name-nondirectory'。路径取不到、或文件名恰为空串时返回
+nil——「什么算取不到」只在这里判定，避免调用方各写一遍。"
+  (let ((file (seshat-reader-reference--file-from-uid uid)))
+    (when (stringp file)
+      (let ((name (file-name-nondirectory file)))
+        (and (not (string-empty-p name)) name)))))
+
 (defun seshat-reader-reference--description (doc-id &optional location)
-  "为 DOC-ID 与可选 LOCATION 生成人类可读的链接描述.
-页取自 `seshat-reader-annotation--page-from-location'（1-based）；文件名取
-DOC-ID 中第一个 `:' 之后部分的 `file-name-nondirectory'（`local:' 前缀的
-DOC-ID 因此取绝对路径为其后的部分）。页非 nil 时返回 \"<文件名> 第 <页>
-页\"，否则只返回文件名。"
+  "为 DOC-ID / UID 与可选 LOCATION 生成人类可读的链接描述，**绝不返回空串**.
+DOC-ID 的参数语义已扩为「doc-id 或 uid 或 nil」，判定顺序**固定**：
+
+1. 按 uid 处理（判据见 `seshat-reader-reference--uid-like-p'）→ 零网络经
+   `seshat-reader-reference--uid-file-name' 取文件名；取不到路径时回落
+   `seshat-reader-reference--uid-fallback-label' 的可辨识标识
+   （`uid:<前 8 位>…'；uid 长度不大于 8 时原样 `uid:<uid>'）。
+2. 其它非空字符串 → 取第一个 `:' 之后部分的 `file-name-nondirectory'
+   （历史行为，逐字不变；`local:' 前缀的 doc-id 因此取绝对路径的文件名）。
+3. nil / 非字符串 / 空串 → \"（未知文档）\"。
+
+**不得返回空串**：uid 形态的链接本身不可读，可读性全由描述承担；描述为空会让
+org 导出与摘录块出现空描述，用户也无从判断链接指向什么。
+
+页取自 `seshat-reader-annotation--page-from-location'（1-based，逻辑不变）；
+页非 nil 时返回 \"<名字> 第 <页> 页\"，否则只返回名字。"
   (let* ((page (seshat-reader-annotation--page-from-location location))
-         (rest (if (and (stringp doc-id) (string-match ":" doc-id))
-                   (substring doc-id (1+ (match-beginning 0)))
-                 (or doc-id "")))
-         (name (file-name-nondirectory rest)))
+         (name (let ((raw (cond
+                           ((seshat-reader-reference--uid-like-p doc-id)
+                            (or (seshat-reader-reference--uid-file-name doc-id)
+                                (seshat-reader-reference--uid-fallback-label
+                                 doc-id)))
+                           ((and (stringp doc-id)
+                                 (not (string-empty-p doc-id)))
+                            (file-name-nondirectory
+                             (if (string-match ":" doc-id)
+                                 (substring doc-id (1+ (match-beginning 0)))
+                               doc-id)))
+                           (t "（未知文档）"))))
+                 (if (and (stringp raw) (not (string-empty-p raw)))
+                     raw
+                   "（未知文档）"))))
     (if page
         (format "%s 第 %d 页" name page)
       name)))
@@ -256,14 +570,19 @@ DOC-ID 因此取绝对路径为其后的部分）。页非 nil 时返回 \"<文�
 (defun seshat-reader-reference--format-block
     (text doc-id &optional location description)
   "把 TEXT 与 DOC-ID（及可选 LOCATION、DESCRIPTION）组装为摘录块字符串.
-链接由 `seshat-reader-reference--link' 生成；DESCRIPTION 为空时用
-`seshat-reader-reference--description' 现算。最终按
+链接由 `seshat-reader-reference--link-for' 生成——**能解析出 uid 时是 uid 形态**
+（\"seshat:uid:<uid>[#LOCATION]\"），否则回落 doc-id 形态；DOC-ID 为 nil 时
+不产链接（链接占位符以空串填充，不写出 nil 字样）。DESCRIPTION 为空时用
+`seshat-reader-reference--description' 现算（uid 形态同样给出非空描述）。最终按
 `seshat-reader-reference-format' 用 `format' 代入正文 / 链接 / 描述三个
-占位符，TEXT 为 nil 时以空串填充。"
-  (let ((link (seshat-reader-reference--link doc-id location))
+占位符，TEXT 为 nil 时以空串填充。
+
+`:store' / `insert' / `insert-annotation' / `copy-link' 与摘录块共用同一形态
+入口（`--link-for'），本函数改形态后四条路径同时生效。"
+  (let ((link (seshat-reader-reference--link-for doc-id location))
         (desc (or description
                   (seshat-reader-reference--description doc-id location))))
-    (format seshat-reader-reference-format (or text "") link desc)))
+    (format seshat-reader-reference-format (or text "") (or link "") desc)))
 
 (defun seshat-reader-reference--summary (text)
   "把 TEXT 压缩为单行摘要（薄封装，复用批注模块的实现）.
@@ -360,43 +679,102 @@ buffer）时在该 buffer 中插入到 `seshat-reader-reference--insert-position
 
 ;;; 链接注册与 :follow / :store / :complete
 
+(defun seshat-reader-reference--display-file (file)
+  "在阅读器中显示 FILE：复用已有 reader buffer，否则新开文档.
+复用判据：`find-buffer-visiting'（它会做路径规范化，**不用** `get-file-buffer'，
+其精确字符串匹配会因路径归一化差异而静默失效）命中且该 buffer 的
+`major-mode' 为 `seshat-reader-mode' 时 `pop-to-buffer'；否则调用
+`seshat-reader-open-doc' 新开文档。
+
+doc-id 形态与 uid 形态**共用**本函数：两种链接最终都是「显示一个本地文件」，
+各写一套 `pop-to-buffer' 必然口径漂移。"
+  (let ((buf (find-buffer-visiting file)))
+    (if (and buf
+             (eq (buffer-local-value 'major-mode buf) 'seshat-reader-mode))
+        (pop-to-buffer buf)
+      (seshat-reader-open-doc file))))
+
+(defun seshat-reader-reference--goto-location (parsed)
+  "按 PARSED（`--parse-link' 的结果）的 `:location' 跳到对应页.
+location 含 `page:<n>' 时用 `seshat-reader-goto-page' 跳到该 1-based 页
+（**不再加 1**）；`rect:' 部分不产生任何 UI 动作（本模块无高亮能力，rect 仅
+承载信息）；无 location、或 location 不含页码时什么都不做。"
+  (let ((page (seshat-reader-annotation--page-from-location
+               (plist-get parsed :location))))
+    (when page
+      (seshat-reader-goto-page page))))
+
+(defun seshat-reader-reference--fetch-library (uid)
+  "按需下载 UID 对应的书，返回本地绝对路径；失败时 `user-error'.
+软依赖 `seshat-library-fetch'（项目层 `seshat-library'，按 D7 的**单向**依赖
+纪律只探测不 require）：
+
+- 函数不存在（`seshat-library' 未加载）→ `user-error'：此时既无本地副本也无
+  下载能力，只能明确告知用户缺什么；**不自行 require**（reader 包反向依赖
+  项目层会成环）。
+- 函数可用 → `(funcall \\='seshat-library-fetch UID)'：返回非空字符串即本地
+  绝对路径；返回 nil（取书失败，细节由该函数 `display-warning' 到
+  `*Warnings*' / echo area）→ `user-error'，定位信息交给那边的提示。
+
+为什么用 `fboundp' + `funcall' 而不是直接调用：本文件不 require
+`seshat-library'，直接调用在未加载时会 `void-function'，错误信息对用户毫无
+指向性。"
+  (unless (fboundp 'seshat-library-fetch)
+    (user-error "Seshat Reader reference: uid 形态链接需要 `seshat-library'（未加载）且本地无副本，无法打开：%s"
+                uid))
+  (let ((file (funcall 'seshat-library-fetch uid)))
+    (unless (and (stringp file) (not (string-empty-p file)))
+      (user-error "Seshat Reader reference: 取书失败（详见 `*Warnings*' / echo area）：%s"
+                  uid))
+    file))
+
 (defun seshat-reader-reference-open (path &optional _arg)
   "打开 PATH 指向的文档并跳到链接记录的位置.
 PATH 为 `seshat:' 链接的路径部分（可带或不带 \"seshat:\" 前缀），本函数是
-`org-link-set-parameters' 的 `:follow' 处理函数。解析出的 doc-id 经
-`seshat-reader-reference--file-from-doc-id' 反解析为本地绝对路径；doc-id
-无法解析、标签未知或文件不存在时 `user-error'。
+`org-link-set-parameters' 的 `:follow' 处理函数。解析结果**按形态分流**：
 
-打开文档时优先复用已存在且 major-mode 为 `seshat-reader-mode' 的 buffer：
-用 `find-buffer-visiting'（它会做路径规范化），**不用** `get-file-buffer'
-（其精确字符串匹配会因路径归一化差异而静默失效）；未命中复用条件时调用
-`seshat-reader-open-doc' 新开文档。location 含 `page:<n>' 时用
-`seshat-reader-goto-page' 跳到该 1-based 页（**不再加 1**）；`rect:' 部分
-不产生任何 UI 动作（本模块无高亮能力，rect 仅承载信息）。
+1. **uid 形态**（`--parse-link' 给出 `:uid'）：先经
+   `seshat-reader-reference--file-from-uid' **零网络**查本地副本，文件存在就
+   直接打开；本地查不到路径**或**查到的文件不存在时按需下载——见
+   `seshat-reader-reference--fetch-library'（软依赖 `seshat-library-fetch'，
+   依赖缺失或取书失败都 `user-error'）。
+2. **doc-id 形态**（`:doc-id' 非 nil）：经
+   `seshat-reader-reference--file-from-doc-id' 反解析为本地绝对路径；doc-id
+   无法解析、标签未知或文件不存在时 `user-error'。行为与引入 uid 形态前一致。
+
+两形态的「显示」与「跳页」共用 `--display-file' / `--goto-location'：优先复用
+已存在且 major-mode 为 `seshat-reader-mode' 的 buffer（判据是
+`find-buffer-visiting'，**不用** `get-file-buffer'——其精确字符串匹配会因路径
+归一化差异而静默失效）；未命中复用条件时调用 `seshat-reader-open-doc' 新开
+文档。location 含 `page:<n>' 时用 `seshat-reader-goto-page' 跳到该 1-based
+页（**不再加 1**）；`rect:' 部分不产生任何 UI 动作（本模块无高亮能力，rect
+仅承载信息）。
 
 可选 _ARG 为 org `:follow' 传入的前缀参数，本实现忽略。"
   (let* ((link (if (string-prefix-p "seshat:" path)
                    path
                  (concat "seshat:" path)))
          (parsed (seshat-reader-reference--parse-link link))
+         (uid (plist-get parsed :uid))
          (doc-id (plist-get parsed :doc-id)))
-    (unless doc-id
-      (user-error "Seshat Reader reference: 链接格式非法，无法解析：%s" path))
-    (let ((file (seshat-reader-reference--file-from-doc-id doc-id)))
-      (unless file
-        (user-error "Seshat Reader reference: 未在 `seshat-reader-annotation-roots' 中找到标签，或链接格式非法：%s"
-                    doc-id))
-      (unless (file-exists-p file)
-        (user-error "Seshat Reader reference: 文档不存在：%s" file))
-      (let ((buf (find-buffer-visiting file)))
-        (if (and buf
-                 (eq (buffer-local-value 'major-mode buf) 'seshat-reader-mode))
-            (pop-to-buffer buf)
-          (seshat-reader-open-doc file)))
-      (let ((page (seshat-reader-annotation--page-from-location
-                   (plist-get parsed :location))))
-        (when page
-          (seshat-reader-goto-page page))))))
+    (cond
+     (uid
+      (let ((local (seshat-reader-reference--file-from-uid uid)))
+        (seshat-reader-reference--display-file
+         (if (and local (file-exists-p local))
+             local
+           (seshat-reader-reference--fetch-library uid)))))
+     (doc-id
+      (let ((file (seshat-reader-reference--file-from-doc-id doc-id)))
+        (unless file
+          (user-error "Seshat Reader reference: 未在 `seshat-reader-annotation-roots' 中找到标签，或链接格式非法：%s"
+                      doc-id))
+        (unless (file-exists-p file)
+          (user-error "Seshat Reader reference: 文档不存在：%s" file))
+        (seshat-reader-reference--display-file file)))
+     (t
+      (user-error "Seshat Reader reference: 链接格式非法，无法解析：%s" path)))
+    (seshat-reader-reference--goto-location parsed)))
 
 (defun seshat-reader-reference-store-link (&optional _interactive)
   "为 `org-store-link' 生成当前阅读位置的 `seshat:' 链接并返回 t.
@@ -408,7 +786,9 @@ PATH 为 `seshat:' 链接的路径部分（可带或不带 \"seshat:\" 前缀）
 取不到整数页码，说明当前缓冲区不是阅读器视图，`user-error' 提示先打开
 文档）。几何尾段只写进链接片段供将来取用，**本模块不据此渲染任何内容**。
 描述在有选区文本时用 `seshat-reader-reference--summary'，否则用
-`seshat-reader-reference--description'。
+`seshat-reader-reference--description'。链接本身由
+`seshat-reader-reference--link-for' 构造——**能零网络解析出 uid 时存的是 uid
+形态**（`seshat:uid:<uid>[#<location>]'），否则回落 doc-id 形态。
 
 可选 _INTERACTIVE 被忽略，仅为满足 org 9.7+ 对 `:store' 的首选单参签名。"
   (unless (derived-mode-p 'seshat-reader-mode)
@@ -436,7 +816,7 @@ PATH 为 `seshat:' 链接的路径部分（可带或不带 \"seshat:\" 前缀）
                         (not (string-empty-p (string-trim text))))
                    (seshat-reader-reference--summary text)
                  (seshat-reader-reference--description doc-id location)))
-         (link (seshat-reader-reference--link doc-id location)))
+         (link (seshat-reader-reference--link-for doc-id location)))
     (org-link-store-props :type "seshat" :link link :description desc)
     t))
 
@@ -472,12 +852,17 @@ nil, the export backend, the export communication channel, as a plist」，
 **恒返回字符串**，从不返回 nil。
 
 PATH 为链接路径（允许缺 \"seshat:\" 前缀，本函数自行补齐后解析）；DESC 为
-链接描述，非空时**原样采用**，为空或 nil 时用
-`seshat-reader-reference--description' 现算（\"<文件名> 第 <页> 页\"）——与
-摘录块、`:store' 的描述同源，**不重写一份**逻辑。FORMAT 为导出后端符号
-（常见取值 `html' / `latex' / `ascii' / `md' / `texinfo' / `odt' / `org'，也可能
-为 nil），本实现**对所有后端输出同一份纯文本**，不按后端区分；可选 _BACKEND
-为导出通信通道 plist，忽略。
+链接描述，非空时**原样采用**（org 已有描述时直接用，符合 org 语义），为空或 nil
+时用 `seshat-reader-reference--description' 现算——doc-id 形态得
+\"<文件名> 第 <页> 页\"，**uid 形态**同样经它得 \"<文件名> 第 <页> 页\"（零网络
+查本地状态库取文件名），与摘录块、`:store' 的描述同源，**不重写一份**逻辑。
+FORMAT 为导出后端符号（常见取值 `html' / `latex' / `ascii' / `md' / `texinfo' /
+`odt' / `org'，也可能为 nil），本实现**对所有后端输出同一份纯文本**，不按后端
+区分；可选 _BACKEND 为导出通信通道 plist，忽略。
+
+**绝不输出空串**：uid 的本地路径取不到（未下载 / 状态库无此 uid）时描述回落为
+`uid:<前 8 位>…'（见 `seshat-reader-reference--uid-fallback-label'），因此导出
+结果恒为非空文本——空描述会让读者完全看不出链接指向什么。
 
 取舍（**有意如此，不是遗漏**）：本实现不生成可点击的跨文档 URL——`seshat:'
 链接指向本机书库里的 PDF 与其页码，没有稳定的服务端 URL 方案，凭空拼一个
@@ -496,8 +881,17 @@ PATH 无法解析（非字符串、空串、剥掉 `#' 后 doc-id 为空）时**
     (cond
      ((not parsed) (concat "seshat:" (if (stringp path) path "")))
      ((and (stringp desc) (not (string-empty-p desc))) desc)
-     (t (seshat-reader-reference--description (plist-get parsed :doc-id)
-                                              (plist-get parsed :location))))))
+     (t (let* ((uid (plist-get parsed :uid))
+               (location (plist-get parsed :location))
+               ;; uid 形态下传 uid（`--description' 按 uid 分支取本地文件名），
+               ;; doc-id 形态下传 doc-id（历史行为逐字不变）。
+               (name (seshat-reader-reference--description
+                      (or uid (plist-get parsed :doc-id))
+                      location)))
+          (cond
+           ((and (stringp name) (not (string-empty-p name))) name)
+           (uid (seshat-reader-reference--uid-fallback-label uid))
+           (t "（未知文档）")))))))
 
 ;; 注册 `seshat:' 链接类型：`:follow' 收 (path arg)、`:store' 收
 ;; (interactive?)、`:complete' 收可选前缀参数并返回完整链接字符串、
@@ -561,10 +955,11 @@ T6 的批注引用复用。"
 
 (defun seshat-reader-reference-copy-link ()
   "把当前阅读位置对应的 `seshat:' 链接复制到 `kill-ring' 并提示.
-链接由 `seshat-reader-reference--link' 用当前文档标识与当前阅读位置
-（`seshat-reader-reference--current-location'）构造。"
+链接由 `seshat-reader-reference--link-for' 用当前文档标识与当前阅读位置
+（`seshat-reader-reference--current-location'）构造：**能解析出 uid 时复制 uid
+形态**，否则回落 doc-id 形态（与摘录、`:store' 同一入口，形态始终一致）。"
   (interactive)
-  (let ((link (seshat-reader-reference--link
+  (let ((link (seshat-reader-reference--link-for
                (seshat-reader-reference--current-doc-id)
                (seshat-reader-reference--current-location))))
     (kill-new link)

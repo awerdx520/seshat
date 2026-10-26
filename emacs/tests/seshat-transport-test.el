@@ -285,7 +285,7 @@ special 变量），`let' 绑定对被测代码不可见——这里改用全局
   (let ((seshat-rest-token "")
         (captured nil))
     (cl-letf (((symbol-function 'url-retrieve-synchronously)
-               (lambda (url &optional _silent _inhibit)
+               (lambda (url &optional _silent _inhibit _timeout)
                  (setq captured (list url url-request-method
                                       url-request-extra-headers
                                       url-request-data))
@@ -344,6 +344,29 @@ special 变量），`let' 绑定对被测代码不可见——这里改用全局
         ;; 桩返回的是合法 200 响应，整条 `--url' 链路必须正常收尾。
         (should (equal (plist-get response :status) 200))))
     captured))
+
+(ert-deftest seshat-transport-url-backend-passes-timeout ()
+  "`seshat-transport--url' 把 TIMEOUT 作为第四个实参交给
+`url-retrieve-synchronously'（第三参 INHIBIT-COOKIES 恒为 t）；TIMEOUT 为 nil
+或非正数时该实参为 nil（交回 url.el 默认：不设限）。"
+  (let ((captured 'not-captured))
+    (cl-letf (((symbol-function 'url-retrieve-synchronously)
+               (lambda (&rest args)
+                 (setq captured args)
+                 nil)))
+      (seshat-transport--url "GET" "https://example.com/api/x" :timeout 7)
+      (should (equal (length captured) 4))
+      (should (eq (nth 2 captured) t))
+      (should (equal (nth 3 captured) 7))
+      (setq captured 'not-captured)
+      (seshat-transport--url "GET" "https://example.com/api/x")
+      (should (null (nth 3 captured)))
+      (setq captured 'not-captured)
+      (seshat-transport--url "GET" "https://example.com/api/x" :timeout 0)
+      (should (null (nth 3 captured)))
+      (setq captured 'not-captured)
+      (seshat-transport--url "GET" "https://example.com/api/x" :timeout -3)
+      (should (null (nth 3 captured))))))
 
 (ert-deftest seshat-transport-url-backend-sends-unibyte-body-verbatim ()
   "unibyte 请求体**逐字节原样**发出，wire 形态与输入完全相同。

@@ -265,9 +265,9 @@ BASE64 为 `用户名:令牌' 的 base64 编码；令牌为空串时仍照常构
 (cl-defun seshat-transport--url (method url &key body headers timeout binary)
   "用 `url.el' 发送一次请求（`rest' 后端）。
 METHOD 为请求方法字符串；URL 为完整地址；BODY 为请求体字符串或 nil；
-HEADERS 为附加请求头 alist（认证头由本函数前置添加）；TIMEOUT 被忽略——本后端
-暂未使用 TIMEOUT（`url-retrieve-synchronously' 自 Emacs 24 起支持 timeout 参数，
-但为与旧 `seshat-rest--request' 行为保持一致而忽略它）；BINARY 非 nil 时
+HEADERS 为附加请求头 alist（认证头由本函数前置添加）；TIMEOUT 为超时秒数，
+作为 `url-retrieve-synchronously' 的 TIMEOUT 形参传入（nil 或非正数时传 nil，
+即 url.el 默认「不限时」）；BINARY 非 nil 时
 响应体按原始字节返回（unibyte 字符串，不做 UTF-8 解码），nil 时维持既有文本口径。
 返回统一契约 plist，永不抛错。
 
@@ -277,7 +277,6 @@ HEADERS 为附加请求头 alist（认证头由本函数前置添加）；TIMEOU
 这里显式分支而不依赖「`encode-coding-string' 对 unibyte 串是逐字节直通」这个
 实现细节（实测 Emacs 31.1 确实如此，但那是 Emacs 内部语义，不该由本模块默默
 承担），口径因此与 `seshat-transport--curl' 完全一致。"
-  (ignore timeout)
   (condition-case err
       (let* ((url-request-method method)
              (url-request-extra-headers
@@ -287,7 +286,10 @@ HEADERS 为附加请求头 alist（认证头由本函数前置添加）；TIMEOU
                 (if (multibyte-string-p body)
                     (encode-coding-string body 'utf-8)
                   body)))
-             (buffer (url-retrieve-synchronously url t t)))
+             ;; 第三参 INHIBIT-COOKIES 恒为 t；第四参 TIMEOUT 只在给出正数秒数时
+             ;; 生效（url.el 的契约是「nil 或非正数 = 不限时」）。
+             (buffer (url-retrieve-synchronously
+                      url t t (and (numberp timeout) (> timeout 0) timeout))))
         (if (not (buffer-live-p buffer))
             (list :status nil :error 'connection-failed
                   :message "未返回有效响应缓冲区")
@@ -419,7 +421,9 @@ METHOD 为请求方法字符串（\"GET\"、\"PUT\"、\"POST\"、\"DELETE\" 等�
 URL 为完整绝对地址；BODY 为可选的请求体字符串（UTF-8 编码后发送）；
 HEADERS 为可选附加请求头 alist（`(NAME . VALUE)'），认证头由本模块按
 `seshat-transport-backend' 前置添加，调用方不要重复提供；
-TIMEOUT 为可选超时秒数（仅 `webdav' 后端生效，`rest' 后端忽略）；
+TIMEOUT 为可选超时秒数（两个后端都生效：`rest' 后端传入
+`url-retrieve-synchronously' 的 TIMEOUT，`webdav' 后端映射为 curl
+`--max-time'；nil 或非正数表示不限）；
 BINARY 为可选「响应体是二进制」标志：nil（默认）时 `rest' 后端把响应体按
 UTF-8 解码（既有文本口径，JSON / 纯文本调用方依赖它）；非 nil 时 `:body' 为
 **原始字节的 unibyte 字符串**，全程不经编码转换——下载 EPUB / PDF / 附件等

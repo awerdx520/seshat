@@ -112,11 +112,14 @@
     (should (equal (plist-get parsed :doc-id) "ebook:a.pdf"))))
 
 (ert-deftest seshat-reader-reference-test--parse-link-accepts-missing-prefix ()
-  "带与不带 `seshat:' 前缀的输入解析结果一致."
+  "带与不带 `seshat:' 前缀的输入解析结果一致.
+只断言 `:doc-id' / `:location' 的键值（**不**整体 `equal' 整个 plist）：
+引入 uid 形态后 plist 多出 `:uid' 键，整体比较会把测试绑死在结构上。"
   (should (equal (seshat-reader-reference--parse-link "seshat:ebook:a.pdf#page:3")
                  (seshat-reader-reference--parse-link "ebook:a.pdf#page:3")))
-  (should (equal (seshat-reader-reference--parse-link "ebook:a.pdf#page:3")
-                 (list :doc-id "ebook:a.pdf" :location "page:3"))))
+  (let ((parsed (seshat-reader-reference--parse-link "ebook:a.pdf#page:3")))
+    (should (equal (plist-get parsed :doc-id) "ebook:a.pdf"))
+    (should (equal (plist-get parsed :location) "page:3"))))
 
 (ert-deftest seshat-reader-reference-test--parse-link-invalid-returns-nil ()
   "非字符串、空串与 `#' 前文档标识为空时返回 nil."
@@ -673,6 +676,865 @@ buffer 启用 `org-mode'，`point' 置 `point-min'，便于用 `search-forward' 
                            (buffer-string))
                          "既有\n追加\n")))
       (delete-file file))))
+
+;;; uid 形态（M8-C T3a：解析 + 构造 + 身份入口 + 零网络路径解析）
+
+(defconst seshat-reader-reference-test--uid "01J8ZKQ2ABCDEFGHJKMNPQRSTV"
+  "测试用合法 uid：26 位 Crockford Base32（排除 I / L / O / U）.")
+
+(ert-deftest seshat-reader-reference-test--parse-link-uid-form ()
+  "`uid:' + 合法 26 位串判为 uid 形态：`:uid' 为该串、`:doc-id' 为 nil.
+`:uid' / `:doc-id' / `:location' 三个键始终存在，便于调用方统一 `plist-get'。"
+  (let ((parsed (seshat-reader-reference--parse-link
+                 (concat "seshat:uid:" seshat-reader-reference-test--uid))))
+    (should (plist-member parsed :uid))
+    (should (plist-member parsed :doc-id))
+    (should (plist-member parsed :location))
+    (should (equal (plist-get parsed :uid) seshat-reader-reference-test--uid))
+    (should-not (plist-get parsed :doc-id))
+    (should-not (plist-get parsed :location)))
+  ;; 允许缺 `seshat:' 前缀（与 doc-id 形态一致）
+  (should (equal (plist-get (seshat-reader-reference--parse-link
+                             (concat "uid:" seshat-reader-reference-test--uid))
+                            :uid)
+                 seshat-reader-reference-test--uid)))
+
+(ert-deftest seshat-reader-reference-test--parse-link-uid-with-location ()
+  "`uid:<合法>#page:3' 的 location 为 \"page:3\"，rect 尾段完整保留."
+  (let ((parsed (seshat-reader-reference--parse-link
+                 (concat "seshat:uid:" seshat-reader-reference-test--uid
+                         "#page:3"))))
+    (should (equal (plist-get parsed :uid) seshat-reader-reference-test--uid))
+    (should-not (plist-get parsed :doc-id))
+    (should (equal (plist-get parsed :location) "page:3")))
+  (should (equal
+           (plist-get
+            (seshat-reader-reference--parse-link
+             (concat "seshat:uid:" seshat-reader-reference-test--uid
+                     "#page:112;rect:50.00,100.00,545.00,140.00"))
+            :location)
+           "page:112;rect:50.00,100.00,545.00,140.00")))
+
+(ert-deftest seshat-reader-reference-test--parse-link-uid-trailing-hash ()
+  "`uid:<合法>#'（尾部空 location）归一为 nil，uid 仍解析成功."
+  (let ((parsed (seshat-reader-reference--parse-link
+                 (concat "seshat:uid:" seshat-reader-reference-test--uid "#"))))
+    (should (equal (plist-get parsed :uid) seshat-reader-reference-test--uid))
+    (should-not (plist-get parsed :doc-id))
+    (should (plist-member parsed :location))
+    (should-not (plist-get parsed :location))))
+
+(ert-deftest seshat-reader-reference-test--parse-link-uid-empty-falls-back ()
+  "`uid:' 后为空串时回落 doc-id 形态（`:uid' 为 nil、`:doc-id' 为原文）."
+  (dolist (link '("seshat:uid:" "uid:"))
+    (let ((parsed (seshat-reader-reference--parse-link link)))
+      (should (plist-member parsed :uid))
+      (should-not (plist-get parsed :uid))
+      (should (equal (plist-get parsed :doc-id) "uid:"))
+      (should-not (plist-get parsed :location))))
+  ;; 带 location 的空 uid 同样回落，location 按既有规则解析
+  (let ((parsed (seshat-reader-reference--parse-link "seshat:uid:#page:3")))
+    (should-not (plist-get parsed :uid))
+    (should (equal (plist-get parsed :doc-id) "uid:"))
+    (should (equal (plist-get parsed :location) "page:3"))))
+
+(ert-deftest seshat-reader-reference-test--parse-link-uid-wrong-length-falls-back ()
+  "`uid:' 后长度非 26（25 / 27 位）时回落 doc-id 形态."
+  (should (= 26 (length seshat-reader-reference-test--uid)))
+  (dolist (uid (list (substring seshat-reader-reference-test--uid 0 25)
+                     (concat seshat-reader-reference-test--uid "V")))
+    (should (/= 26 (length uid)))
+    (let ((parsed (seshat-reader-reference--parse-link
+                   (concat "seshat:uid:" uid "#page:5"))))
+      (should-not (plist-get parsed :uid))
+      (should (equal (plist-get parsed :doc-id) (concat "uid:" uid)))
+      (should (equal (plist-get parsed :location) "page:5")))))
+
+(ert-deftest seshat-reader-reference-test--parse-link-uid-lowercase-falls-back ()
+  "`uid:' 后含小写字母时回落 doc-id 形态."
+  (let ((uid (downcase seshat-reader-reference-test--uid)))
+    (should (= 26 (length uid)))
+    (should (string-match-p "[a-z]" uid))
+    (let ((parsed (seshat-reader-reference--parse-link
+                   (concat "seshat:uid:" uid))))
+      (should-not (plist-get parsed :uid))
+      (should (equal (plist-get parsed :doc-id) (concat "uid:" uid))))))
+
+(ert-deftest seshat-reader-reference-test--parse-link-uid-excluded-letters-falls-back ()
+  "`uid:' 后是含 I / L / O / U 的 26 位串时回落 doc-id 形态.
+uid 的权威字符集是 Crockford Base32 `[0-9A-HJKMNP-TV-Z]'（排除 I/L/O/U），
+不是 `[0-9A-Z]'（见服务端 `internal/registry/uid.go:29'）。"
+  (dolist (uid '("01J8ZKQ2ABCDEFGHIJKLMNOPQR"   ; 含 I / L / O
+                 "01J8ZKQ2ABCDEFGHJKMNPQRSTU"))  ; 含 U
+    (should (= 26 (length uid)))
+    (should (string-match-p "[ILOU]" uid))
+    (let ((parsed (seshat-reader-reference--parse-link
+                   (concat "seshat:uid:" uid))))
+      (should-not (plist-get parsed :uid))
+      (should (equal (plist-get parsed :doc-id) (concat "uid:" uid))))))
+
+(ert-deftest seshat-reader-reference-test--parse-link-doc-id-forms-unchanged ()
+  "回归：`tag:path' / `local:' / 根 tag 名为 `uid' 的形态语义逐字不变.
+**不得**用整体 `equal' 断言 plist——新增 `:uid' 键后结构必然变化，只断言
+`:doc-id' 与 `:location' 的键值语义不变。"
+  (let ((parsed (seshat-reader-reference--parse-link "seshat:books:a.pdf")))
+    (should (plist-member parsed :uid))
+    (should-not (plist-get parsed :uid))
+    (should (equal (plist-get parsed :doc-id) "books:a.pdf"))
+    (should-not (plist-get parsed :location)))
+  (let ((parsed (seshat-reader-reference--parse-link
+                 "seshat:books:a.pdf#page:7")))
+    (should-not (plist-get parsed :uid))
+    (should (equal (plist-get parsed :doc-id) "books:a.pdf"))
+    (should (equal (plist-get parsed :location) "page:7")))
+  (let ((parsed (seshat-reader-reference--parse-link "seshat:local:/abs/x.pdf")))
+    (should-not (plist-get parsed :uid))
+    (should (equal (plist-get parsed :doc-id) "local:/abs/x.pdf"))
+    (should-not (plist-get parsed :location)))
+  (let ((parsed (seshat-reader-reference--parse-link
+                 "seshat:local:/abs/x.pdf#page:2;rect:1.00,2.00,3.00,4.00")))
+    (should-not (plist-get parsed :uid))
+    (should (equal (plist-get parsed :doc-id) "local:/abs/x.pdf"))
+    (should (equal (plist-get parsed :location)
+                   "page:2;rect:1.00,2.00,3.00,4.00")))
+  ;; 根 tag 叫 `uid' 时 `uid:foo.pdf' 仍是 doc-id 形态（不误判）
+  (let ((parsed (seshat-reader-reference--parse-link "seshat:uid:foo.pdf")))
+    (should-not (plist-get parsed :uid))
+    (should (equal (plist-get parsed :doc-id) "uid:foo.pdf"))
+    (should-not (plist-get parsed :location))))
+
+(ert-deftest seshat-reader-reference-test--uid-link-construction ()
+  "`--uid-link' 构造 uid 形态：无 location 只给整篇链接，有 location 追加 `#<location>'."
+  (let ((base (concat "seshat:uid:" seshat-reader-reference-test--uid)))
+    (should (equal (seshat-reader-reference--uid-link
+                    seshat-reader-reference-test--uid)
+                   base))
+    (should (equal (seshat-reader-reference--uid-link
+                    seshat-reader-reference-test--uid nil)
+                   base))
+    (should (equal (seshat-reader-reference--uid-link
+                    seshat-reader-reference-test--uid "")
+                   base))
+    (should (equal (seshat-reader-reference--uid-link
+                    seshat-reader-reference-test--uid "page:3")
+                   (concat base "#page:3"))))
+  ;; 构造 → 解析往返
+  (let ((parsed (seshat-reader-reference--parse-link
+                 (seshat-reader-reference--uid-link
+                  seshat-reader-reference-test--uid "page:9"))))
+    (should (equal (plist-get parsed :uid) seshat-reader-reference-test--uid))
+    (should-not (plist-get parsed :doc-id))
+    (should (equal (plist-get parsed :location) "page:9"))))
+
+(ert-deftest seshat-reader-reference-test--uid-link-rejects-illegal-uid ()
+  "非法 uid 抛 `error'（编程错误，不是 `user-error'）."
+  (dolist (bad (list nil
+                     ""
+                     "not-a-uid"
+                     (substring seshat-reader-reference-test--uid 0 25)
+                     "01J8ZKQ2ABCDEFGHIJKLMNOPQR"
+                     (downcase seshat-reader-reference-test--uid)))
+    (let ((err (should-error (seshat-reader-reference--uid-link bad))))
+      (should (eq (car err) 'error)))))
+
+(ert-deftest seshat-reader-reference-test--identity-nil-doc-id ()
+  "DOC-ID 为 nil 或非字符串时返回 `(:doc-id nil)'（调用方据此什么都不产）."
+  (should (equal (seshat-reader-reference--identity nil) (list :doc-id nil)))
+  (should (equal (seshat-reader-reference--identity 42) (list :doc-id nil)))
+  (should (equal (seshat-reader-reference--identity 'sym) (list :doc-id nil))))
+
+(ert-deftest seshat-reader-reference-test--identity-returns-uid ()
+  "软依赖 `seshat-state-uid-for-path' 查到 uid 时返回 `(:uid ...)'，实参为 `(TAG REL)'."
+  (seshat-reader-reference-test--with-temp-dir dir
+    (let* ((file (expand-file-name "book.pdf" dir))
+           (seshat-reader-annotation-roots (list (cons "ebook" dir)))
+           (asked nil))
+      (with-temp-file file)
+      (cl-letf (((symbol-function 'seshat-state-uid-for-path)
+                 (lambda (root path)
+                   (setq asked (cons root path))
+                   seshat-reader-reference-test--uid)))
+        (should (equal (seshat-reader-reference--identity "ebook:book.pdf")
+                       (list :uid seshat-reader-reference-test--uid))))
+      (should (equal asked (cons "ebook" "book.pdf"))))))
+
+(ert-deftest seshat-reader-reference-test--identity-falls-back-to-doc-id ()
+  "软依赖查不到 uid（返回 nil）时回落 `(:doc-id DOC)'."
+  (seshat-reader-reference-test--with-temp-dir dir
+    (let* ((file (expand-file-name "book.pdf" dir))
+           (seshat-reader-annotation-roots (list (cons "ebook" dir))))
+      (with-temp-file file)
+      (cl-letf (((symbol-function 'seshat-state-uid-for-path)
+                 (lambda (&rest _) nil)))
+        (should (equal (seshat-reader-reference--identity "ebook:book.pdf")
+                       (list :doc-id "ebook:book.pdf")))))))
+
+(ert-deftest seshat-reader-reference-test--identity-without-state-module ()
+  "软依赖 `seshat-state' 缺失（`fboundp' 为 nil）时回落 `(:doc-id ...)' 且不报错."
+  (seshat-reader-reference-test--with-temp-dir dir
+    (let* ((file (expand-file-name "book.pdf" dir))
+           (seshat-reader-annotation-roots (list (cons "ebook" dir)))
+           (orig (symbol-function 'fboundp)))
+      (with-temp-file file)
+      (cl-letf (((symbol-function 'fboundp)
+                 (lambda (sym)
+                   (and (not (eq sym 'seshat-state-uid-for-path))
+                        (funcall orig sym)))))
+        (should (equal (seshat-reader-reference--identity "ebook:book.pdf")
+                       (list :doc-id "ebook:book.pdf")))))))
+
+(ert-deftest seshat-reader-reference-test--identity-outside-roots ()
+  "不在任何已配置根下（`local:' 降级 doc-id 且无根命中）时回落 `(:doc-id ...)'."
+  (let ((seshat-reader-annotation-roots nil))
+    (should (equal (seshat-reader-reference--identity "local:/abs/x.pdf")
+                   (list :doc-id "local:/abs/x.pdf")))
+    (should (equal (seshat-reader-reference--identity "ghost:x.pdf")
+                   (list :doc-id "ghost:x.pdf")))))
+
+(ert-deftest seshat-reader-reference-test--file-from-uid-hit ()
+  "state 命中且根的 DIR 已配置时经 `seshat-sync--local-path' 拼出绝对路径（零网络）."
+  (seshat-reader-reference-test--with-temp-dir dir
+    (let ((seshat-reader-annotation-roots nil)
+          (asked nil))
+      (cl-letf (((symbol-function 'seshat-state-path-for-uid)
+                 (lambda (uid)
+                   (and (equal uid seshat-reader-reference-test--uid)
+                        (cons "ebook" "sub/book.pdf"))))
+                ((symbol-function 'seshat-state-roots)
+                 (lambda () (list (list "ebook" dir "mirror"))))
+                ((symbol-function 'seshat-sync--local-path)
+                 (lambda (root-dir path)
+                   (setq asked (cons root-dir path))
+                   (expand-file-name path root-dir))))
+        (should (equal (seshat-reader-reference--file-from-uid
+                        seshat-reader-reference-test--uid)
+                       (expand-file-name "sub/book.pdf" dir))))
+      ;; 传给 sync 层的是「带结尾斜杠的根目录」
+      (should (equal asked (cons (file-name-as-directory
+                                  (expand-file-name dir))
+                                 "sub/book.pdf"))))))
+
+(ert-deftest seshat-reader-reference-test--file-from-uid-without-sync-module ()
+  "软依赖 `seshat-sync--local-path' 缺失时**不再**回落弱校验：一律返回 nil 并
+`display-warning' 一次（安全优先——自写的前缀比较缺 `file-truename' 双校验，
+且 `path' 为 \".\" 时会返回根目录本身）。"
+  (seshat-reader-reference-test--with-temp-dir dir
+    (let ((orig (symbol-function 'fboundp))
+          (warnings nil)
+          (seshat-reader-reference--uid-path-warned nil))
+      (cl-letf (((symbol-function 'seshat-state-path-for-uid)
+                 (lambda (&rest _) (cons "ebook" "sub/book.pdf")))
+                ((symbol-function 'seshat-state-roots)
+                 (lambda () (list (list "ebook" dir "mirror"))))
+                ((symbol-function 'display-warning)
+                 (lambda (&rest args) (push args warnings) nil))
+                ((symbol-function 'fboundp)
+                 (lambda (sym)
+                   (and (not (eq sym 'seshat-sync--local-path))
+                        (funcall orig sym)))))
+        ;; 合法路径同样返回 nil：无法安全校验就不解析
+        (should-not (seshat-reader-reference--file-from-uid
+                     seshat-reader-reference-test--uid))
+        (should (= 1 (length warnings)))
+        ;; 幂等：第二次不再刷警告
+        (should-not (seshat-reader-reference--file-from-uid
+                     seshat-reader-reference-test--uid))
+        (should (= 1 (length warnings)))
+        ;; 越界 / 绝对路径 / `~' 前缀一并返回 nil（且不再重复警告）
+        (dolist (bad '("../../etc/passwd" "/etc/passwd" "~/x.pdf" "."))
+          (cl-letf (((symbol-function 'seshat-state-path-for-uid)
+                     (lambda (&rest _) (cons "ebook" bad))))
+            (should-not (seshat-reader-reference--file-from-uid
+                         seshat-reader-reference-test--uid))))
+        (should (= 1 (length warnings)))))))
+
+(ert-deftest seshat-reader-reference-test--file-from-uid-misses ()
+  "未登记 / 根 DIR 未配置 / uid 非法时返回 nil，不抛错."
+  ;; 未登记
+  (cl-letf (((symbol-function 'seshat-state-path-for-uid)
+             (lambda (&rest _) nil)))
+    (should-not (seshat-reader-reference--file-from-uid
+                 seshat-reader-reference-test--uid)))
+  ;; 已登记但根不在 `seshat-state-roots' 里 / DIR 为空串
+  (dolist (roots (list nil (list (list "ebook" "" "mirror"))))
+    (cl-letf (((symbol-function 'seshat-state-path-for-uid)
+               (lambda (&rest _) (cons "ebook" "book.pdf")))
+              ((symbol-function 'seshat-state-roots) (lambda () roots)))
+      (should-not (seshat-reader-reference--file-from-uid
+                   seshat-reader-reference-test--uid))))
+  ;; uid 非字符串 / 空串
+  (should-not (seshat-reader-reference--file-from-uid nil))
+  (should-not (seshat-reader-reference--file-from-uid "")))
+
+(ert-deftest seshat-reader-reference-test--file-from-uid-without-state-module ()
+  "软依赖 `seshat-state' 缺失（`fboundp' 为 nil）时返回 nil，不抛错."
+  (let ((orig (symbol-function 'fboundp)))
+    (cl-letf (((symbol-function 'fboundp)
+               (lambda (sym)
+                 (and (not (memq sym '(seshat-state-path-for-uid
+                                       seshat-state-roots)))
+                      (funcall orig sym)))))
+      (should-not (seshat-reader-reference--file-from-uid
+                   seshat-reader-reference-test--uid)))))
+
+;;; T3b：uid 形态接入全部插入与导出路径
+
+(defconst seshat-reader-reference-test--short-uid "01J8ZKQ2ABCDEFGH"
+  "测试用「不足 26 位」的 uid 串.
+用于断言描述回落标识 `uid:<前 8 位>…'；它不是权威 uid 形态（26 位），因此只能
+出现在 `--description' / `:export' 的**宽松 uid 识别**路径上（doc-id 必含
+`:'，故不含 `:' 的 Crockford Base32 串一律按 uid 处理）。")
+
+(defconst seshat-reader-reference-test--uid-expected-label "uid:01J8ZKQ2…"
+  "权威测试 uid 与短 uid 共同的回落标识（两者前 8 位相同：`01J8ZKQ2'）.")
+
+;;; `--link-for'：统一链接构造入口
+
+(ert-deftest seshat-reader-reference-test--link-for-uid-form ()
+  "`--identity' 给出 uid 时 `--link-for' 产 uid 形态（带 / 不带 location）."
+  (cl-letf (((symbol-function 'seshat-reader-reference--identity)
+             (lambda (doc-id)
+               (should (equal doc-id "ebook:a.pdf"))
+               (list :uid seshat-reader-reference-test--uid))))
+    (let ((base (concat "seshat:uid:" seshat-reader-reference-test--uid)))
+      (should (equal (seshat-reader-reference--link-for "ebook:a.pdf") base))
+      (should (equal (seshat-reader-reference--link-for "ebook:a.pdf" nil) base))
+      (should (equal (seshat-reader-reference--link-for "ebook:a.pdf" "") base))
+      (should (equal (seshat-reader-reference--link-for "ebook:a.pdf" "page:3")
+                     (concat base "#page:3"))))))
+
+(ert-deftest seshat-reader-reference-test--link-for-doc-id-fallback ()
+  "`--identity' 给出 doc-id 时回落 doc-id 形态；DOC-ID 为 nil 时返回 nil."
+  (cl-letf (((symbol-function 'seshat-reader-reference--identity)
+             (lambda (doc-id)
+               (if (stringp doc-id)
+                   (list :doc-id doc-id)
+                 (list :doc-id nil)))))
+    (should (equal (seshat-reader-reference--link-for "ebook:a.pdf")
+                   "seshat:ebook:a.pdf"))
+    (should (equal (seshat-reader-reference--link-for "ebook:a.pdf" "page:3")
+                   "seshat:ebook:a.pdf#page:3"))
+    ;; nil doc-id 不产链接（不报错、不产空链接）
+    (should-not (seshat-reader-reference--link-for nil))
+    (should-not (seshat-reader-reference--link-for nil "page:3"))))
+
+(ert-deftest seshat-reader-reference-test--link-for-real-identity-uid ()
+  "真实 `--identity' 查到 uid 时 `--link-for' 产 uid 形态（端到端，零网络）."
+  (seshat-reader-reference-test--with-temp-dir dir
+    (let* ((file (expand-file-name "book.pdf" dir))
+           (seshat-reader-annotation-roots (list (cons "ebook" dir))))
+      (with-temp-file file)
+      (cl-letf (((symbol-function 'seshat-state-uid-for-path)
+                 (lambda (&rest _) seshat-reader-reference-test--uid)))
+        (should (equal (seshat-reader-reference--link-for
+                        "ebook:book.pdf" "page:7")
+                       (concat "seshat:uid:" seshat-reader-reference-test--uid
+                               "#page:7")))))))
+
+(ert-deftest seshat-reader-reference-test--link-for-without-state-module ()
+  "软依赖 `seshat-state' 缺失时自动回落 doc-id 形态，不报错（设计行为）."
+  (seshat-reader-reference-test--with-temp-dir dir
+    (let* ((file (expand-file-name "book.pdf" dir))
+           (seshat-reader-annotation-roots (list (cons "ebook" dir)))
+           (orig (symbol-function 'fboundp)))
+      (with-temp-file file)
+      (cl-letf (((symbol-function 'fboundp)
+                 (lambda (sym)
+                   (and (not (eq sym 'seshat-state-uid-for-path))
+                        (funcall orig sym)))))
+        (should (equal (seshat-reader-reference--link-for "ebook:book.pdf")
+                       "seshat:ebook:book.pdf"))))))
+
+;;; `:store'（org-store-link）
+
+(defmacro seshat-reader-reference-test--with-store-capture (&rest body)
+  "在阅读器 buffer 中执行 BODY，返回 `org-link-store-props' 捕获到的 plist.
+阅读器 buffer 用临时空 PDF 作 `buffer-file-name'，doc-id / 页码 / 身份都由
+桩给（BODY 内自行 `cl-letf' 身份入口）。"
+  (declare (indent 0) (debug t))
+  `(let ((file (seshat-reader-reference-test--temp-pdf))
+         (captured nil))
+     (unwind-protect
+         (progn
+           (with-temp-buffer
+             (setq major-mode 'seshat-reader-mode)
+             (setq buffer-file-name file)
+             (let ((seshat-reader-select-last nil))
+               (cl-letf (((symbol-function 'seshat-reader-annotation--doc-id)
+                          (lambda (&rest _) "ebook:a.pdf"))
+                         ((symbol-function 'seshat-reader-annotation--quiet-p)
+                          (lambda (&rest _) t))
+                         ((symbol-function 'seshat-reader-current-doc-pagenumber)
+                          (lambda (&optional _window) 3))
+                         ((symbol-function 'org-link-store-props)
+                          (lambda (&rest plist) (setq captured plist))))
+                 ,@body)))
+           captured)
+       (delete-file file))))
+
+(ert-deftest seshat-reader-reference-test--store-link-uid-form ()
+  "能查到 uid 时 `org-store-link' 存的是 uid 形态链接，描述仍可读."
+  (let ((props (seshat-reader-reference-test--with-store-capture
+                 (cl-letf (((symbol-function 'seshat-reader-reference--identity)
+                            (lambda (&rest _)
+                              (list :uid seshat-reader-reference-test--uid))))
+                   (should (seshat-reader-reference-store-link))))))
+    (should (equal (plist-get props :type) "seshat"))
+    (should (equal (plist-get props :link)
+                   (concat "seshat:uid:" seshat-reader-reference-test--uid
+                           "#page:3")))
+    (should (equal (plist-get props :description) "a.pdf 第 3 页"))))
+
+(ert-deftest seshat-reader-reference-test--store-link-doc-id-fallback ()
+  "查不到 uid 时 `org-store-link' 回落 doc-id 形态（回归）."
+  (let ((props (seshat-reader-reference-test--with-store-capture
+                 (cl-letf (((symbol-function 'seshat-reader-reference--identity)
+                            (lambda (doc-id) (list :doc-id doc-id))))
+                   (should (seshat-reader-reference-store-link))))))
+    (should (equal (plist-get props :link) "seshat:ebook:a.pdf#page:3"))
+    (should (equal (plist-get props :description) "a.pdf 第 3 页"))))
+
+;;; 摘录（`insert'，经 `--format-block'）
+
+(ert-deftest seshat-reader-reference-test--insert-uid-form ()
+  "能查到 uid 时摘录块里的链接为 uid 形态（`--format-block' 经 `--link-for'）."
+  (let ((file (seshat-reader-reference-test--temp-pdf))
+        (target (make-temp-file "seshat-ref-ins-" nil ".org")))
+    (unwind-protect
+        (progn
+          (with-temp-buffer
+            (setq major-mode 'seshat-reader-mode)
+            (setq buffer-file-name file)
+            (let ((seshat-reader-select-last nil)
+                  (seshat-reader-reference-target-file target))
+              (cl-letf (((symbol-function 'seshat-reader-annotation--doc-id)
+                         (lambda (&rest _) "ebook:a.pdf"))
+                        ((symbol-function 'seshat-reader-annotation--quiet-p)
+                         (lambda (&rest _) t))
+                        ((symbol-function 'seshat-reader-current-doc-pagenumber)
+                         (lambda (&optional _window) 3))
+                        ((symbol-function 'seshat-reader-reference--identity)
+                         (lambda (&rest _)
+                           (list :uid seshat-reader-reference-test--uid))))
+                (seshat-reader-reference-insert))))
+          (let ((content (with-temp-buffer
+                           (insert-file-contents target)
+                           (buffer-string))))
+            (should (string-match-p
+                     (regexp-quote
+                      (concat "[[" "seshat:uid:"
+                              seshat-reader-reference-test--uid
+                              "#page:3" "][" "a.pdf 第 3 页" "]]"))
+                     content))))
+      (delete-file file)
+      (delete-file target))))
+
+;;; 批注引用（`insert-annotation'）
+
+(ert-deftest seshat-reader-reference-test--insert-annotation-uid-form ()
+  "能查到 uid 时批注引用的链接为 uid 形态（经 `--format-block'）."
+  (let ((target (make-temp-file "seshat-ref-ann-" nil ".org")))
+    (unwind-protect
+        (progn
+          (with-temp-buffer
+            (setq major-mode 'seshat-reader-annotation-list-mode)
+            (insert "批注正文")
+            (add-text-properties
+             (point-min) (point-max)
+             '(seshat-reader-annotation-id 7
+               seshat-reader-annotation-location "page:3"
+               seshat-reader-annotation-page 3))
+            (let ((seshat-reader-annotation-list-document-id "ebook:a.pdf")
+                  (seshat-reader-annotation-list-entries
+                   '(((id . 7) (text . "批注正文"))))
+                  (seshat-reader-reference-target-file target))
+              (cl-letf (((symbol-function 'seshat-reader-reference--identity)
+                         (lambda (&rest _)
+                           (list :uid seshat-reader-reference-test--uid))))
+                (seshat-reader-reference-insert-annotation))))
+          (let ((content (with-temp-buffer
+                           (insert-file-contents target)
+                           (buffer-string))))
+            (should (string-match-p (regexp-quote "批注正文") content))
+            (should (string-match-p
+                     (regexp-quote
+                      (concat "seshat:uid:" seshat-reader-reference-test--uid
+                              "#page:3"))
+                     content))
+            (should-not (string-match-p "seshat:ebook:" content))))
+      (delete-file target))))
+
+;;; copy-link
+
+(defun seshat-reader-reference-test--copy-link-with (identity)
+  "以桩身份 IDENTITY 调用 `seshat-reader-reference-copy-link'，返回复制内容."
+  (let ((killed nil))
+    (cl-letf (((symbol-function 'seshat-reader-reference--current-doc-id)
+               (lambda () "ebook:a.pdf"))
+              ((symbol-function 'seshat-reader-reference--current-location)
+               (lambda () "page:3"))
+              ((symbol-function 'seshat-reader-reference--identity)
+               (lambda (&rest _) identity))
+              ((symbol-function 'kill-new)
+               (lambda (string) (setq killed string))))
+      (seshat-reader-reference-copy-link))
+    killed))
+
+(ert-deftest seshat-reader-reference-test--copy-link-uid-form ()
+  "能查到 uid 时 copy-link 复制 uid 形态链接."
+  (should (equal (seshat-reader-reference-test--copy-link-with
+                  (list :uid seshat-reader-reference-test--uid))
+                 (concat "seshat:uid:" seshat-reader-reference-test--uid
+                         "#page:3"))))
+
+(ert-deftest seshat-reader-reference-test--copy-link-doc-id-fallback ()
+  "查不到 uid 时 copy-link 复制 doc-id 形态链接（回归）."
+  (should (equal (seshat-reader-reference-test--copy-link-with
+                  (list :doc-id "ebook:a.pdf"))
+                 "seshat:ebook:a.pdf#page:3")))
+
+;;; `--description'：uid 形态 / 未知文档
+
+(ert-deftest seshat-reader-reference-test--description-uid-with-local-file ()
+  "uid 形态且本地可解析时描述为「文件名 + 页号」（零网络）。"
+  (cl-letf (((symbol-function 'seshat-reader-reference--file-from-uid)
+             (lambda (uid)
+               (and (equal uid seshat-reader-reference-test--uid)
+                    "/lib/ebook/a.pdf"))))
+    (should (equal (seshat-reader-reference--description
+                    seshat-reader-reference-test--uid "page:3")
+                   "a.pdf 第 3 页"))
+    (should (equal (seshat-reader-reference--description
+                    seshat-reader-reference-test--uid)
+                   "a.pdf"))))
+
+(ert-deftest seshat-reader-reference-test--description-uid-without-file ()
+  "uid 形态但本地取不到路径时回落逐字 `uid:<前 8 位>…'（不得为空串）。"
+  (cl-letf (((symbol-function 'seshat-reader-reference--file-from-uid)
+             (lambda (&rest _) nil)))
+    ;; 权威 26 位 uid
+    (should (equal (seshat-reader-reference--description
+                    seshat-reader-reference-test--uid)
+                   seshat-reader-reference-test--uid-expected-label))
+    ;; 不足 26 位的短 uid（宽松识别路径）
+    (should (equal (seshat-reader-reference--description
+                    seshat-reader-reference-test--short-uid)
+                   seshat-reader-reference-test--uid-expected-label))
+    ;; 页号仍照旧拼接
+    (should (equal (seshat-reader-reference--description
+                    seshat-reader-reference-test--short-uid "page:5")
+                   (concat seshat-reader-reference-test--uid-expected-label
+                           " 第 5 页")))))
+
+(ert-deftest seshat-reader-reference-test--description-uid-fallback-label ()
+  "回落标识格式定死：长度 > 8 取前 8 位加省略号，≤ 8 原样 `uid:<uid>'."
+  (should (equal (seshat-reader-reference--uid-fallback-label
+                  "01J8ZKQ2ABCDEFGH")
+                 "uid:01J8ZKQ2…"))
+  (should (equal (seshat-reader-reference--uid-fallback-label "ABCDEFGH")
+                 "uid:ABCDEFGH"))
+  (should (equal (seshat-reader-reference--uid-fallback-label "ABCDE")
+                 "uid:ABCDE"))
+  (should (equal (seshat-reader-reference--uid-fallback-label
+                  seshat-reader-reference-test--uid)
+                 seshat-reader-reference-test--uid-expected-label)))
+
+(ert-deftest seshat-reader-reference-test--description-unknown-doc-not-empty ()
+  "DOC-ID 为 nil / 空串 / 非字符串时返回非空占位串，绝不返回空串."
+  (dolist (doc-id (list nil "" 42 'sym))
+    (let ((desc (seshat-reader-reference--description doc-id)))
+      (should (stringp desc))
+      (should (not (string-empty-p desc)))
+      (should (equal desc "（未知文档）")))
+    (should (equal (seshat-reader-reference--description doc-id "page:2")
+                   "（未知文档） 第 2 页")))
+  ;; 既有 doc-id 形态的描述逐字不变（回归）
+  (should (equal (seshat-reader-reference--description "ebook:a.pdf" "page:3")
+                 "a.pdf 第 3 页"))
+  (should (equal (seshat-reader-reference--description "local:/abs/x.pdf")
+                 "x.pdf")))
+
+;;; `:export'
+
+(ert-deftest seshat-reader-reference-test--export-link-uid-form ()
+  "`:export' 对 uid 形态输出「文件名 第 N 页」，所有后端一致."
+  (cl-letf (((symbol-function 'seshat-reader-reference--file-from-uid)
+             (lambda (&rest _) "/lib/ebook/a.pdf")))
+    (dolist (format '(html latex ascii md nil))
+      (should (equal (seshat-reader-reference-export-link
+                      (concat "seshat:uid:" seshat-reader-reference-test--uid
+                              "#page:3")
+                      nil format)
+                     "a.pdf 第 3 页"))
+      ;; 无 location 时只给文件名
+      (should (equal (seshat-reader-reference-export-link
+                      (concat "seshat:uid:" seshat-reader-reference-test--uid)
+                      nil format)
+                     "a.pdf")))
+    ;; 有 DESC 时优先用 DESC（org 语义不变）
+    (should (equal (seshat-reader-reference-export-link
+                    (concat "seshat:uid:" seshat-reader-reference-test--uid
+                            "#page:3")
+                    "我的描述" 'html)
+                   "我的描述"))))
+
+(ert-deftest seshat-reader-reference-test--export-link-uid-without-file ()
+  "`:export' 在 uid 描述取不到时输出含 `uid:' 的非空文本（逐字断言回落格式）."
+  (cl-letf (((symbol-function 'seshat-reader-reference--file-from-uid)
+             (lambda (&rest _) nil)))
+    (let ((out (seshat-reader-reference-export-link
+                (concat "seshat:uid:" seshat-reader-reference-test--uid
+                        "#page:5")
+                nil 'html)))
+      (should (stringp out))
+      (should (not (string-empty-p out)))
+      (should (string-match-p "uid:" out))
+      (should (equal out (concat seshat-reader-reference-test--uid-expected-label
+                                 " 第 5 页"))))
+    ;; 无 location 的纯回落
+    (should (equal (seshat-reader-reference-export-link
+                    (concat "seshat:uid:" seshat-reader-reference-test--uid)
+                    nil 'latex)
+                   seshat-reader-reference-test--uid-expected-label))
+    ;; 不足 26 位的 `uid:' **链接**按 doc-id 形态解析（`--parse-link' 的判别
+    ;; 不放宽，否则根标签名为 `uid' 的 doc-id 会被误判），因此走 doc-id 分支
+    (should (equal (seshat-reader-reference-export-link
+                    (concat "seshat:uid:"
+                            seshat-reader-reference-test--short-uid)
+                    nil 'latex)
+                   seshat-reader-reference-test--short-uid))))
+
+;;; `:complete' 保持 doc-id 形态（回归）
+
+(ert-deftest seshat-reader-reference-test--complete-stays-doc-id ()
+  ":complete 的候选与产物仍是 doc-id 形态（不产 uid、不经身份入口）."
+  (cl-letf (((symbol-function 'seshat-reader-reference--complete-link)
+             (lambda () '("ebook:a.pdf")))
+            ((symbol-function 'completing-read)
+             (lambda (&rest _) "ebook:a.pdf"))
+            ((symbol-function 'seshat-reader-reference--identity)
+             (lambda (&rest _)
+               (ert-fail ":complete 不应经 `--identity' 决定形态"))))
+    (should (equal (seshat-reader-reference-complete-link)
+                   "seshat:ebook:a.pdf"))))
+
+;;; T4：`:follow' 的按需下载链
+
+;; 全部用例都把「打开」「跳页」「身份解析」「取书」四个副作用入口桩替，
+;; 只用 `make-temp-file' 造真实空文件通过存在性检查，不碰用户真实文件、不触网。
+;; 「软依赖可用」这一态由 `cl-letf' 绑定 `(symbol-function 'seshat-library-fetch)'
+;; 促成——绑上后 `fboundp' 自然为 t，与实现里的 `fboundp' + `funcall' 口径一致；
+;; 「软依赖缺失」态则把 `fboundp' 桩为对该符号返回 nil。
+
+(ert-deftest seshat-reader-reference-test--follow-uid-opens-local-file ()
+  "uid 形态：本地有副本时直接打开该路径，**不**调用 `seshat-library-fetch'."
+  (let ((file (seshat-reader-reference-test--temp-pdf))
+        (opened nil)
+        (fetch-calls 0))
+    (unwind-protect
+        (cl-letf (((symbol-function 'seshat-reader-reference--file-from-uid)
+                   (lambda (uid)
+                     (should (equal uid seshat-reader-reference-test--uid))
+                     file))
+                  ((symbol-function 'seshat-library-fetch)
+                   (lambda (&rest _) (cl-incf fetch-calls) nil))
+                  ((symbol-function 'find-buffer-visiting)
+                   (lambda (&rest _) nil))
+                  ((symbol-function 'seshat-reader-open-doc)
+                   (lambda (doc) (setq opened doc)))
+                  ((symbol-function 'seshat-reader-goto-page)
+                   (lambda (&rest _) (ert-fail "无 location 的链接不应跳页"))))
+          (seshat-reader-reference-open
+           (concat "seshat:uid:" seshat-reader-reference-test--uid)))
+      (delete-file file))
+    (should (equal opened file))
+    (should (= fetch-calls 0))))
+
+(ert-deftest seshat-reader-reference-test--follow-uid-downloads-when-unregistered ()
+  "uid 形态：本地查不到路径（`--file-from-uid' 返回 nil）时按需下载并用其返回路径打开."
+  (let ((file (seshat-reader-reference-test--temp-pdf))
+        (opened nil)
+        (fetch-uid nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'seshat-reader-reference--file-from-uid)
+                   (lambda (&rest _) nil))
+                  ((symbol-function 'seshat-library-fetch)
+                   (lambda (uid &optional _force)
+                     (setq fetch-uid uid)
+                     file))
+                  ((symbol-function 'find-buffer-visiting)
+                   (lambda (&rest _) nil))
+                  ((symbol-function 'seshat-reader-open-doc)
+                   (lambda (doc) (setq opened doc)))
+                  ((symbol-function 'seshat-reader-goto-page)
+                   (lambda (&rest _) (ert-fail "无 location 的链接不应跳页"))))
+          (seshat-reader-reference-open
+           (concat "seshat:uid:" seshat-reader-reference-test--uid)))
+      (delete-file file))
+    ;; 实参必须就是链接里的 uid（不是 doc-id、不是派生值）
+    (should (equal fetch-uid seshat-reader-reference-test--uid))
+    (should (equal opened file))))
+
+(ert-deftest seshat-reader-reference-test--follow-uid-missing-file-downloads ()
+  "uid 形态：`--file-from-uid' 给出的路径**不存在**时同样按需下载."
+  (let ((ghost (expand-file-name
+                (format "seshat-ref-t4-ghost-%d.pdf" (abs (random 1000000)))
+                temporary-file-directory))
+        (file (seshat-reader-reference-test--temp-pdf))
+        (opened nil)
+        (fetch-calls 0))
+    (unwind-protect
+        (progn
+          (should-not (file-exists-p ghost))
+          (cl-letf (((symbol-function 'seshat-reader-reference--file-from-uid)
+                     (lambda (&rest _) ghost))
+                    ((symbol-function 'seshat-library-fetch)
+                     (lambda (&rest _) (cl-incf fetch-calls) file))
+                    ((symbol-function 'find-buffer-visiting)
+                     (lambda (&rest _) nil))
+                    ((symbol-function 'seshat-reader-open-doc)
+                     (lambda (doc) (setq opened doc)))
+                    ((symbol-function 'seshat-reader-goto-page)
+                     (lambda (&rest _) (ert-fail "无 location 的链接不应跳页"))))
+            (seshat-reader-reference-open
+             (concat "seshat:uid:" seshat-reader-reference-test--uid))))
+      (delete-file file))
+    (should (= fetch-calls 1))
+    (should (equal opened file))))
+
+(ert-deftest seshat-reader-reference-test--follow-uid-without-library-errors ()
+  "uid 形态：本地无副本且软依赖缺失（`fboundp' 为 nil）时 `user-error'，取书桩 0 次调用."
+  (let ((fetch-calls 0)
+        (orig (symbol-function 'fboundp)))
+    (cl-letf (((symbol-function 'seshat-reader-reference--file-from-uid)
+               (lambda (&rest _) nil))
+              ((symbol-function 'seshat-library-fetch)
+               (lambda (&rest _) (cl-incf fetch-calls) "/nonexistent/x.pdf"))
+              ((symbol-function 'fboundp)
+               (lambda (sym)
+                 (and (not (eq sym 'seshat-library-fetch))
+                      (funcall orig sym))))
+              ((symbol-function 'find-buffer-visiting)
+               (lambda (&rest _) (ert-fail "失败路径不应查找 buffer")))
+              ((symbol-function 'seshat-reader-open-doc)
+               (lambda (&rest _) (ert-fail "失败路径不应打开文档"))))
+      ;; 判据要能区分两条失败路径：缺依赖的消息必须点名 `seshat-library'
+      (should (string-match-p
+               "seshat-library"
+               (error-message-string
+                (should-error
+                 (seshat-reader-reference-open
+                  (concat "seshat:uid:" seshat-reader-reference-test--uid))
+                 :type 'user-error)))))
+    (should (= fetch-calls 0))))
+
+(ert-deftest seshat-reader-reference-test--follow-uid-download-failure-errors ()
+  "uid 形态：软依赖可用但返回 nil 时 `user-error'，且不打开任何文件."
+  (let ((opened nil)
+        (poped nil))
+    (cl-letf (((symbol-function 'seshat-reader-reference--file-from-uid)
+               (lambda (&rest _) nil))
+              ((symbol-function 'seshat-library-fetch)
+               (lambda (&rest _) nil))
+              ((symbol-function 'find-buffer-visiting)
+               (lambda (&rest _) nil))
+              ((symbol-function 'pop-to-buffer)
+               (lambda (buf &rest _) (setq poped buf) buf))
+              ((symbol-function 'seshat-reader-open-doc)
+               (lambda (doc) (setq opened doc))))
+      ;; 取书失败与「缺依赖」都抛 `user-error'，用消息区分两条路径
+      (should (string-match-p
+               "取书失败"
+               (error-message-string
+                (should-error
+                 (seshat-reader-reference-open
+                  (concat "seshat:uid:" seshat-reader-reference-test--uid))
+                 :type 'user-error)))))
+    (should-not opened)
+    (should-not poped)))
+
+(ert-deftest seshat-reader-reference-test--follow-uid-goto-page ()
+  "uid 形态带 `#page:3' 时打开后调用 `seshat-reader-goto-page'，实参为 3（不再加 1）."
+  (let ((file (seshat-reader-reference-test--temp-pdf))
+        (opened nil)
+        (page-arg nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'seshat-reader-reference--file-from-uid)
+                   (lambda (&rest _) file))
+                  ((symbol-function 'seshat-library-fetch)
+                   (lambda (&rest _) (ert-fail "本地有副本不应取书")))
+                  ((symbol-function 'find-buffer-visiting)
+                   (lambda (&rest _) nil))
+                  ((symbol-function 'seshat-reader-open-doc)
+                   (lambda (doc) (setq opened doc)))
+                  ((symbol-function 'seshat-reader-goto-page)
+                   (lambda (n) (setq page-arg n))))
+          (seshat-reader-reference-open
+           (concat "seshat:uid:" seshat-reader-reference-test--uid "#page:3")))
+      (delete-file file))
+    (should (equal opened file))
+    (should (equal page-arg 3))))
+
+(ert-deftest seshat-reader-reference-test--follow-doc-id-unchanged ()
+  "回归：doc-id 形态仍走 `--file-from-doc-id'，不触发取书、不经 `--file-from-uid'."
+  (let ((file (seshat-reader-reference-test--temp-pdf))
+        (opened nil)
+        (page-arg nil)
+        (fetch-calls 0))
+    (unwind-protect
+        (let ((seshat-reader-annotation-roots
+               (list (cons "ebook" (file-name-directory file)))))
+          (cl-letf (((symbol-function 'seshat-reader-reference--file-from-uid)
+                     (lambda (&rest _)
+                       (ert-fail "doc-id 形态不应经 `--file-from-uid'")))
+                    ((symbol-function 'seshat-library-fetch)
+                     (lambda (&rest _) (cl-incf fetch-calls)))
+                    ((symbol-function 'find-buffer-visiting)
+                     (lambda (&rest _) nil))
+                    ((symbol-function 'seshat-reader-open-doc)
+                     (lambda (doc) (setq opened doc)))
+                    ((symbol-function 'seshat-reader-goto-page)
+                     (lambda (n) (setq page-arg n))))
+            (seshat-reader-reference-open
+             (concat "seshat:ebook:" (file-name-nondirectory file) "#page:2"))))
+      (delete-file file))
+    (should (equal opened (expand-file-name file)))
+    (should (equal page-arg 2))
+    (should (= fetch-calls 0))))
+
+(ert-deftest seshat-reader-reference-test--follow-local-form-unchanged ()
+  "回归：`local:' 形态仍按绝对路径直接打开，不触发取书."
+  (let ((file (seshat-reader-reference-test--temp-pdf))
+        (opened nil)
+        (fetch-calls 0))
+    (unwind-protect
+        (cl-letf (((symbol-function 'seshat-reader-reference--file-from-uid)
+                   (lambda (&rest _)
+                     (ert-fail "`local:' 形态不应经 `--file-from-uid'")))
+                  ((symbol-function 'seshat-library-fetch)
+                   (lambda (&rest _) (cl-incf fetch-calls)))
+                  ((symbol-function 'find-buffer-visiting)
+                   (lambda (&rest _) nil))
+                  ((symbol-function 'seshat-reader-open-doc)
+                   (lambda (doc) (setq opened doc)))
+                  ((symbol-function 'seshat-reader-goto-page)
+                   (lambda (&rest _) (ert-fail "无 location 的链接不应跳页"))))
+          (seshat-reader-reference-open (concat "seshat:local:" file)))
+      (delete-file file))
+    (should (equal opened (expand-file-name file)))
+    (should (= fetch-calls 0))))
+
+(ert-deftest seshat-reader-reference-test--follow-malformed-uid-link-errors ()
+  "畸形链接（`seshat:'）仍 `user-error'，且不因 uid 改造而误触发取书."
+  (let ((fetch-calls 0))
+    (cl-letf (((symbol-function 'seshat-library-fetch)
+               (lambda (&rest _) (cl-incf fetch-calls) "/nonexistent/x.pdf"))
+              ((symbol-function 'find-buffer-visiting)
+               (lambda (&rest _) (ert-fail "失败路径不应查找 buffer")))
+              ((symbol-function 'seshat-reader-open-doc)
+               (lambda (&rest _) (ert-fail "失败路径不应打开文档"))))
+      (should-error (seshat-reader-reference-open "seshat:") :type 'user-error))
+    (should (= fetch-calls 0))))
 
 (provide 'seshat-reader-reference-test)
 ;;; seshat-reader-reference-test.el ends here

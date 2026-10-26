@@ -249,7 +249,7 @@ JSON 的 false 必须转成 nil（`json-parse-string' 读出的是符号 `:false
 ;;; seshat-rest-get-resource
 
 (ert-deftest seshat-rest-get-resource-builds-uid-path ()
-  "`seshat-rest-get-resource' 把 uid 直接拼进路径（uid 只含 [0-9A-Z]，不编码），
+  "`seshat-rest-get-resource' 把 uid 直接拼进路径（uid 只含 [0-9A-HJKMNP-TV-Z]，不编码），
 且不带查询参数。"
   (seshat-rest-test--with (seshat-rest-test--ok "{}")
     (seshat-rest-get-resource "01K8Q3M7D2X9V6T1B8N5C0RDEX")
@@ -608,6 +608,75 @@ JSON 的 false 必须转成 nil（`json-parse-string' 读出的是符号 `:false
                                  :if-none-match "\"blob1\"")
       (should (equal (seshat-rest-test--captured-header "If-None-Match")
                      "\"blob1\"")))))
+
+(ert-deftest seshat-rest-download-file-passes-timeout ()
+  "`seshat-rest-download-file' 的 `:timeout' 透传给传输层（`:timeout' 形参）。
+（下载超时是 A3 的安全修复：不加超时一台慢服务的单次取书能无限期挂住 Emacs。）"
+  (seshat-rest-test--with-temp-dir dir
+    (seshat-rest-test--with (list :status 200 :headers nil :body "x")
+      (seshat-rest-download-file "a.org" (expand-file-name "a.org" dir)
+                                 :timeout 30)
+      (should (equal (plist-get (seshat-rest-test--captured-args) :timeout) 30)))
+    ;; 未传时为 nil（交给传输层默认：不设限）
+    (seshat-rest-test--with (list :status 200 :headers nil :body "x")
+      (seshat-rest-download-file "a.org" (expand-file-name "b.org" dir))
+      (should-not (plist-get (seshat-rest-test--captured-args) :timeout)))))
+
+(ert-deftest seshat-rest-download-file-too-large-skips-write ()
+  "`Content-Length' 超过 `:max-bytes' 时**不写盘**，返回 `:too-large t' 与 `:size'。
+（A3 的大小上限：先看头再落盘，避免一次取书把磁盘写满。）"
+  (seshat-rest-test--with-temp-dir dir
+    (let ((target (expand-file-name "big.epub" dir)))
+      (seshat-rest-test--with
+          (list :status 200
+                :headers '(("Content-Length" . "2048")
+                           ("ETag" . "\"blob9\""))
+                :body "payload")
+        (let ((result (seshat-rest-download-file "big.epub" target
+                                                :max-bytes 1024)))
+          (should (eq (plist-get result :too-large) t))
+          (should (equal (plist-get result :size) 2048))
+          (should (equal (plist-get result :status) 200))
+          ;; 超限不写盘：目标文件与临时文件都不应存在
+          (should-not (file-exists-p target))
+          (should (equal (directory-files dir nil "\\`[^.]") nil))))))
+  ;; 上限内照常写盘，且 `:size' 带上头部大小
+  (seshat-rest-test--with-temp-dir dir
+    (let ((target (expand-file-name "ok.epub" dir)))
+      (seshat-rest-test--with
+          (list :status 200 :headers '(("Content-Length" . "7")) :body "payload")
+        (let ((result (seshat-rest-download-file "ok.epub" target
+                                                :max-bytes 1024)))
+          (should-not (plist-get result :too-large))
+          (should (equal (plist-get result :size) 7))
+          (should (file-exists-p target))
+          (should (equal (seshat-rest-test--read-text target) "payload")))))
+    ;; Content-Length 缺失时跳过检查（绝不因为「不知道大小」就拒写）
+    (let ((target (expand-file-name "nolength.epub" dir)))
+      (seshat-rest-test--with (list :status 200 :headers nil :body "payload")
+        (let ((result (seshat-rest-download-file "nolength.epub" target
+                                                :max-bytes 1)))
+          (should-not (plist-get result :too-large))
+          (should (file-exists-p target)))))))
+
+(ert-deftest seshat-rest-download-file-too-large-accepts-float-max-bytes ()
+  "`:max-bytes' 传浮点时上限**照旧生效**（判据用 `numberp' 而不是 `integerp'）。
+A3 复核（low）：Elisp 里 `1.5e8' 是 float，`(integerp 1.5e8)' 为 nil——判据写成
+`integerp' 时浮点配置会**静默失效**，用户以为自己设了 150 MB 上限，实际一道闸
+都没有。"
+  (seshat-rest-test--with-temp-dir dir
+    (let ((target (expand-file-name "big2.epub" dir)))
+      (seshat-rest-test--with
+          (list :status 200
+                :headers '(("Content-Length" . "200000000"))
+                :body "payload")
+        (let ((result (seshat-rest-download-file "big2.epub" target
+                                                :max-bytes 1.5e8)))
+          (should (eq (plist-get result :too-large) t))
+          (should (equal (plist-get result :size) 200000000))
+          ;; 超限不写盘
+          (should-not (file-exists-p target))
+          (should (equal (directory-files dir nil "\\`[^.]") nil)))))))
 
 ;;; seshat-rest-download-file：`:binary' 二进制口径
 ;;
