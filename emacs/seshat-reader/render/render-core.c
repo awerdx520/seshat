@@ -265,76 +265,58 @@ load_page_dl(DocState *state, DocPage *dp)
 }
 
 /**
- * Thread function to render a page and encode it as a PNM image.
+ * render_page_to_buffer - Rasterize one page and encode it as PNM bytes.
  *
- * Uses the page's display list to generate a pixmap, optionally inverts
- * and gamma-corrects it, then encodes it to PNM and stores it in
- * `cp->img_data'. Updates image dimensions and status, and signals
- * completion via a condition variable.
+ * This is the rendering core that used to live inline in
+ * `draw_page_thread'.  It was extracted unchanged so that a second,
+ * purely additive entry point (`emacs_page_image_spec') can reuse it
+ * without duplicating the painter: the ordering below — rasterize,
+ * optional luminance invert + gamma, decoration wash, PNM encode — is
+ * load bearing and must not be rearranged.
  *
- * @param arg  Pointer to DrawThreadArgs (contains DocState and CachedPage).
- * Return:     NULL (result is stored in CachedPage).
+ * Every render parameter is an argument, so the caller decides them:
+ * nothing here reads `EmacsWinState'.  The document-level state that is
+ * deliberately still read from DOC_STATE is `invert' and `frame_scale',
+ * exactly as the worker used to read it, because both are properties of
+ * the document/frame rather than of a window.
+ *
+ * The rasterization runs on a cloned MuPDF context (shared lock set), so
+ * it is safe to call from the Emacs main thread while worker jobs are in
+ * flight.
+ *
+ * @param doc_state  Document the page belongs to.
+ * @param dp         Page to render; its display list must be loaded.
+ * @param resolution Resolution in dpi (72 dpi == scale 1.0).
+ * @param rotate     Rotation in degrees, 0 / 90 / 180 / 270.
+ * @param deco       Decoration snapshot to paint over the page, may be NULL.
+ * @param deco_count Number of entries in DECO.
+ * @param out_w      Receives the image width in unscaled pixels.
+ * @param out_h      Receives the image height in unscaled pixels.
+ * @param out_data   Receives a malloc'ed PNM byte block owned by the caller.
+ * @param out_size   Receives the size of OUT_DATA in bytes.
+ * Return:           true on success; false leaves every OUT_* zeroed/NULL.
  */
 
-void *
-draw_page_thread(void *arg)
+static bool
+render_page_to_buffer(DocState *doc_state, DocPage *dp, float resolution,
+		      int rotate, Decoration *deco, int deco_count, int *out_w,
+		      int *out_h, unsigned char **out_data, size_t *out_size)
 {
-	DrawThreadArgs *args = (DrawThreadArgs *)arg;
-	if (!args)
-		return NULL;
+	if (!doc_state || !dp || !dp->display_list || !out_w || !out_h
+	    || !out_data || !out_size)
+		return false;
 
-	DocState *doc_state = args->doc_state;
-	EmacsWinState *win_state = args->win_state;
-	CachedPage *cp = args->cp;
-	DocPage *dp = args->dp;
-
-	if (!doc_state || !win_state || !cp || !dp)
-		{
-			free_draw_thread_args(args);
-			return NULL;
-		}
-
-	 /* If the document is being reloaded/closed, or the window is closing, */
-	 /* abort this job safely. */
-	if (doc_state->is_reloading || win_state->closing)
-		{
-			mark_cp_error_if_rendering(cp);
-			release_doc_page(doc_state, dp);
-
-			atomic_fetch_sub(&doc_state->active_jobs, 1);
-			atomic_fetch_sub(&win_state->active_jobs, 1);
-
-			free_draw_thread_args(args);
-			return NULL;
-		}
-
-	// If the page isn't ready then parse/load it
-	if (!dp->ready)
-		load_page_dl(doc_state, dp);
-	if (!dp->ready || !dp->display_list)
-		{
-			mark_cp_error_if_rendering(cp);
-			release_doc_page(doc_state, dp);
-			atomic_fetch_sub(&doc_state->active_jobs, 1);
-			atomic_fetch_sub(&win_state->active_jobs, 1);
-			free_draw_thread_args(args);
-			return NULL;
-		}
+	*out_w = 0;
+	*out_h = 0;
+	*out_data = NULL;
+	*out_size = 0;
 
 	fz_context *ctx = fz_clone_context(doc_state->ctx);
-	if (!ctx)
-		{
-			mark_cp_error_if_rendering(cp);
-			release_doc_page(doc_state, dp);
-			atomic_fetch_sub(&doc_state->active_jobs, 1);
-			atomic_fetch_sub(&win_state->active_jobs, 1);
-			free_draw_thread_args(args);
-			return NULL;
-		}
 
-	fz_matrix ctm = fz_transform_page(dp->bbox,
-					  win_state->resolution,
-					  win_state->rotate);
+	if (!ctx)
+		return false;
+
+	fz_matrix ctm = fz_transform_page(dp->bbox, resolution, rotate);
 	fz_pixmap *pixmap = NULL;
 	fz_buffer *buf = NULL;
 	fz_output *out = NULL;
@@ -366,7 +348,7 @@ draw_page_thread(void *arg)
 			 * Rectangles are grouped by style and each group is
 			 * filled once, so overlapping highlights keep a
 			 * uniform alpha instead of stacking up. */
-			if (args->deco_count > 0)
+			if (deco_count > 0)
 				{
 					fz_device *dev = NULL;
 					fz_path *path = NULL;
@@ -379,7 +361,7 @@ draw_page_thread(void *arg)
 					 * flag false, which degrades to
 					 * "paint each rect on its own". */
 					bool *assigned
-						= calloc((size_t)args->deco_count,
+						= calloc((size_t)deco_count,
 							 sizeof(bool));
 
 					fz_try(ctx)
@@ -397,10 +379,10 @@ draw_page_thread(void *arg)
 								{
 									for (int i = 0;
 									     i
-									     < args->deco_count;
+									     < deco_count;
 									     ++i)
 										{
-											if (args->deco[i].kind
+											if (deco[i].kind
 											    != DECORATION_KIND_RECT)
 												continue;
 
@@ -410,13 +392,13 @@ draw_page_thread(void *arg)
 											     ++g)
 												{
 													if (groups[g][0]
-														== args->deco[i].color[0]
+														== deco[i].color[0]
 														&& groups[g][1]
-														== args->deco[i].color[1]
+														== deco[i].color[1]
 														&& groups[g][2]
-														== args->deco[i].color[2]
+														== deco[i].color[2]
 														&& groups[g][3]
-														== args->deco[i].alpha)
+														== deco[i].alpha)
 														break;
 												}
 
@@ -426,13 +408,13 @@ draw_page_thread(void *arg)
 												 < DECORATION_MAX_STYLE_GROUPS)
 												{
 													groups[group_count][0]
-														= args->deco[i].color[0];
+														= deco[i].color[0];
 													groups[group_count][1]
-														= args->deco[i].color[1];
+														= deco[i].color[1];
 													groups[group_count][2]
-														= args->deco[i].color[2];
+														= deco[i].color[2];
 													groups[group_count][3]
-														= args->deco[i].alpha;
+														= deco[i].alpha;
 													++group_count;
 													assigned[i] = true;
 												}
@@ -449,29 +431,29 @@ draw_page_thread(void *arg)
 									path = fz_new_path(ctx);
 
 									for (int i = 0;
-									     i < args->deco_count;
+									     i < deco_count;
 									     ++i)
 										{
 											if (!assigned[i]
-											    || args->deco[i].kind
+											    || deco[i].kind
 												   != DECORATION_KIND_RECT)
 												continue;
-											if (args->deco[i].color[0]
+											if (deco[i].color[0]
 												    != groups[g][0]
-											    || args->deco[i].color[1]
+											    || deco[i].color[1]
 												    != groups[g][1]
-											    || args->deco[i].color[2]
+											    || deco[i].color[2]
 												    != groups[g][2]
-											    || args->deco[i].alpha
+											    || deco[i].alpha
 												    != groups[g][3])
 												continue;
 
 											fz_rectto(
 												ctx, path,
-												args->deco[i].x0,
-												args->deco[i].y0,
-												args->deco[i].x1,
-												args->deco[i].y1);
+												deco[i].x0,
+												deco[i].y0,
+												deco[i].x1,
+												deco[i].y1);
 										}
 
 									float color[3]
@@ -510,27 +492,27 @@ draw_page_thread(void *arg)
 							if (assigned)
 								{
 									for (int i = 0;
-									     i < args->deco_count;
+									     i < deco_count;
 									     ++i)
 										{
 											if (assigned[i]
-											    || args->deco[i].kind
+											    || deco[i].kind
 												   != DECORATION_KIND_RECT)
 												continue;
 
 											path = fz_new_path(ctx);
 											fz_rectto(
 												ctx, path,
-												args->deco[i].x0,
-												args->deco[i].y0,
-												args->deco[i].x1,
-												args->deco[i].y1);
+												deco[i].x0,
+												deco[i].y0,
+												deco[i].x1,
+												deco[i].y1);
 											fz_fill_path(
 												ctx, dev, path, 0,
 												fz_identity,
 												fz_device_rgb(ctx),
-												args->deco[i].color,
-												args->deco[i].alpha,
+												deco[i].color,
+												deco[i].alpha,
 												fz_default_color_params);
 											fz_drop_path(ctx, path);
 											path = NULL;
@@ -542,10 +524,10 @@ draw_page_thread(void *arg)
 							 * so a freehand polyline has
 							 * no visible corners. */
 							for (int i = 0;
-							     i < args->deco_count; ++i)
+							     i < deco_count; ++i)
 								{
 									const Decoration *d
-										= &args->deco[i];
+										= &deco[i];
 
 									if (d->kind
 										    != DECORATION_KIND_STROKE
@@ -652,12 +634,7 @@ draw_page_thread(void *arg)
 				fz_drop_buffer(ctx, buf);
 
 			fz_drop_context(ctx);
-			mark_cp_error_if_rendering(cp);
-			release_doc_page(doc_state, dp);
-			atomic_fetch_sub(&doc_state->active_jobs, 1);
-			atomic_fetch_sub(&win_state->active_jobs, 1);
-			free_draw_thread_args(args);
-			return NULL;
+			return false;
 		}
 
 	size_t local_img_size = buf->len;
@@ -667,6 +644,70 @@ draw_page_thread(void *arg)
 		{
 			fz_drop_buffer(ctx, buf);
 			fz_drop_context(ctx);
+			return false;
+		}
+
+	memcpy(local_img_data, buf->data, local_img_size);
+	fz_drop_buffer(ctx, buf);
+	fz_drop_context(ctx);
+
+	*out_w = local_imgw;
+	*out_h = local_imgh;
+	*out_data = (unsigned char *)local_img_data;
+	*out_size = local_img_size;
+
+	return true;
+}
+
+/**
+ * Thread function to render a page and encode it as a PNM image.
+ *
+ * Uses the page's display list to generate a pixmap, optionally inverts
+ * and gamma-corrects it, then encodes it to PNM and stores it in
+ * `cp->img_data'. Updates image dimensions and status, and signals
+ * completion via a condition variable.
+ *
+ * @param arg  Pointer to DrawThreadArgs (contains DocState and CachedPage).
+ * Return:     NULL (result is stored in CachedPage).
+ */
+
+void *
+draw_page_thread(void *arg)
+{
+	DrawThreadArgs *args = (DrawThreadArgs *)arg;
+	if (!args)
+		return NULL;
+
+	DocState *doc_state = args->doc_state;
+	EmacsWinState *win_state = args->win_state;
+	CachedPage *cp = args->cp;
+	DocPage *dp = args->dp;
+
+	if (!doc_state || !win_state || !cp || !dp)
+		{
+			free_draw_thread_args(args);
+			return NULL;
+		}
+
+	 /* If the document is being reloaded/closed, or the window is closing, */
+	 /* abort this job safely. */
+	if (doc_state->is_reloading || win_state->closing)
+		{
+			mark_cp_error_if_rendering(cp);
+			release_doc_page(doc_state, dp);
+
+			atomic_fetch_sub(&doc_state->active_jobs, 1);
+			atomic_fetch_sub(&win_state->active_jobs, 1);
+
+			free_draw_thread_args(args);
+			return NULL;
+		}
+
+	// If the page isn't ready then parse/load it
+	if (!dp->ready)
+		load_page_dl(doc_state, dp);
+	if (!dp->ready || !dp->display_list)
+		{
 			mark_cp_error_if_rendering(cp);
 			release_doc_page(doc_state, dp);
 			atomic_fetch_sub(&doc_state->active_jobs, 1);
@@ -675,9 +716,27 @@ draw_page_thread(void *arg)
 			return NULL;
 		}
 
-	memcpy(local_img_data, buf->data, local_img_size);
-	fz_drop_buffer(ctx, buf);
-	fz_drop_context(ctx);
+	/* The rasterization itself (rasterize -> invert/gamma -> decoration
+	 * wash -> PNM encode) lives in `render_page_to_buffer' so that the
+	 * page-image-spec entry point can share it.  The ordering inside is
+	 * identical to what this function used to do inline. */
+	int local_imgw = 0;
+	int local_imgh = 0;
+	unsigned char *local_img_data = NULL;
+	size_t local_img_size = 0;
+
+	if (!render_page_to_buffer(doc_state, dp, win_state->resolution,
+				   win_state->rotate, args->deco,
+				   args->deco_count, &local_imgw, &local_imgh,
+				   &local_img_data, &local_img_size))
+		{
+			mark_cp_error_if_rendering(cp);
+			release_doc_page(doc_state, dp);
+			atomic_fetch_sub(&doc_state->active_jobs, 1);
+			atomic_fetch_sub(&win_state->active_jobs, 1);
+			free_draw_thread_args(args);
+			return NULL;
+		}
 
 	/* If the slot was invalidated while we were rendering, its status will */
 	/* no longer be PAGE_STATUS_RENDERING. In that case, discard the result. */
@@ -686,7 +745,7 @@ draw_page_thread(void *arg)
 	if (cp->status == PAGE_STATUS_RENDERING)
 		{
 			free(cp->img_data);
-			cp->img_data = local_img_data;
+			cp->img_data = (char *)local_img_data;
 			cp->img_size = local_img_size;
 			cp->imgw = local_imgw;
 			cp->imgh = local_imgh;
@@ -3242,6 +3301,213 @@ emacs_refresh_highlights(emacs_env *env, ptrdiff_t nargs, emacs_value *args,
 	return EMACS_T;
 }
 
+/**
+ * snapshot_page_decorations - Deep-copy the decorations of one page.
+ *
+ * The Emacs main thread owns `DocState->decorations', while the entry
+ * point below rasterizes a page synchronously on that same thread; a
+ * snapshot is nonetheless taken, for two reasons: the painter signature
+ * takes a plain array (no DocState walk), and the copy makes the
+ * ownership rule of `free_decoration_table' the single release path for
+ * this call as well.
+ *
+ * DECORATION_KIND_STROKE entries own a heap block (`pts'), so a struct
+ * copy alone would alias it with the DocState table and the two owners
+ * would free the same pointer.  Every stroke's points are therefore DEEP
+ * COPIED, exactly like `submit_render_job' does for the worker path.
+ * RECT entries have `pts == NULL' and need no copy.
+ *
+ * A failed allocation is not an error: the page renders without the
+ * decoration that could not be copied, and the partially built snapshot
+ * is still fully owned (every not-yet-filled slot is zeroed up front).
+ *
+ * @param doc_state  Document owning the table.
+ * @param page_num   0-based page index to copy.
+ * @param out_count  Receives the number of entries in the returned array.
+ * Return:          The snapshot, or NULL when the page has no decoration.
+ */
+
+static Decoration *
+snapshot_page_decorations(DocState *doc_state, int page_num, int *out_count)
+{
+	if (out_count)
+		*out_count = 0;
+
+	if (!doc_state || !doc_state->decorations || doc_state->decoration_count <= 0)
+		return NULL;
+
+	int count = 0;
+
+	for (int i = 0; i < doc_state->decoration_count; ++i)
+		if (doc_state->decorations[i].page == page_num)
+			++count;
+
+	if (count <= 0)
+		return NULL;
+
+	Decoration *snap = calloc((size_t)count, sizeof(Decoration));
+
+	if (!snap)
+		return NULL;
+
+	int j = 0;
+
+	for (int i = 0; i < doc_state->decoration_count; ++i)
+		{
+			const Decoration *src = &doc_state->decorations[i];
+
+			if (src->page != page_num)
+				continue;
+
+			snap[j] = *src;
+			snap[j].pts = NULL;
+			snap[j].pt_count = 0;
+
+			if (src->kind == DECORATION_KIND_STROKE && src->pts
+			    && src->pt_count > 0)
+				{
+					fz_point *copy
+						= malloc((size_t)src->pt_count
+							 * sizeof(fz_point));
+
+					if (copy)
+						{
+							memcpy(copy, src->pts,
+							       (size_t)src->pt_count
+								   * sizeof(fz_point));
+							snap[j].pts = copy;
+							snap[j].pt_count
+								= src->pt_count;
+						}
+					/* else: leave pts NULL — this stroke
+					 * is skipped, nothing to free. */
+				}
+
+			++j;
+		}
+
+	if (out_count)
+		*out_count = j;
+
+	return snap;
+}
+
+/**
+ * emacs_page_image_spec - Render one page and return its image spec.
+ *
+ * The read-only counterpart of the display path: it rasterizes PAGE at an
+ * explicit SCALE and hands the result back as the very spec
+ * `create-image' builds for the page overlay, so the caller can put the
+ * image anywhere it likes.  It exists so that a multi-page view can ask
+ * for a page without going through a window: nothing here reads or writes
+ * `EmacsWinState', a window parameter, a cache slot or an overlay.
+ *
+ * PAGE is 1-based, like every other page-addressed entry point, and is
+ * validated by `resolve_page_arg'.  SCALE is a multiple of 72 dpi and is
+ * clamped to MINRES/72 .. MAXRES/72.  ROTATE defaults to 0 and must be 0,
+ * 90, 180 or 270 — anything else is refused rather than snapped to the
+ * nearest quarter turn, because a silent snap would let the caller
+ * believe a rotation happened.  Every refusal is silent nil (no message):
+ * an out-of-range or non-integral page, a non-numeric/non-finite scale, an
+ * unsupported rotation, and a document that is being reloaded.
+ *
+ * The page's decorations are painted onto the bitmap (from a deep-copied
+ * snapshot) so that the result matches what the screen shows.
+ *
+ * Rendering is synchronous on the Emacs main thread, with the same cost
+ * as one page of `seshat-reader-dyn--refresh-highlights'; it must not be
+ * called from a scrolling or redisplay path.
+ *
+ * @param env    Emacs module environment.
+ * @param nargs  Number of Elisp args (2 or 3).
+ * @param args   Elisp arguments: page, scale, optional rotate.
+ * @param data   Additional data (unused).
+ * Return:       The image spec, or nil.
+ */
+
+emacs_value
+emacs_page_image_spec(emacs_env *env, ptrdiff_t nargs, emacs_value *args,
+		      void *data)
+{
+	(void)data;
+
+	DocState *doc_state = get_doc_state_ptr(env);
+
+	/* No window state is involved, so `closing' (an EmacsWinState field)
+	 * has no meaning here; only the document's own reload flag guards
+	 * against freeing the tables under us. */
+	if (!doc_state || doc_state->is_reloading)
+		return EMACS_NIL;
+
+	if (doc_state->pagecount <= 0)
+		return EMACS_NIL;
+
+	int page = 0;
+
+	if (!resolve_page_arg(env, args[0], doc_state->pagecount, &page))
+		return EMACS_NIL;
+
+	float scale = 0.0f;
+
+	if (!extract_float_coerced(env, args[1], &scale) || !isfinite(scale))
+		return EMACS_NIL;
+
+	int rotate = 0;
+
+	if (nargs >= 3)
+		{
+			float rotate_f = 0.0f;
+
+			if (!extract_float_coerced(env, args[2], &rotate_f))
+				return EMACS_NIL;
+
+			if (!(rotate_f == 0.0f || rotate_f == 90.0f
+			      || rotate_f == 180.0f || rotate_f == 270.0f))
+				return EMACS_NIL;
+
+			rotate = (int)rotate_f;
+		}
+
+	double resolution = fz_clamp((double)scale * 72.0, MINRES, MAXRES);
+
+	/* `acquire_doc_page' loads the page's display list on first use and
+	 * takes a reference; the release below is unconditional so that no
+	 * exit path can leak it. */
+	DocPage *dp = acquire_doc_page(doc_state, page);
+
+	if (!dp)
+		return EMACS_NIL;
+
+	int deco_count = 0;
+	Decoration *deco = snapshot_page_decorations(doc_state, page, &deco_count);
+
+	int width = 0;
+	int height = 0;
+	unsigned char *img_data = NULL;
+	size_t img_size = 0;
+
+	bool ok = render_page_to_buffer(doc_state, dp, (float)resolution, rotate,
+					deco, deco_count, &width, &height,
+					&img_data, &img_size);
+
+	/* This entry point owns both: the worker path frees the snapshot
+	 * through `free_draw_thread_args', which does not exist here. */
+	free_decoration_table(deco, deco_count);
+	release_doc_page(doc_state, dp);
+
+	if (!ok || !img_data)
+		return EMACS_NIL;
+
+	/* `data2elisp_image' copies the bytes into an Emacs string, so the C
+	 * block can go away as soon as the spec exists. */
+	emacs_value spec
+		= data2elisp_image(env, width, height, (char *)img_data, img_size);
+
+	free(img_data);
+
+	return spec;
+}
+
 // Entrypoint for the dynamic module
 int
 emacs_module_init(struct emacs_runtime *runtime)
@@ -3389,6 +3655,20 @@ emacs_module_init(struct emacs_runtime *runtime)
 			     "Re-renders the cache window of the current "
 			     "window so that pending highlight changes become "
 			     "visible.");
+
+	register_module_func(env, emacs_page_image_spec,
+			     "seshat-reader-dyn--page-image-spec", 2, 3,
+			     "Renders PAGE (1-based) at SCALE, a multiple of "
+			     "72 dpi clamped to MINRES/72 .. MAXRES/72, and "
+			     "returns the image spec `create-image' builds for "
+			     "the page overlay, decorations included, without "
+			     "touching any window. Optional ROTATE must be 0, "
+			     "90, 180 or 270 and defaults to 0. An out-of-range "
+			     "or non-integral PAGE, a non-numeric or non-finite "
+			     "SCALE, any other ROTATE value and a document that "
+			     "is being reloaded all return nil silently. The "
+			     "current page, the window state, the page cache "
+			     "and every overlay are left unchanged.");
 
 	// Register buffer-local variables.
 	permanent_buffer_local_var(env, "seshat-reader-current-doc-pagecount");

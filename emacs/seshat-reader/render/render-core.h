@@ -284,6 +284,10 @@ emacs_refresh_highlights(emacs_env *env, ptrdiff_t nargs, emacs_value *args,
 			 void *data);
 
 emacs_value
+emacs_page_image_spec(emacs_env *env, ptrdiff_t nargs, emacs_value *args,
+		      void *data);
+
+emacs_value
 emacs_close_doc(emacs_env *env, ptrdiff_t nargs, emacs_value *args, void *data);
 
 #endif // RENDER_CORE_H
