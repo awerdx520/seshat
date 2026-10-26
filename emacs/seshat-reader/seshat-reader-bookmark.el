@@ -72,10 +72,16 @@ offset as-is and used as an approximation.  nil / a non-number falls back to
 
 The recorded place is restored in this order:
 
-1. `scale' — applied first, because resizing the pages changes where the row
-   of the target page sits; the scale is restored as an explicit zoom
-   \\(`manual' fit mode), so a later window resize does not replace it with a
-   fit; a missing or non-numeric scale is skipped.
+1. `fit-mode' + `scale' — applied first, because resizing the pages changes
+   where the row of the target page sits.  The recorded **fit mode takes part
+   in the restore**: `manual' (or a missing mode) restores the recorded
+   explicit `scale' as a manual zoom, so a later window resize does not
+   replace it with a fit; `contain' / `width' / `height' instead restore the
+   base scale that mode implies for the reference page
+   \\(`seshat-reader--multipage-base-fit-scale'), which keeps the same fit
+   behaviour across resizes — the recorded `scale' is then not used, because a
+   fit scale has to be recomputed from the current window.  A missing or
+   non-numeric value skips that step.
 2. `page' — `seshat-reader--multipage-goto', which lands on the **top** of the
    page and clears the pixel scroll of the window.
 3. `offset' — the page-internal pixel offset, re-applied on top of that top
@@ -92,9 +98,18 @@ The recorded place is restored in this order:
       (switch-to-buffer (current-buffer))
       (unless (derived-mode-p 'seshat-reader-mode)
 	(seshat-reader-mode))
-      ;; ① 先恢复缩放：页行高度变了，目标页的位置才稳定。
-      (when (and (numberp scale) (> scale 0))
-        (seshat-reader--multipage-set-scale scale 'manual 'manual))
+      ;; ① 先恢复缩放：页行高度变了，目标页的位置才稳定。记录的 fit 模式参与
+      ;; 恢复：`manual' 或缺失 → 用记录的显式 scale；`contain' / `width' /
+      ;; `height' → 用该模式的基准页 fit（resize 后行为一致，且不依赖记录里
+      ;; 那个已过期的 scale）。
+      (let ((mode (bookmark-prop-get bookmark 'fit-mode)))
+        (cond
+         ((memq mode '(contain width height))
+          (let ((fit (seshat-reader--multipage-base-fit-scale mode)))
+            (when (numberp fit)
+              (seshat-reader--multipage-set-scale fit 'fit mode))))
+         ((and (numberp scale) (> scale 0))
+          (seshat-reader--multipage-set-scale scale 'manual 'manual))))
       ;; ② 跳到目标页（`--multipage-goto' 会把页内偏移清零，停在页首）。
       (when (numberp page)
         (seshat-reader--multipage-goto page))

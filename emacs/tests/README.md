@@ -37,6 +37,29 @@ emacs --batch -Q -L emacs -L emacs/seshat-reader $(LIBS) \
 并打印 `FAIL` / `SKIP` / `NORAN`（后者表示该文件连 `Ran N tests` 都没有，通常是
 load 失败，日志在 `/tmp/seshat-reader-ert/<文件>.log`）。
 
+### 判据实现与自检（`ert-judge.sh` + `check-criteria`）
+
+判定逻辑单独放在同目录的 `ert-judge.sh` 里（`ert` 与自检共用同一段代码，避免
+「自检用一套、真实运行用另一套」）。三条判据：行以 `Ran ` 开头、`unexpected`
+**数值**为 0、行内不含 `skipped`。
+
+**注意不要用子串匹配**：`grep "0 unexpected"` 会把 `10 unexpected` 判成通过
+（`10 unexpected` 里含 `0 unexpected`）。这正是 M2 修掉的缺陷 —— 现在用
+`sed -n 's/.* \([0-9][0-9]*\) unexpected.*/\1/p'` 取出数字后做 `-eq 0`。
+
+自检入口（`all` 也会跑它）：
+
+```sh
+make -C emacs/tests check-criteria
+# 期望输出：
+#   [期望通过→通过] Ran 3 tests, 3 results as expected, 0 unexpected (...)
+#   [期望失败→失败] Ran 20 tests, 10 results as expected, 10 unexpected (...)
+#   [期望失败→失败] Ran 3 tests, 2 results as expected, 0 unexpected, 1 skipped (...)
+#   check-criteria: PASS
+```
+
+三条假汇总行的期望都成立才 EXIT 0；改判据（或换 shell）后先跑它，再信 `ert` 的绿。
+
 ## 为什么必须 `-Q` 与这些 `-L`
 
 - **`-Q`**：用户配置会加载 evil、主题、全局 minor mode，改变按键与窗口行为，

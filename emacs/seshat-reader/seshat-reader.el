@@ -219,11 +219,28 @@ used when the viewport cannot be mapped to a row."
          (or window (selected-window)))
         seshat-reader--recent-pagenumber-fallback)))
 
-(defun seshat-reader-current-doc-scale-value (&optional window)
-  "Scaling factor of WINDOW.
+;; 前置声明：真值在多页布局一节定义（`defvar-local'），这里先声明让字节编译器
+;; 知道它是 special variable（`defvar' 不设值，不会覆盖后面的默认值）。
+(defvar seshat-reader--multipage-base-scale)
 
-WINDOW must be a valid window and defaults to the selected one."
-  (or (window-parameter window 'scale) seshat-reader--recent-scale-fallback))
+(defun seshat-reader-current-doc-scale-value (&optional window)
+  "Scaling factor of the current document, as shown in WINDOW.
+
+WINDOW defaults to the selected one and is only a hint: since P1 the zoom is a
+**buffer level** value (`seshat-reader--multipage-base-scale'), because every
+window showing the document displays the same page rows at the same scale.
+The window parameter `scale' is a compatibility mirror (written by
+`seshat-reader--multipage-set-scale' for every window that shows the buffer),
+and it is only consulted while the buffer holds no page row yet -- during
+startup, or in a buffer that never rendered a document.
+
+Reading the buffer value first is what keeps a **second** window correct
+after the user zooms the first one: its own `scale' parameter may be stale,
+and a stale mirror would make the selection geometry (which divides by this
+value) return coordinates off by the ratio of the two scales."
+  (or (and seshat-reader--pages seshat-reader--multipage-base-scale)
+      (window-parameter window 'scale)
+      seshat-reader--recent-scale-fallback))
 
 ;; We queue some commands because the user is expected to use the
 ;; commands repeatedly, such as by simply spamming a key. If we don't
@@ -496,6 +513,11 @@ page for as long as the user keeps typing.  BASE is returned."
     (when mode
       (setq seshat-reader--multipage-fit-mode mode))
     (setq seshat-reader--recent-scale-fallback base)
+    ;; `scale' 是兼容镜像：所有显示本 buffer 的窗口都写一遍，避免别的模块
+    ;; （选区 / 书签 / 旧调用点）从另一个窗口读到 stale 值。真值仍是上面的
+    ;; buffer-local `--multipage-base-scale'。
+    (dolist (win (get-buffer-window-list (current-buffer) nil t))
+      (set-window-parameter win 'scale base))
     (set-window-parameter window 'scale base)
     (when source
       (set-window-parameter window 'scale-source source))
@@ -845,6 +867,22 @@ WINDOW must be a valid window and defaults to the selected one."
 (defvar seshat-reader--multipage-preload)
 (defvar seshat-reader--multipage-memory-warned)
 
+(defconst seshat-reader--multipage-preload-max 3
+  "Hard ceiling for `seshat-reader--multipage-preload', in pages per side.
+
+Two pages each side is already more than one screen of slack on a normal
+frame, and every extra page costs a row plus a cached spec (each holding a
+Lisp copy of the bitmap), so the residency would grow linearly with no gain.
+The clamp is internal on purpose: `seshat-reader--multipage-preload' stays a
+plain defvar (no new user option), and a configuration that raises it is
+silently bounded by `seshat-reader--multipage-effective-preload'.")
+
+(defun seshat-reader--multipage-effective-preload ()
+  "Return the preload actually used, clamped to [0 `-preload-max']."
+  (min seshat-reader--multipage-preload-max
+       (max 0 seshat-reader--multipage-preload)))
+
+
 (defvar seshat-reader--page-spec-cache-limit 8
   "Hard ceiling for `seshat-reader--page-spec-cache', and a knob to lower it.
 
@@ -899,7 +937,7 @@ The smallest of the three wins, so a configuration that raises the preload
 cannot push the cache past what memory allows."
   (min 16
        (max 0 seshat-reader--page-spec-cache-limit)
-       (max 4 (+ (* 2 (max 0 seshat-reader--multipage-preload)) 2))))
+       (max 4 (+ (* 2 (seshat-reader--multipage-effective-preload)) 2))))
 
 (defun seshat-reader--multipage-resident-page-range ()
   "Return the pages the layout currently holds, as a cons (FIRST . LAST).
@@ -1368,7 +1406,7 @@ no page rows and no page count is known either."
                         (and seshat-reader--pages
                              (car (car (last seshat-reader--pages))))
                         first-page))
-           (preload (max 0 seshat-reader--multipage-preload)))
+           (preload (seshat-reader--multipage-effective-preload)))
       (cons (max 1 (- first-page preload))
             (min highest (+ (max first-page last-page) preload))))))
 
@@ -1791,10 +1829,19 @@ scrolling loop always advances: a page without a rendered spec has a span of
 (defun seshat-reader--multipage-page-max-offset (page)
   "Return the largest vertical scroll, in pixels, that PAGE allows.
 
-One pixel less than the page height, so the page never scrolls completely off
-the top of the window; 0 for a page without a rendered spec.  Clamping to this
-value is what stops the scroll loop when there is no page left to cross."
-  (max 0 (1- (seshat-reader--multipage-page-pixel-height page))))
+One pixel less than the **span** of PAGE (page height + the gap that follows
+it, see `seshat-reader--multipage-page-span'), or 0 for a page without a
+rendered spec.  Clamping to this value is what stops the scroll loop when
+there is no page left to cross.
+
+The ceiling must cover the gap, not just the bitmap: the scroll loop crosses to
+the next page when `window-vscroll + step` reaches the span, so a ceiling of
+`page-height - 1` would clamp back every attempt to accumulate the gap pixels --
+those pixels are neither inside the page nor past the span, so the page bottom
+became a dead zone (with `seshat-reader-page-gap-lines' > 0 the reader could
+never scroll past the last `gap' pixels of a page).  Using the span keeps the
+clamp and the crossing test on the same number."
+  (max 0 (1- (seshat-reader--multipage-page-span page))))
 
 (defun seshat-reader--multipage-page-neighbour (page delta)
   "Return the page DELTA pages away from PAGE, or nil when there is none.
@@ -1920,12 +1967,16 @@ row is placed according to the current geometry."
                      (seshat-reader--multipage-clamp-page
                       (seshat-reader-current-doc-pagenumber))
                      1))
-         (preload (max 0 seshat-reader--multipage-preload))
+         (preload (seshat-reader--multipage-effective-preload))
          (count (seshat-reader--multipage-pagecount))
          (first (max 1 (- target preload)))
          (last (if count (min count (+ target preload)) (+ target preload))))
     (let ((inhibit-read-only t))
       (erase-buffer))
+    ;; 与 `--render-buffer' 同一纪律：buffer 正文由原生模块生成，重排后
+    ;; `erase-buffer' 留下的 modified 标志必须清掉，否则 modeline 显示 `**'、
+    ;; super-save 一类包会把重生成内容写回原文件。
+    (set-buffer-modified-p nil)
     (seshat-reader--multipage-clear)
     (setq seshat-reader--page-native-sizes nil
           seshat-reader--page-render-scales nil
@@ -2780,7 +2831,7 @@ PAGE."
 	  ;; 位图随重载失效，按页缓存的 spec 不能再复用；清缓存失败不得中断重载。
 	  (ignore-errors (seshat-reader--page-spec-clear-cache))
 	  (let* ((target (or (seshat-reader--multipage-clamp-page (1+ p)) 1))
-		 (preload (max 0 seshat-reader--multipage-preload))
+		 (preload (seshat-reader--multipage-effective-preload))
 		 (count (seshat-reader--multipage-pagecount))
 		 (first (max 1 (- target preload)))
 		 (last (if count (min count (+ target preload))

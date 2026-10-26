@@ -235,7 +235,9 @@ of `--multipage-goto'), :vscroll (args of `set-window-vscroll') and :hscroll."
                          (cons 'offset 120)
                          (cons 'hscroll 40)
                          (cons 'scale 1.5)
-                         (cons 'fit-mode 'width)))
+                         ;; `manual' 记录才用记录里的 scale；fit 模式走基准页
+                         ;; fit（见 `--bookmark-restores-recorded-fit-mode'）
+                         (cons 'fit-mode 'manual)))
          (calls (seshat-reader-periphery-test--jump-calls bookmark)))
     (should (equal '(1.5 manual manual) (plist-get calls :scale)))
     (should (= 7 (plist-get calls :page)))
@@ -472,6 +474,79 @@ of `--multipage-goto'), :vscroll (args of `set-window-vscroll') and :hscroll."
             (should (eq selected-before (selected-window)))
             ;; window-start 没动：拖拽不得打断像素滚动位置
             (should (= start-before (window-start window)))))
+      (kill-buffer buffer))))
+
+;;;; T9 回归：审查修复（多窗口 scale / 书签 fit 模式）
+
+(ert-deftest seshat-reader-periphery-test--posn->page-uses-current-scale-across-windows ()
+  "Selection geometry divides by the buffer level scale, not a stale mirror."
+  (let* ((buffer (seshat-reader-periphery-test--reader-buffer '(1 2)))
+         (window-a (selected-window))
+         (window-b nil))
+    (unwind-protect
+        (progn
+          (setq window-b (split-window window-a))
+          (set-window-buffer window-a buffer)
+          (set-window-buffer window-b buffer)
+          (seshat-reader-periphery-test--load-select-source)
+          (with-current-buffer buffer
+            ;; buffer 级缩放 2.0，而窗口 B 的镜像被人为写脏成 1.0
+            (setq seshat-reader--multipage-base-scale 2.0)
+            (set-window-parameter window-a 'scale 2.0)
+            (set-window-parameter window-b 'scale 1.0)
+            (seshat-reader-periphery-test--with-posn-stubs window-b
+              (let ((posn (seshat-reader-periphery-test--fake-posn
+                           window-b 1 (cons 200 400))))
+                ;; 200/2 = 100（不是 200/1 = 200）
+                (should (equal (cons 100.0 200.0)
+                               (seshat-reader-select-posn->page posn window-b)))
+                (should-not (equal (cons 200.0 400.0)
+                                   (seshat-reader-select-posn->page posn window-b)))))))
+      (when (window-live-p window-b) (delete-window window-b))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-periphery-test--bookmark-restores-recorded-fit-mode ()
+  "A recorded fit mode drives the restore; manual uses the recorded scale."
+  (let ((buffer (seshat-reader-periphery-test--reader-buffer '(1 2)))
+        (width-bookmark (list (cons 'filename "/tmp/doc.pdf")
+                              (cons 'page 2)
+                              (cons 'offset 0)
+                              (cons 'scale 1.5)
+                              (cons 'fit-mode 'width)))
+        (manual-bookmark (list (cons 'filename "/tmp/doc.pdf")
+                               (cons 'page 2)
+                               (cons 'scale 1.5)
+                               (cons 'fit-mode 'manual))))
+    (unwind-protect
+        (with-current-buffer buffer
+          (cl-letf (((symbol-function 'bookmark-default-handler)
+                     (lambda (&rest _) nil))
+                    ((symbol-function 'file-exists-p) (lambda (&rest _) t))
+                    ((symbol-function 'switch-to-buffer) (lambda (&rest _) nil))
+                    ((symbol-function 'derived-mode-p)
+                     (lambda (&rest _) 'seshat-reader-mode))
+                    ((symbol-function 'seshat-reader--multipage-goto)
+                     (lambda (&rest _) nil))
+                    ((symbol-function 'set-window-vscroll) (lambda (&rest _) nil))
+                    ((symbol-function 'set-window-hscroll) (lambda (&rest _) nil))
+                    ((symbol-function 'seshat-reader--multipage-base-fit-scale)
+                     (lambda (&optional _mode _window) 0.42))
+                    ((symbol-function 'seshat-reader--apply-display-scale)
+                     (lambda (&rest _) nil))
+                    ((symbol-function 'seshat-reader--center-page)
+                     (lambda (&rest _) nil))
+                    ((symbol-function 'seshat-reader--multipage-refit-page)
+                     (lambda (&rest _) nil))
+                    ((symbol-function 'seshat-reader--multipage-sync)
+                     (lambda (&rest _) nil)))
+            ;; 记录 width → base = 该模式的基准页 fit（0.42），不是记录里的 1.5
+            (seshat-reader-bookmark-jump width-bookmark)
+            (should (eq 'width seshat-reader--multipage-fit-mode))
+            (should (= 0.42 seshat-reader--multipage-base-scale))
+            ;; 记录 manual → 用记录的显式 scale，并把 fit 模式置 manual
+            (seshat-reader-bookmark-jump manual-bookmark)
+            (should (eq 'manual seshat-reader--multipage-fit-mode))
+            (should (= 1.5 seshat-reader--multipage-base-scale))))
       (kill-buffer buffer))))
 
 (provide 'seshat-reader-periphery-test)

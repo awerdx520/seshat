@@ -240,13 +240,20 @@
                                         (cadr (assq 2 seshat-reader--pages))))
               (should (= (window-start window)
                          (marker-position (cadr (assq 2 seshat-reader--pages)))))
+              ;; preload 本身被夹到 3（m5）：视口底页 3 + 3 = 6，下界夹到第 1 页
               (let ((seshat-reader--multipage-preload 10))
+                (should (= 3 (seshat-reader--multipage-effective-preload)))
                 (should (equal (seshat-reader--multipage-visible-range window)
-                               '(1 . 13))))
+                               '(1 . 6))))
               (let ((seshat-reader--multipage-preload 100))
-                ;; 下界恒为第 1 页，上界夹到文档页数
+                ;; preload 再大也只到 1..6，仍远小于 40 页
                 (should (equal (seshat-reader--multipage-visible-range window)
-                               '(1 . 40))))))
+                               '(1 . 6))))
+              ;; 页数比「视口 + preload」更小时才体现页数裁剪
+              (let ((seshat-reader-current-doc-pagecount 4)
+                    (seshat-reader--multipage-preload 3))
+                (should (equal (seshat-reader--multipage-visible-range window)
+                               '(1 . 4))))))
         (set-window-buffer window original)))))
 
 ;;;; 批次 2（T1b/T2/T3）：可见集同步、页号派生、翻页边界
@@ -1851,20 +1858,25 @@ one page height shows."
 ;;;; 用例
 
 (ert-deftest seshat-reader-multipage-test--geometry-cache-limit-follows-preload ()
-  "The cache limit follows the preload, bounded by 8 (knob) and 16 (ceiling).
+  "The cache limit follows the preload, bounded by 3 pages, 8 (knob), 16.
 
 The resident set is the viewport plus `preload' pages on each side, so the
 cache needs `2 * preload + 2` entries, never less than 4: 0/1/2/3 pages of
-preload give 4/4/6/8.  A huge preload cannot push it past the ceiling recorded
-in `decisions.md' (16), and never past the `seshat-reader--page-spec-cache-limit'
-knob either -- the smallest of the three wins."
+preload give 4/4/6/8.  The preload itself is clamped to
+`seshat-reader--multipage-preload-max' (3), so a huge value gives exactly the
+same 8 as 3 -- an unbounded preload would grow the residency (and the memory)
+linearly with no gain.  The `seshat-reader--page-spec-cache-limit' knob and the
+16 of `decisions.md' stay as further upper bounds."
   (with-temp-buffer
     (let ((seshat-reader--page-spec-cache-limit 16))
       (dolist (case '((0 . 4) (1 . 4) (2 . 6) (3 . 8)))
         (let ((seshat-reader--multipage-preload (car case)))
           (should (= (cdr case) (seshat-reader--multipage-cache-limit)))))
+      ;; preload 20 先被夹到 3 → 2*3+2 = 8
       (let ((seshat-reader--multipage-preload 20))
-        (should (= 16 (seshat-reader--multipage-cache-limit)))))
+        (should (= 3 (seshat-reader--multipage-effective-preload)))
+        (should (= 8 (seshat-reader--multipage-cache-limit)))
+        (should (= 8 (seshat-reader--multipage-cache-limit)))))
     ;; 变量的默认值 8 是兜底：preload 再大也只给 8
     (let ((seshat-reader--page-spec-cache-limit 8)
           (seshat-reader--multipage-preload 20))
@@ -2218,6 +2230,8 @@ P1 起该访问器返回 image spec（`overlayp' 为 nil、`car-safe' 是 `image
             (set-window-start window
                               (seshat-reader-multipage-test--row-start 2))
             (should (= 2 (seshat-reader-current-doc-pagenumber window)))
+            ;; 缩放真值是 buffer 级的（M3）：窗口参数只是镜像，必须一起写
+            (setq seshat-reader--multipage-base-scale 2.0)
             (set-window-parameter window 'scale 2.0)
             (cl-letf (((symbol-function 'posn-window) (lambda (_posn) window))
                       ((symbol-function 'posn-object)
@@ -2489,6 +2503,113 @@ T7 的验收是「不崩」：跨页选区的 `user-error' 属 T8，本批只要
           (let ((seshat-reader--recent-pagenumber-fallback 42))
             (seshat-reader--multipage-clear)
             (should-not (seshat-reader-current-doc-pagenumber window))))
+      (kill-buffer buffer))))
+
+;;;; T9 回归：审查修复（gap 滚动死区 / 多窗口 scale / preload 上限）
+
+(ert-deftest seshat-reader-multipage-test--geometry-scroll-crosses-page-with-gap ()
+  "Scrolling reaches the next page even when a page gap follows the bitmap."
+  (let* ((fixture (seshat-reader-multipage-test--geometry-buffer '(1 2) 600 500))
+         (buffer (car fixture))
+         (window (selected-window))
+         (vscroll 490)
+         (page 1)
+         (pages-seen nil))
+    (unwind-protect
+        (seshat-reader-multipage-test--with-window-buffer buffer
+          (with-current-buffer buffer
+            (cl-letf (((symbol-function 'seshat-reader--multipage-page-gap-pixels)
+                       (lambda (&optional _page) 20))
+                      ((symbol-function 'seshat-reader--multipage-page-at-pos)
+                       (lambda (&rest _) page))
+                      ((symbol-function 'window-start) (lambda (&optional _w) 1))
+                      ((symbol-function 'window-vscroll)
+                       (lambda (&optional _w _pixels) vscroll))
+                      ((symbol-function 'set-window-vscroll)
+                       (lambda (_w value &optional _pixels) (setq vscroll value)))
+                      ((symbol-function 'seshat-reader--multipage--scroll-to-page)
+                       (lambda (_w target) (setq page target) (push target pages-seen) nil))
+                      ((symbol-function 'seshat-reader--multipage-sync)
+                       (lambda (&rest _) nil)))
+              ;; 页高 500 + gap 20 = span 520；从页内 490 起每步 10 像素，
+              ;; 5 次之内必须跨到第 2 页（页底不能是死区）。
+              (dotimes (_ 5)
+                (seshat-reader--multipage-scroll 10 window))
+              (should (= 2 page))
+              (should (memq 2 pages-seen)))))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-page-max-offset-covers-gap ()
+  "The vscroll ceiling covers the page gap, not just the bitmap."
+  (let* ((fixture (seshat-reader-multipage-test--geometry-buffer '(1) 600 500))
+         (buffer (car fixture)))
+    (unwind-protect
+        (with-current-buffer buffer
+          (cl-letf (((symbol-function 'seshat-reader--multipage-page-gap-pixels)
+                     (lambda (&optional _page) 20)))
+            ;; 500（页高）+ 20（gap）− 1
+            (should (= 519 (seshat-reader--multipage-page-max-offset 1)))
+            ;; 没有 gap 时与旧口径一致
+            (cl-letf (((symbol-function 'seshat-reader--multipage-page-gap-pixels)
+                       (lambda (&optional _page) 0)))
+              (should (= 499 (seshat-reader--multipage-page-max-offset 1))))))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-scale-value-is-buffer-level ()
+  "The zoom is buffer level: a second window reads the scale the first set."
+  (let* ((fixture (seshat-reader-multipage-test--geometry-buffer '(1 2)))
+         (buffer (car fixture))
+         (window-a (selected-window))
+         (window-b nil))
+    (unwind-protect
+        (progn
+          (setq window-b (split-window window-a))
+          (set-window-buffer window-a buffer)
+          (set-window-buffer window-b buffer)
+          (with-current-buffer buffer
+            (cl-letf (((symbol-function 'seshat-reader--apply-display-scale)
+                       (lambda (&rest _) nil))
+                      ((symbol-function 'seshat-reader--center-page)
+                       (lambda (&rest _) nil))
+                      ((symbol-function 'seshat-reader--multipage-refit-page)
+                       (lambda (&rest _) nil))
+                      ((symbol-function 'seshat-reader--multipage-sync)
+                       (lambda (&rest _) nil)))
+              ;; 缩放窗口 A → 两个窗口的镜像与 buffer 级真值都应是 2.0
+              (seshat-reader--multipage-set-scale 2.0 'manual 'manual)
+              (should (= 2.0 seshat-reader--multipage-base-scale))
+              (should (= 2.0 (seshat-reader-current-doc-scale-value window-a)))
+              (should (= 2.0 (seshat-reader-current-doc-scale-value window-b)))
+              (should (= 2.0 (window-parameter window-b 'scale)))
+              ;; 即使 B 的镜像被人为写脏，读到的仍是 buffer 级真值
+              (set-window-parameter window-b 'scale 1.25)
+              (should (= 2.0 (seshat-reader-current-doc-scale-value window-b))))))
+      (when (window-live-p window-b) (delete-window window-b))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-preload-is-clamped ()
+  "A preload above the hard ceiling does not widen the resident range."
+  (let* ((fixture (seshat-reader-multipage-test--geometry-buffer
+                   '(1 2 3 4 5 6 7 8 9 10 11 12)))
+         (buffer (car fixture))
+         (window (selected-window))
+         (seshat-reader--multipage-preload 10))
+    (unwind-protect
+        (seshat-reader-multipage-test--with-window-buffer buffer
+          (with-current-buffer buffer
+            (cl-letf (((symbol-function 'seshat-reader--multipage-pagecount)
+                       (lambda () 12))
+                      ((symbol-function 'window-start)
+                       (lambda (&optional _w)
+                         (seshat-reader-multipage-test--row-start 6)))
+                      ((symbol-function 'window-end)
+                       (lambda (&optional _w _update)
+                         (seshat-reader-multipage-test--row-start 6))))
+              (should (= 3 seshat-reader--multipage-preload-max))
+              (should (= 3 (seshat-reader--multipage-effective-preload)))
+              ;; 视口停在第 6 页 → 两端各最多 3 页：3..9
+              (should (equal (cons 3 9)
+                             (seshat-reader--multipage-visible-range window))))))
       (kill-buffer buffer))))
 
 (provide 'seshat-reader-multipage-test)
