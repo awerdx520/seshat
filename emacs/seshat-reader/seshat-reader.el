@@ -2304,15 +2304,54 @@ windows from being refitted."
 ;; and keeps the remainder as the window's pixel vertical scroll.  Nothing
 ;; here turns a page: `n' / `p' stay on `seshat-reader--multipage-goto'.
 
-(defun seshat-reader--scroll-line-pixels (&optional window)
-  "Return the pixel height of one *text* line, the unit of a one-line scroll.
+;; 前置声明：两个 defcustom 定义在文件后部的选项区（`screen-context-lines' 附近），
+;; 而读取它们的函数在这里，先声明让字节编译器知道它们是 special variable；真正的
+;; 默认值与 `:type' 仍由后面的 `defcustom' 给出（`defvar' 不设值，不覆盖默认值）。
+(defvar seshat-reader-scroll-step-ratio)
+(defvar seshat-reader-scroll-step-pixels)
 
-WINDOW defaults to the selected window.  This is deliberately not
-`line-pixel-height': the line under point is a page row whose height is the
-whole page bitmap, so a one-line scroll would move by a whole page — the bug
-that made `j' turn pages.  `seshat-reader--default-line-pixels' returns the
-frame's character height instead, which is what one line of scrolling means."
+(defun seshat-reader--scroll-line-pixels (&optional window)
+  "Return the pixel height of one *text* line in WINDOW.
+
+WINDOW defaults to the selected window.  This is the unit of the screen-scroll
+overlap (`seshat-reader-screen-context-lines') and of the page gap, not the
+unit of a scroll step: a step is configurable
+\(`seshat-reader--scroll-step-pixels').
+
+It is deliberately not `line-pixel-height': the line under point is a page row
+whose height is the whole page bitmap, so one \"line\" of it would be a whole
+page — the bug that made `j' turn pages.  `seshat-reader--default-line-pixels'
+returns the frame's character height instead."
   (seshat-reader--default-line-pixels window))
+
+(defun seshat-reader--scroll-step-pixels (&optional window)
+  "Return the pixel distance of one scroll step of WINDOW.
+
+WINDOW defaults to the selected window.  A step is what one press of
+\\[seshat-reader-scroll-down] / \\[seshat-reader-scroll-up], one wheel notch and
+one `<remap> next-line' move by.
+
+`seshat-reader-scroll-step-pixels' wins when it is a positive integer: an
+absolute distance that does not change with the window.  Otherwise the step is
+`seshat-reader-scroll-step-ratio' times the pixel height of the window's *text
+area* (the PIXELWISE argument of `window-body-height'), so the mode line and the
+header line are never counted: a step must not grow by the height of the mode
+line.  A ratio that is not a positive number, or one that rounds to less than a
+pixel, falls back to one default text line
+\(`seshat-reader--default-line-pixels'), so a scroll step can never end up moving
+0 pixels and the commands keep working whatever the option holds."
+  (let ((window (if (window-live-p window) window (selected-window))))
+    (or (and (integerp seshat-reader-scroll-step-pixels)
+             (> seshat-reader-scroll-step-pixels 0)
+             seshat-reader-scroll-step-pixels)
+        (let* ((ratio seshat-reader-scroll-step-ratio)
+               (height (window-body-height window t))
+               (pixels (and (numberp ratio) (> ratio 0)
+                            (numberp height) (> height 0)
+                            (round (* ratio height)))))
+          (if (and (integerp pixels) (>= pixels 1))
+              pixels
+            (seshat-reader--default-line-pixels window))))))
 
 (defun seshat-reader--scroll-screen-pixels (&optional window)
   "Return the pixel distance of one screen scroll of WINDOW.
@@ -2329,33 +2368,38 @@ which would answer with the height of the page row under point."
                  (seshat-reader--scroll-line-pixels window))))))
 
 (defun seshat-reader-scroll-up (&optional amount)
-  "Scroll the view upward by AMOUNT lines, one line by default.
+  "Scroll the view upward by AMOUNT steps, one step by default.
 
-The text moves down and the content above comes into view, one pixel line at a
-time and continuously across the page boundary: a page is one buffer line, so
-the built-in line scrolling would jump a whole page.
-`seshat-reader--multipage-scroll' moves the view instead and synchronises the
-resident page rows afterwards, so scrolling into a page that was not rendered
-yet renders it on the spot."
+The text moves down and the content above comes into view, continuously across
+the page boundary: a page is one buffer line, so the built-in line scrolling
+would jump a whole page.  How far one step travels is decided by
+`seshat-reader-scroll-step-ratio' / `seshat-reader-scroll-step-pixels' through
+`seshat-reader--scroll-step-pixels'.
+
+`seshat-reader--multipage-scroll' moves the view and synchronises the resident
+page rows afterwards, so scrolling into a page that was not rendered yet renders
+it on the spot."
   (interactive "p")
   (seshat-reader--multipage-scroll
-   (- (* (or amount 1) (seshat-reader--scroll-line-pixels)))))
+   (- (* (or amount 1) (seshat-reader--scroll-step-pixels)))))
 
 (defun seshat-reader-scroll-down (&optional amount)
-  "Scroll the view downward by AMOUNT lines, one line by default.
+  "Scroll the view downward by AMOUNT steps, one step by default.
 
 The text moves up and the content below comes into view, continuously across
-the page boundary, for the reason given in `seshat-reader-scroll-up'."
+the page boundary, for the reason and with the step size given in
+`seshat-reader-scroll-up'."
   (interactive "p")
   (seshat-reader--multipage-scroll
-   (* (or amount 1) (seshat-reader--scroll-line-pixels))))
+   (* (or amount 1) (seshat-reader--scroll-step-pixels))))
 
 (defun seshat-reader-scroll-up-screen (&optional amount)
-  "Scroll the view upward by one screen, or by AMOUNT lines.
+  "Scroll the view upward by one screen, or by AMOUNT steps.
 
 One screen is the pixel body height of the window minus
-`next-screen-context-lines' lines, so a line of context stays visible.
-Switching pages stays on `n' / `p'."
+`next-screen-context-lines' lines, so a line of context stays visible.  A screen
+is a whole view, not a step, so `seshat-reader-scroll-step-ratio' does not
+affect it.  Switching pages stays on `n' / `p'."
   (interactive "P")
   (if amount
       (seshat-reader-scroll-up amount)
@@ -2363,11 +2407,12 @@ Switching pages stays on `n' / `p'."
      (- (seshat-reader--scroll-screen-pixels)))))
 
 (defun seshat-reader-scroll-down-screen (&optional amount)
-  "Scroll the view downward by one screen, or by AMOUNT lines.
+  "Scroll the view downward by one screen, or by AMOUNT steps.
 
 One screen is the pixel body height of the window minus
-`next-screen-context-lines' lines, so a line of context stays visible.
-Switching pages stays on `n' / `p'."
+`next-screen-context-lines' lines, so a line of context stays visible.  A screen
+is a whole view, not a step, so `seshat-reader-scroll-step-ratio' does not
+affect it.  Switching pages stays on `n' / `p'."
   (interactive "P")
   (if amount
       (seshat-reader-scroll-down amount)
@@ -2455,8 +2500,9 @@ now and turning pages stays on `n' / `p'."
 (define-queue-command mwheel-scroll-up (event)
   "Scroll the view up, but also handle mouse EVENT.
 
-The wheel delta is read from the event: one line for a single notch and more
-for a double or triple one.  See also `seshat-reader-scroll-up'."
+The wheel delta is read from the event: one scroll step for a single notch, two
+or three for a double or triple one, so the notch count multiplies
+`seshat-reader--scroll-step-pixels'.  See also `seshat-reader-scroll-up'."
   (interactive "e")
   (let* ((event-type (car event))
 	 (amount (pcase event-type
@@ -2470,8 +2516,9 @@ for a double or triple one.  See also `seshat-reader-scroll-up'."
 (define-queue-command mwheel-scroll-down (event)
   "Scroll the view down, but also handle mouse EVENT.
 
-The wheel delta is read from the event: one line for a single notch and more
-for a double or triple one.  See also `seshat-reader-scroll-down'."
+The wheel delta is read from the event: one scroll step for a single notch, two
+or three for a double or triple one, so the notch count multiplies
+`seshat-reader--scroll-step-pixels'.  See also `seshat-reader-scroll-down'."
   (interactive "e")
   (let* ((event-type (car event))
 	 (amount (pcase event-type
@@ -2854,6 +2901,41 @@ Bound locally to `next-screen-context-lines' in reader buffers, which makes
 0 means a full screen with no overlap; 1 keeps one line of context."
   :type 'integer
   :group 'seshat-reader)
+
+(defcustom seshat-reader-scroll-step-ratio 0.15
+  "Fraction of the window text height scrolled by one step.
+
+A step is what \\[seshat-reader-scroll-down] and
+\\[seshat-reader-scroll-up] move by (one line, one wheel notch, or a
+`<remap> next-line' press), so this option decides how far one keypress
+travels: 0.15 moves about a seventh of the visible text area.
+
+The ratio is taken from the pixel height of the window's text area
+\(`window-body-height' with the PIXELWISE argument), which excludes the mode
+line and the header line: scrolling must never be computed from the whole
+frame height, or a step would silently grow by the height of the mode line.
+
+`seshat-reader-scroll-step-pixels', when non-nil, overrides this ratio."
+  :type 'number
+  :group 'seshat-reader)
+;; 中文：一次滚动步长占窗口**文本区**高度的比例（不含 mode-line / header-line）。
+;; 0.15 ≈ 一屏的七分之一，连按 j 时有段落感而不至于一次跨半页。
+
+(defcustom seshat-reader-scroll-step-pixels nil
+  "Absolute pixel distance of one scroll step, or nil to use the ratio.
+
+When non-nil this overrides `seshat-reader-scroll-step-ratio' and every scroll
+step is exactly this many pixels, whatever the window size is: it is meant for
+users who want the speed of \\[seshat-reader-scroll-down] pinned to a value
+instead of scaling with the window.
+
+A non-positive value is ignored and the ratio is used instead, because a step
+of 0 pixels would make the scroll commands silently do nothing."
+  :type '(choice (const :tag "Use the ratio of the window height" nil)
+                 (integer :tag "Fixed pixel distance"))
+  :group 'seshat-reader)
+;; 中文：绝对像素步长；非 nil 时**优先**于上面那个比例，适合把滚动速度钉死、
+;; 不随窗口大小变化的人。非正数视同 nil（否则一次滚动 0 像素＝按键没反应）。
 
 (defcustom seshat-reader-keymap-preset 'vim
   "Keymap preset for `seshat-reader-mode-map'.

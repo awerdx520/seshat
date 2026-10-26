@@ -1079,12 +1079,15 @@ stops the scroll; the viewport stays on page 1 with no pixel offset."
 (ert-deftest seshat-reader-multipage-test--geometry-screen-scroll-pixels ()
   "One screen is the window body height minus the context lines, in pixels.
 
-`SPC' / `DEL' must scroll a screen, not a line and not a whole page: the
-distance is computed from the pixel body height so the reader never scrolls
-past more than one screen at a time."
+`SPC' / `DEL' must scroll a screen, not a step and not a whole page: the
+distance is computed from the pixel body height, so it does not depend on
+`seshat-reader-scroll-step-ratio' — the ratio is bound to 0.5 here and the
+answer must still be 790."
   (let ((buffer (seshat-reader-multipage-test--scroll-fixture '(1 2)))
         (captured nil)
-        (next-screen-context-lines 1))
+        (next-screen-context-lines 1)
+        (seshat-reader-scroll-step-ratio 0.5)
+        (seshat-reader-scroll-step-pixels nil))
     (unwind-protect
         (seshat-reader-multipage-test--window-pixels 1000 800
           (seshat-reader-multipage-test--with-window-buffer buffer
@@ -1102,20 +1105,24 @@ past more than one screen at a time."
                                 (selected-window))))))))
       (kill-buffer buffer))))
 
-(ert-deftest seshat-reader-multipage-test--geometry-mwheel-scrolls-one-two-three-lines ()
-  "One wheel notch scrolls a line, a double or triple notch two or three.
+(ert-deftest seshat-reader-multipage-test--geometry-mwheel-scales-with-notch ()
+  "One wheel notch is one scroll step; double and triple notches are two and three.
 
-The wheel must not turn the page either: the notch count is converted to lines
-and then to pixels, and the sign follows the wheel direction."
+The step is the ratio of the window text height here (0.15 × 800px = 120px), and
+the notch count multiplies it: 120 / 240 / 360 downwards and the same upwards.
+The wheel must never turn the page, so what is recorded is the distance handed
+to `seshat-reader--multipage-scroll', not a page number."
   (let ((buffer (seshat-reader-multipage-test--scroll-fixture '(1 2)))
         (captured nil)
-        (window (selected-window)))
+        (window (selected-window))
+        (seshat-reader-scroll-step-ratio 0.15)
+        (seshat-reader-scroll-step-pixels nil))
     (unwind-protect
         (seshat-reader-multipage-test--window-pixels 1000 800
           (seshat-reader-multipage-test--with-window-buffer buffer
             (with-current-buffer buffer
               (cl-letf (((symbol-function 'frame-char-height)
-                         (lambda (&optional _frame) 10))
+                         (lambda (&optional _frame) 20))
                         ((symbol-function 'seshat-reader--multipage-scroll)
                          (lambda (pixels &optional _window)
                            (push pixels captured) pixels)))
@@ -1125,7 +1132,7 @@ and then to pixels, and the sign follows the wheel direction."
                 (dolist (type '(wheel-up double-wheel-up triple-wheel-up))
                   (seshat-reader--non-queue-mwheel-scroll-up
                    (list type (list window 1 (list 1 1) nil 0))))
-                (should (equal '(10 20 30 -10 -20 -30) (reverse captured)))))))
+                (should (equal '(120 240 360 -120 -240 -360) (reverse captured)))))))
       (kill-buffer buffer))))
 
 (ert-deftest seshat-reader-multipage-test--geometry-goto-resets-vscroll ()
@@ -1191,16 +1198,18 @@ scroll that forgot it would be applied on a completely different scale (a
 ;; 这三个用例把 `line-pixel-height' 桩成**页高**、把 `frame-char-height' 桩成真正
 ;; 的行高，因此一旦有人把取值改回 `line-pixel-height'，断言立刻变红。
 
-(ert-deftest seshat-reader-multipage-test--geometry-scroll-line-pixels-ignores-page-height ()
-  "A one-line scroll moves by the frame's line height, not by the page height.
+(ert-deftest seshat-reader-multipage-test--geometry-scroll-step-ratio-scales-with-window ()
+  "One scroll step is the ratio of the window text height, not a page.
 
-`line-pixel-height' is stubbed to the page height here, which is exactly what a
-real frame answers on a page row; the scroll must ignore it and use
-`frame-char-height', otherwise one keypress moves a whole page and the pixel
-offset never grows."
+`window-body-height' is stubbed to 800px and the ratio to 0.15, so a step is
+120px.  `line-pixel-height' is stubbed to the page height (500px), which is what
+a real frame answers on a page row: the step must not consult it, otherwise one
+keypress moves a whole page and the pixel offset never grows."
   (let ((buffer (seshat-reader-multipage-test--scroll-fixture '(1 2)))
         (calls nil)
-        (starts 0))
+        (starts 0)
+        (seshat-reader-scroll-step-ratio 0.15)
+        (seshat-reader-scroll-step-pixels nil))
     (unwind-protect
         (seshat-reader-multipage-test--window-pixels 1000 800
           (seshat-reader-multipage-test--with-window-buffer buffer
@@ -1222,10 +1231,72 @@ offset never grows."
                         ((symbol-function 'seshat-reader--multipage-sync)
                          (lambda (&optional _window) nil)))
                 (seshat-reader-scroll-down 1)
-                (should (= 20 (seshat-reader--scroll-line-pixels
-                               (selected-window)))))
-              (should (equal '((20 . t)) calls))
+                (should (= 120 (seshat-reader--scroll-step-pixels
+                                (selected-window)))))
+              (should (equal '((120 . t)) calls))
               (should (= 0 starts)))))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-scroll-step-absolute-pixels-wins ()
+  "`seshat-reader-scroll-step-pixels' overrides the ratio.
+
+With the window 800px tall the ratio (0.15) would give 120px per step; the
+absolute value 37 must win, and the amount argument must still multiply it
+\(so two steps are 74px on top of the current offset)."
+  (let ((buffer (seshat-reader-multipage-test--scroll-fixture '(1 2)))
+        (calls nil)
+        (seshat-reader-scroll-step-ratio 0.15)
+        (seshat-reader-scroll-step-pixels 37))
+    (unwind-protect
+        (seshat-reader-multipage-test--window-pixels 1000 800
+          (seshat-reader-multipage-test--with-window-buffer buffer
+            (with-current-buffer buffer
+              (cl-letf (((symbol-function 'window-start)
+                         (lambda (&optional _window)
+                           (seshat-reader-multipage-test--row-position 1)))
+                        ((symbol-function 'set-window-start)
+                         (lambda (&rest _args) nil))
+                        ((symbol-function 'window-vscroll)
+                         (lambda (&optional _window _pixels-p)
+                           seshat-reader-multipage-test--scroll-offset))
+                        ((symbol-function 'set-window-vscroll)
+                         (lambda (_window value &optional pixels-p)
+                           (push (cons value pixels-p) calls)
+                           (setq seshat-reader-multipage-test--scroll-offset value)
+                           value))
+                        ((symbol-function 'frame-char-height)
+                         (lambda (&optional _frame) 20))
+                        ((symbol-function 'seshat-reader--multipage-sync)
+                         (lambda (&optional _window) nil)))
+                ;; 全局模拟量由前面的用例留下过数值，先归零
+                (setq seshat-reader-multipage-test--scroll-offset 0)
+                (should (= 37 (seshat-reader--scroll-step-pixels
+                               (selected-window))))
+                (seshat-reader-scroll-down 1)
+                (seshat-reader-scroll-down 2))
+              ;; 37，然后 37 + 2 × 37 = 111（不是 120 / 360）
+              (should (equal '((111 . t) (37 . t)) calls)))))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-scroll-step-falls-back-to-line-pixels ()
+  "A ratio that cannot produce a pixel falls back to one default text line.
+
+A ratio of 0, a non-number and a ratio so small that it rounds to 0 all have to
+give `seshat-reader--default-line-pixels' (20px here): a step of 0 pixels would
+make `j' silently do nothing instead of moving the view."
+  (let ((buffer (seshat-reader-multipage-test--scroll-fixture '(1 2)))
+        (seshat-reader-scroll-step-pixels nil))
+    (unwind-protect
+        (seshat-reader-multipage-test--window-pixels 1000 800
+          (seshat-reader-multipage-test--with-window-buffer buffer
+            (with-current-buffer buffer
+              (cl-letf (((symbol-function 'frame-char-height)
+                         (lambda (&optional _frame) 20))
+                        ((symbol-function 'line-pixel-height) (lambda () 500)))
+                (dolist (ratio (list 0 'x 0.00001))
+                  (let ((seshat-reader-scroll-step-ratio ratio))
+                    (should (= 20 (seshat-reader--scroll-step-pixels
+                                   (selected-window))))))))))
       (kill-buffer buffer))))
 
 (ert-deftest seshat-reader-multipage-test--geometry-screen-scroll-pixels-uses-default-line-height ()
@@ -1234,10 +1305,15 @@ offset never grows."
 With the page height (500) answered by `line-pixel-height' and the real line
 height (20) by `frame-char-height', a screen of 800px and one context line must
 give 780 — not 800 - 500 = 300, which is what the page-height confusion would
-produce."
+produce.
+
+A screen is a viewful, not a step, so `seshat-reader-scroll-step-ratio' (bound
+to 0.5 here, i.e. 400px if it were consulted) must not change the answer."
   (let ((buffer (seshat-reader-multipage-test--scroll-fixture '(1 2)))
         (captured nil)
-        (next-screen-context-lines 1))
+        (next-screen-context-lines 1)
+        (seshat-reader-scroll-step-ratio 0.5)
+        (seshat-reader-scroll-step-pixels nil))
     (unwind-protect
         (seshat-reader-multipage-test--window-pixels 1000 800
           (seshat-reader-multipage-test--with-window-buffer buffer
