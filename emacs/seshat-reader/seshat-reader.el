@@ -1869,6 +1869,21 @@ normal state when evil turns on."
                 (bound-and-true-p seshat-reader-translate-panel-mode))
         (seshat-reader--disable-evil)))))
 
+(defun seshat-reader--refit-evil-after-major-mode ()
+  "Turn evil off again after a major-mode change in a reader buffer.
+evil is a globalized minor mode whose enable function runs on
+`after-change-major-mode-hook', i.e. after the mode body already called
+`seshat-reader--disable-evil'; this function is appended so that it runs
+after that entry.  Being a named function, `add-hook' keeps a single copy
+even when the file is loaded twice."
+  (when (derived-mode-p 'seshat-reader-mode
+                        'seshat-reader-outline-mode
+                        'seshat-reader-annotation-list-mode)
+    (seshat-reader--disable-evil)))
+
+(add-hook 'after-change-major-mode-hook
+          #'seshat-reader--refit-evil-after-major-mode 'append)
+
 (with-eval-after-load 'evil
   (seshat-reader--disable-evil-in-existing-buffers))
 

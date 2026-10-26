@@ -164,6 +164,41 @@
         (seshat-reader--disable-evil)
         (should-not calls)))))
 
+;;; 4.1 `after-change-major-mode-hook'：evil 的 globalized 启用之后再关一次
+
+(ert-deftest seshat-reader-evil-keymap-test--major-mode-hook-disables-evil ()
+  "reader 系 buffer 换 major mode 后再次关闭 evil，非 reader buffer 不受影响."
+  ;; ① reader 系 buffer：hook 排在 evil 的 globalized 启用函数之后，用 -1 再关
+  (let ((calls nil))
+    (with-temp-buffer
+      ;; 不真调 `seshat-reader-mode'（会触发渲染），`derived-mode-p' 只看
+      ;; `major-mode' 与 `derived-mode-parent'，直接摆好即可
+      (setq major-mode 'seshat-reader-mode)
+      (setq-local evil-local-mode t)
+      (cl-letf (((symbol-function 'evil-local-mode)
+                 (lambda (arg) (push arg calls) nil)))
+        (run-hooks 'after-change-major-mode-hook))
+      (should (equal calls '(-1)))))
+  ;; ② 非 reader buffer：同一个 hook 不碰 evil
+  (let ((calls nil))
+    (with-temp-buffer
+      (setq major-mode 'fundamental-mode)
+      (setq-local evil-local-mode t)
+      (cl-letf (((symbol-function 'evil-local-mode)
+                 (lambda (arg) (push arg calls) nil)))
+        (run-hooks 'after-change-major-mode-hook))
+      (should-not calls)))
+  ;; ③ defcustom 关掉时：即使是 reader 系 buffer 也不碰 evil
+  (let ((seshat-reader-disable-evil nil)
+        (calls nil))
+    (with-temp-buffer
+      (setq major-mode 'seshat-reader-mode)
+      (setq-local evil-local-mode t)
+      (cl-letf (((symbol-function 'evil-local-mode)
+                 (lambda (arg) (push arg calls) nil)))
+        (run-hooks 'after-change-major-mode-hook))
+      (should-not calls))))
+
 ;;; 5. 面板显示漏斗：先关 evil，再显示
 
 (ert-deftest seshat-reader-evil-keymap-test--display-disables-evil-first ()

@@ -730,6 +730,12 @@ M12 回归（strip 行破坏页面几何 + `--center-page` 在 `window-size-chan
 **evil 下按 `?` 变成了反向搜索（`evil-search-backward`）**
 已修（2026-10-26）：阅读 buffer 进入 `seshat-reader-mode` 时关闭 evil（`seshat-reader--disable-evil`，受 `seshat-reader-disable-evil` 控制，默认 `t`），`?` 直接由 `seshat-reader-mode-map` 解析，不再被 `evil-normal-state-map` 压掉。验证：阅读 buffer 里 `(bound-and-true-p evil-local-mode)` 应为 `nil`、`(key-binding (kbd "?"))` 应为 `seshat-reader-help`；仍为 `evil-search-backward` 说明 `seshat-reader-disable-evil` 被设成了 `nil`（此时 evil 可用，见「evil 与键位预设」）或加载的是旧 `.elc`（`make clean all` 后重启 Emacs）。若确实想保留 evil 的反向搜索，把 `seshat-reader-disable-evil` 设回 `nil` 并在自己配置里覆盖 `?` 即可。
 
+**鼠标拖不动 / `j` `k` 又被 evil 抢走**
+
+evil 是 globalized minor mode，启用函数挂在 `after-change-major-mode-hook`（mode body 之后），会把阅读器关掉的 evil 重新打开，于是 `[down-mouse-1]` 解析到 `evil-mouse-drag-region`（`mouse-1` / `drag-mouse-1` 又被本包 remap 成 `ignore`，表现为拖拽完全无反应）。`seshat-reader.el` 在同一个 hook 上以 `append` 再关一次。
+
+诊断：`(key-binding [down-mouse-1])` 应为 `seshat-reader-select-drag`。临时绕过：`M-x evil-local-mode`。
+
 ## 12. 已知限制
 
 以下条目全部出自 [`../openspec/tech-debt.md`](../openspec/tech-debt.md)，如实列出，未做美化。

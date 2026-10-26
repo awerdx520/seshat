@@ -101,7 +101,7 @@
 - 影响所有依赖 `down-mouse-1` 的 major-mode 级交互（如 seshat-reader 的鼠标拖拽选区取文）。
 - 当前在 `thomas-emacs/lisp/init-evil.el` 侧以 normal state 显式重绑规避。
 - 根治需上游 evil 提供更细的 state 映射策略或改用 aux keymap 的更明确写法。
-- 解决：阅读器 buffer 关闭 evil 后 `emulation-mode-map-alists` 里不再有 evil 的 normal state map，`[down-mouse-1]` 直接解析到 major-mode 的 `<remap> mouse-drag-region`（框选取文恢复），不再需要 `init-evil.el` 侧的 normal state 重绑规避。
+- 2026-10-26 首次结论不成立：只在 mode body 里 `evil-local-mode -1`，会被 evil 的 globalized 启用（`after-change-major-mode-hook`，在 body 之后）覆盖。实际修复：在同一 hook 上 `append` 一个再次关闭的钩子（见 `seshat-reader.el`「Evil 兼容」段）；判据 `(key-binding [down-mouse-1])` 应为 `seshat-reader-select-drag`。
 
 ## 服务端 LLM 端点缺口（M11.5，2026-10-16）
 - `internal/llm` 的 5 类能力（含云端/本地节点混合路由）尚未暴露任何客户端 HTTP 接口（`internal/api/server.go` 中零命中）；Emacs 侧因此暂时绕过服务端直连本地 gt。
