@@ -1661,3 +1661,7 @@
 - 影响：`sepia` 档下所有批注高亮 / 框选闪现（同为暖黄系）可见性接近 0；`midnight` / `charcoal` / `night-sepia` 三档是暗底，黄块对比充足，不受影响。属**装饰配色未随预设自适应**，不是渲染缺陷。
 - 建议：让装饰默认色随当前 tint 档位取反相 / 高对比色（例如亮底走深蓝、暗底保留黄），需要把「当前预设」暴露给 `seshat-reader-annotation--redraw-highlights` 一侧（C 侧已有 `theme_tint_bg`，可由 elisp 读一份镜像值）；或最小改法——检测到亮底预设时把默认高亮色改为深色系（`0.1/0.3/0.9`）。两条路径都要保证 `--add-highlight` 的历史配色在默认（`charcoal` / `graphite`）下逐像素不变。
 
+
+## 2026-10-27 阅读器多页布局（P1）遗留
+
+- **多页布局的内存上限**：同时驻留 spec ≤ 6 页（K=2），按 150 dpi ≈6.2 MB/页 × 2（Lisp 堆 + C 侧）≈ 75 MB 为告警线（`seshat-reader-multipage-memory-warning-mb`）；P1 不做异步预取与内存回收策略，长期滚动仍依赖视口淘汰。

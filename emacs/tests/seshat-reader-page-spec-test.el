@@ -257,13 +257,18 @@ BODY 执行前缓存被清空，因此各用例互不影响；`image-flush' 被�
         (should (eq first fourth))))))
 
 (ert-deftest seshat-reader-page-spec-test--cache-drops-the-oldest-entry ()
-  "连续请求 10 页后缓存不超过上限，且最早的一页已被淘汰。"
+  "连续请求 10 页后缓存不超过动态上限，且最早的一页已被淘汰。
+
+P1 T6 起上限不再是固定的 8，而是按驻留集推导的
+`seshat-reader--multipage-cache-limit'（preload 2 时为 6）；淘汰仍从最旧的开始，
+因为这些页都不在驻留集里。"
   (seshat-reader-page-spec-test--with-doc
     ;; 用最小 scale（18 dpi）渲染，尽量把 10 次渲染的成本压到最低。
-    (let ((scale (/ (float seshat-reader-page-spec-test--min-dpi) 72)))
+    (let ((scale (/ (float seshat-reader-page-spec-test--min-dpi) 72))
+          (limit (seshat-reader--multipage-cache-limit)))
       (dotimes (i 10)
         (should (seshat-reader--page-spec (+ 10 i) scale)))
-      (should (= (length seshat-reader--page-spec-cache) 8))
+      (should (= (length seshat-reader--page-spec-cache) limit))
       ;; 最早的 10、11 页已被淘汰：再次请求会重新进 C。
       (seshat-reader-page-spec-test--with-c-counter calls
         (should (seshat-reader--page-spec 10 scale))
@@ -354,10 +359,17 @@ BODY 执行前缓存被清空，因此各用例互不影响；`image-flush' 被�
     (should-not (delq nil (mapcar (lambda (entry)
                                     (when (= (car (car entry)) 8) t))
                                   seshat-reader--page-spec-cache)))
-    ;; 缓存里只剩重建时渲染的页，且每一页都有对应的页行。
+    ;; 缓存里只剩下重建时渲染的页，加上方向预取预热的那一页（它没有页行，见
+    ;; `seshat-reader--multipage-prefetch'）：每条的页号都必须是驻留页或紧邻
+    ;; 驻留集的页。
     (should seshat-reader--page-spec-cache)
-    (dolist (entry seshat-reader--page-spec-cache)
-      (should (assq (car (car entry)) seshat-reader--pages)))))
+    (let ((range (seshat-reader--multipage-resident-page-range)))
+      (dolist (entry seshat-reader--page-spec-cache)
+        (let ((page (car (car entry))))
+          (should (or (assq page seshat-reader--pages)
+                      (and range
+                           (>= page (1- (car range)))
+                           (<= page (1+ (cdr range)))))))))))
 
 (provide 'seshat-reader-page-spec-test)
 ;;; seshat-reader-page-spec-test.el ends here

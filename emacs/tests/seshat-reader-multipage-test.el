@@ -1825,6 +1825,338 @@ resolution it would silently clamp behind our back."
                 (should (< (abs (- seshat-reader--multipage-base-scale 0.25)) 1e-9))))))
       (kill-buffer buffer))))
 
+;;;; T6：缓存与虚拟化（动态上限 / 视口优先淘汰 / 方向预取 / 内存告警）
+
+(defun seshat-reader-multipage-test--cached-pages ()
+  "Return the sorted page numbers that have an entry in the spec cache."
+  (let (pages)
+    (dolist (entry seshat-reader--page-spec-cache)
+      (push (car (car entry)) pages))
+    (sort (delete-dups pages) #'<)))
+
+(defmacro seshat-reader-multipage-test--with-single-page-viewport (&rest body)
+  "Run BODY with the viewport treated as one page tall.
+
+In batch `window-end' reports the end of the buffer, which would make the
+resident range grow without bound while a test jumps from page to page; the stub
+makes the viewport the single page at `window-start', i.e. what a GUI window of
+one page height shows."
+  `(cl-letf (((symbol-function 'window-end)
+              (lambda (&optional _window _update) (window-start))))
+     ,@body))
+
+;;;; 用例
+
+(ert-deftest seshat-reader-multipage-test--geometry-cache-limit-follows-preload ()
+  "The cache limit follows the preload, bounded by 8 (knob) and 16 (ceiling).
+
+The resident set is the viewport plus `preload' pages on each side, so the
+cache needs `2 * preload + 2` entries, never less than 4: 0/1/2/3 pages of
+preload give 4/4/6/8.  A huge preload cannot push it past the ceiling recorded
+in `decisions.md' (16), and never past the `seshat-reader--page-spec-cache-limit'
+knob either -- the smallest of the three wins."
+  (with-temp-buffer
+    (let ((seshat-reader--page-spec-cache-limit 16))
+      (dolist (case '((0 . 4) (1 . 4) (2 . 6) (3 . 8)))
+        (let ((seshat-reader--multipage-preload (car case)))
+          (should (= (cdr case) (seshat-reader--multipage-cache-limit)))))
+      (let ((seshat-reader--multipage-preload 20))
+        (should (= 16 (seshat-reader--multipage-cache-limit)))))
+    ;; 变量的默认值 8 是兜底：preload 再大也只给 8
+    (let ((seshat-reader--page-spec-cache-limit 8)
+          (seshat-reader--multipage-preload 20))
+      (should (= 8 (seshat-reader--multipage-cache-limit))))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-cache-evicts-out-of-viewport-first ()
+  "When the cache overflows, pages outside the resident set go first.
+
+Five pages are resident, so their bitmaps are the ones on screen; a request for
+pages 9 and 10 (both outside) must drop page 9 first, leaving the five resident
+pages cached even though they are older."
+  (let* ((fixture (seshat-reader-multipage-test--geometry-buffer '(1 2 3 4 5)))
+         (buffer (car fixture))
+         (counter (list 0)))
+    (unwind-protect
+        (with-current-buffer buffer
+          (should (equal (cons 1 5) (seshat-reader--multipage-resident-page-range)))
+          (seshat-reader-multipage-test--with-fake-renderer counter 600 800
+            (dolist (page '(1 2 3 4 5))
+              (should (seshat-reader--page-spec page 1.0)))
+            (should (= 5 (length seshat-reader--page-spec-cache)))
+            ;; 上限 6：第 9 页只是填满，不触发淘汰
+            (should (seshat-reader--page-spec 9 1.0))
+            (should (= 6 (length seshat-reader--page-spec-cache)))
+            ;; 第 10 页溢出 → 淘汰视口外的第 9 页，视口内 5 页全在
+            (should (seshat-reader--page-spec 10 1.0))
+            (should (= (seshat-reader--multipage-cache-limit)
+                       (length seshat-reader--page-spec-cache)))
+            (should (equal '(1 2 3 4 5 10)
+                           (seshat-reader-multipage-test--cached-pages)))))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-cache-falls-back-to-fifo ()
+  "Without page rows the cache has no viewport, so eviction is plain FIFO.
+
+A buffer that is not a reader layout (before the first render, or a document
+whose rows were dropped) must still keep the cache bounded, and the only fair
+policy left is dropping the oldest entry."
+  (with-temp-buffer
+    (let ((counter (list 0)))
+      (should-not (seshat-reader--multipage-resident-page-range))
+      (seshat-reader-multipage-test--with-fake-renderer counter 600 800
+        (let ((limit (seshat-reader--multipage-cache-limit)))
+          (dotimes (i (+ limit 2))
+            (should (seshat-reader--page-spec (1+ i) 1.0)))
+          (should (= limit (length seshat-reader--page-spec-cache)))
+          ;; 最新的 limit 页留下，最早的两页被 FIFO 淘汰
+          (should (equal (number-sequence 3 (+ limit 2))
+                         (seshat-reader-multipage-test--cached-pages))))))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-recycle-keeps-adjacent-page-spec ()
+  "Recycling a page keeps its bitmap while it is one page from the viewport.
+
+Scrolling one page back must hit the cache, so the spec of a page that just
+left the resident set is kept as long as it is within one page of the set; a page
+that ends up further away loses its bitmap, which is the order in which memory
+is reclaimed.
+
+The far case needs a non-contiguous layout: the rows are dropped with the raw
+`--multipage-remove-page' (which does not touch the cache) so that page 1 is
+three pages away from the remaining row when it is recycled."
+  (let* ((fixture (seshat-reader-multipage-test--geometry-buffer '(1 3 5 7)))
+         (buffer (car fixture))
+         (counter (list 0)))
+    (unwind-protect
+        (with-current-buffer buffer
+          (seshat-reader-multipage-test--with-fake-renderer counter 600 800
+            (dolist (page '(1 2 3 4 5 6 7))
+              (seshat-reader--page-spec page 1.0))
+            ;; 回收第 1 页：驻留集变 3..7，保留区间 [2, 8] → 第 1 页太远，删
+            (seshat-reader--multipage-recycle-page 1)
+            (should-not (member 1 (seshat-reader-multipage-test--cached-pages)))
+            ;; 回收第 3 页：驻留集变 5..7，保留区间 [4, 8] → 第 2、3 页都太远
+            (should (member 2 (seshat-reader-multipage-test--cached-pages)))
+            (seshat-reader--multipage-recycle-page 3)
+            (should-not (member 3 (seshat-reader-multipage-test--cached-pages)))
+            ;; 回收第 7 页：驻留集是 5，保留区间 [4, 6] → 第 7 页删，第 6 页留
+            (seshat-reader--multipage-recycle-page 7)
+            (should-not (member 7 (seshat-reader-multipage-test--cached-pages)))
+            (should (member 6 (seshat-reader-multipage-test--cached-pages)))
+            ;; 相邻保留的正面例子：还剩第 5 页一行，回收它时区间是 [4, 6]
+            (should (seshat-reader--multipage-page-near-resident-p 4))))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-recycle-keeps-just-left-page ()
+  "The page that the viewport just left keeps its bitmap for the way back.
+
+This is the positive half of the rule above, isolated: with the resident set
+4..7 the page 3 is one page away and survives the recycle, which is what makes
+scrolling back a cache hit."
+  (let* ((fixture (seshat-reader-multipage-test--geometry-buffer '(3 4 5 6 7)))
+         (buffer (car fixture))
+         (counter (list 0)))
+    (unwind-protect
+        (with-current-buffer buffer
+          (seshat-reader-multipage-test--with-fake-renderer counter 600 800
+            (dolist (page '(3 4 5 6 7))
+              (seshat-reader--page-spec page 1.0))
+            (seshat-reader--multipage-recycle-page 3)
+            (should (equal (cons 4 7) (seshat-reader--multipage-resident-page-range)))
+            (should (member 3 (seshat-reader-multipage-test--cached-pages)))))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-scroll-back-hits-cache ()
+  "Scrolling one page back re-uses the bitmap of the page just left.
+
+The P0 measurement was a 0% hit rate while scanning 20 pages, because every
+page lost its bitmap the moment it left the resident set.  The renderer is
+instrumented per page here, so the assertion is about the page itself: page 2 is
+rendered once, and the row shows the very same spec object after the way back
+\(the prefetch warms other pages, which is fine and does not touch page 2)."
+  (let* ((buffer (seshat-reader-multipage-test--scroll-fixture '(1)))
+         (renders nil)
+         (window (selected-window)))
+    (unwind-protect
+        (progn
+          (with-current-buffer buffer
+            (setq-local seshat-reader--multipage-preload 1
+                        seshat-reader-current-doc-pagecount 10))
+          (seshat-reader-multipage-test--window-pixels 1000 800
+            (seshat-reader-multipage-test--with-window-buffer buffer
+              (with-current-buffer buffer
+                (cl-letf (((symbol-function 'seshat-reader-dyn--page-image-spec)
+                           (lambda (page scale _rotate)
+                             (push page renders)
+                             (list 'image :type 'pbm :data "x"
+                                   :width (max 1 (round (* 600 scale)))
+                                   :height (max 1 (round (* 800 scale)))))))
+                  (seshat-reader-multipage-test--with-single-page-viewport
+                    (seshat-reader--multipage-goto 2)
+                    (let ((spec-before (seshat-reader--multipage-page-spec 2)))
+                      (seshat-reader--multipage-goto 3)
+                      (seshat-reader--multipage-goto 2)
+                      ;; 第 2 页只在第一次进入时渲染过一次
+                      (should (= 1 (cl-count 2 renders)))
+                      ;; 回来时用的是同一个 spec 对象（缓存命中）
+                      (should (eq spec-before (seshat-reader--multipage-page-spec 2))))))))))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-prefetch-warms-next-page-in-direction ()
+  "The prefetch warms the page beyond the set in the scrolling direction.
+
+Downwards that is the page after the last resident one, upwards the page before
+the first; the page is only cached, so the reader finds a bitmap ready when it
+scrolls one page further."
+  (let* ((fixture (seshat-reader-multipage-test--geometry-buffer '(2 3 4)))
+         (buffer (car fixture))
+         (counter (list 0)))
+    (unwind-protect
+        (with-current-buffer buffer
+          (seshat-reader-multipage-test--with-fake-renderer counter 600 800
+            (setq-local seshat-reader--multipage-scroll-direction 1)
+            (seshat-reader--multipage-prefetch (selected-window))
+            (should (seshat-reader--multipage-spec-cached-p 5))
+            (should-not (seshat-reader--multipage-spec-cached-p 1))
+            ;; 清空后反向预取
+            (seshat-reader--page-spec-clear-cache)
+            (setq-local seshat-reader--multipage-scroll-direction -1)
+            (seshat-reader--multipage-prefetch (selected-window))
+            (should (seshat-reader--multipage-spec-cached-p 1))
+            (should-not (seshat-reader--multipage-spec-cached-p 5))))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-prefetch-does-not-insert-rows ()
+  "Prefetching warms the cache without adding a page row.
+
+The resident rows stay exactly what the viewport asked for: an extra row would
+enlarge the layout (and the scroll range) for a page the reader has not reached."
+  (let* ((fixture (seshat-reader-multipage-test--geometry-buffer '(2 3 4)))
+         (buffer (car fixture))
+         (counter (list 0)))
+    (unwind-protect
+        (with-current-buffer buffer
+          (seshat-reader-multipage-test--with-fake-renderer counter 600 800
+            (let ((rows (length seshat-reader--pages)))
+              (setq-local seshat-reader--multipage-scroll-direction 1)
+              (seshat-reader--multipage-prefetch (selected-window))
+              (should (= rows (length seshat-reader--pages)))
+              (should (seshat-reader--multipage-spec-cached-p 5))
+              (should-not (assq 5 seshat-reader--pages)))))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-prefetch-skips-when-cached ()
+  "A page that is already cached is not rendered again by the prefetch.
+
+The prefetch exists to save a render, so it has to be free when there is nothing
+to warm: any cached entry of the page counts, whatever scale or rotation it was
+rendered at."
+  (let* ((fixture (seshat-reader-multipage-test--geometry-buffer '(2 3 4)))
+         (buffer (car fixture))
+         (counter (list 0)))
+    (unwind-protect
+        (with-current-buffer buffer
+          (seshat-reader-multipage-test--with-fake-renderer counter 600 800
+            (setq-local seshat-reader--multipage-scroll-direction 1)
+            ;; 先用不同 scale 把第 5 页放进缓存
+            (seshat-reader--page-spec 5 1.0)
+            (let ((after-warm (car counter)))
+              (seshat-reader--multipage-prefetch (selected-window))
+              (should (= after-warm (car counter)))
+              (should (seshat-reader--multipage-spec-cached-p 5)))))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-cache-bounded-while-scrolling ()
+  "Scanning 30 pages keeps the cache and the row count bounded.
+
+With preload 1 the resident range is `2 * 1 + 1 = 3` rows (viewport + one page
+on each side) and the cache limit is `2 * 1 + 2 = 4`; the prefetch warms one
+page beyond the rows but never inserts a row, so both numbers hold after every
+single page turn -- that is the virtualisation budget of decision D4."
+  (let* ((buffer (seshat-reader-multipage-test--scroll-fixture '(1)))
+         (counter (list 0)))
+    (unwind-protect
+        (progn
+          (with-current-buffer buffer
+            (setq-local seshat-reader--multipage-preload 1
+                        seshat-reader-current-doc-pagecount 30))
+          (seshat-reader-multipage-test--window-pixels 1000 800
+            (seshat-reader-multipage-test--with-window-buffer buffer
+              (with-current-buffer buffer
+                (seshat-reader-multipage-test--with-fake-renderer counter 600 800
+                  (seshat-reader-multipage-test--with-single-page-viewport
+                    (let ((limit (seshat-reader--multipage-cache-limit))
+                          (max-rows (+ (* 2 seshat-reader--multipage-preload) 1)))
+                      (dotimes (i 30)
+                        (seshat-reader--multipage-goto (1+ i))
+                        (should (<= (length seshat-reader--page-spec-cache) limit))
+                        (should (<= (length seshat-reader--pages) max-rows))
+                        (should (<= (car counter) (* 30 3)))))))))))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-sequential-scan-gets-cache-hits ()
+  "Scanning 20 pages costs fewer than one render per page.
+
+This is the P0 regression: with a fixed FIFO cache the page that was just
+scrolled away was dropped first, so a sequential scan rendered every page and
+scored a 0% hit rate.  Now the neighbour is kept and the next page is
+prefetched, so the renderer is called strictly fewer than 20 times, and going
+back one page costs nothing at all."
+  (let* ((buffer (seshat-reader-multipage-test--scroll-fixture '(1)))
+         (counter (list 0)))
+    (unwind-protect
+        (progn
+          (with-current-buffer buffer
+            (setq-local seshat-reader--multipage-preload 1
+                        seshat-reader-current-doc-pagecount 20))
+          (seshat-reader-multipage-test--window-pixels 1000 800
+            (seshat-reader-multipage-test--with-window-buffer buffer
+              (with-current-buffer buffer
+                (seshat-reader-multipage-test--with-fake-renderer counter 600 800
+                  (seshat-reader-multipage-test--with-single-page-viewport
+                    (dotimes (i 20)
+                      (seshat-reader--multipage-goto (1+ i)))
+                    (should (< (car counter) 20))
+                    ;; 往回一页：命中缓存，零渲染
+                    (let ((before (car counter)))
+                      (seshat-reader--multipage-goto 19)
+                      (should (= before (car counter))))))))))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-memory-warning-fires-once ()
+  "The memory budget is reported once per buffer, not on every scroll.
+
+Six 100 KB bitmaps count as roughly 1.1 MB (the estimate doubles the `:data'
+length for the native copy), which crosses a 0.5 MB budget; the message is
+recorded in a buffer-local flag, so a second check stays silent -- and the flag
+is cleared when the document is reloaded with the cache."
+  (let* ((fixture (seshat-reader-multipage-test--geometry-buffer '(1 2 3 4 5 6)))
+         (buffer (car fixture))
+         (messages 0)
+         (big-data (make-string 100000 ?x)))
+    (unwind-protect
+        (with-current-buffer buffer
+          (cl-letf (((symbol-function 'seshat-reader-dyn--page-image-spec)
+                     (lambda (_page scale _rotate)
+                       (list 'image :type 'pbm :data big-data
+                             :width (max 1 (round (* 600 scale)))
+                             :height (max 1 (round (* 800 scale))))))
+                    ((symbol-function 'message)
+                     (lambda (&rest _args) (setq messages (1+ messages)))))
+            (dolist (page '(1 2 3 4 5 6))
+              (seshat-reader--page-spec page 1.0))
+            (should (> (or (seshat-reader--multipage-resident-spec-megabytes) 0) 0))
+            (let ((seshat-reader-multipage-memory-warning-mb 0.5))
+              (seshat-reader--multipage-check-memory)
+              (should (= 1 messages))
+              (should seshat-reader--multipage-memory-warned)
+              ;; 再查一次：本 buffer 已经报过，保持沉默
+              (seshat-reader--multipage-check-memory)
+              (should (= 1 messages))
+              ;; 重载/清缓存后重新武装
+              (seshat-reader--page-spec-clear-cache)
+              (should-not seshat-reader--multipage-memory-warned))))
+      (kill-buffer buffer))))
+
 (provide 'seshat-reader-multipage-test)
 
 ;;; seshat-reader-multipage-test.el ends here

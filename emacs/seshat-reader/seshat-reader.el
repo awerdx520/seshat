@@ -918,14 +918,25 @@ WINDOW must be a valid window and defaults to the selected one."
 ;; exposes it for explicit measurement (and for P1 to build on).  Nothing in
 ;; the display, redisplay or scrolling paths may call it.
 
+;; 前置声明：这两个变量属于多页布局一节（定义在下方），但缓存上限与清缓存函数
+;; 先用到它们（`defvar' 不设值，不覆盖后面的 `defvar-local' 默认值），先声明让
+;; 字节编译器知道它们是 special variable。
+(defvar seshat-reader--multipage-preload)
+(defvar seshat-reader--multipage-memory-warned)
+
 (defvar seshat-reader--page-spec-cache-limit 8
-  "Maximum number of specs kept in `seshat-reader--page-spec-cache'.
+  "Hard ceiling for `seshat-reader--page-spec-cache', and a knob to lower it.
 
 Each entry pins a copy of the page bitmap on the Lisp heap (the `:data'
 string of the spec) while the native module keeps its own copy in the
 `CachedPage' and in the MuPDF image cache, so one entry costs roughly two
-bitmaps.  Eight is what P0 needs to measure page-to-page reuse; do not
-raise it past sixteen.")
+bitmaps.
+
+The effective size is the smallest of this value,
+`seshat-reader--multipage-cache-limit' (derived from the resident set) and 16
+\(the ceiling registered in `decisions.md'): the cache may never grow past what
+memory allows, so raising `seshat-reader--multipage-preload' must not raise it
+past 16 either.")
 
 (defvar-local seshat-reader--page-spec-cache nil
   "Buffer-local cache of per-page image specs, newest entry first.
@@ -933,9 +944,9 @@ raise it past sixteen.")
 Each element is a cons cell (KEY . SPEC).  KEY is the normalized list
 \(PAGE SCALE ROTATE), as built by `seshat-reader--page-spec-key', and SPEC
 is the image spec the native module returned for it.  At most
-`seshat-reader--page-spec-cache-limit' entries are kept and the oldest one
-is dropped first.  Only `seshat-reader--page-spec' reads this cache: no
-display path uses it in P0.")
+`seshat-reader--multipage-cache-limit' entries are kept; entries whose page is
+outside the resident set are dropped first (see
+`seshat-reader--page-spec-eviction-victim').")
 
 (defun seshat-reader--page-spec-key (page &optional scale rotate)
   "Return the cache key for PAGE rendered at SCALE and rotated by ROTATE.
@@ -952,20 +963,86 @@ nil with 1.0."
               ((numberp rotate) (truncate rotate))
               (t rotate))))
 
-(defun seshat-reader--page-spec-remember (key spec)
-  "Cache SPEC under KEY, dropping the oldest entry above the cache limit.
+(defun seshat-reader--multipage-cache-limit ()
+  "Return how many page specs may be cached at once, given the resident set.
 
-The list is kept newest first, so the oldest entry is the last one; the
-walk is a plain `while' loop rather than a `cl-*' helper to stay in line
-with the hand-written list code elsewhere in this file."
+The resident set is the viewport plus `seshat-reader--multipage-preload' pages
+on each side, so one spec per resident page plus one page of slack on each side
+is enough: `2 * preload + 2` -- 6 with the default preload of 2, which is the
+\"at most 6 resident specs\" budget of decision D4, and never below 4.
+
+Two hard bounds apply on top: `seshat-reader--page-spec-cache-limit' (the knob
+P0 measured) and 16 (the ceiling registered in `decisions.md', because every
+entry pins a Lisp copy of the bitmap while the native module keeps its own).
+The smallest of the three wins, so a configuration that raises the preload
+cannot push the cache past what memory allows."
+  (min 16
+       (max 0 seshat-reader--page-spec-cache-limit)
+       (max 4 (+ (* 2 (max 0 seshat-reader--multipage-preload)) 2))))
+
+(defun seshat-reader--multipage-resident-page-range ()
+  "Return the pages the layout currently holds, as a cons (FIRST . LAST).
+
+The rows are kept sorted by page, so the first and the last row give the range
+the viewport is allowed to draw from.  nil is returned when the buffer has no
+page row at all, which is what makes the cache fall back to plain FIFO and the
+recycle keep no spec."
+  (when seshat-reader--pages
+    (cons (car (car seshat-reader--pages))
+          (car (car (last seshat-reader--pages))))))
+
+(defun seshat-reader--multipage-spec-cached-p (page)
+  "Return non-nil when the cache holds any spec of PAGE, at any scale.
+
+PAGE is a 1-based page number.  The prefetch uses this to avoid re-rendering a
+page that is already cached under another scale or rotation; any entry of the
+page counts, because a cached bitmap of the page is what makes the render cheap
+\(the native module keeps the decoded page around as well)."
+  (let ((entries seshat-reader--page-spec-cache)
+        (found nil))
+    (while (and entries (not found))
+      (when (equal (car (car (car entries))) page)
+        (setq found t))
+      (setq entries (cdr entries)))
+    found))
+
+(defun seshat-reader--page-spec-eviction-victim ()
+  "Return the cache entry to drop when the cache is over its limit.
+
+Entries whose page is outside the resident range go first, oldest of them
+first: the reader cannot see those pages any more, so their bitmaps are worth
+less than the ones on screen.  When every entry belongs to a resident page the
+oldest entry is dropped, which is the plain FIFO behaviour of P0."
+  (let* ((range (seshat-reader--multipage-resident-page-range))
+         (victim nil))
+    (dolist (entry seshat-reader--page-spec-cache)
+      (let ((page (car (car entry))))
+        (unless (and range
+                     (>= page (car range))
+                     (<= page (cdr range)))
+          ;; The list is newest first: the last match is the oldest match.
+          (setq victim entry))))
+    (or victim (car (last seshat-reader--page-spec-cache)))))
+
+(defun seshat-reader--page-spec-remember (key spec)
+  "Cache SPEC under KEY, dropping entries above `--multipage-cache-limit'.
+
+The list is kept newest first.  Entries of pages that left the resident set are
+evicted before the entries of pages still on screen (see
+`seshat-reader--page-spec-eviction-victim'), which is what keeps a viewport's
+worth of bitmaps alive while the reader scrolls: P0's plain FIFO cache with a
+fixed limit of 8 scored a 0% hit rate while scanning 20 pages, because the page
+that was just scrolled away was the first one to be dropped."
   (push (cons key spec) seshat-reader--page-spec-cache)
-  (let ((tail seshat-reader--page-spec-cache)
-        (count 1))
-    (while (and (cdr tail) (< count seshat-reader--page-spec-cache-limit))
-      (setq tail (cdr tail))
-      (setq count (1+ count)))
-    (when (cdr tail)
-      (setcdr tail nil)))
+  (let ((limit (seshat-reader--multipage-cache-limit)))
+    (while (> (length seshat-reader--page-spec-cache) limit)
+      (let ((victim (seshat-reader--page-spec-eviction-victim)))
+        (if victim
+            (setq seshat-reader--page-spec-cache
+                  (delq victim seshat-reader--page-spec-cache))
+          ;; No victim means the cache is empty, i.e. the limit is 0; stop
+          ;; rather than spin.
+          (setq seshat-reader--page-spec-cache nil)))))
   seshat-reader--page-spec-cache)
 
 (defun seshat-reader--page-spec (page &optional scale rotate)
@@ -1004,8 +1081,12 @@ file working with an older `seshat-render-core'."
 Called when the cached specs become stale: the document is closed
 \(`seshat-reader--clear-doc-memory') or re-rendered
 \(`seshat-reader--render-buffer'), where the page bitmaps and the
-decorations painted into them are rebuilt from scratch."
-  (setq seshat-reader--page-spec-cache nil))
+decorations painted into them are rebuilt from scratch.
+
+The memory warning is re-armed as well: a reloaded document starts from an
+empty cache, so the budget is worth reporting again if it is exceeded again."
+  (setq seshat-reader--page-spec-cache nil
+        seshat-reader--multipage-memory-warned nil))
 
 ;;; Multi-page layout (P1)
 
@@ -1026,6 +1107,20 @@ empty lines between the bottom of one page and the top of the next one."
   :group 'seshat-reader
   :type 'integer)
 
+(defcustom seshat-reader-multipage-memory-warning-mb 75
+  "Warn when the resident page bitmaps exceed this many megabytes.
+
+The estimate counts the `:data' string of every cached page spec and doubles
+it, because each spec pins a copy on the Lisp heap while the native module
+keeps its own copy of the bitmap.  With the default preload the cache holds at
+most 6 specs, i.e. roughly 75 MB at 150 dpi; a document whose pages are much
+larger, or a configuration that raises the preload, can cross that line and the
+message says so once per buffer instead of on every scroll.
+
+Set it to nil to disable the warning."
+  :group 'seshat-reader
+  :type '(choice (const :tag "Do not warn" nil) (number :tag "Megabytes")))
+
 (defvar-local seshat-reader--multipage-preload 2
   "Number of pages kept resident above and below the visible ones.
 
@@ -1033,6 +1128,21 @@ The resident set is the page at the top of the window through the page at
 its bottom, widened by this many pages in each direction and clipped to
 the pages that actually exist in the buffer.  A value of 0 keeps only the
 pages the window currently shows.")
+
+(defvar-local seshat-reader--multipage-scroll-direction 1
+  "Direction of the last scroll: 1 towards later pages, -1 towards earlier.
+
+Set by `seshat-reader--multipage-scroll' and read by
+`seshat-reader--multipage-prefetch', which warms the cache one page beyond the
+resident set *in that direction*: the page the reader is about to reach, not
+the one it just left.")
+
+(defvar-local seshat-reader--multipage-memory-warned nil
+  "Non-nil once the memory budget of this buffer has been reported.
+
+The warning is per buffer and fires once: repeating it on every scroll would
+only fill the echo area, and the situation does not change by itself while the
+same document stays open (it is cleared when the document is reloaded).")
 
 (defun seshat-reader--multipage-page-row (spec &optional wide)
   "Return the buffer text of one page row displaying SPEC.
@@ -1483,23 +1593,113 @@ sharp after a resize without ever rendering a page twice."
                     seshat-reader--refit-scale-tolerance))
       (seshat-reader--multipage-rerender-page page window))))
 
+(defun seshat-reader--multipage-page-near-resident-p (page)
+  "Return non-nil when PAGE is resident or within one page of the set.
+
+PAGE is a 1-based page number.  The resident range is read from the rows that
+are still in the buffer, so the answer is about the viewport as it is now; nil
+is returned when no row is left."
+  (let ((range (seshat-reader--multipage-resident-page-range)))
+    (and range
+         (>= page (1- (car range)))
+         (<= page (1+ (cdr range))))))
+
 (defun seshat-reader--multipage-recycle-page (page)
-  "Remove the row of PAGE and drop the cached spec of that page.
+  "Remove the row of PAGE and release the cached spec of that page.
 
 PAGE is a 1-based page number and the spec the row was displaying is
-returned.  Dropping the cached spec is what actually releases the bitmap:
-the row marker alone pins nothing, but the spec cache would keep the image
-of a page nobody can see any more.  The recorded native size and render
-scale are dropped too, so a page that comes back is measured again instead
-of reusing a size that a rotation may have changed."
+returned.  Dropping the cached spec is what actually releases the bitmap.
+
+The spec of a page that is resident or one page next to the resident range is
+kept, which is what makes scrolling one page back hit the cache instead of
+rendering the page again: in P0 every recycled page lost its bitmap
+immediately and a single page back was a full re-render (a 0% hit rate while
+scanning 20 pages, the measurement this batch exists to fix).  Only pages
+further away -- the ones the eviction rule of
+`seshat-reader--page-spec-eviction-victim' would drop first anyway -- lose
+their bitmap here.
+
+The recorded native size and render scale are dropped either way, so a page
+that comes back is measured again instead of reusing a size that a rotation
+may have changed."
   (let ((spec (seshat-reader--multipage-remove-page page)))
-    (when spec
+    (when (and spec
+               (not (seshat-reader--multipage-page-near-resident-p page)))
       (seshat-reader--multipage-forget-specs page))
     (setq seshat-reader--page-native-sizes
           (assq-delete-all page seshat-reader--page-native-sizes)
           seshat-reader--page-render-scales
           (assq-delete-all page seshat-reader--page-render-scales))
     spec))
+
+(defun seshat-reader--multipage-prefetch (&optional window)
+  "Warm the cache with the page just beyond WINDOW's resident set.
+
+WINDOW defaults to the selected window.  The page is chosen from
+`seshat-reader--multipage-scroll-direction': scrolling down warms the page after
+the last resident one, scrolling up the page before the first.  The target is
+clamped to the document and skipped when it is already resident or already
+cached under any scale (`seshat-reader--multipage-spec-cached-p'), so a command
+that stays inside the same range costs nothing.
+
+Only the cache is warmed: no row is inserted and the buffer is not touched, so
+the resident row count stays what `--multipage-visible-range' asked for.  Errors
+are swallowed -- a prefetch is an optimisation and must never break scrolling --
+and a failed render simply does not populate the cache."
+  (ignore-errors
+    (let ((range (seshat-reader--multipage-resident-page-range)))
+      (when range
+        (let* ((direction (if (eq seshat-reader--multipage-scroll-direction -1)
+                              -1 1))
+               (window (if (window-live-p window) window (selected-window)))
+               (edge (if (> direction 0) (cdr range) (car range)))
+               (page (seshat-reader--multipage-clamp-page (+ edge direction))))
+          (when (and page
+                     (not (and (>= page (car range)) (<= page (cdr range))))
+                     (not (seshat-reader--multipage-spec-cached-p page)))
+            (seshat-reader--page-spec
+             page
+             (seshat-reader--multipage-target-scale page window)
+             seshat-reader--multipage-rotate)))))))
+
+(defun seshat-reader--multipage-resident-spec-megabytes ()
+  "Estimate the memory the cached page specs hold, in megabytes.
+
+The estimate sums the `:data' string length of every cached spec and doubles
+it: the Lisp heap keeps one copy of the bitmap while the native module keeps its
+own in the `CachedPage' and in the MuPDF cache.  Pages without a `:data' string
+\(a placeholder row, or a stub in a test) are skipped.  nil is returned when
+nothing measurable is cached."
+  (let ((bytes 0)
+        (seen 0))
+    (dolist (entry seshat-reader--page-spec-cache)
+      (let* ((spec (cdr entry))
+             (data (and spec (image-property spec :data))))
+        (when (stringp data)
+          (setq bytes (+ bytes (length data)))
+          (setq seen (1+ seen)))))
+    (when (> seen 0)
+      (/ (* 2.0 bytes) (* 1024.0 1024.0)))))
+
+(defun seshat-reader--multipage-check-memory (&optional _window)
+  "Report once per buffer when the resident page bitmaps exceed the budget.
+
+The budget is `seshat-reader-multipage-memory-warning-mb'; the estimate comes
+from `seshat-reader--multipage-resident-spec-megabytes'.  The warning is
+recorded in `seshat-reader--multipage-memory-warned' so that it fires once per
+buffer (scrolling would otherwise repeat it on every command), and the flag is
+cleared when the document is reloaded or the cache is dropped.
+
+WINDOW is accepted for symmetry with the other sync helpers and is not used."
+  (unless seshat-reader--multipage-memory-warned
+    (let ((budget seshat-reader-multipage-memory-warning-mb)
+          (megabytes (seshat-reader--multipage-resident-spec-megabytes)))
+      (when (and (numberp budget) (numberp megabytes)
+                 (> megabytes budget))
+        (setq seshat-reader--multipage-memory-warned t)
+        (message "seshat-reader: %d page specs hold about %.0f MB of bitmaps (budget %s MB); consider lowering seshat-reader--multipage-preload or the render resolution"
+                 (length seshat-reader--page-spec-cache)
+                 megabytes budget)))))
 
 (defun seshat-reader--multipage-sync (&optional window)
   "Keep the resident page rows of WINDOW in sync with its viewport.
@@ -1519,7 +1719,12 @@ Scrolling never changes the zoom: the base scale is read by
 `seshat-reader--multipage-target-scale' and is only ever written by the zoom
 commands and `seshat-reader--first-fit', so a page pulled in here is rendered
 at exactly the same scale as the pages that were already on screen
-\(decision D5's reference page anchoring)."
+\(decision D5's reference page anchoring).
+
+Once the range is settled the page just beyond it in the scrolling direction is
+warmed into the cache (`seshat-reader--multipage-prefetch') and the memory
+budget is checked, so the frame that scrolls one page further finds a bitmap
+ready instead of blocking on the native renderer."
   (let* ((win (or window (selected-window)))
          (range (and (window-live-p win)
                      (not seshat-reader--multipage-syncing)
@@ -1537,7 +1742,10 @@ at exactly the same scale as the pages that were already on screen
         (dolist (entry (copy-sequence seshat-reader--pages))
           (let ((page (car entry)))
             (when (or (< page first) (> page last))
-              (seshat-reader--multipage-recycle-page page)))))
+              (seshat-reader--multipage-recycle-page page))))
+        ;; 区间定型后才预热与体检：此时驻留集就是最终的视口 ± preload。
+        (seshat-reader--multipage-prefetch win)
+        (seshat-reader--multipage-check-memory win))
       range)))
 
 (defun seshat-reader--multipage--show-page (page)
@@ -1690,6 +1898,8 @@ new viewport asks for."
                seshat-reader--pages
                (numberp pixels)
                (/= pixels 0))
+      ;; 预取方向：往下滚预热下一页，往上滚预热上一页
+      (setq seshat-reader--multipage-scroll-direction (if (> pixels 0) 1 -1))
       (let ((page (or (seshat-reader--multipage-page-at-pos (window-start win))
                       (car (car seshat-reader--pages))))
             (distance (+ (window-vscroll win t) pixels))
