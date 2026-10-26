@@ -1649,3 +1649,21 @@
 - 现状：该用例起 8 个并发 `POST /api/resources/rescan`，只断言「每个响应状态 ∈ {200, 409}」「至少有一个 200」「收尾请求成功」。**没有**断言「恰好 1×200 + 7×409」——理论上 8 个全返回 200 也能通过，而 `rescanRunning` 的 CAS 互斥正是本用例唯一要守的不变量。
 - 影响：若将来有人把 CAS 抢占改坏（例如误改成 `Store(true)` 或用读-判断-写），该用例仍会绿，并发互斥的不变量失去回归保护。
 - 建议：在原断言基础上补 `ok == 1 && busy == 7`（在 `rescanMinInterval = 0` 的 fixture 下这是确定性结果，不是概率断言）；同时注意 `t.Cleanup` 恢复包级 var 的顺序，避免与其他 rescan 用例互相污染。属测试加固，不与已归档的 A 批混改。
+## 暗色 tint 把彩色内容压成单色调（阅读器暗色配色预设，2026-10-27）
+
+- 现状：`seshat-reader-dyn--doc-tint` 的下发路径把**每像素亮度**线性映射到 BG–FG 两端（C 侧 `fz_tint_pixmap`），Chrominance 信息整体丢弃。因此暗色模式下彩色插图、彩色封面、彩色标注图一律变成单色（实测 p775 彩色插图 + 透明 mask 页：整页最大亮度分量恰等于 FG，即全图被压到调色板末端的同一个色值）。`graphite` 预设走旧 `fz_invert_pixmap_luminance` 路径，保留色度，是唯一例外。
+- 影响：**可读性**上无问题（文字页与线稿更好读），但**信息丢失**——书里的彩色示意图、图表配色、封面无法辨认原色，读图类文档（教材、图鉴、幻灯片型 PDF）实际不可用暗色模式。
+- 建议：做内容分流——「文字走 tint、图片保色」需要 C 层按区域判定（例如用 `fz_stext` 的 image block 或页面 display list 的 image device 划出图片区域，只对非图片区域做 tint），代价是每页多一次区域分析，且与既有「像素变换 → 装饰 wash → PNM」的次序耦合；短期替代方案是保留 `graphite` 作为读图时的切换档，或在阅读器提供「本页临时关闭 tint」的一次性命令。
+
+## `sepia`（亮底）下既有黄色高亮装饰几乎不可见（阅读器暗色配色预设，2026-10-27）
+
+- 现状：装饰配色是独立于暗色调色板的固定值——批注 `highlight` 恒为黄 `1.0/0.85/0.0` α `0.35`（`--add-highlight` 的历史配色，未改），`sepia` 预设的页面底色是亮米黄 `#xe8dfc8`。黄色半透明块叠在米黄底上几乎不产生可见差异，用户会以为高亮没画出来。
+- 影响：`sepia` 档下所有批注高亮 / 框选闪现（同为暖黄系）可见性接近 0；`midnight` / `charcoal` / `night-sepia` 三档是暗底，黄块对比充足，不受影响。属**装饰配色未随预设自适应**，不是渲染缺陷。
+- 建议：让装饰默认色随当前 tint 档位取反相 / 高对比色（例如亮底走深蓝、暗底保留黄），需要把「当前预设」暴露给 `seshat-reader-annotation--redraw-highlights` 一侧（C 侧已有 `theme_tint_bg`，可由 elisp 读一份镜像值）；或最小改法——检测到亮底预设时把默认高亮色改为深色系（`0.1/0.3/0.9`）。两条路径都要保证 `--add-highlight` 的历史配色在默认（`charcoal` / `graphite`）下逐像素不变。
+
+## 暗色状态是进程级 `static`，隐含单写者假设（阅读器暗色配色预设，2026-10-27）
+
+- 现状：`render-theme.c` 用 `static bool g_dark_enabled` / `static bool g_tint_set` / `static unsigned g_tint_bg` / `static unsigned g_tint_fg` 承载暗色开关与配色，写入点只有两个 Emacs 模块入口（`emacs_doc_invert` / `emacs_doc_tint`，均跑在主线程），读取点是渲染线程里的 `theme_dark_enabled()` 等访问器。**没有** `atomic` / 锁，正确性依赖「同一时刻只有主线程写」。
+- 影响：worker 读到上一版值是**良性**的（该页用旧配色渲染一次，调用方紧接着的 `--redisplay-all-windows` 会覆盖），因此当前实现没有可见缺陷。风险在演进：若将来出现并发写（例如后台线程按文档切换配色、或把 tint 做成 per-buffer 状态后再多线程下发），非原子的 `unsigned` 撕裂 / 判定与取色不一致就会变成偶发的「半页新配色半页旧配色」，且极难复现。
+- 建议：保持现状即可，但把这条假设当成**不变量**看待——任何新增写入点都必须先改成 `_Atomic`（`atomic_bool` / `atomic_uint` + `memory_order_relaxed` 足够，四个字段彼此独立、不需要与像素数据同步），并在 C 文件头注释里同步说明；同一批改动应给 `render-theme.c` 补一条「多线程下发」的回归测试（或用线程 sanitizer 跑一遍）。
+

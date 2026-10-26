@@ -279,7 +279,7 @@ M12 把 M11 的「单个底部面板」升级为「左目录 / 右信息 / 中�
 
 - **数据结构**：一张 `Decoration` 表取代原来的单色 `Highlight` 表，每条带 `kind`（`DECORATION_KIND_RECT` 填充矩形 / `DECORATION_KIND_STROKE` 折线）、几何（rect 四角，或 `fz_point *pts` + `pt_count`）、`color`（RGB ∈ [0,1]）与 `alpha`。rect 与 stroke **共用一张表**，因此渲染线程只遍历一次；`width` 只对 stroke 有意义，rect 恒为 0。上限：`DECORATION_MAX_COUNT`（100000 条）、`DECORATION_MAX_ABS_COORD`（±1e6 点）、`DECORATION_MAX_POINTS`（每笔 1024 点，超出**截断而非拒绝**）、`DECORATION_MAX_STYLE_GROUPS`（64 个样式分组）。
 - **为何必须改 C**：elisp 层无法在已有页面 image 上叠加半透明矩形——同一区域的 `display` 属性**互斥**（一处只有一份 `display` 规格生效），image 规格里也没有「第二个矩形」这一层。既有两个证据：M11.2b 计划记录（`openspec/completed/2026-10-12-m11.2b-reader-selection.md:25`）与 `seshat-reader-select.el` 的选区实现注释（只做文本属性、不做矩形绘制）。因此装饰在 `draw_page_thread` 内绘制。
-- **绘制顺序（不变）**：在 `fz_invert_pixmap_luminance` / `fz_gamma_pixmap` **之后**、写 PNM **之前**。反色与 gamma 是整页像素变换，若在装饰之后做会连装饰一起反色；写 PNM 之后再画则进不了缓存位图，翻页回来装饰消失。
+- **绘制顺序（不变）**：在暗色像素变换（暗色模式下 `fz_tint_pixmap`，未设 tint 时为 `fz_invert_pixmap_luminance` + `fz_gamma_pixmap`）**之后**、写 PNM **之前**。这一层是整页像素变换，若在装饰之后做会连装饰一起变色；写 PNM 之后再画则进不了缓存位图，翻页回来装饰消失。
 - **颜色分组与「重叠不叠深」**：rect 先扫一遍收集至多 64 组不同的 `(R,G,B,A)`，再**每组一条 `fz_path` + 一次 `fz_fill_path`**（`fz_identity` 下传，device 已持 ctm）；同组内重叠区域只被填充一次，因此多段高亮叠在一起仍是同一个透明度。越过组上限的 rect 各自单独填充（只是多几次 fill，语义不变）。
 - **`ctm` 复用**：直接复用该页 rasterize 用的同一个 `fz_transform_page(dp->bbox, resolution, rotate)`，因此缩放与旋转自动对齐，不必另算变换；`rect_to_page_space` 是「Emacs rect → MuPDF 页面空间」的**唯一**换算点（被 `--text-in-rect` / `--rects-in-rect` 与绘制共用）。
 - **快照深拷贝与所有权**：装饰表在派发时**快照**进 `DrawThreadArgs`（`deco` + `deco_count`），渲染线程不碰 `DocState`；快照归 job 所有，由 `free_draw_thread_args`（`draw_page_thread` 全部 7 条退出路径的唯一漏斗）经 `free_decoration_table` 释放。stroke 的点列是**堆分配**，struct 浅拷贝会让渲染线程与 `DocState` 共享 `pts`——因此快照对每条 stroke **逐条深拷贝 `pts`**；所有权规则写进 `Decoration` 结构体注释（「谁持有结构体谁释放 `pts`，且只有一份所有权」），`free_decoration_table` 是**唯一**释放路径（`--clear-highlights`、`free_doc_state`、`free_draw_thread_args` 共用），从机制上排除双 free。浅拷贝时代的 `args->hl` 裸 `free` 已替换，否则会漏掉每笔 stroke 的 `pts`。
@@ -318,6 +318,15 @@ M12 把 M11 的「单个底部面板」升级为「左目录 / 右信息 / 中�
 | 搜索单页命中 | 1024（`SEARCH_PAGE_MAX_QUADS`；`limit` 另被夹到 1..10000） | 截断为前 1024 条，状态行提示「仅显示前 1024 条」 |
 | 搜索整次命中 | 20000（`seshat-reader-search-max-matches`） | 达到即停止扫描并提示「命中过多」 |
 
+### 暗色像素变换与状态存储（2026-10-27）
+
+暗色模式是**用户偏好**而非文档属性，因此在 C 侧同时改了两件事：像素变换的方式，以及这份状态的存储粒度。
+
+- **像素变换只有一条分支**：`render_page_to_buffer` 里 `dark_on && tint_set` → `fz_tint_pixmap(ctx, pixmap, bg, fg)`（把每像素亮度线性映射到 BG–FG 两端）；`dark_on` 但未设 tint → 旧的 `fz_invert_pixmap_luminance` + `fz_gamma_pixmap(1/1.4)`（满量程反色）。次序不变：**栅格化 → 像素变换 → 装饰 wash → PNM 编码**（理由见上节「绘制顺序」）。tint 是双端压缩，暗底不再等于「白变纯黑」，代价是彩色内容被压成单色调（见 `openspec/tech-debt.md`）。
+- **状态是进程级 static**：`render-theme.c` 的 `g_dark_enabled` / `g_tint_set` / `g_tint_bg` / `g_tint_fg` 承载开关与配色，**不随 `reset_doc_state` 清零**——重载文档或新开另一本都保持用户当前选择。`DocState` 因此**没有** `invert` 字段（原字段已删除），`mupdf-helpers.c` 的 `reset_doc_state` 也不再初始化它。
+- **elisp 侧如何写**：`seshat-reader-dyn--doc-invert` 只翻进程级开关、**不再要求文档存在**（进程级标志没有「文档缺失」这种失败态，恒返回 `t`）；`seshat-reader-dyn--doc-tint`（arity `2`，`BG FG` 均为 `#xRRGGBB` 整数）写配色，`-1 -1` 是**清空 tint** 的哨兵（回退旧 invert+gamma，即 `graphite` 预设的「一键回旧观感」），`> 0xFFFFFF` 返回 nil 且只 `message`、不改状态，非整数同样不改状态。两者都**不重绘**，重绘由调用方显式触发。
+- **单写多读**：四个 static 只由 Emacs 主线程经上述模块入口写、由渲染线程（`render_page_to_buffer` 通过 `theme_dark_enabled` / `theme_tint_set` / `theme_tint_bg` / `theme_tint_fg` 四个只读访问器）读；worker 若读到上一版值，只会用旧配色画一页，调用方紧接着的 redisplay 会覆盖它。**这是单写者假设**：将来若出现并发写（例如后台线程改配色）需改为 `atomic`，已记 `openspec/tech-debt.md`。
+
 ### 按页渲染查询接口（P0，2026-10-26）
 
 面向「PDF 多页连续布局」（路线 3，见 `openspec/decisions.md` 2026-10-26 条）的**前置地基**：本仓库第一次提供「渲染任意页并把 image spec 交回 Lisp」的通道。
@@ -345,7 +354,7 @@ M12 把 M11 的「单个底部面板」升级为「左目录 / 右信息 / 中�
 
 1. **解析**（纯 Lisp，零 C 依赖，可单测）：`seshat-reader-annotation--ink-strokes-from-location` 把 `location` 的每个 `ink:` 段解为 `(PAGE R G B ALPHA WIDTH POINTS TRUNCATED)`。颜色只认恰好 8 位 `#AARRGGBB`；缺颜色/宽度、非有限数、坐标个数为奇数、点数为 0 均**整笔跳过**（画歪一笔比不画更误导）；超过 1024 点截断为前 1024 点并标记 `TRUNCATED`（整笔丢弃等于用户笔迹凭空消失）。解析有界：`location` 先按 64 KB 截断。
 2. **过滤与缓存**：重绘只投**当前文档**的批注（`--cached-entries` 做跨文档过滤），每页笔迹集合按 buffer 缓存（`--annotation-strokes`），避免每次重绘都重新解析整本文档。
-3. **投喂**：`--add-stroke`（`page r g b alpha width points`，页号 **1-based**，`points` 为扁平 `(x0 y0 x1 y1 …)`）→ C 侧 `Decoration` 表追加 `DECORATION_KIND_STROKE` 条目（`pts` 堆分配、派发快照时逐条深拷贝）→ 渲染线程在反色/gamma **之后**、写 PNM **之前**绘制（圆头圆角），因此缩放后与页面同变换对齐。
+3. **投喂**：`--add-stroke`（`page r g b alpha width points`，页号 **1-based**，`points` 为扁平 `(x0 y0 x1 y1 …)`）→ C 侧 `Decoration` 表追加 `DECORATION_KIND_STROKE` 条目（`pts` 堆分配、派发快照时逐条深拷贝）→ 渲染线程在暗色像素变换（`fz_tint_pixmap`，或未设 tint 时的 `fz_invert_pixmap_luminance` + `fz_gamma_pixmap`）**之后**、写 PNM **之前**绘制（圆头圆角），因此缩放后与页面同变换对齐。
 4. **投喂顺序（唯一约定）**：`clear` → 批注 rect → 框选闪现 → 搜索命中 → **ink 笔迹** → `refresh`。ink 放在最后是因为它是唯一带 alpha 且可能很长的折线，先画不会被后画的半透明矩形叠加影响判断；顺序写进 `seshat-reader-annotation--redraw-highlights`，新增装饰路必须插进这条链而不是另起一条。
 5. **失败隔离**：缺 stroke 入口（旧 `.so`）或 ink 解析失败时只跳过 ink，rect 装饰照常投喂；返回值仍只统计批注 rect 条数（ink 不进这个计数）。
 6. **坐标**：ink 点与 `rect:` 同 page space（页面 pt、原点左上、y 向下），**不翻转**（数值证据见 `docs/emacs-reader.md` §5「手写轨迹显示」）。

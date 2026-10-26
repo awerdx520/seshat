@@ -309,6 +309,49 @@ Emacs 端通过 `seshat-reader-annotation` 采集 PDF 页面选区并同步为�
 - **`C-c C-h`**：批注高亮的手动刷新入口（重投当前文档的矩形并触发 C 侧 `--refresh-highlights`）；自动刷新发生在打开文档与批注列表增删之后。
 - **`o`**：收起/展开左侧目录面板（目录不再 `pop-to-buffer` 抢窗口，改由承载层按 `seshat-reader-outline-sidebar-position` 显示）。只开合目录的命令 `seshat-reader-sidebar-toggle-outline` 不再绑键（与 `o` 功能重复），仍可 `M-x` 调用。
 
+### 阅读器暗色模式配色（2026-10-27）
+
+> 客户端侧配置（由 `seshat-reader` 读取，经原生模块的进程级状态生效），与服务端无关。暗色开关仍是 `M-x seshat-reader-dark-mode`，本节的选项只决定**暗色下页面被映射成哪两色**。
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `seshat-reader-dark-tint` | `charcoal` | 暗色模式的像素映射配色。取值是 `seshat-reader-dark-tint-presets` 里的预设符号（见下表），或直接给出 `(BG . FG)` 两个 `#xRRGGBB` 整数组成的 cons 自定义配色；`nil` 与 `graphite` 同义（不下发 tint，走旧满量程反色） |
+
+内置预设（`seshat-reader-dark-tint-presets`）：
+
+| 预设 | BG | FG | 观感 |
+|---|---|---|---|
+| `graphite` | `-1`（哨兵） | `-1`（哨兵） | **不下发 tint**：走 `fz_invert_pixmap_luminance` + `fz_gamma_pixmap(1/1.4)`，像素与改造前逐位一致（白→黑、对比度 21:1） |
+| `midnight` | `#x1c1c22` | `#xc8c4ba` | 极暗底 + 冷灰字，对比最低、最省眼 |
+| `charcoal`（默认） | `#x26262b` | `#xa8a49a` | 深灰底 + 暖灰字，正文可读性与柔和度折中 |
+| `night-sepia` | `#x201d18` | `#xc0b49c` | 暗底 + 旧纸色字，偏暖 |
+| `sepia` | `#xe8dfc8` | `#3a342a` | **亮底暗字**的米黄纸观感（不是严格意义的「暗色」，但同属该开关） |
+
+说明：
+
+- **双端压缩，不是反色**：原生模块把每像素亮度线性映射到 BG–FG 之间（最黑的像素画成 BG、最白的画成 FG）。因此暗底不再等于「白变纯黑」，代价是彩色内容被压成**单色调**——彩色插图、彩色封面会失去原有颜色（见 `openspec/tech-debt.md`「暗色 tint 把彩色内容压成单色调」）。
+- **`graphite` 是一键回退口**：它的 `(-1 . -1)` 是哨兵而非颜色，表示「不下发 tint」，像素变换退回改造前的满量程反色 + gamma。想要旧观感设 `(setq seshat-reader-dark-tint 'graphite)` 即可，无需降级 `.so`。
+- **进程级共享，不是逐 buffer**：配色与开关都由原生模块的进程级 static 承载（`seshat-reader-dyn--doc-invert` / `--doc-tint` 写入），因此**同一 Emacs 内所有 reader buffer 共用同一套配色**，也不能按文档分别设置；反过来**重载文档或新开另一本都保持当前选择**——暗色是用户偏好，不是文档属性。关闭 `seshat-reader-dark-mode` 时**不下发** tint（偏好保留），下次打开仍是同一档。
+- **非法值的处置**：未知预设符号、cons 里的元素不是整数或超出 `0..#xFFFFFF` 时，一律按「不下发 tint」处理（即回退旧满对比路径），只在 `*Messages*` 留一条 `message` 说明原因——**不报错、不静默换成另一档配色**。C 侧对 `>0xFFFFFF` 的参数返回 nil 并 `message`，非整数参数则不改状态。
+- **改后需重新 toggle**：修改 `seshat-reader-dark-tint` **不会自动重绘**已打开的 buffer——重新 toggle `seshat-reader-dark-mode`（`M-x` 两次）下发新配色，或按 `C-l` 让当前页重新渲染。
+- **新增预设不改 C 侧**：预设表就在 `seshat-reader.el` 的 `seshat-reader-dark-tint-presets` 里，加档只改 elisp，不需要重编 `seshat-render-core.so`。
+
+配置示例：
+
+```elisp
+;; 默认：charcoal（深灰底暖灰字）
+(setq seshat-reader-dark-tint 'charcoal)
+
+;; 旧观感（满量程反色 + gamma，改造前的像素）
+(setq seshat-reader-dark-tint 'graphite)
+
+;; 亮底暗字的米黄纸
+(setq seshat-reader-dark-tint 'sepia)
+
+;; 自定义：BG 与 FG 直接给 #xRRGGBB 整数
+(setq seshat-reader-dark-tint (cons #x101014 #xd0ccc0))
+```
+
 ### 双向引用（M11.4）
 
 > 客户端侧配置（由 `seshat-reader-reference` 读取），与服务端无关。链接有**两种形态**（M8-C 起）：`seshat:uid:<uid>[#<location>]`（身份由服务端 uid 承载，**改名后仍可跟随**）与 `seshat:<tag>:<相对路径>[#<location>]`（人类可读，改名后失效）；新产生的链接能零网络解析出 uid 时用前者，否则回落后者。

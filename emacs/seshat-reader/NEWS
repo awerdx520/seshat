@@ -3,6 +3,22 @@ See =(info "(standards) NEWS File")=. User facing changes per release
 are to be recorded here.
 
 * Version 0.4.0
+- Add =seshat-reader-dark-tint= (default =charcoal=) with five presets.
+  Dark mode no longer inverts the page full range: pixel luminance is
+  mapped onto two colours, so a dark background keeps a readable
+  contrast instead of going pure black. =graphite= keeps the old
+  full-range inversion + gamma and is the one-step way back.
+- Dark mode is now a process-wide preference rather than a property of
+  the open document: it survives reloading the file or opening another
+  one, and turning it off keeps the chosen palette for next time.
+- =seshat-reader-dyn--doc-invert= no longer needs an open document.
+  New module function =seshat-reader-dyn--doc-tint= sets the two colours
+  (=BG= / =FG= as =#xRRGGBB=), and =-1 -1= clears the tint again.
+- Changing =seshat-reader-dark-tint= does not repaint open buffers:
+  toggle =seshat-reader-dark-mode= again or press =C-l=.
+- Note: the tint maps every pixel onto a two-colour ramp, so colour
+  figures and covers become monochrome; the =sepia= preset also makes
+  the existing yellow highlight decorations hard to see.
 - Per window pages, zooming, etc. support, which means that it is now
   possible to view different pages of the same document (from the same
   buffer) on different windows.

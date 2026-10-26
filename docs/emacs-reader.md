@@ -165,7 +165,7 @@ ETAF 渲染层是可选外部依赖：`Makefile` 先探测 `~/Workspace/emacs-ta
 | 面板宽度切换 | `w` | 单键别名（`C-c w` 同样可用） |
 | 关闭文档 | `Q` | |
 | 演示模式 | `M-x seshat-reader-presentation-mode` | 隐藏模式行并 fit-to-height；无默认键位 |
-| 暗色模式 | `M-x seshat-reader-dark-mode` | 反色显示；无默认键位 |
+| 暗色模式 | `M-x seshat-reader-dark-mode` | 5 档配色预设（默认 `charcoal`）；`graphite` 为满量程反色；无默认键位 |
 
 可用格式（取自包内 `README.org` 的 Supported Formats，经 MuPDF）：
 
@@ -883,6 +883,8 @@ evil 是 globalized minor mode，会在 mode body 之后重新启用自己，所
 26. **`character` 粒度会撞 500 段锚上限**：逐字符矩形可达数千条，`--anchor` 按写入端上限只写前 500 段（并提示一次），页面下部因此**没有高亮**；批注本身仍可创建。`line` 粒度（默认）每页通常几十段，不受影响。解除条件见 tech-debt（先按行合并再写入，或提高上限并重估 64 KB location 长度）。
 27. **同一处多段高亮不会叠深**：装饰按颜色分组进同一 path 一次填充，因此多段重叠仍是一个透明度——这是有意的（避免出现深浅不匀的色块），不是渲染缺陷。
 28. **面板里的宽表格被右侧裁切**：`valign-mode` 用 `:align-to` 做**绝对像素**对齐，单元格宽度按表格自身最大内容宽度分配，与面板窗口宽度无关；因此列总宽超过面板可用宽时，**最右侧几列直接落到面板右缘之外**——不可见、不能折行，也不能横向滚动（面板正文不折行时才横向滚动，而那时 valign 本就不启用）。常态面板只有 0.25 屏宽，4 列以上且含长中文单元格时很容易命中，且**没有任何截断提示**，容易误判为模型少输出了内容。缓解：按 `w`（`C-c w`）把面板扩宽，或 `(setq seshat-reader-translate-valign nil)` 退回不依赖像素对齐的 Markdown 渲染。根治方案（表格宽度感知、渲染侧重排）见 tech-debt「面板宽表格溢出被裁切（valign 绝对像素对齐）」，本计划不解决，只保证不加剧。
+29. **暗色 tint 会把彩色插图/封面压成单色调**：`charcoal` / `midnight` / `sepia` 都把每像素亮度映射到 BG→FG 连线上，颜色信息因此整体丢失（彩色图变单色渐变）；`graphite` 走的是 `fz_invert_pixmap_luminance`，保留 chrominance，是唯一不回退的例外。
+30. **`sepia`（亮底）档下既有黄色高亮装饰几乎不可见**：批注高亮默认黄（RGB `1.0 0.85 0.0`、α `0.35`）在浅米底色上对比度极低，装饰配色未随预设自适应；需要时手动调 `seshat-reader-annotation-highlight-color` / `-alpha`。
 
 ## 13. 开发者备注
 
@@ -905,7 +907,7 @@ evil 是 globalized minor mode，会在 mode body 之后重新启用自己，所
 | `seshat-reader-bookmark.el` | bookmark 记录与跳转 |
 | `render/render-core.c` | 模块入口、页面栅格化、`ctm`、高亮绘制、缓存与窗口状态 |
 | `render/render-threads.c` / `.h` | 渲染线程池、job 提交与缓存页生命周期 |
-| `render/render-theme.c` / `.h` | 反色 / gamma 等整页像素变换 |
+| `render/render-theme.c` / `.h` | tint / 反色 / gamma 等整页像素变换 + 进程级暗色状态 |
 | `render/mupdf-helpers.c` / `.h` | MuPDF 文档与页面封装 |
 | `render/elisp-helpers.c` / `.h` | emacs-module 参数编解码辅助 |
 
@@ -924,6 +926,16 @@ evil 是 globalized minor mode，会在 mode body 之后重新启用自己，所
 - **旧 `.so` 兼容**：`seshat-reader--page-spec` 有 `fboundp` 守卫，加载改造前的 `.so` 时返回 nil 而不是报错。
 - 缓存由 `seshat-reader--clear-doc-memory` 与 `seshat-reader--render-buffer` 自动清空；`--page-spec-clear-cache` 供手动清（例如改 scale 后想重新测）。
 - 用途与边界见 `openspec/decisions.md`（2026-10-26）与 `docs/architecture.md` §「按页渲染查询接口（P0，2026-10-26）」；实测数据见 `openspec/completed/2026-10-26-reader-multipage-p0-page-spec-api.md`。注意与已有的 `seshat-reader--page-image-spec` **不是**同一个函数——后者是读页 overlay 的 `display`（只对当前显示页有效），不带页号参数。
+
+### 暗色开关与配色预设（进程级，内部接口）
+
+```elisp
+(seshat-reader-dyn--doc-invert FLAG)  ; arity 1,1 → 翻进程级暗色开关，恒返回 t
+(seshat-reader-dyn--doc-tint BG FG)   ; arity 2,2 → 0xRRGGBB 背景/文字；负值清空 tint
+```
+
+- 两者都**只改进程级状态、不触发重绘**：画面变化要调用方自己触发（elisp 侧跟一次 `seshat-reader--redisplay-all-windows`）。状态不属于任何文档，重载 / 新开文档后仍保持。
+- `--doc-invert` **不再要求文档已打开**：没有 `DocState` 也返回 `t`，不再打印 `No valid DocState user pointer found.`——暗色开关是进程级用户偏好，没有「哪个文档」可言。
 
 ### 构建与测试
 
@@ -956,7 +968,7 @@ GTROOT=$(dirname "$(find "$HOME" -maxdepth 6 -type d \
 echo "$GTROOT"
 ```
 
-现有套件（**29** 个文件，逐文件实测合计 **1163** 例，0 unexpected / 0 skipped）：`seshat-conflict-test.el`（10 例）、`seshat-library-test.el`（**54 例**，M8-C T1/T2 新增 38 例——数据层 21 + 书架 buffer 17；Phase 4 安全加固再 +16 例——根归属门、清单根一致与 uid 形态过滤、`u` 覆盖确认、下载 `:timeout` / `:max-bytes` 透传与 `:too-large`、分页上限）、`seshat-merge-test.el`（13 例）、`seshat-reader-annotation-decoration-test.el`（21 例）、`seshat-reader-annotation-ink-test.el`（24 例）、`seshat-reader-annotation-queue-test.el`（27 例）、`seshat-reader-annotation-test.el`（**58 例**）、`seshat-reader-annotation-v8-test.el`（14 例）、`seshat-reader-etaf-test.el`（19 例）、`seshat-reader-evil-keymap-test.el`（9 例）、`seshat-reader-outline-test.el`（29 例）、`seshat-reader-page-join-test.el`（26 例）、`seshat-reader-page-spec-test.el`（**13 例**，P0 新增：真实 `.so` + 真实 PDF 下的参数语义、scale 夹紧、rotate 方向互换、缓存命中与上限淘汰、零副作用守门）、`seshat-reader-reference-test.el`（**95 例**，基线 50；M8-C 带入 +19 例 uid 形态解析与构造、+17 例全部插入路径与导出回落、+9 例 follow 按需下载链与 doc-id 回归）、`seshat-reader-resize-test.el`（80 例）、`seshat-reader-search-test.el`（**49 例**）、`seshat-reader-select-flash-test.el`（11 例）、`seshat-reader-select-merge-test.el`（18 例）、`seshat-reader-select-scope-test.el`（7 例）、`seshat-reader-select-report-test.el`（**7 例**，M12 T8a 新增：框选回显只报行列数、`seshat-reader-select-message-limit` 已删除）、`seshat-reader-sidebar-test.el`（**143 例**）、`seshat-reader-translate-test.el`（**159 例**）、`seshat-reading-test.el`（**49 例**）、`seshat-rest-test.el`（**58 例**，安全加固 +3 例——`:max-bytes` 按 `Content-Length` 超限不写盘、`:timeout` 透传）、`seshat-state-test.el`（36 例）、`seshat-sync-cmd-test.el`（14 例）、`seshat-sync-test.el`（77 例）、`seshat-transparency-test.el`（**9 例**，M8-C T5 新增：六项白名单式反向断言 + 3 例反向自我验证）、`seshat-transport-test.el`（**34 例**，安全加固 +1 例——url 后端真正传递 `:timeout`）。**前置**：`seshat-render-core.so` 已构建，否则加载 `seshat-reader` 会触发交互式构建询问并阻塞 batch 运行。
+现有套件（**31** 个文件，逐文件实测合计 **1166** 例，0 unexpected / 0 skipped）：`seshat-conflict-test.el`（10 例）、`seshat-library-test.el`（**54 例**，M8-C T1/T2 新增 38 例——数据层 21 + 书架 buffer 17；Phase 4 安全加固再 +16 例——根归属门、清单根一致与 uid 形态过滤、`u` 覆盖确认、下载 `:timeout` / `:max-bytes` 透传与 `:too-large`、分页上限）、`seshat-merge-test.el`（13 例）、`seshat-reader-annotation-decoration-test.el`（21 例）、`seshat-reader-annotation-ink-test.el`（24 例）、`seshat-reader-annotation-queue-test.el`（27 例）、`seshat-reader-annotation-test.el`（**58 例**）、`seshat-reader-annotation-v8-test.el`（14 例）、`seshat-reader-etaf-test.el`（19 例）、`seshat-reader-evil-keymap-test.el`（9 例）、`seshat-reader-multipage-test.el`（39 例）、`seshat-reader-outline-test.el`（29 例）、`seshat-reader-page-join-test.el`（6 例）、`seshat-reader-page-spec-test.el`（**13 例**，P0 新增：真实 `.so` + 真实 PDF 下的参数语义、scale 夹紧、rotate 方向互换、缓存命中与上限淘汰、零副作用守门）、`seshat-reader-reference-test.el`（**95 例**，基线 50；M8-C 带入 +19 例 uid 形态解析与构造、+17 例全部插入路径与导出回落、+9 例 follow 按需下载链与 doc-id 回归）、`seshat-reader-resize-test.el`（53 例）、`seshat-reader-search-test.el`（**49 例**）、`seshat-reader-select-flash-test.el`（11 例）、`seshat-reader-select-merge-test.el`（18 例）、`seshat-reader-select-scope-test.el`（7 例）、`seshat-reader-select-report-test.el`（**7 例**，M12 T8a 新增：框选回显只报行列数、`seshat-reader-select-message-limit` 已删除）、`seshat-reader-sidebar-test.el`（**143 例**）、`seshat-reader-theme-test.el`（**11 例**，新建：5 档预设与自定义 cons 的下发颜色、`graphite` 走 `-1 -1` 哨兵、关灯不下发 tint、未知/非法预设回落旧路径）、`seshat-reader-translate-test.el`（**159 例**）、`seshat-reading-test.el`（**49 例**）、`seshat-rest-test.el`（**58 例**，安全加固 +3 例——`:max-bytes` 按 `Content-Length` 超限不写盘、`:timeout` 透传）、`seshat-state-test.el`（36 例）、`seshat-sync-cmd-test.el`（14 例）、`seshat-sync-test.el`（77 例）、`seshat-transparency-test.el`（**9 例**，M8-C T5 新增：六项白名单式反向断言 + 3 例反向自我验证）、`seshat-transport-test.el`（**34 例**，安全加固 +1 例——url 后端真正传递 `:timeout`）。**前置**：`seshat-render-core.so` 已构建，否则加载 `seshat-reader` 会触发交互式构建询问并阻塞 batch 运行。
 
 用例数是**实测值**，统计命令（每个文件单独跑、抓 `Ran N tests` 求和；与全仓脚本同一套 `-L`）：
 
@@ -983,7 +995,7 @@ total=0; for f in emacs/tests/*-test.el; do \
 
 其余 24 个文件只用仓库内两个 `-L` 即可跑全；上表的 skip / 失败都是**缺 `-L` 造成的假绿/假红**，跑全仓时 12 个 straight 目录必须齐备。
 
-**必须逐文件运行**：一次 `emacs --batch` 加载全部测试文件时，`seshat-reader-annotation-test.el` 与 `seshat-reader-annotation-queue-test.el` 各有 3 个列表渲染用例会失败——同时加载 `etaf` 测试后 `etaf-ui` 变为可用，批注列表改走 EBOX/ETAF 渲染，而那两个用例断言的是纯文本（如 `"没有批注"`）。这是**既有基线特性、不是回归**：全仓用例总数按逐文件求和计（当前 **29** 个文件合计 **1163** 例，0 unexpected / 0 skipped；本轮读取器 P0 带入 `seshat-reader-page-spec-test.el` **13** 例（`seshat-render-core.so` 真实渲染，不是桩）；M8-C 一轮带入：新增 `seshat-library-test.el` **38** 例与 `seshat-transparency-test.el` **9** 例，`seshat-reader-reference-test.el` 69 → **95** 例；Phase 4 安全加固再带入 **20** 例——library 38 → **54**、rest 55 → **58**、transport 33 → **34**；更早一轮「面板键改用 evil `'local` state keymap」带入 sidebar 套件 137 → 140（**当前实测 139**，以上表列值为准）：删除 1 例 `--panel-evil-keys-four-keymaps`（按 map 对象断言，与新方案互斥）、新增 4 例「`'normal`+`'local` 且落在面板 buffer 内 / 四个 kind 的键→命令集合 / buffer 已 kill 时空操作 / 显示漏斗与 `pop-to-buffer` 回退分支都传 (BUFFER KIND)」；上一轮「面板保持 evil normal state + `n` / `p` 翻页补绑 + 搜索翻页高亮侧栏当前页」带入 search 套件 38 → **48**、sidebar 套件 134 → **137**；上一轮「搜索命中在阅读与结果侧栏之间双向同步」带入 search 套件 30 → **38**；再上一轮「追问中转 buffer 隐藏 + 面板内 evil emacs state + 翻译/解释 toggle 语境对应」带入 translate 套件 138 → **143**、sidebar 套件 132 → **134**；再上一轮「重开按最近显示顺序 + 搜索侧栏补 `C-c w`」带入 sidebar 套件 126 → **132**；再上一轮「M-o 面板键位 / 重开位置 / evil 下 ? 补绑」带入 sidebar 套件 120 → **126**；再上一轮「搜索侧栏纳入面板机制」带入 sidebar 套件 117 → **120**；本轮「面板正文宽度跟随窗口 + valign」带入 translate 套件 143 → **159** 例（+16）、sidebar 套件 139 → 143 例（+4，resize 出口显式刷新正文宽度的兜底））。跑全仓脚本见下（`for` 循环逐文件执行，任一文件非零退出即整体失败）：
+**必须逐文件运行**：一次 `emacs --batch` 加载全部测试文件时，`seshat-reader-annotation-test.el` 与 `seshat-reader-annotation-queue-test.el` 各有 3 个列表渲染用例会失败——同时加载 `etaf` 测试后 `etaf-ui` 变为可用，批注列表改走 EBOX/ETAF 渲染，而那两个用例断言的是纯文本（如 `"没有批注"`）。这是**既有基线特性、不是回归**：全仓用例总数按逐文件求和计（当前 **31** 个文件合计 **1166** 例，0 unexpected / 0 skipped；本轮读取器 P0 带入 `seshat-reader-page-spec-test.el` **13** 例（`seshat-render-core.so` 真实渲染，不是桩）；M8-C 一轮带入：新增 `seshat-library-test.el` **38** 例与 `seshat-transparency-test.el` **9** 例，`seshat-reader-reference-test.el` 69 → **95** 例；Phase 4 安全加固再带入 **20** 例——library 38 → **54**、rest 55 → **58**、transport 33 → **34**；更早一轮「面板键改用 evil `'local` state keymap」带入 sidebar 套件 137 → 140（**当前实测 139**，以上表列值为准）：删除 1 例 `--panel-evil-keys-four-keymaps`（按 map 对象断言，与新方案互斥）、新增 4 例「`'normal`+`'local` 且落在面板 buffer 内 / 四个 kind 的键→命令集合 / buffer 已 kill 时空操作 / 显示漏斗与 `pop-to-buffer` 回退分支都传 (BUFFER KIND)」；上一轮「面板保持 evil normal state + `n` / `p` 翻页补绑 + 搜索翻页高亮侧栏当前页」带入 search 套件 38 → **48**、sidebar 套件 134 → **137**；上一轮「搜索命中在阅读与结果侧栏之间双向同步」带入 search 套件 30 → **38**；再上一轮「追问中转 buffer 隐藏 + 面板内 evil emacs state + 翻译/解释 toggle 语境对应」带入 translate 套件 138 → **143**、sidebar 套件 132 → **134**；再上一轮「重开按最近显示顺序 + 搜索侧栏补 `C-c w`」带入 sidebar 套件 126 → **132**；再上一轮「M-o 面板键位 / 重开位置 / evil 下 ? 补绑」带入 sidebar 套件 120 → **126**；再上一轮「搜索侧栏纳入面板机制」带入 sidebar 套件 117 → **120**；本轮「面板正文宽度跟随窗口 + valign」带入 translate 套件 143 → **159** 例（+16）、sidebar 套件 139 → 143 例（+4，resize 出口显式刷新正文宽度的兜底））。跑全仓脚本见下（`for` 循环逐文件执行，任一文件非零退出即整体失败）：
 
 ```bash
 cd /home/thomas/Workspace/seshat && rm -f emacs/seshat-reader/*.elc && \
@@ -998,5 +1010,5 @@ for f in emacs/tests/*-test.el; do \
 ### 改 C 的纪律
 
 - 本目录是 vendored + 自研化改名的代码：任何 C 侧改动都必须在该文件「按文件的本地改动清单」中登记，否则下次对照上游时改动会丢失依据。
-- 渲染层的不变量（装饰在反色/gamma **之后**、写 PNM **之前**绘制；`rect_to_page_space` 是唯一坐标换算点；装饰表在派发时快照进 `DrawThreadArgs`，stroke 点列**逐条深拷贝**）改动前先读 [`architecture.md`](architecture.md) 对应小节。
+- 渲染层的不变量（装饰在暗色像素变换（`fz_tint_pixmap`，或未设 tint 时的 `fz_invert_pixmap_luminance` + `fz_gamma_pixmap`）**之后**、写 PNM **之前**绘制；`rect_to_page_space` 是唯一坐标换算点；装饰表在派发时快照进 `DrawThreadArgs`，stroke 点列**逐条深拷贝**）改动前先读 [`architecture.md`](architecture.md) 对应小节。
 - 装饰条数 100000、坐标 ±1e6 点、每笔 stroke 1024 点、outline 标题 8192 字节、批注 `location` 64 KB / 2000 段 `rect:`（写入端 500 段）是防御上限，不要随手放宽。
