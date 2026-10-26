@@ -3086,6 +3086,302 @@ buffer（未显示则为 nil）。"
           (should-not (display-buffer buffer))
         (when (buffer-live-p buffer) (kill-buffer buffer))))))
 
+;;; 面板正文宽度跟随窗口（vfcm width 跟随）+ valign
+;;
+;; 这一组的共同前提：batch Emacs 里 `display-graphic-p' 为 nil、真实 vfcm 的
+;; adjust 会去改窗口 margin。因此一律用 `cl-letf' 桩掉
+;; `visual-fill-column-adjust' / `visual-fill-column-mode'，并桩
+;; `window-buffer' / `window-width' / `window-margins' 以构造「面板窗口」——
+;; 被测的宽度公式与状态机才真实。
+
+(ert-deftest seshat-reader-translate-test--vfcm-follow-window-ratio ()
+  "按 ratio 计算 `visual-fill-column-width'：avail × ratio 后取整."
+  (skip-unless (require 'visual-fill-column nil t))
+  (with-temp-buffer
+    (setq-local visual-fill-column-mode t)
+    (setq-local visual-fill-column-width nil)
+    (cl-letf (((symbol-function 'window-buffer)
+               (lambda (&optional _window) (current-buffer)))
+              ((symbol-function 'window-width)
+               (lambda (&optional _window _pixels _round) 80))
+              ((symbol-function 'window-margins)
+               (lambda (&optional _window) '(1 . 2)))
+              ((symbol-function 'visual-fill-column-adjust) #'ignore))
+      (let ((seshat-reader-translate-visual-fill-column-ratio 0.94))
+        ;; avail = 80（remap）+ 1×1.0 + 2×1.0 = 83；83 × 0.94 = 78.02 → 78
+        (should (= 78 (seshat-reader-translate--vfcm-follow-window
+                       (selected-window))))
+        (should (= 78 visual-fill-column-width))))))
+
+(ert-deftest seshat-reader-translate-test--vfcm-follow-window-ratio-nil ()
+  "ratio 为 nil（回退旧行为）时不设置宽度，既有本地值也不被覆写."
+  (skip-unless (require 'visual-fill-column nil t))
+  (with-temp-buffer
+    (setq-local visual-fill-column-mode t)
+    (setq-local visual-fill-column-width 42)
+    (cl-letf (((symbol-function 'window-buffer)
+               (lambda (&optional _window) (current-buffer)))
+              ((symbol-function 'window-width)
+               (lambda (&optional _window _pixels _round) 80))
+              ((symbol-function 'window-margins)
+               (lambda (&optional _window) '(1 . 2)))
+              ((symbol-function 'visual-fill-column-adjust) #'ignore))
+      (let ((seshat-reader-translate-visual-fill-column-ratio nil))
+        (should-not (seshat-reader-translate--vfcm-follow-window
+                     (selected-window)))
+        ;; nil 语义 = 沿用全局 `fill-column'：不写 `visual-fill-column-width'
+        (should (= 42 visual-fill-column-width))))))
+
+(ert-deftest seshat-reader-translate-test--vfcm-follow-window-mode-off ()
+  "vfcm 未启用时不设置宽度、不报错、返回 nil."
+  (skip-unless (require 'visual-fill-column nil t))
+  (with-temp-buffer
+    (setq-local visual-fill-column-mode nil)
+    (setq-local visual-fill-column-width nil)
+    (cl-letf (((symbol-function 'window-buffer)
+               (lambda (&optional _window) (current-buffer)))
+              ((symbol-function 'window-width)
+               (lambda (&optional _window _pixels _round) 80))
+              ((symbol-function 'window-margins)
+               (lambda (&optional _window) '(1 . 2)))
+              ((symbol-function 'visual-fill-column-adjust) #'ignore))
+      (let ((seshat-reader-translate-visual-fill-column-ratio 0.9))
+        (should-not (seshat-reader-translate--vfcm-follow-window
+                     (selected-window)))
+        (should-not visual-fill-column-width)))))
+
+(ert-deftest seshat-reader-translate-test--vfcm-follow-window-no-window ()
+  "取不到窗口（buffer 未显示）时静默返回 nil，不设宽度也不报错."
+  (skip-unless (require 'visual-fill-column nil t))
+  (with-temp-buffer
+    (setq-local visual-fill-column-mode t)
+    (setq-local visual-fill-column-width nil)
+    (cl-letf (((symbol-function 'get-buffer-window)
+               (lambda (&optional _buffer _all-frames) nil)))
+      (let ((seshat-reader-translate-visual-fill-column-ratio 0.94))
+        (should-not (seshat-reader-translate--vfcm-follow-window))
+        (should-not (seshat-reader-translate--vfcm-refresh))
+        (should-not visual-fill-column-width)))))
+
+(ert-deftest seshat-reader-translate-test--vfcm-available-width-remap ()
+  "宽度公式取 remap 口径，而不是 `window-body-width' 口径."
+  (skip-unless (require 'visual-fill-column nil t))
+  (with-temp-buffer
+    (cl-letf (((symbol-function 'window-width)
+               ;; 无参调用返回「逻辑列」（80），`remap' 调用返回 88；
+               ;; 二者差 8 列，取错口径结果必然不同。
+               (lambda (&optional _window pixels _round)
+                 (if pixels 88 80)))
+              ((symbol-function 'window-margins)
+               (lambda (&optional _window) '(2 . 3)))
+              ;; 证明不使用 `window-body-width'：一旦调用即失败
+              ((symbol-function 'window-body-width)
+               (lambda (&rest _args)
+                 (error "不得使用 window-body-width"))))
+      ;; scale = 88/80 = 1.1；avail = 88 + 2×1.1 + 3×1.1 = 88 + 5.5 = 93.5 → 93
+      (should (= 93 (seshat-reader-translate--vfcm-available-width
+                     (selected-window))))
+      (with-temp-buffer
+        (setq-local visual-fill-column-mode t)
+        (cl-letf (((symbol-function 'window-buffer)
+                   (lambda (&optional _window) (current-buffer)))
+                  ((symbol-function 'visual-fill-column-adjust) #'ignore))
+          (let ((seshat-reader-translate-visual-fill-column-ratio 1.0))
+            (should (= 93 (seshat-reader-translate--vfcm-follow-window
+                           (selected-window))))
+            ;; body 口径（80+5=85）与 remap 口径（93）不同，断言取的是后者
+            (should-not (= 85 visual-fill-column-width))))))))
+
+(ert-deftest seshat-reader-translate-test--prepare-view-registers-local-refresh-hook ()
+  "`--prepare-view' 注册 buffer-local 刷新 hook，且不污染全局值."
+  (skip-unless (require 'visual-fill-column nil t))
+  (with-temp-buffer
+    (let ((seshat-reader-panel-truncate-lines nil)
+          (seshat-reader-translate-visual-fill-column t)
+          (seshat-reader-translate-valign nil))
+      (cl-letf (((symbol-function 'visual-fill-column-mode) #'ignore))
+        (seshat-reader-translate--prepare-view))
+      ;; buffer-local 值含 refresh（prepend 语义：排在 vfcm 的 adjust 之前）
+      (should (memq #'seshat-reader-translate--vfcm-refresh
+                    (buffer-local-value 'window-state-change-functions
+                                        (current-buffer))))
+      (should (local-variable-p 'window-state-change-functions))
+      ;; 全局值不含（`add-hook ... 'local' 不写 default-value）
+      (should-not (memq #'seshat-reader-translate--vfcm-refresh
+                        (default-value 'window-state-change-functions))))))
+
+(ert-deftest seshat-reader-translate-test--prepare-view-skips-refresh-hook-when-truncating ()
+  "不折行模式（`truncate-lines' 为 t）下不注册刷新 hook."
+  (skip-unless (require 'visual-fill-column nil t))
+  (with-temp-buffer
+    (let ((seshat-reader-panel-truncate-lines t)
+          (seshat-reader-translate-visual-fill-column t)
+          (seshat-reader-translate-valign t))
+      (cl-letf (((symbol-function 'visual-fill-column-mode) #'ignore)
+                ((symbol-function 'valign-mode) #'ignore))
+        (seshat-reader-translate--prepare-view))
+      (should-not (memq #'seshat-reader-translate--vfcm-refresh
+                        (buffer-local-value 'window-state-change-functions
+                                            (current-buffer)))))))
+
+(ert-deftest seshat-reader-translate-test--prepare-view-kills-local-width-when-off ()
+  "选项为 nil 时 `kill-local-variable' 生效：buffer 内不再有本地宽度."
+  (skip-unless (require 'visual-fill-column nil t))
+  (with-temp-buffer
+    (let ((seshat-reader-panel-truncate-lines nil)
+          (seshat-reader-translate-visual-fill-column nil)
+          (seshat-reader-translate-valign nil))
+      (cl-letf (((symbol-function 'visual-fill-column-mode) #'ignore))
+        (seshat-reader-translate--prepare-view)
+        ;; `--prepare-view' 换 major mode 已清过一次；再手工设一次本地值，
+        ;; 验证关闭分支的 kill-local-variable 确实抹掉它（防御性冗余路径）。
+        (setq-local visual-fill-column-width 55)
+        (should (local-variable-p 'visual-fill-column-width))
+        (seshat-reader-translate--prepare-view)
+        (should-not (local-variable-p 'visual-fill-column-width))
+        (should-not visual-fill-column-width)))))
+
+(ert-deftest seshat-reader-translate-test--prepare-view-enables-valign ()
+  "valign 可用且选项为 t 时启用 `valign-mode'（图形环境）."
+  (with-temp-buffer
+    (let ((seshat-reader-panel-truncate-lines nil)
+          (seshat-reader-translate-visual-fill-column nil)
+          (seshat-reader-translate-valign t)
+          (valign-arg 'not-called))
+      (cl-letf (((symbol-function 'display-graphic-p)
+                 (lambda (&optional _frame) t))
+                ((symbol-function 'valign-mode)
+                 (lambda (&optional arg) (setq valign-arg arg)))
+                ((symbol-function 'visual-fill-column-mode) #'ignore))
+        (seshat-reader-translate--prepare-view)
+        (should (equal 1 valign-arg))))))
+
+(ert-deftest seshat-reader-translate-test--prepare-view-honors-valign-off ()
+  "选项为 nil 时不调用 `valign-mode'."
+  (with-temp-buffer
+    (let ((seshat-reader-panel-truncate-lines nil)
+          (seshat-reader-translate-visual-fill-column nil)
+          (seshat-reader-translate-valign nil)
+          (valign-called nil))
+      (cl-letf (((symbol-function 'valign-mode)
+                 (lambda (&optional _arg) (setq valign-called t))))
+        (seshat-reader-translate--prepare-view)
+        (should-not valign-called)))))
+
+(ert-deftest seshat-reader-translate-test--prepare-view-tolerates-missing-valign ()
+  "valign 缺失（`require' 返回 nil、`fboundp' 为 nil）时静默跳过、不报错.
+须把 `display-graphic-p' 桩成 t：非图形环境下 `--prepare-view' 会先短路，
+测不到「包缺失」这条路径。"
+  (with-temp-buffer
+    (let ((seshat-reader-panel-truncate-lines nil)
+          (seshat-reader-translate-visual-fill-column nil)
+          (seshat-reader-translate-valign t)
+          (orig-fboundp (symbol-function 'fboundp))
+          (orig-require (symbol-function 'require)))
+      (cl-letf (((symbol-function 'display-graphic-p)
+                 (lambda (&optional _frame) t))
+                ((symbol-function 'fboundp)
+                 (lambda (sym)
+                   (if (memq sym '(valign-mode valign))
+                       nil
+                     (funcall orig-fboundp sym))))
+                ((symbol-function 'require)
+                 (lambda (feature &optional filename noerror)
+                   (if (memq feature '(valign valign-mode))
+                       nil
+                     (funcall orig-require feature filename noerror))))
+                ((symbol-function 'visual-fill-column-mode) #'ignore))
+        ;; 不抛出即通过
+        (should (progn (seshat-reader-translate--prepare-view) t))
+        (should-not (bound-and-true-p valign-mode))))))
+
+(ert-deftest seshat-reader-translate-test--render-panel-refreshes-vfcm-width ()
+  "`--render-panel' 在显示面板之后调用一次 `--vfcm-refresh'."
+  (skip-unless (require 'gt nil t))
+  (let* ((seshat-reader-sidebar-translate-buffer-name "*Seshat Test Panel*")
+         (seshat-reader-translate-show-source nil)
+         (seshat-reader-translate-template nil)
+         (seshat-reader-panel-truncate-lines nil)
+         (seshat-reader-select-last nil)
+         (calls nil)
+         (buf nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'seshat-reader-sidebar-show)
+                   (lambda (b &rest _args) b))
+                  ((symbol-function 'seshat-reader-translate--vfcm-refresh)
+                   (lambda (&optional window) (push window calls) nil)))
+          (setq buf (seshat-reader-translate--render-panel "正文" "标题"))
+          (should (= 1 (length calls))))
+      (when (buffer-live-p buf) (kill-buffer buf)))))
+
+(ert-deftest seshat-reader-translate-test--prepare-view-skips-valign-when-non-graphic ()
+  "非图形环境（`display-graphic-p' 为 nil）时不调用 `valign-mode'：静默跳过.
+`ignore-errors' 挡不住 `valign-mode' 在非图形环境下 `message' 出的
+\"no effect in non-graphical display\" 提示，故 `--prepare-view' 自己先判。"
+  (with-temp-buffer
+    (let ((seshat-reader-panel-truncate-lines nil)
+          (seshat-reader-translate-visual-fill-column nil)
+          (seshat-reader-translate-valign t)
+          (valign-called nil))
+      (cl-letf (((symbol-function 'display-graphic-p)
+                 (lambda (&optional _frame) nil))
+                ((symbol-function 'valign-mode)
+                 (lambda (&optional _arg) (setq valign-called t))))
+        (seshat-reader-translate--prepare-view)
+        (should-not valign-called)))))
+
+(ert-deftest seshat-reader-translate-test--vfcm-available-width-text-scale ()
+  "text-scale 因子与 vfcm 同源：放大字体后可用列数按 `text-scale-mode-step' 缩小."
+  (skip-unless (require 'visual-fill-column nil t))
+  (require 'face-remap)
+  (with-temp-buffer
+    (cl-letf (((symbol-function 'window-width)
+               (lambda (&optional _window _pixels _round) 80))
+              ((symbol-function 'window-margins)
+               (lambda (&optional _window) '(1 . 2))))
+      (let ((visual-fill-column-adjust-for-text-scale t)
+            (text-scale-mode-step 1.2)
+            (text-scale-mode-amount 1))
+        ;; base = 80 + 1×1.0 + 2×1.0 = 83；83 / 1.2 = 69.17 → 69
+        (should (= 69 (seshat-reader-translate--vfcm-available-width
+                       (selected-window))))
+        ;; 未放大字体（amount 0）时因子为 1.0 → 83
+        (let ((text-scale-mode-amount 0))
+          (should (= 83 (seshat-reader-translate--vfcm-available-width
+                         (selected-window)))))))))
+
+(ert-deftest seshat-reader-translate-test--vfcm-follow-window-non-number-ratio ()
+  "ratio 为非法值（字符串）时静默不设宽度：锁 `numberp' 守卫."
+  (skip-unless (require 'visual-fill-column nil t))
+  (with-temp-buffer
+    (setq-local visual-fill-column-mode t)
+    (setq-local visual-fill-column-width nil)
+    (cl-letf (((symbol-function 'window-buffer)
+               (lambda (&optional _window) (current-buffer)))
+              ((symbol-function 'window-width)
+               (lambda (&optional _window _pixels _round) 80))
+              ((symbol-function 'window-margins)
+               (lambda (&optional _window) '(1 . 2)))
+              ((symbol-function 'visual-fill-column-adjust) #'ignore))
+      (let ((seshat-reader-translate-visual-fill-column-ratio "0.9"))
+        (should-not (seshat-reader-translate--vfcm-follow-window
+                     (selected-window)))
+        (should-not visual-fill-column-width)))))
+
+(ert-deftest seshat-reader-translate-test--vfcm-follow-window-non-live-window ()
+  "传入非 live 窗口时静默返回 nil、不报错：锁 `window-live-p' 守卫."
+  (skip-unless (require 'visual-fill-column nil t))
+  (with-temp-buffer
+    (setq-local visual-fill-column-mode t)
+    (setq-local visual-fill-column-width nil)
+    (cl-letf (((symbol-function 'window-live-p)
+               (lambda (&optional _window) nil)))
+      (let ((seshat-reader-translate-visual-fill-column-ratio 0.9))
+        (should-not (seshat-reader-translate--vfcm-follow-window
+                     (selected-window)))
+        (should-not (seshat-reader-translate--vfcm-refresh (selected-window)))
+        (should-not visual-fill-column-width)))))
+
 (provide 'seshat-reader-translate-test)
 ;;; seshat-reader-translate-test.el ends here
 

@@ -3384,5 +3384,102 @@ kind 由 buffer 名推断；命令必须把 kind 交给 `--toggle-kind'（它按
                     #'seshat-reader-scroll-up-or-prev-page)))
     (seshat-reader--install-keymap-preset 'vim)))
 
+;;; 宽度调整后的正文宽度兜底刷新（2026-10-26 现场诊断）
+
+(ert-deftest seshat-reader-sidebar-test--resize-width-refreshes-after-success ()
+  "`--resize-width' 成功调整后显式刷新面板正文宽度，且传的是同一个 WINDOW.
+现场问题：正文跟随原先只靠 `window-state-change-functions'，hook 缺失时（旧代码
+渲染的残留 buffer）`w' 只改窗口、正文毫无反应且不报错；本函数是显式兜底。"
+  (let* ((win (selected-window))
+         (calls nil))
+    (cl-letf (((symbol-function 'window-total-width)
+               (lambda (&rest _) 20))
+              ((symbol-function 'window-resize)
+               (lambda (&rest _) t))
+              ((symbol-function 'seshat-reader-translate--vfcm-refresh)
+               (lambda (&optional window) (push window calls))))
+      (should (seshat-reader-sidebar--resize-width win 60))
+      ;; 恰好一次，且收到被调整的那个窗口
+      (should (= 1 (length calls)))
+      (should (eq win (car calls))))))
+
+(ert-deftest seshat-reader-sidebar-test--resize-width-refreshes-when-delta-zero ()
+  "契约：DELTA 为 0 的「无需调整」路径**也**刷新一次（幂等，统一出口）.
+刷新只做 `setq-local' + margin 重算，走同一出口比在每个分支各判一次更不易漏。"
+  (let* ((win (selected-window))
+         (calls 0)
+         (resized nil))
+    (cl-letf (((symbol-function 'window-total-width)
+               (lambda (&rest _) 60))
+              ((symbol-function 'window-resize)
+               (lambda (&rest _) (setq resized t)))
+              ((symbol-function 'seshat-reader-translate--vfcm-refresh)
+               (lambda (&optional _window) (cl-incf calls))))
+      (should (seshat-reader-sidebar--resize-width win 60))
+      ;; 没有真的 resize，但刷新发生了一次
+      (should-not resized)
+      (should (= 1 calls)))))
+
+(ert-deftest seshat-reader-sidebar-test--resize-width-tolerates-missing-refresh ()
+  "`--vfcm-refresh' 未定义（译文模块未加载）时 `--resize-width' 与 `toggle-width' 均不报错.
+零依赖边界：本模块不 require 译文模块，故刷新按 `fboundp' 软依赖处理。"
+  (let ((orig-fboundp (symbol-function 'fboundp))
+        (width 20))
+    (cl-letf (((symbol-function 'fboundp)
+               (lambda (sym)
+                 (if (eq sym 'seshat-reader-translate--vfcm-refresh)
+                     nil
+                   (funcall orig-fboundp sym))))
+              ((symbol-function 'window-total-width)
+               (lambda (&rest _) width))
+              ((symbol-function 'window-resize)
+               (lambda (_window delta &rest _) (cl-incf width delta)))
+              ((symbol-function 'frame-width)
+               (lambda (&rest _) 80))
+              ((symbol-function 'window-parameter)
+               (lambda (&rest _) 'translate))
+              ((symbol-function 'seshat-reader-sidebar-window-p)
+               (lambda (&rest _) t))
+              ((symbol-function 'message) #'ignore))
+      (let ((seshat-reader-sidebar--width-memory (make-hash-table :test #'eq))
+            (seshat-reader-sidebar-position 'right)
+            (seshat-reader-sidebar-expanded-width 0.75))
+        (should (seshat-reader-sidebar--resize-width (selected-window) 60))
+        ;; 扩大 + 恢复：两条路径都不抛错
+        (should (progn (seshat-reader-sidebar-toggle-width) t))
+        (should (progn (seshat-reader-sidebar-toggle-width) t))))))
+
+(ert-deftest seshat-reader-sidebar-test--toggle-width-restore-refreshes ()
+  "`toggle-width' 的「恢复原宽度」分支同样触发正文宽度刷新（经 `--resize-width' 出口）."
+  (let* ((width 20)
+         (calls 0)
+         (refreshed nil)
+         (memory (make-hash-table :test #'eq)))
+    (let ((seshat-reader-sidebar--width-memory memory)
+          (seshat-reader-sidebar-position 'right)
+          (seshat-reader-sidebar-expanded-width 0.75))
+      (cl-letf (((symbol-function 'seshat-reader-sidebar-window-p)
+                 (lambda (&rest _) t))
+                ((symbol-function 'window-parameter)
+                 (lambda (&rest _) 'translate))
+                ((symbol-function 'window-total-width)
+                 (lambda (&rest _) width))
+                ((symbol-function 'frame-width)
+                 (lambda (&rest _) 80))
+                ((symbol-function 'window-resize)
+                 (lambda (_window delta &rest _) (cl-incf width delta)))
+                ((symbol-function 'message) #'ignore)
+                ((symbol-function 'seshat-reader-translate--vfcm-refresh)
+                 (lambda (&optional window) (cl-incf calls) (push window refreshed))))
+        ;; 第一次：扩大到 round(80 × 0.75) = 60
+        (seshat-reader-sidebar-toggle-width)
+        (should (= 60 width))
+        (should (= 1 calls))
+        ;; 第二次：恢复原宽度（20），同样刷新一次
+        (seshat-reader-sidebar-toggle-width)
+        (should (= 20 width))
+        (should (= 2 calls))
+        (should (eq (selected-window) (car refreshed)))))))
+
 (provide 'seshat-reader-sidebar-test)
 ;;; seshat-reader-sidebar-test.el ends here
