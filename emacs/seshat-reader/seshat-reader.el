@@ -1465,14 +1465,32 @@ page rather than dividing by an unknown."
   (let ((spec (seshat-reader--multipage-page-spec page)))
     (or (and spec (image-property spec :height)) 0)))
 
-(defun seshat-reader--multipage-page-gap-pixels ()
+(defun seshat-reader--default-line-pixels (&optional window)
+  "Return the pixel height of a normal text line in WINDOW.
+
+A page is one buffer line whose height is the whole page bitmap, so
+`line-pixel-height' answers with the page height (2400px on a real frame) when
+point is on a page row, and it must therefore never be used as \"one line\"
+here: a scroll of one line would jump a whole page, which is exactly the bug
+this function exists to prevent.
+
+The height of a plain text line is the frame's character height instead: it is
+independent of what is displayed on the current line, which is what the scroll
+commands and the page gap need."
+  (let ((frame (window-frame (if (window-live-p window) window
+                               (selected-window)))))
+    (max 1 (frame-char-height frame))))
+
+(defun seshat-reader--multipage-page-gap-pixels (&optional window)
   "Return the pixel height of the gap lines that follow a page row.
 
-The gap is `seshat-reader-page-gap-lines' empty lines, whose height is taken
-from `line-pixel-height' because an empty line has the frame's default line
-height.  The value is 0 — the default configuration — when the option is 0."
+The gap is `seshat-reader-page-gap-lines' empty lines, so their height is one
+default line height each (`seshat-reader--default-line-pixels') — not
+`line-pixel-height', which would report the height of the page row the gap
+belongs to.  The value is 0 — the default configuration — when the option is 0.
+WINDOW defaults to the selected one and is only used to find the frame."
   (let ((lines (max 0 seshat-reader-page-gap-lines)))
-    (if (> lines 0) (* lines (line-pixel-height)) 0)))
+    (if (> lines 0) (* lines (seshat-reader--default-line-pixels window)) 0)))
 
 (defun seshat-reader--multipage-page-span (page)
   "Return the pixel distance from the top of PAGE's row to the next row.
@@ -2286,25 +2304,29 @@ windows from being refitted."
 ;; and keeps the remainder as the window's pixel vertical scroll.  Nothing
 ;; here turns a page: `n' / `p' stay on `seshat-reader--multipage-goto'.
 
-(defun seshat-reader--scroll-line-pixels ()
-  "Return the pixel height of one buffer line in the selected window.
+(defun seshat-reader--scroll-line-pixels (&optional window)
+  "Return the pixel height of one *text* line, the unit of a one-line scroll.
 
-`line-pixel-height' measures the line at point, which is the page row the
-reader's point sits on.  A plain text line is used as the unit of a one-line
-scroll, exactly like the line scrolling this replaces."
-  (max 1 (line-pixel-height)))
+WINDOW defaults to the selected window.  This is deliberately not
+`line-pixel-height': the line under point is a page row whose height is the
+whole page bitmap, so a one-line scroll would move by a whole page — the bug
+that made `j' turn pages.  `seshat-reader--default-line-pixels' returns the
+frame's character height instead, which is what one line of scrolling means."
+  (seshat-reader--default-line-pixels window))
 
 (defun seshat-reader--scroll-screen-pixels (&optional window)
   "Return the pixel distance of one screen scroll of WINDOW.
 
 WINDOW defaults to the selected window.  The distance is the pixel body height
-of the window minus `next-screen-context-lines' lines, so a line of context
-stays visible; it is clamped to at least one pixel so that a tiny window still
-scrolls instead of doing nothing."
+of the window minus `next-screen-context-lines' default text lines, so a line
+of context stays visible; it is clamped to at least one pixel so that a tiny
+window still scrolls instead of doing nothing.  The context lines are measured
+with `seshat-reader--default-line-pixels', never with `line-pixel-height',
+which would answer with the height of the page row under point."
   (let ((window (if (window-live-p window) window (selected-window))))
     (max 1 (- (window-body-height window t)
               (* (max 0 next-screen-context-lines)
-                 (seshat-reader--scroll-line-pixels))))))
+                 (seshat-reader--scroll-line-pixels window))))))
 
 (defun seshat-reader-scroll-up (&optional amount)
   "Scroll the view upward by AMOUNT lines, one line by default.

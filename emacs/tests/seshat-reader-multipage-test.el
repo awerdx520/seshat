@@ -705,6 +705,8 @@ the resident pages is the only way the visible pages come back consistent."
             (with-current-buffer buffer
               (cl-letf (((symbol-function 'seshat-reader-dyn--doc-invert)
                          (lambda (flag) (push flag inverted)))
+                        ((symbol-function 'seshat-reader-dyn--doc-tint)
+                         (lambda (&rest _) t))
                         ((symbol-function 'seshat-reader--multipage-rerender-page)
                          (lambda (&rest _) (cl-incf rendered))))
                 (seshat-reader-dark-mode 1))
@@ -714,6 +716,8 @@ the resident pages is the only way the visible pages come back consistent."
               (setq rendered 0)
               (cl-letf (((symbol-function 'seshat-reader-dyn--doc-invert)
                          (lambda (flag) (push flag inverted)))
+                        ((symbol-function 'seshat-reader-dyn--doc-tint)
+                         (lambda (&rest _) t))
                         ((symbol-function 'seshat-reader--multipage-rerender-page)
                          (lambda (&rest _) (cl-incf rendered))))
                 (seshat-reader-dark-mode -1))
@@ -834,9 +838,9 @@ comes back at a different rotation."
 
 ;;;; T4-fix（像素级连续滚动）：一页一行的布局下 `scroll-up' 会整页跳，改为像素滚动
 
-;; 每个用例都把「窗口」桩成：页高 500px、行高 10px、窗口体高 800px，并用一层
+;; 每个用例都把「窗口」桩成：页高 500px、默认行高 10px、窗口体高 800px，并用一层
 ;; cl-letf 替掉 `window-start' / `set-window-start' / `window-vscroll' /
-;; `set-window-vscroll' / `line-pixel-height' / `--multipage-sync'，这样滚动结果
+;; `set-window-vscroll' / `frame-char-height' / `--multipage-sync'，这样滚动结果
 ;; （视口在第几页、页内偏移多少像素）可以精确断言，且不需要真实 redisplay。
 
 (defun seshat-reader-multipage-test--row-position (page)
@@ -844,7 +848,12 @@ comes back at a different rotation."
   (seshat-reader-multipage-test--row-start page))
 
 (defconst seshat-reader-multipage-test--scroll-line-height 10
-  "Stubbed pixel height of one buffer line in the scroll tests.")
+  "Stubbed `frame-char-height' in the scroll tests.
+
+Stands for the height of a normal text line.  The scroll code must take its
+one-line unit from here and never from `line-pixel-height', which on a page row
+reports the whole page height (2400px on a real frame) — the bug that turned a
+one-line scroll into a page turn.")
 
 (defvar seshat-reader-multipage-test--scroll-offset 0
   "Simulated pixel vertical scroll of the window in the scroll tests.")
@@ -867,7 +876,11 @@ comes back at a different rotation."
 The simulated window is described by the `--scroll-*' variables above; the
 macro records the calls instead of applying them, so a test can assert both
 \"which page the viewport moved to\" (via `set-window-start') and \"how many
-pixels inside that page\" (via `set-window-vscroll')."
+pixels inside that page\" (via `set-window-vscroll').
+
+Only `frame-char-height' is stubbed as the line height: `line-pixel-height' is
+left to the real implementation, so a scroll that went back to measuring the
+line under point would be caught instead of silently matching the stub."
   (declare (indent 0) (debug t))
   `(let ((seshat-reader-multipage-test--scroll-starts nil)
          (seshat-reader-multipage-test--scroll-vscrolls nil)
@@ -888,8 +901,9 @@ pixels inside that page\" (via `set-window-vscroll')."
                   (push value seshat-reader-multipage-test--scroll-vscrolls)
                   (setq seshat-reader-multipage-test--scroll-offset value)
                   value))
-               ((symbol-function 'line-pixel-height)
-                (lambda () seshat-reader-multipage-test--scroll-line-height))
+               ((symbol-function 'frame-char-height)
+                (lambda (&optional _frame)
+                  seshat-reader-multipage-test--scroll-line-height))
                ((symbol-function 'seshat-reader--multipage-sync)
                 (lambda (&optional _window)
                   (setq seshat-reader-multipage-test--scroll-syncs
@@ -1075,8 +1089,8 @@ past more than one screen at a time."
         (seshat-reader-multipage-test--window-pixels 1000 800
           (seshat-reader-multipage-test--with-window-buffer buffer
             (with-current-buffer buffer
-              (cl-letf (((symbol-function 'line-pixel-height)
-                         (lambda () 10))
+              (cl-letf (((symbol-function 'frame-char-height)
+                         (lambda (&optional _frame) 10))
                         ((symbol-function 'seshat-reader--multipage-scroll)
                          (lambda (pixels &optional _window)
                            (push pixels captured) pixels)))
@@ -1100,8 +1114,8 @@ and then to pixels, and the sign follows the wheel direction."
         (seshat-reader-multipage-test--window-pixels 1000 800
           (seshat-reader-multipage-test--with-window-buffer buffer
             (with-current-buffer buffer
-              (cl-letf (((symbol-function 'line-pixel-height)
-                         (lambda () 10))
+              (cl-letf (((symbol-function 'frame-char-height)
+                         (lambda (&optional _frame) 10))
                         ((symbol-function 'seshat-reader--multipage-scroll)
                          (lambda (pixels &optional _window)
                            (push pixels captured) pixels)))
@@ -1163,11 +1177,102 @@ scroll that forgot it would be applied on a completely different scale (a
                          (lambda (_window value &optional pixels-p)
                            (push (cons value pixels-p) calls)
                            value))
-                        ((symbol-function 'line-pixel-height) (lambda () 10))
+                        ((symbol-function 'frame-char-height) (lambda (&optional _frame) 10))
                         ((symbol-function 'seshat-reader--multipage-sync)
                          (lambda (&optional _window) nil)))
                 (seshat-reader--multipage-scroll 25))
               (should (equal '((25 . t)) calls)))))
+      (kill-buffer buffer))))
+
+;;;; T4-fix2：滚动量必须用 frame 默认行高，不能用 `line-pixel-height'
+
+;; 真机实测：多页布局里点所在行就是页行，`(line-pixel-height)' 返回整页高度
+;; （2414px），于是「滚一行」= 滚一整页、`window-vscroll' 恒为 0、每次按键翻页。
+;; 这三个用例把 `line-pixel-height' 桩成**页高**、把 `frame-char-height' 桩成真正
+;; 的行高，因此一旦有人把取值改回 `line-pixel-height'，断言立刻变红。
+
+(ert-deftest seshat-reader-multipage-test--geometry-scroll-line-pixels-ignores-page-height ()
+  "A one-line scroll moves by the frame's line height, not by the page height.
+
+`line-pixel-height' is stubbed to the page height here, which is exactly what a
+real frame answers on a page row; the scroll must ignore it and use
+`frame-char-height', otherwise one keypress moves a whole page and the pixel
+offset never grows."
+  (let ((buffer (seshat-reader-multipage-test--scroll-fixture '(1 2)))
+        (calls nil)
+        (starts 0))
+    (unwind-protect
+        (seshat-reader-multipage-test--window-pixels 1000 800
+          (seshat-reader-multipage-test--with-window-buffer buffer
+            (with-current-buffer buffer
+              (cl-letf (((symbol-function 'window-start)
+                         (lambda (&optional _window)
+                           (seshat-reader-multipage-test--row-position 1)))
+                        ((symbol-function 'set-window-start)
+                         (lambda (&rest _args) (setq starts (1+ starts)) nil))
+                        ((symbol-function 'window-vscroll)
+                         (lambda (&optional _window _pixels-p) 0))
+                        ((symbol-function 'set-window-vscroll)
+                         (lambda (_window value &optional pixels-p)
+                           (push (cons value pixels-p) calls) value))
+                        ;; 页行上的「真实」行高 = 整页高度
+                        ((symbol-function 'line-pixel-height) (lambda () 500))
+                        ((symbol-function 'frame-char-height)
+                         (lambda (&optional _frame) 20))
+                        ((symbol-function 'seshat-reader--multipage-sync)
+                         (lambda (&optional _window) nil)))
+                (seshat-reader-scroll-down 1)
+                (should (= 20 (seshat-reader--scroll-line-pixels
+                               (selected-window)))))
+              (should (equal '((20 . t)) calls))
+              (should (= 0 starts)))))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-screen-scroll-pixels-uses-default-line-height ()
+  "One screen is the body height minus the context lines, in frame line heights.
+
+With the page height (500) answered by `line-pixel-height' and the real line
+height (20) by `frame-char-height', a screen of 800px and one context line must
+give 780 — not 800 - 500 = 300, which is what the page-height confusion would
+produce."
+  (let ((buffer (seshat-reader-multipage-test--scroll-fixture '(1 2)))
+        (captured nil)
+        (next-screen-context-lines 1))
+    (unwind-protect
+        (seshat-reader-multipage-test--window-pixels 1000 800
+          (seshat-reader-multipage-test--with-window-buffer buffer
+            (with-current-buffer buffer
+              (cl-letf (((symbol-function 'line-pixel-height) (lambda () 500))
+                        ((symbol-function 'frame-char-height)
+                         (lambda (&optional _frame) 20))
+                        ((symbol-function 'seshat-reader--multipage-scroll)
+                         (lambda (pixels &optional _window)
+                           (push pixels captured) pixels)))
+                (seshat-reader-scroll-down-screen)
+                (should (= 780 (seshat-reader--scroll-screen-pixels
+                                (selected-window)))))
+              (should (equal '(780) captured)))))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-scroll-gap-pixels-uses-default-line-height ()
+  "The page gap is measured in frame line heights, not in page heights.
+
+An empty line after a page row has the default line height; measuring the line
+under point would report the page height and make the scroll threshold wrong by
+two orders of magnitude."
+  (let ((buffer (seshat-reader-multipage-test--scroll-fixture '(1 2)))
+        (seshat-reader-page-gap-lines 2))
+    (unwind-protect
+        (seshat-reader-multipage-test--window-pixels 1000 800
+          (seshat-reader-multipage-test--with-window-buffer buffer
+            (with-current-buffer buffer
+              (cl-letf (((symbol-function 'line-pixel-height) (lambda () 500))
+                        ((symbol-function 'frame-char-height)
+                         (lambda (&optional _frame) 20)))
+                ;; 2 行 × 20px（不是 2 × 500）
+                (should (= 40 (seshat-reader--multipage-page-gap-pixels)))
+                (should (= 500 (seshat-reader--multipage-page-pixel-height 1)))
+                (should (= 540 (seshat-reader--multipage-page-span 1)))))))
       (kill-buffer buffer))))
 
 (provide 'seshat-reader-multipage-test)
