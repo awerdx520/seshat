@@ -87,7 +87,7 @@ M8 把 Emacs 端同步器从 WebDAV 传输迁到 REST，分三层落地，本节
 | API 层 | `emacs/seshat-rest.el` | 服务端端点封装（roots / resources / changes / files / move / versions）与统一状态码解释；`seshat-rest--request` 保留为**薄包装**（旧 `(status . body)` 契约 + 抛错语义不变，保护既有 4 处调用方） |
 | 状态层 | `emacs/seshat-state.el` | 单一 `.eld` 原子写：全局 `cursor`、per-uid `base-blob`（取代旧的单文件 head）、`uid ↔ (root . path)` 双索引、`dirty` 集合、墓碑 |
 
-**分层约束**：传输层抛错责任在 API 层，不得上提；二进制下载必须传 `:binary t`（否则 `url.el` 后端会按 UTF-8 解码破坏字节）。**接入进度**：M8-B 已接入增量循环、条件写、move 检测与冲突合并（见下一节）；多根分流与 `seshat:` link follow 仍属计划 C。
+**分层约束**：传输层抛错责任在 API 层，不得上提；二进制下载必须传 `:binary t`（否则 `url.el` 后端会按 UTF-8 解码破坏字节）。**接入进度**：M8-B 已接入增量循环、条件写、move 检测与冲突合并（见下一节）；计划 C（M8-C）已补上书架 / 按需取书与 `seshat:` uid 形态的 follow（见「书架与按需取书（M8-C）」节）。
 
 ## Emacs 增量同步引擎（M8-B）
 
@@ -110,6 +110,35 @@ seshat-sync-now
 
 **根映射**：`seshat-sync-roots`（`(TAG DIR MODE)`）是唯一配置入口，`seshat-sync--ensure-roots` 在首次 pull 时把它写入状态库（`MODE` 为 nil 时向 `GET /api/roots` 取权威值）；改配置后需 `M-x seshat-sync-reset-roots`。
 
+## 书架与按需取书（M8-C）
+
+M8-C 在 M8-A/M8-B 之上新增**一层**：`emacs/seshat-library.el`（项目层，与 `seshat-sync.el` / `seshat-state.el` 同级，**不属于** vendored 的 `seshat-reader` 包）。它补的是同步引擎留下的两个缺口——`ondemand` 根「只登记不下载」与「本地副本无刷新入口」。
+
+| 层 | 文件 | 职责 |
+|---|---|---|
+| 数据层 | `emacs/seshat-library.el`（`seshat-library--roots` / `--remote-entries` / `--local-state` / `seshat-library-fetch`） | 读远端 `ondemand` 根清单（`:since-mtime` 翻页）、判本地三态、按需取书（六步事务，见 [`docs/sync-protocol.md`](sync-protocol.md)「Emacs 客户端按需取书实现要点（M8-C）」） |
+| UI 层 | 同一文件的 `seshat-library-mode`（`tabulated-list-mode` 派生）+ `seshat-library` / `-open-at-point` / `-refresh-at-point` / `-delete-local-at-point` | 书架 buffer `*Seshat Library*`：四列（书名 / 根 / 大小 / 状态）、`RET` / `u` / `d` / `g` / `q` 五键 |
+
+**依赖方向（单向，无环）**：
+
+| 依赖 | 内容 |
+|---|---|
+| `seshat-library` → `seshat-rest` / `seshat-state` / `seshat-sync` | 项目层依赖基础设施层与引擎层（路径校验、游标推进、位置登记） |
+| `seshat-library` → `seshat-reading` → `seshat-reader/**` | 书架 `RET` 经 `seshat-reading-open` 打开文档（单向：library → reading → reader） |
+| `seshat-reader/**` 不得依赖 `seshat-library` | **禁止反向 require**：reader 是 vendored 包，需取书的两处一律软依赖（`fboundp` 探测 + `declare-function`） |
+
+- `seshat-library` 复用 `seshat-sync` 的**路径安全校验**（`seshat-sync--local-path`）、**游标推进**（`seshat-sync--next-since-mtime`）与**位置登记**（`seshat-sync--event-set-location`），不另写一份——另写必然与引擎漂移。
+- `emacs/seshat-reader/**` **不得 require** `seshat-library`：reader 是 vendored 包，反向依赖会让它在没有项目层时无法加载。需要取书的两处一律**软依赖**：`fboundp` 探测 + `declare-function`（`seshat-reader-reference--fetch-library` 调 `seshat-library-fetch`；`:follow` 的 uid 分支由它托管）。缺函数时 `user-error` 说明缺什么，**不自行 require**（否则成环）。
+- `seshat-reading-open` 也是软依赖：`seshat-library` 用 `(require 'seshat-reading nil t)` 探测，缺失时书架 `RET` 退化为 `find-file`——可选依赖缺失不该让「打开一本书」失败。
+
+**三条不变量**：
+
+1. **`d`（删本地副本）零网络**：只用 buffer-local 缓存的清单重算状态列（`seshat-library--redisplay`），不走 `tabulated-list-revert`（那条路挂着「重拉远端清单」）。远端文件一律保留。
+2. **所有落盘路径都过 `seshat-sync--local-path`**：服务端下发的相对路径不可信（拒绝 `..`、绝对路径、盘符、`~`、符号链接逃逸），取书与删本地副本共用这一处校验，不自行拼路径字符串。
+3. **`ondemand` 根绝不写远端**：`seshat-library` 只发 `GET`；服务端对书库根的写入本就 `403 root_read_only`，客户端不制造撞墙的机会。
+
+**为什么书架读的是状态库而不是配置变量**：`seshat-library--roots` 从 `seshat-state-roots`（状态库里的根映射）筛 `MODE` 为 `ondemand` 的根——与同步引擎同源，避免「书架认一套根、同步认另一套」。代价是**首次使用前必须先跑过一次同步**（`M-x seshat-sync-now` 把 `seshat-sync-roots` 写入状态库），改配置后需 `M-x seshat-sync-reset-roots`。
+
 ## `seshat:` 引用协议（M11.4）
 
 笔记与阅读器之间的双向引用通道，格式为 **`seshat:<target>[#<location>]`**，`<target>` 有两种形态（见下「双形态」）：
@@ -131,9 +160,11 @@ seshat-sync-now
 
 **双形态（M7 起）**：`<target>` 可以是 **uid**（服务端权威身份，如 `seshat:01J8ZK4Q7M2X9VYB3TR6NDW5PC#page:3`）或 **doc-id 文本**（`tag:path` 或纯 path，人可读、可手写）。服务端解析优先级为 **uid → `tag:path` → 纯 path（默认根）**（`registry.Resolve`）：uid 形态跨改名稳定，doc-id 形态在改名后失效，需重新构造。含 `#`/`%` 的非法 target 仍按上述规则拒绝。
 
+**客户端新增的 `uid:` 前缀（M8-C）**：Emacs 端产出的 uid 形态写作 `seshat:uid:<uid>[#<location>]`——多一个 `uid:` 前缀，既让「根 tag 恰好叫 `uid`」的 doc-id 不被误判（判别靠 `uid:` 之后是否匹配 26 位 Crockford Base32），也让链接形态在文本上一眼可辨。**服务端 `registry.Resolve` 已识别两种 uid 形态**（M8-C T8）：裸 uid（`IsUID`）与客户端产出的显式前缀 `uid:<uid>`（`uid:` 之后须为合法 26 位 Crockford Base32）；`uid:` 之后不合法时**回落** `tag:path`，因此根 tag 名为 `uid` 的配置仍可用。因此 `registry.RefreshRefs` 对两种 uid 形态都能建立引用边，`GET /api/refs` 与客户端产出的链接形态一致。
+
 **refs 表由写路径维护**：`.org` 写入成功后，服务端解析全文 `seshat:` 链接并用 `registry.RefreshRefs` **整份替换**该源的全部引用（先删后插、单事务）；文件被删除或从 `.org` 改成其它扩展名时清空（`ClearRefs`）。目标解析不到只跳过该条（链接可以指向尚未同步的文档），故 `refs` 是**尽力而为**的派生数据，解析失败不阻塞写响应。查询走 `GET /api/refs?uid=&direction=in|out`。
 
-**Emacs 侧的双值分工**：`seshat-reader-annotation--uid`（路径 → `GET /api/resolve` → uid，`file-truename` 内存缓存）只用于状态 API；`seshat-reader-annotation--doc-id`（文件 → `tag:path`）仍用于显示与链接文本。二者分别落在列表 buffer 的 `seshat-reader-annotation-list-uid` 与 `seshat-reader-annotation-list-document-id`；`seshat-reader-reference.el` **零改动**——链接身份仍由 doc-id 文本承载，uid 只是 API 身份。
+**Emacs 侧的双值分工**：`seshat-reader-annotation--uid`（路径 → `GET /api/resolve` → uid，`file-truename` 内存缓存）只用于状态 API；`seshat-reader-annotation--doc-id`（文件 → `tag:path`）曾只用于显示与链接文本。二者分别落在列表 buffer 的 `seshat-reader-annotation-list-uid` 与 `seshat-reader-annotation-list-document-id`。**M8-C 起链接身份也走 uid**：`seshat-reader-reference.el` 不再是「零改动」的旁观者，新增单一身份入口 `seshat-reader-reference--identity`（按 `seshat-reader-annotation-roots` 得 `(tag . 相对路径)` → 零网络 `seshat-state-uid-for-path` 查 uid），产出链接与链接描述时优先 uid 形态、查不到回落 doc-id 形态（见「书架与按需取书（M8-C）」节与 [`docs/emacs-reader.md`](emacs-reader.md) §8）。
 
 ## 阅读器面板分层（M11.7–M11.10）
 

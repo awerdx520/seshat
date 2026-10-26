@@ -159,9 +159,35 @@ Emacs 端通过 `seshat-reader-annotation` 采集 PDF 页面选区并同步为�
 
 **改配置后必须运行 `M-x seshat-sync-reset-roots`**：根映射在首次同步时会写入状态库，之后不再读取配置；不重置则新配置不生效。
 
+**`ondemand` 根必须配 `DIR`**：书架（`M-x seshat-library`）只能对配了本地目录的 `ondemand` 根取书——`DIR` 为空（`nil` / 空串）时该根在书架里只给一次 `message` 提示（「根 X 未配置本地目录，无法取书」）、**不列出任何条目**，因为无法由「根 tag + 服务端相对路径」定位落点。`MODE` 填 `nil`、由服务端 `GET /api/roots` 自动补齐时同样适用：**补齐的只是 `MODE`，`DIR` 永远不会被自动补齐**（服务端根到本地目录的对应关系只有用户配置说得清）。
+
 **首次同步**：会为 `mirror` 根建一次全库索引（耗时与库规模成正比），之后每次同步的代价与变更数成正比。
 
 **迁移**：旧的单文件 head `~/.emacs.d/seshat-head` 不再使用，无需迁移。
+
+### 书架与按需取书（M8-C）
+
+> **M8-C 新增 2 个 defcustom（见下）**：书架（`emacs/seshat-library.el`，命令 `M-x seshat-library`）不做根过滤持久化、也没有可调键位表；Phase 4 安全审查后补了**下载边界**两项（超时与字节上限）。除此之外，它的行为由两个既有变量驱动：
+
+| 既有变量 | 对书架的作用 |
+|---|---|
+| `seshat-sync-roots` | 决定有哪些根；其中 `MODE` 为 `ondemand` 的根进书架（`mirror` 根不进）。每个 `ondemand` 根**必须配 `DIR`**，否则该根在书架里只给一次提示、不列条目（无法定位落点） |
+| `seshat-state-roots` | 书架实际读的是**状态库里的根映射**（`seshat-sync-roots` 在首次同步时写入的那份），不是配置变量本身：根配好后需跑过一次 `M-x seshat-sync-now`，改配置后需 `M-x seshat-sync-reset-roots` |
+
+**新增变量（M8-C 安全加固）**：
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `seshat-library-download-timeout` | `30` | 单次取书下载的超时秒数；`nil` 表不限。作用于 `seshat-rest-download-file` 的 `:timeout`（rest 后端的 `url-retrieve-synchronously` 与 curl 后端的 `--max-time` 都已实现） |
+| `seshat-library-max-download-bytes` | `(* 512 1024 1024)`（512 MiB） | 单次取书允许的最大字节数；`nil` 表不限。按响应 `Content-Length` 在**写盘前**预判，超限不写盘、报 `:too-large` |
+
+备注：两个变量的 `:type` 均为 `(choice (const nil) integer)`，**可在 Customize 里选「不限」**（即设为 `nil`）；在 Lisp 里 `setq` 同样有效，例如 `(setq seshat-library-max-download-bytes nil)`。上限判定用 `numberp`，因此配浮点（如 `1.5e8`）也生效。
+
+**根归属是硬门（安全底线）**：只有 `ondemand` 根的书才能在书架里**取书**（`RET` / `u`）与**删本地副本**（`d`）。`mirror` 根上的 uid 即使混进书架清单，`seshat-library-fetch` 与 `seshat-library-delete-local-at-point` 都会 `user-error` 拒绝——`mirror` 根是用户自己正在编辑的笔记，书架不该有覆盖或删除它们的能力。客户端的清单收集环节还会**校验响应 `:root` 与请求 tag 一致**（不一致的行直接丢弃并警告），因此「服务端在清单里塞 `mirror` 根 uid」这条路径不会到达用户按键。
+
+**`u` 刷新已有副本会先确认**：`u` 是强制重下（`force` 非 nil），若本地已有副本会先 `yes-or-no-p` 询问「覆盖本地副本 …？」——拒绝则保留原副本、不做任何改动（`user-error "已取消（保留原副本）"`）。`RET` 与 `seshat:` 链接的 `:follow` 不带 `force`，本地已有副本时直接打开、不触发确认。
+
+同理，`seshat:` 链接的 uid 形态也不需要新配置：能否产出 uid 形态由「两套根配置能否映射到同一路径」决定（见下节），不引入开关。
 
 ### 阅读器翻译 / 解释（go-translate 预设）
 
@@ -283,7 +309,7 @@ Emacs 端通过 `seshat-reader-annotation` 采集 PDF 页面选区并同步为�
 
 ### 双向引用（M11.4）
 
-> 客户端侧配置（由 `seshat-reader-reference` 读取），与服务端无关。链接仅以 **doc-id 文本**承载身份，不依赖尚未实现的服务端 uid。
+> 客户端侧配置（由 `seshat-reader-reference` 读取），与服务端无关。链接有**两种形态**（M8-C 起）：`seshat:uid:<uid>[#<location>]`（身份由服务端 uid 承载，**改名后仍可跟随**）与 `seshat:<tag>:<相对路径>[#<location>]`（人类可读，改名后失效）；新产生的链接能零网络解析出 uid 时用前者，否则回落后者。
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
@@ -293,11 +319,23 @@ Emacs 端通过 `seshat-reader-annotation` 采集 PDF 页面选区并同步为�
 
 说明：
 
-- 链接格式为 **`seshat:<doc-id>#<location>`**（`#<location>` 可省略），例如 `seshat:ebook:d2l-zh-pytorch.pdf#page:112`。`doc-id` 即批注的 `document_id`（`<书库标签>:<相对路径>`，由 `seshat-reader-annotation-roots` 决定），`location` 与批注的 `location` **同源同构**，不新增解析器。
+- 链接格式为 **`seshat:<target>#<location>`**（`#<location>` 可省略）。两种 `<target>` 形态：**uid 形态** `uid:<26 位 Crockford Base32>`（如 `seshat:uid:01J8ZKQ2ABCDEFGHJKMNPQRST#page:112`，改名稳定）与 **doc-id 形态** `<书库标签>:<相对路径>`（如 `seshat:ebook:d2l-zh-pytorch.pdf#page:112`，人类可读）。`location` 与批注的 `location` **同源同构**，不新增解析器；doc-id 形态的 `<书库标签>:<相对路径>` 即批注的 `document_id`（由 `seshat-reader-annotation-roots` 决定）。
+- **uid 形态的判别**：`uid:` 之后到第一个 `#` 之前必须是 26 位 Crockford Base32（`[0-9A-HJKMNP-TV-Z]`，排除 I / L / O / U，大小写敏感），否则按 doc-id 解析——因此把根标签取名为 `uid` 仍然合法。
 - **`doc-id` 不得包含 `#` 或 `%`**：含这两个字符时生成链接会 `user-error` 并提示重命名文件（本实现不做百分号转义，理由见 [`docs/architecture.md`](architecture.md) 的「`seshat:` 引用协议」小节）。
-- 键位：阅读器内 `C-c C-r` 插入**选区摘录**；批注列表 buffer 内 `C-c C-r` 插入**该条批注的引用**（服务端项与本地待同步项都支持，取值不触网）。
-- 阅读器内执行 `M-x org-store-link` 可直接把当前文档（或当前页）存为 `seshat:` 链接；在笔记里 `C-c C-o` 即可跳回对应文档与页码。
-- **补全与导出（M12）**：该协议另注册 `:complete`（候选来自 `seshat-reader-annotation-roots` 下的书库文件，当前文档优先）与 `:export`（导出为「文件名 第 N 页」的可读文本，不输出裸 `seshat:` 协议串——下游读者点开假链接比纯文本更有害）。
+- 键位：阅读器内 `C-c C-r` 插入**选区摘录**；批注列表 buffer 内 `C-c C-r` 插入**该条批注的引用**（服务端项与本地待同步项都支持，取值不触网）。两条路径与 `M-x org-store-link`、`M-x seshat-reader-reference-copy-link` 一样，**能零网络解析出 uid 时产 uid 形态，否则回落 doc-id 形态**（不报错、不阻塞插入）。
+- 阅读器内执行 `M-x org-store-link` 可直接把当前文档（或当前页）存为 `seshat:` 链接；在笔记里 `C-c C-o` 即可跳回对应文档与页码（uid 形态且本地无副本时**按需下载**，软依赖 `seshat-library`）。
+- **补全与导出（M12）**：该协议另注册 `:complete`（候选来自 `seshat-reader-annotation-roots` 下的书库文件，当前文档优先，**候选恒为人类可读的 doc-id**）与 `:export`（导出为「文件名 第 N 页」的可读文本，不输出裸 `seshat:` 协议串——下游读者点开假链接比纯文本更有害；uid 形态还原不到文件名时回落 `uid:<前 8 位>…`，**绝不输出空串**）。
+
+**两套根配置是两回事**（M8-C 起这一点会直接影响链接形态）：
+
+| 配置 | 用途 | 形状 |
+|---|---|---|
+| `seshat-state-roots`（由 `seshat-sync-roots` 在首次同步写入） | **同步**：同步引擎的根映射，含 `MODE` | `(TAG DIR MODE)` |
+| `seshat-reader-annotation-roots` | **批注 / 引用**：`document_id` 与 `seshat:` 链接的 doc-id 来源 | `(TAG . DIR)` |
+
+uid 形态的产出要求**两者 tag 一致**（且都能映射到同一本地路径）：`:store` / 摘录 / 批注引用 / `copy-link` 先按 `seshat-reader-annotation-roots` 得 `(tag . 相对路径)`，再用它查同步状态库的 uid 索引；tag 不一致或状态库未登记该路径时**查不到 uid**，新链接回落 doc-id 形态（不报错、不阻塞插入）。
+
+反过来，**已有的 uid 形态链接**在本地查不到路径时（尚未下载 / 换了机器 / 两套根配置事后不一致），链接描述与 `:export` 会回落为 `uid:<前 8 位>…`（如 `uid:01J8ZKQ2…`；uid 长度不大于 8 时原样输出 `uid:<uid>`）——它是「这一步查不到本地路径」的可辨识标识，**不是 bug**，也绝不是空串。`:follow` 对 uid 形态会先按需下载（软依赖 `seshat-library`），因此描述里的回落标识不妨碍打开。（两套根配置统一已记入 [`../openspec/tech-debt.md`](../openspec/tech-debt.md)。）
 
 ### ETAF 渲染层（M11.9 引入，M11.10 收敛，可选）
 

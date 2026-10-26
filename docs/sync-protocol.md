@@ -376,26 +376,32 @@ loop:
 
 ## 8. 引用图
 
-### 8.1 `seshat:` 链接的两种形态
+### 8.1 `seshat:` 链接的形态
 
 `.org` 文件中的链接写法：
 
 ```
-seshat:01K8Q3M7D2X9V6T1B8N5C0RDEX#chapter-3      ← uid 形态
+seshat:01K8Q3M7D2X9V6T1B8N5C0RDEX#chapter-3      ← 裸 uid（服务端既有形态，向后兼容）
+seshat:uid:01K8Q3M7D2X9V6T1B8N5C0RDEX#chapter-3  ← 显式 uid（客户端 Emacs 产出）
 seshat:notes:journal/2026-10-18.org#chapter-3   ← tag:path 形态
 seshat:journal/2026-10-18.org#chapter-1         ← 纯 path（默认根）
 ```
 
 - `#` 之后是目标内位置（`target_location`），可为空；
-- target 段取到 `#`、空白、`)`、`]` 为止，因此 org 链接与裸文本写法都能识别。
+- target 段取到 `#`、空白、`)`、`]` 为止，因此 org 链接与裸文本写法都能识别；
+- 客户端（Emacs，M8-C 起）产出的 uid 形态是**显式前缀** `seshat:uid:<uid>`，服务端
+  `Resolve` **已识别该前缀**（其后须为合法 26 位 Crockford Base32 uid），两端已对齐；
+  裸 uid 形态仍被接受（向后兼容），两种 uid 写法指向同一 uid。
 
 ### 8.2 解析优先级
 
-`uid` → `tag:path` → 纯 path（默认根）：
+`uid` → `uid:` + 合法 uid → `tag:path` → 纯 path（默认根）：
 
 1. 形态是合法 uid → 按 uid 查（墓碑视为不存在）；
-2. 含 `:` → 首个冒号前为根 tag，其后为路径；
-3. 否则按默认根（`roots[0]`）解释。
+2. 以 `uid:` 开头且其后为合法 uid → 按该 uid 查（**显式 uid 形态**；其后不合法则**回落**
+   下一步，即把 `uid` 当作普通根 tag，不报 `invalid_uid`）；
+3. 含 `:` → 首个冒号前为根 tag，其后为路径；
+4. 否则按默认根（`roots[0]`）解释。
 
 同一套规则同时用于 `GET /api/resolve?doc_id=` 与写入时的引用刷新，故两种写法在任何
 时候都指向同一 uid。
@@ -463,6 +469,17 @@ GET /api/refs?uid=<uid>&direction=in    # 谁引用了我
 - **push**：无基线用 `If-None-Match: *`（仅创建），有基线用 `If-Match: "<blob>"`（条件覆盖）；`412` 取远端 + 祖先做三方合并，无冲突带新基线重发一次、有冲突写回标记并保留待推送；`409` 与 `403` 不重试。
 - **本地改动发现**：`size`/`mtime` 快照比对 → 待推送标记，不做 inotify（最坏延迟一个同步周期）。
 - **rename**：双向——服务端 `rename` 事件驱动本地改名；本地快照比对（`size` + `mtime` 都相同）驱动 `POST /api/resources/{uid}/move`。`409`（墓碑占用）不重试，先 `rescan`。
+
+### Emacs 客户端按需取书实现要点（M8-C）
+
+书架（`M-x seshat-library`）与 `seshat:` 链接的「按需下载」共用一套实现（`emacs/seshat-library.el` 的数据层 + 取书事务），落地口径如下：
+
+- **清单拉取没有 offset 分页**：`GET /api/resources` 只有 `limit` + `has_more`，没有 `offset` / `next_cursor`。客户端只能用 `:since-mtime` 翻页（由 `seshat-rest-list-resources` 的 `:since-mtime` 参数下发，语义是「**mtime >= SINCE**」），每页 2000 条（服务端把 `limit` 夹到上限 2000），一路翻到 `has_more` 为 nil。游标推进**复用**首同步建索引用的同一函数 `seshat-sync--next-since-mtime`（不另写一份跳秒逻辑，两份必然漂移）。
+- **同秒超页是已知代价**：同一秒内的记录多于一页时 `since = mtime` 会反复取到同一批，只能前进到 `(1+ mtime)`，**该秒剩余记录被跳过**。客户端只在**真正命中这一成因**时提示一次「清单可能不完整（同秒记录超页）」——判据写死为「本页 `items` 非空**且**末项 `:mtime` 不大于本次请求的 `since`」；`items` 为空但 `has_more` 为真、末项 mtime 非数字这两种退化成因**不提示**（它们说明响应异常，与「同秒超页」不是同一件事）。不重试、不补救。
+- **取书事务（顺序固定，任一步失败即中止）**：① uid → `(root, path)`：优先本地状态库 `seshat-state-path-for-uid`（零网络），未登记时才 `GET /api/resources/{uid}` 取 `:root` / `:path`（404 墓碑是确定性答案，**不重试**）；② `seshat-sync--root-dir` 取本地根目录（为空 → 提示去配 `seshat-sync-roots`）；③ `seshat-sync--local-path` 做**越界校验**并拼出绝对路径（服务端下发的 path 不可信：拒绝 `..`、绝对路径、盘符、`~`、符号链接逃逸）；④ `GET /api/files/{path}?root=` **整份下载**（未用 `Range`，无断点续传）；⑤ 登记 `(root, path)` 并写 base-blob（`ondemand` 根的 blob **恒为空串**，size / mtime 取落盘后本地 `file-attributes`）；⑥ 状态库落盘一次。
+- **原子落位**：Emacs 客户端由 `seshat-rest--write-binary-file` 用 `make-temp-file`（随机临时名）+ `rename-file` 完成——中断不留半文件，并发取书也不会互相覆盖。这与 Android 端的 `<name>.part` + `renameTo` **语义相同、命名不同**（`.part` 是 Android 端实现，Emacs 端没有这个机制；书架层只传最终 TARGET，不自己写临时文件）。
+- **显式刷新，不做自动比对**：`ondemand` 根的内容变化**没有可检测信号**——`blob` 恒为空串、`changes` 事件不带 `size` / `mtime`，因此客户端**不做**基线比对，也不因「可能过期」而每次打开都重下整本。刷新只有显式入口：书架的 `u` 键（以 `force` 非 nil 取书，本地已有副本也重下）。
+- **只读**：客户端对 `ondemand` 根**不发任何写请求**（PUT / DELETE / move 都没有）。删本地副本（书架 `d` 键）只在本地 `delete-file`，且路径必须经 `seshat-sync--local-path` 校验——远端文件一律保留，状态库也不改（该条目自然退回「未下载」）。这一动作同样**零网络**：它走的是内部重画路径，不触发 `GET /api/resources`。
 
 ## 10. 已知限制
 

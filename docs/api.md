@@ -543,7 +543,7 @@ GET /api/resources/{uid}
 
 ```
 GET /api/resolve?root={tag}&path={relpath}
-GET /api/resolve?doc_id={uid | tag:path | path}
+GET /api/resolve?doc_id={uid | uid:<uid> | tag:path | path}
 ```
 
 两种输入形态**互斥**（都写或都不写 → `400 invalid_argument`）：
@@ -553,11 +553,18 @@ GET /api/resolve?doc_id={uid | tag:path | path}
 | 根 + 路径 | `root` + `path`（两者必须同时提供） | 按 `(root tag, 根内路径)` 精确查登记表 |
 | 引用 key | `doc_id` | `tag:path` 时按 `tag` 定根；纯 path 时用**默认根**（首个根） |
 
-`doc_id` 的解析优先级（与 `seshat:` 链接一致）：
+`doc_id` 的解析优先级（与服务端 `registry.Service.Resolve`、`seshat:` 链接三处一致）：
 
-1. 形态是合法 uid → 按 uid 直查（墓碑视为不存在）；
-2. 含 `:` → 首个冒号前为根 tag、其后为路径；
-3. 否则按默认根（`roots[0]`）解释为纯路径。
+1. 空 key → 报错（HTTP 侧即 `400 invalid_argument`）；
+2. 形态是合法 uid（26 位 Crockford Base32 `[0-9A-HJKMNP-TV-Z]`，排除 `I`/`L`/`O`/`U`）→ 按 uid 直查（墓碑视为不存在）；
+3. **`uid:` 前缀，且其后为合法 uid** → 按该 uid 直查（**显式 uid 形态**，客户端 Emacs 产出的写法；见 §10 引用）；
+4. 含 `:` → 首个冒号前为根 tag、其后为路径（`tag:path`）；
+5. 否则按默认根（`roots[0]`）解释为纯路径。
+
+- **回落规则**：`uid:` 之后不是合法 uid 时**按 `tag:path` 解析**（即把 `uid` 当作普通根 tag），
+  **不报 `invalid_uid`**——因此根 tag 名恰好为 `uid` 的配置仍然可用。
+- 请求参数里的 `#<location>` 片段不参与判定（`doc_id` 不含锚点；锚点只出现在 `seshat:` 链接里，
+  解析前已被剥离，见 §10）。
 
 - 成功响应 `200`（`root`/`path` 取自登记表，即规范化后的权威值）：
 
@@ -929,16 +936,32 @@ GET /api/refs?uid={uid}&direction=in|out
   结果恰为 2000 条时不要假定「这就是全部」，需要完整集合时按 `target_uid`/`source_uid`
   逐条反查，或依赖变更流增量维护本地引用图。
 
-引用来源：`.org` 文件中形如 `seshat:<target>#<loc>` 的链接。`<target>` 有两种形态：
+引用来源：`.org` 文件中形如 `seshat:<target>#<loc>` 的链接。`<target>` 有四种写法（两种 uid
+形态 + 两种人类可读路径形态）：
 
 | 形态 | 示例 | 解析 |
 |---|---|---|
-| uid | `seshat:01K8Q3M7D2X9V6T1B8N5C0RDEX#chapter-3` | 直接按 uid 查 |
+| 裸 uid | `seshat:01K8Q3M7D2X9V6T1B8N5C0RDEX#chapter-3` | 直接按 uid 查 |
+| **显式 uid** | `seshat:uid:01K8Q3M7D2X9V6T1B8N5C0RDEX#chapter-3` | 剥掉 `uid:` 后按 uid 查（客户端 Emacs 产出） |
 | 文档 key | `seshat:notes:journal/2026-10-18.org#chapter-3` | `tag:path` |
 | 文档 key | `seshat:journal/2026-10-18.org#chapter-3` | 纯 path（默认根） |
 
-解析优先级与 §6 相同：uid → `tag:path` → 纯 path。**目标解析不到（未登记/已墓碑/非法）
-的链接被静默跳过**，不使引用刷新失败、也不产生悬空边。
+解析优先级与 §6、服务端 `registry.Service.Resolve` 完全一致：
+
+1. 空 key → 报错（引用刷新里等价于「解析不到」，该条被跳过）；
+2. 裸 uid（26 位 Crockford Base32 `[0-9A-HJKMNP-TV-Z]`，排除 `I`/`L`/`O`/`U`）→ 按 uid 查；
+3. **`uid:` 前缀 + 其后为合法 uid** → 按该 uid 查（**新增**，客户端 Emacs 产出的显式形态）；
+4. 含 `:` → 首个冒号前为根 tag、其后为路径（`tag:path`）；
+5. 否则按默认根（`roots[0]`）解释为纯路径。
+
+- **回落规则**：`uid:` 之后不是合法 uid 时**按 `tag:path` 解析**（即把 `uid` 当作普通根 tag），
+  不报 `invalid_uid`——因此根 tag 名恰好为 `uid` 的配置仍然可用。
+- `#<location>` 片段在解析前**已被剥离**（`target` 段取到 `#`、空白、`)`、`]` 为止），不参与
+  target 判定；它只作为该条边的 `target_location`。
+- **两种 uid 形态（裸 uid 与 `uid:<uid>`）都会被 `RefreshRefs` 收录为引用边**，因此
+  `GET /api/refs` 不会因客户端改用 `uid:` 前缀而缺边——同写法指向同一 uid 时落库前合并
+  （去重键 `uid + location`）。
+- 目标解析不到（未登记 / 已墓碑 / 非法）的链接被静默跳过，不使引用刷新失败、也不产生悬空边。
 
 - 错误：`400 invalid_uid`、`400 invalid_argument`（`direction` 非 `in`/`out`）、
   `404 unknown_uid`（主体未登记或已墓碑）、`503 unavailable`、`401`、`500`。

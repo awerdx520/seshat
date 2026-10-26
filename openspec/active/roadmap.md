@@ -2,15 +2,16 @@
 
 ## 当前状态
 
-- 阶段：Phase 4（Review & Document）· M12 及其后续（尺寸自适应重贴合、平滑适配 + `W`/`H` 持久模式）均已归档，`openspec/active/` 仅剩本路线图；下一个里程碑待定
+- 阶段：M8 计划 C（多根分流收尾 / `seshat:` uid 稳定跟随 / 透明性验证）已完成并归档（Phase 4 收尾，2026-10-26）；M12 及其后续（尺寸自适应重贴合、平滑适配 + `W`/`H` 持久模式）均已归档；`openspec/active/` 除本路线图外另有并发会话创建的计划（不归本路线图跟踪）
 - 已确认：整体方案 ✅（用户 2026-10-12 确认）、路线图 ✅（用户 2026-10-12 确认）；M7 方案 ✅ 与计划 ✅（用户 2026-10-18 确认）
 - 加密：维持现有 TLS（反向代理终止）；**不做应用层加密**（用户已取消该需求）
-- 下一步：M8（Emacs 端接入）需另行方案确认与计划确认
+- 下一步：M8 计划 C 已完成并归档（`openspec/completed/2026-10-26-m8c-ondemand-library-and-uid-links.md`，含 Phase 4 安全加固）；其 L3 端到端六项需服务端可用后人工复核；`openspec/active/` 下另有并发会话创建的「阅读器多页连续布局 P0」计划（本路线图不负责跟踪）
 - 2026-10-19 进展：**M10.7 真机验收通过并归档**（七项全过；同步修 2 处缺陷：渲染页 toolbar 标题不随内容更新、笔记列表不读 `#+FILETAGS:`；新增 5 条 tech-debt，单测 562 → 566）；M9.1 / M9.2（设置项·连续滚动）/ M10.5（手写·点击翻页·横屏）/ M10.6-B1（服务端可选）已完成并归档；M10.6-B2（阅读器交互：浮层显隐·SeekBar·目录）、M10.6-B3（书架：封面网格·进度徽标·过滤排序·点击打开）、M10.6-B4（Notes：树列表·搜索·编辑页·GTD 并入 + `NotesSync` 抽取与数据源统一）代码/单测/文档完成（**真机验证通过**，2026-10-18/19，见 openspec/completed/2026-10-18-m10.6-reader-books-notes-alignment.md「B1~B4 全部完成（真机全通过）」）；M9.2 B 批（文件同步：接入 `ResourceIndex`/`SyncEngine`、服务端书架数据源、按需下载、本地导入上传（≤32 MiB）、元数据回填、`move` 跟随）代码/单测/文档完成（2026-10-19，真机验证通过，单测 566 → 641）；M7 服务端已完成（待提交）
 - 2026-10-20 进展：**M10.8（阅读器 UX 重排与手写增强，7 项需求）与 M10.9（目录树形左侧抽屉）均已实现并归档**（代码已提交 `e50a23a` / `8c14494` / `0361faf` / `bb759f1` / `9e7ffd8` / `cd55316` / `c4a76d3`；单测 649 → **721** → **754**，含 1 例 skipped），**✅ 真机验证通过（2026-10-20，设备 24091RPADC / Android 16，EPUB 与 PDF 两个阅读器）**；`c4a76d3` 追加两项：进入阅读默认沉浸、手写参数面板移到屏幕右侧竖排浮条；文档已同步 `docs/android.md` §6 / `CHANGELOG.md` / `openspec/decisions.md` / `openspec/tech-debt.md`（新增 4 条未通过项）；破例引入 `com.tom-roush:pdfbox-android:2.0.27.0`（用户 2026-10-20 授权的唯一例外，见 decisions.md）
-- 下一步：**M12 已完成并归档（openspec/completed/2026-10-22-m12-reader-ux-layout-and-highlight.md，残余视觉项待用户目视）；下一个里程碑待定；M10.3/M10.4 已归档，L3 真机待验；emacs-reader 尺寸自适应计划已归档（`openspec/completed/2026-10-22-emacs-reader-resize-refit.md`，2026-10-23；机制已由后续 `2026-10-23-emacs-reader-smooth-fit.md` 演进）**（M10.6 B2/B3/B4、M9.2 B 批、M10.8、M10.9 均已验收通过并归档）
+- 下一步：**M12 已完成并归档（openspec/completed/2026-10-22-m12-reader-ux-layout-and-highlight.md，残余视觉项待用户目视）；下一个里程碑已确定为 M8 计划 C（已于 2026-10-26 完成并归档，见下方 2026-10-26 进展）；M10.3/M10.4 已归档，L3 真机待验；emacs-reader 尺寸自适应计划已归档（`openspec/completed/2026-10-22-emacs-reader-resize-refit.md`，2026-10-23；机制已由后续 `2026-10-23-emacs-reader-smooth-fit.md` 演进）**（M10.6 B2/B3/B4、M9.2 B 批、M10.8、M10.9 均已验收通过并归档）
 - 2026-10-23 进展：阅读器**尺寸变化即时适配 + `W` / `H` 适配模式持久化**实施完成并归档（`openspec/completed/2026-10-23-emacs-reader-smooth-fit.md`）：L1 `make all` EXIT=0、警告集 33 条零新增（逐条 diff）；L2 全仓 ERT **379** 例全绿 / 0 unexpected / 0 skipped（resize 测试 30 → **67** 例）；**真机验收通过**（开关目录第一帧即居中、`W` / `H` 后仍居中、打开文档无「先小后大」；隔离实例逐帧测量 Δ≤0.5px）；文档已同步（CHANGELOG / decisions ×5 / tech-debt / VENDORED 第 ⑧+⑨ 项 / `docs/emacs-reader.md` §3+§12）。
 - 未决问题（阻塞后续里程碑，不阻塞本文件）：收录目录清单、GTD 深度、Reader 功能清单、EPUB location 约定
+- 2026-10-26 进展：**M8 计划 C 开工于 2026-10-26**（计划文件（现已归档）`openspec/completed/2026-10-26-m8c-ondemand-library-and-uid-links.md`），范围三子项：M8.4 书架 + 按需取书（含显式刷新）、M8.5 `seshat:` 改由 uid 承载身份且**全部插入路径统一**、M8.6 透明性反向断言；审查过程：plan-reviewer 四轮（前三轮不通过/仅剩 major，第四轮终审通过）→ 用户确认计划（门禁 2 通过）；批次 1（T1 数据层 / T3a uid 解析 / T5 透明性测试）已完成：T1 21 例、T3a 19 例（累计 69）、T5 9 例（含 5 组变异自检）全绿，T5 的两处变异自检结论已回写计划 D6；批次 2（T2 书架 UI / T3b 全路径 uid 接入）完成：T2 38 例、T3b 86 例全绿，两处执行期偏差（`d`/`u` 零网络、`--description` 裸 uid 判据）已回写计划 D3 / D4；T6 文档沉淀（emacs-reader / configuration / sync-protocol / architecture / CHANGELOG / decisions / tech-debt 七处同步）已完成；**计划外范围扩大（用户 2026-10-26 确认）**：服务端 `registry.Resolve` 补识别 `seshat:uid:<uid>` 前缀（与 Emacs 客户端对齐，Android 不涉及），新增 T8/T9；原「服务端零改动」口径作废；**计划 C 已完成并归档（2026-10-26）**：L1 `make all` EXIT 0、警告集 **33 条 = 基线零新增**、`make checkdoc` 0 报错、顶层 6 个 `.el` 与 4 个测试文件字节编译 0 warning 0 error、`go build ./...` / `go vet ./...` 干净；L2 全仓 ERT **28 个文件 1110 例**（Phase 4 安全加固新增 20 例后为 **1130** 例）逐文件全绿（0 unexpected / 0 skipped）+ Go **13 包全 PASS / 0 SKIP**；L3 **未验证**（服务端未运行，且六项中 ②③④⑤⑥ 需交互式 Emacs → 需人工）；归档路径 `openspec/completed/2026-10-26-m8c-ondemand-library-and-uid-links.md`（T1–T9 共 10 项全 `[x]`）；**M8 计划 C 已完成并归档**：全量验证 28 个测试文件 / **1130 例** 0 unexpected / 0 skipped、Go 13 包 PASS、`make all` warning 33 = 基线、checkdoc 0；Phase 4 代码审查（code-reviewer）✅ 通过，安全审查（security-reviewer）首轮判「需修复后合入」（1 high：uid 归属根 mode 未校验，可删/覆盖 `mirror` 根笔记）→ 已修复并复核「可合入」（含下载超时与大小上限、分页上限、uid 形态守卫等 6 项加固）；**L3 端到端仍未验证**（服务端未运行），六项需人工复核；归档路径 `openspec/completed/2026-10-26-m8c-ondemand-library-and-uid-links.md`
 
 ## 背景与起点
 
@@ -89,14 +90,16 @@ M0–M6 已完成并归档，见 `openspec/completed/personal-notes-system.md`�
 
 **计划 B（增量引擎）已完成并归档（2026-10-24）**，见 `openspec/completed/2026-10-24-m8b-incremental-engine.md`：同步切到 REST 增量（`changes` 游标、代价与变更数成正比），push 改条件写（`If-Match`/`If-None-Match`），新增本地 `size`/`mtime` 快照比对发现编辑与改名、`diff3` 三方合并（并修复既有参数顺序 bug）、根映射初始化（`seshat-sync-roots`）与 `seshat-sync-reset-roots` 命令。新增 120 例用例，全仓 ERT 517 → **637**（0 unexpected / 0 skipped）。**M8 剩余**：M8.4 多根分流（`/api/roots` 已消费，但 `ondemand` 的按需下载入口与 UI 未做）、M8.5 `seshat:` org-link follow、M8.6 透明性验证（denote/dired/org-agenda 零变化）——归计划 C。
 
+**计划 C（已完成并归档，2026-10-26）**，归档文件 `openspec/completed/2026-10-26-m8c-ondemand-library-and-uid-links.md`（T1–T9 共 10 项全 `[x]`；L1/L2 全绿，L3 未验证——服务端未运行 + 需交互式 Emacs）：M8.4 具体化为「新增 `emacs/seshat-library.el` + `*Seshat Library*` 书架 buffer：远端清单（`:since-mtime` 翻页）、`RET` 取书、`u` 显式刷新本地副本、`d` 删本地副本」；M8.5 具体化为「新增 `seshat:uid:<uid>` 形态，`:store` / 摘录 / 批注引用 / copy-link **全部**优先输出 uid 形态，`:follow` 双形态兼容，本地缺文件时经 `seshat-library-fetch` 按需下载」；M8.6 具体化为「`emacs/tests/seshat-transparency-test.el` 白名单式反向断言（`.org` 绑定、`dired-mode-map`、两个 hook、全局 advice、`auto-mode-alist` 注册）+ L3 人工清单（denote 改名 / dired 改名删除 / org-agenda）」。**Phase 4 补充（2026-10-26）**：代码审查通过；安全审查发现「书架取书/删本地副本未校验 uid 所属根 mode」（high）与三项 medium（`u` 无确认强覆盖、下载无超时与大小上限、清单分页无上限），已全部修复并复核可合入——取书/删除前增加 `--ondemand-root-p` 门、`u` 增加 `yes-or-no-p` 确认、新增 `seshat-library-download-timeout` / `seshat-library-max-download-bytes` 两个 defcustom 并在 `seshat-rest-download-file` 写盘前按 `Content-Length` 预判、`--max-pages 500`；另修 3 项 low（uid 形态守卫、`--uid-local-path` 回落改为拒绝、服务端日志截断）。
+
 | 子项 | 内容 | 风险 |
 |---|---|---|
 | M8.1 | REST 同步器（替代 WebDAV 传输层） | 高：现有 `emacs/notes-sync.el` 返工 |
 | M8.2 | 本地状态库（`uid↔path`、`base_revision`、`cursor`、dirty、墓碑） | 中 |
 | M8.3 | 快照比对 → rename/move 检测上报（用户无感） | 中 |
-| M8.4 | 根映射支持（多根 + 前缀） | 低 |
-| M8.5 | `seshat:` org-link follow（uid → 本地路径） | 低 |
-| M8.6 | 透明性验证：denote/dired/org-agenda 行为零变化 | 高（零侵入约束） |
+| M8.4 | **已完成（2026-10-26）**：根映射支持（多根 + 前缀），`ondemand` 根按需取书入口 `seshat-library` + `*Seshat Library*` 书架 | 低 |
+| M8.5 | **已完成（2026-10-26）**：`seshat:` org-link follow（uid → 本地路径），新增 `seshat:uid:<uid>` 形态并全部插入路径统一 | 低 |
+| M8.6 | **已完成（2026-10-26，L3 人工清单待验）**：透明性验证：denote/dired/org-agenda 行为零变化（9 例白名单式反向断言） | 高（零侵入约束） |
 
 ### M9 Android 客户端重构
 

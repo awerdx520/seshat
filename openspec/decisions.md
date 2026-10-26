@@ -768,3 +768,52 @@ refit 按当前窗口尺寸做一次几何适配 + 重渲染，一次到位。
 **被推翻的假设**：计划曾假设「在 mode body 里关一次即可」——实测把 buffer `pop-to-buffer` 显示之后 `evil-local-mode` 会**重新变回 `t`**，故帮助页改为「`special-mode` 就位时关一次 + 显示之后再关一次」；面板则由 `--display` 显示漏斗（window / childframe 两条承载路径）在显示前关闭、`show` 的 `pop-to-buffer` 回退分支各关一次覆盖，并有测试断言「re-enable 后重关」。
 
 **影响**：`seshat-reader.el` 新增 `--disable-evil` / `--disable-evil-in-existing-buffers`（`(with-eval-after-load 'evil …)` 补扫已显示的 buffer，覆盖「evil 在本包之后才加载」）、3 个 defcustom、三张 preset 绑定表与 `--install-keymap-preset` / `--set-keymap-preset`，删除 `--install-evil-bindings`；`seshat-reader-outline.el` / `-annotation.el` / `-translate.el` / `-search.el` / `-help.el` 各在 mode body 或显示路径调 helper 并补 `j`/`k`（译文面板另有 `w`），`seshat-reader-sidebar.el` 删除 128 行面板补绑机制改为在 `--display` / `show` 调 helper；`seshat-reader-etaf.el` 仅改注释。配置侧 `thomas-emacs`：`lisp/init-evil.el` 删除 103 行 seshat 段、`lisp/init-reader.el` 改用 `:custom` 声明三个 defcustom。
+
+## 2026-10-26 · 按需取书用「原子落位 + 显式刷新」，不做自动比对
+
+**决策**：`seshat-library-fetch` 的契约是「保证本地有副本」，**不判断副本是否最新**——内容是否最新由用户**显式刷新**（书架 `u` 键，即以 `force` 非 nil 重新取书）。落盘一律经 `seshat-rest-download-file`（内部 `seshat-rest--write-binary-file` 用 `make-temp-file` 生成随机临时名 + `rename-file` 原子改名），library **不自写任何临时文件**（`.part` 是 Android 端的命名，Emacs 端不存在该机制；自写固定名会在并发取书时冲突、中断时残留半文件并污染三态判定）。取书前后**不做**全清单比对，也**不读服务端内容做校验**（直接下载覆盖）。
+
+**理由**：`ondemand` 根的 `blob` 恒为空串、`changes` 事件不带 `size` / `mtime`，客户端**没有任何可检测的过期信号**——「本地副本是否过期」这个问题在协议层就没有答案。为「可能过期」引入全清单比对，会让每次打开书架都多一轮请求，而收益仅是省用户按一次 `u`；同理，下载前读内容比对是为一个不可判定的问题付出额外往返。原子落位复用 rest 层而非在 library 自写，是因为「中断不留半文件」与「并发不互相覆盖」两条不变量已经在那一层实现并测试过，第二份实现必然漂移。
+
+**代价与约束**：① 服务端更新书库文件后，用户不按 `u` 就继续读旧副本——该边界写入 `openspec/tech-debt.md`「`ondemand` 副本过期无可检测信号」与 `docs/emacs-reader.md` 的透明性边界节；② 取书不进入 push 路径（`ondemand` 根只读），状态库只写 base-blob（空串）+ 落盘后的 `size` / `mtime`；③ 位置重申用 `seshat-sync--event-set-location`（merge 语义）而不是 `seshat-state-remap`——remap 是**改名语义**（清 `:orphan`、把占据同路径的旧属主标孤儿），取书不该改动其它 uid。
+
+## 2026-10-26 · `seshat:` 链接改由 uid 承载身份，且全部插入路径统一
+
+**决策**：`seshat:` 链接身份由服务端权威 uid 承载（新增形态 `seshat:uid:<uid>[#<location>]`），路径派生的 `doc-id`（`tag:relative-path`）降级为人类可读描述。**所有产生链接的路径**——`org-store-link`（`:store`）、`C-c C-r` 摘录（`--format-block`）、批注引用插入（`insert-annotation`）、`copy-link`——统一经**单一构造入口** `seshat-reader-reference--link-for` 决定形态，不得各自拼 `doc-id`。判别规则：剥掉 `seshat:` 后若以 `uid:` 开头**且** `uid:` 到第一个 `#` 之间的部分匹配 26 位 Crockford Base32 `[0-9A-HJKMNP-TV-Z]\{26\}`（排除 I/L/O/U）才判为 uid 形态，否则回落 `tag:path` 形态。`:complete` **不变**（候选仍是 `doc-id`）。
+
+**理由**：路径派生的身份改名即失效，而 uid 是改名稳定的**唯一**身份（服务端 `refs` 早已支持两种形态）。各入口分别拼 `doc-id` 会让「同一文件在不同入口产出不同形态」，用户没法建立稳定心智；收敛到 `--link-for` 后形态只由「能否零网络解析出 uid」决定，一处改动即四条路径同时生效。`uid:` 前缀用 26 位 Crockford Base32 严格校验，是为了让**根 tag 名为 `uid`** 保持合法（`docs/configuration.md` 只要求 tag 非空、唯一、不含 `:`）——只有「tag 为 `uid` 且相对路径恰好是 26 位大写字母数字」这一极端组合会误判，接受该风险。`:` 前缀判别必须大小写敏感（`string-match-p` 默认 `case-fold-search` 为 `t`，会把小写 uid 误判成 uid 形态，T3a 已抓到该真实 bug）。
+
+**代价与约束**：① **用户可感知的行为变更**——新产生的链接形态由 `doc-id` 变为 `uid`；未配置 `seshat-sync-roots`、或两套根配置 tag 不一致时自动回落 `doc-id`（不报错、不阻塞插入），因此回退路径必须长期保持可用；② uid 形态**不可读**，可读性由 org 链接描述承担（`[[seshat:uid:X][书名 第 3 页]]`）；③ `:export` 与链接描述对 uid 形态必须还原文件名，取不到时回落 `uid:<前 8 位>…`（如 `uid:01J8ZKQ2…`），**绝不输出空串**——回落判据除严格 26 位 uid 外还接受「裸 Crockford Base32 串」（见 T3b 执行期修正），因为回落标识本身要能处理非 26 位输入，而合法 `doc-id` 必含 `:`、两者不可能相撞；该放宽**只作用于描述/导出**，不作用于 `--parse-link` 的形态判别；④ 既有 `tag:path` / `local:` 形态的解析逐字不变（回归测试守护），`:follow` 双形态兼容。
+
+## 2026-10-26 · 两套根配置暂不统一（`seshat-state-roots` 与 `seshat-reader-annotation-roots` 并存）
+
+**决策**：`seshat-state-roots`（同步用，`(TAG DIR MODE)`）与 `seshat-reader-annotation-roots`（批注 / 引用用，`(TAG . DIR)`）**本计划不统一**，继续并存。uid 解析（`seshat-reader-reference--identity`）按后者得 `(tag . rel)` 后软依赖 `seshat-state-uid-for-path` 查 uid。
+
+**理由**：统一会牵动批注 / 翻译 / 离线队列整条链路（三处都按 `seshat-reader-annotation-roots` 推导 `doc-id`），风险与收益不成比例；而本计划的目标（书名册化、链接改名稳定）在两套配置并存的现状下已能达成。
+
+**代价与约束**：① 同一目录可能被配两次（两套配置各写一遍），配错时的症状是「某个入口查不到 uid」而不是报错；② `seshat:` 的 uid 解析要求两套 tag 一致——不一致时回落到 `doc-id` 形态（链接仍可用，只是失去改名稳定性），描述回落 `uid:<前 8 位>…`；③ 统一动作列入 `openspec/tech-debt.md`「两套根配置待统一」，将来的方向是把后者改为从前者派生（或提供同步命令），而不是再引入第三份配置。
+
+## 2026-10-26 · 透明性验证用「白名单式反向断言」，不用「加载前后差分」
+
+**决策**：`emacs/tests/seshat-transparency-test.el` 采用**加载后白名单式反向断言**——加载 `seshat-sync` / `seshat-reading` / `seshat-library` 之后，断言「不该出现的东西不出现」（`.org` 的实际 major mode、`dired-mode-map` 里的 seshat 命令、两个全局 hook、被 advice 的函数名集合、`auto-mode-alist` 注册），**不依赖任何「加载前」基线**；并为每条探测器附**变异自检 / 反向自我验证**（注入假侵入必须让断言失败），证明断言真的能抓到侵入。
+
+**理由**：共享 ERT 单进程里模块在测试文件加载时早已 `require` 完成，`require` 幂等 → 加载前后差分恒为空 → 断言恒真（**假绿**）；`seshat-reading--take-over-auto-mode-alist` 又是就地改写，第二次执行零效果，差分法在这个代码结构下从根上不成立。「不该有什么」这类否定断言不需要基线，天然适配共享进程。变异自检是必需的：`dired-mode-map` 若只扫 `map-keymap` 顶层，前缀绑定与 `remap` 都落在子 keymap 里，注入假侵入也不会被检出（T5 实测）。
+
+**代价与约束**：① advice 白名单初始为 `{save-place-to-alist, pcase--mutually-exclusive-p}`——前者是 vendored reader 包的既有侵入（`seshat-reader-saveplace.el` 的 `:around`，集成 saveplace 所需，非本计划引入），后者是 stock Emacs `cl-macs.el` 在 `cl-lib` 加载时自带的 advice（不纳入会因**无关原因**永久失败）；**新增任何 advice 都必须先更新该白名单**，断言失败时先问「为什么要 advice 第三方函数」而不是直接加白名单——白名单变更即侵入评审点。② `advice--p` 接受的是**函数对象**、不是符号（对符号直接调用恒返回 nil，会让集合恒空、断言恒真），实现须作用在 `(symbol-function SYM)` 上——这也让匿名 lambda advice 同样被覆盖。③ 两处已知边界：hook 内部的 lambda 若调用 seshat 函数查不到；keymap 断言只覆盖 `dired-mode-map`，未覆盖 `global-map` / `tabulated-list-mode-map`（均记 `openspec/tech-debt.md`）。
+
+## 2026-10-26 · 服务端识别 `seshat:uid:<uid>`，与客户端 uid 形态对齐
+
+**决策**：`registry.Service.Resolve` 增加 `uid:` 前缀识别（其后须为合法 26 位 Crockford Base32 `[0-9A-HJKMNP-TV-Z]`），并在不合法时回落 `tag:path`。裸 uid 形态继续支持。解析优先级固定为四段：① 空 key 报错 → ② 裸 uid（`IsUID`）→ ③ `uid:` 前缀 + 其后为合法 26 位 uid → ④ 其余按 `tag:path` / 默认根纯路径。
+
+**理由**：客户端需要「显式前缀」以便与人类可读的 `tag:path` 共存（26 位 uid 与任意 tag 无法靠长度可靠区分，且根 tag 可以是任意不含 `:` 的字符串）。服务端若只认裸 uid，客户端产出的链接在 `refs` 图里会静默丢失，双向引用功能的服务端侧数据不完整——`RefreshRefs` 提取不到该形态，`GET /api/refs` 直接缺边，且失败没有任何报错信号（「解析不到即跳过」是既有契约），排查成本极高。两端对齐后，`seshat:uid:<uid>` 与 `seshat:<uid>` 指向同一 uid 的同一条边（去重键 `uid + location`）。
+
+**代价与约束**：① 协议多一个前缀形态，服务端需识别两种 uid 形态（裸 uid + `uid:<uid>`），判别须大小写敏感（`[0-9A-HJKMNP-TV-Z]` 排除 `I`/`L`/`O`/`U`）；② `uid:` 之后不合法时**回落** `tag:path` 而不是报 `invalid_uid`——这是刻意选择：报错会让「根 tag 名为 `uid`」的既有配置直接失效，回落的代价仅是「`uid` + 26 位大写字母数字」这一极端组合被当成 uid；③ Android 端目前没有任何 `seshat:` 链接处理能力，不受影响；将来 Android 新增链接能力时按同一规则实现（产 `uid:` 前缀形态、解析两种 uid 形态）；④ 原计划的「服务端零改动」口径作废，服务端改动由计划的 T8 承载（`internal/registry/service.go` + 测试），协议与文档同步由 T9 承载。
+
+## 2026-10-26 · 书库操作必须有「根归属」校验，下载必须有超时与大小上限
+
+**决策**：`ondemand` 根的取书与删本地副本前，校验 uid 所属根在本地配置中的 mode 为 `ondemand`（`seshat-library--ondemand-root-p`）；非 ondemand 根一律 `user-error`。下载统一经 `seshat-rest-download-file` 的 `:timeout` / `:max-bytes`，按 `Content-Length` 写盘前预判。清单分页设 500 页上限。
+
+**理由**：`seshat-sync--local-path` 只保证「不越出根目录」，不保证「这个 uid 该由这个根处理」——路径安全 ≠ 归属安全。书架的 `d`（删本地副本）与 `u`（刷新）在语义上都很"安全"，若清单来源不可信（被攻陷的服务端、或本地状态库因根重配而过期），它们就能删掉 / 覆盖 `mirror` 根下用户未提交的笔记。同理，`:follow` 一条链接会触发同步网络与磁盘写，若无超时与大小上限，一个不可信 org 文件就能让 Emacs 主线程无限阻塞或 OOM。
+
+**代价与约束**：书架只服务 `ondemand` 根（`mirror` 根的笔记仍需用同步/编辑器处理，这是正确的分工）；`u` 在本地已有副本时会打断用户一次；`Content-Length` 不可解析时上限不生效（兜底仍靠服务端与自己人）——该残余风险记入 `openspec/tech-debt.md`。
+

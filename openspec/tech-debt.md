@@ -1490,3 +1490,65 @@
 - 现状：`seshat-reader-help--navigation-keys` / `--feature-keys` / `--panel-keys` / `--search-panel-keys` 是「命令符号 → 说明」的静态表，帮助页渲染时用 `substitute-command-keys` 从**运行时** keymap 解析键位，取不到绑定就显示「（未加载）」。若某命令改名或删除而未同步改表，帮助页会**静默**把该行显示成「（未加载）」，既不报错也不失败测试——本轮改键位时就依赖人工核对。
 - 影响：文档与代码漂移只表现为帮助页多出一行「（未加载）」，容易被忽略；比编造键位好，但仍不是不变量。
 - 建议：加一条 ERT 遍历四张表的 `car` 并断言 `(fboundp cmd)`（模块未加载时用 `require` 或 `declare-function` 桩），把「表里的命令必须存在」编码成可机械检查的不变量；`make -C emacs/seshat-reader all` 的 checkdoc 不覆盖这类语义，只能靠测试。
+
+## 两套根配置待统一（M8-C，2026-10-26）
+
+- 现象：Emacs 端存在两套互相独立、形态不同的根配置——`seshat-state-roots`（同步用，元素 `(TAG DIR MODE)`）与 `seshat-reader-annotation-roots`（批注 / 引用用，元素 `(TAG . DIR)`）。`seshat:` 的 uid 解析链路是「按后者得 `(tag . rel)` → 软依赖 `seshat-state-uid-for-path` 查 uid」，因此**两套 tag 必须一致**才能解析出 uid。本计划（M8-C）按取舍 A4 明确**不统一**。
+- 影响：① 同一目录可能被配两次（用户要在两处各写一遍，且两处形态不同、无法复制粘贴）；② 两套 tag 不一致时不报错、只表现为「链接回落成 `doc-id` 形态」（失去改名稳定性），定位成本高；③ 新增入口每接一次就要重复一遍「这套配置给谁用」的判断。
+- 建议：将来把 `seshat-reader-annotation-roots` 改为**从** `seshat-state-roots` 派生（保留只读覆盖语义），或提供一条把后者同步成前者的命令；改动需同步批注 / 翻译 / 离线队列三处推导点，并补「两套配置不一致时给出显式提示」的断言。
+
+## `ondemand` 副本过期无可检测信号（M8-C，2026-10-26）
+
+- 现象：`ondemand` 根的资源 `blob` **恒为空串**，`changes` 事件也不带 `size` / `mtime`（`docs/api.md` / `docs/sync-protocol.md` 均已写明）。因此服务端替换书库文件后，客户端的 `need-download` 判定恒为 nil，**本地副本永不自动刷新**；本计划只能提供显式刷新（书架 `u` 键 / `seshat-library-fetch` 传 `force`）。
+- 影响：用户不按 `u` 就继续读旧副本，且没有任何提示能告诉他「你手上的副本已经过期」。属已知取舍，不属缺陷——协议层没有可比较的信号。
+- 建议：服务端先为 `ondemand` 根补 `blob`（或让 `changes` 事件带 `size` / `mtime`），客户端再做自动比对（比对放书架打开路径还是后台定时器需另行决策：前者多一轮请求，后者引入后台写状态库的并发面）。在此之前**不要**用「每次打开书架都拉全清单比对」来绕过——实测收益仅为省一次按键。
+
+## 书架清单一次性拉全根（M8-C，2026-10-26）
+
+- 现象：`M-x seshat-library` 首次打开会分页拉取全部 `ondemand` 根的清单（每页 2000 条，直到 `has-more` 为 nil），全程同步 HTTP、跑在主线程上。另因 `/api/resources` **没有 offset 分页**，客户端只能用 `:since-mtime` 前进；「同秒记录多于一页」时 `seshat-sync--next-since-mtime` 会强制 `(1+ mtime)`，该秒剩余记录被**跳过**（只在真正同秒超页时提示一次，不重试、不补救）。
+- 影响：大书库下打开书架会阻塞 Emacs（无进度、不可中断）；同秒超页会静默少几行（提示只在消息区闪一次，缓冲区分页后更难察觉）。`g`（重拉清单）同样一次性拉全根，且 `d` / `u` 刻意不走它（见 decisions「按需取书用原子落位 + 显式刷新」）。
+- 建议：服务端为 `/api/resources` 加**分页游标**（稳定排序键而非 `mtime`），客户端改为按页异步拉取（`url-retrieve` 回调 + 增量 `tabulated-list` 插入），并把「清单可能不完整」升级为 buffer 内的可见横幅而不是一次性 `message`。
+- 状态更新（2026-10-26 安全加固）：现已加 `seshat-library--max-pages` **500 页上限**（100 万条），恶意 / 异常服务端不再能造成无限循环——达上限 `display-warning` 并返回已收集部分；清单仍是一次性拉全根，阻塞主线程的体验问题与上条建议不变。
+
+## reader 包对 `save-place-to-alist` 的 advice 是既有侵入（M8-C，2026-10-26）
+
+- 现象：`emacs/seshat-reader/seshat-reader-saveplace.el:66` 用 `(advice-add 'save-place-to-alist :around (lambda …))` 把 reader buffer 的 saveplace 记录改存成 vector——属 **vendored 既有行为**（集成 saveplace 所需），非 M8-C 引入，已纳入透明性白名单 `{save-place-to-alist, pcase--mutually-exclusive-p}`。**另有一处重复**：`emacs/seshat-reader/seshat-reader-autoloads.el:204` 有**功能完全相同**的一条 `advice-add`，与 `.el` 里的 `;;;###autoload` 重复。
+- 影响：① advice 链会出现**两跳**（两个匿名 lambda 串联），调试时 `advice--p` 只说明「被 advice 过」、看不出层数，排查 saveplace 行为异常时容易漏看；② 只要 `.el` 与 `autoloads` 两份中任一份被编辑而另一份未同步，两者行为就会静默分叉（其中一份带 `;;;###autoload`、另一份是生成物，改动时机不同）。白名单是**精确函数名集合**（不是计数或前缀过滤），因此任何**新增** advice 都必须先更新白名单——白名单变更即侵入评审点。
+- 建议：清理 `seshat-reader-autoloads.el` 里的重复条目，源头收敛到 `.el`（并确认 `make all` 的 autoload 生成不会把它再写回来）；或补一条 ERT 断言「同一函数上 seshat 系 advice 条数 ≤ 1」，把「不留双跳」编码成可机械检查的不变量。附注：`pcase--mutually-exclusive-p` 是 stock `cl-macs.el` 自带 advice（装不装 seshat 都在），纳入白名单是基线而非侵入。
+
+## 透明性断言的两处已知边界（M8-C，2026-10-26）
+
+- 现象：`emacs/tests/seshat-transparency-test.el` 的六项反向断言有两处覆盖不到——① **hook 内部**：`after-save-hook` / `after-change-major-mode-hook` 的断言只检查 hook 列表里**顶层函数符号**是否以 `seshat-` 开头，若某 seshat 行为被包进 `(lambda …)` 再挂上 hook，名字里没有 `seshat-` 就查不到；② **keymap 范围**：keymap 断言只覆盖 `dired-mode-map`（递归前缀子 keymap 含 `remap`，不跟随父链与 `global-map`），`global-map` / `tabulated-list-mode-map` 等未被覆盖。
+- 影响：这两条侵入路径在断言下是**静默通过**的假绿面——hook 里塞 lambda、或在 `global-map` 上绑 `C-c` 前缀 seshat 命令，测试都不会失败。要求「不跟随 `keymap-parent` / 不看 `global-map`」是刻意的：按命令反查按键的查询函数会连带搜索父链与 `global-map`，无法限定「只查自身」，会让断言在无关绑定上误报。
+- 建议：① keymap 断言参数化——把「要检查的 keymap 列表」提成变量（追加 `tabulated-list-mode-map`，`global-map` 若纳入需先评估噪声：第三方包在 `global-map` 上绑键很常见，只筛 `seshat-` 前缀命令应可接受）；② hook 项改用「函数**源文件位置**是否在 seshat 目录内」过滤——`(symbol-file fn)` 对具名函数有效、对 lambda 无效，故只能作为补充而非替代，且易误报（用户配置里的包装函数），需先评估误报率再落。两项改动都要同时补充**变异自检**（注入假侵入必须让断言失败），否则改了等于没改。
+
+## `Content-Length` 缺失时下载上限不生效（M8-C 安全加固，2026-10-26）
+
+- 现状：`seshat-library-max-download-bytes` 的超限判定依据是服务端响应的 `Content-Length`，在写盘**之前**预判（这样不会先把磁盘写满才发现超限）。但分块传输（`Transfer-Encoding: chunked`）或网关压缩时，该头可能**不存在**、或数值与实际字节数不符；此时预判被跳过，上限形同不设。`url.el` 一侧没有流式读入字节数的限制能力（`url-retrieve-synchronously` 只能整体取回），curl 后端虽有 `--max-filesize`，但当前 `:binary` 路径主要走 url 后端。
+- 影响：面对**恶意**服务端（故意不给 `Content-Length` 却持续发送大响应）时，单次取书仍可能把 Emacs 拖入长时间等待与大内存占用；超时闸（`seshat-library-download-timeout`）能兜住「无限阻塞」，但兜不住「在 30 秒内塞满几百 MB」。
+- 建议：将来在传输层按**实际读入字节数**硬限（回调计数达上限即中止并丢弃 buffer），或把 `:binary` 路径统一切到 curl 后端并启用 `--max-filesize`。在此之前，上限只对「规矩的服务端」有效，残余风险由服务端可信度承担。另有一条低成本加固：写盘前可用 `(string-bytes (plist-get response :body))' 对**已取回的响应体**再做第二道判定，能防「磁盘写满」（内存占用仍需传输层流式限制，故它只是减轻而不是替代）。
+
+## `force` + 非交互路径会阻塞在确认（M8-C 安全加固，2026-10-26）
+
+- 现状：`seshat-library-fetch` 在 `force` 非 nil 且本地已有副本时 `yes-or-no-p` 询问是否覆盖。当前只有书架 `u` 键会带 `force`（交互场景，确认合理），但函数契约本身不区分「有人按键」与「程序调用」。
+- 影响：将来若加「批量全部刷新」「定时刷新」这类入口，`yes-or-no-p` 会阻塞在批处理 / 定时器上下文（无 `y-or-n-p` 输入来源，轻则卡住流程、重则在 `--batch` 下直接报错），而调用方多半不会预期一个「刷新」动作会弹确认。
+- 建议：届时改为显式传入「已确认」标志（如 `:confirmed t` 形参），或把确认改用可 `noerror` 的 `y-or-n-p` 并把「拒绝」交给调用方决定重试策略；改签名时须同步书架 `u`、`:follow` 按需下载两条既有调用路径与对应 ERT。
+
+
+## uid 正则在 4 处 + 2 处测试内联重复（M8-C 安全复核，2026-10-26）
+
+- 现象：uid 的权威字符集（26 位 Crockford Base32，排除 I / L / O / U）在多处以**字面量正则**重复出现：`internal/registry/uid.go:29`（`^[0-9A-HJKMNP-TV-Z]{26}$`）、`emacs/seshat-library.el:71`（`seshat-library--uid-regexp`）、`emacs/seshat-reader/seshat-reader-reference.el:154`（`--uid-regexp`）、`seshat-reader-reference.el:214`（同字符集的 `+` 变体，用于「整串都是 Crockford 字符」的判定），另有两处测试内联：`emacs/tests/seshat-library-test.el:1055` 与 `internal/registry/uid_test.go:89`。
+- 影响：改字符集（例如服务端换编码）时要同步改 **6 处**，漏一处就出现「服务端认为合法、客户端拒绝」（或更糟：客户端放行一个服务端会拼进 URL 的更宽字符集，安全性由**较宽**的那份决定）。重复本身由依赖方向决定、**不可简单去重**：`emacs/seshat-reader/**` 不得依赖项目层（`seshat-library`），`seshat-library` 也不得依赖 reader 包，Go 侧更不可能共享 Elisp 常量——任何「提取公共定义」的方案都要先打破分层约束。
+- 建议：不做代码去重，改为在文档里固定一句「uid 字符集唯一权威 = `internal/registry/uid.go`（`^[0-9A-HJKMNP-TV-Z]{26}$`）」，并在 `docs/`（architecture 或 api 的 uid 节）显式列出其余 5 处副本；改动字符集时**必须** `grep -rn '0-9A-HJKMNP-TV-Z'` 复核全部副本，同时更新 `seshat-library-test.el` 的 fixture 校验用例。若将来要机械化，可考虑一条跨语言的一致性测试（Go 侧生成期望值、Elisp 测试读同一份 JSON fixture），但那要求仓库内置一份 fixture 文件而不是再抄一遍正则。
+
+## `mirror` 根下载仍无 timeout / max-bytes（M8-C 安全复核，2026-10-26）
+
+- 现状：本轮（M8-C 安全加固）只给 `seshat-library` 路径收口了下载边界——`seshat-library-fetch' 显式传 `seshat-library-download-timeout` / `seshat-library-max-download-bytes` 给 `seshat-rest-download-file'。其余调用方**一个关键字都没传**：`emacs/seshat-sync.el`（两处，`need-download` 与首同步取内容）、`emacs/seshat-conflict.el'（三方合并前拉远端版本）、`emacs/seshat-reading.el'（阅读器按需取原文件）。
+- 影响：同一条「一台挂住的慢服务 / 一个超大响应拖死主线程」的风险面在笔记同步路径**依旧完全敞开**——同步是后台定时器触发的，用户看不到任何进度，卡住的表现是「Emacs 莫名不动」。`seshat-rest-download-file' 的 `timeout` / `max-bytes` 默认都是 nil（不限），因此「不传」等于「无闸」。
+- 建议：把两个限制提升为 `seshat-rest' 层的默认策略——或给 `seshat-rest-download-file' 内部兜底读取全局 defcustom（如 `seshat-rest-download-timeout` / `seshat-rest-max-download-bytes`，供所有调用方继承），或在 `seshat-rest' 层给 `:timeout` / `:max-bytes' 一个非 nil 默认值。注意 `mirror` 根的正常文件可能比书库大（附件类笔记），设默认值前先确认「超限」在同步路径的降级行为（当前是 `:too-large' → 不写盘，需要调用方各自处理，否则会被静默当成「已下载失败」重试）。
+
+## 书架「根」列与实际操作目标可能分叉（M8-C 安全复核，2026-10-26）
+
+- 现状：`seshat-library--collect' 只保证「响应 `:root' == 请求的 tag」，**不保证**它等于「本地状态库为该 uid 登记的 root」。两者在配置迁移（`ondemand` → `mirror`，或服务端换根而客户端状态库未跟上）后会分叉：行仍然显示在 books 根下、状态列显示「已下载」（`--local-state' 用的是状态库里的 root + path），但 `RET' / `u' / `d' 会先按**状态库登记的 root** 过 mode 门，于是被 `user-error' 拒绝（提示「不是书库（ondemand）根」）。
+- 影响：失败方向是安全的（**拒绝**，不写不删），但体验误导——用户看到一列「已下载」的书，按 `RET' 却被告知「该根不是书库」，且提示里的根 tag 与「根」列显示的 tag **不一致**，很难自己定位到「状态库没跟上」。
+- 建议：让 `seshat-library--local-state'（或 `--entry'）顺带比对「状态库登记的 `(car location)'」与「清单 item 的 root」，不一致时把状态列显示为「未登记」（或新增一个「根已变」文案），并在 `seshat-library-fetch' 的 mode 门拒绝消息里带上两边 tag（「清单根 X，登记根 Y」）。改动需补一条 ERT：构造「item root = books、状态库登记 root = notes」的不一致态，断言状态列不显示「已下载」。
