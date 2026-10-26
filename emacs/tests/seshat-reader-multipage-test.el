@@ -661,30 +661,44 @@ own choice, and the horizontal scroll is what makes it usable."
 
 Entry scales every page to the window height (300x800 here) and hides the mode
 line; exit puts the previous fit mode *and* the previous base scale back, so a
-zoom the user had chosen is not silently replaced by the presentation one."
+zoom the user had chosen is not silently replaced by the presentation one.
+
+Both commands now refit synchronously, so the renderer is stubbed: without a
+stub the pages would be re-rendered through the real module, which has no
+document here and would leave the rows without a spec.
+"
   (let* ((fixture (seshat-reader-multipage-test--geometry-buffer '(1 2) 600 1600))
          (buffer (car fixture))
-         (window (selected-window)))
+         (window (selected-window))
+         (counter (list 0)))
     (unwind-protect
         (seshat-reader-multipage-test--window-pixels 1000 800
           (seshat-reader-multipage-test--with-window-buffer buffer
             (with-current-buffer buffer
-              (setq seshat-reader--multipage-fit-mode 'manual
-                    seshat-reader--multipage-base-scale 2.0)
-              (set-window-parameter window 'fit-mode 'manual)
-              (seshat-reader--apply-display-scale window)
-              (seshat-reader-presentation-mode 1)
-              (should (eq 'height seshat-reader--multipage-fit-mode))
-              (should (< (abs (- seshat-reader--multipage-base-scale 0.5)) 1e-9))
-              (should-not mode-line-format)
-              (should (eql 300 (image-property
-                                (seshat-reader--multipage-page-spec 1) :width)))
-              (seshat-reader-presentation-mode -1)
-              (should (eq 'manual seshat-reader--multipage-fit-mode))
-              (should (< (abs (- seshat-reader--multipage-base-scale 2.0)) 1e-9))
-              (should mode-line-format)
-              (should (eql 1200 (image-property
-                                 (seshat-reader--multipage-page-spec 1) :width))))))
+              (cl-letf (((symbol-function 'seshat-reader-dyn--page-image-spec)
+                         (seshat-reader-multipage-test--fake-renderer
+                          counter 600 1600)))
+                (setq seshat-reader--multipage-fit-mode 'manual
+                      seshat-reader--multipage-base-scale 2.0)
+                (set-window-parameter window 'fit-mode 'manual)
+                (seshat-reader--apply-display-scale window)
+                (seshat-reader-presentation-mode 1)
+                (should (eq 'height seshat-reader--multipage-fit-mode))
+                (should (< (abs (- seshat-reader--multipage-base-scale 0.5)) 1e-9))
+                (should-not mode-line-format)
+                (should (eql 300 (image-property
+                                  (seshat-reader--multipage-page-spec 1) :width)))
+                ;; 进入后两页都已按目标分辨率重渲染（同步 refit）
+                (should (< (abs (- (seshat-reader--multipage-render-scale 1) 0.5))
+                           1e-9))
+                (seshat-reader-presentation-mode -1)
+                (should (eq 'manual seshat-reader--multipage-fit-mode))
+                (should (< (abs (- seshat-reader--multipage-base-scale 2.0)) 1e-9))
+                (should mode-line-format)
+                (should (eql 1200 (image-property
+                                   (seshat-reader--multipage-page-spec 1) :width)))
+                (should (< (abs (- (seshat-reader--multipage-render-scale 1) 2.0))
+                           1e-9))))))
       (set-window-parameter window 'fit-mode nil)
       (kill-buffer buffer))))
 
@@ -1349,6 +1363,466 @@ two orders of magnitude."
                 (should (= 40 (seshat-reader--multipage-page-gap-pixels)))
                 (should (= 500 (seshat-reader--multipage-page-pixel-height 1)))
                 (should (= 540 (seshat-reader--multipage-page-span 1)))))))
+      (kill-buffer buffer))))
+
+;;;; T5：缩放口径（base × 系数 / W·H 基准页 / 首屏即清晰 / 跨页 scale 锚定）
+
+;; 这些用例走真实缩放命令（`+` `-` `0` `W` `H` 与滚轮），因此必须桩掉
+;; `seshat-reader-dyn--page-image-spec`：缩放会**同步** refit 驻留页，而真实渲染器
+;; 在 batch 里没有文档，会返回 nil 并清空页行 spec。桩出来的 spec 按 scale 缩放，
+;; 所以 native 尺寸（spec ÷ scale）保持稳定，页宽/页高断言才有意义。
+
+(defmacro seshat-reader-multipage-test--with-fake-renderer (counter width height &rest body)
+  "Run BODY with the per-page renderer stubbed to a counter.
+
+COUNTER is a one-element list receiving the number of render requests; every
+request returns a WIDTH x HEIGHT page scaled like the real renderer."
+  (declare (indent 4) (debug t))
+  `(cl-letf (((symbol-function 'seshat-reader-dyn--page-image-spec)
+              (seshat-reader-multipage-test--fake-renderer ,counter ,width ,height)))
+     ,@body))
+
+(defun seshat-reader-multipage-test--scale-fixture (pages width height)
+  "Geometry buffer of PAGES WIDTH x HEIGHT pages, ready for the scale commands.
+
+On top of `--geometry-buffer' it records the reference native size the way
+`seshat-reader--first-fit' does and sets the document page count, so `W' /
+`H' / `0' have a deterministic page to derive their base scale from."
+  (let* ((fixture (seshat-reader-multipage-test--geometry-buffer pages width height))
+         (buffer (car fixture)))
+    (with-current-buffer buffer
+      (setq-local seshat-reader--multipage-reference-native
+                  (cons (float width) (float height))
+                  seshat-reader-current-doc-pagecount (length pages)))
+    buffer))
+
+(defun seshat-reader-multipage-test--page-width (page)
+  "Return the displayed width of PAGE."
+  (image-property (seshat-reader--multipage-page-spec page) :width))
+
+(defun seshat-reader-multipage-test--page-height (page)
+  "Return the displayed height of PAGE."
+  (image-property (seshat-reader--multipage-page-spec page) :height))
+
+(defun seshat-reader-multipage-test--all-sharp-p (window)
+  "Return non-nil when every resident page was rendered at its target scale.
+
+The comparison uses `seshat-reader--refit-scale-tolerance', i.e. the same
+\"sharp enough\" notion the implementation refits on: the native size of a page
+is the spec size divided by the scale it was rendered at, so rounding moves the
+target by a fraction of a percent on every re-render."
+  (let ((pages (seshat-reader--multipage-page-numbers))
+        (ok t))
+    (while (and pages ok)
+      (let* ((page (car pages))
+             (target (seshat-reader--multipage-target-scale page window))
+             (rendered (seshat-reader--multipage-render-scale page)))
+        (unless (and (numberp target) (numberp rendered)
+                     (< (abs (- target rendered))
+                        seshat-reader--refit-scale-tolerance))
+          (setq ok nil)))
+      (setq pages (cdr pages)))
+    ok))
+
+;;;; 用例
+
+(ert-deftest seshat-reader-multipage-test--geometry-enlarge-multiplies-base-scale ()
+  "`+' multiplies the base scale and re-renders every resident page once.
+
+The base scale goes 1.0 -> 1.25 (`seshat-reader-enlarge-factor'), the fit mode
+becomes `manual' (so no page is cropped for its own width), every spec grows by
+the same factor, every row is centred again and every page is rendered exactly
+once at the new resolution -- the last point is what makes the page sharp the
+moment the command returns."
+  (let* ((buffer (seshat-reader-multipage-test--scale-fixture '(1 2 3) 600 800))
+         (window (selected-window))
+         (counter (list 0))
+         (centers 0)
+         (original-center (symbol-function 'seshat-reader--center-page)))
+    (unwind-protect
+        (seshat-reader-multipage-test--window-pixels 1000 800
+          (seshat-reader-multipage-test--with-window-buffer buffer
+            (with-current-buffer buffer
+              ;; 从 2.0 起而不是 1.0：这样「乘系数」与「拿系数当绝对 scale」
+              ;; 会给出不同结果（2.5 vs 1.25），断言才真正钉住 D5 语义。
+              (setq seshat-reader--multipage-base-scale 2.0)
+              (seshat-reader--apply-display-scale window)
+              (setcar counter 0)
+              (seshat-reader-multipage-test--with-fake-renderer counter 600 800
+                (cl-letf (((symbol-function 'seshat-reader--center-page)
+                           (lambda (&optional window)
+                             (setq centers (1+ centers))
+                             (funcall original-center window))))
+                  (seshat-reader-enlarge-size)))
+              (should (< (abs (- seshat-reader--multipage-base-scale 2.5)) 1e-9))
+              (should (eq 'manual seshat-reader--multipage-fit-mode))
+              (should (= 1 centers))
+              ;; 三页各重渲染一次（不是每页两次，也不是只渲染顶页）
+              (should (= 3 (car counter)))
+              (dolist (page '(1 2 3))
+                (should (eql 1500 (seshat-reader-multipage-test--page-width page)))
+                (should (eql 2000 (seshat-reader-multipage-test--page-height page)))
+                (should (< (abs (- (seshat-reader--multipage-render-scale page) 2.5))
+                           1e-9)))
+              (should (seshat-reader-multipage-test--all-sharp-p window)))))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-shrink-multiplies-base-scale ()
+  "`-' multiplies the base scale by `seshat-reader-shrink-factor'.
+
+Mirroring `+': 1.0 -> 0.75, mode `manual', every spec scaled by 0.75 and every
+page rendered once at the new resolution."
+  (let* ((buffer (seshat-reader-multipage-test--scale-fixture '(1 2) 600 800))
+         (window (selected-window))
+         (counter (list 0)))
+    (unwind-protect
+        (seshat-reader-multipage-test--window-pixels 1000 800
+          (seshat-reader-multipage-test--with-window-buffer buffer
+            (with-current-buffer buffer
+              ;; 同样从 2.0 起：0.75 作为乘数给 1.5，作为绝对 scale 给 0.75
+              (setq seshat-reader--multipage-base-scale 2.0)
+              (seshat-reader--apply-display-scale window)
+              (setcar counter 0)
+              (seshat-reader-multipage-test--with-fake-renderer counter 600 800
+                (seshat-reader-shrink-size))
+              (should (< (abs (- seshat-reader--multipage-base-scale 1.5)) 1e-9))
+              (should (eq 'manual seshat-reader--multipage-fit-mode))
+              (should (= 2 (car counter)))
+              (dolist (page '(1 2))
+                (should (eql 900 (seshat-reader-multipage-test--page-width page)))
+                (should (eql 1200 (seshat-reader-multipage-test--page-height page)))))))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-reset-size-re-fits-like-first-fit ()
+  "`0' drops the manual zoom and re-fits the way the document was opened.
+
+After a `+' the base scale is 1.25; `0' must bring it back to the fit of the
+reference page under the initial fit mode -- `contain' gives 1.0 here, and a
+`width' default gives 1000/600 -- instead of the old \"scale 1.0\" behaviour,
+which ignored the document's geometry."
+  (let* ((buffer (seshat-reader-multipage-test--scale-fixture '(1 2) 600 800))
+         (window (selected-window))
+         (counter (list 0)))
+    (unwind-protect
+        (seshat-reader-multipage-test--window-pixels 1000 800
+          (seshat-reader-multipage-test--with-window-buffer buffer
+            (with-current-buffer buffer
+              (unwind-protect
+                  (progn
+                    (set-window-parameter window 'fit-mode nil)
+                    (seshat-reader-multipage-test--with-fake-renderer counter 600 800
+                      (seshat-reader-enlarge-size)
+                      (let ((seshat-reader-default-fit 'contain))
+                        (seshat-reader-reset-size))
+                      (should (eq 'contain seshat-reader--multipage-fit-mode))
+                      (should (< (abs (- seshat-reader--multipage-base-scale 1.0))
+                                 1e-9))
+                      (should (eql 600 (seshat-reader-multipage-test--page-width 1)))
+                      ;; 宽度默认：base 取首页 width-fit（先清掉窗口已记录的
+                      ;; fit-mode，否则 `--initial-fit-mode' 会沿用上一次的 contain）
+                      (seshat-reader-enlarge-size)
+                      (set-window-parameter window 'fit-mode nil)
+                      (let ((seshat-reader-default-fit 'width))
+                        (seshat-reader-reset-size))
+                      (should (eq 'width seshat-reader--multipage-fit-mode))
+                      (should (< (abs (- seshat-reader--multipage-base-scale
+                                         (/ 1000.0 600)))
+                                 1e-9))
+                      (should (eql 1000 (seshat-reader-multipage-test--page-width 1))))
+                (set-window-parameter window 'fit-mode nil)))))
+      (kill-buffer buffer)))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-fit-to-width-uses-reference-page ()
+  "`W' derives the base scale from the reference page and renders sharply.
+
+Window 1000x800, reference page 600x800: width fit = 1000/600 = 1.667, so the
+page is exactly as wide as the window, the fit mode is `width' and every page
+is already at the target resolution."
+  (let* ((buffer (seshat-reader-multipage-test--scale-fixture '(1 2) 600 800))
+         (window (selected-window))
+         (counter (list 0)))
+    (unwind-protect
+        (seshat-reader-multipage-test--window-pixels 1000 800
+          (seshat-reader-multipage-test--with-window-buffer buffer
+            (with-current-buffer buffer
+              (unwind-protect
+                  (progn
+                    (set-window-parameter window 'fit-mode nil)
+                    (seshat-reader-multipage-test--with-fake-renderer counter 600 800
+                      (seshat-reader-fit-to-width))
+                    (should (eq 'width seshat-reader--multipage-fit-mode))
+                    (should (< (abs (- seshat-reader--multipage-base-scale
+                                       (/ 1000.0 600)))
+                               1e-9))
+                    (dolist (page '(1 2))
+                      (should (= 1000 (seshat-reader-multipage-test--page-width page))))
+                    (should (seshat-reader-multipage-test--all-sharp-p window)))
+                (set-window-parameter window 'fit-mode nil)))))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-fit-to-height-uses-reference-page ()
+  "`H' derives the base scale from the reference page height and renders sharply.
+
+Window 1000x400 for a 600x800 reference page: height fit = 400/800 = 0.5, so the
+page is 300x400 (narrower than the window, no horizontal scroll needed) and the
+fit mode is `height'."
+  (let* ((buffer (seshat-reader-multipage-test--scale-fixture '(1 2) 600 800))
+         (window (selected-window))
+         (counter (list 0)))
+    (unwind-protect
+        (seshat-reader-multipage-test--window-pixels 1000 400
+          (seshat-reader-multipage-test--with-window-buffer buffer
+            (with-current-buffer buffer
+              (unwind-protect
+                  (progn
+                    (set-window-parameter window 'fit-mode nil)
+                    (seshat-reader-multipage-test--with-fake-renderer counter 600 800
+                      (seshat-reader-fit-to-height))
+                    (should (eq 'height seshat-reader--multipage-fit-mode))
+                    (should (< (abs (- seshat-reader--multipage-base-scale 0.5)) 1e-9))
+                    (should (eql 400 (seshat-reader-multipage-test--page-height 1)))
+                    (should (seshat-reader-multipage-test--all-sharp-p window)))
+                (set-window-parameter window 'fit-mode nil)))))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-mwheel-zoom-same-as-keys ()
+  "The wheel zooms through exactly the same path as `+' and `-'.
+
+A single C-wheel notch hands the multiplier to `seshat-reader-enlarge-size', so
+base, fit mode and page size after a wheel notch are identical to what one `+'
+produces; the same holds for the shrink direction."
+  (let* ((buffer (seshat-reader-multipage-test--scale-fixture '(1 2 3) 600 800))
+         (window (selected-window))
+         (counter (list 0)))
+    (unwind-protect
+        (seshat-reader-multipage-test--window-pixels 1000 800
+          (seshat-reader-multipage-test--with-window-buffer buffer
+            (with-current-buffer buffer
+              (seshat-reader-multipage-test--with-fake-renderer counter 600 800
+                ;; 轮子：一格放大
+                (seshat-reader-mwheel-enlarge-size
+                 (list 'C-wheel-up (list window 1 (list 1 1) nil 0)))
+                (let ((wheel-base seshat-reader--multipage-base-scale)
+                      (wheel-width (seshat-reader-multipage-test--page-width 1))
+                      (wheel-mode seshat-reader--multipage-fit-mode))
+                  ;; 回到 1.0 再按键：结果必须逐项相同
+                  (seshat-reader--multipage-set-scale 1.0 'manual 'manual)
+                  (seshat-reader-enlarge-size)
+                  (should (< (abs (- seshat-reader--multipage-base-scale wheel-base))
+                             1e-9))
+                  (should (eq seshat-reader--multipage-fit-mode wheel-mode))
+                  (should (= (seshat-reader-multipage-test--page-width 1) wheel-width)))
+                ;; 缩小方向：一格轮子 == 一次 `-'
+                (seshat-reader-mwheel-shrink-size
+                 (list 'C-wheel-down (list window 1 (list 1 1) nil 0)))
+                (let ((wheel-base seshat-reader--multipage-base-scale))
+                  (seshat-reader--multipage-set-scale 1.25 'manual 'manual)
+                  (seshat-reader-shrink-size)
+                  (should (< (abs (- seshat-reader--multipage-base-scale wheel-base))
+                             1e-9)))))
+      (kill-buffer buffer))))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-first-fit-leaves-every-page-sharp ()
+  "`--first-fit' finishes the rendering, so the first frame is already sharp.
+
+The rows were rendered at base 1.0 by `--render-buffer' while the window is
+1000x400, so the contain fit of the reference page is 0.5: the specs are
+resized in place and every resident page is rendered once more, which leaves no
+page whose render scale differs from its target."
+  (let* ((buffer (seshat-reader-multipage-test--scale-fixture '(1 2 3) 600 800))
+         (window (selected-window))
+         (counter (list 0)))
+    (unwind-protect
+        (seshat-reader-multipage-test--window-pixels 1000 400
+          (seshat-reader-multipage-test--with-window-buffer buffer
+            (with-current-buffer buffer
+              (unwind-protect
+                  (progn
+                    (set-window-parameter window 'fit-mode nil)
+                    (seshat-reader-multipage-test--with-fake-renderer counter 600 800
+                      (seshat-reader--first-fit))
+                    (should (< (abs (- seshat-reader--multipage-base-scale 0.5)) 1e-9))
+                    (should (eq 'contain seshat-reader--multipage-fit-mode))
+                    ;; 基准页尺寸被记住，供 W / H / 0 复用
+                    (should (equal (cons 600.0 800.0)
+                                   seshat-reader--multipage-reference-native))
+                    (should (= 3 (car counter)))
+                    (should (seshat-reader-multipage-test--all-sharp-p window)))
+                (set-window-parameter window 'fit-mode nil)))))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-manual-zoom-refits-visible-pages-once ()
+  "A manual zoom renders every resident page exactly once.
+
+Zooming multiplies the base scale, so the bitmaps of the pages that are on
+screen are now too coarse for their new size: each of them has to be rendered
+again, and exactly once -- a refit that rendered the page it just rendered
+\(or the top page only) would show up in the counter."
+  (let* ((buffer (seshat-reader-multipage-test--scale-fixture '(1 2 3) 600 800))
+         (window (selected-window))
+         (counter (list 0)))
+    (unwind-protect
+        (seshat-reader-multipage-test--window-pixels 1000 800
+          (seshat-reader-multipage-test--with-window-buffer buffer
+            (with-current-buffer buffer
+              (seshat-reader-multipage-test--with-fake-renderer counter 600 800
+                (seshat-reader-enlarge-size 2.0)
+                ;; 两倍：base 2.0，页 1200x1600
+                (should (< (abs (- seshat-reader--multipage-base-scale 2.0)) 1e-9))
+                (should (= 3 (car counter)))
+                (dolist (page '(1 2 3))
+                  (should (eql 1200 (seshat-reader-multipage-test--page-width page)))
+                  (should (< (abs (- (seshat-reader--multipage-render-scale page) 2.0))
+                             1e-9)))
+                (should (seshat-reader-multipage-test--all-sharp-p window))
+                ;; 再放大一次：只多渲染 3 次（每页一次）
+                (setcar counter 0)
+                (seshat-reader-enlarge-size 1.25)
+                (should (= 3 (car counter))))))
+      (kill-buffer buffer)))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-refit-is-idempotent ()
+  "A second refit renders nothing: the render scale already matches the target.
+
+The refit gate is `render-scale ≠ target', which is what keeps the debounced
+resize path from re-rendering the whole resident set on every scroll or
+redisplay."
+  (let* ((buffer (seshat-reader-multipage-test--scale-fixture '(1 2 3) 600 800))
+         (window (selected-window))
+         (counter (list 0)))
+    (unwind-protect
+        (seshat-reader-multipage-test--window-pixels 1000 800
+          (seshat-reader-multipage-test--with-window-buffer buffer
+            (with-current-buffer buffer
+              (seshat-reader-multipage-test--with-fake-renderer counter 600 800
+                (seshat-reader--refit-window window)
+                (should (= 0 (car counter)))
+                (seshat-reader--refit-window window)
+                (should (= 0 (car counter)))
+                ;; 破坏一页的分辨率后只重渲染那一页
+                (setq seshat-reader--page-render-scales
+                      (assq-delete-all 2 seshat-reader--page-render-scales))
+                (seshat-reader--refit-window window)
+                (should (= 1 (car counter))))))
+      (kill-buffer buffer)))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-scroll-does-not-change-base-scale ()
+  "Scrolling across a page boundary keeps the zoom identical on both pages.
+
+The base scale is only written by the zoom commands and `--first-fit'; a page
+that the sync pulls in while scrolling is therefore rendered at exactly the
+same scale as the page the reader was looking at (decision D5's reference page
+anchoring).  This is the anti-regression for \"the page shrinks when I scroll\"."
+  (let* ((fixture (seshat-reader-multipage-test--geometry-buffer '(1) 600 800))
+         (buffer (car fixture))
+         (window (selected-window))
+         (counter (list 0)))
+    (unwind-protect
+        (progn
+          (with-current-buffer buffer
+            (setq-local seshat-reader--multipage-reference-native (cons 600.0 800.0)
+                        seshat-reader-current-doc-pagecount 2))
+          (seshat-reader-multipage-test--window-pixels 1000 800
+            (seshat-reader-multipage-test--with-window-buffer buffer
+              (with-current-buffer buffer
+                (seshat-reader-multipage-test--with-fake-renderer counter 600 800
+                  ;; 先把缩放设成非 contain 的 2.0：如果滚动时谁重算了 base
+                  ;; scale（例如拿顶页重新 fit），这里立刻会掉回 1.0
+                  (setq seshat-reader--multipage-base-scale 2.0
+                        seshat-reader--multipage-fit-mode 'manual)
+                  (seshat-reader--apply-display-scale window)
+                  (setq seshat-reader-multipage-test--scroll-start
+                        (seshat-reader-multipage-test--row-position 1)
+                        seshat-reader-multipage-test--scroll-offset 1500)
+                  ;; 页高 1600（800 × 2.0）：1500 + 300 = 1800 → 跨到第 2 页，余 200
+                  ;; 这里**不**桩 `--multipage-sync'：本用例要证明真实 sync 不会
+                  ;; 重算缩放基准，桩掉它等于把被验证的代码换成空操作。
+                  (cl-letf (((symbol-function 'window-start)
+                             (lambda (&optional _window)
+                               seshat-reader-multipage-test--scroll-start))
+                            ((symbol-function 'set-window-start)
+                             (lambda (_window pos &optional _noforce)
+                               (setq seshat-reader-multipage-test--scroll-start pos)
+                               pos))
+                            ((symbol-function 'window-vscroll)
+                             (lambda (&optional _window _pixels-p)
+                               seshat-reader-multipage-test--scroll-offset))
+                            ((symbol-function 'set-window-vscroll)
+                             (lambda (_window value &optional _pixels-p)
+                               (setq seshat-reader-multipage-test--scroll-offset value)
+                               value)))
+                    (seshat-reader--multipage-scroll 300)
+                    ;; 断言必须在桩作用域内：`window-start' 用的是模拟值
+                    (should (= 2 (seshat-reader--multipage-window-start-page window)))
+                    (should (= (seshat-reader-multipage-test--row-position 2)
+                               seshat-reader-multipage-test--scroll-start))
+                    (should (= 200 seshat-reader-multipage-test--scroll-offset)))
+                  ;; 缩放基准没被滚动改变
+                  (should (< (abs (- seshat-reader--multipage-base-scale 2.0)) 1e-9))
+                  (should (eq 'manual seshat-reader--multipage-fit-mode))
+                  ;; 两页目标 scale 相同，新页也是按该 scale 渲染的
+                  (should (< (abs (- (seshat-reader--multipage-target-scale 1 window)
+                                     (seshat-reader--multipage-target-scale 2 window)))
+                             1e-9))
+                  (should (< (abs (- (seshat-reader--multipage-render-scale 2) 2.0))
+                             1e-9))
+                  (should (eql 1200 (seshat-reader-multipage-test--page-width 2)))
+                  (should (eql 1600 (seshat-reader-multipage-test--page-height 2))))))))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-resize-refits-every-resident-page ()
+  "After a window resize every resident page is sharp again, not only the top one.
+
+The debounced refit walks the whole resident set, so in `width' mode (where a
+narrower window lowers the target of every page) all three pages end up at the
+new render scale.  A refit that only handled the page at `window-start' would
+leave the other pages stretched."
+  (let* ((buffer (seshat-reader-multipage-test--scale-fixture '(1 2 3) 600 800))
+         (window (selected-window))
+         (counter (list 0)))
+    (unwind-protect
+        (seshat-reader-multipage-test--with-window-buffer buffer
+          (with-current-buffer buffer
+            (unwind-protect
+                (progn
+                  (set-window-parameter window 'fit-mode nil)
+                  (seshat-reader-multipage-test--window-pixels 1000 800
+                    (seshat-reader-multipage-test--with-fake-renderer counter 600 800
+                      (seshat-reader-fit-to-width)))
+                  (should (< (abs (- (seshat-reader--multipage-render-scale 1)
+                                     (/ 1000.0 600)))
+                             1e-9))
+                  (setcar counter 0)
+                  ;; 窗口变窄 → 目标 scale 降到 500/600，refit 必须覆盖三页
+                  (seshat-reader-multipage-test--window-pixels 500 800
+                    (seshat-reader-multipage-test--with-fake-renderer counter 600 800
+                      (seshat-reader--refit-window window)))
+                  (should (= 3 (car counter)))
+                  (dolist (page '(1 2 3))
+                    (should (< (abs (- (seshat-reader--multipage-render-scale page)
+                                       (/ 500.0 600)))
+                               1e-9))))
+              (set-window-parameter window 'fit-mode nil))))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-zoom-clamps-at-renderer-bounds ()
+  "Repeated zooming stops at the range the native renderer can draw.
+
+Twenty presses of `+' (1.25 each) would need a scale of 87, and forty presses of
+`-' a scale of 7e-5; both are clamped to `seshat-reader--multipage-clamp-scale'
+\(11.0 and 0.25), so the commands stay usable and the module is never handed a
+resolution it would silently clamp behind our back."
+  (let* ((buffer (seshat-reader-multipage-test--scale-fixture '(1) 600 800))
+         (counter (list 0)))
+    (unwind-protect
+        (seshat-reader-multipage-test--window-pixels 1000 800
+          (seshat-reader-multipage-test--with-window-buffer buffer
+            (with-current-buffer buffer
+              (seshat-reader-multipage-test--with-fake-renderer counter 600 800
+                (dotimes (_ 20) (seshat-reader-enlarge-size))
+                (should (< (abs (- seshat-reader--multipage-base-scale 11.0)) 1e-9))
+                (dotimes (_ 40) (seshat-reader-shrink-size))
+                (should (< (abs (- seshat-reader--multipage-base-scale 0.25)) 1e-9))))))
       (kill-buffer buffer))))
 
 (provide 'seshat-reader-multipage-test)

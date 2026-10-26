@@ -633,34 +633,38 @@ presentation 的 scale，用户的缩放会被静默改掉。
           (set-window-buffer window buffer)
           (seshat-reader-resize-test--with-window-pixels 1000 800
             (with-current-buffer buffer
-              ;; 进入前的状态：手动 2 倍缩放
-              (setq-local seshat-reader--multipage-base-scale 2.0
-                          seshat-reader--multipage-fit-mode 'manual)
-              (set-window-parameter window 'fit-mode 'manual)
-              (seshat-reader--apply-display-scale window)
+              ;; 缩放命令现在同步 refit；本用例只关心 presentation 的状态机，
+              ;; 故把重渲染桩成空操作（否则真实渲染器没有文档，会把页行 spec 清空）。
+              (cl-letf (((symbol-function 'seshat-reader--multipage-rerender-page)
+                         (lambda (&rest _args) nil)))
+                ;; 进入前的状态：手动 2 倍缩放
+                (setq-local seshat-reader--multipage-base-scale 2.0
+                            seshat-reader--multipage-fit-mode 'manual)
+                (set-window-parameter window 'fit-mode 'manual)
+                (seshat-reader--apply-display-scale window)
+                (should (eql 1200 (image-property
+                                   (seshat-reader--multipage-page-spec 1) :width)))
+                (seshat-reader-presentation-mode 1)
+                (should seshat-reader-presentation-mode)
+                (should-not mode-line-format)
+                (should (eq 'height seshat-reader--multipage-fit-mode))
+                (should (eq 'height (seshat-reader--window-fit-mode window)))
+                (should (< (abs (- seshat-reader--multipage-base-scale 0.5)) 1e-9))
+                (let ((spec (seshat-reader--multipage-page-spec 1)))
+                  (should (eql 300 (image-property spec :width)))
+                  (should (eql 800 (image-property spec :height))))
+                ;; 300 ≤ 1000 → 仍然居中
+                (should (seshat-reader--multipage-page-centered-p 1))
+                ;; 退出：fit 模式、base scale、mode-line 全部复原
+                (seshat-reader-presentation-mode -1)
+                (should-not seshat-reader-presentation-mode)
+                (should mode-line-format)
+                (should (eq 'manual seshat-reader--multipage-fit-mode))
+                (should (eq 'manual (seshat-reader--window-fit-mode window)))
+                (should (< (abs (- seshat-reader--multipage-base-scale 2.0)) 1e-9))
               (should (eql 1200 (image-property (seshat-reader--multipage-page-spec 1)
                                                 :width)))
-              (seshat-reader-presentation-mode 1)
-              (should seshat-reader-presentation-mode)
-              (should-not mode-line-format)
-              (should (eq 'height seshat-reader--multipage-fit-mode))
-              (should (eq 'height (seshat-reader--window-fit-mode window)))
-              (should (< (abs (- seshat-reader--multipage-base-scale 0.5)) 1e-9))
-              (let ((spec (seshat-reader--multipage-page-spec 1)))
-                (should (eql 300 (image-property spec :width)))
-                (should (eql 800 (image-property spec :height))))
-              ;; 300 ≤ 1000 → 仍然居中
-              (should (seshat-reader--multipage-page-centered-p 1))
-              ;; 退出：fit 模式、base scale、mode-line 全部复原
-              (seshat-reader-presentation-mode -1)
-              (should-not seshat-reader-presentation-mode)
-              (should mode-line-format)
-              (should (eq 'manual seshat-reader--multipage-fit-mode))
-              (should (eq 'manual (seshat-reader--window-fit-mode window)))
-              (should (< (abs (- seshat-reader--multipage-base-scale 2.0)) 1e-9))
-              (should (eql 1200 (image-property (seshat-reader--multipage-page-spec 1)
-                                                :width)))
-              (should-not seshat-reader--presentation-state))))
+              (should-not seshat-reader--presentation-state)))))
       (set-window-parameter window 'fit-mode nil)
       (set-window-buffer window original)
       (kill-buffer buffer))))
@@ -1059,8 +1063,12 @@ width 模式下还会留下一个不存在的可滚动区间。"
             (with-current-buffer buffer
               (should (= 1200 (seshat-reader--multipage-max-page-width)))
               (should (= 200 (seshat-reader--right-most-window-hscroll window)))
-              ;; 缩到 0.5 倍：所有页都放得下 → 余量 0
-              (seshat-reader--multipage-set-scale 0.5 'manual 'manual)
+              ;; 缩到 0.5 倍：所有页都放得下 → 余量 0。缩放命令会同步 refit，
+              ;; 本用例只关心 hscroll 口径，故把重渲染桩成空操作（真实渲染器
+              ;; 在此没有文档，会把页行 spec 清空）。
+              (cl-letf (((symbol-function 'seshat-reader--multipage-rerender-page)
+                         (lambda (&rest _args) nil)))
+                (seshat-reader--multipage-set-scale 0.5 'manual 'manual))
               (should (= 600 (seshat-reader--multipage-max-page-width)))
               (should (= 0 (seshat-reader--right-most-window-hscroll window))))))
       (kill-buffer buffer))))

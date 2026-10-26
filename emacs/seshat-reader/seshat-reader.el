@@ -434,6 +434,20 @@ been seeded yet: `seshat-reader--multipage-current-fit-mode' then falls back
 to the window's fit mode.  The value is buffer-local because the scales
 belong to the buffer -- every window showing it shows the same sizes.")
 
+(defvar-local seshat-reader--multipage-reference-native nil
+  "Native pixel size (W . H) of the reference page, or nil when unknown.
+
+Set by `seshat-reader--first-fit' from the page the document is opened on,
+i.e. the first page (decision D5: the whole document is scaled from the first
+page and never from the page that happens to be on screen).
+
+Remembering the size instead of re-reading the page is what keeps `W' / `H' /
+`0' deterministic: `seshat-reader--multipage-recycle-page' drops the measured
+size of a page that leaves the resident set, so re-deriving the reference size
+from `seshat-reader--page-native-sizes' would silently fall back to page 1.0
+after the user scrolled away.  It is cleared when the document is reloaded or
+the pages are rotated, because both change the native size.")
+
 (defvar-local seshat-reader--page-native-sizes nil
   "Unscaled pixel sizes of the pages, as an alist PAGE -> (W . H).
 
@@ -494,85 +508,165 @@ so that a caller which lost its value still renders."
         ((<= scale 0) 1.0)
         (t (max 0.25 (min 11.0 (float scale))))))
 
-(defun seshat-reader--multipage-set-scale (scale &optional source mode)
-  "Display every page row at SCALE and return SCALE.
+(defun seshat-reader--multipage-set-scale (base &optional source mode)
+  "Display every page row at BASE scale, synchronously and sharply.
 
-SCALE becomes the buffer local base scale, so every page keeps the same zoom
+BASE becomes the buffer local base scale, so every page keeps the same zoom
 factor and no page is cropped for its own width (decision D5: the manual
 `+' / `-' zoom never crops).  SOURCE, when non-nil, is recorded as the scale
 source of the selected window (`fit' or `manual'); MODE, when non-nil,
 replaces the buffer local fit mode.
 
-The specs are rewritten in place and every row is re-centred, so the frame
-that follows already shows the new geometry; the bitmaps are rendered at the
-new resolution by the debounced refit."
-  (let ((scale (seshat-reader--multipage-clamp-scale scale)))
-    (setq seshat-reader--multipage-base-scale scale)
+The order is the one every zoom command needs, and it is what makes one
+keypress produce a finished frame:
+
+  1. clamp BASE into the range the native renderer can draw
+     (`seshat-reader--multipage-clamp-scale');
+  2. `seshat-reader--apply-display-scale' -- rewrite the `:width'/`:height' of
+     every resident spec in place, so the geometry is final without touching a
+     bitmap;
+  3. `seshat-reader--center-page' -- re-place every row for its new width;
+  4. `seshat-reader--multipage-refit-page' for every resident page -- render
+     the pages whose bitmap resolution no longer matches the target, once each;
+  5. `seshat-reader--multipage-sync' -- pull in the pages the viewport now
+     asks for (they are rendered straight at the target scale).
+
+The refit is synchronous on purpose: zooming and opening a document are user
+actions that may block for a few milliseconds per page (0.7-11 ms measured),
+whereas leaving the bitmap stretched until an idle timer fires shows a blurry
+page for as long as the user keeps typing.  BASE is returned."
+  (let ((base (seshat-reader--multipage-clamp-scale base))
+        (window (selected-window)))
+    (setq seshat-reader--multipage-base-scale base)
     (when mode
       (setq seshat-reader--multipage-fit-mode mode))
-    (setq seshat-reader--recent-scale-fallback scale)
-    (set-window-parameter nil 'scale scale)
+    (setq seshat-reader--recent-scale-fallback base)
+    (set-window-parameter window 'scale base)
     (when source
-      (set-window-parameter nil 'scale-source source))
-    (seshat-reader--apply-display-scale (selected-window))
-    (seshat-reader--center-page (selected-window))
-    (seshat-reader--schedule-refit)
-    scale))
+      (set-window-parameter window 'scale-source source))
+    (seshat-reader--apply-display-scale window)
+    (seshat-reader--center-page window)
+    (dolist (page (seshat-reader--multipage-page-numbers))
+      (seshat-reader--multipage-refit-page page window))
+    (seshat-reader--multipage-sync window)
+    base))
 
-(defun seshat-reader-enlarge-size (&optional scaling-factor)
-  "Enlarge the size of every visible page by `seshat-reader-enlarge-factor'.
+(defun seshat-reader--multipage-base-fit-scale (mode &optional window)
+  "Return the base scale that a document-wide fit MODE implies.
 
-Optionally scale it by the SCALING-FACTOR, which is the new scale itself.
-Scales on the selected window: the pages are rescaled in place by rewriting
-their image specs, so nothing is re-rendered here."
-  (interactive (list (float
-		      (* (seshat-reader-current-doc-scale-value) seshat-reader-enlarge-factor))))
-  (seshat-reader--multipage-set-scale scaling-factor 'manual 'manual))
+MODE is `contain', `width', `height' or `manual' and WINDOW defaults to the
+selected one.  The scale is computed from the *reference* page -- the one the
+document was opened on, whose native size is remembered in
+`seshat-reader--multipage-reference-native' -- and the window size, exactly the
+way `seshat-reader--multipage-fit-scale' does it for a single page:
 
-(defun seshat-reader-shrink-size (&optional scaling-factor)
-  "Shrink the size of every visible page by `seshat-reader-shrink-factor'.
+  `contain'  min (width fit, height fit)
+  `width'    width fit
+  `height'   height fit
+  `manual'   the current base scale (a manual zoom has no fit of its own)
 
-Optionally scale it by the SCALING-FACTOR, which is the new scale itself.
-Scales on the selected window: the pages are rescaled in place by rewriting
-their image specs, so nothing is re-rendered here."
-  (interactive (list (float
-		      (* (seshat-reader-current-doc-scale-value) seshat-reader-shrink-factor))))
-  (seshat-reader--multipage-set-scale scaling-factor 'manual 'manual))
+Anchoring on the remembered size is what keeps `W' / `H' / `0' deterministic:
+the measured size of a page is dropped when it leaves the resident set, so
+re-deriving the reference size from the page on screen would fall back to 1.0
+after the user scrolled away.  When even the reference size is unknown (the
+document was not fitted yet) the top page is used as a last resort, and nil is
+returned when neither is measurable -- the callers then keep their current
+scale instead of jumping to an arbitrary one."
+  (let* ((window (if (window-live-p window) window (selected-window)))
+         (native (or seshat-reader--multipage-reference-native
+                     (seshat-reader--multipage-native-size
+                      (or (seshat-reader--multipage-window-start-page window) 1))))
+         (width (car-safe native))
+         (height (cdr-safe native)))
+    (if (eq mode 'manual)
+        (or seshat-reader--multipage-base-scale 1.0)
+      (when (and (numberp width) (> width 0) (numberp height) (> height 0))
+        (let ((window-width (window-body-width window t))
+              (window-height (window-body-height window t)))
+          (when (and (numberp window-width) (> window-width 0)
+                     (numberp window-height) (> window-height 0))
+            (let ((width-fit (/ (float window-width) width))
+                  (height-fit (/ (float window-height) height)))
+              (pcase mode
+                ('width width-fit)
+                ('height height-fit)
+                (_ (min width-fit height-fit))))))))))
+
+(defun seshat-reader--multipage-zoom (factor &optional source)
+  "Multiply the base scale of the buffer by FACTOR and return the new scale.
+
+FACTOR is a multiplier, not an absolute scale, which is what decision D5 asks
+for: `+' / `-' keep zooming relative to the scale the document was opened
+with, so the same number of keypresses always ends at the same zoom.  SOURCE
+defaults to `manual' and is recorded as the scale source of the window."
+  (seshat-reader--multipage-set-scale
+   (* (or seshat-reader--multipage-base-scale 1.0) (or factor 1.0))
+   (or source 'manual)
+   'manual))
+
+(defun seshat-reader-enlarge-size (&optional factor)
+  "Zoom in by FACTOR, `seshat-reader-enlarge-factor' by default.
+
+FACTOR multiplies the current base scale, so 20 presses of `+' end at
+\\(enlarge-factor)^20 times the opening scale (clamped by
+`seshat-reader--multipage-set-scale').  The visible pages are re-rendered
+synchronously, so the page is sharp as soon as the command returns."
+  (interactive (list seshat-reader-enlarge-factor))
+  (seshat-reader--multipage-zoom (or factor seshat-reader-enlarge-factor) 'manual))
+
+(defun seshat-reader-shrink-size (&optional factor)
+  "Zoom out by FACTOR, `seshat-reader-shrink-factor' by default.
+
+FACTOR multiplies the current base scale, mirroring
+`seshat-reader-enlarge-size'; the visible pages are re-rendered synchronously."
+  (interactive (list seshat-reader-shrink-factor))
+  (seshat-reader--multipage-zoom (or factor seshat-reader-shrink-factor) 'manual))
 
 (defun seshat-reader-reset-size ()
-  "Reset the size of every visible page to 1.0.
+  "Drop the manual zoom and re-fit the document the way it was opened.
 
-The zoom becomes manual, so the pages are shown at their native scale even
-when they do not fit the window."
+The base scale goes back to the fit of the reference page under
+`seshat-reader--initial-fit-mode' -- the same scale `seshat-reader--first-fit'
+would have computed -- and the fit mode returns to that mode, so `0' really
+means \"start over\" instead of \"scale 1.0\".
+
+The zoom command is re-rendered synchronously, like every other zoom."
   (interactive)
-  (seshat-reader--multipage-set-scale 1.0 'manual 'manual))
+  (let* ((window (selected-window))
+         (mode (seshat-reader--initial-fit-mode))
+         (scale (or (seshat-reader--multipage-base-fit-scale mode window) 1.0)))
+    (set-window-parameter window 'fit-mode mode)
+    (seshat-reader--multipage-set-scale scale 'fit mode)))
 
 (defun seshat-reader-fit-to-height ()
-  "Scale every visible page so that one page fills the window height.
+  "Fit every page to the window height and keep it sharp.
+
+The base scale is the height fit of the *reference* page (the one the document
+was opened on), and the fit mode becomes `height'; every page is then rendered
+at that scale, so the frame that follows is already sharp.
 
 The page is scaled on both dimensions, so a wide page overflows horizontally
-and is left aligned; horizontal scrolling brings the rest into view.  That
-is the pre-existing `fit-to-height' semantics, kept as it is by decision D5
+and is left aligned; horizontal scrolling brings the rest into view.  That is
+the pre-existing `fit-to-height' semantics, kept as it is by decision D5
 \(`height' is the one mode that is allowed to overflow)."
   (interactive)
   (let* ((window (selected-window))
-         (page (or (seshat-reader--multipage-window-start-page window) 1))
-         (scale (or (seshat-reader--multipage-fit-scale page 'height window)
-                    1.0)))
+         (scale (or (seshat-reader--multipage-base-fit-scale 'height window) 1.0)))
     (set-window-parameter window 'fit-mode 'height)
     (seshat-reader--multipage-set-scale scale 'fit 'height)))
 
 (defun seshat-reader-fit-to-width ()
-  "Scale every visible page so that each page fills the window width.
+  "Fit every page to the window width and keep it sharp.
+
+The base scale is the width fit of the *reference* page, and the fit mode
+becomes `width'; every page is then rendered at that scale.
 
 Every page is fitted to its own width, so pages of different widths all end
 up exactly as wide as the window and none of them overflows (decision D5,
 `width' mode)."
   (interactive)
   (let* ((window (selected-window))
-         (page (or (seshat-reader--multipage-window-start-page window) 1))
-         (scale (or (seshat-reader--multipage-fit-scale page 'width window)
-                    1.0)))
+         (scale (or (seshat-reader--multipage-base-fit-scale 'width window) 1.0)))
     (set-window-parameter window 'fit-mode 'width)
     (seshat-reader--multipage-set-scale scale 'fit 'width)))
 
@@ -616,28 +710,41 @@ normalised through `seshat-reader--normalize-default-fit'."
 (defun seshat-reader--first-fit ()
   "Fit the pages of the selected window for the first time they are shown.
 
-The base scale is derived from the native size of the page at the top of the
-window and the window size, under the window's initial fit mode
-\(`seshat-reader--initial-fit-mode'), which is recorded first so that later
-resizes keep using it.  That base scale is then fixed for the whole document
-\(decision D5: the reference page is the first one and it never follows the
-scroll position).
+The base scale is derived from the native size of the page the document is
+opened on -- remembered in `seshat-reader--multipage-reference-native', which
+is what `W' / `H' / `0' later re-derive from -- and the window size, under the
+window's initial fit mode (`seshat-reader--initial-fit-mode'), which is
+recorded first so that later resizes keep using it.  That base scale is then
+fixed for the whole document (decision D5: the reference page is the first one
+and it never follows the scroll position).
 
-The specs are adapted in place, so the very first frame already shows the
-pages at their final size; the bitmaps are rendered at the new resolution by
-the debounced refit afterwards.  Nothing is done in a buffer without page
-rows."
+The rows were rendered at the base scale of `seshat-reader--render-buffer'
+\(1.0) before this function runs, so their specs are resized in place and then
+every resident page is reconciled once with
+`seshat-reader--multipage-refit-page': the pages whose bitmap resolution does
+not match the new target are rendered again.  That costs one render per page
+\(0.7-11 ms measured, i.e. a few dozen milliseconds for the resident set) and
+buys a first frame that is already sharp, instead of a stretched bitmap that
+only the idle refit would fix.  Never rendering twice is what keeps the call
+cheap: a page that is already at the target scale is skipped.
+
+Nothing is done in a buffer without page rows."
   (let* ((window (selected-window))
          (mode (seshat-reader--initial-fit-mode))
          (page (or (seshat-reader--multipage-window-start-page window) 1)))
     (set-window-parameter window 'fit-mode mode)
     (setq seshat-reader--multipage-fit-mode mode)
-    (when-let* ((scale (seshat-reader--multipage-fit-scale page mode window)))
+    ;; 基准页的 native 尺寸在此刻测量（此后它可能被回收，见该变量的 docstring）。
+    (setq seshat-reader--multipage-reference-native
+          (seshat-reader--multipage-native-size page))
+    (when-let* ((scale (seshat-reader--multipage-base-fit-scale mode window)))
       (setq seshat-reader--multipage-base-scale
             (seshat-reader--multipage-clamp-scale scale)))
     (seshat-reader--apply-display-scale window)
     (seshat-reader--center-page window)
-    (seshat-reader--schedule-refit)))
+    (dolist (page (seshat-reader--multipage-page-numbers))
+      (seshat-reader--multipage-refit-page page window))
+    (seshat-reader--center-page window)))
 
 (defun seshat-reader--window-fit-mode (&optional window)
   "Return WINDOW's fit mode: `contain', `width' or `height'.
@@ -1348,17 +1455,32 @@ without a row."
          page (seshat-reader--multipage-page-should-center-p page window)))
       spec)))
 
+(defconst seshat-reader--refit-scale-tolerance 0.005
+  "Largest difference between two scales that still counts as the same one.
+
+The gate in `seshat-reader--multipage-refit-page' compares the scale a bitmap
+was rendered at with the target scale of its page.  Exact equality would be too
+strict: the native size of a page is the spec size divided by the scale it was
+rendered at, so rounding moves the target in the third decimal on every
+re-render, and an exact comparison would re-render the page again on the next
+refit -- forever.  0.5% of a scale is far below what can be seen, so treating
+such a difference as \"already sharp\" is both safe and what makes the refit
+idempotent.")
+
 (defun seshat-reader--multipage-refit-page (page &optional window)
   "Re-render PAGE when its bitmap resolution differs from its target scale.
 
 PAGE is a 1-based page number and WINDOW defaults to the selected one.  The
 geometry itself is adapted in place by `seshat-reader--multipage-resize-spec'
 \(no pixels change), and the page is rendered again only when the scale its
-bitmap was rendered at differs from the target, which is what makes the
-visible pages sharp after a resize without ever rendering a page twice."
+bitmap was rendered at differs from the target by more than
+`seshat-reader--refit-scale-tolerance', which is what makes the visible pages
+sharp after a resize without ever rendering a page twice."
   (let ((target (seshat-reader--multipage-target-scale page window))
         (rendered (seshat-reader--multipage-render-scale page)))
-    (unless (and (numberp target) (numberp rendered) (= target rendered))
+    (unless (and (numberp target) (numberp rendered)
+                 (< (abs (- target rendered))
+                    seshat-reader--refit-scale-tolerance))
       (seshat-reader--multipage-rerender-page page window))))
 
 (defun seshat-reader--multipage-recycle-page (page)
@@ -1391,7 +1513,13 @@ an unchanged range returns at once, which keeps the `post-command-hook'
 entry from redoing the work on every command.  Nothing is done while a sync
 is already running, which is what stops a buffer modification made here
 from re-entering through `window-state-change-functions'.  The range that
-was synchronised is returned, or nil when there was nothing to do."
+was synchronised is returned, or nil when there was nothing to do.
+
+Scrolling never changes the zoom: the base scale is read by
+`seshat-reader--multipage-target-scale' and is only ever written by the zoom
+commands and `seshat-reader--first-fit', so a page pulled in here is rendered
+at exactly the same scale as the pages that were already on screen
+\(decision D5's reference page anchoring)."
   (let* ((win (or window (selected-window)))
          (range (and (window-live-p win)
                      (not seshat-reader--multipage-syncing)
@@ -1639,7 +1767,10 @@ row is placed according to the current geometry."
       (erase-buffer))
     (seshat-reader--multipage-clear)
     (setq seshat-reader--page-native-sizes nil
-          seshat-reader--page-render-scales nil)
+          seshat-reader--page-render-scales nil
+          ;; 旋转会交换页面的宽高，基准页尺寸随之作废；下一次 `W'/`H'/`0'
+          ;; 会退回视口顶页重新测量。
+          seshat-reader--multipage-reference-native nil)
     (let ((number first))
       (while (<= number last)
         (seshat-reader--multipage-render-page number)
@@ -2558,9 +2689,12 @@ See also `seshat-reader-scroll-right'."
       (seshat-reader-scroll-right amount))))
 
 (defun seshat-reader-mwheel-enlarge-size (event)
-  "Enlarge the current page, but also handle mouse EVENT.
+  "Zoom in with the wheel, but also handle mouse EVENT.
 
-See also `seshat-reader-enlarge-size'."
+A single notch passes `seshat-reader-enlarge-factor' as the multiplier and a
+double or triple notch a slightly larger one, so the wheel goes through the
+very same path as `+' (`seshat-reader-enlarge-size'): the multiplier is
+applied to the base scale and the visible pages are re-rendered."
   (interactive "e")
   (let* ((event-type (car event))
 	 (scaling-factor (pcase event-type
@@ -2569,13 +2703,13 @@ See also `seshat-reader-enlarge-size'."
 			   ('C-triple-wheel-up (+ seshat-reader-enlarge-factor 0.2))))
 	 (scrolled-window (car (cadr event))))
     (with-selected-window scrolled-window
-      (seshat-reader-enlarge-size
-       (* scaling-factor (seshat-reader-current-doc-scale-value))))))
+      (seshat-reader-enlarge-size scaling-factor))))
 
 (defun seshat-reader-mwheel-shrink-size (event)
-  "Shrink the current page, but also handle mouse EVENT.
+  "Zoom out with the wheel, but also handle mouse EVENT.
 
-See also `seshat-reader-shrink-size'."
+Mirrors `seshat-reader-mwheel-enlarge-size': the notch picks the multiplier that
+is handed to `seshat-reader-shrink-size', which multiplies the base scale."
   (interactive "e")
   (let* ((event-type (car event))
 	 (scaling-factor (pcase event-type
@@ -2584,8 +2718,7 @@ See also `seshat-reader-shrink-size'."
 			   ('C-triple-wheel-down (- seshat-reader-shrink-factor 0.2))))
 	 (scrolled-window (car (cadr event))))
     (with-selected-window scrolled-window
-      (seshat-reader-shrink-size
-       (* scaling-factor (seshat-reader-current-doc-scale-value))))))
+      (seshat-reader-shrink-size scaling-factor))))
 
 (defun seshat-reader-rotate-clockwise ()
   "Rotate every page of the current document by 90 degrees, clockwise.
@@ -2692,8 +2825,10 @@ PAGE."
 	  (set-window-parameter window 'render-scale nil)
 	  (set-window-parameter window 'native-size nil)
 	  ;; 按页的几何缓存随重载一起作废：native 尺寸与渲染 scale 都是上一份
-	  ;; 文档的位图量出来的，缩放基准重新由 `--first-fit' 推导。
+	  ;; 文档的位图量出来的，缩放基准重新由 `--first-fit' 推导（基准页尺寸也
+	  ;; 一并作废，否则 `W'/`H'/`0' 会用上一份文档的页面尺寸算 base）。
 	  (setq seshat-reader--multipage-base-scale 1.0
+	        seshat-reader--multipage-reference-native nil
 	        seshat-reader--page-native-sizes nil
 	        seshat-reader--page-render-scales nil)
 	  ;; 位图随重载失效，按页缓存的 spec 不能再复用；清缓存失败不得中断重载。
