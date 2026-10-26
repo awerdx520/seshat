@@ -38,6 +38,10 @@
 (defvar seshat-reader--recent-pagenumber-fallback nil
   "Registered by the native module; declared here to silence the byte-compiler.")
 
+;; 前向声明：页表在下面的多页布局段落里由 `defvar-local' 定义，而
+;; `seshat-reader-current-doc-pagenumber' 等访问器先于它出现。
+(defvar seshat-reader--pages)
+
 (defconst seshat-reader-directory
   (or (and load-file-name
            (file-name-directory load-file-name))
@@ -204,10 +208,21 @@ WINDOW must be a valid window and defaults to the selected one."
   (window-parameter (or window (selected-window)) 'overlay))
 
 (defun seshat-reader-current-doc-pagenumber (&optional window)
-  "Page number of WINDOW.
+  "Page number at the top of WINDOW.
 
-WINDOW must be a valid window and defaults to the selected one."
-  (window-parameter (or window (selected-window)) 'page))
+WINDOW must be a valid window and defaults to the selected one.  The number
+is derived from the page row that `window-start' falls into, because the
+multi-page layout shows several pages at once and only the page at the top
+is unambiguous.  The page parameter the native module writes is no longer
+read: it still describes a single displayed page and would disagree with
+the layout as soon as the window is scrolled by less than a page.
+
+nil is returned while the buffer holds no page row; the native fallback is
+used when the viewport cannot be mapped to a row."
+  (when seshat-reader--pages
+    (or (seshat-reader--multipage-window-start-page
+         (or window (selected-window)))
+        seshat-reader--recent-pagenumber-fallback)))
 
 (defun seshat-reader-current-doc-scale-value (&optional window)
   "Scaling factor of WINDOW.
@@ -290,79 +305,74 @@ See `%s' for the actual definition."
 (defun seshat-reader-open-doc (document)
   "Open DOCUMENT for viewing.
 
-This function calls the module function `seshat-reader-dyn--load-doc' from the
-dynamic module to render the first page and displays it in a new buffer.
+The document is loaded and displayed by `seshat-reader-mode', which calls
+`seshat-reader--render-buffer' to build the multi-page layout in a new
+buffer.  Loading the document here as well would leave the buffer with the
+single-page overlay the native module creates, because the render status it
+records would make the mode skip the layout.
 
 The only formats that can be opened `seshat-reader-supported-formats', any
 other file format will simply not show up as a candidate."
   (interactive (list (expand-file-name (seshat-reader--read-doc-name))))
   (switch-to-buffer (create-file-buffer document))
   (setq buffer-file-name document)
-  (if (seshat-reader-dyn--load-doc (expand-file-name document) 0)
-      (seshat-reader-mode)
-    (kill-buffer (current-buffer))))
+  (seshat-reader-mode))
 
 (define-queue-command next-page ()
   "Go to the next page of the document."
   (interactive)
-  (seshat-reader--remember-current-page-spec)
-  (when (seshat-reader-dyn--next-page)
-    (seshat-reader--update-join-strip)
-    ;; Land at the strip top, so that the last line of the previous page
-    ;; stays visible right above the new page.
-    (seshat-reader--set-window-vscroll nil 0)
-    ;; Must return `t' when the command succeeds.
-    (force-mode-line-update) t))
+  (let* ((page (seshat-reader-current-doc-pagenumber))
+         (target (and (integerp page)
+                      (seshat-reader--multipage-clamp-page (1+ page)))))
+    (when (and target (> target page))
+      (seshat-reader--multipage-goto target)
+      ;; Must return `t' when the command succeeds.
+      (force-mode-line-update) t)))
 
 (define-queue-command previous-page ()
   "Go to the previous page of the document."
   (interactive)
-  (seshat-reader--remember-current-page-spec)
-  (when (seshat-reader-dyn--prev-page)
-    (seshat-reader--update-join-strip)
-    ;; Landing at the page bottom keeps the pages continuous when
-    ;; scrolling upwards.
-    (seshat-reader--set-page-bottom)
-    ;; Must return `t' when the command succeeds.
-    (force-mode-line-update) t))
+  (let* ((page (seshat-reader-current-doc-pagenumber))
+         (target (and (integerp page)
+                      (seshat-reader--multipage-clamp-page (1- page)))))
+    (when (and target (< target page))
+      (seshat-reader--multipage-goto target)
+      ;; Must return `t' when the command succeeds.
+      (force-mode-line-update) t)))
 
 (defun seshat-reader-first-page ()
   "Go to the first page of the document."
   (interactive)
-  (seshat-reader--remember-current-page-spec)
-  (seshat-reader-dyn--first-page)
-  (seshat-reader--update-join-strip)
-  (seshat-reader--center-page)
-  (seshat-reader--set-window-vscroll nil 0)
-  (force-mode-line-update))
+  (when (seshat-reader--multipage-goto 1)
+    (force-mode-line-update)))
 
 (defun seshat-reader-last-page ()
   "Go to the last page of the document."
   (interactive)
-  (seshat-reader--remember-current-page-spec)
-  (seshat-reader-dyn--last-page)
-  (seshat-reader--update-join-strip)
-  (seshat-reader--center-page)
-  (seshat-reader--set-page-bottom)
-  (force-mode-line-update))
+  (let ((count (seshat-reader--multipage-pagecount)))
+    (when (and count (seshat-reader--multipage-goto count))
+      (force-mode-line-update))))
 
 (defun seshat-reader-goto-page (n)
   "Go to page number N in the current document."
   (interactive "nGoto page: ")
-  (seshat-reader--remember-current-page-spec)
-  (seshat-reader-dyn--goto-page (- n 1)) ; MuPDF does 0-indexing
-  (seshat-reader--update-join-strip)
-  (seshat-reader--center-page)
-  (seshat-reader--set-window-vscroll nil 0))
+  (when (seshat-reader--multipage-goto n)
+    (force-mode-line-update)))
 
 (defun seshat-reader--get-current-doc-image-size (&optional window)
   "Get the dimensions of the page in WINDOW.
 
-WINDOW must be a valid window and defaults to the selected one."
-  (let* ((cdr-image (cdr (overlay-get (seshat-reader-current-doc-overlay window) 'display)))
-	 (width (plist-get cdr-image :width))
-	 (height (plist-get cdr-image :height)))
-    (cons width height)))
+WINDOW must be a valid window and defaults to the selected one.  nil is
+returned when the window carries no page overlay.  The multi-page layout
+displays its pages through text properties instead of an overlay, so this
+accessor -- and every geometry function built on top of it -- is inert
+until the batch that rewrites the centring works on the page rows again."
+  (when-let* ((overlay (seshat-reader-current-doc-overlay window))
+              ((overlayp overlay)))
+    (let* ((cdr-image (cdr (overlay-get overlay 'display)))
+           (width (plist-get cdr-image :width))
+           (height (plist-get cdr-image :height)))
+      (cons width height))))
 
 (defun seshat-reader-doc-scale-page (factor &optional source)
   "Scales the page by a given FACTOR.
@@ -401,53 +411,68 @@ source, for example one restored from a bookmark, counts as `fit'."
 (defun seshat-reader-enlarge-size (&optional scaling-factor)
   "Enlarge the size of the current page by the `seshat-reader-enlarge-factor'.
 
-Optionally scale it by the SCALING-FACTOR.  Scales on selected window."
+Optionally scale it by the SCALING-FACTOR.  Scales on selected window.
+
+Inert while the selected window has no page overlay: the multi-page layout
+renders every page at scale 1.0 and scaling is restored by a later batch."
   (interactive (list (float
 		      (* (seshat-reader-current-doc-scale-value) seshat-reader-enlarge-factor))))
-  (seshat-reader-doc-scale-page scaling-factor 'manual)
-  (seshat-reader--center-page)
-  (seshat-reader--set-page-top-when-joined))
+  (when (window-parameter nil 'overlay)
+    (seshat-reader-doc-scale-page scaling-factor 'manual)
+    (seshat-reader--center-page)))
 
 (defun seshat-reader-shrink-size (&optional scaling-factor)
   "Shrink the size of the current page by the `seshat-reader-shrink-factor'.
 
-Optionally scale it by the SCALING-FACTOR.  Scales on selected window."
+Optionally scale it by the SCALING-FACTOR.  Scales on selected window.
+
+Inert while the selected window has no page overlay: the multi-page layout
+renders every page at scale 1.0 and scaling is restored by a later batch."
   (interactive (list (float
 		      (* (seshat-reader-current-doc-scale-value) seshat-reader-shrink-factor))))
-  (seshat-reader-doc-scale-page scaling-factor 'manual)
-  (seshat-reader--center-page)
-  (seshat-reader--set-page-top-when-joined))
+  (when (window-parameter nil 'overlay)
+    (seshat-reader-doc-scale-page scaling-factor 'manual)
+    (seshat-reader--center-page)))
 
 (defun seshat-reader-reset-size ()
-  "Reset the size of the current page to 1.0."
+  "Reset the size of the current page to 1.0.
+
+Inert while the selected window has no page overlay: the multi-page layout
+renders every page at scale 1.0 already."
   (interactive)
-  (seshat-reader-doc-scale-page 1.0 'manual)
-  (seshat-reader--center-page)
-  (seshat-reader--set-page-top-when-joined))
+  (when (window-parameter nil 'overlay)
+    (seshat-reader-doc-scale-page 1.0 'manual)
+    (seshat-reader--center-page)))
 
 (defun seshat-reader-fit-to-height ()
-  "Scale the current page in the selected window to fit its height."
+  "Scale the current page in the selected window to fit its height.
+
+Inert while the selected window has no page overlay: the fitting done on
+the page overlay is restored by a later batch."
   (interactive)
-  (let* ((image-height (cdr (seshat-reader--get-current-doc-image-size)))
-	 (pixel-window-height (window-body-height nil t))
-	 (unscaled-height (/ image-height (seshat-reader-current-doc-scale-value)))
-	 (scaling-factor (/ pixel-window-height unscaled-height)))
-    (seshat-reader-doc-scale-page scaling-factor 'fit)
-    (seshat-reader--center-page)
-    (seshat-reader--set-page-top)
-    (set-window-parameter nil 'fit-mode 'height)))
+  (when (window-parameter nil 'overlay)
+    (let* ((image-height (cdr (seshat-reader--get-current-doc-image-size)))
+	   (pixel-window-height (window-body-height nil t))
+	   (unscaled-height (/ image-height (seshat-reader-current-doc-scale-value)))
+	   (scaling-factor (/ pixel-window-height unscaled-height)))
+      (seshat-reader-doc-scale-page scaling-factor 'fit)
+      (seshat-reader--center-page)
+      (set-window-parameter nil 'fit-mode 'height))))
 
 (defun seshat-reader-fit-to-width ()
-  "Scale the current page in the selected window to fit its width."
+  "Scale the current page in the selected window to fit its width.
+
+Inert while the selected window has no page overlay: the fitting done on
+the page overlay is restored by a later batch."
   (interactive)
-  (let* ((image-width (car (seshat-reader--get-current-doc-image-size)))
-	 (pixel-window-width (window-body-width nil t))
-	 (unscaled-width (/ image-width (seshat-reader-current-doc-scale-value)))
-	 (scaling-factor (/ pixel-window-width unscaled-width)))
-    (seshat-reader-doc-scale-page scaling-factor 'fit)
-    (seshat-reader--center-page)
-    (seshat-reader--set-page-top-when-joined)
-    (set-window-parameter nil 'fit-mode 'width)))
+  (when (window-parameter nil 'overlay)
+    (let* ((image-width (car (seshat-reader--get-current-doc-image-size)))
+	   (pixel-window-width (window-body-width nil t))
+	   (unscaled-width (/ image-width (seshat-reader-current-doc-scale-value)))
+	   (scaling-factor (/ pixel-window-width unscaled-width)))
+      (seshat-reader-doc-scale-page scaling-factor 'fit)
+      (seshat-reader--center-page)
+      (set-window-parameter nil 'fit-mode 'width))))
 
 (defun seshat-reader--contain-scale (&optional window)
   "Return the scale at which the current page fits WINDOW completely.
@@ -508,14 +533,19 @@ The target scale follows the window's initial fit mode
 display-level rescale instead of a re-render, so the very first frame
 already shows the page at its final size; the bitmap is rendered at the
 new resolution by the debounced refit afterwards.  Falls back to a
-synchronous re-render when the page spec is not available yet."
-  (let ((mode (seshat-reader--initial-fit-mode)))
-    (set-window-parameter nil 'fit-mode mode)
-    (let ((target (seshat-reader--fit-scale)))
-      (unless (seshat-reader--apply-display-scale (selected-window) target)
-        (seshat-reader-doc-scale-page target 'fit))))
-  (seshat-reader--center-page)
-  (seshat-reader--schedule-refit))
+synchronous re-render when the page spec is not available yet.
+
+Inert while the selected window has no page overlay: the multi-page layout
+renders every page at scale 1.0, and `seshat-reader--ensure-window-layout'
+records the fit mode instead."
+  (when (window-parameter nil 'overlay)
+    (let ((mode (seshat-reader--initial-fit-mode)))
+      (set-window-parameter nil 'fit-mode mode)
+      (let ((target (seshat-reader--fit-scale)))
+        (unless (seshat-reader--apply-display-scale (selected-window) target)
+          (seshat-reader-doc-scale-page target 'fit))))
+    (seshat-reader--center-page)
+    (seshat-reader--schedule-refit)))
 
 (defun seshat-reader--window-fit-mode (&optional window)
   "Return WINDOW's fit mode: `contain', `width' or `height'.
@@ -563,20 +593,25 @@ reused only while the window still shows PAGE.  The cache is also dropped
 when the page is re-rendered at a new resolution
 \(`seshat-reader-doc-scale-page'), the document is reloaded
 \(`seshat-reader--render-buffer') or the page is rotated
-\(`seshat-reader-rotate-clockwise' / `-counter-clockwise')."
-  (let* ((page (seshat-reader-current-doc-pagenumber window))
-         (cached (window-parameter window 'native-size)))
-    (if (and (consp cached) (equal (car cached) page) (consp (cdr cached)))
-        (cdr cached)
-      (let* ((spec (seshat-reader--page-image-spec window))
-             (scale (seshat-reader-current-doc-scale-value window))
-             (w (and spec (image-property spec :width)))
-             (h (and spec (image-property spec :height))))
-        (when (and (integerp w) (integerp h) (> w 0) (> h 0)
-                   (numberp scale) (> scale 0))
-          (let ((native (cons (/ (float w) scale) (/ (float h) scale))))
-            (set-window-parameter window 'native-size (cons page native))
-            native))))))
+\(`seshat-reader-rotate-clockwise' / `-counter-clockwise').
+
+nil is returned while the window has no page overlay, which is the case for
+the whole multi-page layout: the per-page native size is read from the page
+rows by a later batch."
+  (when (window-parameter window 'overlay)
+    (let* ((page (seshat-reader-current-doc-pagenumber window))
+           (cached (window-parameter window 'native-size)))
+      (if (and (consp cached) (equal (car cached) page) (consp (cdr cached)))
+          (cdr cached)
+        (let* ((spec (seshat-reader--page-image-spec window))
+               (scale (seshat-reader-current-doc-scale-value window))
+               (w (and spec (image-property spec :width)))
+               (h (and spec (image-property spec :height))))
+          (when (and (integerp w) (integerp h) (> w 0) (> h 0)
+                     (numberp scale) (> scale 0))
+            (let ((native (cons (/ (float w) scale) (/ (float h) scale))))
+              (set-window-parameter window 'native-size (cons page native))
+              native)))))))
 
 (defun seshat-reader--apply-display-scale (window scale)
   "Resize WINDOW's page to SCALE by rewriting the image spec, without rendering.
@@ -592,7 +627,10 @@ the new geometry to take effect, and flushing on every size change would
 make the redisplay re-decode the whole page bitmap each time, which is
 what makes dragging a window divider stall.  Stale cache entries are
 dropped by the C side when it replaces the spec on the next re-render."
-  (when (and (windowp window) (numberp scale) (> scale 0))
+  (when (and (windowp window) (numberp scale) (> scale 0)
+             ;; 多页布局没有 per-window overlay，缩放改写的是页行里的 spec；
+             ;; 本批一律按 1.0 渲染，改写在后续批次接回页行。
+             (window-parameter window 'overlay))
     (let* ((spec (seshat-reader--page-image-spec window))
            (native (and spec (seshat-reader--native-page-size window)))
            (w (and spec (image-property spec :width)))
@@ -872,22 +910,300 @@ a buffer without page rows returns nil."
 WINDOW defaults to the selected window and must be a live window.  FIRST
 and LAST are page numbers: the ones at `window-start' and `window-end',
 widened by `seshat-reader--multipage-preload' pages in each direction and
-clipped to the pages present in the buffer.  The viewport counts as a
-single page when `window-end' cannot be determined.  The value is nil when
-the buffer has no page rows."
-  (when seshat-reader--pages
+clipped to the document pages, i.e. to 1 and the page count the native
+module reports.  A document whose page count is still unknown is clipped
+to the pages the buffer already holds, which is what keeps the very first
+render of a buffer working.  The viewport counts as a single page when
+`window-end' cannot be determined.  The value is nil when the buffer has
+no page rows and no page count is known either."
+  (when (or seshat-reader--pages
+            (seshat-reader--multipage-pagecount))
     (let* ((win (or window (selected-window)))
            (first-page (or (seshat-reader--multipage-page-at-pos
                             (window-start win))
-                           (car (car seshat-reader--pages))))
+                           (and seshat-reader--pages
+                                (car (car seshat-reader--pages)))
+                           1))
            (last-page (or (when-let* ((end (window-end win t)))
                             (seshat-reader--multipage-page-at-pos end))
                           first-page))
-           (lowest (car (car seshat-reader--pages)))
-           (highest (car (car (last seshat-reader--pages))))
+           ;; 裁剪基准是文档页数（不是「已存在的页」），否则首次渲染后视口一旦
+           ;; 移到尚未插入的页就会把范围算成空集。
+           (highest (or (seshat-reader--multipage-pagecount)
+                        (and seshat-reader--pages
+                             (car (car (last seshat-reader--pages))))
+                        first-page))
            (preload (max 0 seshat-reader--multipage-preload)))
-      (cons (max lowest (- first-page preload))
+      (cons (max 1 (- first-page preload))
             (min highest (+ (max first-page last-page) preload))))))
+
+;;; Multi-page layout residency (P1 T1b)
+
+;; The resident set is the pages the viewport shows plus
+;; `seshat-reader--multipage-preload' pages on each side.  Rendering is
+;; synchronous and one page costs a few milliseconds, so the set is kept
+;; small on purpose: a page row is inserted when the viewport reaches it and
+;; recycled as soon as it leaves the set.
+
+(defvar-local seshat-reader--multipage-rotate 0
+  "Rotation in degrees applied to every page row of this buffer.
+
+One of 0, 90, 180 and 270.  The value is buffer-local because the pages are
+not attached to a window any more: every window showing this buffer sees
+the same rotation.  It is passed to the native per-page renderer through
+`seshat-reader--page-spec'.")
+
+(defvar-local seshat-reader--multipage-syncing nil
+  "Non-nil while `seshat-reader--multipage-sync' is modifying the buffer.
+
+Inserting or deleting a page row can report a window state change, which
+runs `seshat-reader--ensure-window-layout' and would re-enter the sync.
+The flag breaks that cycle.")
+
+(defvar-local seshat-reader--multipage-last-range nil
+  "Page range the resident set was last synchronised for, as (FIRST . LAST).
+
+`seshat-reader--multipage-sync' returns immediately while the range asked
+for is still this one, so the `post-command-hook' entry costs one range
+computation per command instead of a full pass over the resident pages.")
+
+(defun seshat-reader--multipage-pagecount ()
+  "Return the number of pages of the loaded document, or nil.
+
+The value comes from the buffer-local
+`seshat-reader-current-doc-pagecount' the native module maintains.  A
+missing or non-positive value is reported as nil, so callers can fall back
+to the pages the buffer actually holds."
+  (let ((count (bound-and-true-p seshat-reader-current-doc-pagecount)))
+    (and (integerp count) (> count 0) count)))
+
+(defun seshat-reader--multipage-clamp-page (page)
+  "Return PAGE clamped into 1..PAGECOUNT, or nil when PAGE is unusable.
+
+PAGE is a 1-based page number.  When the document page count is unknown the
+value is only checked to be a positive integer."
+  (when (and (integerp page) (> page 0))
+    (let ((count (seshat-reader--multipage-pagecount)))
+      (if count (max 1 (min count page)) page))))
+
+(defun seshat-reader--multipage-clear ()
+  "Drop every page row of the current buffer together with its marker.
+
+The buffer text is left untouched; callers that want it gone erase the
+buffer themselves, which is why this is separate from
+`seshat-reader--multipage-remove-page'."
+  (dolist (entry seshat-reader--pages)
+    (when (markerp (cadr entry))
+      (set-marker (cadr entry) nil)))
+  (setq seshat-reader--pages nil
+        seshat-reader--multipage-last-range nil))
+
+(defun seshat-reader--multipage-render-page (page)
+  "Make sure PAGE has a row displaying its image spec and return the spec.
+
+PAGE is a 1-based page number.  A page without a row gets one built from
+`seshat-reader--page-spec', a page whose row exists but carries no spec
+gets the spec filled in, and an already rendered page is left alone, so
+calling this on every scroll step is cheap.  Pages are rendered at scale
+1.0 -- scaling is the job of a later batch -- with the buffer-local
+rotation, and the spec the native module returns is used as it is."
+  (if (and (assq page seshat-reader--pages)
+           (seshat-reader--multipage-page-spec page))
+      (seshat-reader--multipage-page-spec page)
+    (let ((spec (seshat-reader--page-spec
+                 page 1.0 seshat-reader--multipage-rotate)))
+      (seshat-reader--multipage-insert-page page spec)
+      spec)))
+
+(defun seshat-reader--multipage-recycle-page (page)
+  "Remove the row of PAGE and drop the cached spec of that page.
+
+PAGE is a 1-based page number and the spec the row was displaying is
+returned.  Dropping the cached spec is what actually releases the bitmap:
+the row marker alone pins nothing, but the spec cache would keep the image
+of a page nobody can see any more."
+  (let ((spec (seshat-reader--multipage-remove-page page)))
+    (when spec
+      (setq seshat-reader--page-spec-cache
+            (let (kept)
+              (dolist (entry seshat-reader--page-spec-cache (nreverse kept))
+                (unless (equal (car (car entry)) page)
+                  (push entry kept))))))
+    spec))
+
+(defun seshat-reader--multipage-sync (&optional window)
+  "Keep the resident page rows of WINDOW in sync with its viewport.
+
+WINDOW defaults to the selected window.  The pages
+`seshat-reader--multipage-visible-range' asks for are rendered when they
+are missing and every page outside that range is recycled, so the buffer
+only holds the visible pages plus the preload around them.  The range of
+the previous run is remembered in `seshat-reader--multipage-last-range' and
+an unchanged range returns at once, which keeps the `post-command-hook'
+entry from redoing the work on every command.  Nothing is done while a sync
+is already running, which is what stops a buffer modification made here
+from re-entering through `window-state-change-functions'.  The range that
+was synchronised is returned, or nil when there was nothing to do."
+  (let* ((win (or window (selected-window)))
+         (range (and (window-live-p win)
+                     (not seshat-reader--multipage-syncing)
+                     (eq (window-buffer win) (current-buffer))
+                     (seshat-reader--multipage-visible-range win))))
+    (when (and range (not (equal range seshat-reader--multipage-last-range)))
+      (let ((seshat-reader--multipage-syncing t)
+            (first (car range))
+            (last (cdr range)))
+        (setq seshat-reader--multipage-last-range range)
+        (let ((page first))
+          (while (<= page last)
+            (seshat-reader--multipage-render-page page)
+            (setq page (1+ page))))
+        (dolist (entry (copy-sequence seshat-reader--pages))
+          (let ((page (car entry)))
+            (when (or (< page first) (> page last))
+              (seshat-reader--multipage-recycle-page page)))))
+      range)))
+
+(defun seshat-reader--multipage--show-page (page)
+  "Put the window start and point on the row of PAGE and return its position.
+
+The position is read fresh from the row marker, so callers get a value that is
+valid after the buffer was modified.  When the selected window does not show
+the current buffer only point is moved, because `set-window-start' would
+otherwise be applied to a buffer nobody asked about; nil is returned when
+PAGE has no row."
+  (when-let* ((entry (assq page seshat-reader--pages)))
+    (let ((pos (marker-position (cadr entry))))
+      (if (eq (window-buffer (selected-window)) (current-buffer))
+          (with-selected-window (selected-window)
+            (set-window-start (selected-window) pos)
+            (goto-char pos))
+        (goto-char pos))
+      pos)))
+
+(defun seshat-reader--multipage-goto (page)
+  "Scroll the selected window to the row of PAGE and put point there.
+
+PAGE is a 1-based page number and is clamped to the document; nil is
+returned when no row can be shown.  The row of PAGE is rendered first, so
+jumping outside the resident set works, and the pages around it are pulled
+in afterwards by `seshat-reader--multipage-sync'.  The window is positioned
+again after the sync, because the sync inserts or recycles rows in front of
+the viewport: the markers follow the text, but a window start that sits at
+`point-min' would be left before the freshly inserted rows.  The buffer
+position of the row is returned."
+  (let ((target (seshat-reader--multipage-clamp-page page)))
+    (when target
+      (seshat-reader--multipage-render-page target)
+      (seshat-reader--multipage--show-page target)
+      (seshat-reader--multipage-sync)
+      (seshat-reader--multipage--show-page target))))
+
+(defun seshat-reader--multipage-window-start-page (&optional window)
+  "Return the number of the page shown at the top of WINDOW.
+
+WINDOW defaults to the selected window.  nil is returned for a buffer
+without page rows.  A window whose start is not inside a page row, and a
+window showing some other buffer, count as showing the first page: that
+keeps the derived page number inside the document instead of inventing
+one."
+  (when seshat-reader--pages
+    (let* ((win (or window (selected-window)))
+           (first (car (car seshat-reader--pages))))
+      (if (eq (window-buffer win) (current-buffer))
+          (or (seshat-reader--multipage-page-at-pos (window-start win))
+              first)
+        first))))
+
+(defun seshat-reader--multipage--after-command ()
+  "Refresh the resident page rows after a command moved the viewport.
+
+Registered buffer-locally at the end of `post-command-hook'.  Errors are
+swallowed: a `post-command-hook' entry that signals blocks every following
+command, and the next scroll step simply retries the same work."
+  (when (and (derived-mode-p 'seshat-reader-mode)
+             (eq (window-buffer (selected-window)) (current-buffer)))
+    (ignore-errors (seshat-reader--multipage-sync))))
+
+(defun seshat-reader--multipage-relayout (&optional page)
+  "Rebuild the page rows of the current buffer around PAGE.
+
+PAGE defaults to the page at the top of the selected window, and the first
+page is used when even that is unknown.  Every row is dropped and the pages
+from PAGE minus the preload through PAGE plus the preload are rendered
+again, which is what a command that changes the rendering of every page
+\(rotation, dark mode) needs.  The window is left showing PAGE."
+  (let* ((target (or (seshat-reader--multipage-clamp-page page)
+                     (seshat-reader--multipage-clamp-page
+                      (seshat-reader-current-doc-pagenumber))
+                     1))
+         (preload (max 0 seshat-reader--multipage-preload))
+         (count (seshat-reader--multipage-pagecount))
+         (first (max 1 (- target preload)))
+         (last (if count (min count (+ target preload)) (+ target preload))))
+    (let ((inhibit-read-only t))
+      (erase-buffer))
+    (seshat-reader--multipage-clear)
+    (let ((number first))
+      (while (<= number last)
+        (seshat-reader--multipage-render-page number)
+        (setq number (1+ number))))
+    (seshat-reader--multipage-goto target)))
+
+(defun seshat-reader--multipage-drop-c-overlay (window)
+  "Remove the single-page overlay the native module attached to WINDOW.
+
+That overlay spans the whole buffer and carries the image of one page in
+its `display' property, so it would cover the multi-page layout and has to
+go once the page rows take over.  It is closed through
+`seshat-reader-dyn--window-close' rather than `delete-overlay' because the
+native module owns an `EmacsWinState' behind it and only that entry point
+releases it.  The window parameter is cleared either way."
+  (let ((overlay (window-parameter window 'overlay)))
+    (when (overlayp overlay)
+      (ignore-errors (seshat-reader-dyn--window-close overlay)))
+    (set-window-parameter window 'overlay nil)))
+
+(defun seshat-reader--multipage-rotate-by (delta)
+  "Rotate every page of the buffer by DELTA degrees.
+
+DELTA is 90 or -90; the buffer-local rotation is kept in the 0..359 range,
+and every cached spec is dropped because a rotated page has a different
+bitmap and, for the quarter turns, swapped dimensions.  The rows are then
+rebuilt around the page that is on screen, so the reader stays where it
+was."
+  (let ((page (seshat-reader-current-doc-pagenumber)))
+    (setq seshat-reader--multipage-rotate
+          (mod (+ (or seshat-reader--multipage-rotate 0) delta) 360))
+    (ignore-errors (seshat-reader--page-spec-clear-cache))
+    (seshat-reader--multipage-relayout page)
+    (force-mode-line-update)))
+
+(defun seshat-reader--ensure-window-layout (window)
+  "Make WINDOW show the multi-page layout of the current buffer.
+
+Registered buffer-locally on `window-state-change-functions', which is what
+gives a new window, a resized window and a window that just switched to
+this buffer their layout.  The window gets its starting fit mode recorded
+\(the geometry that consumes it belongs to a later batch) and its resident
+pages synchronised; when the window start is no longer inside a page row,
+the window is moved to the nearest page row so that the page number derived
+from the viewport stays meaningful."
+  (when (and (window-live-p window)
+             (eq (window-buffer window) (current-buffer)))
+    (with-current-buffer (window-buffer window)
+      (when (derived-mode-p 'seshat-reader-mode)
+        (unless (window-parameter window 'fit-mode)
+          (set-window-parameter window 'fit-mode
+                                (seshat-reader--initial-fit-mode window)))
+        (seshat-reader--multipage-sync window)
+        (when (and seshat-reader--pages
+                   (not (seshat-reader--multipage-page-at-pos
+                         (window-start window))))
+          (when-let* ((entry (assq (seshat-reader--multipage-window-start-page
+                                    window)
+                                   seshat-reader--pages)))
+            (set-window-start window (marker-position (cadr entry)))))))))
 
 ;;; Cross-page join
 
@@ -1228,31 +1544,36 @@ Two different prefixes are used: pages that fit are centred by a
 while pages wider than the window are left-aligned through the buffer-wide
 centring overlay's `line-prefix'.  Either one counts as centred only when
 it matches the current geometry, so that a re-render (new spec identity) or
-a resize (different leftover width) is detected and repaired once."
-  (let* ((overlay (window-parameter window 'overlay))
-         (spec (seshat-reader--page-image-spec window))
-         (image-width (and spec (image-property spec :width)))
-         (window-width (window-body-width window t)))
-    (cond
-     ;; 页面比窗口宽：center overlay 的 line-prefix 宽度必须等于剩余宽度
-     ((and (numberp image-width) (> image-width 0)
-           (numberp window-width) (< window-width image-width))
-      (let* ((center seshat-reader--center-overlay)
-             (prefix (and (overlayp center) (overlay-get center 'line-prefix)))
-             (width (and (consp prefix) (car (plist-get (cdr prefix) :width)))))
-        (and (numberp width)
-             (= width (max 0 (- window-width image-width)))
-             t)))
-     ;; 能放下：before-string 必须引用当前 spec（身份比较）
-     ((and (overlayp overlay) spec)
-      (let* ((before (overlay-get overlay 'before-string))
-             (display (and (stringp before) (> (length before) 0)
-                           (get-text-property 0 'display before)))
-             (align (and (consp display) (plist-get (cdr display) :align-to)))
-             (form (and (consp align) (eq (car align) '+)
-                        (nth 2 align))))
-        (and (consp form) (eq (cdr form) spec) t)))
-     (t nil))))
+a resize (different leftover width) is detected and repaired once.
+
+nil is returned while the window has no page overlay: the multi-page layout
+has no per-window centring to check, and the centring of page rows is
+restored by a later batch."
+  (when (window-parameter window 'overlay)
+    (let* ((overlay (window-parameter window 'overlay))
+           (spec (seshat-reader--page-image-spec window))
+           (image-width (and spec (image-property spec :width)))
+           (window-width (window-body-width window t)))
+      (cond
+       ;; 页面比窗口宽：center overlay 的 line-prefix 宽度必须等于剩余宽度
+       ((and (numberp image-width) (> image-width 0)
+             (numberp window-width) (< window-width image-width))
+        (let* ((center seshat-reader--center-overlay)
+               (prefix (and (overlayp center) (overlay-get center 'line-prefix)))
+               (width (and (consp prefix) (car (plist-get (cdr prefix) :width)))))
+          (and (numberp width)
+               (= width (max 0 (- window-width image-width)))
+               t)))
+       ;; 能放下：before-string 必须引用当前 spec（身份比较）
+       ((and (overlayp overlay) spec)
+        (let* ((before (overlay-get overlay 'before-string))
+               (display (and (stringp before) (> (length before) 0)
+                             (get-text-property 0 'display before)))
+               (align (and (consp display) (plist-get (cdr display) :align-to)))
+               (form (and (consp align) (eq (car align) '+)
+                          (nth 2 align))))
+          (and (consp form) (eq (cdr form) spec) t)))
+       (t nil)))))
 
 ;; We need this hack involving line-prefix because Emacs' scrolling is
 ;; idiosyncratic, and doesn't allow arbitrary scrolling in every
@@ -1278,9 +1599,15 @@ instead: the page is left-aligned and scrolled with the width-based
 `line-prefix'.
 
 When the geometry is unknown everything is cleared, so a stale offset from
-an earlier centring cannot keep the page stuck to one side."
+an earlier centring cannot keep the page stuck to one side.
+
+Nothing is done while the window has no page overlay: the multi-page layout
+leaves the horizontal placement of each page row to a later batch, and this
+function must stay inert instead of writing a prefix onto a page overlay that
+is not there."
   (let ((window (or window (selected-window))))
-    (let* ((overlay (seshat-reader-current-doc-overlay window))
+    (when (window-parameter window 'overlay)
+      (let* ((overlay (seshat-reader-current-doc-overlay window))
            (window-width (window-body-width window t))
            (spec (seshat-reader--page-image-spec window))
            (doc-image-width (and spec (image-property spec :width))))
@@ -1322,7 +1649,7 @@ an earlier centring cannot keep the page stuck to one side."
           (when (overlayp ov)
             (overlay-put ov 'line-prefix nil)))
         (ignore-errors (seshat-reader--set-window-hscroll window 0 t))
-        (ignore-errors (set-window-hscroll window 0)))))))
+        (ignore-errors (set-window-hscroll window 0))))))))
 
 (defun seshat-reader--ensure-centered (window)
   "Re-centre WINDOW's page when its centring prefix is missing or stale.
@@ -1433,7 +1760,6 @@ debounced refit when the drag stops."
                             (eq (seshat-reader--window-scale-source window) 'manual))
                   (seshat-reader--apply-display-scale
                    window (seshat-reader--fit-scale window))))
-              (seshat-reader--clamp-window-vscroll window)
               (seshat-reader--center-page window))
           (error
            (message "seshat-reader: resize recentre skipped in %s: %S"
@@ -1515,52 +1841,59 @@ reported and does not prevent the other windows from being refitted."
                     ;; 不传 source：清晰化重渲染不得改动 scale-source，
                     ;; 否则 manual 窗口会被静默转成 fit。
                     (seshat-reader-doc-scale-page scale))))
-              (seshat-reader--clamp-window-vscroll window)
               (seshat-reader--center-page window))
           (error
            (message "seshat-reader: resize refit skipped in %s: %S"
                     (buffer-name) err)))))))
 
 
-(defun seshat-reader-scroll-up (&optional amount)
-  "Scroll up the current page by AMOUNT.
+;; Scrolling is ordinary line scrolling now: a page is one buffer line whose
+;; height is the page image, so redisplay scrolls through it and the next page
+;; simply follows.  Nothing here turns a page, and nothing here touches the
+;; vertical scroll of the window directly -- the page rows carry the content
+;; and `set-window-start' is used for page jumps only.
 
-AMOUNT defaults to 1."
+(defun seshat-reader-scroll-up (&optional amount)
+  "Scroll the view upward by AMOUNT lines, one line by default.
+
+The text moves down and the content above comes into view.  The resident
+page rows are synchronised afterwards, so scrolling into a page that was
+not rendered yet renders it on the spot."
   (interactive "p")
-  (or amount (setq amount 1))
-  (let* ((prev-scroll (window-vscroll))
-	 (vscroll (- prev-scroll amount)))
-    (- prev-scroll (seshat-reader--set-window-vscroll nil vscroll))))
+  (condition-case nil
+      (scroll-down (or amount 1))
+    ((beginning-of-buffer end-of-buffer) nil))
+  (seshat-reader--multipage-sync))
 
 (defun seshat-reader-scroll-down (&optional amount)
-  "Scroll down the current page by AMOUNT.
+  "Scroll the view downward by AMOUNT lines, one line by default.
 
-AMOUNT defaults to 1."
+The text moves up and the content below comes into view.  The resident page
+rows are synchronised afterwards, so scrolling into a page that was not
+rendered yet renders it on the spot."
   (interactive "p")
-  (or amount (setq amount 1))
-  (let* ((prev-scroll (window-vscroll))
-	 (vscroll (+ prev-scroll amount)))
-    (- (seshat-reader--set-window-vscroll nil vscroll) prev-scroll)))
+  (condition-case nil
+      (scroll-up (or amount 1))
+    ((beginning-of-buffer end-of-buffer) nil))
+  (seshat-reader--multipage-sync))
 
 (defun seshat-reader-scroll-up-screen (&optional amount)
-  "Scroll up the current page by a screen.
+  "Scroll the view upward by one screen, or by AMOUNT lines.
 
-Unless AMOUNT is specified in which case we scroll by that value."
+One screen is the window body height minus `next-screen-context-lines', so a
+line of context stays visible.  Switching pages stays on `n' / `p'."
   (interactive "P")
-  (let ((amount (or amount (- (window-body-height)
-			      next-screen-context-lines))))
-    (when (= 0 (seshat-reader-scroll-up amount))
-      (message "Beginning of page"))))
+  (seshat-reader-scroll-up (or amount (- (window-body-height)
+					 next-screen-context-lines))))
 
 (defun seshat-reader-scroll-down-screen (&optional amount)
-  "Scroll down the current page by a screen.
+  "Scroll the view downward by one screen, or by AMOUNT lines.
 
-Unless AMOUNT is specified in which case we scroll by that value."
+One screen is the window body height minus `next-screen-context-lines', so a
+line of context stays visible.  Switching pages stays on `n' / `p'."
   (interactive "P")
-  (let ((amount (or amount (- (window-body-height)
-			      next-screen-context-lines))))
-    (when (= 0 (seshat-reader-scroll-down amount))
-      (message "End of page"))))
+  (seshat-reader-scroll-down (or amount (- (window-body-height)
+					   next-screen-context-lines))))
 
 (defun seshat-reader-scroll-left (&optional amount)
   "Scroll to the left of the current page by AMOUNT.
@@ -1605,48 +1938,46 @@ Only scrolls when the document page width is larger then the window width."
     (set-window-hscroll nil (seshat-reader--right-most-window-hscroll))))
 
 (define-queue-command scroll-up-or-prev-page (&optional amount)
-  "Scroll up the current page by AMOUNT, otherwise switch to the previous page.
+  "Scroll the view upward by AMOUNT lines, one line by default.
 
-AMOUNT defaults to 1."
+The name is kept for the key bindings that predate the multi-page layout:
+the command no longer turns the page, because scrolling itself is continuous
+now and turning pages stays on `n' / `p'."
   (interactive "p")
-  (or amount (setq amount 1))
-  (seshat-reader-scroll-up amount)
-  ;; The join strip makes "the top of the page is on screen" the boundary
-  ;; of a page, which `seshat-reader--at-page-top-p' detects even when the
-  ;; strip itself is still visible.
-  (when (and (seshat-reader--at-page-top-p)
-	     (seshat-reader--non-queue-previous-page)) ; if succeeds
-    ;; Bottom landing keeps the pages continuous when reading upwards.
-    (seshat-reader--set-page-bottom)))
+  (seshat-reader-scroll-up amount))
 
 (define-queue-command scroll-down-or-next-page (&optional amount)
-  "Scroll down the current page by AMOUNT, otherwise switch to the next page.
+  "Scroll the view downward by AMOUNT lines, one line by default.
 
-AMOUNT defaults to 1."
+The name is kept for the key bindings that predate the multi-page layout:
+the command no longer turns the page, because scrolling itself is continuous
+now and turning pages stays on `n' / `p'."
   (interactive "p")
-  (or amount (setq amount 1))
-  (when (and (= 0 (seshat-reader-scroll-down amount))
-	     (seshat-reader--non-queue-next-page)) ; if succeeds
-    (seshat-reader--set-window-vscroll nil 0)))
+  (seshat-reader-scroll-down amount))
 
 (define-queue-command scroll-up-screen-or-prev-page ()
-  "Scroll up the current page by screen, otherwise switch to the previous page."
+  "Scroll the view upward by one screen.
+
+The name is kept for the key bindings that predate the multi-page layout:
+the command no longer turns the page, because scrolling itself is continuous
+now and turning pages stays on `n' / `p'."
   (interactive)
-  (let ((scroll (- (window-body-height)
-		   next-screen-context-lines)))
-    (seshat-reader--non-queue-scroll-up-or-prev-page scroll)))
+  (seshat-reader-scroll-up-screen))
 
 (define-queue-command scroll-down-screen-or-next-page ()
-  "Scroll down the current page by screen, otherwise switch to the next page."
+  "Scroll the view downward by one screen.
+
+The name is kept for the key bindings that predate the multi-page layout:
+the command no longer turns the page, because scrolling itself is continuous
+now and turning pages stays on `n' / `p'."
   (interactive)
-  (let ((scroll (- (window-body-height)
-		   next-screen-context-lines)))
-    (seshat-reader--non-queue-scroll-down-or-next-page scroll)))
+  (seshat-reader-scroll-down-screen))
 
 (define-queue-command mwheel-scroll-up (event)
-  "Scroll up or switch to the previous page, but also handle mouse EVENT.
+  "Scroll the view up, but also handle mouse EVENT.
 
-See also `seshat-reader-non-queue-scroll-up-or-prev-page'."
+The wheel delta is read from the event: one line for a single notch and more
+for a double or triple one.  See also `seshat-reader-scroll-up'."
   (interactive "e")
   (let* ((event-type (car event))
 	 (amount (pcase event-type
@@ -1655,12 +1986,13 @@ See also `seshat-reader-non-queue-scroll-up-or-prev-page'."
 		   ('triple-wheel-up 3)))
 	 (scrolled-window (car (cadr event))))
     (with-selected-window scrolled-window
-      (seshat-reader--non-queue-scroll-up-or-prev-page amount))))
+      (seshat-reader-scroll-up amount))))
 
 (define-queue-command mwheel-scroll-down (event)
-  "Scroll down or switch to the next page, but also handle mouse EVENT.
+  "Scroll the view down, but also handle mouse EVENT.
 
-See also `seshat-reader--non-queue-scroll-down-or-next-page'."
+The wheel delta is read from the event: one line for a single notch and more
+for a double or triple one.  See also `seshat-reader-scroll-down'."
   (interactive "e")
   (let* ((event-type (car event))
 	 (amount (pcase event-type
@@ -1669,7 +2001,7 @@ See also `seshat-reader--non-queue-scroll-down-or-next-page'."
 		   ('triple-wheel-down 3)))
 	 (scrolled-window (car (cadr event))))
     (with-selected-window scrolled-window
-      (seshat-reader--non-queue-scroll-down-or-next-page amount))))
+      (seshat-reader-scroll-down amount))))
 
 (defun seshat-reader-mwheel-scroll-left (event)
   "Scroll to the left, but also handle mouse EVENT.
@@ -1730,20 +2062,20 @@ See also `seshat-reader-shrink-size'."
        (* scaling-factor (seshat-reader-current-doc-scale-value))))))
 
 (defun seshat-reader-rotate-clockwise ()
-  "Rotate the current window's view by 90 degrees, clockwise."
+  "Rotate every page of the current document by 90 degrees, clockwise.
+
+The rotation is buffer-local and is applied when a page is rendered, so the
+rows around the page on screen are rebuilt at the new orientation."
   (interactive)
-  (seshat-reader-dyn--rotate-page 90)
-  (set-window-parameter nil 'native-size nil)
-  (seshat-reader--center-page)
-  (seshat-reader--set-page-top-when-joined))
+  (seshat-reader--multipage-rotate-by 90))
 
 (defun seshat-reader-rotate-counter-clockwise ()
-  "Rotate the current window's view by 90 degrees, counter-clockwise."
+  "Rotate every page of the current document by 90 degrees, counter-clockwise.
+
+The rotation is buffer-local and is applied when a page is rendered, so the
+rows around the page on screen are rebuilt at the new orientation."
   (interactive)
-  (seshat-reader-dyn--rotate-page -90)
-  (set-window-parameter nil 'native-size nil)
-  (seshat-reader--center-page)
-  (seshat-reader--set-page-top-when-joined))
+  (seshat-reader--multipage-rotate-by -90))
 
 (defun seshat-reader--clear-doc-memory ()
   "Clear document memory if we are in `seshat-reader-mode'.
@@ -1765,17 +2097,18 @@ buffer."
   (when (yes-or-no-p "Are you sure you want to close the current document?")
     (kill-buffer (current-buffer))))
 
-(defun seshat-reader--restore-display-on-quit (page scale)
-  "Reload the document with PAGE at SCALE and rebuild window overlays on quit.
+(defun seshat-reader--restore-display-on-quit (page _scale)
+  "Reload the document with PAGE and rebuild the layout on quit.
 
-Quit is deferred inside so the recovery cannot itself be interrupted."
+Quit is deferred inside so the recovery cannot itself be interrupted.  The
+scale is still part of the signature because the caller has it at hand, but
+it is not applied: every page of the layout is rendered at scale 1.0 and
+scaling comes back with a later batch."
   (with-local-quit
     (condition-case nil
         (progn
           (seshat-reader--render-buffer (1- page))
-          (seshat-reader-doc-scale-page scale)
-          (seshat-reader--center-page)
-          (seshat-reader--manage-window-overlays))
+          (seshat-reader--center-page))
       (error nil))))
 
 (define-queue-command refresh-doc-buffer (&optional _ignore-auto _noconfirm _preserve-modes)
@@ -1796,9 +2129,7 @@ This function is replaced as `revert-buffer-function' for `seshat-reader-mode' b
 	  (condition-case err
               (progn
                 (seshat-reader--render-buffer (1- page))
-                (seshat-reader-doc-scale-page scale)
-                (seshat-reader--center-page)
-                (seshat-reader--manage-window-overlays))
+                (seshat-reader--center-page))
             ((quit error)
              (message "Reloading interrupted; restoring display...")
              (seshat-reader--restore-display-on-quit page scale)
@@ -1807,124 +2138,58 @@ This function is replaced as `revert-buffer-function' for `seshat-reader-mode' b
 
 (defun seshat-reader--render-buffer (&optional page)
   "Render the document file current buffer is associated with.
-Load the PAGE if provided."
+Load the PAGE if provided.
+
+PAGE is a 0-based page index, which is what the native loader expects, and
+defaults to the first page.  The document is loaded through
+`seshat-reader-dyn--load-doc', which also attaches a whole-buffer overlay
+displaying a single page; that overlay is closed again, because the pages are
+displayed by the rows of the multi-page layout instead.  The buffer is then
+emptied, the rows around PAGE are rendered and the window is left showing
+PAGE."
   (interactive)
   (if-let* ((file (buffer-file-name (current-buffer))))
       (when (file-exists-p file)
-	(let ((p (if (numberp page) (max 0 page) 0)))
+	(let* ((p (if (numberp page) (max 0 page) 0))
+	       (window (selected-window)))
 	  (seshat-reader-dyn--load-doc file p)
-	  ;; seshat-reader-dyn--load-doc resets the window state, which also
-	  ;; needs to be reflected in the frontend.
-	  (set-window-parameter nil 'scale 1.0)
-	  (set-window-parameter nil 'render-scale nil)
-	  (set-window-parameter nil 'native-size nil)
-	  ;; The page images are rendered anew, so cached specs are stale.
-	  (setq seshat-reader--page-image-specs nil)
-	  ;; 同上：清缓存失败不得中断重载，故吞掉异常。
+	  ;; C 在建完 DocState 后总会挂一个覆盖全文、带单页图片的 overlay；它带着
+	  ;; display 属性，会盖住整页布局。必须经 `--window-close' 释放（它同时
+	  ;; 释放 C 侧的 EmacsWinState），直接 `delete-overlay' 会漏掉那份状态。
+	  (seshat-reader--multipage-drop-c-overlay window)
+	  ;; 页行由本函数重建，旧的页行/标记全部作废。
+	  (let ((inhibit-read-only t))
+	    (erase-buffer))
+	  (seshat-reader--multipage-clear)
+	  ;; 页面按 1.0 重画，窗口参数里的缩放与尺寸缓存全部复位。
+	  (set-window-parameter window 'scale 1.0)
+	  (set-window-parameter window 'render-scale nil)
+	  (set-window-parameter window 'native-size nil)
+	  ;; 位图随重载失效，按页缓存的 spec 不能再复用；清缓存失败不得中断重载。
 	  (ignore-errors (seshat-reader--page-spec-clear-cache))
-	  (seshat-reader--update-join-strip)
+	  (let* ((target (or (seshat-reader--multipage-clamp-page (1+ p)) 1))
+		 (preload (max 0 seshat-reader--multipage-preload))
+		 (count (seshat-reader--multipage-pagecount))
+		 (first (max 1 (- target preload)))
+		 (last (if count (min count (+ target preload))
+			 (+ target preload)))
+		 (number first))
+	    (while (<= number last)
+	      (seshat-reader--multipage-render-page number)
+	      (setq number (1+ number)))
+	    (seshat-reader--multipage-goto target))
 	  ;; 文档文本由原生模块生成，buffer 永远不是用户意义上的「已编辑」。
 	  ;; `seshat-reader-dyn--load-doc' 重写全文后留下的 modified 标志必须清掉，
 	  ;; 否则 revert 后 modeline 显示 **，super-save 等包会把重生成内容写回 PDF。
 	  (set-buffer-modified-p nil)))
     (message "No file associated with buffer.")))
 
-;; We have an overlay per window, since we (naturally) need to be able
-;; show different pages on different windows.
-;;
-;; The window knows (as a window parameter):
-;; * Which overlay it belongs to.
-;; * Which page number it's currently displaying.
-;; * What the current scale is.
-;;
-;; The overlay knows (as an overlay property):
-;; * Which window it belongs to.
-;; * user pointer to the underlying EmacsWinState from the native
-;; module.
-;;
-;; Window and overlay need to know each other for efficient lookup.
-
-(defun seshat-reader--manage-window-overlays ()
-  "Manage the creation and deletion of window overlays as needed.
-
-It is hooked to `window-configuration-change-hook' to keep detecting."
-  (let ((overlays (car (overlay-lists)))
-	(windows (get-buffer-window-list (current-buffer) nil t)))
-    (mapc #'seshat-reader--window-close-function overlays)
-    (mapc #'seshat-reader--window-create-function windows)))
-
-(defun seshat-reader--window-create-function (window)
-  "Create window overlay for WINDOW."
-  (when-let* ((existing-overlay (window-parameter window 'overlay))
-
-	      ;; Check if overlay exists but is invalid or belongs to
-	      ;; a different buffer.
-	      ((or (not (overlayp existing-overlay))
-                   (not (eq (overlay-buffer existing-overlay) (current-buffer))))))
-
-    ;; We intentionally DO NOT clear 'page and 'scale here.  We must
-    ;; preserve the window's independent page and scale parameters so
-    ;; they can be restored to the new DocState.
-    (set-window-parameter window 'overlay nil))
-
-  (unless (window-parameter window 'overlay)
-    ;; Prioritize the window's own page and scale parameters.
-    (let* ((page (or (window-parameter window 'page)
-                     seshat-reader--recent-pagenumber-fallback
-                     1))
-           (scale (or (window-parameter window 'scale)
-                      seshat-reader--recent-scale-fallback
-                      1.0)))
-      ;; 新窗口的适配模式起点。已有 fit-mode 的窗口（用户按过 W/H，或
-      ;; --first-fit 已记录）不被覆盖，因此只在参数缺失时写入。
-      (unless (window-parameter window 'fit-mode)
-        (set-window-parameter window 'fit-mode
-                              (seshat-reader--normalize-default-fit
-                               seshat-reader-default-fit)))
-      (seshat-reader-dyn--window-create window)
-      (set-window-parameter window 'page page)
-      (with-selected-window window
-        (seshat-reader-goto-page page)
-        (seshat-reader-doc-scale-page scale)
-        (seshat-reader--center-page)))))
-
-(defun seshat-reader--window-close-function (overlay)
-  "Properly close the window belonging to OVERLAY."
-  (let ((window (overlay-get overlay 'window)))
-    (unless (window-valid-p window)
-      (seshat-reader-dyn--window-close overlay))))
-
-(defun seshat-reader--handle-window-buffer-change (window)
-  "Handle overlay state when WINDOW's buffer changes.
-
-Cleans up stale overlays if the window switched to a different buffer,
-ensures a valid overlay exists if the new buffer is a seshat-reader buffer,
-and recentres a window whose page overlay survived the switch.
-
-`set-window-buffer' resets the window's horizontal scroll to zero on its
-own, and showing the same document in a new window or a new frame triggers
-neither `window-size-change-functions' nor the creation of a new overlay,
-so without this recentre the page stays glued to the right edge of the
-window and never recovers."
-  (when (windowp window)
-    (let ((overlay (window-parameter window 'overlay)))
-      (when (and overlay (overlayp overlay))
-        (unless (eq (overlay-buffer overlay) (window-buffer window))
-          ;; Overlay belongs to a different buffer. Clean it up.
-          (seshat-reader-dyn--window-close overlay)
-          (set-window-parameter window 'overlay nil)
-          ;; We intentionally preserve 'page and 'scale so they can be
-          ;; restored if the user switches back to the original seshat-reader buffer.
-          )))
-    ;; If the new buffer is a seshat-reader buffer: recentre when the page
-    ;; overlay is already there, otherwise create it.  The two branches are
-    ;; mutually exclusive on purpose — `--window-create-function' already
-    ;; centres the page, so recentring again would only do the work twice.
-    (when (with-current-buffer (window-buffer window)
-            (derived-mode-p 'seshat-reader-mode))
-      (if (window-parameter window 'overlay)
-          (seshat-reader--recenter-window window)
-        (seshat-reader--window-create-function window)))))
+;; The layout keeps one buffer row per page and no per-window overlay, so the
+;; window no longer owns any display state: every window showing this buffer
+;; shows the same text and only differs in where it is scrolled to.  The
+;; window state that is left is the fit mode (`fit-mode'), initialised by
+;; `seshat-reader--ensure-window-layout', and the scale parameters the
+;; geometry batch maintains.
 
 ;; We explicitly bind default keys because relying on the rebinding
 ;; mechanism can lead to them not being bound at all if users have
@@ -2226,15 +2491,23 @@ Keybindings:
   ;; 起点由 `seshat-reader-default-fit' 的 `fit-mode' 决定（默认含 contain）。
   (seshat-reader--first-fit)
   (add-hook 'window-size-change-functions #'seshat-reader--window-size-change nil t)
-  (add-hook 'window-configuration-change-hook #'seshat-reader--manage-window-overlays nil t)
-  (add-hook 'window-buffer-change-functions #'seshat-reader--handle-window-buffer-change nil t)
-  (add-hook 'pre-redisplay-functions #'seshat-reader--pre-redisplay-center nil t))
+  ;; 多页布局下窗口不再拥有显示状态：新窗口、尺寸变化与「换成本 buffer」都由
+  ;; `window-state-change-functions' 承接，它按窗口补齐可见页并初始化 fit-mode。
+  ;; 因此不再需要 `window-configuration-change-hook' 与
+  ;; `window-buffer-change-functions'：没有 per-window overlay 可建可删。
+  (add-hook 'window-state-change-functions #'seshat-reader--ensure-window-layout nil t)
+  (add-hook 'pre-redisplay-functions #'seshat-reader--pre-redisplay-center nil t)
+  ;; 滚动后补齐可见页。追加到末尾（DEPTH 传 t），不与命令队列的
+  ;; `--process-command-queue' 抢顺序；先 remove 再 add，重复进 mode 不累积副本。
+  (remove-hook 'post-command-hook #'seshat-reader--multipage--after-command t)
+  (add-hook 'post-command-hook #'seshat-reader--multipage--after-command t t))
 
 (defun seshat-reader--page-indicator ()
   "返回 `[当前页/总页]' 形式的字符串，供 mode-line 显示.
-当前页取 `seshat-reader-current-doc-pagenumber'（读窗口参数），总页数取
-buffer-local 变量 `seshat-reader-current-doc-pagecount'（由动态模块设置）；
-任一取不到（文档尚未加载完）时该项用 `?' 占位，不报错、不阻塞 redisplay。"
+当前页取 `seshat-reader-current-doc-pagenumber'（多页布局下由视口顶页派生），
+总页数取 buffer-local 变量 `seshat-reader-current-doc-pagecount'（由动态模块
+设置）；任一取不到（文档尚未加载完）时该项用 `?' 占位，不报错、不阻塞
+redisplay。"
   (format "[%s/%s]"
           (or (seshat-reader-current-doc-pagenumber) "?")
           (or (bound-and-true-p seshat-reader-current-doc-pagecount) "?")))
@@ -2247,8 +2520,15 @@ buffer-local 变量 `seshat-reader-current-doc-pagecount'（由动态模块设�
 (defun seshat-reader-mode-line ()
   "Set custom mode-line interface when reading documents."
   (setq-local mode-line-position
-	      '(" P" (:eval (number-to-string (seshat-reader-current-doc-pagenumber)))
-                "/" (:eval (number-to-string seshat-reader-current-doc-pagecount))))
+	      '(" P" (:eval (let ((page (seshat-reader-current-doc-pagenumber)))
+			      (or (and (integerp page)
+				       (number-to-string page))
+				  "?")))
+                "/" (:eval (let ((count (bound-and-true-p
+					 seshat-reader-current-doc-pagecount)))
+			     (or (and (integerp count)
+				      (number-to-string count))
+				 "?")))))
   ;; 第三方 modeline（doom-modeline 等）接管 `mode-line-format' 后不会读
   ;; `mode-line-position'，故同时把页码挂到 `mode-line-misc-info'：
   ;; doom-modeline 的 misc-info segment 会 `format-mode-line' 它，原生 modeline
@@ -2273,12 +2553,16 @@ buffer-local 变量 `seshat-reader-current-doc-pagecount'（由动态模块设�
 (add-hook 'seshat-reader-mode-hook #'imenu-add-menubar-index)
 
 (defun seshat-reader--redisplay-all-windows ()
-  "Redisplay the current document in all windows showing this buffer."
-  (let ((current-win (selected-window)))
-    (dolist (win (get-buffer-window-list (current-buffer) nil t))
-      (with-selected-window win
-        (seshat-reader-dyn--redisplay-doc)))
-    (select-window current-win)))
+  "Re-render the page rows of the current buffer.
+
+The pages of the multi-page layout are not attached to a window, so
+re-rendering the document once per window would only repeat identical work:
+the cached specs are dropped once and the rows around the page on screen are
+rendered again.  Every other window keeps its own page, because the row
+markers move with the text they belong to."
+  (ignore-errors (seshat-reader--page-spec-clear-cache))
+  (seshat-reader--multipage-relayout (seshat-reader-current-doc-pagenumber))
+  (force-mode-line-update))
 
 (define-minor-mode seshat-reader-dark-mode
   "Toggle dark-mode for current seshat-reader document."
