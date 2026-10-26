@@ -615,6 +615,108 @@ dropped by the C side when it replaces the spec on the next re-render."
 WINDOW must be a valid window and defaults to the selected one."
   (/ (window-body-width window t) (window-body-width window)))
 
+;;; Per-page image spec (P0 groundwork for a multi-page layout)
+
+;; `seshat-reader-dyn--page-image-spec' renders one page outside the display
+;; path: given a page number, a scale and a rotation it hands back the image
+;; spec of that page without reading or writing a window parameter, an
+;; overlay, a cache slot or the current page number.  The wrapper below adds
+;; a small spec cache on top of it.
+;;
+;; The entry point is synchronous and blocks the Emacs main thread for about
+;; as long as one page of `seshat-reader-dyn--refresh-highlights', so P0 only
+;; exposes it for explicit measurement (and for P1 to build on).  Nothing in
+;; the display, redisplay or scrolling paths may call it.
+
+(defvar seshat-reader--page-spec-cache-limit 8
+  "Maximum number of specs kept in `seshat-reader--page-spec-cache'.
+
+Each entry pins a copy of the page bitmap on the Lisp heap (the `:data'
+string of the spec) while the native module keeps its own copy in the
+`CachedPage' and in the MuPDF image cache, so one entry costs roughly two
+bitmaps.  Eight is what P0 needs to measure page-to-page reuse; do not
+raise it past sixteen.")
+
+(defvar-local seshat-reader--page-spec-cache nil
+  "Buffer-local cache of per-page image specs, newest entry first.
+
+Each element is a cons cell (KEY . SPEC).  KEY is the normalized list
+\(PAGE SCALE ROTATE), as built by `seshat-reader--page-spec-key', and SPEC
+is the image spec the native module returned for it.  At most
+`seshat-reader--page-spec-cache-limit' entries are kept and the oldest one
+is dropped first.  Only `seshat-reader--page-spec' reads this cache: no
+display path uses it in P0.")
+
+(defun seshat-reader--page-spec-key (page &optional scale rotate)
+  "Return the cache key for PAGE rendered at SCALE and rotated by ROTATE.
+
+SCALE defaults to 1.0 and is coerced to a float, ROTATE defaults to 0, so
+that equal requests spelled differently (nil / 1 / 1.0) share one key —
+`assoc' compares keys with `equal', which equates neither 1 with 1.0 nor
+nil with 1.0."
+  (list page
+        (cond ((null scale) 1.0)
+              ((numberp scale) (float scale))
+              (t scale))
+        (cond ((null rotate) 0)
+              ((numberp rotate) (truncate rotate))
+              (t rotate))))
+
+(defun seshat-reader--page-spec-remember (key spec)
+  "Cache SPEC under KEY, dropping the oldest entry above the cache limit.
+
+The list is kept newest first, so the oldest entry is the last one; the
+walk is a plain `while' loop rather than a `cl-*' helper to stay in line
+with the hand-written list code elsewhere in this file."
+  (push (cons key spec) seshat-reader--page-spec-cache)
+  (let ((tail seshat-reader--page-spec-cache)
+        (count 1))
+    (while (and (cdr tail) (< count seshat-reader--page-spec-cache-limit))
+      (setq tail (cdr tail))
+      (setq count (1+ count)))
+    (when (cdr tail)
+      (setcdr tail nil)))
+  seshat-reader--page-spec-cache)
+
+(defun seshat-reader--page-spec (page &optional scale rotate)
+  "Return the image spec of PAGE rendered at SCALE and rotated by ROTATE.
+
+PAGE is 1-based.  SCALE is a multiple of 72 dpi (1.0 when nil) and is
+clamped by the native module to its MINRES/MAXRES range.  ROTATE is 0 when
+nil and must then be 0, 90, 180 or 270.  The native module rejects invalid
+arguments (out-of-range or non-integral page, non-numeric scale,
+unsupported rotation, document being reloaded) by returning nil, and nil is
+what this function returns then as well; a nil result is never cached.
+
+A spec is cached in `seshat-reader--page-spec-cache' under the normalized
+key (PAGE SCALE ROTATE), so a repeated request returns the very same spec
+object without calling the native module again.  Rendering is synchronous
+and blocks the Emacs main thread, so this is a measurement/P1 hook only and
+must not be called from a scrolling or redisplay path.  The result is nil
+when the loaded native module predates the entry point, which keeps this
+file working with an older `seshat-render-core'."
+  (when (fboundp 'seshat-reader-dyn--page-image-spec)
+    (let* ((key (seshat-reader--page-spec-key page scale rotate))
+           (cached (assoc key seshat-reader--page-spec-cache)))
+      (if cached
+          (cdr cached)
+        ;; The normalized key doubles as the argument list, so the scale and
+        ;; rotate defaults are applied in exactly one place.
+        (let ((spec (seshat-reader-dyn--page-image-spec
+                     page (nth 1 key) (nth 2 key))))
+          (when spec
+            (seshat-reader--page-spec-remember key spec))
+          spec)))))
+
+(defun seshat-reader--page-spec-clear-cache ()
+  "Drop every cached per-page image spec of the current buffer.
+
+Called when the cached specs become stale: the document is closed
+\(`seshat-reader--clear-doc-memory') or re-rendered
+\(`seshat-reader--render-buffer'), where the page bitmaps and the
+decorations painted into them are rebuilt from scratch."
+  (setq seshat-reader--page-spec-cache nil))
+
 ;;; Cross-page join
 
 ;; The bottom strip of the previous page is drawn as a single buffer line
@@ -1479,6 +1581,9 @@ for this buffer is cancelled as well, so that no timer survives the
 buffer."
   (when (derived-mode-p 'seshat-reader-mode)
     (seshat-reader--cancel-pending-refit)
+    ;; 关文档后位图（含装饰）全部失效，按页缓存的 spec 不能再复用。
+    ;; 清理失败不得拦住关文档本身，故吞掉异常。
+    (ignore-errors (seshat-reader--page-spec-clear-cache))
     (seshat-reader-dyn--close-doc)))
 (add-hook 'kill-buffer-hook 'seshat-reader--clear-doc-memory nil t)
 
@@ -1543,6 +1648,8 @@ Load the PAGE if provided."
 	  (set-window-parameter nil 'native-size nil)
 	  ;; The page images are rendered anew, so cached specs are stale.
 	  (setq seshat-reader--page-image-specs nil)
+	  ;; 同上：清缓存失败不得中断重载，故吞掉异常。
+	  (ignore-errors (seshat-reader--page-spec-clear-cache))
 	  (seshat-reader--update-join-strip)
 	  ;; 文档文本由原生模块生成，buffer 永远不是用户意义上的「已编辑」。
 	  ;; `seshat-reader-dyn--load-doc' 重写全文后留下的 modified 标志必须清掉，
