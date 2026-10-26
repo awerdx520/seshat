@@ -717,6 +717,178 @@ Called when the cached specs become stale: the document is closed
 decorations painted into them are rebuilt from scratch."
   (setq seshat-reader--page-spec-cache nil))
 
+;;; Multi-page layout skeleton (P1 T1)
+
+;; P1 replaces the per-window page overlay with a buffer that holds one row
+;; per page, each row carrying that page's image spec as its `display' text
+;; property.  The code below is only the data structure and the row
+;; primitives of that layout: nothing here is called from
+;; `seshat-reader--render-buffer', from the scrolling commands or from any
+;; other existing path.  T1 lands the structure first; T1b and T4 wire it
+;; into the display path.
+
+(defcustom seshat-reader-page-gap-lines 0
+  "Number of blank lines kept between two consecutive page rows.
+
+0 makes adjacent pages touch each other, which matches the continuous
+scrolling layout of the Android client; a positive value leaves that many
+empty lines between the bottom of one page and the top of the next one."
+  :group 'seshat-reader
+  :type 'integer)
+
+(defvar-local seshat-reader--multipage-preload 2
+  "Number of pages kept resident above and below the visible ones.
+
+The resident set is the page at the top of the window through the page at
+its bottom, widened by this many pages in each direction and clipped to
+the pages that actually exist in the buffer.  A value of 0 keeps only the
+pages the window currently shows.")
+
+(defvar-local seshat-reader--pages nil
+  "Page rows of the multi-page layout of the current buffer.
+
+Each element is (PAGE MARKER . SPEC): PAGE is the 1-based page number,
+MARKER points at the first character of the page row (made with
+`copy-marker' and an insertion type of t, so text inserted at the row
+start stays before the marker) and SPEC is the image spec the row
+displays, or nil while the page has not been rendered yet.  The list is
+kept sorted by PAGE; go through `seshat-reader--multipage-insert-page' and
+`seshat-reader--multipage-remove-page' rather than editing it directly.")
+
+(defun seshat-reader--multipage-page-row (spec)
+  "Return the buffer text of one page row displaying SPEC.
+
+SPEC is an image spec as returned by `seshat-reader--page-spec', or nil
+for a page that is not rendered yet.  The row is a single space carrying
+SPEC as its `display' property followed by a newline, so the row occupies
+exactly one buffer line and has a well-defined line start to anchor its
+marker on.  A nil SPEC returns a placeholder row without the property."
+  (if spec
+      (concat (propertize " " 'display spec) "\n")
+    " \n"))
+
+(defun seshat-reader--multipage-page-spec (page)
+  "Return the image spec recorded for PAGE, or nil when it has none.
+
+PAGE is a 1-based page number.  nil means either that the page is not part
+of the layout or that it is part of it but not rendered yet; callers that
+must tell those two cases apart test `seshat-reader--pages' with `assq'."
+  (cddr (assq page seshat-reader--pages)))
+
+(defun seshat-reader--multipage-insert-page (page spec)
+  "Insert the row of PAGE holding SPEC, keeping the layout sorted by page.
+
+PAGE is a 1-based page number and SPEC is an image spec, or nil for a page
+that is not rendered yet.  A page that already has a row only gets its
+SPEC replaced and the function returns nil, so it is idempotent and can be
+called on every scroll step.  A new row goes before the first row of a
+greater page and at the end of the buffer when PAGE is greater than every
+page present; the newline count from `seshat-reader-page-gap-lines' is
+appended after the row.  The buffer is written under `inhibit-read-only'
+and left unmodified, and the marker of the row is returned."
+  (let ((entry (assq page seshat-reader--pages)))
+    (if entry
+        (let ((start (marker-position (cadr entry))))
+          ;; 结构里的 spec 与 buffer 上的 `display' 属性必须一致：行首那个空格
+          ;; 是属性的唯一载体，spec 为 nil 时把属性摘掉。
+          (let ((inhibit-read-only t))
+            (if spec
+                (put-text-property start (1+ start) 'display spec)
+              (remove-text-properties start (1+ start) '(display nil)))
+            (set-buffer-modified-p nil))
+          (setcdr (cdr entry) spec)
+          nil)
+      (let ((inhibit-read-only t)
+            (start nil))
+        ;; 页按页号升序存放，第一个页号更大的行就是插入点。
+        (catch 'found
+          (dolist (other seshat-reader--pages)
+            (when (> (car other) page)
+              (setq start (marker-position (cadr other)))
+              (throw 'found t))))
+        (save-excursion
+          (goto-char (or start (point-max)))
+          (let ((row-start (point)))
+            (insert (seshat-reader--multipage-page-row spec))
+            (dotimes (_ seshat-reader-page-gap-lines)
+              (insert "\n"))
+            ;; marker 在插入之后创建：位置 = 页行行首，插入类型 t 保证之后在
+            ;; 行首前插入别的页时它随文本后移，仍指向自己的页行。
+            (let ((marker (copy-marker row-start t)))
+              (setq seshat-reader--pages
+                    (sort (cons (cons page (cons marker spec))
+                                seshat-reader--pages)
+                          (lambda (a b) (< (car a) (car b)))))
+              (set-buffer-modified-p nil)
+              marker)))))))
+
+(defun seshat-reader--multipage-remove-page (page)
+  "Remove the row of PAGE and return the image spec it was displaying.
+
+PAGE is a 1-based page number.  The row and the gap newlines that follow
+it are deleted, the marker is detached with `set-marker' so that it cannot
+leak, and the page is dropped from `seshat-reader--pages'.  The returned
+spec is the one `seshat-reader--multipage-insert-page' was given for that
+page, or nil when the page has no row or was not rendered; that is what
+the caller needs in order to release the bitmap.  The buffer is written
+under `inhibit-read-only' and left unmodified."
+  (let ((entry (assq page seshat-reader--pages)))
+    (when entry
+      (let ((marker (cadr entry))
+            (spec (cddr entry)))
+        (let ((inhibit-read-only t))
+          (let ((start (marker-position marker)))
+            (set-marker marker nil)
+            ;; 页行固定是「空格 + 换行」两个字符，其后跟着 gap 空行。
+            (delete-region start
+                           (min (point-max)
+                                (+ start 2
+                                   (max 0 seshat-reader-page-gap-lines))))))
+        (setq seshat-reader--pages (delq entry seshat-reader--pages))
+        (unless seshat-reader--pages
+          (setq seshat-reader--pages nil))
+        (set-buffer-modified-p nil)
+        spec))))
+
+(defun seshat-reader--multipage-page-at-pos (pos)
+  "Return the number of the page that contains POS, or nil.
+
+POS inside a page row, at its line end or in the gap newlines that follow
+it belongs to that page, so the answer only changes at the start of the
+next row.  POS before the first page row, past the end of the buffer or in
+a buffer without page rows returns nil."
+  (when (and seshat-reader--pages
+             (integer-or-marker-p pos)
+             (<= pos (point-max)))
+    (let ((page nil))
+      (dolist (entry seshat-reader--pages)
+        (when (<= (marker-position (cadr entry)) pos)
+          (setq page (car entry))))
+      page)))
+
+(defun seshat-reader--multipage-visible-range (&optional window)
+  "Return the pages to keep resident for WINDOW as a cons (FIRST . LAST).
+
+WINDOW defaults to the selected window and must be a live window.  FIRST
+and LAST are page numbers: the ones at `window-start' and `window-end',
+widened by `seshat-reader--multipage-preload' pages in each direction and
+clipped to the pages present in the buffer.  The viewport counts as a
+single page when `window-end' cannot be determined.  The value is nil when
+the buffer has no page rows."
+  (when seshat-reader--pages
+    (let* ((win (or window (selected-window)))
+           (first-page (or (seshat-reader--multipage-page-at-pos
+                            (window-start win))
+                           (car (car seshat-reader--pages))))
+           (last-page (or (when-let* ((end (window-end win t)))
+                            (seshat-reader--multipage-page-at-pos end))
+                          first-page))
+           (lowest (car (car seshat-reader--pages)))
+           (highest (car (car (last seshat-reader--pages))))
+           (preload (max 0 seshat-reader--multipage-preload)))
+      (cons (max lowest (- first-page preload))
+            (min highest (+ (max first-page last-page) preload))))))
+
 ;;; Cross-page join
 
 ;; The bottom strip of the previous page is drawn as a single buffer line
