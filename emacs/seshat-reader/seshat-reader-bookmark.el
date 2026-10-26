@@ -45,7 +45,11 @@
       (unless (derived-mode-p 'seshat-reader-mode)
 	(seshat-reader-mode))
       (seshat-reader-goto-page page)
-      (seshat-reader-doc-scale-page scale)
+      ;; P1：单页时代的 `seshat-reader-doc-scale-page'（走 C 侧按页缩放）已删除，
+      ;; 缩放口径改为 buffer 级的 base scale，故这里直接设 base scale。存的是绝对
+      ;; 比例（不是增量），且不传 SOURCE，免得把「手动缩放」标成 fit。
+      (when (numberp scale)
+        (seshat-reader--multipage-set-scale scale))
       (seshat-reader--center-page)
       (set-window-hscroll nil hscroll)
       (set-window-vscroll nil vscroll))))

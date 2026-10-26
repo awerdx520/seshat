@@ -44,6 +44,9 @@
 (require 'ert)
 (require 'cl-lib)
 (require 'seshat-reader)
+;; T7：选区（`seshat-reader-select-*'）与滚轮命令的用例需要 select 模块，
+;; 它的 `with-eval-after-load' 只负责绑 `down-mouse-1'，batch 里无副作用。
+(require 'seshat-reader-select)
 
 ;; `seshat-reader-current-doc-pagecount' 由 C 模块注册为永久 buffer-local；本套件
 ;; 不打开真实文档，故在此声明为 special，让 `let' 能临时模拟文档页数。
@@ -2156,6 +2159,198 @@ is cleared when the document is reloaded with the cache."
               (seshat-reader--page-spec-clear-cache)
               (should-not seshat-reader--multipage-memory-warned))))
       (kill-buffer buffer))))
+
+;;;; T7：选区 / 滚轮 / 单页 overlay 残留（P1 批次 6）
+
+(defun seshat-reader-multipage-test--load-select-source ()
+  "Reload `seshat-reader-select' from source so `posn-*' stubs take effect.
+
+`posn-window'/`posn-object'/`posn-object-x-y' 在 Emacs 31 里是可内联的函数，
+`make all' 生成的 `seshat-reader-select.elc' 已把它们**内联**进
+`seshat-reader-select-posn->page'，`cl-letf' 改 `symbol-function' 也拦不住。
+测试里改载同源的 `.el'，这些访问器就恢复成运行时查找（语义不变）。"
+  (let* ((elc (symbol-file 'seshat-reader-select-posn->page 'defun))
+         (el (and elc (concat (file-name-sans-extension elc) ".el"))))
+    (when (and el (file-exists-p el))
+      (load el nil t t))))
+
+;; 这一节钉住三件事：`seshat-reader-current-doc-overlay' 自 P1 起返回的是
+;; **image spec** 而不是 overlay（真机 `Wrong type argument: overlayp, nil` 的
+;; 根源是还有调用方把它当 overlay 用）；选区坐标换算只看 `posn-object-x-y'
+;; 与页 scale；滚轮命令在 buffer 首尾静默，且 `pixel-scroll-precision-mode'
+;; 的命令被重映射回本 mode。
+
+(ert-deftest seshat-reader-multipage-test--current-doc-overlay-returns-spec ()
+  "`seshat-reader-current-doc-overlay' returns the image spec of a page, never an overlay.
+
+P1 起该访问器返回 image spec（`overlayp' 为 nil、`car-safe' 是 `image'），不再是单页时代的 overlay。"
+  (let* ((fixture (seshat-reader-multipage-test--geometry-buffer '(1 2)))
+         (buffer (car fixture)))
+    (unwind-protect
+        (seshat-reader-multipage-test--with-window-buffer buffer
+          (with-current-buffer buffer
+            (let ((spec (seshat-reader-current-doc-overlay (selected-window) 2)))
+              (should spec)
+              (should-not (overlayp spec))
+              (should (eq 'image (car-safe spec)))
+              ;; 与按页访问器是**同一个对象**（不是拷贝）：引导空格的
+              ;; `align-to' 靠对象身份跟随尺寸
+              (should (eq spec (seshat-reader--multipage-page-spec 2)))
+              ;; 不给 PAGE 时取视口顶页
+              (should (eq (seshat-reader-current-doc-overlay)
+                          (seshat-reader--multipage-page-spec
+                           (seshat-reader--multipage-window-start-page)))))))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--select-posn->page-divides-by-page-scale ()
+  "Convert image pixels to page coordinates, independently of the visible page.
+
+`posn-object-x-y' 已含滚动与居中偏移，故换算只需除掉页 scale；视口非首页时
+`posn-object-x-y' 报的就是该页图内的坐标。"
+  (let* ((fixture (seshat-reader-multipage-test--geometry-buffer '(1 2)))
+         (buffer (car fixture))
+         (window (selected-window)))
+    (unwind-protect
+        (seshat-reader-multipage-test--with-window-buffer buffer
+          (with-current-buffer buffer
+            (seshat-reader-multipage-test--load-select-source)
+            ;; 视口停在第 2 页（非首页）
+            (set-window-start window
+                              (seshat-reader-multipage-test--row-start 2))
+            (should (= 2 (seshat-reader-current-doc-pagenumber window)))
+            (set-window-parameter window 'scale 2.0)
+            (cl-letf (((symbol-function 'posn-window) (lambda (_posn) window))
+                      ((symbol-function 'posn-object)
+                       (lambda (_posn) (list 'image :type 'pbm :data "x")))
+                      ((symbol-function 'posn-object-x-y)
+                       (lambda (_posn) '(200 . 400)))
+                      ((symbol-function 'frame-scale-factor)
+                       (lambda (&optional _frame) 1.0)))
+              (should (equal (cons 100.0 200.0)
+                             (seshat-reader-select-posn->page '(dummy)))))))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--select-extract-survives-a-non-page-position ()
+  "`select-extract' returns nil, without signalling, when a drag ends outside a page.
+
+T7 的验收是「不崩」：跨页选区的 `user-error' 属 T8，本批只要求
+`seshat-reader-select-extract' 在两端页号不一时安静返回 nil。"
+  (let* ((fixture (seshat-reader-multipage-test--geometry-buffer '(1 2)))
+         (buffer (car fixture))
+         (window (selected-window))
+         (messages 0))
+    (unwind-protect
+        (seshat-reader-multipage-test--with-window-buffer buffer
+          (with-current-buffer buffer
+            (seshat-reader-multipage-test--load-select-source)
+            (set-window-parameter window 'scale 1.0)
+            (let ((seshat-reader-select-last nil))
+              (cl-letf (((symbol-function 'posn-window) (lambda (_posn) window))
+                      ;; 起点在图片上（`(image …)'），终点落在页间空隙（nil）
+                        ((symbol-function 'posn-object)
+                         (lambda (posn)
+                           (when (eq (car-safe posn) 'image-pos)
+                             (list 'image :type 'pbm :data "x"))))
+                        ((symbol-function 'posn-object-x-y)
+                         (lambda (_posn) '(10 . 20)))
+                        ((symbol-function 'frame-scale-factor)
+                         (lambda (&optional _frame) 1.0))
+                        ((symbol-function 'message)
+                         (lambda (&rest _args) (cl-incf messages))))
+                (should-not (seshat-reader-select-extract '(image-pos) '(gap)))
+                (should (= 1 messages))
+                (should-not seshat-reader-select-last)))))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--scroll-commands-swallow-buffer-limits ()
+  "Scroll commands return nil silently at the buffer limits.
+
+真机上滚轮停在文档首尾时会出现 `Beginning of buffer' / `End of buffer'；
+`seshat-reader-scroll-*' 用 `ignore-errors' 吞掉这类信号，它们属于边界而非错误。"
+  (cl-letf (((symbol-function 'seshat-reader--multipage-scroll)
+             (lambda (&optional _pixels)
+               (signal 'beginning-of-buffer nil))))
+    (should-not (seshat-reader-scroll-up))
+    (should-not (seshat-reader-scroll-down))
+    (should-not (seshat-reader-scroll-up-screen))
+    (should-not (seshat-reader-scroll-down-screen)))
+  (cl-letf (((symbol-function 'seshat-reader--multipage-scroll)
+             (lambda (&optional _pixels)
+               (signal 'end-of-buffer nil))))
+    (should-not (seshat-reader-scroll-up))
+    (should-not (seshat-reader-scroll-down)))
+  ;; 滚轮包装同样静默（走非队列版本，队列版只负责排队）
+  (let ((window (selected-window)))
+    (cl-letf (((symbol-function 'seshat-reader--multipage-scroll)
+               (lambda (&optional _pixels)
+                 (signal 'beginning-of-buffer nil))))
+      (should-not (seshat-reader--non-queue-mwheel-scroll-up
+                   (list 'wheel-up (list window 10 10) 0 nil '(0 . -1))))
+      (should-not (seshat-reader--non-queue-mwheel-scroll-down
+                   (list 'wheel-down (list window 10 10) 0 nil '(0 . 1)))))))
+
+(ert-deftest seshat-reader-multipage-test--pixel-scroll-precision-is-remapped ()
+  "`pixel-scroll-precision-mode' wheel commands are remapped to this mode's commands.
+
+它是**全局** minor mode，键表优先级高于本 mode 的局部键表；命令重映射在命令
+解析之后才查，故能把滚轮收回本 mode（否则 `<wheel-up>' 永远走不出它的像素滚动）。
+`pixel-scroll-precision' 是它绑在 `<wheel-up>' 上的命令，另两个是它内部调用
+的滚动函数，老版本可能直接绑它们。"
+  (let* ((fixture (seshat-reader-multipage-test--geometry-buffer '(1 2)))
+         (buffer (car fixture)))
+    (unwind-protect
+        (seshat-reader-multipage-test--with-window-buffer buffer
+          (with-current-buffer buffer
+            (use-local-map seshat-reader-mode-map)
+            (when (fboundp 'pixel-scroll-precision)
+              (should (eq 'seshat-reader-mwheel-precision-scroll
+                          (command-remapping 'pixel-scroll-precision))))
+            (should (eq 'seshat-reader-scroll-up
+                        (command-remapping 'pixel-scroll-precision-scroll-up)))
+            (should (eq 'seshat-reader-scroll-down
+                        (command-remapping 'pixel-scroll-precision-scroll-down)))
+            ;; 未知命令没有重映射，证明上面不是恒真
+            (should-not (command-remapping 'seshat-reader-next-page))))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--precision-wheel-dispatcher-keeps-direction ()
+  "Dispatch the remapped wheel event by direction and notch count, not by pixel delta.
+
+`pixel-scroll-precision' 一档一步、按原始像素增量滚动；本 mode 的滚轮语义是
+「一档 = 一个 `seshat-reader--scroll-step-pixels'」，故分发器只看事件符号与
+档数，没有方向符号（触控板）时才回落到像素增量的符号。"
+  (let ((window (selected-window))
+        (up 0)
+        (down 0))
+    (cl-letf (;; 分发器转调的是队列命令（与直接绑 `<wheel-up>' 一致），这里让队列
+              ;; 立即执行，计数才是同步可见的
+              ((symbol-function 'seshat-reader--enqueue-command)
+               ;; 注意 `args' 是**参数表**，要 `apply' 展开（生产代码里是
+               ;; `(apply #\'apply-partially cmd args)'）
+               (lambda (cmd args) (apply cmd args)))
+              ((symbol-function 'seshat-reader-scroll-up)
+               (lambda (&optional amount) (cl-incf up (or amount 1))))
+              ((symbol-function 'seshat-reader-scroll-down)
+               (lambda (&optional amount) (cl-incf down (or amount 1)))))
+      ;; 一档上滚
+      (seshat-reader-mwheel-precision-scroll
+       (list 'wheel-up (list window 10 10) 0 nil '(0 . -1)))
+      (should (= 1 up))
+      (should (= 0 down))
+      ;; 双击档下滚 = 两步
+      (seshat-reader-mwheel-precision-scroll
+       (list 'double-wheel-down (list window 10 10) 0 nil '(0 . 2)))
+      (should (= 1 up))
+      (should (= 2 down))
+      ;; 没有方向符号：按像素增量符号（负 = 内容下移 = 本 mode 的上滚）
+      (seshat-reader-mwheel-precision-scroll
+       (list 'mouse-movement (list window 10 10) 0 nil '(0 . -3)))
+      (should (= 2 up))
+      ;; 增量缺失也没有方向符号：什么都不做，不报错
+      (should-not (seshat-reader-mwheel-precision-scroll
+                   (list 'mouse-movement (list window 10 10) 0 nil nil)))
+      (should (= 2 up))
+      (should (= 2 down)))))
 
 (provide 'seshat-reader-multipage-test)
 
