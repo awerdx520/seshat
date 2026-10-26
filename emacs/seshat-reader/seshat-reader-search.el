@@ -993,6 +993,10 @@ header."
       (goto-char position)
       (seshat-reader-search-sidebar-goto))))
 
+(defun seshat-reader-search--in-sidebar-p ()
+  "Return non-nil when the current buffer is the search sidebar."
+  (eq (current-buffer) (get-buffer seshat-reader-search-sidebar-buffer-name)))
+
 (defun seshat-reader-search-sidebar-next ()
   "Jump to the next result listed in the search sidebar."
   (interactive)
@@ -1190,14 +1194,25 @@ gets stuck at the last hit without knowing the search is cyclic."
       (seshat-reader-search--show notice)))))
 
 (defun seshat-reader-search-next ()
-  "Jump to the next hit of the active search, wrapping at the end."
+  "Jump to the next hit of the active search, wrapping at the end.
+In the search sidebar this delegates to `seshat-reader-search-sidebar-next':
+the transient map is `overriding-terminal-local-map' and its KEEP-PRED only
+runs from `pre-command-hook', after the key has already been looked up, so
+without this delegation the first `n' in the sidebar would be consumed here
+\(and report \"没有进行中的搜索\") instead of moving to the next result."
   (interactive)
-  (seshat-reader-search--move 1))
+  (if (seshat-reader-search--in-sidebar-p)
+      (seshat-reader-search-sidebar-next)
+    (seshat-reader-search--move 1)))
 
 (defun seshat-reader-search-prev ()
-  "Jump to the previous hit of the active search, wrapping at the start."
+  "Jump to the previous hit of the active search, wrapping at the start.
+Delegates to `seshat-reader-search-sidebar-prev' in the search sidebar, for
+the same reason as `seshat-reader-search-next'."
   (interactive)
-  (seshat-reader-search--move -1))
+  (if (seshat-reader-search--in-sidebar-p)
+      (seshat-reader-search-sidebar-prev)
+    (seshat-reader-search--move -1)))
 
 (defun seshat-reader-search--end (&optional page)
   "End the search session, optionally returning to PAGE (1-based).

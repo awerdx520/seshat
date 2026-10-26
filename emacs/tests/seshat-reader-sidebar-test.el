@@ -3194,9 +3194,10 @@ kind 由 buffer 名推断；命令必须把 kind 交给 `--toggle-kind'（它按
 ;; 专用键（`seshat-reader-sidebar--ensure-panel-evil-keys' /
 ;; `--panel-normal-key-specs' / `--panel-common-keys'），现在改为在显示漏斗里
 ;; **直接关闭 evil**：面板键位完全由各面板自己的键表决定，不再有第二套「补绑表」
-;; 需要与面板 map 同步。收起 evil 的调用点在 `seshat-reader-sidebar--display' 开
-;; 头（childframe / window / childframe 失败回退三条路径都覆盖）与 `show' 的
-;; `pop-to-buffer' 回退分支。
+;; 需要与面板 map 同步。收起 evil 的调用点在 `seshat-reader-sidebar--display' 的
+;; **显示动作之后**（`--kill-evil-in'；childframe / window / childframe 失败回退
+;; 三条路径都覆盖，且显示本身会把 evil 重新打开，故必须后置）与 `show' 的
+;; `pop-to-buffer' 回退分支（同样在 `pop-to-buffer' 之后）。
 
 (ert-deftest seshat-reader-sidebar-test--panel-display-disables-evil ()
   "面板显示不切 emacs state、不补绑 evil 键表，两条显示路径都只调关闭 helper."
@@ -3229,20 +3230,27 @@ kind 由 buffer 名推断；命令必须把 kind 交给 `--toggle-kind'（它按
             (should-not emacs-state-calls)
             (should (= 0 evil-key-calls)))
         (when (buffer-live-p buffer) (kill-buffer buffer)))))
-  ;; 面板禁用时 `show' 走 `pop-to-buffer' 回退分支：同样只关闭，不切 state
+  ;; 面板禁用时 `show' 走 `pop-to-buffer' 回退分支：同样只关闭、不切 state，且
+  ;; 关闭必须发生在 `pop-to-buffer' **之后**（它会把 evil 重新打开）。
   (let ((disable-calls 0)
         (emacs-state-calls nil)
+        (events nil)
         (buffer (get-buffer-create " *Seshat evil-off fallback*"))
         (seshat-reader-sidebar-enabled nil))
     (unwind-protect
         (cl-letf (((symbol-function 'evil-emacs-state)
                    (lambda (&optional arg) (push arg emacs-state-calls) nil))
                   ((symbol-function 'seshat-reader--disable-evil)
-                   (lambda () (setq disable-calls (1+ disable-calls))))
+                   (lambda () (setq disable-calls (1+ disable-calls))
+                     (setq events (append events (list :kill)))))
                   ((symbol-function 'pop-to-buffer)
-                   (lambda (_buffer &rest _args) 'fake-window)))
+                   (lambda (_buffer &rest _args)
+                     (setq events (append events (list :pop)))
+                     'fake-window)))
           (seshat-reader-sidebar-show buffer 'translate nil)
           (should (= 1 disable-calls))
+          ;; 事件按时间顺序：先 `pop-to-buffer'，后关 evil
+          (should (equal events '(:pop :kill)))
           (should-not emacs-state-calls))
       (when (buffer-live-p buffer) (kill-buffer buffer)))))
 

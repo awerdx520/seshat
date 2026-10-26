@@ -33,8 +33,9 @@
 ;;   3. `seshat-reader-keymap-preset' 的两向切换（vim ↔ emacs），含 `g' 在
 ;;      「前缀」与「完整绑定」之间的干净切换；
 ;;   4. `seshat-reader-disable-evil' 为 nil 时 helper **不**碰 `evil-local-mode'；
-;;   5. 面板显示漏斗 `seshat-reader-sidebar--display' 在显示动作**之前**关闭
-;;      evil，且 evil 在显示路径上被重新打开后再次显示仍能关掉（T7 实测现象）；
+;;   5. 面板显示漏斗 `seshat-reader-sidebar--display' 在显示动作**之后**关闭
+;;      evil（显示本身会把 evil 重新打开），且 evil 在显示路径上被重新打开后再次
+;;      显示仍能关掉（T7 实测现象）；
 ;;   6. 被删除的三处 evil 补绑入口不再存在。
 ;;
 ;; 运行方式（在仓库根目录执行）：
@@ -164,45 +165,28 @@
         (seshat-reader--disable-evil)
         (should-not calls)))))
 
-;;; 4.1 `after-change-major-mode-hook'：evil 的 globalized 启用之后再关一次
+;;; 4.1 reader 系 mode 的 evil initial state = emacs
 
-(ert-deftest seshat-reader-evil-keymap-test--major-mode-hook-disables-evil ()
-  "reader 系 buffer 换 major mode 后再次关闭 evil，非 reader buffer 不受影响."
-  ;; ① reader 系 buffer：hook 排在 evil 的 globalized 启用函数之后，用 -1 再关
-  (let ((calls nil))
-    (with-temp-buffer
-      ;; 不真调 `seshat-reader-mode'（会触发渲染），`derived-mode-p' 只看
-      ;; `major-mode' 与 `derived-mode-parent'，直接摆好即可
-      (setq major-mode 'seshat-reader-mode)
-      (setq-local evil-local-mode t)
-      (cl-letf (((symbol-function 'evil-local-mode)
-                 (lambda (arg) (push arg calls) nil)))
-        (run-hooks 'after-change-major-mode-hook))
-      (should (equal calls '(-1)))))
-  ;; ② 非 reader buffer：同一个 hook 不碰 evil
-  (let ((calls nil))
-    (with-temp-buffer
-      (setq major-mode 'fundamental-mode)
-      (setq-local evil-local-mode t)
-      (cl-letf (((symbol-function 'evil-local-mode)
-                 (lambda (arg) (push arg calls) nil)))
-        (run-hooks 'after-change-major-mode-hook))
-      (should-not calls)))
-  ;; ③ defcustom 关掉时：即使是 reader 系 buffer 也不碰 evil
-  (let ((seshat-reader-disable-evil nil)
-        (calls nil))
-    (with-temp-buffer
-      (setq major-mode 'seshat-reader-mode)
-      (setq-local evil-local-mode t)
-      (cl-letf (((symbol-function 'evil-local-mode)
-                 (lambda (arg) (push arg calls) nil)))
-        (run-hooks 'after-change-major-mode-hook))
-      (should-not calls))))
+(ert-deftest seshat-reader-evil-keymap-test--evil-initial-states ()
+  "reader 系四个 major mode 的 evil initial state 都设成 emacs."
+  (let (calls)
+    (cl-letf (((symbol-function 'evil-set-initial-state)
+               (lambda (mode state) (push (cons mode state) calls) nil)))
+      (seshat-reader--evil-set-initial-states))
+    (should (equal (sort (mapcar #'car calls) #'string<)
+                   (sort '(seshat-reader-mode seshat-reading-mode
+                           seshat-reader-outline-mode
+                           seshat-reader-annotation-list-mode)
+                         #'string<)))
+    (should (seq-every-p (lambda (call) (eq (cdr call) 'emacs)) calls))))
 
-;;; 5. 面板显示漏斗：先关 evil，再显示
+;;; 5. 面板显示漏斗：先显示，再关 evil
 
-(ert-deftest seshat-reader-evil-keymap-test--display-disables-evil-first ()
-  "`seshat-reader-sidebar--display' 在显示动作**之前**调用关闭 helper."
+(ert-deftest seshat-reader-evil-keymap-test--display-disables-evil-after ()
+  "`seshat-reader-sidebar--display' 在显示动作**之后**调用关闭 helper.
+显示动作本身会把面板 buffer 的 evil 重新打开（实测 `pop-to-buffer' /
+`display-buffer' 之后 `evil-local-mode' 又变回 t），故关闭必须发生在显示之后，
+否则等于白关。"
   (let ((buffer (get-buffer-create " *Seshat evil-order panel*"))
         (events nil)
         (seshat-reader-sidebar--recent-kinds nil)
@@ -210,23 +194,21 @@
     (unwind-protect
         (progn
           (cl-letf (((symbol-function 'seshat-reader--disable-evil)
-                     (lambda () (push 'disable-evil events)))
+                     (lambda () (setq events (append events (list :kill)))))
                     ((symbol-function 'seshat-reader-sidebar--carrier-for-kind)
                      (lambda (_kind) 'window))
                     ((symbol-function 'seshat-reader-sidebar--display-window)
                      (lambda (_buffer _kind &optional _select)
-                       (push 'display events)
+                       (setq events (append events (list :display)))
                        'fake-window))
                     ((symbol-function 'seshat-reader-sidebar--cf-show)
                      (lambda (&rest _)
-                       (push 'childframe-display events)
+                       (setq events (append events (list :childframe-display)))
                        'fake-frame-window)))
             (should (eq (seshat-reader-sidebar--display buffer 'outline nil)
                         'fake-window)))
-          ;; `push' 让 EVENTS 反序：最先发生的排在末尾
-          (should (memq 'disable-evil events))
-          (should (eq (car (last events)) 'disable-evil))
-          (should (eq (car events) 'display)))
+          ;; EVENTS 按**时间顺序**记录（`append' 而非 `push'）：先显示、后关 evil
+          (should (equal events '(:display :kill))))
       (when (buffer-live-p buffer) (kill-buffer buffer)))))
 
 (ert-deftest seshat-reader-evil-keymap-test--display-re-disables-re-enabled-evil ()

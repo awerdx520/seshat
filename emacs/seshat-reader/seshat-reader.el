@@ -1844,9 +1844,12 @@ Bound locally to `next-screen-context-lines' in reader buffers, which makes
 ;; evil 是软依赖：本包不 require、不写进 Package-Requires；evil 不在时下面的
 ;; helper 全部是空操作（fboundp 守卫）。
 ;;
-;; 阅读器关闭 evil 而不是给它补绑：阅读 buffer 是只读单页位图，evil 的 normal
-;; state 只会通过 `emulation-mode-map-alists' 压在本 mode 的键表之前，把
-;; C-v / C-f / j / k / n / p 抢走。关闭后键位完全由 mode-map 决定。
+;; 阅读 buffer 是只读单页位图，evil 的 normal state 会经
+;; `emulation-mode-map-alists' 压在本 mode 的键表之前，抢走 `down-mouse-1' 与
+;; j / k / C-v。阅读系 major mode 因此设 `emacs' initial state；面板 buffer
+;; 走 `seshat-reader--disable-evil' 直接关掉。
+(declare-function evil-set-initial-state "evil" (mode state &optional keymap))
+
 (defun seshat-reader--disable-evil ()
   "Turn evil off in the current buffer if `seshat-reader-disable-evil'.
 That variable is non-nil by default; setting it to nil keeps evil available."
@@ -1869,22 +1872,20 @@ normal state when evil turns on."
                 (bound-and-true-p seshat-reader-translate-panel-mode))
         (seshat-reader--disable-evil)))))
 
-(defun seshat-reader--refit-evil-after-major-mode ()
-  "Turn evil off again after a major-mode change in a reader buffer.
-evil is a globalized minor mode whose enable function runs on
-`after-change-major-mode-hook', i.e. after the mode body already called
-`seshat-reader--disable-evil'; this function is appended so that it runs
-after that entry.  Being a named function, `add-hook' keeps a single copy
-even when the file is loaded twice."
-  (when (derived-mode-p 'seshat-reader-mode
-                        'seshat-reader-outline-mode
-                        'seshat-reader-annotation-list-mode)
-    (seshat-reader--disable-evil)))
-
-(add-hook 'after-change-major-mode-hook
-          #'seshat-reader--refit-evil-after-major-mode 'append)
+(defun seshat-reader--evil-set-initial-states ()
+  "Put the Seshat reader modes into evil's `emacs' state.
+evil is a globalized minor mode and re-enables itself after the mode body
+has run, so `seshat-reader--disable-evil' alone does not stick.  An `emacs'
+initial state keeps `down-mouse-1', j/k and the screen-scroll keys with the
+mode maps."
+  (when (fboundp 'evil-set-initial-state)
+    (dolist (mode '(seshat-reader-mode seshat-reading-mode
+                    seshat-reader-outline-mode
+                    seshat-reader-annotation-list-mode))
+      (evil-set-initial-state mode 'emacs))))
 
 (with-eval-after-load 'evil
+  (seshat-reader--evil-set-initial-states)
   (seshat-reader--disable-evil-in-existing-buffers))
 
 ;;;###autoload

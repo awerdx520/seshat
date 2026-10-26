@@ -1071,6 +1071,52 @@ buffer 的 `n' / `p' 就会落到 evil 的搜索/粘贴上。故跳页路径必�
             (should-not overriding-terminal-local-map))))
     (setq overriding-terminal-local-map nil)))
 
+;;; 侧栏里第一次按 `n' / `p' 就生效
+
+;; 临时键表挂在 `overriding-terminal-local-map' 上（全局优先于所有 keymap），
+;; 而 KEEP-PRED 只在 `pre-command-hook' 里执行 —— 此时按键的绑定已经查表完成。
+;; 所以在侧栏按 `n' 第一次仍会解析到 `seshat-reader-search-next'（侧栏 buffer
+;; 里 `--active' 是 nil，只报「没有进行中的搜索」）并注销临时键表，第二次才轮到
+;; 侧栏 local map 的 `n'，表现为「按两次才跳一条」。修法是让两个命令在侧栏 buffer
+;; 里直接转调侧栏命令。
+
+(ert-deftest seshat-reader-search-test--next-prev-delegate-in-sidebar ()
+  "侧栏 buffer 里 `-next' / `-prev' 转调侧栏命令，普通 buffer 仍走 `--move'."
+  (let ((calls nil)
+        (sidebar (get-buffer-create seshat-reader-search-sidebar-buffer-name))
+        (other (get-buffer-create " *not-sidebar*")))
+    (unwind-protect
+        (cl-letf (((symbol-function 'seshat-reader-search-sidebar-next)
+                   (lambda () (push 'sidebar-next calls)))
+                  ((symbol-function 'seshat-reader-search-sidebar-prev)
+                   (lambda () (push 'sidebar-prev calls)))
+                  ((symbol-function 'seshat-reader-search--move)
+                   (lambda (step) (push (cons 'move step) calls))))
+          ;; 侧栏：`n' → 侧栏 next，不再碰 `--move'（否则首次按键作废）
+          (with-current-buffer sidebar
+            (should (seshat-reader-search--in-sidebar-p))
+            (seshat-reader-search-next))
+          (should (equal calls '(sidebar-next)))
+          (setq calls nil)
+          ;; 侧栏：`p' → 侧栏 prev
+          (with-current-buffer sidebar
+            (seshat-reader-search-prev))
+          (should (equal calls '(sidebar-prev)))
+          (setq calls nil)
+          ;; 普通 buffer：`n' → 原路径 `--move 1'，不碰侧栏命令
+          (with-current-buffer other
+            (should-not (seshat-reader-search--in-sidebar-p))
+            (seshat-reader-search-next))
+          (should (equal calls '((move . 1))))
+          (setq calls nil)
+          ;; 普通 buffer：`p' → `--move -1'
+          (with-current-buffer other
+            (seshat-reader-search-prev))
+          (should (equal calls '((move . -1)))))
+      (dolist (buffer (list sidebar other))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
 (ert-deftest seshat-reader-search-test--goto-match-syncs-sidebar-without-goto ()
   "`n' / `p' 的调用链 `--move' → `--goto-match' → `--sidebar-sync' 始终执行.
 命中就在当前页时不触发跳页，但侧栏仍必须同步到该命中（否则阅读侧换了命中、

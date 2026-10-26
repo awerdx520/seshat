@@ -732,9 +732,9 @@ M12 回归（strip 行破坏页面几何 + `--center-page` 在 `window-size-chan
 
 **鼠标拖不动 / `j` `k` 又被 evil 抢走**
 
-evil 是 globalized minor mode，启用函数挂在 `after-change-major-mode-hook`（mode body 之后），会把阅读器关掉的 evil 重新打开，于是 `[down-mouse-1]` 解析到 `evil-mouse-drag-region`（`mouse-1` / `drag-mouse-1` 又被本包 remap 成 `ignore`，表现为拖拽完全无反应）。`seshat-reader.el` 在同一个 hook 上以 `append` 再关一次。
+evil 是 globalized minor mode，会在 mode body 之后重新启用自己，所以「在 mode body 里关 evil」不生效，`[down-mouse-1]` 会解析到 `evil-mouse-drag-region`（`mouse-1`/`drag-mouse-1` 又被本包 remap 成 `ignore`，表现为拖拽完全无反应）。修法是给 reader 系四个 major mode 设 `emacs` initial state（`seshat-reader--evil-set-initial-states`），evil 自己就不启用这些键。
 
-诊断：`(key-binding [down-mouse-1])` 应为 `seshat-reader-select-drag`。临时绕过：`M-x evil-local-mode`。
+诊断：`(key-binding [down-mouse-1])` 应为 `seshat-reader-select-drag`、`(bound-and-true-p evil-state)` 应为 `emacs`。注意 `evil-local-mode` 仍为 `t`（emacs state 下 evil 本身是开着的），这不是异常。
 
 ## 12. 已知限制
 

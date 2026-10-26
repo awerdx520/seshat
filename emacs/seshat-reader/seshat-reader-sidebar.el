@@ -1435,6 +1435,16 @@ ACTION 实参——overriding-action 的优先级高于 `display-buffer-alist'�
       (seshat-reader-sidebar--fit-height-for-content window kind)
       window)))
 
+(defun seshat-reader-sidebar--kill-evil-in (buffer)
+  "Turn evil off in BUFFER when the reader is loaded.
+Displaying a panel re-enables evil in its buffer, so this has to run
+*after* the display action; the reader may not be loaded at all, hence the
+`fboundp' guard."
+  (when (and (fboundp 'seshat-reader--disable-evil)
+             (buffer-live-p (get-buffer buffer)))
+    (with-current-buffer (get-buffer buffer)
+      (seshat-reader--disable-evil))))
+
 (defun seshat-reader-sidebar--display (buffer kind &optional select)
   "把 BUFFER 显示到信息面板并返回承载单元的窗口.
 本函数是面板显示的**分派层**，两层语义：
@@ -1473,16 +1483,8 @@ SELECT 原样透传给选中的后端（`--cf-show' / `--display-window'），�
 
 其余语义（幂等显示、per-kind 独立、per-kind 尺寸记忆）由窗口后端在
 `seshat-reader-sidebar--display-window' 内实现，本层不重复。"
-  ;; 面板是**只读展示视图**，而 evil 的 normal state 经
-  ;; `emulation-mode-map-alists' 排在 major/minor/local keymap 之前，会把面板
-  ;; 自己的 `q' 抢给 `evil-record-macro'（宏录制）。故显示前直接关掉面板 buffer
-  ;; 的 evil，键位完全由本包键表决定。放在本分派层**开头**，childframe /
-  ;; window / childframe 失败回退三条路径都覆盖（它们都在本行之后分派）。
-  ;; evil 是软依赖：本模块不 require 阅读器，`fboundp' 守卫保证未加载时静默跳过。
-  (when (and (fboundp 'seshat-reader--disable-evil)
-             (buffer-live-p (get-buffer buffer)))
-    (with-current-buffer buffer
-      (seshat-reader--disable-evil)))
+  ;; 面板是只读展示视图，显示动作会重新打开 evil，故显示后统一关掉（见
+  ;; `--kill-evil-in`）。
   (setq seshat-reader-sidebar--last-kind kind
         seshat-reader-sidebar--last-buffer buffer)
   (when kind
@@ -1493,11 +1495,15 @@ SELECT 原样透传给选中的后端（`--cf-show' / `--display-window'），�
     ;; 旧位置的同名项，故表内不会出现重复项。
     (setq seshat-reader-sidebar--recent-kinds
           (cons kind (delq kind seshat-reader-sidebar--recent-kinds))))
-  (if (eq (seshat-reader-sidebar--carrier-for-kind kind) 'childframe)
-      (or (seshat-reader-sidebar--cf-show buffer kind select)
-          ;; child frame 建不出来（非图形 / 父 frame 异常 / 创建失败）→ 回退窗口承载
-          (seshat-reader-sidebar--display-window buffer kind select))
-    (seshat-reader-sidebar--display-window buffer kind select)))
+  (prog1
+      (if (eq (seshat-reader-sidebar--carrier-for-kind kind) 'childframe)
+          (or (seshat-reader-sidebar--cf-show buffer kind select)
+              ;; child frame 建不出来（非图形 / 父 frame 异常 / 创建失败）→ 回退窗口承载
+              (seshat-reader-sidebar--display-window buffer kind select))
+        (seshat-reader-sidebar--display-window buffer kind select))
+    ;; 显示动作本身会把面板 buffer 的 evil 重新打开（实测 `pop-to-buffer' /
+    ;; `display-buffer' 之后 `evil-local-mode' 又变回 t），故显示之后再关一次。
+    (seshat-reader-sidebar--kill-evil-in buffer)))
 
 (defvar seshat-reader-sidebar-extra-kinds nil
   "其它模块注册的面板 buffer 名 → kind 映射.
@@ -1623,13 +1629,10 @@ SELECT 非 nil 表示「面板内容已就绪，可以跟随光标」：**批注
   (if seshat-reader-sidebar-enabled
       (seshat-reader-sidebar--display buffer kind select)
     ;; 面板禁用时退回 `pop-to-buffer'：这条分支不经 `--display'，故单独关一次
-    ;; 面板 buffer 的 evil（同样要保证面板里的 `q' 能按到）；守卫与 `--display'
-    ;; 同一套（软依赖 + live buffer）。
-    (when (and (fboundp 'seshat-reader--disable-evil)
-               (buffer-live-p (get-buffer buffer)))
-      (with-current-buffer buffer
-        (seshat-reader--disable-evil)))
-    (pop-to-buffer buffer)))
+    ;; 面板 buffer 的 evil。同样是**显示之后**——`pop-to-buffer' 会把 evil 重新
+    ;; 打开，显示前关掉等于白关（守卫与 `--display' 同一套，见 `--kill-evil-in'）。
+    (prog1 (pop-to-buffer buffer)
+      (seshat-reader-sidebar--kill-evil-in buffer))))
 
 (defun seshat-reader-sidebar-close-buffer-kind (kind buffer)
   "关闭 KIND 面板中正在显示 BUFFER 的那个承载单元.
