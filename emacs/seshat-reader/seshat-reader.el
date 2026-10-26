@@ -3136,17 +3136,104 @@ another buffer is left alone."
       (seshat-reader--center-page window)))
   (force-mode-line-update))
 
+(declare-function seshat-reader-dyn--doc-tint "seshat-render-core" (bg fg))
+
+(defconst seshat-reader-dark-tint-presets
+  '((graphite    . (-1 . -1))          ; 哨兵：走旧的 invert+gamma 路径
+    (midnight    . (#x1c1c22 . #xc8c4ba))
+    (charcoal    . (#x26262b . #xa8a49a))
+    (night-sepia . (#x201d18 . #xc0b49c))
+    (sepia       . (#xe8dfc8 . #x3a342a)))
+  "暗色模式各预设的像素映射端点.
+
+每项是 (NAME . (BG . FG))，BG / FG 都是 `#xRRGGBB' 整数：原生模块把页面
+里最白的像素（页面的底）映射到 BG、最黑的像素（文字）映射到 FG（双端压
+缩），因此彩色图会变成单色调。注意方向：BG 是「底」而不是「深色」，
+`sepia' 的 BG 就是亮色，所以它渲染成亮底暗字而不是暗底亮字。
+
+唯一例外是 `graphite'，它的 (-1 . -1) 是哨兵，表示「不下发 tint」，
+像素仍走改动前的满量程反色（`fz_invert_pixmap_luminance' + gamma 1/1.4），
+观感与旧版逐位一致，是配色的一键回退口。
+
+新增预设只改本表，不需要改 C 侧、也不需要重编动态模块。")
+
+(defcustom seshat-reader-dark-tint 'charcoal
+  "暗色模式使用的配色预设.
+
+取值是 `seshat-reader-dark-tint-presets' 里的符号（`graphite' / `midnight'
+/ `charcoal' / `night-sepia' / `sepia'），或直接给出 (BG . FG) 两个
+`#xRRGGBB' 整数组成的 cons 自定义配色。`graphite' 保留改动前的满量程反色
+（观感与旧版一致），其余预设是双端压缩；`sepia' 是亮底暗字。
+
+颜色由原生模块的进程级状态承载：**同一 Emacs 内所有 reader buffer 共享同
+一套配色**，不能逐 buffer 设置；重载或新开文档也保持该配色（这是暗色作为
+用户偏好而非文档属性的结果）。
+
+改预设不会自动重绘已打开的 buffer：重新 toggle `seshat-reader-dark-mode'
+（`M-x seshat-reader-dark-mode' 两次）或按 `C-l' 让页面重新渲染即可生效。"
+  :group 'seshat-reader
+  :type '(choice (const :tag "Graphite (old look, full contrast)" graphite)
+                 (const :tag "Midnight" midnight)
+                 (const :tag "Charcoal (default)" charcoal)
+                 (const :tag "Night sepia" night-sepia)
+                 (const :tag "Sepia (light background)" sepia)
+                 (cons :tag "Custom (BG . FG) as #xRRGGBB" integer integer)))
+
+(defun seshat-reader--dark-tint-colors (preset)
+  "把预设 PRESET 解析成下发到原生模块的 (BG . FG) 整数对.
+
+返回 nil 表示「不下发 tint」，即让原生模块走旧的满量程反色：`graphite'、
+nil 与非法取值都是这条分支（非法取值额外 `message' 一次，不静默换成另一
+档配色）。PRESET 可以是 `seshat-reader-dark-tint-presets' 里的符号，也可
+以直接是两个 `#xRRGGBB' 整数组成的 cons；超出 0..`#xFFFFFF' 或不是整数的
+cons 一律视为非法。"
+  (cond
+   ((consp preset)
+    (let ((bg (car preset))
+          (fg (cdr preset)))
+      (if (and (integerp bg) (integerp fg)
+               (<= 0 bg #xFFFFFF)
+               (<= 0 fg #xFFFFFF))
+          (cons bg fg)
+        (message "seshat-reader-dark-tint: 需要 (BG . FG) 两个 #xRRGGBB 整数，\
+忽略 %S" preset)
+        nil)))
+   ((null preset) nil)
+   (t
+    (let ((entry (assq preset seshat-reader-dark-tint-presets)))
+      (if (null entry)
+          (progn
+            (message "seshat-reader-dark-tint: 未知预设 %S，按不下发 tint 处理" preset)
+            nil)
+        (let ((colors (cdr entry)))
+          ;; `graphite' 的 (-1 . -1) 是「不下发 tint」的哨兵，不是颜色。
+          ;; 两侧都校验：只查 `car' 会让 (BG . -1) 这种半负值蒙进来，
+          ;; 原生模块收到负值会静默清空 tint，表现为「配色没生效」。
+          (when (and (>= (car colors) 0) (>= (cdr colors) 0))
+            colors)))))))
+
 (define-minor-mode seshat-reader-dark-mode
   "Toggle dark-mode for current seshat-reader document.
 
-The inversion happens in the native module, at document level, so every page
-bitmap becomes stale at once: the spec cache is dropped and the resident
+The pixel mapping happens in the native module, at process level, so every
+page bitmap becomes stale at once: the spec cache is dropped and the resident
 pages are rendered again by `seshat-reader--redisplay-all-windows'.  The
-pages are not inverted on the Lisp side, which is what keeps the highlights
-painted into the bitmap by the native module consistent."
+pages are not recoloured on the Lisp side, which is what keeps the highlights
+painted into the bitmap by the native module consistent.
+
+Turning the mode on also pushes the colours of `seshat-reader-dark-tint'
+through `seshat-reader--dark-tint-colors', so the flag and the palette always
+travel together; `graphite' pushes the (-1 -1) sentinel instead, which keeps
+the old full-range inversion.  Turning it off leaves the tint untouched: it
+is a user preference, so the next activation comes back with the same
+palette."
   :lighter " Dark"
   (when (derived-mode-p 'seshat-reader-mode)
     (seshat-reader-dyn--doc-invert (if seshat-reader-dark-mode 1 0))
+    (when seshat-reader-dark-mode
+      (let ((colors (seshat-reader--dark-tint-colors seshat-reader-dark-tint)))
+        (seshat-reader-dyn--doc-tint (if colors (car colors) -1)
+                                     (if colors (cdr colors) -1))))
     (seshat-reader--redisplay-all-windows)))
 
 (defvar-local seshat-reader--presentation-state nil

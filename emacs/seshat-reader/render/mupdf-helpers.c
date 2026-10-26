@@ -42,7 +42,9 @@ reset_doc_state(DocState *state)
 		.pagecount = 0,
 		.frame_scale = 1,
 		.outline = NULL,
-		.invert = 0,
+		/* No dark-mode field to clear: the invert flag and the
+		 * tint colours are process-wide state (render-theme.c),
+		 * so a reload keeps the user's chosen theme. */
 		/* A reset drops the decoration table: it belongs to the
 		 * document that was just replaced.  `decorations' is owned
 		 * by DocState and allocated lazily, so it starts out

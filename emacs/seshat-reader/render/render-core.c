@@ -271,14 +271,22 @@ load_page_dl(DocState *state, DocPage *dp)
  * `draw_page_thread'.  It was extracted unchanged so that a second,
  * purely additive entry point (`emacs_page_image_spec') can reuse it
  * without duplicating the painter: the ordering below — rasterize,
- * optional luminance invert + gamma, decoration wash, PNM encode — is
- * load bearing and must not be rearranged.
+ * optional pixel transform (tint, or luminance invert + gamma),
+ * decoration wash, PNM encode — is load bearing and must not be
+ * rearranged.
  *
  * Every render parameter is an argument, so the caller decides them:
  * nothing here reads `EmacsWinState'.  The document-level state that is
- * deliberately still read from DOC_STATE is `invert' and `frame_scale',
- * exactly as the worker used to read it, because both are properties of
- * the document/frame rather than of a window.
+ * deliberately still read from DOC_STATE is `frame_scale', exactly as the
+ * worker used to read it, because it is a property of the frame rather
+ * than of a window.  Dark mode is deliberately *not* document state:
+ * whether it is on and which colours it uses come from the process-wide
+ * preference exposed by render-theme.c (`theme_dark_enabled' /
+ * `theme_tint_set' / `theme_tint_colors'), so reloading a document or
+ * opening a second one keeps the user's chosen theme.  Those readers run
+ * on whichever thread rasterizes the page -- possibly a worker -- so
+ * render-theme.c stores them in atomics and hands the two endpoints out
+ * as one pair (`theme_tint_colors'), never as two independent loads.
  *
  * The rasterization runs on a cloned MuPDF context (shared lock set), so
  * it is safe to call from the Emacs main thread while worker jobs are in
@@ -325,6 +333,9 @@ render_page_to_buffer(DocState *doc_state, DocPage *dp, float resolution,
 
 	bool render_ok = false;
 	float frame_scale = doc_state->frame_scale;
+	/* Read the process-wide dark-mode preference once, so the two
+	 * branches below can never disagree about whether it is on. */
+	bool dark_on = theme_dark_enabled();
 
 	if (frame_scale <= 0.0f)
 		frame_scale = 1.0f;
@@ -334,7 +345,41 @@ render_page_to_buffer(DocState *doc_state, DocPage *dp, float resolution,
 			pixmap = fz_new_pixmap_from_display_list(ctx, dp->display_list,
 								 ctm, fz_device_rgb(ctx), 0);
 
-			if (doc_state->invert)
+			/* Dark mode has exactly two pixel transforms.
+			 * Without a tint it is the historical full-range
+			 * inversion plus gamma, which preserves the
+			 * chrominance of coloured artwork; with one, the
+			 * luminance is mapped onto the two colours the
+			 * caller supplied, which is what makes a
+			 * lower-contrast preset possible (and what flattens
+			 * colour, by construction).  `graphite' takes the
+			 * second branch, so it stays bit-for-bit what dark
+			 * mode rendered before presets existed. */
+			if (dark_on && theme_tint_set())
+				{
+					unsigned tint_bg;
+					unsigned tint_fg;
+
+					/* 一次 acquire 读出整对端点色：bg/fg
+					 * 打包成单个 64 位原子量，避免切预设
+					 * 落在两次独立 load 之间时出现「bg
+					 * 来自旧档、fg 来自新档」的撕裂。 */
+					theme_tint_colors(&tint_bg, &tint_fg);
+
+					/* fz_tint_pixmap 的形参顺序是
+					 * (black, white)：第一个参数是「黑」
+					 * 映射到的颜色，第二个是「白」映射到
+					 * 的颜色。页面栅格化后是白底黑字，暗
+					 * 色模式要「白底→BG、黑字→FG」，故此
+					 * 处必须反着传：先 FG（黑字去处）后
+					 * BG（白底去处）。与 Elisp API 的
+					 * `--doc-tint BG FG' 顺序相反，是为
+					 * 了让 elisp 侧与文档保持「背景在前」
+					 * 的自然语序。 */
+					fz_tint_pixmap(ctx, pixmap, (int) tint_fg,
+						       (int) tint_bg);
+				}
+			else if (dark_on)
 				{
 					fz_invert_pixmap_luminance(ctx, pixmap);
 					fz_gamma_pixmap(ctx, pixmap, 1 / 1.4f);
@@ -342,8 +387,9 @@ render_page_to_buffer(DocState *doc_state, DocPage *dp, float resolution,
 
 			/* Wash this page's decorations over the
 			 * rasterized page.  The order matters: the
-			 * inversion above must already be done, otherwise
-			 * the decoration colours would be inverted too, and
+			 * pixel transform above must already be done,
+			 * otherwise the decoration colours would be
+			 * tinted or inverted too, and
 			 * the PNM encoding below must see the result.
 			 * Rectangles are grouped by style and each group is
 			 * filled once, so overlapping highlights keep a
@@ -662,10 +708,11 @@ render_page_to_buffer(DocState *doc_state, DocPage *dp, float resolution,
 /**
  * Thread function to render a page and encode it as a PNM image.
  *
- * Uses the page's display list to generate a pixmap, optionally inverts
- * and gamma-corrects it, then encodes it to PNM and stores it in
- * `cp->img_data'. Updates image dimensions and status, and signals
- * completion via a condition variable.
+ * Uses the page's display list to generate a pixmap, applies the dark-mode
+ * pixel transform to it (tinted between the two process-wide colours, or
+ * inverted and gamma-corrected when no tint is set), then encodes it to
+ * PNM and stores it in `cp->img_data'. Updates image dimensions and
+ * status, and signals completion via a condition variable.
  *
  * @param arg  Pointer to DrawThreadArgs (contains DocState and CachedPage).
  * Return:     NULL (result is stored in CachedPage).
@@ -716,10 +763,11 @@ draw_page_thread(void *arg)
 			return NULL;
 		}
 
-	/* The rasterization itself (rasterize -> invert/gamma -> decoration
-	 * wash -> PNM encode) lives in `render_page_to_buffer' so that the
-	 * page-image-spec entry point can share it.  The ordering inside is
-	 * identical to what this function used to do inline. */
+	/* The rasterization itself (rasterize -> pixel transform, tint or
+	 * invert/gamma -> decoration wash -> PNM encode) lives in
+	 * `render_page_to_buffer' so that the page-image-spec entry point
+	 * can share it.  The ordering inside is identical to what this
+	 * function used to do inline. */
 	int local_imgw = 0;
 	int local_imgh = 0;
 	unsigned char *local_img_data = NULL;
@@ -3566,7 +3614,24 @@ emacs_module_init(struct emacs_runtime *runtime)
 
 	register_module_func(env, emacs_doc_invert,
 			     "seshat-reader-dyn--doc-invert", 1, 1,
-			     "Sets the document-local invert state for dark mode.");
+			     "Toggles the process-wide dark mode flag that "
+			     "every document in this Emacs renders with; the "
+			     "colours come from "
+			     "seshat-reader-dyn--doc-tint. No page is "
+			     "re-rendered here, so call "
+			     "seshat-reader--redisplay-all-windows "
+			     "afterwards.");
+
+	register_module_func(env, emacs_doc_tint,
+			     "seshat-reader-dyn--doc-tint", 2, 2,
+			     "Sets the process-wide dark mode colours: BG "
+			     "and FG are 0xRRGGBB integers, and every "
+			     "pixel's luminance is mapped between them. "
+			     "Negative values clear the tint and restore "
+			     "the plain invert + gamma rendering. Only the "
+			     "process-wide state changes here, so the "
+			     "caller has to redraw the visible pages "
+			     "afterwards.");
 
 	register_module_func(env, emacs_doc_rotate,
 			     "seshat-reader-dyn--rotate-page", 1, 1,

@@ -143,7 +143,6 @@ typedef struct
 	int pagecount;
 	fz_outline *outline;
 	float frame_scale; // Emacs' frame-scale-factor
-	int invert;
 
 	/* Document-level decoration table (rects and strokes).  Owned by
 	 * whichever thread runs the module functions (Emacs' main thread);
@@ -164,7 +163,8 @@ typedef struct
 /**************************************************************/
 /* This represents rasterized image of a page that has been   */
 /* produced via load_page_dl and draw_page_thread. This image */
-/* has specific properties such as invert, resolution, etc.   */
+/* has specific properties such as its page number, its pixel */
+/* dimensions, its render status, etc.                        */
 /* The image is to be owned by an EmacsWinState, i.e., an     */
 /* Emacs Window.					      */
 /**************************************************************/

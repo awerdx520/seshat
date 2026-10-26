@@ -181,6 +181,8 @@ RESPONSE 是桩返回的 `(STATUS . BODY)'。用途：断言「零请求」以�
       (setq major-mode 'seshat-reading-mode)
       (cl-letf (((symbol-function 'seshat-reader-dyn--doc-invert)
                  (lambda (flag) (push flag invert-args)))
+                ((symbol-function 'seshat-reader-dyn--doc-tint)
+                 (lambda (&rest _) t))
                 ((symbol-function 'seshat-reader--redisplay-all-windows)
                  (lambda () (setq redisplay-calls
                                   (1+ (or redisplay-calls 0))))))
