@@ -882,4 +882,22 @@ refit 按当前窗口尺寸做一次几何适配 + 重渲染，一次到位。
 
 （实现位置/字段已按批次 1 实际代码校正，2026-10-27）
 
+## 2026-10-27 · PDF 多页连续布局 P1 落地记录
+
+**决策**：P1 按计划 T1–T10 全部落地，单页 overlay 模型退役（elisp 侧 `(window-parameter … 'overlay)` 读取点为 0）。
+
+**落地要点（与计划的差异已逐条记录）**：
+1. **D3 被真机推翻并修正**：原方案「滚动改原生行滚动」不成立——每页是 buffer 一个行、行高=整页位图高，`scroll-up`/`scroll-down` 按缓冲行滚动等于一次跨整页（用户实测 `j` 与 `n` 同效）。改为像素级 `window-vscroll` + `set-window-start` 的 `--multipage-scroll`。
+2. **行滚动量取值**：`line-pixel-height` 在页行上返回整页高度（实测 2414px），导致一次按键跨整页；改为 `frame-char-height`（`--default-line-pixels`）。
+3. **滚动步长可配置**：`seshat-reader-scroll-step-ratio`（默认 0.15，窗口文本区高度比例）与 `seshat-reader-scroll-step-pixels`（默认 nil，绝对像素优先）。
+4. **居中手法**：逐页行内 `(space :align-to (+ center (-0.5 . SPEC)))` 引导空格，align-to 引用 spec 对象本身，原地改尺寸自动跟随；超宽页摘除引导空格贴左（D5b 已知缺陷：hscroll 仍是窗口级、整栏平移）。
+5. **缩放**：`base-scale` 由「打开文档那一页」的 native 尺寸锚定（`--multipage-reference-native` 缓存，reload/rotate 清空）；`+`/`-` = base × 系数、`W`/`H` = 基准页 width/height-fit、`0` = 重新首屏适配；refit 闸门用 0.005 容差（native 取整漂移）。
+6. **缓存与虚拟化**：上限 = 视口驻留 + 1（K=2 → 6，夹 4..16）、视口外优先淘汰、回收保留相邻一页、方向感知预取只暖缓存不插行；内存告警线 `seshat-reader-multipage-memory-warning-mb` 默认 75 MB。
+7. **书签字段变更**：`vscroll` → `offset`（页内像素偏移），新增 `fit-mode`；旧记录按 `vscroll` 近似迁移。
+8. **装饰刷新**：C 侧 `--refresh-highlights`（依赖 overlay/win-state）在 elisp 侧退役，改为「清 spec 缓存 + 重渲染全部驻留页」。
+9. **测试基建**：`make -C emacs/tests ert` 固化判据（`0 unexpected` 且无 `skipped`）；`page-join-test.el` 随 strip 机制整体删除。
+10. **保留的已知缺陷**：跨页选区首期 `user-error`（D7）；横向滚动整栏平移；P1 不做异步预取。
+
+（来源计划：[openspec/completed/2026-10-26-reader-multipage-p1-layout.md](completed/2026-10-26-reader-multipage-p1-layout.md)；实现与逐批偏差见该计划「## 执行记录」）
+
 

@@ -363,7 +363,7 @@
 - 影响：改源码后仍加载旧字节码，表现为「改了没效果」或测试假失败（本次已踩坑，属假失败）。
 - 建议：改源码后固定执行 `rm -f *.elc && make all`；若要根治，把 `.elc` 目标改为 `.PHONY` 或按源码哈希判定重编。
 
-## ERT 假绿判据（M7，2026-10-18）
+## ERT 假绿判据（M7，2026-10-18）——已解决（2026-10-27 已随 P1 多页布局改造失效/解决：由 `make -C emacs/tests ert` 固化为不变量）
 - 现象：跑 ERT 时若缺少 `-L` 加载路径，测试里的 `skip-unless` 会静默跳过整批用例，ERT 仍报 `0 unexpected`，看起来全绿。
 - 影响：会误判「测试通过」并掩盖真实回归。
 - 建议：把 `skipped=0` 作为通过判据（不能只看 unexpected 计数），并把完整 `-L` 集合固化进脚本或 Makefile 目标，避免手敲遗漏。
@@ -971,12 +971,12 @@
 - 影响：**仅多窗口场景**（同一 PDF 在两个窗口并排对照）。单窗口下两条局限都观察不到。
 - 建议：①刷新时遍历同 buffer 的全部窗口（`get-buffer-window-list`）逐个失效并重建，或至少对其它窗口打「高亮已过期」标记，在其 redisplay 时强制重建；②把 spec 缓存改为按窗口维度（`window-parameter` 或 `(window . page)` 为键的 alist），而不是 buffer 级。
 
-## 缩放/旋转后 strip 的上一页 spec 是旧尺寸（M12，2026-10-22）
+## 缩放/旋转后 strip 的上一页 spec 是旧尺寸（M12，2026-10-22）——已解决（2026-10-27 已随 P1 多页布局改造失效/解决：strip 机制已删除，spec 由 `--multipage-resize-spec` 逐页改写）
 - 现状：`seshat-reader--page-image-specs` 缓存的是**页面已显示时**的 image spec（含当时的像素尺寸），缩放（`seshat-reader-increase-size` / `fit-to-width` / `fit-to-height`）或旋转后只重渲染当前页，**不清空该缓存**；strip 按缓存的旧图像尺寸裁取，再以 `:slice` 插到新尺寸的当前页之前。
 - 影响：缩放后跨页 strip 的高度/内容与新页不匹配（旧尺寸的底部若干行被拉成固定像素高，比例与当前页不一致），旋转后同理；关掉 `seshat-reader-page-join-lines`（设 0）可规避。
 - 建议：在缩放/旋转/重排尺寸的入口统一清空 `seshat-reader--page-image-specs`（或按新尺寸重新 `--remember-current-page-spec`），并保证下一次「上一页」可见时重建缓存；补一条 ERT 断言「缩放后缓存为空/尺寸已更新」。
 
-## 跨页衔接（M12 strip）在 fit-to-height 下裁切页面（2026-10-22 真机反馈）
+## 跨页衔接（M12 strip）在 fit-to-height 下裁切页面（2026-10-22 真机反馈）——已解决（2026-10-27 已随 P1 多页布局改造失效/解决：机制已删除，跨页衔接由多页连续布局天然提供）
 - 现象：`seshat-reader-page-join-lines` 取非 0（M12 默认值曾是 `1`）时，刚打开 PDF 页面不居中、整体挤向左侧，且只显示当前页的一小部分——`seshat-reader-fit-to-height` 下尤其明显。
 - 根因：① 纵向——`seshat-reader--insert-join-strip` 在 `point-min` 插入 strip 行，破坏了页面 overlay 的几何假设：`seshat-reader--set-window-vscroll` 的上限与落点按「strip 高 + 图高」计算，而实际渲染的页面 image 并不包含 strip（strip 是另一行的独立 image），`fit-to-height` 把页高压到窗高之后任何正 vscroll 都会把页顶挤出窗口。② 横向——`seshat-reader--center-page` 把 `line-prefix` 从页面 overlay 移到 buffer 级 overlay 后，一旦 `when-let*` 链路短路就零兜底；叠加**既有缺陷**：`window-size-change-functions` 把 frame 当 window 传给 `--center-page`（参数类型不符，实际不生效），窗口尺寸变化后居中从不重算。
 - 现状（止血，2026-10-22）：`seshat-reader-page-join-lines` 默认值改为 `0`（strip 默认关闭，代码路径完全不插 strip）；`window-size-change-functions` 改挂 `seshat-reader--window-size-change`（遍历 frame 的窗口，只处理显示当前 buffer 的窗口，单窗口出错不影响其它）；`--set-window-vscroll` 的 `image-height`、`--get-prefix-width` 的返回值补 nil 守卫（后者恒返回数字），`--center-page` 短路时清掉旧 `line-prefix` 并把水平滚动归零。
@@ -1047,7 +1047,7 @@
 - 建议：二选一 —— ① 删除该 defcustom（破坏性变更，需在 CHANGELOG 记 BREAKING 并同步 `docs/configuration.md`）；② 重新定义为「手动 `H`/`W` 之外的默认命令」或彻底改语义（例如「是否允许放大到填满」）。在定稿前保留原样，并在 docstring 注明「自动 fit 不再使用本选项」。
 - 已解决（2026-10-23）：该选项被重定义为「新窗口 / 新文档的初始适配模式」（`contain` / `width` / `height`，默认 `contain`），由 `--first-fit` 与 `--window-create-function` 读取；旧函数符号值经 `--normalize-default-fit` 兼容映射。见 `openspec/completed/2026-10-23-reader-default-fit-mode.md`。
 
-## `seshat-reader--set-window-vscroll` 缺下界夹紧（2026-10-23）
+## `seshat-reader--set-window-vscroll` 缺下界夹紧（2026-10-23）——已解决（2026-10-27 已随 P1 多页布局改造失效/解决：vscroll 族已删除，页内偏移由 `--multipage-page-max-offset` 夹紧）
 
 - 现状：`seshat-reader.el:607-610` 的 `(max 0 …)` 只作用于**上限值**（`max-pixel-vscroll`），`corrected-pixel-vscroll` 只做 `(min pixel-vscroll max-pixel-vscroll)`，负值原样下发给 `set-window-vscroll`。本轮仅在尺寸变化路径用 `seshat-reader--clamp-window-vscroll` 绕行（先按 `--page-max-vscroll-pixels` 夹到 `[0, max]` 再下发），函数本身未修。
 - 影响：其他调用点（翻页落点、书签恢复的 vscroll）若传入负值，页面仍可能被推出窗口顶部；`seshat-reader-page-join-test.el` 的 5 个 vscroll 用例锁定的是当前（含该缺口）行为，动函数会牵动这些断言。
@@ -1100,7 +1100,7 @@
 - 建议：① 真机长观测（见上一条）；② 若确认峰值内存不可接受，改为「apply 只在几何变化超过阈值时执行」（合并连续小幅尺寸变化，减少键数量）或临时下调 `image-cache-eviction-delay`；③ 把清晰度闸移进 `unless manual` 分支（或显式加 `manual` 判据）以消除附记里的理论入口。
 - 已观测（2026-10-23 真机 T4-4）：拖右侧分割线 10 秒，0.2 秒/次共 51 个采样点。拖拽期间 `(image-cache-size)` 的最大值 82,581,352 B **正是起始值**，末次采样 82,037,816 B（零增长、略降）；停手后一次采样 88,059,084 B（+6 MB ≈ 3 张位图，由 `image-cache-eviction-delay` 回收）；`(nth 1 (memory-info))` 21,864,632–21,892,992 kB，波动 <0.2%。结论：`seshat-reader--drag-threshold`（0.12 秒）**确认生效**，拖拽期间不产生新 cache 条目；条目累积风险由「密集增长」降级为「停手后一次性 +数张位图」。附记（清晰度闸写在 `unless manual` 守卫之外）仍然成立，未改。
 
-## `page-join` strip 与 `before-string` 居中的交互未验证（2026-10-23）
+## `page-join` strip 与 `before-string` 居中的交互未验证（2026-10-23）——已解决（2026-10-27 已随 P1 多页布局改造失效/解决：两套居中机制合并为逐页 `(space :align-to …)` 引导空格，strip 与 `--center-overlay` 全族已删除）
 
 - 现状：居中改由页面 overlay 的 `before-string`（`:align-to`）承载后，页面行不再依赖 `line-prefix`；而跨页衔接 strip（`seshat-reader-page-join-lines` > 0）**依赖 center overlay 的 `line-prefix`** 才会跟着右移——fits 模式下 `--center-page` 现在会主动把 center overlay 的 `line-prefix` 清成 nil，strip 行因此只拿到页面 overlay 的 `before-string`（overlay 覆盖范围是页面行，strip 行是否在范围内取决于 `--ensure-center-overlay` / 页 overlay 的 `point-min`..`point-max` 覆盖）。
 - 影响：`page-join-lines` 默认 `0`（关闭），故默认配置不受影响；一旦用户开启，strip 行可能比页面左移半个余量（或反之），表现为「上一页底部残影偏左」。批量 ERT 用 `overlay-get … 'before-string` / `'line-prefix` 断言几何，**不产生真实 redisplay**，无法发现视觉错位。
@@ -1665,3 +1665,9 @@
 ## 2026-10-27 阅读器多页布局（P1）遗留
 
 - **多页布局的内存上限**：同时驻留 spec ≤ 6 页（K=2），按 150 dpi ≈6.2 MB/页 × 2（Lisp 堆 + C 侧）≈ 75 MB 为告警线（`seshat-reader-multipage-memory-warning-mb`）；P1 不做异步预取与内存回收策略，长期滚动仍依赖视口淘汰。
+- **跨页选区未实现**：首期 `user-error`（决策 D7）；需「按阅读顺序拼接两页文本 + 跨页矩形集合（带页号）」。
+- **横向滚动整栏平移**：`height` 模式与手动放大下，宽页横向滚动会让整栏（含邻页）一起移动（窗口级 hscroll）。
+- **宽页按宽裁剪的取舍**：基准页取「打开文档那一页」，异常宽页被缩到刚好不溢窗；若改用「全文档最大页」需新增 C 侧批量查页尺寸接口。
+- **异步渲染未做**：P1 全同步（0.7–11 ms/页），滚动到新页会阻塞；P2 再做异步 + idle 预取。
+- **C 侧单页 overlay 机制仅剩兼容外壳**：`init_overlay` / `init_win_state_ptr` / `get_win_state_ptr` / `--refresh-highlights` / `--window-close` 仍存在但 elisp 侧除 `--window-close`（释放 EmacsWinState）外已无调用；`elisp-helpers.c:279-287` 的 `overlay-put` 无 nil 守卫（`overlayp, nil` 的潜在来源）。
+- **`posn-*` 访问器在字节编译后被内联**：测试若要桩替必须加载同源 `.el`（已在 `emacs/tests/README.md` 记录）。

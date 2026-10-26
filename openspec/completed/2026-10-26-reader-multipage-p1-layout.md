@@ -1,11 +1,14 @@
 # 阅读器多页连续布局 P1：buffer 内多页纵向连续滚动
 
+> 已归档（2026-10-27）：T1–T10 全部完成；实现与偏差见文末「## 执行记录」。
+
 ## 当前状态
-- 阶段：Phase 3（Implement）· 批次 3（T4）已完成 + 滚动缺陷已修，等待用户重新 L3 验收 → 批次 4（T5）
-- 已确认：整体路线与决策 D1–D7 ✅（用户 2026-10-26 确认路线 3）、缩放基准 A ✅、缩放公式分模式 ✅、计划 v3 终审通过 ✅（plan-reviewer 三轮）、**D3 由「原生行滚动」修正为「像素级 vscroll 连续滚动」✅（真机验收 2026-10-27 推翻，用户已报告现象）**
-- 执行状态：批次 1 ✅ `d7ef467`；批次 2 ✅ `12d8911` + `4590f0b`；批次 3 ✅ `19a5a91` + `80eb582` + `c6caf85`（像素级滚动）+ `4751929`（行高取值修复）+ `27bdbbe`（步长可配置）；全仓 ERT **1171 例 / 0 unexpected / 0 skipped**（31 个测试文件）；`make clean all` EXIT 0；warning 20 零新增；checkdoc 0
-- 现象：多页连续**像素级**滚动 + 逐页居中 + 宽页裁剪 + `W`/`H`/`+`/`-`/`0` 可用；高亮刷新范围 / 选区页号反查 / 书签与 saveplace 仍为旧语义（T8）
-- 下一步：用户重新 L3（页内滚动连续 / 跨页接续 / `n`·`p` 停页首 / 缩放后仍连续）→ 通过后进批次 4（T5）
+- 阶段：Phase 4（Review & Document）· T1–T10 全部完成，待代码审查（code-reviewer）与最终提交
+- 已确认：路线 3 ✅、缩放基准 A ✅、缩放公式分模式 ✅、计划 v3 终审 ✅、D3 修正为像素级滚动 ✅、滚动步长可配置 ✅、跨页选区首期禁用（D7）✅
+- 执行状态：批次 1–8 全部完成（commit `d7ef467` / `12d8911` / `4590f0b` / `19a5a91` / `80eb582` / `c6caf85` / `4751929` / `27bdbbe` / `78b273a` / `b82e03d` / `f83bb64` / `e27dd78` / `365198a` / `e2c6f02`）
+- 验证基线：`make -C emacs/seshat-reader clean all` EXIT 0、warning **24**（P0 基线 33 → T7 后 24，零新增）、checkdoc 0；`make -C emacs/tests ert` → **31 文件 / 1213 例 / 0 unexpected / 0 skipped**
+- 现象：多页连续像素级滚动 + 逐页居中 + 宽页裁剪 + `W`/`H`/`+`/`-`/`0` 缩放（首屏即清晰）+ 视口缓存/预取 + 选区页号反查 + 书签页内偏移
+- 下一步：code-reviewer 审查 → 修复 blocking → 归档本计划到 `openspec/completed/`
 - dark-mode 相关：存储粒度与配色预设由 `openspec/active/2026-10-27-reader-dark-tint-presets.md` 接管（D2 已定为 A（进程级，2026-10-27））；T4 的「反色后重渲染全部可见页」语义不变，但 T4 已落地的 dark-mode body 将是该计划的编辑点，两计划需串行合并。
 
 ## 目标
@@ -119,12 +122,12 @@
 - [x] T2 页号派生：`current-doc-pagenumber` 改视口顶页、`goto-page` 改 `set-window-start`、`--page-indicator` 与 mode-line 正常、`scale` 升 buffer 级。验收：滚到第 3 页时 `(seshat-reader-current-doc-pagenumber)` 返回 3；`M-g g` 跳到第 10 页后光标所在页为 10；outline 当前章高亮随之变化。（依赖：T1）**已完成（批次 2）**：`current-doc-pagenumber` 改视口顶页派生（不再读窗口参数 `page`）；next/prev/first/last/goto 改页 marker 定位（队列机制保留）；mode-line 页数补 nil 守卫。
 - [x] T3 滚动命令重写：`scroll-up/down`、`-screen`、`mwheel`、`scroll-*-or-*-page`、`--at-page-top-p`、`--set-page-top/bottom`、`--set-window-vscroll`，并清理 `--page-max-vscroll-pixels` / `--clamp-window-vscroll` 的调用点（这两个函数在 T7 删除，T3 阶段若不清调用会悬空）。验收：向下滚到底后继续按 ↓ **不换页**，而是进入下一页内容的连续滚动；向上滚到顶同理；`SPC` / `DEL` 仍滚一屏。（依赖：T1、T2）**已完成（批次 2）**：`scroll-up/down/-screen` 与 `mwheel-*` 改原生行滚动 + `--multipage-sync`；四个 `*-or-*-page` 保留名字改纯滚动；vscroll 族外部调用点清零（定义留待 T7）；旋转改为真实实现（buffer-local 角度 → 清 spec 缓存 → 按视口顶页 relayout）。
 - [x] T4 几何与居中：`seshat-reader-current-doc-overlay`（定义改造：签名改 `(window &optional page)`、语义变为『读指定页的 spec』）、`--get-current-doc-image-size`、`--page-image-spec`、`--center-page`（逐页 `before-string`/`:align-to`）、`--centered-p`、`--ensure-centered`、`--recenter-window`、`--right-most-window-hscroll`（按可见页宽）。验收：多页同时可见时每页各自水平居中；窗口尺寸变化后所有可见页在同一帧内重新居中；宽页按宽裁剪生效：任一可见页 `image :width` ≤ `window-body-width`（contain / width 模式）；`seshat-reader-presentation-mode`：**保留既有语义**（`mode-line-format` 置 nil + `fit-to-height`），多页布局下自然等价于「视口约装一页」；**不新增第二种布局**（决策 4）——进入时每页高度适配窗口、约一页可见，退出后恢复原 `base-scale` 与 `mode-line`。同时覆盖：`--render-buffer`（重建布局而非单页 overlay）、`--first-fit`（首屏对全部可见页生效）、`--native-page-size`（按页缓存改为 alist）、`--redisplay-all-windows`（遍历窗口重绘可见页）、`seshat-reader-dark-mode`（反色后全部可见页重渲染）、**超宽页对齐**：`height` 模式与手动放大下超宽页**贴左 + 横向滚动**，不再用 `line-prefix` 做居中补偿（`--center-overlay` 随 D6 删除）——`openspec/tech-debt.md`「居中两套机制」条目随之勾销。本任务完成后全仓 grep `(window-parameter [^)]*'overlay` 应无读取点（仅允许出现在注释/迁移说明）。（依赖：T1、T1b、T2、T3）**注意**：批次 2 用「无 overlay 即惰性」守卫保住了 `seshat-reader-resize-test.el` 的 53 例（它们仍断言单页 overlay 几何，靠守卫才通过），T4 必须把这些用例按多页语义重写或删除，不得依赖守卫继续绿。**已完成（批次 3，commit 19a5a91 + 80eb582）**：行结构升为「引导空格 `(space :align-to (+ center (-0.5 . SPEC)))` + 图像空格 + 换行」，逐页独立居中、超宽页摘除引导空格贴左；新增 `--multipage-base-scale` / `--multipage-fit-mode` / `--page-native-sizes` / `--page-render-scales`（窗口参数 `native-size`/`render-scale` 退场）、`--multipage-target-scale`（D5 分模式表）、`--multipage-resize-spec`、批量 `--apply-display-scale`、逐页 `--center-page`/`--centered-p`、全页 `--refit-window`；`seshat-reader-current-doc-overlay` 改为返回 spec（签名 `(window &optional page)`）；dark-mode/presentation-mode/`--redisplay-all-windows` 多页化（presentation 成对记住/恢复 fit-mode + base-scale）；生产代码 `(window-parameter … 'overlay)` 读取点 **0**。修掉 2 个实现缺陷：`--multipage-rerender-page` 早退导致 refit/dark/rotate 假重渲染、presentation 退出未恢复 base-scale。
-- [ ] T5 缩放与 refit：`--apply-display-scale` 批量、`--refit-window` 重渲染可见页、`render-scale` 按页、`fit-mode` 基准页。验收：`W`/`H`/`+`/`-` 后所有可见页同步缩放；窗口 resize 后可见页全部清晰化（不只当前页）；`fit-mode` 语义不变；**滚动跨过页边界时 scale 不跳变**（基准页锚定策略生效）。（依赖：T4）
-- [ ] T6 缓存与虚拟化：动态上限、视口优先淘汰、预取 1 页、内存告警线。验收：连续滚动 30 页时缓存长度始终 ≤ 可见页数+1；**往回滚 1 页**命中缓存（不调 C）；P0 的「顺序扫 20 页命中率 0」问题不复现。（依赖：T1、T3、T4）
-- [ ] T7 删除 strip 全族（D6 清单）并清理相关 tech-debt 条目（912/1036 等）。验收：全仓 grep 无 `page-join-lines` / `--join-strip` / `--page-max-vscroll-pixels` 残留；`page-join-test.el` 删除或整体重写。（依赖：T3、T4）**注意**：像素级滚动所需的 `--multipage-scroll` / `--multipage-page-pixel-height` / `--multipage-page-gap-pixels` / `--multipage-page-span` / `--multipage-page-max-offset` / `--multipage-page-neighbour` / `--multipage--scroll-to-page` 是 P1 的新实现，**必须保留**；T7 只删与本清单冲突的旧 vscroll 族（`--set-window-vscroll` / `--clamp-window-vscroll` / `--page-max-vscroll-pixels` / `--window-vscroll-pixels` / `--at-page-top-p` / `--set-page-top*` / `--set-page-bottom`）。
-- [ ] T8 外围适配：① 选区 `posn→page` 加「页号反查 + 页内 y 偏移」，跨页拖选 `user-error`；② 书签/saveplace 从 `vscroll` 改为「页号 + 页内像素偏移」（或直接存 buffer position）；**同时处理 `hscroll` 字段**（`seshat-reader-bookmark.el` 的 record 含 `hscroll`；**`hscroll` 字段保留**（D5b 下 `height` 模式与放大后仍有横向滚动），仅把定位语义从 `vscroll` 改为「页号 + 页内像素偏移 + hscroll」；旧记录（有 `vscroll` 无页内偏移）按「页号 + vscroll 近似换算为页内像素偏移」迁移，读不到时退回页首）；③ 搜索 `goto-page` 语义复核（跳转后停在页首）；④ 高亮刷新范围扩到全部可见页（若需 C 改动则显式列出并评估）；⑤ `seshat-reader-select-drag` 的 `select-window` 假设复核；⑥ `seshat-reader-reference.el` 的 `page:<n>` 生成与跳转语义复核（`seshat-reader-reference.el:810/951`），验收补「摘录到笔记的 `page:` 与从笔记跳回均落在正确页首」。验收：单页内框选建批注坐标正确；跨页拖选给出明确提示；书签保存/恢复落到同一页同一偏移；搜索跳转后停在命中页。（依赖：T2–T5）
-- [ ] T9 测试重写与新增。现有基线（P0 归档口径）：`emacs/tests/` **29 个测试文件 / 1163 例**；`seshat-reader-page-join-test.el` **26**、`seshat-reader-resize-test.el` **80**、`seshat-reader-page-spec-test.el` **13**。**批次 2 后的实际基线**：30 个测试文件 / **1131** 例（resize 80 → 53、page-join 26 → 6、page-spec 13 → 13 夹具适配、multipage 9 → 15），0 unexpected / 0 skipped。**批次 3 后的实际基线**：30 个测试文件 / **1144** 例（resize 53 例全部重写为多页语义、multipage 15 → 28 含 13 条几何用例），0 unexpected / 0 skipped。`page-join-test.el`（26 例，24 例作废）删除/重写；`resize-test.el` **80 例**（实测，其中约 55 例需改写断言、其余可保留）按「多页 + 批量 scale」改写；新增 `seshat-reader-multipage-test.el`（布局/页号派生/虚拟化/滚动边界 ≥15 例）；从零补 `posn→page` 用例（当前零覆盖）≥4 例。另需同步改写 P0 的 `seshat-reader-page-spec-test.el`（13 例）中受 D4 缓存策略与 T1b/T4 改造影响的用例：`--cache-drops-the-oldest-entry`（FIFO → 视口优先）、`--does-not-touch-window-state`（窗口参数语义变化）、`--render-buffer-drops-cache`（`--render-buffer` 重建布局）。验收：全仓 `unexpected = 0` 且 `skipped = 0`（`skipped > 0` 视为假绿）；新增用例覆盖 D1–D7 每条决策。本任务同时落地 `emacs/tests/Makefile` 的 `ert` 目标，固化 `-L` 路径集合（`-L emacs -L emacs/seshat-reader` + straight build 目录），此后 L2 一律用该目标执行。（依赖：T1–T8）
-- [ ] T10 文档与归档：`docs/architecture.md`（布局模型整章改写）、`docs/emacs-reader.md`（键位语义变化：↓ 不再换页、`n`/`p` 仍整页；多窗口语义变更；跨页选区限制）、`docs/configuration.md`（新增 `page-gap-lines`、删除 `page-join-lines` 条目并给迁移说明：迁移说明必须给出具体步骤：从 `custom-set-variables` 中删除 `seshat-reader-page-join-lines` 条目（否则老配置残留为 free variable，静默失效、无提示）；若希望更友好，可保留一个标记为 obsolete 的兼容变量并在首次使用时 `message` 提示）、`VENDORED.md`、`CHANGELOG.md`（行为变更段）、`decisions.md`（补 P1 落地记录）、`tech-debt.md`（勾销失效条目、登记新缺口）、`roadmap.md`（P1 ✅）；计划归档。验收：新人仅凭文档能理解连续滚动布局与键位语义。（依赖：T1–T9）
+- [x] T5 缩放与 refit：`--apply-display-scale` 批量、`--refit-window` 重渲染可见页、`render-scale` 按页、`fit-mode` 基准页。验收：`W`/`H`/`+`/`-` 后所有可见页同步缩放；窗口 resize 后可见页全部清晰化（不只当前页）；`fit-mode` 语义不变；**滚动跨过页边界时 scale 不跳变**（基准页锚定策略生效）。（依赖：T4）**已完成（批次 4，commit b82e03d）**：`+`/`-` 改为 `base-scale × seshat-reader-enlarge/shrink-factor`（mode 置 manual）、`0` 重新首屏适配、`W`/`H` 用基准页（打开文档首页的 native 尺寸，`--first-fit` 时缓存进 `--multipage-reference-native`）算 fit、滚轮与按键同路径；`--first-fit` 末尾同步逐页 refit（**首屏即清晰**）；`--multipage-refit-page` 加 `render-scale` 容差 0.005（避免 native 取整漂移导致每次重渲染）；`--multipage-set-scale` 收敛为「clamp → 批量 apply → 居中 → 逐页 refit → sync」五段同步流水线；跨页滚动只读 `base-scale`（不重算）。12 条新用例，4 个变异自检全被抓，真文档冒烟 11/11。
+- [x] T6 缓存与虚拟化：动态上限、视口优先淘汰、预取 1 页、内存告警线。验收：连续滚动 30 页时缓存长度始终 ≤ 可见页数+1；**往回滚 1 页**命中缓存（不调 C）；P0 的「顺序扫 20 页命中率 0」问题不复现。（依赖：T1、T3、T4）**已完成（批次 5，commit f83bb64）**：动态上限 `--multipage-cache-limit`（2K+2，夹 4..16）、视口优先淘汰、回收时保留相邻页 spec、方向感知预取（只暖缓存不插行）、`seshat-reader-multipage-memory-warning-mb`（默认 75，每 buffer 一次）；12 例新用例 + 3 变异自检；P0 的「顺序扫 20 页 0 命中」不复现。
+- [x] T7 删除 strip 全族（D6 清单）并清理相关 tech-debt 条目（912/1036 等）。验收：全仓 grep 无 `page-join-lines` / `--join-strip` / `--page-max-vscroll-pixels` 残留；`page-join-test.el` 删除或整体重写。（依赖：T3、T4）**注意**：像素级滚动所需的 `--multipage-scroll` / `--multipage-page-pixel-height` / `--multipage-page-gap-pixels` / `--multipage-page-span` / `--multipage-page-max-offset` / `--multipage-page-neighbour` / `--multipage--scroll-to-page` 是 P1 的新实现，**必须保留**；T7 只删与本清单冲突的旧 vscroll 族（`--set-window-vscroll` / `--clamp-window-vscroll` / `--page-max-vscroll-pixels` / `--window-vscroll-pixels` / `--at-page-top-p` / `--set-page-top*` / `--set-page-bottom`）。**已完成（批次 6，commit e27dd78）**：删除 strip / vscroll / center-overlay / 旧单页访问器全族（`seshat-reader.el` 净删约 270 行），`page-join-test.el` 整体删除；顺带修掉真机三报错——`pixel-scroll-precision` 用命令 remap 接管（全局 minor mode 的 `setq-local` 无效，实测 `/usr/share/emacs/31.1/lisp/pixel-scroll.el.gz` 优先级高于局部 map）、选区与滚动的 overlay 残留清零、滚动命令 `ignore-errors` 兜住首尾。
+- [x] T8 外围适配：① 选区 `posn→page` 加「页号反查 + 页内 y 偏移」，跨页拖选 `user-error`；② 书签/saveplace 从 `vscroll` 改为「页号 + 页内像素偏移」（或直接存 buffer position）；**同时处理 `hscroll` 字段**（`seshat-reader-bookmark.el` 的 record 含 `hscroll`；**`hscroll` 字段保留**（D5b 下 `height` 模式与放大后仍有横向滚动），仅把定位语义从 `vscroll` 改为「页号 + 页内像素偏移 + hscroll」；旧记录（有 `vscroll` 无页内偏移）按「页号 + vscroll 近似换算为页内像素偏移」迁移，读不到时退回页首）；③ 搜索 `goto-page` 语义复核（跳转后停在页首）；④ 高亮刷新范围扩到全部可见页（若需 C 改动则显式列出并评估）；⑤ `seshat-reader-select-drag` 的 `select-window` 假设复核；⑥ `seshat-reader-reference.el` 的 `page:<n>` 生成与跳转语义复核（`seshat-reader-reference.el:810/951`），验收补「摘录到笔记的 `page:` 与从笔记跳回均落在正确页首」。验收：单页内框选建批注坐标正确；跨页拖选给出明确提示；书签保存/恢复落到同一页同一偏移；搜索跳转后停在命中页。（依赖：T2–T5）**已完成（批次 7，commit 365198a）**：选区页号反查（`posn-point` → 页行）+ 跨页 `user-error`、`select-drag` 去掉 `select-window` 副作用；书签/saveplace 改「页号 + 页内像素偏移 `offset` + hscroll + scale + fit-mode（恢复为 manual）」，旧 `vscroll` 记录可迁移；装饰刷新改走 `--multipage-refresh-decorations`（清 spec 重渲染可见页，`dyn--refresh-highlights` 在 elisp 侧 0 调用）；新增 `seshat-reader-periphery-test.el` 16 例。
+- [x] T9 测试重写与新增。现有基线（P0 归档口径）：`emacs/tests/` **29 个测试文件 / 1163 例**；`seshat-reader-page-join-test.el` **26**、`seshat-reader-resize-test.el` **80**、`seshat-reader-page-spec-test.el` **13**。**批次 2 后的实际基线**：30 个测试文件 / **1131** 例（resize 80 → 53、page-join 26 → 6、page-spec 13 → 13 夹具适配、multipage 9 → 15），0 unexpected / 0 skipped。**批次 3 后的实际基线**：30 个测试文件 / **1144** 例（resize 53 例全部重写为多页语义、multipage 15 → 28 含 13 条几何用例），0 unexpected / 0 skipped。**批次 4 后的实际基线**：31 个测试文件 / **1183** 例（multipage 44 → 56），0 unexpected / 0 skipped。`page-join-test.el`（26 例，24 例作废）删除/重写；`resize-test.el` **80 例**（实测，其中约 55 例需改写断言、其余可保留）按「多页 + 批量 scale」改写；新增 `seshat-reader-multipage-test.el`（布局/页号派生/虚拟化/滚动边界 ≥15 例）；从零补 `posn→page` 用例（当前零覆盖）≥4 例。另需同步改写 P0 的 `seshat-reader-page-spec-test.el`（13 例）中受 D4 缓存策略与 T1b/T4 改造影响的用例：`--cache-drops-the-oldest-entry`（FIFO → 视口优先）、`--does-not-touch-window-state`（窗口参数语义变化）、`--render-buffer-drops-cache`（`--render-buffer` 重建布局）。验收：全仓 `unexpected = 0` 且 `skipped = 0`（`skipped > 0` 视为假绿）；新增用例覆盖 D1–D7 每条决策。本任务同时落地 `emacs/tests/Makefile` 的 `ert` 目标，固化 `-L` 路径集合（`-L emacs -L emacs/seshat-reader` + straight build 目录），此后 L2 一律用该目标执行。（依赖：T1–T8）**已完成（批次 8 上，commit e2c6f02）**：新增 `emacs/tests/Makefile`（`make -C emacs/tests ert`，自动发现 + 判据「0 unexpected 且无 skipped」）+ `emacs/tests/README.md`；resize 用例更名到新语义（数量不变）；补 6 例（自愈、pagecount nil 退化、重载无残留、dark/presentation 顺序无关、占位页不死循环、跨 buffer 页号）。当前基线 **31 文件 / 1213 例 / 0-0**。
+- [x] T10 文档与归档：`docs/architecture.md`（布局模型整章改写）、`docs/emacs-reader.md`（键位语义变化：↓ 不再换页、`n`/`p` 仍整页；多窗口语义变更；跨页选区限制）、`docs/configuration.md`（新增 `page-gap-lines`、删除 `page-join-lines` 条目并给迁移说明：迁移说明必须给出具体步骤：从 `custom-set-variables` 中删除 `seshat-reader-page-join-lines` 条目（否则老配置残留为 free variable，静默失效、无提示）；若希望更友好，可保留一个标记为 obsolete 的兼容变量并在首次使用时 `message` 提示）、`VENDORED.md`、`CHANGELOG.md`（行为变更段）、`decisions.md`（补 P1 落地记录）、`tech-debt.md`（勾销失效条目、登记新缺口）、`roadmap.md`（P1 ✅）；计划归档。验收：新人仅凭文档能理解连续滚动布局与键位语义。（依赖：T1–T9）**已完成（批次 8 下）**：文档八处同步 + 计划归档（见下）。
 
 ## 批次执行（每批独立验收，批次间由用户真机确认）
 
@@ -240,3 +243,48 @@
 - **实现**：新增两个 defcustom —— `seshat-reader-scroll-step-ratio`（**number，默认 0.15**＝窗口文本区像素高 × 比例，`j`/`k` 与滚轮每档都按此）与 `seshat-reader-scroll-step-pixels`（**nil 或正整数，默认 nil**，非 nil 时覆盖比例、钉死绝对像素）；取值函数 `seshat-reader--scroll-step-pixels`（比例非数字/≤0/结果 <1 → 回退 `--default-line-pixels`）。
 - **不动**：`SPC`/`DEL` 一屏量仍 = `(window-body-height WIN t)` − `seshat-reader-screen-context-lines × 默认行高`（与步长无关，用例里把 ratio 绑 0.5 断言结果不变）。
 - **验证**：`make clean all` EXIT 0、warning 20 零新增、checkdoc 0；全仓 ERT 31 文件 **1171 例** 双零（multipage 42 → 44：步长随窗口缩放、绝对像素优先、非法比例回退、滚轮 1/2/3 档）；两处变异验证（忽略绝对像素 / 忽略比例）均被用例抓住。提交时用 hunk 精确入索引，未卷入并行会话的 theme 调色板改动。
+
+### 批次 4 — T5 缩放与 refit（2026-10-27，commit `b82e03d`）
+
+- **产出**：`seshat-reader.el` +287/−?（10 个 hunk）；`seshat-reader-multipage-test.el` 44 → 56（新增 12 例）；`seshat-reader-resize-test.el` 2 例改造（缩放改为同步 refit 后需桩渲染器）。
+- **缩放口径**：`+`/`-` = `base-scale × factor`（1.25 / 0.75）、mode → `manual`；`0` = 基准 `--initial-fit-mode` 下的 fit（重新首屏适配）；`W`/`H` = 基准页 width/height-fit；滚轮与按键走同一路径（不再传绝对 scale）。
+- **基准页**：新增 buffer-local `--multipage-reference-native`，在 `--first-fit` 时测量并缓存「打开文档那一页」的 native 尺寸；`reload` 与 `rotate` 时清空。理由：页 1 被 `--multipage-recycle-page` 回收后无法再测，回读会静默退回 1.0。
+- **首屏即清晰**：`--first-fit` 末尾对全部驻留页同步 `--multipage-refit-page`，不再依赖 idle refit（代价 ≈5 页 × 0.7–11 ms，已写注释）；`--multipage-set-scale` 也改为「clamp → 批量 apply → 居中 → 逐页 refit → sync」五段**同步**流水线。
+- **refit 闸门容差**：`--multipage-refit-page` 用 `|render − target| < 0.005`（新 defconst `--refit-scale-tolerance`）。精确比较会因 native = spec ÷ render-scale 的取整漂移而每次重渲染，破坏幂等。偏差在 1000px 页面上 ≤1px。
+- **跨页 scale 锚定**：`base-scale` 的写点只有 `--multipage-set-scale` / `--first-fit` / `--render-buffer`（复位）；`--multipage-sync` / `--multipage-render-page` 只读，滚动补页用同一 base，故跨页不跳变（已在 sync docstring 明写）。
+- **验证**：`make clean all` EXIT 0；warning 20 零新增；checkdoc 0；parens-ok；全仓 ERT 31 文件 **1183 例** 双零；4 个变异自检（系数当绝对 / first-fit 不 refit / refit 只顶页 / sync 重算 base）全部被抓；真文档冒烟 11/11 PASS。
+- **L3**：待用户真机（首屏清晰、`+`/`-` 即时清晰、`W`/`H`、拖窗后全部可见页清晰、跨页不跳变、滚轮一致）。
+
+### 批次 5 — T6 缓存与虚拟化（commit f83bb64）
+
+- **产出**：动态缓存上限 `--multipage-cache-limit`（`2K+2`，夹 4..16）、视口优先淘汰、回收时保留相邻页 spec、方向感知预取（只暖缓存、不插行）、内存告警 `seshat-reader-multipage-memory-warning-mb`（默认 75 MB，每 buffer 只提示一次）；新增 12 例用例。
+- **取舍**：预取只暖 spec 缓存，不提前插页行——避免滚动方向抖动时反复增删行（行增删仍只由 `--multipage-sync` 按视口决定）。
+- **验证**：`make clean all` EXIT 0、checkdoc 0；L2 双零；3 个变异自检（去掉视口优先 / 上限退化为固定 8 / 预取插行）全部被抓；P0 的「顺序扫 20 页 0 命中」不再复现。
+- **遗留**：内存告警线 75 MB 未经长时真机压测（150 dpi 下多为估算）。
+
+### 批次 6 — T7 删除死族与三报错修复（commit e27dd78）
+
+- **产出**：`seshat-reader.el` 净删约 270 行——strip 全族、vscroll 全族、`--center-overlay` 全族、旧单页访问器（`--page-image-spec` / `--native-page-size` / `--contain-scale` / `doc-scale-page` / `--remember-current-page-spec`）；`seshat-reader-page-join-test.el` 整体删除。
+- **真机三报错修复**：① `pixel-scroll-precision` 改用**命令 remap** 接管（全局 minor mode 的 `setq-local` 无效，实测 `/usr/share/emacs/31.1/lisp/pixel-scroll.el.gz` 的优先级高于局部 keymap）；② 选区与滚动残留 overlay 清零；③ 滚动命令首尾用 `ignore-errors` 兜住（`point-min`/`point-max` 边界）。
+- **验证**：`make clean all` EXIT 0、checkdoc 0、warning 24（P0 基线 33 → 24，零新增）；L2 双零（`page-join-test.el` 的 6 例随文件删除）。
+- **偏差**：删除面比计划 D6 清单更宽（把旧单页访问器一并清掉），因 T4 后它们已无调用点。
+
+### 批次 7 — T8 外围适配（commit 365198a）
+
+- **产出**：选区页号反查（`posn-point` → 页行）+ 跨页 `user-error`；`select-drag` 去掉 `select-window` 副作用；书签/saveplace 记录改「页号 + 页内像素偏移 `offset` + hscroll + scale + fit-mode（恢复为 manual）」并支持旧 `vscroll` 迁移；装饰刷新改走 `--multipage-refresh-decorations`（清 spec 重渲染可见页），`dyn--refresh-highlights` 在 elisp 侧 0 调用；新增 `seshat-reader-periphery-test.el` 16 例。
+- **取舍**：装饰刷新选择「清缓存 + 全可见页重渲染」而非逐页增量重绘——简单且与 P1 同步渲染一致，代价是刷新瞬间的重渲染量（≈可见页数 × 0.7–11 ms）。
+- **验证**：`make clean all` EXIT 0、checkdoc 0、warning 24；L2 双零。
+- **遗留**：跨页选区仍 `user-error`（决策 D7）；hscroll 仍是窗口级（整栏平移）。
+
+### 批次 8 上 — T9 测试基建（commit e2c6f02）
+
+- **产出**：`emacs/tests/Makefile`（`make -C emacs/tests ert`，自动发现测试文件 + 判据「`0 unexpected` 且无 `skipped`」）+ `emacs/tests/README.md`（记录 `-L` 集合与 `posn-*` 需加载同源 `.el` 的桩替注意事项）；resize 用例更名到新语义（数量不变）。
+- **补 6 例**：自愈、`pagecount` nil 退化、重载无残留、dark/presentation 顺序无关、占位页不死循环、跨 buffer 页号。
+- **验证**：`make -C emacs/tests ert` → **31 文件 / 1213 例 / 0 unexpected / 0 skipped**；`make clean all` EXIT 0、warning 24、checkdoc 0。
+- **价值**：把「漏 `-L` 即静默 skip」的假绿风险编码为不变量（对应 tech-debt「ERT 假绿判据」条目的收口）。
+
+### 批次 8 下 — T10 文档与归档
+
+- **产出**：`docs/architecture.md`（多页布局整章）、`docs/emacs-reader.md`（键位语义 / 多窗口 / 跨页选区限制 / 已知限制）、`docs/configuration.md`（`page-gap-lines`、`scroll-step-ratio`、`scroll-step-pixels`、删除 `page-join-lines` 并给迁移说明）、`emacs/seshat-reader/VENDORED.md`、`CHANGELOG.md`（变更 + 破坏性）、`openspec/decisions.md`（P1 落地记录）、`openspec/tech-debt.md`（勾销失效条目 + 登记 P1 遗留）、`openspec/active/roadmap.md`（P1 ✅）；本计划归档到 `openspec/completed/`。
+- **验证（文档侧）**：`make -C emacs/seshat-reader clean all` EXIT 0、`make -C emacs/tests ert` 31 文件 / 1213 例 / 双零；文档中的命令与键位均可直接复制执行。
+- **遗留**：L3 真机全套项由用户在最终提交前确认（计划「验证标准」的 L3 十五项）。

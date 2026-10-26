@@ -227,10 +227,12 @@ M0–M6 已完成并归档，见 `openspec/completed/personal-notes-system.md`�
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | P0 | 按页渲染返回 spec 的 C 接口 + elisp 缓存 | ✅ 完成（2026-10-26）；见 openspec/completed/2026-10-26-reader-multipage-p0-page-spec-api.md |
-| P1 | buffer 多页布局 + 页号派生 + 删 strip 全族 | ⏳ 待启动 |
+| P1 | buffer 多页布局 + 页号派生 + 删 strip 全族 | ✅ 完成（2026-10-27）；见 openspec/completed/2026-10-26-reader-multipage-p1-layout.md |
 
 - **P0 已交付**：C 入口 `seshat-reader-dyn--page-image-spec`（arity `2..3`，1-based，同步、零副作用）+ elisp `seshat-reader--page-spec`（上限 8 的会话内缓存）+ 13 例 ERT（真实 `.so` + 真实 PDF）。**零用户可见行为变更**：不接入任何显示/滚动路径。
 - **P0 实测结论（决定 P1 设计）**：单页 0.7–11 ms（72 dpi，与既有 `wait_for_cached_page` 同量级）；缓存收益只在工作集 ≤ 8 页时成立（8 页第二轮 22.3 → 0.0 ms），顺序扫 20 页命中率 **0**（先进先出淘汰）；`VmRSS` 增量 ≈ 0.9 MB/页（首轮 20 页 +17.9 MB），Lisp 侧 `gcs-done` / `memory-info` 不具备分辨力。数据见 P0 计划「## 实测数据」。
+
+- **2026-10-27 进展（P1 完成并归档）**：T1–T10 全部落地，计划归档于 `openspec/completed/2026-10-26-reader-multipage-p1-layout.md`（含逐批执行记录与偏差）。commit 清单：`d7ef467`（T1 布局骨架）/ `12d8911`+`4590f0b`（T1b+T2+T3）/ `19a5a91`+`80eb582`（T4 逐页几何）/ `c6caf85`+`4751929`+`27bdbbe`（像素级滚动三次修复）/ `78b273a`（计划回写）/ `b82e03d`（T5 缩放与 refit）/ `f83bb64`（T6 缓存与虚拟化）/ `e27dd78`（T7 删死族 + 真机三报错）/ `365198a`（T8 外围适配）/ `e2c6f02`（T9 测试基建）。验证基线：`make -C emacs/seshat-reader clean all` EXIT 0、warning 24（P0 基线 33 → 24，零新增）、checkdoc 0；`make -C emacs/tests ert` → 31 文件 / 1213 例 / 0 unexpected / 0 skipped。真机验收要点：滚动为像素级连续（`j` 不再等同 `n`）、逐页居中与宽页贴左、`W`/`H`/`+`/`-`/`0` 缩放后全部可见页同步清晰、跨页滚动 scale 不跳变、滚轮与按键手感一致（步长可配置）。遗留项（跨页选区、横向滚动整栏平移、异步渲染、C 侧 overlay 兼容外壳等）见 `openspec/tech-debt.md`「2026-10-27 阅读器多页布局（P1）遗留」。
 
 ## 风险登记
 
