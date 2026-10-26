@@ -1661,9 +1661,3 @@
 - 影响：`sepia` 档下所有批注高亮 / 框选闪现（同为暖黄系）可见性接近 0；`midnight` / `charcoal` / `night-sepia` 三档是暗底，黄块对比充足，不受影响。属**装饰配色未随预设自适应**，不是渲染缺陷。
 - 建议：让装饰默认色随当前 tint 档位取反相 / 高对比色（例如亮底走深蓝、暗底保留黄），需要把「当前预设」暴露给 `seshat-reader-annotation--redraw-highlights` 一侧（C 侧已有 `theme_tint_bg`，可由 elisp 读一份镜像值）；或最小改法——检测到亮底预设时把默认高亮色改为深色系（`0.1/0.3/0.9`）。两条路径都要保证 `--add-highlight` 的历史配色在默认（`charcoal` / `graphite`）下逐像素不变。
 
-## 暗色状态是进程级 `static`，隐含单写者假设（阅读器暗色配色预设，2026-10-27）
-
-- 现状：`render-theme.c` 用 `static bool g_dark_enabled` / `static bool g_tint_set` / `static unsigned g_tint_bg` / `static unsigned g_tint_fg` 承载暗色开关与配色，写入点只有两个 Emacs 模块入口（`emacs_doc_invert` / `emacs_doc_tint`，均跑在主线程），读取点是渲染线程里的 `theme_dark_enabled()` 等访问器。**没有** `atomic` / 锁，正确性依赖「同一时刻只有主线程写」。
-- 影响：worker 读到上一版值是**良性**的（该页用旧配色渲染一次，调用方紧接着的 `--redisplay-all-windows` 会覆盖），因此当前实现没有可见缺陷。风险在演进：若将来出现并发写（例如后台线程按文档切换配色、或把 tint 做成 per-buffer 状态后再多线程下发），非原子的 `unsigned` 撕裂 / 判定与取色不一致就会变成偶发的「半页新配色半页旧配色」，且极难复现。
-- 建议：保持现状即可，但把这条假设当成**不变量**看待——任何新增写入点都必须先改成 `_Atomic`（`atomic_bool` / `atomic_uint` + `memory_order_relaxed` 足够，四个字段彼此独立、不需要与像素数据同步），并在 C 文件头注释里同步说明；同一批改动应给 `render-theme.c` 补一条「多线程下发」的回归测试（或用线程 sanitizer 跑一遍）。
-

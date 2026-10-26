@@ -325,7 +325,7 @@ M12 把 M11 的「单个底部面板」升级为「左目录 / 右信息 / 中�
 - **像素变换只有一条分支**：`render_page_to_buffer` 里 `dark_on && tint_set` → `fz_tint_pixmap(ctx, pixmap, bg, fg)`（把每像素亮度线性映射到 BG–FG 两端）；`dark_on` 但未设 tint → 旧的 `fz_invert_pixmap_luminance` + `fz_gamma_pixmap(1/1.4)`（满量程反色）。次序不变：**栅格化 → 像素变换 → 装饰 wash → PNM 编码**（理由见上节「绘制顺序」）。tint 是双端压缩，暗底不再等于「白变纯黑」，代价是彩色内容被压成单色调（见 `openspec/tech-debt.md`）。
 - **状态是进程级 static**：`render-theme.c` 的 `g_dark_enabled` / `g_tint_set` / `g_tint_bg` / `g_tint_fg` 承载开关与配色，**不随 `reset_doc_state` 清零**——重载文档或新开另一本都保持用户当前选择。`DocState` 因此**没有** `invert` 字段（原字段已删除），`mupdf-helpers.c` 的 `reset_doc_state` 也不再初始化它。
 - **elisp 侧如何写**：`seshat-reader-dyn--doc-invert` 只翻进程级开关、**不再要求文档存在**（进程级标志没有「文档缺失」这种失败态，恒返回 `t`）；`seshat-reader-dyn--doc-tint`（arity `2`，`BG FG` 均为 `#xRRGGBB` 整数）写配色，`-1 -1` 是**清空 tint** 的哨兵（回退旧 invert+gamma，即 `graphite` 预设的「一键回旧观感」），`> 0xFFFFFF` 返回 nil 且只 `message`、不改状态，非整数同样不改状态。两者都**不重绘**，重绘由调用方显式触发。
-- **单写多读**：四个 static 只由 Emacs 主线程经上述模块入口写、由渲染线程（`render_page_to_buffer` 通过 `theme_dark_enabled` / `theme_tint_set` / `theme_tint_bg` / `theme_tint_fg` 四个只读访问器）读；worker 若读到上一版值，只会用旧配色画一页，调用方紧接着的 redisplay 会覆盖它。**这是单写者假设**：将来若出现并发写（例如后台线程改配色）需改为 `atomic`，已记 `openspec/tech-debt.md`。
+- **原子状态**：`atomic_bool g_dark_enabled` / `atomic_bool g_tint_set` / `atomic_uint_fast64_t g_tint_pair`；主线程写（release）、渲染线程读（acquire）；BG 与 FG 打包在同一个 64 位字里一次读出，避免一帧内混用两档配色。
 
 ### 按页渲染查询接口（P0，2026-10-26）
 

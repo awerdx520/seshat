@@ -223,7 +223,7 @@ if (dark_enabled())
 
 - **偏差**：D2 备选 A 的表格与 T1 描述写的是 `static atomic_int g_dark_enabled; static atomic_int g_tint_bg, g_tint_fg;`；实际落地为 `static bool g_dark_enabled` / `g_tint_set` + `static unsigned g_tint_bg` / `g_tint_fg`（`render/render-theme.c`）。
 - **理由**：写者**只有一个**——Emacs 模块函数全部在主线程串行调用（`emacs_doc_invert` / `emacs_doc_tint`），读者是同线程的 `render_page_to_buffer`；不存在并发读写，`atomic` 只带来无收益的屏障与类型别扭（`atomic_int` 存颜色需要 `int` 而非 `unsigned`，`0xRRGGBB` 虽在 `int` 范围内但语义上更宜 `unsigned`）。
-- **影响**：语义等价、无功能差；**若将来引入后台线程改写配色**（例如按 buffer 切换配色的异步实现），必须回到 `atomic`——已在此登记为约束。
+- **影响**：语义等价、无功能差；**若将来引入后台线程改写配色**（例如按 buffer 切换配色的异步实现），必须回到 `atomic`——已在此登记为约束。 **已被批次 3d 推翻**：评审指出 bg/fg 两次独立 load 会撕裂，最终实现为 `atomic_bool` × 2 + `atomic_uint_fast64_t` 打包（一次 64 位 acquire 读出），见代码 `render-theme.c`。
 
 **② 分支形状是 `if (dark_on && tint_set) … else if (dark_on) …`，不是嵌套 `if`**
 
