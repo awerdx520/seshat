@@ -42,7 +42,13 @@
 ;;; Code:
 
 (require 'ert)
+(require 'cl-lib)
 (require 'seshat-reader)
+
+;; `seshat-reader-current-doc-pagecount' 由 C 模块注册为永久 buffer-local；本套件
+;; 不打开真实文档，故在此声明为 special，让 `let' 能临时模拟文档页数。
+(defvar seshat-reader-current-doc-pagecount nil
+  "Document page count, normally written by the native module.")
 
 ;;;; 夹具与辅助函数
 
@@ -203,22 +209,162 @@
                              '(1 . 5)))))
         (set-window-buffer window original)))))
 
-(ert-deftest seshat-reader-multipage-test--visible-range-clips-to-existing-pages ()
-  "A large preload is clipped to the first and the last existing page."
+(ert-deftest seshat-reader-multipage-test--visible-range-clips-to-pagecount ()
+  "A large preload is clipped to page 1 and to the document page count.
+
+裁剪基准是文档页数而不是「已经插入的页」：视口在第 2 页、只有 1..3 页存在，
+但文档共 40 页时，区间上界要越过第 3 页（否则滚动到第 4 页时范围会算成空集）。"
   (with-temp-buffer
-    (seshat-reader-multipage-test--insert-pages '(1 2 3))
     (let ((window (selected-window))
-          (original (window-buffer))
-          (second (cadr (assq 2 seshat-reader--pages))))
+          (original (window-buffer)))
       (unwind-protect
           (progn
             (set-window-buffer window (current-buffer))
-            (set-window-start window (marker-position second))
-            (should (= (window-start window) (marker-position second)))
-            (let ((seshat-reader--multipage-preload 10))
-              (should (equal (seshat-reader--multipage-visible-range window)
-                             '(1 . 3)))))
+            (let ((seshat-reader-current-doc-pagecount 40))
+              (seshat-reader-multipage-test--insert-pages '(1 2 3))
+              (set-window-start window (marker-position
+                                        (cadr (assq 2 seshat-reader--pages))))
+              (should (= (window-start window)
+                         (marker-position (cadr (assq 2 seshat-reader--pages)))))
+              (let ((seshat-reader--multipage-preload 10))
+                (should (equal (seshat-reader--multipage-visible-range window)
+                               '(1 . 13))))
+              (let ((seshat-reader--multipage-preload 100))
+                ;; 下界恒为第 1 页，上界夹到文档页数
+                (should (equal (seshat-reader--multipage-visible-range window)
+                               '(1 . 40))))))
         (set-window-buffer window original)))))
+
+;;;; 批次 2（T1b/T2/T3）：可见集同步、页号派生、翻页边界
+
+(defmacro seshat-reader-multipage-test--with-window-buffer (&rest body)
+  "Run BODY with the current buffer displayed in the selected window."
+  (declare (indent 0) (debug t))
+  `(let ((window (selected-window))
+         (original (window-buffer)))
+     (unwind-protect
+         (progn
+           (set-window-buffer window (current-buffer))
+           ,@body)
+       (set-window-buffer window original))))
+
+(ert-deftest seshat-reader-multipage-test--goto-puts-window-start-on-page ()
+  "`--multipage-goto' 把窗口起点与 point 都放在目标页行首。"
+  (with-temp-buffer
+    (seshat-reader-multipage-test--with-window-buffer
+      (let ((seshat-reader-current-doc-pagecount 5))
+        (seshat-reader-multipage-test--insert-pages '(1 2 3 4 5))
+        (dolist (page '(3 5 1))
+          (seshat-reader--multipage-goto page)
+          ;; 行首位置取调用之后的 marker：同步会回收/补齐页行，文本位置会变。
+          (let ((pos (marker-position (cadr (assq page seshat-reader--pages)))))
+            (should (= (window-start) pos))
+            (should (= (point) pos))
+            (should (= (seshat-reader--multipage-window-start-page
+                        (selected-window))
+                       page))))))))
+
+(ert-deftest seshat-reader-multipage-test--goto-returns-fresh-row-position ()
+  "`--multipage-goto' 返回调用之后的页行位置，而不是同步之前的位置。"
+  (with-temp-buffer
+    (seshat-reader-multipage-test--with-window-buffer
+      (let ((seshat-reader-current-doc-pagecount 20)
+            (seshat-reader--multipage-preload 1))
+        ;; 空 buffer：先跳到第 6 页，同步会在它前面插入 5、7 页行，位置必然变化
+        (let ((returned (seshat-reader--multipage-goto 6)))
+          (should returned)
+          (should (= returned
+                     (marker-position (cadr (assq 6 seshat-reader--pages)))))
+          (should (= (window-start) returned))
+          (should (= (point) returned)))))))
+
+(ert-deftest seshat-reader-multipage-test--pagenumber-follows-window-start ()
+  "`seshat-reader-current-doc-pagenumber' 随 `set-window-start' 变化。"
+  (with-temp-buffer
+    (seshat-reader-multipage-test--with-window-buffer
+      (let ((seshat-reader-current-doc-pagecount 5))
+        (seshat-reader-multipage-test--insert-pages '(1 2 3 4 5))
+        (set-window-start (selected-window)
+                          (marker-position (cadr (assq 1 seshat-reader--pages))))
+        (should (= 1 (seshat-reader-current-doc-pagenumber
+                      (selected-window))))
+        (set-window-start (selected-window)
+                          (marker-position (cadr (assq 4 seshat-reader--pages))))
+        (should (= 4 (seshat-reader-current-doc-pagenumber
+                      (selected-window))))
+        ;; 页行之间的 gap 空行归属上一个页行
+        (set-window-start (selected-window)
+                          (1- (marker-position
+                               (cadr (assq 4 seshat-reader--pages)))))
+        (should (= 3 (seshat-reader-current-doc-pagenumber
+                      (selected-window))))))))
+
+(ert-deftest seshat-reader-multipage-test--page-commands-stop-at-the-edges ()
+  "`next-page' / `previous-page' 在第 1 页与末页都不越界。"
+  (with-temp-buffer
+    (seshat-reader-multipage-test--with-window-buffer
+      (let ((seshat-reader-current-doc-pagecount 3))
+        (seshat-reader-multipage-test--insert-pages '(1 2 3))
+        (seshat-reader--multipage-goto 1)
+        ;; 第 1 页再往前：无动作，返回 nil
+        (should-not (seshat-reader--non-queue-previous-page))
+        (should (= 1 (seshat-reader-current-doc-pagenumber (selected-window))))
+        ;; 逐页向后
+        (should (seshat-reader--non-queue-next-page))
+        (should (= 2 (seshat-reader-current-doc-pagenumber (selected-window))))
+        (should (seshat-reader--non-queue-next-page))
+        (should (= 3 (seshat-reader-current-doc-pagenumber (selected-window))))
+        ;; 末页再往后：无动作，返回 nil
+        (should-not (seshat-reader--non-queue-next-page))
+        (should (= 3 (seshat-reader-current-doc-pagenumber (selected-window))))))))
+
+(ert-deftest seshat-reader-multipage-test--sync-is-idempotent-per-range ()
+  "`--multipage-sync' 在区间不变时不再调用渲染入口。"
+  (with-temp-buffer
+    (seshat-reader-multipage-test--with-window-buffer
+      (let* ((seshat-reader-current-doc-pagecount 5)
+             (calls 0))
+        (cl-letf (((symbol-function 'seshat-reader--page-spec)
+                   (lambda (&rest _args)
+                     (setq calls (1+ calls))
+                     (seshat-reader-multipage-test--fake-spec)))
+                  ;; batch 下整页行只占一行文本，真实 `window-end' 会把整个 buffer
+                  ;; 算进视口；这里固定成「视口只含页顶那一页」，与 GUI 里一页约
+                  ;; 一屏的情形一致。
+                  ((symbol-function 'window-end)
+                   (lambda (&optional _window _update)
+                     (window-start (selected-window)))))
+          (seshat-reader--multipage-goto 3)
+          (let ((first calls))
+            ;; 首轮既渲染目标页也补齐可见范围
+            (should (> first 0))
+            (should (= first (length seshat-reader--pages)))
+            ;; 区间未变 → 零渲染调用
+            (seshat-reader--multipage-sync (selected-window))
+            (should (= calls first))
+            (should (= 3 (seshat-reader--multipage-window-start-page
+                          (selected-window))))))))))
+
+(ert-deftest seshat-reader-multipage-test--sync-recycles-pages-outside-range ()
+  "视口离开较远的页后，`--multipage-sync' 回收区间外的页行。"
+  (with-temp-buffer
+    (seshat-reader-multipage-test--with-window-buffer
+      (let ((seshat-reader-current-doc-pagecount 20)
+            (seshat-reader--multipage-preload 1))
+        (seshat-reader-multipage-test--insert-pages '(1 2 3 4 5 6 7))
+        (cl-letf (((symbol-function 'seshat-reader--page-spec)
+                   (lambda (&rest _args)
+                     (seshat-reader-multipage-test--fake-spec)))
+                  ((symbol-function 'window-end)
+                   (lambda (&optional _window _update)
+                     (window-start (selected-window)))))
+          (seshat-reader--multipage-goto 1)
+          (should (equal (seshat-reader-multipage-test--page-numbers) '(1 2)))
+          ;; 跳到第 6 页：1..2 被回收，5..7 被补上
+          (seshat-reader--multipage-goto 6)
+          (should (equal (seshat-reader-multipage-test--page-numbers)
+                         '(5 6 7)))
+          (should (= (seshat-reader-multipage-test--display-count) 3)))))))
 
 (provide 'seshat-reader-multipage-test)
 

@@ -57,6 +57,18 @@
 ;; hook 内同步完成，重渲染前后几何相同，重渲染只负责提升清晰度，故判据是
 ;; 「已渲染分辨率 vs 显示比例」而不是「新旧目标比例差」。
 ;;
+;; **契约变更（2026-10-26，P1 多页布局批次 2）**：本文件删除 27 个用例
+;; （first-fit 5 个、fit-to-height/width 各 1 个、native-page-size 2 个、
+;; recenter-window 3 个、refit 6 个、rotate 1 个、size-change 2 个、
+;; window-buffer-change 4 个、window-create 2 个）。这些用例断言的是**单页
+;; overlay 几何**（页面挂在窗口参数 `overlay' 上、vscroll 夹紧、per-window
+;; `native-size' 缓存以窗口参数 `page' 为键、`--window-create-function' /
+;; `--handle-window-buffer-change' 的建/复用路径），而多页布局已把页面搬进
+;; buffer 页行、把页号改为视口顶页派生、删掉那两个函数。T4 会以多页语义重写
+;; 这批断言（逐页居中 / 逐页 native size / 批量 scale），届时不是「恢复旧用例」。
+;; 保留的 53 个用例要么与多页布局无关（去抖、守卫、normalize、初始 fit 模式），
+;; 要么其桩替仍模拟出 overlay 参数因而继续成立。
+;;
 ;; 运行方式（在仓库根目录执行）：
 ;;
 ;;   cd /home/thomas/WorkSpace/notes && \
@@ -301,76 +313,9 @@ queueing the next refit."
 
 ;;; 3. refit：fit 分支重算 scale 并夹紧+居中
 
-(ert-deftest seshat-reader-resize-test--refit-fit-branch ()
-  "A window whose scale source is `fit' is rescaled to contain the page.
-
-The contain stub supplies the new scale and the apply stub counts it once,
-followed by one clamp and one recentre.  Reverting the fit branch to
-`(funcall seshat-reader-default-fit)' produces (0 1 1)."
-  (let* ((buffer (seshat-reader-resize-test--reader-buffer))
-         (window (selected-window)))
-    (unwind-protect
-        (progn
-          (seshat-reader-resize-test--set-page-overlay window buffer 'fit)
-          (should (equal '(1 1 1)
-                         (seshat-reader-resize-test--refit-counts buffer window))))
-      (seshat-reader-resize-test--clear-window window)
-      (kill-buffer buffer))))
-
 ;;; 4. refit：manual 分支保留 scale
 
-(ert-deftest seshat-reader-resize-test--refit-manual-branch ()
-  "A `manual' window keeps its scale: the geometry apply is skipped.
-
-`render-scale' is set to the window's scale, so the clarity re-render of
-`seshat-reader--refit-window' is skipped too and the counts stay (0 1 1).
-The apply step is counted directly: removing the `manual' guard makes
-`seshat-reader--apply-display-scale' run once even though the counts alone
-would not notice it (`--contain-scale' is stubbed and there is no spec to
-rewrite here).
-
-契约变更（2026-10-23）：重渲染不再由「1% 偏差闸」决定，而由
-`render-scale' 与 `scale' 是否相等决定；manual 窗口的 `scale' 不参与
-几何适配，但同样受这条清晰度闸约束（相等即不重渲染）。"
-  (let* ((buffer (seshat-reader-resize-test--reader-buffer))
-         (window (selected-window))
-         (applied 0))
-    (unwind-protect
-        (progn
-          (seshat-reader-resize-test--set-page-overlay window buffer 'manual)
-          (set-window-parameter window 'scale 2.25)
-          (set-window-parameter window 'render-scale 2.25)
-          (cl-letf (((symbol-function 'seshat-reader--apply-display-scale)
-                     (lambda (&rest _) (cl-incf applied) nil)))
-            (should (equal '(0 1 1)
-                           (seshat-reader-resize-test--refit-counts
-                            buffer window))))
-          (should (= 0 applied))
-          (should (eql 2.25 (window-parameter window 'scale)))
-          (should (eq 'manual (window-parameter window 'scale-source))))
-      (seshat-reader-resize-test--clear-window window)
-      (kill-buffer buffer))))
-
 ;;; 5. refit：未记录来源时按 fit 处理
-
-(ert-deftest seshat-reader-resize-test--refit-unset-source ()
-  "A window that never recorded a scale source counts as `fit'.
-
-`scale-source' is left nil here.  An implementation that tests for the
-literal `fit' value instead of `not manual' would skip the refit and
-return (0 0 0)."
-  (let* ((buffer (seshat-reader-resize-test--reader-buffer))
-         (window (selected-window)))
-    (unwind-protect
-        (progn
-          (seshat-reader-resize-test--set-page-overlay window buffer nil)
-          (set-window-parameter window 'scale-source nil)
-          (should-not (window-parameter window 'scale-source))
-          (should (eq 'fit (seshat-reader--window-scale-source window)))
-          (should (equal '(1 1 1)
-                         (seshat-reader-resize-test--refit-counts buffer window))))
-      (seshat-reader-resize-test--clear-window window)
-      (kill-buffer buffer))))
 
 ;;; 6. 守卫：窗口已死
 
@@ -565,26 +510,6 @@ really comes from `seshat-reader-fit-to-height' passing it to
       (kill-buffer buffer))))
 
 ;;; 12. 多窗口各处理一次
-
-(ert-deftest seshat-reader-resize-test--refit-multi-window ()
-  "Two windows of the same buffer are refitted once each.
-
-The refit is not restricted to the selected window: the counts are 2 for
-the fit and 2 for the recentre, aggregated over both windows."
-  (let* ((buffer (seshat-reader-resize-test--reader-buffer))
-         (w1 (selected-window))
-         (w2 (split-window w1)))
-    (unwind-protect
-        (progn
-          (seshat-reader-resize-test--set-page-overlay w1 buffer 'fit)
-          (seshat-reader-resize-test--set-page-overlay w2 buffer 'fit)
-          (should (equal '(2 2 2)
-                         (seshat-reader-resize-test--run-pending-counts
-                          buffer :windows (list w1 w2)))))
-      (seshat-reader-resize-test--clear-window w1)
-      (seshat-reader-resize-test--clear-window w2)
-      (delete-window w2)
-      (kill-buffer buffer))))
 
 ;;; 13. buffer 已死
 
@@ -834,40 +759,6 @@ window 而不是 frame。把 window 当 frame 传给 `window-list' 会抛
 
 ;;; 20. 清晰度闸：`render-scale' 与 `scale' 相等 → 不重渲染，但仍夹紧+居中
 
-(ert-deftest seshat-reader-resize-test--refit-fit-skip-when-scale-unchanged ()
-  "A page already rendered at the displayed scale is not re-rendered.
-
-契约变更（2026-10-23）：原判据是「目标 scale 与当前 scale 相对差 ≤1% 则
-不重渲染」，现判据是「窗口参数 `render-scale'（overlay 上次渲染所用的
-分辨率）与当前 `scale' 相等则不重渲染」；原因：几何适配已由
-`--apply-display-scale' 在尺寸变化 hook 内同步完成，几何差恒为 0，
-重渲染只剩下「提升清晰度」的作用，故按已渲染分辨率判断。
-
-Re-rendering is synchronous (the C side waits for the cached page) and the
-re-render changes `line-prefix' and vscroll, which can be reported back as
-another size change; the gate breaks that loop.  Clamping and recentring
-still run, so the counts are (0 1 1) and the `scale' window parameter keeps
-its 1.6 value.  Without the gate the counts would be (1 1 1) and `scale'
-would be written by `seshat-reader-doc-scale-page' even though nothing
-changed."
-  (let* ((buffer (seshat-reader-resize-test--reader-buffer))
-         (window (selected-window))
-         (applied 0))
-    (unwind-protect
-        (progn
-          (seshat-reader-resize-test--set-page-overlay window buffer 'fit)
-          (set-window-parameter window 'scale 1.6)
-          (set-window-parameter window 'render-scale 1.6)
-          (cl-letf (((symbol-function 'seshat-reader--apply-display-scale)
-                     (lambda (&rest _) (cl-incf applied) nil)))
-            (should (equal '(0 1 1)
-                           (seshat-reader-resize-test--refit-counts
-                            buffer window :scale 1.6))))
-          (should (eql 1.6 (window-parameter window 'scale)))
-          (should (eq 'fit (window-parameter window 'scale-source))))
-      (seshat-reader-resize-test--clear-window window)
-      (kill-buffer buffer))))
-
 ;;; 21. 清晰度闸：`render-scale' 与 `scale' 不等 → 重渲染，参数为该 scale
 
 (ert-deftest seshat-reader-resize-test--refit-fit-applies-when-scale-differs ()
@@ -948,77 +839,7 @@ back to nil, so the zero count cannot pass for a broken stub."
 
 ;;; 23. 尺寸变化：同步居中先于排 refit（D7，方案 A）
 
-(ert-deftest seshat-reader-resize-test--size-change-recentres-synchronously ()
-  "A size change recentres the window before the refit is queued.
-
-`seshat-reader--center-page' writes a static `line-prefix' and a static
-horizontal scroll, and redisplay recomputes neither, so a hook that only
-schedules the refit leaves the frame which noticed the size change
-off-centre until the idle timer fires (175px on the real machine).  The
-order assertion is the point of this test: centring must happen
-synchronously, inside the hook, before the debounced refit is armed."
-  (let ((window (selected-window))
-        (orig-buffer (window-buffer (selected-window)))
-        (buffer (seshat-reader-resize-test--reader-buffer))
-        (events nil))
-    (unwind-protect
-        (progn
-          (set-window-buffer window buffer)
-          (seshat-reader-resize-test--set-page-overlay window buffer 'fit)
-          (cl-letf (((symbol-function 'seshat-reader--clamp-window-vscroll)
-                     (lambda (&optional _window) (push 'clamp events)))
-                    ((symbol-function 'seshat-reader--center-page)
-                     (lambda (&optional _window) (push 'center events)))
-                    ((symbol-function 'seshat-reader--schedule-refit)
-                     (lambda () (push 'refit events) nil)))
-            (with-current-buffer buffer
-              (seshat-reader--window-size-change window)))
-          (should (equal '(clamp center refit) (nreverse events))))
-      (set-window-buffer window orig-buffer)
-      (seshat-reader-resize-test--clear-window window)
-      (kill-buffer buffer))))
-
 ;;; 24. 尺寸变化：frame 形态居中每个匹配窗口，但只排一次 refit
-
-(ert-deftest seshat-reader-resize-test--size-change-recentres-every-window ()
-  "The frame shape recentres every matching window but queues one refit.
-
-Both windows show the reader buffer, so both must be recentred
-synchronously: a `throw' that stops at the first match leaves the second
-window showing a stale, off-centre page.  The refit is buffer-wide — it
-cancels and re-arms a single timer — so it is queued once, not once per
-window."
-  (let* ((window1 (selected-window))
-         (orig-buffer (window-buffer window1))
-         (buffer (seshat-reader-resize-test--reader-buffer))
-         (window2 nil)
-         (clamps 0)
-         (centers 0)
-         (refits 0))
-    (unwind-protect
-        (progn
-          (setq window2 (split-window window1))
-          (dolist (window (list window1 window2))
-            (set-window-buffer window buffer)
-            (seshat-reader-resize-test--set-page-overlay window buffer 'fit))
-          (cl-letf (((symbol-function 'seshat-reader--clamp-window-vscroll)
-                     (lambda (&optional _window) (cl-incf clamps)))
-                    ((symbol-function 'seshat-reader--center-page)
-                     (lambda (&optional _window) (cl-incf centers)))
-                    ((symbol-function 'seshat-reader--schedule-refit)
-                     (lambda () (cl-incf refits) nil)))
-            (with-current-buffer buffer
-              (seshat-reader--window-size-change (selected-frame))))
-          (should (= 2 clamps))
-          (should (= 2 centers))
-          (should (= 1 refits)))
-      (when (window-live-p window2)
-        (ignore-errors (delete-window window2)))
-      (dolist (window (list window1 window2))
-        (when (window-live-p window)
-          (set-window-buffer window orig-buffer)
-          (seshat-reader-resize-test--clear-window window)))
-      (kill-buffer buffer))))
 
 ;;; 25. 守卫：overlay 缺失时只跳过同步段，refit 照排
 
@@ -1058,93 +879,9 @@ refit pin exactly that split."
 
 ;;; 26. 换 buffer 到同一个 reader buffer：已有 overlay 时补一次 recentre
 
-(ert-deftest seshat-reader-resize-test--window-buffer-change-recentres-existing-overlay ()
-  "A surviving page overlay gets recentred, and no second overlay is created.
-
-`set-window-buffer' zeroes the window's horizontal scroll by itself, so a
-window that shows an already-rendered reader buffer — the page overlay is
-still there, no size change fired — must be recentred here.  Before the
-recentre branch existed this test failed with zero recentres: the create
-branch was skipped because the overlay parameter was set, and nothing else
-re-aligned the page."
-  (let ((window (selected-window))
-        (orig-buffer (window-buffer (selected-window)))
-        (buffer (seshat-reader-resize-test--reader-buffer))
-        (recentres 0)
-        (creates 0))
-    (unwind-protect
-        (progn
-          (set-window-buffer window buffer)
-          (seshat-reader-resize-test--set-page-overlay window buffer 'fit)
-          (cl-letf (((symbol-function 'seshat-reader--recenter-window)
-                     (lambda (_window) (cl-incf recentres)))
-                    ((symbol-function 'seshat-reader--window-create-function)
-                     (lambda (_window) (cl-incf creates))))
-            (with-current-buffer buffer
-              (seshat-reader--handle-window-buffer-change window)))
-          (should (= 1 recentres))
-          (should (= 0 creates)))
-      (set-window-buffer window orig-buffer)
-      (seshat-reader-resize-test--clear-window window)
-      (kill-buffer buffer))))
-
 ;;; 27. 换 buffer 到同一个 reader buffer：缺 overlay 时只创建，不 recentre
 
-(ert-deftest seshat-reader-resize-test--window-buffer-change-creates-overlay-when-missing ()
-  "Without a page overlay the create branch runs and the recentre does not.
-
-The two branches are mutually exclusive because `--window-create-function'
-centres the page itself; running both would do the alignment work twice.
-One create with zero recentres pins the exclusivity."
-  (let ((window (selected-window))
-        (orig-buffer (window-buffer (selected-window)))
-        (buffer (seshat-reader-resize-test--reader-buffer))
-        (recentres 0)
-        (creates 0))
-    (unwind-protect
-        (progn
-          (set-window-buffer window buffer)
-          (seshat-reader-resize-test--clear-window window)
-          (cl-letf (((symbol-function 'seshat-reader--recenter-window)
-                     (lambda (_window) (cl-incf recentres)))
-                    ((symbol-function 'seshat-reader--window-create-function)
-                     (lambda (_window) (cl-incf creates))))
-            (with-current-buffer buffer
-              (seshat-reader--handle-window-buffer-change window)))
-          (should (= 0 recentres))
-          (should (= 1 creates)))
-      (set-window-buffer window orig-buffer)
-      (seshat-reader-resize-test--clear-window window)
-      (kill-buffer buffer))))
-
 ;;; 28. 换 buffer 到普通 buffer：两条分支都不走
-
-(ert-deftest seshat-reader-resize-test--window-buffer-change-skips-non-reader-buffer ()
-  "A window showing a non-reader buffer neither recentres nor creates an overlay.
-
-The `derived-mode-p' guard must gate both branches: a plain buffer has no
-page to align, and creating an overlay there would attach the reader's
-display machinery to an unrelated buffer."
-  (let ((window (selected-window))
-        (orig-buffer (window-buffer (selected-window)))
-        (buffer (generate-new-buffer " *seshat-reader-resize-test-plain*"))
-        (recentres 0)
-        (creates 0))
-    (unwind-protect
-        (progn
-          (set-window-buffer window buffer)
-          (should (eq (with-current-buffer buffer major-mode) 'fundamental-mode))
-          (cl-letf (((symbol-function 'seshat-reader--recenter-window)
-                     (lambda (_window) (cl-incf recentres)))
-                    ((symbol-function 'seshat-reader--window-create-function)
-                     (lambda (_window) (cl-incf creates))))
-            (with-current-buffer buffer
-              (seshat-reader--handle-window-buffer-change window)))
-          (should (= 0 recentres))
-          (should (= 0 creates)))
-      (set-window-buffer window orig-buffer)
-      (seshat-reader-resize-test--clear-window window)
-      (kill-buffer buffer))))
 
 ;;; 29. image size 未知时 right-most-window-hscroll 返回 0 且不抛错
 
@@ -1408,27 +1145,6 @@ desynchronise the window parameter from a spec that was never resized."
 
 ;;; 39. --native-page-size：由 spec / scale 推算并写入缓存
 
-(ert-deftest seshat-reader-resize-test--native-page-size-computes ()
-  "The unscaled size is the spec size divided by the scale, cached by page.
-
-The page is 200 x 100 at scale 1.0, so the native size is (200.0 . 100.0)
-and the cache holds `(PAGE . SIZE)' = (1 200.0 . 100.0), a cons of the page
-number and the size cons — not a flat three-element list."
-  (let* ((buffer (seshat-reader-resize-test--reader-buffer))
-         (window (selected-window)))
-    (unwind-protect
-        (progn
-          (seshat-reader-resize-test--set-page-overlay window buffer 'fit)
-          (seshat-reader-resize-test--set-page-spec window 200 100)
-          (set-window-parameter window 'page 1)
-          (set-window-parameter window 'scale 1.0)
-          (should (equal (cons 200.0 100.0)
-                         (seshat-reader--native-page-size window)))
-          (should (equal (cons 1 (cons 200.0 100.0))
-                         (window-parameter window 'native-size))))
-      (seshat-reader-resize-test--clear-window window)
-      (kill-buffer buffer))))
-
 ;;; 40. --native-page-size：命中缓存后不再读 spec
 
 (ert-deftest seshat-reader-resize-test--native-page-size-cache-hit ()
@@ -1459,94 +1175,9 @@ call must not read the spec again."
 
 ;;; 41. --recenter-window：fit 窗口先 apply，再 clamp，再 center
 
-(ert-deftest seshat-reader-resize-test--recenter-window-applies-first ()
-  "A fit window is scaled first, then clamped, then recentred.
-
-The order matters: the clamp and the recentre read the page geometry, so
-computing them before the spec is resized would use the previous size.  The
-symbols are pushed as the steps run, then compared in reverse."
-  (let* ((buffer (seshat-reader-resize-test--reader-buffer))
-         (window (selected-window))
-         (order nil))
-    (unwind-protect
-        (progn
-          (seshat-reader-resize-test--set-page-overlay window buffer 'fit)
-          (cl-letf* (((symbol-function 'window-buffer)
-                      (lambda (&optional _window) buffer))
-                     ((symbol-function 'seshat-reader--fit-scale)
-                      (lambda (&optional _window) 1.5))
-                     ((symbol-function 'seshat-reader--apply-display-scale)
-                      (lambda (_window scale)
-                        (push (cons 'apply scale) order)
-                        t))
-                     ((symbol-function 'seshat-reader--clamp-window-vscroll)
-                      (lambda (&optional _window) (push 'clamp order)))
-                     ((symbol-function 'seshat-reader--center-page)
-                      (lambda (&optional _window) (push 'center order))))
-            (with-current-buffer buffer
-              (seshat-reader--recenter-window window)))
-          (should (equal '(center clamp (apply . 1.5)) order)))
-      (seshat-reader-resize-test--clear-window window)
-      (kill-buffer buffer))))
-
 ;;; 42. --recenter-window：manual 窗口跳过 apply
 
-(ert-deftest seshat-reader-resize-test--recenter-window-skips-manual-apply ()
-  "A `manual' window is clamped and recentred but never rescaled.
-
-`scale-source' is `manual', so the synchronous geometry step is skipped: the
-user's zoom must survive a resize.  The clamp and the recentre still run,
-because they are read-only geometry fixes."
-  (let* ((buffer (seshat-reader-resize-test--reader-buffer))
-         (window (selected-window))
-         (order nil))
-    (unwind-protect
-        (progn
-          (seshat-reader-resize-test--set-page-overlay window buffer 'manual)
-          (cl-letf* (((symbol-function 'window-buffer)
-                      (lambda (&optional _window) buffer))
-                     ((symbol-function 'seshat-reader--fit-scale)
-                      (lambda (&optional _window) 1.5))
-                     ((symbol-function 'seshat-reader--apply-display-scale)
-                      (lambda (&rest _) (push 'apply order) t))
-                     ((symbol-function 'seshat-reader--clamp-window-vscroll)
-                      (lambda (&optional _window) (push 'clamp order)))
-                     ((symbol-function 'seshat-reader--center-page)
-                      (lambda (&optional _window) (push 'center order))))
-            (with-current-buffer buffer
-              (seshat-reader--recenter-window window)))
-          (should (equal '(center clamp) order)))
-      (seshat-reader-resize-test--clear-window window)
-      (kill-buffer buffer))))
-
 ;;; 43. --refit-window：已渲染分辨率与显示比例一致 → 零重渲染
-
-(ert-deftest seshat-reader-resize-test--refit-skips-render-when-scale-matches ()
-  "A refit whose displayed scale equals `render-scale' renders nothing.
-
-契约变更（2026-10-23）：判据是 `render-scale' 与 `scale' 相等（原为 1%
-偏差闸）。The apply stub writes the scale the way the real apply does, so the
-window's scale and `render-scale' end up equal and
-`seshat-reader-doc-scale-page' is not called; clamp and recentre still run."
-  (let* ((buffer (seshat-reader-resize-test--reader-buffer))
-         (window (selected-window)))
-    (unwind-protect
-        (progn
-          (seshat-reader-resize-test--set-page-overlay window buffer 'fit)
-          (set-window-parameter window 'scale 1.6)
-          (set-window-parameter window 'render-scale 1.6)
-          (cl-letf (((symbol-function 'seshat-reader--contain-scale)
-                     (lambda (&optional _window) 1.6))
-                    ((symbol-function 'seshat-reader--apply-display-scale)
-                     (lambda (target scale)
-                       (set-window-parameter target 'scale scale)
-                       nil)))
-            (should (equal '(0 1 1)
-                           (seshat-reader-resize-test--refit-counts
-                            buffer window :scale 1.6))))
-          (should (eql 1.6 (window-parameter window 'scale))))
-      (seshat-reader-resize-test--clear-window window)
-      (kill-buffer buffer))))
 
 ;;; 44. --refit-window：从未渲染过（render-scale 为 nil）→ 恰好一次
 
@@ -1590,64 +1221,7 @@ would show up as a count of 2.
 
 ;;; 45. fit-to-width：记录 fit-mode = width
 
-(ert-deftest seshat-reader-resize-test--fit-to-width-records-mode ()
-  "`fit-to-width' scales by width / native width and records `width'.
-
-The dynamic-module entry point is stubbed with the page size, so the factor
-is exact: 400 pixels of window over a 200 pixel page is 2.0.  The recorded
-mode is what makes a later resize keep filling the width instead of falling
-back to the containing scale."
-  (let ((window (selected-window))
-        (calls nil))
-    (unwind-protect
-        (cl-letf* (((symbol-function 'seshat-reader--get-current-doc-image-size)
-                    (lambda (&optional _window) (cons 200 100)))
-                   ((symbol-function 'window-body-width)
-                    (lambda (&optional _window pixels-p)
-                      (if pixels-p 400 50)))
-                   ((symbol-function 'seshat-reader-current-doc-scale-value)
-                    (lambda (&optional _window) 1.0))
-                   ((symbol-function 'seshat-reader-doc-scale-page)
-                    (lambda (factor &optional source)
-                      (push (cons factor source) calls)))
-                   ((symbol-function 'seshat-reader--center-page)
-                    (lambda (&optional _window) nil))
-                   ((symbol-function 'seshat-reader--set-page-top-when-joined)
-                    (lambda (&optional _window) nil)))
-          (seshat-reader-fit-to-width)
-          (should (equal '((2.0 . fit)) calls))
-          (should (eq 'width (window-parameter window 'fit-mode))))
-      (set-window-parameter window 'fit-mode nil))))
-
 ;;; 46. fit-to-height：记录 fit-mode = height
-
-(ert-deftest seshat-reader-resize-test--fit-to-height-records-mode ()
-  "`fit-to-height' scales by height / native height and records `height'.
-
-The factor is exact again: 300 pixels of window over a 100 pixel page is
-3.0.  `presentation-mode' calls this function, so the recorded mode is also
-what keeps presentation mode fitting by height after a resize."
-  (let ((window (selected-window))
-        (calls nil))
-    (unwind-protect
-        (cl-letf* (((symbol-function 'seshat-reader--get-current-doc-image-size)
-                    (lambda (&optional _window) (cons 200 100)))
-                   ((symbol-function 'window-body-height)
-                    (lambda (&optional _window pixels-p)
-                      (if pixels-p 300 30)))
-                   ((symbol-function 'seshat-reader-current-doc-scale-value)
-                    (lambda (&optional _window) 1.0))
-                   ((symbol-function 'seshat-reader-doc-scale-page)
-                    (lambda (factor &optional source)
-                      (push (cons factor source) calls)))
-                   ((symbol-function 'seshat-reader--center-page)
-                    (lambda (&optional _window) nil))
-                   ((symbol-function 'seshat-reader--set-page-top)
-                    (lambda (&optional _window) nil)))
-          (seshat-reader-fit-to-height)
-          (should (equal '((3.0 . fit)) calls))
-          (should (eq 'height (window-parameter window 'fit-mode))))
-      (set-window-parameter window 'fit-mode nil))))
 
 ;;; 47. --native-page-size：页号 nil 且无 spec → nil，不写缓存
 
@@ -1670,118 +1244,9 @@ nil size would make every later call return it for page nil."
 
 ;;; 48. --native-page-size：多窗口隔离，互不覆盖
 
-(ert-deftest seshat-reader-resize-test--native-page-size-per-window ()
-  "Two windows on two pages keep their own cached size.
-
-`native-size' is a window parameter, so window one must keep its 200 x 100
-page even after window two measured a 400 x 200 one; a buffer-level cache
-would make the second measurement overwrite the first."
-  (let* ((buffer (seshat-reader-resize-test--reader-buffer))
-         (w1 (selected-window))
-         (w2 (split-window w1)))
-    (unwind-protect
-        (progn
-          (seshat-reader-resize-test--set-page-overlay w1 buffer 'fit)
-          (seshat-reader-resize-test--set-page-overlay w2 buffer 'fit)
-          (seshat-reader-resize-test--set-page-spec w1 200 100)
-          (seshat-reader-resize-test--set-page-spec w2 400 200)
-          (set-window-parameter w1 'page 1)
-          (set-window-parameter w1 'scale 1.0)
-          (set-window-parameter w2 'page 2)
-          (set-window-parameter w2 'scale 1.0)
-          (should (equal (cons 200.0 100.0)
-                         (seshat-reader--native-page-size w1)))
-          (should (equal (cons 400.0 200.0)
-                         (seshat-reader--native-page-size w2)))
-          (should (equal (cons 200.0 100.0)
-                         (seshat-reader--native-page-size w1)))
-          (should (equal (cons 1 (cons 200.0 100.0))
-                         (window-parameter w1 'native-size)))
-          (should (equal (cons 2 (cons 400.0 200.0))
-                         (window-parameter w2 'native-size))))
-      (seshat-reader-resize-test--clear-window w1)
-      (seshat-reader-resize-test--clear-window w2)
-      (delete-window w2)
-      (kill-buffer buffer))))
-
 ;;; 49. 旋转：两个 rotate 命令都清掉 native-size 缓存
 
-(ert-deftest seshat-reader-resize-test--rotate-clears-native-size ()
-  "Rotating a page invalidates the cached native size.
-
-Rotating swaps width and height, so a cached `(PAGE . (W . H))' would be
-used unrotated by the next fit and the page would be fitted to the wrong
-dimension.  The rotation itself is stubbed; only the invalidation matters."
-  (let* ((buffer (seshat-reader-resize-test--reader-buffer))
-         (window (selected-window))
-         (rotations nil))
-    (unwind-protect
-        (progn
-          (seshat-reader-resize-test--set-page-overlay window buffer 'fit)
-          (set-window-parameter window 'page 1)
-          (cl-letf* (((symbol-function 'seshat-reader-dyn--rotate-page)
-                      (lambda (degrees) (push degrees rotations)))
-                     ((symbol-function 'seshat-reader--center-page)
-                      (lambda (&optional _window) nil))
-                     ((symbol-function 'seshat-reader--set-page-top-when-joined)
-                      (lambda (&optional _window) nil)))
-            (set-window-parameter window 'native-size
-                                  (cons 1 (cons 200.0 100.0)))
-            (with-current-buffer buffer
-              (seshat-reader-rotate-clockwise))
-            (should-not (window-parameter window 'native-size))
-            (set-window-parameter window 'native-size
-                                  (cons 1 (cons 100.0 200.0)))
-            (with-current-buffer buffer
-              (seshat-reader-rotate-counter-clockwise))
-            (should-not (window-parameter window 'native-size)))
-          (should (equal '(-90 90) rotations)))
-      (seshat-reader-resize-test--clear-window window)
-      (kill-buffer buffer))))
-
 ;;; 50. --handle-window-buffer-change：复用点对 fit 窗口 apply 一次
-
-(ert-deftest seshat-reader-resize-test--window-buffer-change-applies-fit-once ()
-  "A surviving overlay makes the buffer change reuse the recentre path.
-
-That path now also adapts the geometry, so a fit window gets one apply and a
-new `scale', while a `manual' window keeps its scale and is applied zero
-times.  This is the documented reuse point of D8: showing the document in a
-new window or frame gives it the right geometry in the first frame."
-  (let ((window (selected-window))
-        (orig-buffer (window-buffer (selected-window)))
-        (buffer (seshat-reader-resize-test--reader-buffer))
-        (applied 0))
-    (unwind-protect
-        (progn
-          (set-window-buffer window buffer)
-          (seshat-reader-resize-test--set-page-overlay window buffer 'fit)
-          (cl-letf* (((symbol-function 'seshat-reader--fit-scale)
-                      (lambda (&optional _window) 1.4))
-                     ((symbol-function 'seshat-reader--apply-display-scale)
-                      (lambda (target scale)
-                        (cl-incf applied)
-                        (set-window-parameter target 'scale scale)
-                        t))
-                     ((symbol-function 'seshat-reader--clamp-window-vscroll)
-                      (lambda (&optional _window) nil))
-                     ((symbol-function 'seshat-reader--center-page)
-                      (lambda (&optional _window) nil)))
-            (with-current-buffer buffer
-              (seshat-reader--handle-window-buffer-change window))
-            (should (= 1 applied))
-            (should (eql 1.4 (window-parameter window 'scale)))
-            ;; manual 窗口复用同一条路径，但几何不动。
-            (setq applied 0)
-            (set-window-parameter window 'scale-source 'manual)
-            (set-window-parameter window 'scale 2.0)
-            (with-current-buffer buffer
-              (seshat-reader--handle-window-buffer-change window))
-            (should (= 0 applied))
-            (should (eql 2.0 (window-parameter window 'scale)))))
-      (set-window-buffer window orig-buffer)
-      (seshat-reader-resize-test--clear-window window)
-      (kill-buffer buffer))))
 
 ;;; 51. --apply-display-scale：边界输入静默返回 nil
 
@@ -1844,46 +1309,6 @@ the zero call case is pinned by the next test."
       (kill-buffer buffer))))
 
 ;;; 53. --recenter-window：拖拽中（间隔小于阈值）→ 零 apply，仍 clamp + center
-
-(ert-deftest seshat-reader-resize-test--recenter-window-skips-apply-while-dragging ()
-  "A burst of size changes only recentres, without rescaling the page bitmap.
-
-`seshat-reader--last-size-change-delta' is 0.02 s, below
-`seshat-reader--drag-threshold': the events arrive once per frame while the
-user drags a window divider.  Rewriting the image spec on every one of them
-makes redisplay rescale the whole page bitmap each frame, which is the
-1–2 s stall reported on the real machine.  The geometry is therefore left
-alone and adapted once by the debounced refit after the drag stops, while
-the clamp and the recentre still run because they touch no bitmap."
-  (let* ((buffer (seshat-reader-resize-test--reader-buffer))
-         (window (selected-window))
-         (applied 0)
-         (clamps 0)
-         (centers 0))
-    (unwind-protect
-        (progn
-          (seshat-reader-resize-test--set-page-overlay window buffer 'fit)
-          (with-current-buffer buffer
-            (setq seshat-reader--last-size-change-delta 0.02))
-          (cl-letf* (((symbol-function 'window-buffer)
-                      (lambda (&optional _window) buffer))
-                     ((symbol-function 'seshat-reader--fit-scale)
-                      (lambda (&optional _window) 1.5))
-                     ((symbol-function 'seshat-reader--apply-display-scale)
-                      (lambda (_window _scale) (cl-incf applied) t))
-                     ((symbol-function 'seshat-reader--clamp-window-vscroll)
-                      (lambda (&optional _window) (cl-incf clamps)))
-                     ((symbol-function 'seshat-reader--center-page)
-                      (lambda (&optional _window) (cl-incf centers))))
-            (with-current-buffer buffer
-              (seshat-reader--recenter-window window)))
-          (should (= 0 applied))
-          (should (= 1 clamps))
-          (should (= 1 centers))
-          ;; 前提：0.02 确实小于阈值
-          (should (< 0.02 seshat-reader--drag-threshold)))
-      (seshat-reader-resize-test--clear-window window)
-      (kill-buffer buffer))))
 
 ;;; 54. --center-page：只写 prefix/hscroll，不再强制标记窗口重算
 
@@ -2031,85 +1456,7 @@ centring (found by sampling an isolated instance)."
 
 ;;; 58. --first-fit：spec 可用时走显示层缩放，不重渲染
 
-(ert-deftest seshat-reader-resize-test--first-fit-uses-display-scale-when-available ()
-  "The first fit rescales the display instead of re-rendering the page.
-
-`seshat-reader--first-fit' is what `seshat-reader-mode' calls when a
-document is opened.  Reaching the target scale by re-rendering produces two
-frames: the default-size bitmap centred once, then the larger bitmap
-centred again -- the \"small then large\" flash.  When the page spec is
-already available the display-level rescale reaches the final size in the
-very first frame, so `seshat-reader-doc-scale-page' must not run at all;
-the crisp bitmap is left to the debounced refit."
-  (let* ((buffer (seshat-reader-resize-test--reader-buffer))
-         (applied 0)
-         (applied-scale nil)
-         (centers 0)
-         (refits 0)
-         (renders 0))
-    (unwind-protect
-        (progn
-          (cl-letf* (((symbol-function 'seshat-reader--contain-scale)
-                      (lambda (&optional _window) 1.9))
-                     ((symbol-function 'seshat-reader--apply-display-scale)
-                      (lambda (_window scale)
-                        (cl-incf applied)
-                        (setq applied-scale scale)
-                        t))
-                     ((symbol-function 'seshat-reader--center-page)
-                      (lambda (&optional _window) (cl-incf centers) nil))
-                     ((symbol-function 'seshat-reader--schedule-refit)
-                      (lambda () (cl-incf refits) nil))
-                     ((symbol-function 'seshat-reader-doc-scale-page)
-                      (lambda (&rest _) (cl-incf renders) nil)))
-            (with-current-buffer buffer
-              (seshat-reader--first-fit)))
-          (should (= 1 applied))
-          (should (eql 1.9 applied-scale))
-          (should (= 0 renders))
-          (should (= 1 centers))
-          (should (= 1 refits)))
-      (kill-buffer buffer))))
-
 ;;; 59. --first-fit：spec 不可用时回退到同步重渲染
-
-(ert-deftest seshat-reader-resize-test--first-fit-falls-back-to-render ()
-  "Without a page spec the first fit re-renders synchronously, as before.
-
-`seshat-reader--apply-display-scale' returns nil while the page spec is not
-available yet, so the old synchronous path must still run: one apply
-attempt, exactly one re-render at the contain scale with `fit' as source,
-then the centre.  Dropping the fallback would leave the first frame
-unscaled instead of merely flashing."
-  (let* ((buffer (seshat-reader-resize-test--reader-buffer))
-         (applied 0)
-         (renders 0)
-         (render-args nil)
-         (centers 0)
-         (refits 0))
-    (unwind-protect
-        (progn
-          (cl-letf* (((symbol-function 'seshat-reader--contain-scale)
-                      (lambda (&optional _window) 1.9))
-                     ((symbol-function 'seshat-reader--apply-display-scale)
-                      (lambda (_window _scale) (cl-incf applied) nil))
-                     ((symbol-function 'seshat-reader--center-page)
-                      (lambda (&optional _window) (cl-incf centers) nil))
-                     ((symbol-function 'seshat-reader--schedule-refit)
-                      (lambda () (cl-incf refits) nil))
-                     ((symbol-function 'seshat-reader-doc-scale-page)
-                      (lambda (factor &optional source)
-                        (cl-incf renders)
-                        (setq render-args (list factor source))
-                        nil)))
-            (with-current-buffer buffer
-              (seshat-reader--first-fit)))
-          (should (= 1 applied))
-          (should (= 1 renders))
-          (should (equal '(1.9 fit) render-args))
-          (should (= 1 centers))
-          (should (= 1 refits)))
-      (kill-buffer buffer))))
 
 ;;; 60. --center-page：能放下时写 before-string（redisplay 自居中）
 
@@ -2435,183 +1782,12 @@ Resizing a window (or refitting it) must not reset the user's explicit
 
 ;;; 76. --first-fit：按默认适配模式（width）求 scale 并记录 fit-mode
 
-(ert-deftest seshat-reader-resize-test--first-fit-records-and-uses-width-mode ()
-  "The first fit asks `--fit-scale' for the mode the window starts with.
-
-A document opened in a window whose initial mode is `width' must be scaled
-to fill the width even on the very first frame; the mode is recorded as the
-window's `fit-mode' first so the debounced refit and later resizes keep it
-instead of falling back to `contain'.  `--contain-scale' is not consulted at
-all here: the target comes from `--fit-scale', which dispatches on the mode."
-  (let ((window (selected-window))
-        (seshat-reader-default-fit 'width)
-        (fit-calls 0)
-        (applied nil)
-        (centers 0)
-        (refits 0)
-        (renders 0))
-    (unwind-protect
-        (progn
-          (set-window-parameter window 'fit-mode nil)
-          (cl-letf* (((symbol-function 'seshat-reader--fit-scale)
-                      (lambda (&optional _window) (cl-incf fit-calls) 0.5))
-                     ((symbol-function 'seshat-reader--apply-display-scale)
-                      (lambda (win scale) (setq applied (list win scale)) t))
-                     ((symbol-function 'seshat-reader--center-page)
-                      (lambda (&optional _window) (cl-incf centers) nil))
-                     ((symbol-function 'seshat-reader--schedule-refit)
-                      (lambda () (cl-incf refits) nil))
-                     ((symbol-function 'seshat-reader-doc-scale-page)
-                      (lambda (&rest _) (cl-incf renders) nil)))
-            (seshat-reader--first-fit))
-          (should (= 1 fit-calls))
-          (should (eq 'width (window-parameter window 'fit-mode)))
-          (should (equal (list window 0.5) applied))
-          (should (= 0 renders))
-          (should (= 1 centers))
-          (should (= 1 refits)))
-      (seshat-reader-resize-test--clear-window window))))
-
 ;;; 77. --first-fit：默认 contain 模式行为不变（转调 --contain-scale）
-
-(ert-deftest seshat-reader-resize-test--first-fit-default-contain-unchanged ()
-  "With the default `contain' mode the first fit still delegates the maths.
-
-`--fit-scale' is deliberately left un-stubbed: the real implementation must
-reach `seshat-reader--contain-scale' through its `contain' branch, so the
-scale handed to `--apply-display-scale' is exactly the one that function
-returns.  This is the no-behaviour-change guarantee for users who never set
-`seshat-reader-default-fit'."
-  (let ((window (selected-window))
-        (seshat-reader-default-fit 'contain)
-        (contain-calls 0)
-        (applied nil)
-        (centers 0)
-        (refits 0)
-        (renders 0))
-    (unwind-protect
-        (progn
-          (set-window-parameter window 'fit-mode nil)
-          (cl-letf* (((symbol-function 'seshat-reader--contain-scale)
-                      (lambda (&optional _window)
-                        (cl-incf contain-calls)
-                        0.25))
-                     ((symbol-function 'seshat-reader--apply-display-scale)
-                      (lambda (win scale) (setq applied (list win scale)) t))
-                     ((symbol-function 'seshat-reader--center-page)
-                      (lambda (&optional _window) (cl-incf centers) nil))
-                     ((symbol-function 'seshat-reader--schedule-refit)
-                      (lambda () (cl-incf refits) nil))
-                     ((symbol-function 'seshat-reader-doc-scale-page)
-                      (lambda (&rest _) (cl-incf renders) nil)))
-            (seshat-reader--first-fit))
-          (should (= 1 contain-calls))
-          (should (eq 'contain (window-parameter window 'fit-mode)))
-          (should (equal (list window 0.25) applied))
-          (should (= 0 renders))
-          (should (= 1 centers))
-          (should (= 1 refits)))
-      (seshat-reader-resize-test--clear-window window))))
 
 ;;; 78. --first-fit：height 模式下回退仍按 --fit-scale 重渲染
 
-(ert-deftest seshat-reader-resize-test--first-fit-height-mode-falls-back-to-render ()
-  "The fallback renders at the mode-specific scale, not at `contain'.
-
-When no page spec is available yet `--apply-display-scale' returns nil and
-the synchronous re-render takes over; it must use the `--fit-scale' value so
-the very first bitmap is already the right size for a `height' window."
-  (let ((window (selected-window))
-        (seshat-reader-default-fit 'height)
-        (applied 0)
-        (renders 0)
-        (render-args nil)
-        (centers 0)
-        (refits 0))
-    (unwind-protect
-        (progn
-          (set-window-parameter window 'fit-mode nil)
-          (cl-letf* (((symbol-function 'seshat-reader--fit-scale)
-                      (lambda (&optional _window) 0.75))
-                     ((symbol-function 'seshat-reader--apply-display-scale)
-                      (lambda (_win _scale) (cl-incf applied) nil))
-                     ((symbol-function 'seshat-reader--center-page)
-                      (lambda (&optional _window) (cl-incf centers) nil))
-                     ((symbol-function 'seshat-reader--schedule-refit)
-                      (lambda () (cl-incf refits) nil))
-                     ((symbol-function 'seshat-reader-doc-scale-page)
-                      (lambda (factor &optional source)
-                        (cl-incf renders)
-                        (setq render-args (list factor source))
-                        nil)))
-            (seshat-reader--first-fit))
-          (should (= 1 applied))
-          (should (eq 'height (window-parameter window 'fit-mode)))
-          (should (= 1 renders))
-          (should (equal '(0.75 fit) render-args))
-          (should (= 1 centers))
-          (should (= 1 refits)))
-      (seshat-reader-resize-test--clear-window window))))
-
 ;;; 79. --window-create-function：新窗口写入归一化后的初始 fit-mode
 
-(ert-deftest seshat-reader-resize-test--window-create-writes-initial-fit-mode ()
-  "A freshly created window records the normalized default fit mode.
-
-`seshat-reader-default-fit' is only a starting point: the window's own
-`fit-mode' parameter is what the resize refit reads, so the create path has
-to seed it.  Without that seed a window opened with a `width' default would
-fall back to the `contain' maths on the first resize."
-  (let ((window (selected-window))
-        (seshat-reader-default-fit 'width)
-        (created 0))
-    (unwind-protect
-        (progn
-          (dolist (parameter '(overlay fit-mode page scale))
-            (set-window-parameter window parameter nil))
-          (cl-letf* (((symbol-function 'seshat-reader-dyn--window-create)
-                      (lambda (_window) (cl-incf created) nil))
-                     ((symbol-function 'seshat-reader-goto-page)
-                      (lambda (&rest _) nil))
-                     ((symbol-function 'seshat-reader-doc-scale-page)
-                      (lambda (&rest _) nil))
-                     ((symbol-function 'seshat-reader--center-page)
-                      (lambda (&optional _window) nil)))
-            (seshat-reader--window-create-function window))
-          (should (= 1 created))
-          (should (eq 'width (window-parameter window 'fit-mode))))
-      (seshat-reader-resize-test--clear-window window))))
-
 ;;; 80. --window-create-function：已有 fit-mode 的窗口不被默认值覆盖
-
-(ert-deftest seshat-reader-resize-test--window-create-keeps-existing-fit-mode ()
-  "An existing `fit-mode' survives window creation.
-
-The create path runs again whenever a window's overlays are rebuilt, so an
-unconditional write would silently reset the user's explicit `H' choice back
-to `seshat-reader-default-fit'.  With a `width' default the recorded
-`height' must still win, so this test guards against a naive
-\"always seed\" implementation rather than being red before green."
-  (let ((window (selected-window))
-        (seshat-reader-default-fit 'width)
-        (created 0))
-    (unwind-protect
-        (progn
-          (dolist (parameter '(overlay fit-mode page scale))
-            (set-window-parameter window parameter nil))
-          (set-window-parameter window 'fit-mode 'height)
-          (cl-letf* (((symbol-function 'seshat-reader-dyn--window-create)
-                      (lambda (_window) (cl-incf created) nil))
-                     ((symbol-function 'seshat-reader-goto-page)
-                      (lambda (&rest _) nil))
-                     ((symbol-function 'seshat-reader-doc-scale-page)
-                      (lambda (&rest _) nil))
-                     ((symbol-function 'seshat-reader--center-page)
-                      (lambda (&optional _window) nil)))
-            (seshat-reader--window-create-function window))
-          (should (= 1 created))
-          (should (eq 'height (window-parameter window 'fit-mode)))
-          (should-not (eq 'width (window-parameter window 'fit-mode))))
-      (seshat-reader-resize-test--clear-window window))))
 
 ;;; seshat-reader-resize-test.el ends here

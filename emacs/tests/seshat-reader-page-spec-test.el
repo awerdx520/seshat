@@ -90,14 +90,16 @@
              (error nil)))))
 
 (defun seshat-reader-page-spec-test--open-doc ()
-  "返回一个已加载夹具 PDF、并显示在窗口里的 reader buffer。
+  "返回一个已加载夹具 PDF、并按多页布局显示出页行的 reader buffer。
 
-必要时重新打开文档。ERT 在每个用例前后恢复窗口配置，所以上一个用例结束时
-窗口会回到 `*scratch*'；这里因此每次都把 buffer 重新显示，页 overlay 由
-`window-configuration-change-hook' 重新创建（窗口参数 `page'/`scale' 随窗口保留）。"
+必要时重新打开文档：`find-file' 经 `seshat-reader-mode' 调
+`seshat-reader--render-buffer' 建立页行，那是布局的唯一入口。ERT 在每个用例
+前后恢复窗口配置，所以上一个用例结束时窗口会回到 `*scratch*'；这里因此每次都
+把 buffer 重新显示，并在页行缺失时重建布局。"
   (unless (and (buffer-live-p seshat-reader-page-spec-test--buffer)
                (with-current-buffer seshat-reader-page-spec-test--buffer
-                 (bound-and-true-p seshat-reader-current-doc-state-ptr)))
+                 (and (bound-and-true-p seshat-reader-current-doc-state-ptr)
+                      seshat-reader--pages)))
     (when (buffer-live-p seshat-reader-page-spec-test--buffer)
       (kill-buffer seshat-reader-page-spec-test--buffer))
     (setq seshat-reader-page-spec-test--buffer
@@ -106,9 +108,11 @@
     (let ((window (selected-window)))
       (unless (eq (window-buffer window) (current-buffer))
         (set-window-buffer window (current-buffer)))
-      (unless (window-parameter window 'overlay)
-        (seshat-reader--manage-window-overlays))))
-  seshat-reader-page-spec-test--buffer)
+      ;; 多页布局：窗口重新显示不会自己建页行，缺失时重建一次。
+      (unless seshat-reader--pages
+        (seshat-reader--render-buffer
+         (1- (or (seshat-reader-current-doc-pagenumber) 1)))))
+    seshat-reader-page-spec-test--buffer))
 
 (defmacro seshat-reader-page-spec-test--with-doc (&rest body)
   "在活的 reader buffer 里执行 BODY，并隔离 `image-flush' 与规范缓存。
@@ -284,25 +288,34 @@ BODY 执行前缓存被清空，因此各用例互不影响；`image-flush' 被�
 ;;; 零副作用守门
 
 (ert-deftest seshat-reader-page-spec-test--does-not-touch-window-state ()
-  "调用前后窗口参数与页面 overlay 的 display 对象保持不变。"
+  "调用前后页表结构、各页 spec 对象与窗口位置保持不变。
+
+多页布局下页面不再挂在窗口 overlay 上，所以「零副作用」的判据换成：页表的页号
+与 spec 对象身份不变、各行 marker 位置不变、窗口起点不变（渲染入口不滚动窗口）。"
   (seshat-reader-page-spec-test--with-doc
     (let* ((window (get-buffer-window (current-buffer) t))
-           (overlay (and window (window-parameter window 'overlay))))
+           (snapshot (lambda ()
+                       (list (mapcar (lambda (entry) (cons (car entry)
+                                                           (cddr entry)))
+                                     seshat-reader--pages)
+                             (mapcar (lambda (entry)
+                                       (marker-position (cadr entry)))
+                                     seshat-reader--pages))))
+           (pages-before (funcall snapshot))
+           (start-before (window-start window)))
       (should (windowp window))
-      (should (overlayp overlay))
-      (let ((page-before (window-parameter window 'page))
-            (scale-before (window-parameter window 'scale))
-            (native-before (window-parameter window 'native-size))
-            (display-before (overlay-get overlay 'display)))
-        (should (seshat-reader--page-spec 5 (/ (float
-                                                seshat-reader-page-spec-test--min-dpi)
-                                               72)
-                                          90))
-        (should (equal (window-parameter window 'page) page-before))
-        (should (equal (window-parameter window 'scale) scale-before))
-        (should (equal (window-parameter window 'native-size) native-before))
-        ;; display 必须是同一个对象（不是等值的新 spec）。
-        (should (eq (overlay-get overlay 'display) display-before))))))
+      (should seshat-reader--pages)
+      (should (seshat-reader--page-spec 5 (/ (float
+                                              seshat-reader-page-spec-test--min-dpi)
+                                             72)
+                                        90))
+      (let ((pages-after (funcall snapshot)))
+        ;; 页号列表与各页 spec 必须是同一批对象（`eq' 由 `equal' 在 cons 上
+        ;; 逐个比较时落到 `eq'，spec 是同一个 list 才能相等）。
+        (should (equal (car pages-after) (car pages-before)))
+        (should (= (length (car pages-after)) (length (car pages-before))))
+        (should (equal (cadr pages-after) (cadr pages-before))))
+      (should (equal (window-start window) start-before)))))
 
 ;;; 兼容与清理挂点
 
@@ -326,15 +339,25 @@ BODY 执行前缓存被清空，因此各用例互不影响；`image-flush' 被�
     (should-not seshat-reader--page-spec-cache)))
 
 (ert-deftest seshat-reader-page-spec-test--render-buffer-drops-cache ()
-  "`--render-buffer' 收尾会清空按页缓存（重载后位图重画）。"
+  "`--render-buffer' 重建布局后旧页的缓存条目不再驻留。
+
+重载后位图全部重画，原来缓存的 spec 对象失效，因此重建布局时必须先清缓存；
+重建过程中新渲染的可见页当然会重新进入缓存。"
   (seshat-reader-page-spec-test--with-doc
     (should (seshat-reader--page-spec 8 1.0))
     (should seshat-reader--page-spec-cache)
-    ;; 桩掉真正的文档重载与 join strip 更新，只验证收尾的清理动作。
-    (cl-letf (((symbol-function 'seshat-reader-dyn--load-doc) #'ignore)
-              ((symbol-function 'seshat-reader--update-join-strip) #'ignore))
+    ;; 桩掉真正的文档重载：只验证重建布局时的清理与页行重建。
+    (cl-letf (((symbol-function 'seshat-reader-dyn--load-doc) #'ignore))
       (seshat-reader--render-buffer 0))
-    (should-not seshat-reader--page-spec-cache)))
+    (should seshat-reader--pages)
+    ;; 旧页 8 已被清掉（不按页号重新渲染就取不回来）。
+    (should-not (delq nil (mapcar (lambda (entry)
+                                    (when (= (car (car entry)) 8) t))
+                                  seshat-reader--page-spec-cache)))
+    ;; 缓存里只剩重建时渲染的页，且每一页都有对应的页行。
+    (should seshat-reader--page-spec-cache)
+    (dolist (entry seshat-reader--page-spec-cache)
+      (should (assq (car (car entry)) seshat-reader--pages)))))
 
 (provide 'seshat-reader-page-spec-test)
 ;;; seshat-reader-page-spec-test.el ends here
