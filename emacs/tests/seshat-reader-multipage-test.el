@@ -63,16 +63,27 @@
      page (seshat-reader-multipage-test--fake-spec page))))
 
 (defun seshat-reader-multipage-test--display-count ()
-  "Return how many buffer positions carry a `display' property."
+  "Return how many buffer positions display an image spec.
+
+自 T4 起每页行有两个 `display' 属性：行首的引导空格携带
+\\(space :align-to ...) 居中规格，第二个字符才是该页的 image spec。
+因此这里只数 `(car-safe val)` 为 `image' 的，即「真正显示图片的位置」。"
   (let ((count 0)
         (pos (point-min)))
     (while (< pos (point-max))
-      (if (get-text-property pos 'display)
+      (if (eq (car-safe (get-text-property pos 'display)) 'image)
           (progn
             (setq count (1+ count))
             (setq pos (next-single-property-change pos 'display nil (point-max))))
         (setq pos (1+ pos))))
     count))
+
+(defun seshat-reader-multipage-test--page-spec-at (pos)
+  "Return the image spec displayed by the page row that starts at POS.
+
+页行结构是「引导空格 + 图像占位空格 + 换行」，图像 spec 挂在行首的
+下一个字符上（T4 引入的 `:align-to' 居中规格占据行首）。"
+  (get-text-property (1+ pos) 'display))
 
 (defun seshat-reader-multipage-test--page-numbers ()
   "Return the page numbers of the layout in buffer order."
@@ -127,7 +138,7 @@
         (dolist (entry seshat-reader--pages)
           (let* ((page (car entry))
                  (pos (marker-position (cadr entry))))
-            (should (eq (get-text-property pos 'display)
+            (should (eq (seshat-reader-multipage-test--page-spec-at pos)
                         (seshat-reader--multipage-page-spec page)))
             (should (= (seshat-reader--multipage-page-at-pos pos) page))))
         ;; 移除最后剩下的页后布局回到空状态。
@@ -172,7 +183,7 @@
       (should (null (seshat-reader--multipage-insert-page 1 second)))
       (should (= (seshat-reader-multipage-test--display-count) 1))
       (should (eq (seshat-reader--multipage-page-spec 1) second))
-      (should (eq (get-text-property (point-min) 'display) second)))))
+      (should (eq (seshat-reader-multipage-test--page-spec-at (point-min)) second)))))
 
 (ert-deftest seshat-reader-multipage-test--page-at-pos-keeps-gaps-on-previous ()
   "The gap line after a page belongs to that page, not to the next one."
