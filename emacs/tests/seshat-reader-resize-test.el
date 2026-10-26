@@ -69,6 +69,11 @@
 ;; 保留的 53 个用例要么与多页布局无关（去抖、守卫、normalize、初始 fit 模式），
 ;; 要么其桩替仍模拟出 overlay 参数因而继续成立。
 ;;
+;; **P1 批次 8（T9）：用例更名，断言未改。** 三个用例名还带着已删除的单页函数
+;; 名（`--contain-scale-*` → `--base-fit-scale-*`、`--native-page-size-cache-hit`
+;; → `--multipage-native-size-cache-hit`），两个已删除用例的占位名同步更名；
+;; 另删掉第 76~80 五个空节标题（其正文在批次 2 删除，只剩标题）。
+;;
 ;; **契约变更（2026-10-26，P1 多页布局批次 6 / T7）**：本文件删除第 9、
 ;; 10、16、47 四节，外加 `--refit-counts' / `--run-pending-counts' 两个助手与
 ;; `--set-page-overlay' / `--set-page-spec' 两个夹具函数。它们断言/模拟的都是
@@ -474,7 +479,7 @@ buffer，零计数才说明守卫生效。"
 ;; `seshat-reader--multipage-scroll` 直接搬 `window-start`，不再夹 vscroll。
 ;; 相关函数与用例一并退役。
 
-;;; 10. doc-scale-page 的 source 语义 —— P1 T7 删除
+;;; 10. 单页 `doc-scale-page` 的 source 语义 —— P1 T7 删除（vscroll/单页缩放族）
 ;;
 ;; 单页时代的 `seshat-reader-doc-scale-page`（走 C 侧 `--scale-page`）已删除，
 ;; 缩放口径改为 `seshat-reader--multipage-set-scale`；其 `scale-source` 语义
@@ -592,7 +597,7 @@ signal.  The second part checks that leaving the mode path
 
 ;;; 14. contain：高度维胜出
 
-(ert-deftest seshat-reader-resize-test--contain-scale-height-limited ()
+(ert-deftest seshat-reader-resize-test--base-fit-scale-height-limited ()
   "The height-fitting scale wins when the page is proportionally taller.
 
 P1 重写：`--contain-scale' 已退役，等价物是 `--multipage-base-fit-scale'，
@@ -614,7 +619,7 @@ P1 重写：`--contain-scale' 已退役，等价物是 `--multipage-base-fit-sca
 
 ;;; 15. contain：宽度维胜出
 
-(ert-deftest seshat-reader-resize-test--contain-scale-width-limited ()
+(ert-deftest seshat-reader-resize-test--base-fit-scale-width-limited ()
   "The width-fitting scale wins when the window is narrow.
 
 `--multipage-base-fit-scale' still returns the smaller of the two dimension fits, so a
@@ -936,7 +941,7 @@ from a bookmark) means `contain', the pre-existing whole-page fit."
           (should (eq 'height (seshat-reader--window-fit-mode window))))
       (set-window-parameter window 'fit-mode nil))))
 
-;;; 32. --fit-scale：contain 模式等价于 --contain-scale
+;;; 32. --fit-scale：contain 模式等价于 `--multipage-base-fit-scale`
 
 (ert-deftest seshat-reader-resize-test--fit-scale-contain-passes-through ()
   "`contain' mode never lets a page exceed the base scale or the width.
@@ -1141,11 +1146,11 @@ returns nil instead of signalling."
       (kill-buffer empty)
       (kill-buffer buffer))))
 
-;;; 39. --native-page-size：由 spec / scale 推算并写入缓存
+;;; 39. `--multipage-native-size`：由 spec / scale 推算并写入缓存
 
-;;; 40. --native-page-size：命中缓存后不再读 spec
+;;; 40. `--multipage-native-size`：命中缓存后不再读 spec
 
-(ert-deftest seshat-reader-resize-test--native-page-size-cache-hit ()
+(ert-deftest seshat-reader-resize-test--multipage-native-size-cache-hit ()
   "The native size is a per-page measurement, not the current spec size.
 
 P1 重写：缓存从窗口参数 `native-size' 改为按页 alist
@@ -1239,13 +1244,13 @@ show up as a count of 4."
 
 ;;; 46. fit-to-height：记录 fit-mode = height
 
-;;; 47. --native-page-size：页号 nil 且无 spec → nil，不写缓存 —— P1 T7 删除
+;;; 47. 单页 `--native-page-size`：页号 nil 且无 spec → nil —— P1 T7 删除
 ;;
 ;; 该用例断言的是窗口参数 native-size 缓存（以窗口参数 page 为键）；P1 的
 ;; 缓存已改为 buffer-local 的按页 alist `seshat-reader--page-native-sizes'，
 ;; 「未知尺寸 → nil」由第 35 节与 `--multipage-native-size` 自身的语义覆盖。
 
-;;; 48. --native-page-size：多窗口隔离，互不覆盖
+;;; 48. `--multipage-native-size`：按页缓存，多窗口互不覆盖
 
 ;;; 49. 旋转：两个 rotate 命令都清掉 native-size 缓存
 
@@ -1784,15 +1789,5 @@ Resizing a window (or refitting it) must not reset the user's explicit
           (set-window-parameter window 'fit-mode 'height)
           (should (eq 'height (seshat-reader--initial-fit-mode window))))
       (seshat-reader-resize-test--clear-window window))))
-
-;;; 76. --first-fit：按默认适配模式（width）求 scale 并记录 fit-mode
-
-;;; 77. --first-fit：默认 contain 模式行为不变（转调 --contain-scale）
-
-;;; 78. --first-fit：height 模式下回退仍按 --fit-scale 重渲染
-
-;;; 79. --window-create-function：新窗口写入归一化后的初始 fit-mode
-
-;;; 80. --window-create-function：已有 fit-mode 的窗口不被默认值覆盖
 
 ;;; seshat-reader-resize-test.el ends here

@@ -207,5 +207,47 @@ BODY 里三个记录变量可用：`tint-args'（每次下发按时间倒序压�
       (should-not (seshat-reader--dark-tint-colors 'no-such-preset)))
     (should (= 1 messages))))
 
+;;;; T9：dark-mode 与 presentation-mode 的顺序无关性（P1 批次 8）
+
+(ert-deftest seshat-reader-theme-test--dark-and-presentation-order-independent ()
+  "Enabling and disabling the two modes ends in the same state in any order."
+  (let ((buffer (generate-new-buffer " *seshat-reader-theme-order*")))
+    (unwind-protect
+        (with-current-buffer buffer
+          (setq major-mode 'seshat-reader-mode
+                mode-name "Seshat Reader")
+          (cl-letf (((symbol-function 'seshat-reader-dyn--doc-invert)
+                     (lambda (&rest _) nil))
+                    ((symbol-function 'seshat-reader-dyn--doc-tint)
+                     (lambda (&rest _) nil))
+                    ((symbol-function 'seshat-reader--multipage-set-scale)
+                     (lambda (&rest _) nil))
+                    ((symbol-function 'seshat-reader--center-page)
+                     (lambda (&rest _) nil))
+                    ((symbol-function 'seshat-reader--multipage-sync)
+                     (lambda (&rest _) nil)))
+            (let (first second)
+              ;; 顺序 A：先暗色，再演示模式
+              (seshat-reader-dark-mode 1)
+              (seshat-reader-presentation-mode 1)
+              (setq first (list seshat-reader-dark-mode
+                                seshat-reader-presentation-mode
+                                seshat-reader--presentation-state
+                                mode-line-format))
+              ;; 复位
+              (seshat-reader-presentation-mode -1)
+              (seshat-reader-dark-mode -1)
+              ;; 顺序 B：先演示模式，再暗色
+              (seshat-reader-presentation-mode 1)
+              (seshat-reader-dark-mode 1)
+              (setq second (list seshat-reader-dark-mode
+                                 seshat-reader-presentation-mode
+                                 seshat-reader--presentation-state
+                                 mode-line-format))
+              (should (eq (car first) (car second)))
+              (should (< 0 (if (car first) 1 0)))
+              (should (equal (cddr first) (cddr second))))))
+      (kill-buffer buffer))))
+
 (provide 'seshat-reader-theme-test)
 ;;; seshat-reader-theme-test.el ends here

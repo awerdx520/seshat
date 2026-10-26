@@ -2352,6 +2352,145 @@ T7 的验收是「不崩」：跨页选区的 `user-error' 属 T8，本批只要
       (should (= 2 up))
       (should (= 2 down)))))
 
+;;;; T9：自愈、退化输入与重载（P1 批次 8）
+
+;; 这一节补的是「异常路径也没坏」：页行被外部抹掉后能自愈、页数未知时的退化
+;; 范围、重载不残留旧文档的页表与 spec 缓存、占位页上的滚动不会卡死、以及
+;; 窗口不显示本 buffer 时页号访问器的回退值。
+
+(ert-deftest seshat-reader-multipage-test--sync-rebuilds-rows-after-external-wipe ()
+  "A sync re-inserts every page row after an external revert wiped them."
+  (let* ((fixture (seshat-reader-multipage-test--geometry-buffer '(1 2 3)))
+         (buffer (car fixture))
+         (window (selected-window)))
+    (unwind-protect
+        (seshat-reader-multipage-test--with-window-buffer buffer
+          (with-current-buffer buffer
+            (cl-letf (((symbol-function 'seshat-reader-dyn--page-image-spec)
+                       (lambda (page scale &optional _rotate)
+                         (list 'image :type 'pbm :data "x"
+                               :width 600 :height 800
+                               :page page :scale scale)))
+                      ((symbol-function 'seshat-reader--multipage-prefetch)
+                       (lambda (&rest _) nil)))
+              (should (= 3 (length seshat-reader--pages)))
+              ;; 模拟外部 revert（`M-x revert-buffer' 走的就是这条路）：正文被
+              ;; 抹掉、页表与「上次同步区间」一起作废。
+              (let ((inhibit-read-only t)) (erase-buffer))
+              (seshat-reader--multipage-clear)
+              (should-not seshat-reader--pages)
+              (should-not seshat-reader--multipage-last-range)
+              ;; 页表为空时 `--multipage-visible-range' 只能靠文档页数判断有页可
+              ;; 渲染：真机上这个值由原生模块写入 buffer-local，夹具里手工给。
+              (setq seshat-reader-current-doc-pagecount 3)
+              ;; 自愈：sync 依视口范围重新渲染并插回页行
+              (should (seshat-reader--multipage-sync window))
+              (should (equal '(1 2 3) (seshat-reader--multipage-page-numbers)))
+              (dolist (page '(1 2 3))
+                (should (seshat-reader--multipage-page-spec page))))))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--visible-range-without-pagecount ()
+  "With an unknown page count the range is clipped to the rows that exist."
+  (let* ((fixture (seshat-reader-multipage-test--geometry-buffer '(1 2 3)))
+         (buffer (car fixture))
+         (window (selected-window)))
+    (unwind-protect
+        (seshat-reader-multipage-test--with-window-buffer buffer
+          (with-current-buffer buffer
+            (cl-letf (((symbol-function 'window-start)
+                       (lambda (&optional _w) (seshat-reader-multipage-test--row-start 1)))
+                      ((symbol-function 'window-end)
+                       (lambda (&optional _w _update) (seshat-reader-multipage-test--row-start 2))))
+              ;; ① 文档页数已知（6）：范围按页数扩张（1 .. 2+preload）
+              (cl-letf (((symbol-function 'seshat-reader--multipage-pagecount)
+                         (lambda () 6)))
+                (should (equal (cons 1 (+ 2 seshat-reader--multipage-preload))
+                               (seshat-reader--multipage-visible-range window))))
+              ;; ② 页数未知（nil）：不得越过现有页行（最高 3）
+              (cl-letf (((symbol-function 'seshat-reader--multipage-pagecount)
+                         (lambda () nil)))
+                (should (equal (cons 1 3)
+                               (seshat-reader--multipage-visible-range window)))))))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--render-buffer-reload-leaves-no-leftovers ()
+  "A second `--render-buffer' drops the rows and specs of the previous document."
+  (let ((buffer (car (seshat-reader-multipage-test--geometry-buffer '(1 2 3))))
+        (window (selected-window)))
+    (unwind-protect
+        (seshat-reader-multipage-test--with-window-buffer buffer
+          (with-current-buffer buffer
+            (setq buffer-file-name "/tmp/t9-reload.pdf")
+            (cl-letf (((symbol-function 'file-exists-p) (lambda (&rest _) t))
+                      ((symbol-function 'seshat-reader-dyn--load-doc)
+                       (lambda (&rest _) nil))
+                      ((symbol-function 'seshat-reader--multipage-drop-c-overlay)
+                       (lambda (&rest _) nil))
+                      ((symbol-function 'seshat-reader--multipage-goto)
+                       (lambda (&rest _) nil))
+                      ((symbol-function 'seshat-reader-dyn--page-image-spec)
+                       (lambda (page scale &optional _rotate)
+                         (list 'image :type 'pbm :data "x"
+                               :width 600 :height 800
+                               :page page :scale scale))))
+              ;; 第一次渲染：3 页文档（页表与缓存都记到第 3 页）
+              (setq seshat-reader-current-doc-pagecount 3)
+              (seshat-reader--render-buffer 0)
+              (should (memq 3 (seshat-reader--multipage-page-numbers)))
+              (should (assq 3 seshat-reader--page-native-sizes))
+              ;; 第二次渲染：2 页文档 —— 旧页行与旧 spec 必须全部作废
+              (setq seshat-reader-current-doc-pagecount 2)
+              (seshat-reader--render-buffer 0)
+              (should (equal '(1 2) (seshat-reader--multipage-page-numbers)))
+              (should-not (assq 3 seshat-reader--page-native-sizes))
+              (should-not (assq 3 seshat-reader--page-render-scales))
+              (should-not (cl-find 3 seshat-reader--page-spec-cache
+                                   :key (lambda (entry) (car (car entry))))))))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--scroll-on-placeholder-page-terminates ()
+  "Scrolling over a page without a spec terminates instead of spinning."
+  (let* ((fixture (seshat-reader-multipage-test--geometry-buffer '(1 2 3)))
+         (buffer (car fixture))
+         (window (selected-window))
+         (vscrolls nil))
+    (unwind-protect
+        (seshat-reader-multipage-test--with-window-buffer buffer
+          (with-current-buffer buffer
+            ;; 第 2 页变成占位页（渲染失败 → spec 为 nil，行高 0）
+            (setcdr (cdr (assq 2 seshat-reader--pages)) nil)
+            (should (= 0 (seshat-reader--multipage-page-pixel-height 2)))
+            (cl-letf (((symbol-function 'set-window-vscroll)
+                       (lambda (&rest args) (push args vscrolls)))
+                      ((symbol-function 'seshat-reader--multipage-sync)
+                       (lambda (&rest _) nil)))
+              ;; 下限 1 像素：每次迭代都必然推进，绝不因 span 0 死循环。
+              ;; 这里只走一小段（不是 100000 像素）：batch 里没有命令循环，
+              ;; `with-timeout' 的定时器不会触发，真死循环就永远不返回——所以
+              ;; 判据是「这几次调用能返回」，而不是超时保护。
+              (seshat-reader--multipage-scroll 10 window)
+              (seshat-reader--multipage-scroll -10 window)
+              (should vscrolls))))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--pagenumber-when-window-shows-another-buffer ()
+  "A window showing another buffer answers the first row, not an error."
+  (let ((buffer (car (seshat-reader-multipage-test--geometry-buffer '(1 2))))
+        (window (selected-window)))
+    (unwind-protect
+        (with-current-buffer buffer
+          ;; 窗口此刻显示的是别的 buffer（未调用 with-window-buffer）
+          (should-not (eq (window-buffer window) buffer))
+          ;; 访问器仍按本 buffer 的页行解析出「最靠前的页」，不抛错
+          (should (= 1 (seshat-reader-current-doc-pagenumber window)))
+          ;; buffer 里没有页行时返回 nil（docstring：no page row → nil），
+          ;; 即使 recent 回退值有内容也不编造页码。
+          (let ((seshat-reader--recent-pagenumber-fallback 42))
+            (seshat-reader--multipage-clear)
+            (should-not (seshat-reader-current-doc-pagenumber window))))
+      (kill-buffer buffer))))
+
 (provide 'seshat-reader-multipage-test)
 
 ;;; seshat-reader-multipage-test.el ends here
