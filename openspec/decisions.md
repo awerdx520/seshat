@@ -870,3 +870,16 @@ refit 按当前窗口尺寸做一次几何适配 + 重渲染，一次到位。
 
 **代价与约束**：① 「新增路径入口必须调 pathguard」成为不变量，但三处纯折叠（`gitver/merge.go:cleanTreePath`、`webdav/symlink.go:cleanRel`、`webdav/versioned.go:blobPath`）尚未收敛，记入 `openspec/tech-debt.md`；② `pathguard` **不做 TrimSpace**（api/registry 侧 TrimSpace、gitver 侧不 TrimSpace 的历史差异留在调用方），也不产出用户可见文案（错误以 5 个哨兵返回，由调用方按各自错误码包装）——这两条都是刻意的边界，写进包注释以免下次被「统一化」。
 
+## 2026-10-27 · 阅读器暗色开关与配色升为进程级用户偏好（取代「dark-mode 是文档级」的隐含语义）
+
+**决策**：暗色开关与 5 档配色预设不再存放在 `DocState`（文档级、随 `reset_doc_state()` 清零），改为 `render/render-theme.c` 的进程级 `static` 状态（4 个字段：`g_dark_enabled`（`bool`，初值 `false`）、`g_tint_set`（`bool`，初值 `false`）、`g_tint_bg` / `g_tint_fg`（`unsigned`，初值均 `0`）；由 `render-theme.h` 暴露 `theme_dark_enabled` / `theme_tint_set` / `theme_tint_bg` / `theme_tint_fg` 四个只读访问器给 `render-core.c`）。`seshat-reader-dyn--doc-invert` 的注册名与 arity（`1,1`）不变，语义改为「翻转进程级暗色开关」；新增 `seshat-reader-dyn--doc-tint`（arity `2,2`，`0xRRGGBB` 背景/文字，负值 = 清空 tint 回旧 invert+gamma 路径）。像素变换仍在 `render_page_to_buffer()` 一处（栅格化后、装饰 wash 前、PNM 编码前），按「tint 已设置 → `fz_tint_pixmap`；否则 → `fz_invert_pixmap_luminance` + `fz_gamma_pixmap 1/1.4`」二分支。`DocState.invert` 字段随之删除，「暗色是否开启」只有一个真相来源。
+
+**理由**：① 配色是用户偏好，不是文档属性——同一台机器上看任何一本书都该是同一个观感；② 消灭已知不一致「重载 / 新开文档后回白底、而 elisp 侧 `seshat-reader-dark-mode` 仍为 t」（`reset_doc_state()` 只保留 `active_jobs` / `is_reloading`，`invert` 恒被清零），该不一致正是 thomas-emacs 配置里 `advice-add 'seshat-reader--render-buffer` 的唯一存在理由；③ 多页布局 P1 的 T4 即将重构 `--render-buffer` / `--redisplay-all-windows`，对外部 advice 的依赖越少，重构风险越低；④ 保留 `DocState.invert` 字段却无人读，会成为下一轮的误导源。
+
+**代价与约束**：① 语义变更——上游或第三方若依赖「dark-mode 是文档级」，重载后会看到「仍是暗色」；② 进程级意味着同一 Emacs 内所有 reader buffer 共享同一配色，不能逐 buffer 设置（与「用户偏好」自洽，已写入 `docs/emacs-reader.md`）；③ 单独调用 `--doc-invert 1` 而不下发 `--doc-tint` 的代码会沿用上一次的 tint：**生产代码**该调用点只有 1 处（`seshat-reader-dark-mode` 的 body，`seshat-reader.el:2893`），总是紧随其后下发 tint（含 `graphite` 的 `-1 -1`）；**测试侧**另有 2 文件 3 处 `cl-letf` stub（`seshat-reading-test.el:182`、`seshat-reader-multipage-test.el:706` / `:715`），T3 后需同步补 `--doc-tint` 桩；④ `graphite` 必须与改动前逐位一致（同一 invert + gamma 序列），以 `--page-image-spec` 的 PNM `sha256` 相等为判据；⑤ 多页计划 T4 的「dark-mode invert 定为 C 侧 `--doc-invert`（文档级）」表述只加一行注记，其「重渲染全部可见页」的任务内容不变。
+
+（来源计划：[openspec/active/2026-10-27-reader-dark-tint-presets.md](active/2026-10-27-reader-dark-tint-presets.md) 的 D2，用户 2026-10-27 拍板选 A。）
+
+（实现位置/字段已按批次 1 实际代码校正，2026-10-27）
+
+
