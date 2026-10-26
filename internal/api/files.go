@@ -29,7 +29,6 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
-	"mime"
 	"net/http"
 	"os"
 	"path"
@@ -39,6 +38,7 @@ import (
 
 	"seshat/internal/gitver"
 	"seshat/internal/logging"
+	"seshat/internal/pathguard"
 	"seshat/internal/registry"
 	"seshat/internal/storage"
 )
@@ -50,11 +50,19 @@ const (
 
 	// defaultContentType 是扩展名无法推断时的 Content-Type。
 	defaultContentType = "application/octet-stream"
-
-	// deleteListLimit 是删除目录时一次列举登记行的上限（防止超大目录树无界读表）。
-	// 取远大于 API 清单分页上限（2000）的值：这里必须尽量一次拿全，否则会漏写墓碑。
-	deleteListLimit = 100000
 )
+
+// deleteListLimit 是删除目录时一次列举登记行的上限（防止超大目录树无界读表）。
+// var 而非常量：测试需要临时调小以触发截断路径；生产恒为 100000（仅测试覆写）。
+//
+// 取远大于 API 清单分页上限（2000）的值：这里必须尽量一次拿全，否则会漏写墓碑。
+var deleteListLimit = 100000
+
+// truncationReached 报告「本次列举是否恰好撞到上限」，即可能仍有未列举的登记行。
+// 注意调用方必须传 List **原始返回条数**（未经子树收敛），收敛后的切片长度会失真。
+func truncationReached(returned, limit int) bool {
+	return limit > 0 && returned >= limit
+}
 
 // fileWriteResponse 是 PUT 成功的响应体。
 //
@@ -172,15 +180,16 @@ func (s *Server) handleGetFile(w http.ResponseWriter, r *http.Request) {
 	// nosniff 对所有下载一律设置：即便类型被降级为 octet-stream，也要明确禁止
 	// 浏览器自行嗅探（旧版 IE/Edge 会忽略 octet-stream 并嗅探内容）。
 	header.Set("X-Content-Type-Options", "nosniff")
-	if isActiveContent(rel) {
-		// 主动内容（HTML/SVG/XML/JS 等）强制降级为下载：这些类型与服务端同源，
-		// 浏览器内联渲染即执行其中的脚本 → 一次 PUT 附件就能形成存储型 XSS。
-		// 必须同时给 Content-Disposition: attachment，否则降级 Content-Type 只是
-		// 依赖浏览器「不嗅探」的约定，直接导航仍可能按扩展名渲染。
+	ct, inline := inlineContentType(rel)
+	if !inline {
+		// 白名单之外一律强制降级为下载（含 HTML/SVG/XML/JS 等主动内容）：这些
+		// 类型与服务端同源，浏览器内联渲染即执行其中的脚本 → 一次 PUT 附件就能
+		// 形成存储型 XSS。必须同时给 Content-Disposition: attachment，否则降级
+		// Content-Type 只是依赖浏览器「不嗅探」的约定，直接导航仍可能按扩展名渲染。
 		header.Set("Content-Type", defaultContentType)
 		header.Set("Content-Disposition", contentDispositionFor(rel))
 	} else {
-		header.Set("Content-Type", contentTypeFor(rel))
+		header.Set("Content-Type", ct)
 	}
 
 	// ServeContent 负责条件请求与 Range：ETag/Content-Type 必须在调用前设好，
@@ -404,6 +413,14 @@ func (s *Server) handleDeleteFile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
+	// 截断可见性：List 达到上限说明可能仍有未列举的登记行（它们会漏写墓碑，
+	// 表现为「物理文件已删、登记表仍存活」）。这里只告警不改行为——分批删除
+	// 留待后续批次。判定必须用 List 的**原始返回条数**：下面的子树收敛会丢掉
+	// 名字共享前缀的条目，收敛后的长度永远判不出截断。
+	if truncationReached(len(entries), deleteListLimit) {
+		slog.Warn("api: 目录删除列举达到上限，可能有未写墓碑的登记行（分批删除待实现）",
+			"root", root.Tag, "prefix", rel, "limit", deleteListLimit)
+	}
 	// 按路径段边界收敛子树：prefix 只是粗筛（存储层按字符串前缀匹配），若不收敛，
 	// 删除 "dir" 时可能把名字共享前缀的无关资源（"dir2/a.org"）一起写墓碑。
 	// 注：internal/webdav 里有一个同名私有函数，这里刻意复制而不跨包引用——两个出口
@@ -556,43 +573,46 @@ func (s *Server) handleMoveResource(w http.ResponseWriter, r *http.Request) {
 
 // cleanRelPath 把请求路径规范化为根内逻辑相对路径。
 //
-// 规则：去首尾空白（登记表的键同样 TrimSpace，两者必须一致）、反斜杠转 '/'、
-// 拒绝含 NUL 与任一 ".." 段的路径、path.Clean 折叠重复斜杠与 '.'、去掉前导 '/'；
-// 结果为空或 "." 时视为非法（不允许用文件端点指向根本身）。
+// 规则本体在 internal/pathguard（单一真源），本函数只做两件调用方特有的事：
+//  1. 去首尾空白（登记表的键同样 TrimSpace，两者必须一致——pathguard 不做
+//     TrimSpace，这个差异必须留在这里）；
+//  2. 把 pathguard 的哨兵错误按本端对外文案与错误码包装成 AppError。
 //
-// 规范化之后再拒绝两类段（与 internal/registry/service.go 的 normalizeResourcePath
-// 保持完全一致的规则——**两处必须同步修改**，否则会出现「API 能写、登记层拒绝」
-// 或反过来的死角）：
-//   - 任一段为 .git（大小写不敏感）：放行 .git 等于把版本库内部目录暴露给读写端点，
-//     一次 PUT/DELETE 就能破坏仓库；
-//   - 任一段以 '.' 开头（隐藏文件/目录）：登记层不登记点路径（bootstrap 整棵跳过），
-//     若 API 接受点路径就会出现「磁盘有、登记表没有」的不一致。
+// 拒绝的类别（零值口径，见 pathguard.Options）：含 NUL、任一 ".." 段、任一 .git 段
+// （大小写不敏感）、任一以 '.' 开头的段、以及规范化后为空（不允许用文件端点指向
+// 根本身）。两类点段的理由：
+//   - .git：放行等于把版本库内部目录暴露给读写端点，一次 PUT/DELETE 就能破坏仓库；
+//   - 隐藏文件/目录：登记层不登记点路径（bootstrap 整棵跳过），若 API 接受点路径
+//     就会出现「磁盘有、登记表没有」的不一致。
 func cleanRelPath(raw string) (string, error) {
-	if strings.ContainsRune(raw, 0) {
-		return "", logging.NewAppError(logging.ErrInvalidArgument, "路径不能包含 NUL 字节")
-	}
-	slashed := filepath.ToSlash(strings.TrimSpace(raw))
-	for _, seg := range strings.Split(slashed, "/") {
-		if seg == ".." {
-			return "", logging.NewAppError(logging.ErrInvalidArgument,
-				`路径不能包含 ".."（禁止越出根目录）`)
-		}
-	}
-	clean := strings.TrimPrefix(path.Clean("/"+slashed), "/")
-	if clean == "" || clean == "." {
-		return "", logging.NewAppError(logging.ErrInvalidArgument, "路径不能为空")
-	}
-	for _, seg := range strings.Split(clean, "/") {
-		if strings.EqualFold(seg, ".git") {
-			return "", logging.NewAppError(logging.ErrInvalidArgument,
-				"路径不能包含 .git 段（版本库内部目录不可经 API 访问）")
-		}
-		if strings.HasPrefix(seg, ".") {
-			return "", logging.NewAppError(logging.ErrInvalidArgument,
-				"路径不能包含以 '.' 开头的段（隐藏文件/目录不可经 API 访问）")
-		}
+	clean, err := pathguard.CleanRel(strings.TrimSpace(raw), pathguard.Options{})
+	if err != nil {
+		return "", relPathError(err)
 	}
 	return clean, nil
+}
+
+// relPathError 把 pathguard 的哨兵错误映射为 API 侧的错误码与中文文案。
+//
+// 文案与错误码与收敛前逐字一致：客户端与既有用例都按它们做断言，改一个字都会
+// 牵连无关用例（规则本体归 pathguard，文案归各入口，两边各自稳定）。
+func relPathError(err error) error {
+	var msg string
+	switch {
+	case errors.Is(err, pathguard.ErrNUL):
+		msg = "路径不能包含 NUL 字节"
+	case errors.Is(err, pathguard.ErrParentSegment):
+		msg = `路径不能包含 ".."（禁止越出根目录）`
+	case errors.Is(err, pathguard.ErrGitSegment):
+		msg = "路径不能包含 .git 段（版本库内部目录不可经 API 访问）"
+	case errors.Is(err, pathguard.ErrDotSegment):
+		msg = "路径不能包含以 '.' 开头的段（隐藏文件/目录不可经 API 访问）"
+	case errors.Is(err, pathguard.ErrEmpty):
+		msg = "路径不能为空"
+	default:
+		msg = "路径不合法"
+	}
+	return logging.NewAppError(logging.ErrInvalidArgument, msg)
 }
 
 // selectRoot 解析 ?root= 选择的根；raw 为空时使用默认根（roots[0]）。
@@ -783,46 +803,38 @@ func contentETag(content []byte) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// contentTypeFor 按扩展名推断 Content-Type，未知时回 application/octet-stream。
+// inlineContentTypes 是「可安全内联展示」的扩展名 → Content-Type 静态白名单。
 //
-// 不使用 mime.TypeByExtension 的嗅探兜底：嗅探会把未知的二进制内容猜成 text/plain，
-// 让客户端按文本处理二进制；宁可显式声明 octet-stream。
-//
-// 注意：本函数只用于「可安全内联展示」的类型，主动内容（见 isActiveContent）不得
-// 走这里——handleGetFile 会在调用前拦下它们。
-func contentTypeFor(rel string) string {
-	if ct := mime.TypeByExtension(strings.ToLower(path.Ext(rel))); ct != "" {
-		return ct
-	}
-	return defaultContentType
+// 三个理由让它必须是静态表、而不是 mime.TypeByExtension：
+//  1. 安全属性可判定——不依赖宿主的 /usr/share/mime/globs2 或 /etc/mime.types，
+//     任何宿主机上「哪些类型可内联」都是同一答案；
+//  2. 跨机一致——MIME 数据库版本差异会让 .org 之类得到 text/org / text/plain /
+//     application/vnd.lotus-organizer 等不同值；
+//  3. 名单外一律不内联（见 handleGetFile），故这里只需列「确定安全」的类型。
+var inlineContentTypes = map[string]string{
+	".txt":      "text/plain; charset=utf-8",
+	".md":       "text/markdown; charset=utf-8",
+	".markdown": "text/markdown; charset=utf-8",
+	".org":      "text/plain; charset=utf-8",
+	".csv":      "text/csv; charset=utf-8",
+	".json":     "application/json",
+	".pdf":      "application/pdf",
+	".epub":     "application/epub+zip",
+	".png":      "image/png",
+	".jpg":      "image/jpeg",
+	".jpeg":     "image/jpeg",
+	".gif":      "image/gif",
+	".webp":     "image/webp",
+	".bmp":      "image/bmp",
+	".ico":      "image/vnd.microsoft.icon",
+	".tif":      "image/tiff",
+	".tiff":     "image/tiff",
 }
 
-// activeContentExts 是「浏览器会当作代码执行」的扩展名黑名单（小写，含点）。
-//
-// 这些类型与服务端同源：攻击者 PUT 一个 evil.svg 后再诱导用户直接访问
-// GET /api/files/evil.svg，脚本即在服务端源下执行——可读取 localStorage 里的
-// 访问令牌，从而形成存储型 XSS。故读写侧都按「被动附件」对待（强制下载）。
-var activeContentExts = map[string]struct{}{
-	".html":  {},
-	".htm":   {},
-	".xhtml": {},
-	".shtml": {},
-	".ehtml": {},
-	".xht":   {},
-	".svg":   {},
-	".svgz":  {},
-	".xml":   {},
-	".xsl":   {},
-	".js":    {},
-	".mjs":   {},
-	".mht":   {},
-	".rdf":   {},
-}
-
-// isActiveContent 报告 rel 的扩展名是否属于主动内容（需强制下载）。
-func isActiveContent(rel string) bool {
-	_, ok := activeContentExts[strings.ToLower(path.Ext(rel))]
-	return ok
+// inlineContentType 返回 rel 的内联 Content-Type；名单外返回 ("", false)。
+func inlineContentType(rel string) (string, bool) {
+	ct, ok := inlineContentTypes[strings.ToLower(path.Ext(rel))]
+	return ct, ok
 }
 
 // contentDispositionFor 构造主动内容的 Content-Disposition：attachment + 文件名。

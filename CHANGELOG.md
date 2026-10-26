@@ -144,6 +144,9 @@
 - `seshat-reader--set-window-vscroll` 的像素路径不再对已按像素传入的值再乘一次 `pixel-per-col`（M12；此前仅因 clamp 而「看起来正确」）。
 - 阅读器翻页/跳页命令现在会显式设置纵向落点（M12）：此前部分命令不改 vscroll，依赖 C 侧重置。
 - 阅读器目录面板行首星号改为零宽显示（保留 outline 折叠能力），缩进收窄；`f` 等单键在 evil 下由包内补绑，不再依赖用户配置。
+- **路径安全规则收敛到新建 `internal/pathguard`（服务端技术债 A 批，2026-10-26）**：新增 `CleanRel(rel, Options)` / `IsDotName` / `HasDotSegment` 作为唯一规则实现，五个入口（`api.cleanRelPath`、`registry.normalizeResourcePath`、`webdav.hasDotSegment`、`registry.isDotName`、`gitver.(*Repo).resolve/resolveAny`）改为**薄包装**（保留原函数名与签名，只做 TrimSpace + 错误码/中文文案包装）。`Options` 三开关零值即最严格（拒空、拒 `..` 段、拒点段），只能放宽；WebDAV 出口与 `gitver` 两处「折叠 `..` 而非拒绝」显式传参，语义与历史实现逐字等价。**对外错误码与中文文案零变化**，抽取前后用 12 个输入（`a/../b`、`../x`、`a/b/..`、`.git/x`、`A.GIT/x`、`.hidden`、含 NUL、纯空白、`//a.org`、`/a.org`、`a/./b`、`a//b`）逐条比对**逐字节一致**。详见 `openspec/completed/2026-10-26-server-techdebt-batch-a.md`。
+- **目录删除撞到列举上限时记 warning 日志（A 批，2026-10-26）**：`deleteListLimit`（100000）由 `const` 改为包级 `var`（仅供测试覆写，生产恒 100000），并抽出纯函数 `truncationReached` 判定；撞上限时记 `slog.Warn`（含 `root` / `prefix` / `limit`）——此前是**静默截断**，超出部分不写墓碑、客户端只能等下一次 rescan 收敛。分批删除留 B 批。详见 `openspec/completed/2026-10-26-server-techdebt-batch-a.md`。
+- **`.org` 文件的 `Content-Type` 由 `text/org; charset=utf-8` 改为 `text/plain; charset=utf-8`（A 批，2026-10-26）**：主动内容策略反转成静态白名单后，`.org` 不再取宿主 MIME 数据库的值（本机 `globs2` 给 `text/org`）而是取静态表里的 `text/plain; charset=utf-8`。其余 16 项（`.txt` / `.md` / `.markdown` / `.csv` / `.json` / `.pdf` / `.epub` / `.png` / `.jpg` / `.jpeg` / `.gif` / `.webp` / `.bmp` / `.ico` / `.tif` / `.tiff`）取值不变；Emacs 与 Android 的下载/阅读路径都不依赖 `Content-Type`，无客户端改动。详见 `openspec/completed/2026-10-26-server-techdebt-batch-a.md`。
 
 ### 破坏性
 
@@ -211,6 +214,20 @@
 - 修复 `seshat:` 链接对**尾部裸 `#`** 解析出空串 location（M12）：现归一为 `nil`。
 - 修阅读器默认不居中与页面裁切（M12 回归）：`window-size-change-functions` 钩子此前把 frame 当 window 传导致居中从不重算；跨页衔接（strip 行）在 `fit-to-height` 下会裁切页面，现默认关闭（`seshat-reader-page-join-lines` 默认 0）
 - 阅读器退出文档后目录面板窗口残留（现随 buffer 关闭一并关闭并清空内容）
+
+### 安全
+
+- **安全响应头覆盖全部路由**（服务端技术债 A 批，2026-10-26）：新增 `internal/api/security.go` 的 `securityHeaders` 中间件，套在 `handler()` 返回的整棵 mux 外层——`/api/`（含 200 JSON、401/4xx/5xx 错误响应）、Web UI 首页、`/static/`、mux 产生的 404/405 **全部**带 `X-Content-Type-Options: nosniff` + `X-Frame-Options: DENY` + `Referrer-Policy: no-referrer`。此前只有 Web UI 与 `GET /api/files` 的下载带安全头，JSON 端点与错误响应裸奔（错误响应可被 MIME 嗅探、API 可被跨站 iframe 嵌入）。**CSP 仍只给 Web UI**（由 `setWebUISecurityHeaders` 设置，含 `script-src 'self'`；中间件刻意不设 CSP，否则会覆盖它并拦掉 `app.js`）；**HSTS 仍留给反向代理**（TLS 在反代终止，服务端判断不了真实 scheme），配置行见 `docs/deploy.md` §7。详见 `openspec/completed/2026-10-26-server-techdebt-batch-a.md`。
+- **主动内容策略由枚举黑名单反转为静态白名单**（A 批，2026-10-26）：删除 14 项**枚举式主动内容黑名单**（旧实现的两个符号名见 git 历史），改为 17 项静态映射表（`.txt` `.md` `.markdown` `.org` `.csv` `.json` `.pdf` `.epub` `.png` `.jpg` `.jpeg` `.gif` `.webp` `.bmp` `.ico` `.tif` `.tiff` → 固定 `Content-Type`，**不查宿主 MIME 表**）；**名单外一律 `application/octet-stream` + `Content-Disposition: attachment`**（含 `.html`/`.svg`/`.js`/无扩展名/任何未知扩展名）。反转消除了「新增 MIME 映射即形成 XSS 缝隙」这一类问题（旧的枚举式黑名单漏项就会显式声明 `text/html`），并使「哪些类型可内联」在任何机器上答案一致。详见 `openspec/completed/2026-10-26-server-techdebt-batch-a.md`。
+- **`/dav/` 与 `/public/` 出口补 `nosniff` + `CSP: sandbox`**（A 批，2026-10-26）：新增 `internal/webdav/security.go` 的 `SandboxContent`，两个 WebDAV 出口的全部响应都带 `X-Content-Type-Options: nosniff` + `Content-Security-Policy: sandbox`。这关闭了「`PUT` 一个 `.html` 再诱导浏览器导航过去」的**同源脚本执行**通道（脚本原本可读 Web UI 存在 `localStorage` 里的令牌）。不采用「强制 `attachment`」是因为那会破坏 Calibre / Obsidian 等按 `Content-Type` 处理文件的第三方客户端；`CSP: sandbox` 只让文档进入不透明源、字节与 `Content-Type` 不变。**注意这不是白名单**——能内联的类型仍是任意扩展名，只是无法执行脚本（记入 `openspec/tech-debt.md`）。详见 `openspec/completed/2026-10-26-server-techdebt-batch-a.md`。
+- **`POST /api/revert` 补齐路径校验**（A 批，2026-10-26）：该端点此前只判 `path` 非空，隐藏文件与 `.git` 路径可经 revert 落盘。现先过与其它文件端点相同的 `cleanRelPath`（拒 NUL、拒任一 `..` 段含中间段、拒 `.git` 段、拒任一以 `.` 开头的段），规则实现于 `internal/pathguard`。详见 `openspec/completed/2026-10-26-server-techdebt-batch-a.md`。
+- **`POST /api/resources/rescan` 加 60 秒最小间隔限流**（A 批，2026-10-26）：新增错误码 `rate_limited`（HTTP **429**）+ `Retry-After`（秒，向上取整且 ≥1）；最小间隔为包级 `var rescanMinInterval = 60 * time.Second`（非配置项）。`rescanLastAt` 记「上一次重扫**结束**的时刻」，故并发请求仍返回 `409`（正在进行中），只有「上一次已结束且不足 60 秒」才 `429`；`429` 分支不抢占互斥锁、不写时间戳，无法通过重试延长禁用窗口，也无后端成本。此前只有并发互斥，令牌持有者可串行循环触发全库重扫。详见 `openspec/completed/2026-10-26-server-techdebt-batch-a.md`。
+
+### 内部
+
+- **新增 `internal/pathguard` 包与 `pathguard_test.go`**（A 批，2026-10-26）：路径规则单一真源，只依赖标准库（`errors` / `path` / `path/filepath` / `strings`），不产出用户可见文案（错误以 5 个哨兵返回，由调用方包装）。表驱动拒绝矩阵锁定「是否拒绝」这一层，不对错误文本做跨入口比较。详见 `openspec/completed/2026-10-26-server-techdebt-batch-a.md`。
+- **新增测试文件**（A 批，2026-10-26）：`internal/api/security_test.go`（安全头覆盖 Web UI / `/static/` / 200 JSON / 4xx 错误响应，并断言 `/api/` 响应**不含** CSP）、`internal/webdav/security_test.go`（`SandboxContent` 两出口的 `nosniff` + `CSP: sandbox`）、`internal/api/files_internal_test.go`（`package api`，覆盖 `truncationReached` 纯函数与 `deleteListLimit` 覆写后的目录删除端到端）。详见 `openspec/completed/2026-10-26-server-techdebt-batch-a.md`。
+- **验证基线**（A 批，2026-10-26）：`go build ./...` / `go vet ./...` EXIT 0，`gofmt -l .` 输出为空；`go test ./...` **14 个包**、顶层 **497** 例、含子测试 **698** 例、**0 FAIL / 0 SKIP**（新增 `internal/pathguard` 为第 14 个包）。详见 `openspec/completed/2026-10-26-server-techdebt-batch-a.md`。
 
 ## [0.2.0] - 2026-10-12
 

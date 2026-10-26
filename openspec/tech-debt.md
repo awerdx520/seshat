@@ -413,11 +413,13 @@
 - 影响：Android 现版本的连通性测试不可用（其它功能不受影响，因尚未部署且状态 API 本就要在后续里程碑适配）。
 - 建议：改用 `GET /api/roots` 或 `GET /api/changes?since=0&limit=1` 作为探测端点（只验证认证与连通性，不依赖具体文档），并与 Android 端 uid 适配（M9.2 数据源/M10）一并落地。
 
-## 安全响应头覆盖不全（M7 安全复审，2026-10-18，部分解决）
+## 安全响应头覆盖不全（M7 安全复审，2026-10-18，部分解决）——已解决（A 批，2026-10-26，除 HSTS）
 - 现象（原）：服务端自身不设 `X-Content-Type-Options: nosniff`、`X-Frame-Options`、`X-XSS-Protection`、CSP，也没有 `Strict-Transport-Security`；这些头全部依赖反向代理添加（`docs/security.md` §5）。
 - 现状（2026-10-18 复核，S2 落地后）：**已覆盖**的两处——Web UI（首页与 `/static/`）由 `internal/api/embed.go` 的 `setWebUISecurityHeaders` 设 `nosniff` + `X-Frame-Options: DENY` + CSP（`default-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'`）；`GET /api/files` 的所有下载设 `nosniff`，主动内容（`.html`/`.svg`/`.js` 等）强制 `application/octet-stream` + `Content-Disposition: attachment`。**仍缺**：`/api/` 的其它响应（全部 JSON 端点与统一错误响应）不带任何安全头，`Strict-Transport-Security` 一概留给反代。
 - 影响：直连服务端端口（或反代配置遗漏）时，JSON 端点与错误响应仍无浏览器侧防护（错误响应可被 MIME 嗅探、API 可被跨站嵌入）；HSTS 缺失让首次明文请求可被降级。与 Web UI 把访问令牌存在同源 `localStorage`（`internal/api/web/static/app.js` 的 `seshat.token`）叠加时，尚未覆盖的入口构成残余 XSS 面。
 - 建议：把安全头做成包住**全部**路由的统一中间件（而非分散在 Web UI 与文件端点两处），HSTS 按域名/TLS 就绪度决定是否由服务端下发；或在启动时检测「非环回监听且无反代标记」并告警。
+- 已解决（A 批，2026-10-26）：新增 `internal/api/security.go` 的 `securityHeaders` 中间件，套在 `handler()` 返回的整棵 mux 外层——`/api/`（含 200 JSON、401/4xx/5xx 错误响应）、Web UI 首页、`/static/`、mux 产生的 404/405 全部带 `X-Content-Type-Options: nosniff` + `X-Frame-Options: DENY` + `Referrer-Policy: no-referrer`。中间件**刻意不设 CSP**（会覆盖 Web UI 含 `script-src 'self'` 的那份、拦掉 `app.js`），CSP 仍由 `setWebUISecurityHeaders` 负责。`/dav/` 与 `/public/` 另由 `internal/webdav/security.go` 的 `SandboxContent` 加 `nosniff` + `CSP: sandbox`。
+- 未解决部分（明确保留）：`Strict-Transport-Security` **仍不由服务端下发**——TLS 在反向代理终止，服务端判断不了真实 scheme；加一个永远默认关闭的配置项只会增加配置面与文档面。反代的 HSTS 配置行与检查清单项见 `docs/deploy.md` §7 / §11，决策理由见 `openspec/decisions.md` 2026-10-26 条。
 
 ## Emacs 端 uid 缓存不随服务端重建失效（M7 安全复审，2026-10-18 复核，仍未解决）
 - 现象：`seshat-rest.el` 的 `seshat-rest-resolve-uid` 结果按文档键缓存；缓存既不设 TTL，也不随服务端登记表重建（DB 从零重建、uid 重新生成）或切换 base-url 而失效。
@@ -425,11 +427,14 @@
 - 影响：服务端重建后，客户端持续用旧 uid 请求，得到 `404 unknown_uid`，表现为「批注/进度全部消失」；用户需手动清缓存或等某条路径触发重新解析。切换服务器时更隐蔽：旧 uid 会被发到**另一台**服务器，可能命中无关资源。
 - 建议：① 缓存键包含 base-url；② 缓存值改为 `(base-url uid . 时间戳)`，遇到 `unknown_uid` 时失效该键并重解析一次（幂等，代价一次 `GET /api/resolve`）；③ 提供显式的清缓存命令。
 
-## 路径规范化逻辑在四处重复（M7 安全复审，2026-10-18 复核，仍未解决；复核后实为五处）
+## 路径规范化逻辑在四处重复（M7 安全复审，2026-10-18 复核，复核后实为五处）——已解决（A 批，2026-10-26，抽 `internal/pathguard`）
 - 现象：同一套「拒 `..`/NUL/`.` 段/`.git` 段」的规则在 `internal/api/files.go`（`cleanRelPath`）、`internal/webdav/policy.go`（`hasDotSegment`）、`internal/registry/service.go`（`normalizeResourcePath`）、`internal/registry/bootstrap.go`（`isDotName` + `SkipDir`）各写一遍。前三处已加「两处必须同步修改」注释。
 - 复核（2026-10-18）：`internal/gitver/version.go` 的 `resolve` / `resolveAny` 另有第五份「拒绝点段 / 越出根」判定，注释同样只写「两处必须同步」。五份实现的集合口径并不完全一致（WebDAV 侧允许挂载根本身，`gitver` 侧按名字解析版本表达式）。
 - 影响：规则演进时容易只改一处，产生「API 能写、登记层拒绝」或「出口可读、登记不可见」的死角；新增入口（如后续的 COPY/版本恢复入口）极易漏掉规则；注释只能提醒，不能阻止。
 - 建议：抽出一个共享包（`internal/pathguard`，或文中的 `internal/pathspec`）提供 `Clean(rel) (string, error)` 与 `IsDotName(name) bool`，五处改为调用；并让 REST / WebDAV 两个出口共用**同一套不变量测试**（表驱动，作为唯一真源）。WebDAV 侧的 `hasDotSegment` 还需保留「挂载根不算点路径」的差异，用选项参数表达。
+- 已解决（A 批，2026-10-26）：新增 `internal/pathguard`（`CleanRel(rel, Options)` / `IsDotName` / `HasDotSegment`），五处改为薄包装——保留原函数名与签名，只做 TrimSpace（部分入口）+ 把哨兵错误包成本入口既有的错误码与中文文案，**对外错误码与文案零变化**。`Options` 零值即最严格（拒空、拒 `..` 段、拒点段），三个开关只能放宽；WebDAV 出口（`hasDotSegment` 的挂载根放行 + `..` 折叠）与 `gitver.resolve`（三个开关全开）两处特例改为**显式传参**。抽取前后用 12 个输入（`a/../b`、`../x`、`a/b/..`、`.git/x`、`A.GIT/x`、`.hidden`、含 NUL、纯空白、`//a.org`、`/a.org`、`a/./b`、`a//b`）逐条比对，输出**逐字节一致**；`HasDotSegment` 改传 `AllowDotSegments: true` 后 13 个输入 0 差异。见 `openspec/decisions.md` 2026-10-26 条与 `openspec/completed/2026-10-26-server-techdebt-batch-a.md`。
+- 本条的**残余**（新增记录，A 批，2026-10-26）：三处仍是纯折叠（只 `path.Clean` 去前导斜杠，不判点段、不判 `..`）——`internal/gitver/merge.go` 的 `cleanTreePath`（git tree 条目名规范化）、`internal/webdav/symlink.go` 的 `cleanRel`（软链守卫里的请求路径规范化）、`internal/webdav/versioned.go` 的 `blobPath`（版本化包装层的 blob 路径拼接）。三者的入参都先经各自出口的 pathguard 判定、或来自 git tree（非客户端直传），当前**不构成绕过**；但「新增路径入口必须调 pathguard」这条不变量对它们尚未成立，故本条不作完全关闭。
+- 不变量（A 批确立）：新增任何路径入口都必须调用 `pathguard`，不得自写 `path.Clean("/"+…)`。判据是「入参是否来自客户端或文件名」——新增 HTTP 端点、新的 WebDAV 包装层、新的版本查询入口都算。
 
 ## `registry.Apply` 的读-改-写非原子（M7 安全复审，2026-10-18 复核，仍未解决）
 - 现象：`Apply` 先用 `db.GetResourceByUID`（**事务外**）读现状判定新 uid / 事件类型，再在同一事务里 upsert 登记 + append 事件；读取点与写入点不在同一事务。
@@ -447,15 +452,19 @@
 - 影响：客户端以为锁生效、实际是无条件覆盖，冲突检测完全失效且**没有任何错误信号**——比直接报错更危险（用户会信任「已加锁」假象）。经 `/dav/` 或 `/public/` 写笔记的第三方编辑器（Obsidian、calibre、文件管理器挂载等）都落在这个盲区里。
 - 建议：客户端侧冲突检测改走 REST，或用 `ETag` + `GET /api/merge-base` 自行检测；根治需自定义 `bufferedFS`——写缓冲到内存/临时文件，在 `Close` 时于 `repo` 锁内调用 `WriteAndCommitIf(rel, content, msg, wantBlob, wantAbsent)`，把 WebDAV 的条件头映射成 `wantBlob` / `wantAbsent`。
 
-## `rescan` 无频率限制（M7 安全复审，2026-10-18）
+## `rescan` 无频率限制（M7 安全复审，2026-10-18）——已解决（A 批，2026-10-26，60s + 429）
 - 现象：`POST /api/resources/rescan` 只有 `Server.rescanRunning`（`atomic.Bool` CAS）做并发互斥，抢不到返回 `409 rescan_in_progress`；这只防「同时两次」，不防「串行地反复触发」——令牌持有者可以循环触发全库重扫。
 - 影响：成本随「文件数 × 内容哈希」增长，单个客户端即可把机器占满（重扫期间 DB 与磁盘都在忙）；且没有审计记录可追溯谁触发了多少次。
 - 建议：加最小间隔（如 60s，窗口内返回 `429` 或带 `retry_after` 的 `409`），或改为后台任务队列 + 任务 id 查询；同时记审计日志（时间、耗时、`scanned`/`deleted`/`failed` 计数）。
+- 已解决（A 批，2026-10-26，最小间隔部分）：新增错误码 `rate_limited`（`internal/logging` 的 `ErrRateLimited` → `statusForCode` 的 `http.StatusTooManyRequests`）+ `Retry-After`（秒，向上取整且 ≥1）；包级 `var rescanMinInterval = 60 * time.Second`（**非配置项**，仅测试覆写）。`Server.rescanLastAt`（`atomic.Int64`）记「上一次重扫**结束**的时刻」，故并发到达的请求看到旧值 → 只有 1 个抢到 CAS、其余 `409`（正在进行中 ≠ 被限流），串行第二次在结束后 60s 内才 `429`。`429` 分支**不抢占互斥锁、不写 lastAt**：重试既不能延长禁用窗口，也无后端成本；失败的重扫同样写 lastAt，防止用注定失败的请求刷频。单实例部署下进程内限流等价于全局。
+- 未解决部分：**审计记录没做**（仍是常规 `slog` 日志，无「谁在何时触发了几次」的独立审计）；后台任务队列方案未做。
 
-## `deleteListLimit = 100000` 截断（M7 安全复审，2026-10-18）
+## `deleteListLimit = 100000` 截断（M7 安全复审，2026-10-18）——降级（A 批，2026-10-26：截断已可见，分批删除留 B 批）
 - 现象：`internal/api/files.go` 的目录删除用 `deleteListLimit = 100000` 一次列举登记行（`Limit: deleteListLimit`），超出部分不再列举。
 - 影响：超大目录（>10 万条登记行）删除时，超出部分**不写墓碑**，登记表留下孤儿行；`GET /api/changes` 因而缺 `delete` 事件，客户端保留已不存在的资源，直到下一次 rescan 才收敛。
 - 建议：改为分批删除（按 uid 游标循环，直到取空），或提高上限并**在截断时记警告日志**（当前是静默截断）；`docs/security.md` §8.4 的「目录删除列举上限」条目应同步说明截断后果。
+- 已降级（A 批，2026-10-26，只做了「可见」这一半）：`deleteListLimit` 由 `const` 改为包级 `var`（注释写明「仅测试覆写，生产恒 100000」），并抽出纯函数 `truncationReached(returned, limit)` 判定；撞上限时记 `slog.Warn`（含 `root` / `prefix` / `limit`）。`docs/security.md` §8.4 与 §8.7 第 8 条已同步说明截断后果（漏写墓碑 → 客户端保留本地副本 → 需 rescan 校准）。
+- 未解决部分：**分批删除仍没做**（留 B 批）；响应体也**没有** `Truncated` 之类的字段，客户端无法自助发现（见本文「`deleteListLimit` 截断无 `Truncated` 响应字段」条）。
 
 ## 根内软链的部署假设（M7 安全复审，2026-10-18）
 - 现象：整条防护链（REST 的 `physicalPathChecked` / `rejectSymlinkAncestors`、WebDAV 的 `symlinkGuardFS`、登记层 `IsRegular` 过滤）都建立在「软链可被识别并拒绝」之上。两个出口现已各自落实守卫（WebDAV 侧见 `internal/webdav/symlink.go`，接入 `/dav/` 与 `/public/`），但**启动期仍不检查根内是否存在软链**，`docs/configuration.md` 也没有「根内不得放置软链」的前置条件。
@@ -467,10 +476,68 @@
 - 影响：同一文件被 REST 与 WebDAV 并发写时存在时间窗——REST 侧在锁内读到的内容可能正被 WebDAV 侧改写，或反之；结果是一个写入被另一个静默覆盖，且事件流的 `blob` 可能与磁盘最终内容不一致（需 rescan 收敛）。
 - 建议：与「WebDAV 出口不支持条件写」同根因，用同一个 `bufferedFS` 统一写路径（缓冲 → `Close` 时在锁内 `WriteAndCommitIf`），让两个出口共用同一临界区。
 
-## 主动内容内联黑名单为枚举式（M7 安全终审，2026-10-18）
-- 现象：`internal/api/files.go` 的 `activeContentExts` 是一张**枚举式**黑名单（`.html`/`.htm`/`.xhtml`/`.shtml`/`.ehtml`/`.xht`/`.svg`/`.svgz`/`.xml`/`.xsl`/`.js`/`.mjs`/`.mht`/`.rdf`）。判定只按 `path.Ext` 精确匹配，名单之外的扩展名一律按「被动内容」内联返回（带按扩展名推断的 `Content-Type`）。
+## 主动内容内联黑名单为枚举式（M7 安全终审，2026-10-18）——REST 侧已解决（A 批，2026-10-26，白名单）；WebDAV 侧改由 `CSP: sandbox` 缓解（≠ 白名单）
+- 现象（历史）：`internal/api/files.go` 曾有一张**枚举式**主动内容黑名单（14 项：`.html` / `.htm` / `.xhtml` / `.shtml` / `.ehtml` / `.xht` / `.svg` / `.svgz` / `.xml` / `.xsl` / `.js` / `.mjs` / `.mht` / `.rdf`，符号名见 git 历史）。判定只按 `path.Ext` 精确匹配，名单之外的扩展名一律按「被动内容」内联返回（带按扩展名推断的 `Content-Type`）。该名单在 A 批被删除。
 - 影响：**漏项即形成 XSS 缝隙**。Go 内建 MIME 表会把 `.shtml`/`.ehtml` 映射为 `text/html`、`.xht` 映射为 `application/xhtml+xml`——这类扩展名一旦漏在名单外，服务端就会**显式声明**主动类型，`nosniff` 不阻止显式声明的类型被当作 HTML 执行，于是 `PUT` 一个 `evil.shtml` 再接 `GET /api/files/evil.shtml` 即可在服务端源下执行脚本（可读 `localStorage` 里的令牌）。本轮已补齐 6 项，但「下次 Go 新增映射」「其它厂商扩展名（如 `.xhtmlz`、`.htc`）」仍会重复此问题；WebDAV 出口连这层强制下载都没有。
 - 建议：反转为「安全类型**白名单**才内联」——只有明确的被动类型（文本笔记、图片、PDF 等）按其推断类型返回，其余一律 `application/octet-stream` + `attachment`；同时 WebDAV 侧对同一份名单同样强制 `attachment`（当前 `Content-Type` 由客户端自行解释，浏览器在 Basic 认证后可能按扩展名内联渲染），并把名单抽成单一真源供 REST / WebDAV 共用。
+- REST 侧已解决（A 批，2026-10-26）：删除 `activeContentExts` / `isActiveContent`（14 项枚举黑名单），改为 17 项静态映射表 `inlineContentTypes`（ext → `Content-Type`，**不查宿主 mime 表**）：`.txt` `.md` `.markdown` `.org` `.csv` `.json` `.pdf` `.epub` `.png` `.jpg` `.jpeg` `.gif` `.webp` `.bmp` `.ico` `.tif` `.tiff`；**名单外一律** `application/octet-stream` + `Content-Disposition: attachment`。三个收益：默认安全（新增/未知扩展名自动强制下载，不再「漏项即缝隙」）、不依赖宿主 MIME 数据库（跨机一致）、安全属性可判定。**行为变更**：`.org` 的 `Content-Type` 由 `text/org; charset=utf-8`（宿主 `globs2` 给的值）改为 `text/plain; charset=utf-8`，其余 16 项不变。
+- WebDAV 侧改为 `CSP: sandbox` 缓解，**但没有采用白名单**（A 批，2026-10-26）：新增 `internal/webdav/security.go` 的 `SandboxContent`，`/dav/` 与 `/public/` 的全部响应加 `nosniff` + `Content-Security-Policy: sandbox`。理由是强制 `attachment` 会破坏 Calibre / Obsidian 等按 `Content-Type` 处理文件的第三方客户端；`sandbox` 让文档进入不透明源、禁掉脚本与同源 DOM 访问（关闭「`PUT` 一个 `.html` 再诱导浏览器导航」的同源脚本执行通道），而字节与 `Content-Type` 都不变。**残余差异**：该出口能内联的类型仍是任意扩展名（只是无法执行脚本），与 REST 侧的「白名单内联」不等价。
+- 该条目**不关闭**：WebDAV 侧的剩余风险与「装配点无集成断言」见本文 A 批新增条目。
+
+## `/api/files/` 的内联响应无 `CSP: sandbox`（服务端技术债 A 批代码审查，2026-10-26）
+- 现状：白名单内的 `.pdf` / `.epub` / 图片按声明类型内联返回，浏览器以原生解析器渲染**攻击者可控的二进制**（任何能 `PUT` 的客户端都能上传一个构造过的 PDF/EPUB）；响应**没有** `Content-Security-Policy: sandbox`，也没有 `X-Content-Type-Options` 之外的隔离手段。
+- 影响：主风险是**解析器漏洞**（PDF/EPUB/图片解码器的内存安全），不是同源脚本执行——`nosniff` + 按声明类型的固定 `Content-Type` 已经堵掉了「当 HTML 执行」。一旦浏览器解析器被攻陷，脚本运行在同源下即可读 Web UI 存在 `localStorage` 里的令牌，故不是零风险。
+- 建议（**评估后决定不加**）：加 `CSP: sandbox` 会让 PDF 预览失效（Chrome/Firefox 的内置阅读器在 `sandbox` 指令下被禁），代价大于收益——这些文件的核心用途就是内联预览。缓解手段保持「白名单内联 + `nosniff`」。若将来出现「必须内联但不能执行脚本」的需求，可对 `Content-Type: text/html` 类（白名单外，本就走 `attachment`）单独评估。
+
+## `pathguard.HasDotSegment` 对 `..` 折叠的安全性依赖下游契约（服务端技术债 A 批代码审查，2026-10-26）
+- 现状：`HasDotSegment` 内部传 `AllowParentSegments: true`，即 `..` 走**折叠**而非拒绝（`a/../b` → `b`，放行）。这在 WebDAV 出口是安全的，但安全性来自**下游**：`x/net/webdav` 的 `stripPrefix` 恒给路径加前导 `/`，且 `webdav.Dir` 的 `resolve` 还会再 `path.Clean` 一次，因此「折叠后仍在根内」由库保证。
+- 影响：若有人把这个函数用于「传相对名」的调用方（如自己拼 `root + rel` 再打开文件），折叠语义会让 `..` 逃出该相对名的父目录，而这层保证**不在** pathguard 里。函数签名（`func(rel string) bool`）不表达这个前提。
+- 建议：在 `HasDotSegment` 的注释里写明「入参必须是已带前导 `/` 的挂载路径，或调用方自行保证折叠后不越界」（现注释已提「与历史实现逐字等价」，但没写这个下游前提）；若要彻底消除，可新增 `CleanRel` 严格版的导出包装供「相对名」调用方使用，把两者语义在 API 上分开。
+
+## `/dav/` 与 `/public/` 出口加固的装配点无集成断言（服务端技术债 A 批代码审查，2026-10-26）
+- 现状：`webdav.SandboxContent` 只有**中间件单测**（`internal/webdav/security_test.go` 直接构造 handler 断言响应头），但「`cmd/server/main.go` 确实把它包在两个出口上」没有集成测试——装配在 `package main`，现有测试无法覆盖。
+- 影响：新增第三个 WebDAV 出口（或重构 `main.go` 的包装链）时不会有测试提醒漏包装；漏了就是「该出口的 `.html` 可内联执行脚本」，而这正是本批修掉的风险。
+- 建议：给 `main.go` 的包装链抽出可测函数（如 `buildWebDAVHandler(cfg, …) http.Handler`），在 `package main` 里加一个 httptest 用例：对 `/dav/` 与 `/public/` 各发一个请求，断言响应含 `nosniff` + `CSP: sandbox`；或用「包装链顺序」的表驱动断言（顺序一旦漏一环即失败）。
+
+## `/api/` 响应无 `Cache-Control`（服务端技术债 A 批代码审查，2026-10-26）
+- 现状：`/api/` 的成功响应与错误响应都不设 `Cache-Control`（只有 `GET /api/files` 的 `http.ServeContent` 走标准缓存语义，会按 `Last-Modified` / `ETag` 协商）。
+- 影响：若在反代启用 `proxy_cache`（或 CDN），私密笔记内容与批注可能被**共享缓存**保存并按 URL 分发给其他请求者——单用户部署下影响有限，但一旦有第二个客户端/租户，这是数据越界。401 响应同样没有 `Cache-Control: no-store`，某些代理会缓存错误响应。
+- 建议：对 `/api/` 统一加 `Cache-Control: no-store`（或至少对 `/api/` 的 JSON 响应加），在安全头中间件里顺手加（同一处装配点）；反代侧显式 `proxy_no_cache` 作为第二道。
+
+## `deleteListLimit` 截断无 `Truncated` 响应字段（服务端技术债 A 批代码审查，2026-10-26）
+- 现状：撞到列举上限时只记服务端 `slog.Warn`，`DELETE /api/files/{path...}` 的响应体仍是 `{"uid","uids","root","path","seq"}`，没有任何「本次删除不完整」的标记。
+- 影响：客户端无法自助发现「这个目录没删干净」——它会认为该子树已全部删除，但登记表里仍有存活行（未写墓碑 → 无 `delete` 事件），于是本地保留副本直到下一次 `rescan`。运维只能靠翻日志发现。
+- 建议：响应体加 `"truncated": true`（或 `"skipped": N`）并在 `docs/api.md` §8.3 写明客户端动作（发现 `truncated` 应触发一次 `rescan` 或分批重试）；与「分批删除」（B 批）一起做最自然。
+
+## 错误 message 反射客户端可控 path（服务端技术债 A 批代码审查，2026-10-26）
+- 现状：多个 handler 用客户端传入的 `path` 直接拼错误文案，例如 `文件 %s 在版本 %s 中不存在`（`ErrNotFound`），该 message 原样回到客户端；`docs/security.md` §8.5 的口径是「响应只含稳定错误码 + 固定中文文案」。
+- 影响：文案里出现攻击者可控的字符串，意味着可注入换行/控制字符（若下游有日志或终端渲染）、也可用于探测「服务端如何规范化我的输入」（回显的是清洗后的还是原始的）。当前**不构成**路径泄漏（回显的是客户端自己的输入，不是服务端物理路径），但与「固定文案」的不变量不一致。
+- 建议：错误 message 里不回显原始 `path`（改成「目标文件在该版本中不存在」这类固定文案），或把 `path` 经 `%q` 转义后再回显；同时补一条断言「错误 message 不含换行/控制字符」。
+
+## `rescanLastAt` 用墙上时钟，NTP 回拨会让限流窗口变长（服务端技术债 A 批代码审查，2026-10-26）
+- 现状：`rescanLastAt` 存 `time.Now().UnixNano()`，限流判断用 `time.Since(...)`——依赖墙上时钟。
+- 影响：NTP 向前跳变时 `since` 变大（限流失效一次）；向后回拨时 `since` 可能为负 → `remaining` 变大 → `Retry-After` 报出很大的值，限流窗口被**被动延长**（但不会崩溃，也不会永久锁死：`Retry-After` 只是建议值，客户端按它退避会等更久）。属「安全侧失效 / 可用性侧劣化」，不是漏洞。
+- 建议：改用单调时钟（`time.Since` 已基于 `monotonic` 读数是正确做法，但 `Store(UnixNano())` 丢了单调部分）——可存 `time.Time`（含 monotonic 读数）而非 UnixNano；或保留现状但把 `since < 0` 视为「窗口已过」。**不改也不影响正确性**，记此条是为了下次改动时不被 NTP 现象误导。
+
+## `rescanMinInterval` / `deleteListLimit` 为包级 `var`，`-race` 下存在数据竞争面（服务端技术债 A 批代码审查，2026-10-26）
+- 现状：两者从 `const` 改为包级 `var` 以便测试临时覆写（配合 `t.Cleanup` 恢复）。测试在 `package api` 内部直接赋值，生产代码只读。
+- 影响：并行测试（`t.Parallel()`）或多个测试文件同时覆写同一个包级变量时，读写之间没有同步 → 开 `-race` 跑全量测试可能出现数据竞争告警（当前测试未用 `t.Parallel()`，故实践上未观察到）。生产路径不改这两个变量，无实际竞争。
+- 建议：若将来开启 `-race` 门禁或引入 `t.Parallel()`，把两个变量换成「`Server` 字段 + 构造函数默认值」或 `atomic.Int64`，测试改用 fixture 注入而不是改包级变量；或明确约定「覆写包级 var 的测试禁止 `t.Parallel()`」并写进测试注释。
+
+## `handleVersion` / `handleFileContent` / `handleFileHistory` 仍不过 pathguard（服务端技术债 A 批代码审查，2026-10-26）
+- 现状：三个只读端点（版本查询 / 历史版本内容 / 版本历史列表）仍只用 `path.Clean` 折叠，不调 `pathguard.CleanRel`；与 §8.1 的文件端点不同，它们不判点段、不判 `..` 段。
+- 影响：**当前无风险**——三者都只读 git tree 内的 blob（不打开工作区文件、不写盘），且 `gitver` 的 `resolve` 已在版本表达式解析处调用 pathguard；`.git/` 一类路径即使被接受，读到的也只是仓库内 blob，不构成越界或写穿。但这是「新增路径入口必须调 pathguard」不变量的例外。
+- 建议：B 批统一补上（把三个 handler 的路径处理改为 `pathguard.CleanRel`，错误文案保持现状），或在注释里显式写明「只读 git tree，故不做点段判定」的理由，避免下一个人以为是漏改。
+
+## `gitver.Revert` 本身仍是宽松解路径（服务端技术债 A 批代码审查，2026-10-26）
+- 现状：`gitver.Revert(path, hash)` 内部对 `path` 只做宽松处理（不含点段/`..` 判定）；唯一的生产调用点 `handleRevert` 现已先过 `cleanRelPath`（A 批补齐）。
+- 影响：**新增调用者不会自动受保护**——`gitver` 是独立包，直接调 `Revert` 的代码（将来的 CLI 工具、批处理脚本）会绕过路径校验，把隐藏文件或 `.git/` 下的内容写回工作区。
+- 建议：把校验下沉到 `gitver.Revert` 内部（调 `pathguard.CleanRel`，与 `resolve` 同口径），使「怎么调都安全」；或在函数注释首段写明「调用方必须先做路径校验，本函数不做」。
+
+## `/api/files/` 截断端到端断言偏浅（服务端技术债 A 批代码审查，2026-10-26）
+- 现状：`internal/api/files_internal_test.go` 的端到端用例把 `deleteListLimit` 设为 1、删除含 2 个登记行的目录，只断言「仍返回 200」+「目录已删」；截断的可观测性由纯函数 `truncationReached` 的断言承担，未断言「漏写墓碑的那条仍存活」。
+- 影响：`truncationReached` 与真实调用点的**接线**（`List` 返回条数 → 判定 → 日志）只被间接覆盖；若有人把判定挪到「子树收敛后的 entries 长度」上（收敛会丢条数，永远判不出截断），纯函数用例仍全绿而实际行为已退化。
+- 建议：补一条端到端断言「截断发生时，未被列举的那条资源在 `resources` 里仍是存活行（墓碑未写）」——这同时锁住「判定基于 `List` 返回条数」这个关键接线。日志本身仍不捕获（包级 `slog` 无可注入点，捕获 stderr 会让用例脆弱）。
 
 ## 阅读器进度推送仅在 onStop 触发一次（M9.2 T4c，2026-10-18）
 - 现状：Android 阅读器（EPUB / PDF）的进度推送只在 `onStop` 触发一次，没有定时/防抖队列；`lastPushedPosition` 的同值跳过只是防抖，不是严格节流。
@@ -1576,3 +1643,9 @@
 - 影响：①②③ 是布局**正确性**前置（不处理会画错位置 / 显示旧装饰 / 邻页被推出视野）；④ 是**能力回退**（用户当前依赖的多窗口各看不同页会消失）；⑤ 是**内存上限**，处理不当会让打开大文档直接吃满内存；⑥⑦ 是**一致性与可测试性**债，短期不致命但会让「两条渲染路径取到不同位图」这类 bug 极难定位。
 - 建议：按 ①→⑦ 顺序处理；①③ 与 P1 的布局改造同一批（它们都在渲染/滚动的几何层），②④ 在 P1 收尾时统一改（都涉及「页号真相来源」），⑤ 在 P1 设计视口时先定量（用 P0 的实测口径复测目标缩放档），⑥ 作为独立的纯重构提交（用 PNM sha256 守门），⑦ 随 P1 的 GUI 冒烟一并验证。
 - 约束：**不得靠「提高 `--page-spec` 缓存上限」掩盖 ⑤**（上限 8 是双份内存的折中，16 是硬上限）；**不得为多页布局再引入第二套渲染路径**（⑥ 的合并方向是「一份快照逻辑」，不是「两套各修各的」）；跨页选区仍按 2026-10-26 决策禁掉，不在本轮技术债里提前解禁。
+
+## `TestRescanSerializesConcurrentRequests` 的并发断言先天宽松（服务端技术债 A 批二次验证，2026-10-26）
+
+- 现状：该用例起 8 个并发 `POST /api/resources/rescan`，只断言「每个响应状态 ∈ {200, 409}」「至少有一个 200」「收尾请求成功」。**没有**断言「恰好 1×200 + 7×409」——理论上 8 个全返回 200 也能通过，而 `rescanRunning` 的 CAS 互斥正是本用例唯一要守的不变量。
+- 影响：若将来有人把 CAS 抢占改坏（例如误改成 `Store(true)` 或用读-判断-写），该用例仍会绿，并发互斥的不变量失去回归保护。
+- 建议：在原断言基础上补 `ok == 1 && busy == 7`（在 `rescanMinInterval = 0` 的 fixture 下这是确定性结果，不是概率断言）；同时注意 `t.Cleanup` 恢复包级 var 的顺序，避免与其他 rescan 用例互相污染。属测试加固，不与已归档的 A 批混改。

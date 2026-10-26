@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"mime"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -998,17 +997,14 @@ func TestGetFileActiveContentForcedDownload(t *testing.T) {
 		}
 	}
 
-	// 被动内容：Content-Type 保持按扩展名推断（.org => text/org; charset=utf-8，
-	// 具体取值由 mime 库决定），且不得被强制下载。
+	// 被动内容：Content-Type 取白名单的静态映射（.org => text/plain; charset=utf-8），
+	// 且不得被强制下载。
 	writeFileOK(t, env.handler, "/api/files/note.org", "* 标题\n")
 	note := doRaw(t, env.handler, http.MethodGet, "/api/files/note.org", testToken, nil, nil)
 	if note.Code != http.StatusOK {
 		t.Fatalf("读取 note.org 状态码 = %d, 期望 200", note.Code)
 	}
-	wantCT := mime.TypeByExtension(".org")
-	if wantCT == "" {
-		wantCT = "application/octet-stream"
-	}
+	const wantCT = "text/plain; charset=utf-8"
 	if ct := note.Header().Get("Content-Type"); ct != wantCT {
 		t.Errorf("note.org Content-Type = %q, 期望 %q（被动内容不得降级）", ct, wantCT)
 	}
@@ -1051,5 +1047,91 @@ func TestGetFileContentDispositionSanitizesFilename(t *testing.T) {
 	}
 	if rec.Header().Get("X-Content-Type-Options") != "nosniff" {
 		t.Error("X-Content-Type-Options 缺失")
+	}
+}
+
+// TestGetFileNonWhitelistedForcedDownload 验证白名单反转后的「名单外一律强制下载」：
+// 每条都必须 Content-Type == application/octet-stream 且 Content-Disposition 前缀为
+// attachment。名单外的集合里既有传统主动内容（HTML/SVG/XML/JS 等），也有大小写变体
+// 与无扩展名文件——后两者分别验证「判定前统一 ToLower」与「path.Ext 为空时不命中」。
+func TestGetFileNonWhitelistedForcedDownload(t *testing.T) {
+	env := newFileEnv(t)
+
+	names := []string{
+		"evil.html", "evil.htm", "evil.xhtml", "evil.shtml", "evil.ehtml", "evil.xht",
+		"evil.svg", "evil.svgz", "evil.xml", "evil.xsl", "evil.js", "evil.mjs",
+		"evil.mht", "evil.rdf",
+		// 大小写变体：名单判定前统一小写，故混写同样被强制下载。
+		"evil.HTML", "evil.Svg",
+		// 无扩展名：path.Ext 返回 ""，白名单不可能命中。
+		"evil",
+	}
+	const payload = `<script>alert(1)</script>`
+	for _, name := range names {
+		if rec := putFile(t, env.handler, "/api/files/"+name, payload, nil); rec.Code != http.StatusCreated {
+			t.Fatalf("写入 %s 失败: %d %s", name, rec.Code, rec.Body.String())
+		}
+	}
+
+	for _, name := range names {
+		rec := doRaw(t, env.handler, http.MethodGet, "/api/files/"+name, testToken, nil, nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("读取 %s 状态码 = %d, 期望 200", name, rec.Code)
+		}
+		if ct := rec.Header().Get("Content-Type"); ct != "application/octet-stream" {
+			t.Errorf("%s Content-Type = %q, 期望 application/octet-stream（名单外强制降级）", name, ct)
+		}
+		if cd := rec.Header().Get("Content-Disposition"); !strings.HasPrefix(cd, "attachment") {
+			t.Errorf("%s Content-Disposition = %q, 期望 attachment 前缀", name, cd)
+		}
+		if nosniff := rec.Header().Get("X-Content-Type-Options"); nosniff != "nosniff" {
+			t.Errorf("%s X-Content-Type-Options = %q, 期望 nosniff", name, nosniff)
+		}
+		if rec.Body.String() != payload {
+			t.Errorf("%s 响应体 = %q, 期望与写入内容一致（降级不能吞内容）", name, rec.Body.String())
+		}
+	}
+}
+
+// TestGetFileWhitelistedInlineContentTypes 验证白名单命中的类型仍按其静态映射内联
+// 返回，且不带 Content-Disposition（证明策略不是「全量强制下载」）。期望值是硬编码
+// 字面量而非 mime.TypeByExtension：白名单本身就是 Content-Type 的唯一来源（不查宿主
+// MIME 数据库），测试用宿主机推断值就等于把被测口径又外包出去一次。
+func TestGetFileWhitelistedInlineContentTypes(t *testing.T) {
+	env := newFileEnv(t)
+
+	cases := []struct{ name, ext, want string }{
+		{"note.org", ".org", "text/plain; charset=utf-8"},
+		{"note.md", ".md", "text/markdown; charset=utf-8"},
+		{"note.txt", ".txt", "text/plain; charset=utf-8"},
+		{"note.csv", ".csv", "text/csv; charset=utf-8"},
+		{"note.json", ".json", "application/json"},
+		{"doc.pdf", ".pdf", "application/pdf"},
+		{"book.epub", ".epub", "application/epub+zip"},
+		{"img.png", ".png", "image/png"},
+		{"img.jpg", ".jpg", "image/jpeg"},
+	}
+	for _, c := range cases {
+		if rec := putFile(t, env.handler, "/api/files/"+c.name, "payload", nil); rec.Code != http.StatusCreated {
+			t.Fatalf("写入 %s 失败: %d %s", c.name, rec.Code, rec.Body.String())
+		}
+	}
+
+	for _, c := range cases {
+		want := c.want
+		rec := doRaw(t, env.handler, http.MethodGet, "/api/files/"+c.name, testToken, nil, nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("读取 %s 状态码 = %d, 期望 200", c.name, rec.Code)
+		}
+		ct := rec.Header().Get("Content-Type")
+		if ct == "application/octet-stream" {
+			t.Errorf("%s Content-Type = application/octet-stream, 期望内联（%q）", c.name, want)
+		}
+		if ct != want {
+			t.Errorf("%s Content-Type = %q, 期望 %q", c.name, ct, want)
+		}
+		if cd := rec.Header().Get("Content-Disposition"); cd != "" {
+			t.Errorf("%s Content-Disposition = %q, 期望为空（名单内不强制下载）", c.name, cd)
+		}
 	}
 }

@@ -19,9 +19,19 @@ package api
 import (
 	"log/slog"
 	"net/http"
+	"strconv"
+	"time"
 
 	"seshat/internal/logging"
 )
+
+// rescanMinInterval 是两次全量重扫之间的最小间隔。var 而非常量：测试需要临时置 0
+// 以便连续调用；生产恒为 60s。
+//
+// 取 60s 的理由：rescan 是修补漏记的兜底手段（客户端定时任务 / 手工触发），不是正常
+// 工作流的一部分；一次全量遍历会读遍所有根并逐条写登记表，比正常写请求贵几个数量级。
+// 60s 足以挡住「重试循环」「多客户端同时触发」这类误用，又不至于让人工排障时等太久。
+var rescanMinInterval = 60 * time.Second
 
 // rescanResponse 是一次重扫的统计结果对外表示（只含计数）。
 //
@@ -49,11 +59,35 @@ type rescanResponse struct {
 //
 // 错误：
 //   - registry 为 nil → 503 unavailable（能力未就绪，与其余身份端点一致）；
+//   - 距上次重扫结束不足 rescanMinInterval → 429 rate_limited + Retry-After；
 //   - 已有重扫在跑 → 409 rescan_in_progress（不排队，见文件头）；
 //   - 遍历/写库失败 → 按错误码映射（如根目录不可读 → 400）。
 func (s *Server) handleRescan(w http.ResponseWriter, r *http.Request) {
 	if !s.requireRegistry(w) {
 		return
+	}
+
+	// 限流：距上一次重扫**结束**不足 rescanMinInterval 则 429。
+	//
+	// 顺序是设计要点：本检查排在 CAS 之前，且命中时**不抢占独占权、不写 lastAt**。
+	// 若在这里写 lastAt，被拒的客户端每次重试都会把窗口往后推，等于把自己永久
+	// 锁在窗口外（也等于给了任意客户端一条无限延长禁用窗口的途径）。
+	if last := s.rescanLastAt.Load(); last != 0 {
+		since := time.Since(time.Unix(0, last))
+		if since < rescanMinInterval {
+			// 向上取整且至少 1 秒：Retry-After 不接受 0/负数，向下取整会让客户端
+			// 在窗口尚未结束时就被放回来（间隔 60s、剩余 1.2s 时向下取整是 1s，
+			// 客户端 1s 后重试仍会被拒，形成乒乓）。
+			remaining := rescanMinInterval - since
+			secs := int((remaining + time.Second - 1) / time.Second)
+			if secs < 1 {
+				secs = 1
+			}
+			w.Header().Set("Retry-After", strconv.Itoa(secs))
+			writeError(w, logging.NewAppError(logging.ErrRateLimited,
+				"重扫过于频繁，请稍后重试"))
+			return
+		}
 	}
 
 	// CAS 抢占：false→true 成功者获得本次独占权。抢不到说明另一次重扫尚未结束，
@@ -63,8 +97,20 @@ func (s *Server) handleRescan(w http.ResponseWriter, r *http.Request) {
 			"已有重扫在进行中，请稍后重试"))
 		return
 	}
-	// 无论成功、失败还是 panic 展开，都必须归还独占权，否则重扫能力永久失效。
-	defer s.rescanRunning.Store(false)
+	// 无论成功、失败还是 panic 展开，都必须归还独占权，否则重扫能力永久失效；
+	// 同时记下本次重扫的「结束」时刻，作为下一次请求的限流基准。
+	//
+	// 两步的顺序不可颠倒：先写 lastAt 再清 running。反过来的话，「running 已清、
+	// lastAt 还没写」之间存在一个真实时序窗口，窗口内到达的新请求会看到旧的
+	// lastAt 而直接抢到 CAS —— 限流被静默绕过。反之（先写 lastAt）的最坏后果只是
+	// 同刻到达者在窗口里看到 429，语义上仍正确（上一次确实刚结束）。
+	//
+	// 失败路径同样写 lastAt：否则客户端可以用注定失败的请求无限刷频（每次都真实
+	// 遍历一遍全部根，正是限流要挡的那件事）。
+	defer func() {
+		s.rescanLastAt.Store(time.Now().UnixNano())
+		s.rescanRunning.Store(false)
+	}()
 
 	stats, err := s.registry.Rescan(r.Context(), s.registry.Roots())
 	if err != nil {

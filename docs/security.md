@@ -167,7 +167,19 @@ scripts/gen-secrets.sh /etc/seshat/secrets.env
 - 本地 LLM 处理节点：经 VPN 或仅凭节点令牌 + TLS 访问服务端，不暴露明文端口。
 - 客户端侧：桌面 Emacs/Android 均校验服务端证书；Basic/Bearer 凭据只在 TLS
   通道内传输，禁止明文 HTTP。
-- HSTS 与安全响应头由反向代理统一设置。
+- **基础安全响应头由服务端自己下发**（`internal/api/security.go` 的 `securityHeaders`
+  中间件，套在 `handler()` 返回的整棵 mux 外层）：`/api/`（含 200 JSON、401/4xx/5xx
+  错误响应）、Web UI 首页、`/static/`、以及 mux 产生的 404/405 **全部**带
+  `X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、
+  `Referrer-Policy: no-referrer`。**CSP 仍只由 Web UI 的 `setWebUISecurityHeaders`
+  设置**（取值 `default-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'`，
+  见 §8.8）——中间件刻意不设 CSP，否则会覆盖含 `script-src 'self'` 的那份、把
+  `app.js` 拦掉。`/dav/` 与 `/public/` 由 `internal/webdav` 自己的 server 提供，
+  由 §8.8 的 `SandboxContent` 单独加 `nosniff` + `Content-Security-Policy: sandbox`。
+- **HSTS 仍由反向代理下发**：TLS 在反代终止，服务端看不到真实 scheme，无法判断该不该
+  发 HSTS（内部回环请求明明是明文）。nginx / Caddy 的配置行与「`always` 让 4xx/5xx 也
+  带上」的说明见 [部署说明 §7](deploy.md#7-反向代理-https)；部署检查清单第 11 节有对应
+  核对项。
 
 ## 6. 提交前自动检查
 
@@ -274,11 +286,17 @@ Android 客户端的访问令牌（等同服务端 `SESHAT_AUTH_TOKEN`）按以�
 4. 逐段拒绝 `.git`（大小写不敏感，兼顾大小写不敏感卷）与任何以 `.` 开头的段
    （隐藏文件/目录）。
 
-**四处入口同口径**：REST（`internal/api/files.go` 的 `cleanRelPath`）、WebDAV 出口
-（`internal/webdav/policy.go` 的 `hasDotSegment`，`/dav/` 与 `/public/` 共用同一策略
-包装）、登记层（`internal/registry/service.go` 的 `normalizeResourcePath`）、扫描层
-（`internal/registry/bootstrap.go` 的 `isDotName` + `SkipDir`）。登记可接受集与出口
-可访问集因此一致——不会出现「磁盘有、登记表没有」或「API 能写、登记拒绝」的死角。
+**五个入口同口径，规则本体唯一（A 批，2026-10-26）**：规则实现在 `internal/pathguard`
+（`CleanRel` / `IsDotName` / `HasDotSegment` + `Options`），下面五个入口都是薄包装——
+REST（`internal/api/files.go` 的 `cleanRelPath`）、WebDAV 出口（`internal/webdav/policy.go`
+的 `hasDotSegment`，`/dav/` 与 `/public/` 共用同一策略包装）、登记层
+（`internal/registry/service.go` 的 `normalizeResourcePath`）、扫描层
+（`internal/registry/bootstrap.go` 的 `isDotName` + `SkipDir`）、版本层
+（`internal/gitver/version.go` 的 `resolve` / `resolveAny`）。`Options` 的**零值即最严格**
+（拒空、拒 `..` 段、拒点段），三个开关只能放宽；WebDAV 出口与 `gitver` 是两处「折叠 `..`
+而非拒绝」的显式例外（`AllowParentSegments: true`），语义与历史实现逐字等价（抽取时用 12
+个输入逐条比对，输出逐字节一致）。登记可接受集与出口可访问集因此一致——不会出现「磁盘有、
+登记表没有」或「API 能写、登记拒绝」的死角。细节见 [架构设计 · 路径安全](architecture.md) 的「路径安全：`internal/pathguard` 单一真源」节。
 
 **根选择**：`?root=` 只能在 `SetRoots` 登记的 tag 中精确匹配（大小写敏感，缺省首根），
 未知 tag → `400 invalid_argument`；客户端无法用 tag 或路径拼出配置之外的物理目录。
@@ -321,7 +339,7 @@ Android 客户端的访问令牌（等同服务端 `SESHAT_AUTH_TOKEN`）按以�
 | PUT 请求体 | 32 MiB（`maxFileBytes`） | 防止单请求把整库内存打满 |
 | GET 响应体 | 流式（`http.ServeContent`），ETag 逐块 sha1 | 内存 O(1)，大书文件不整体读入 |
 | 单文档引用条数 | 2000（`maxRefsPerDocument`） | 超出按首次出现顺序截断并记日志（写操作仍成功），避免单请求阻塞 DB |
-| 目录删除列举上限 | 100000（`deleteListLimit`） | 一次尽量取全登记行，否则会漏写墓碑 |
+| 目录删除列举上限 | 100000（`deleteListLimit`，包级 `var` 仅供测试覆写） | 一次尽量取全登记行，否则会漏写墓碑；**撞到上限时记 `slog.Warn`**（含 `root` / `prefix` / `limit`），超出部分仍不写墓碑，分批删除待实现（见 §8.7 第 8 条） |
 | 清单 / 变更流 `limit` | 夹紧到 `[1, 2000]` | 防止一次拉取无界 |
 | 启动登记 `bootstrapTimeout` | 2 分钟 | 超大目录树不至于让进程无限卡在启动 |
 | `rescan` 执行时长 | 请求上下文（客户端断开即取消） | 断开的长扫描不会继续跑完 |
@@ -335,30 +353,48 @@ Android 客户端的访问令牌（等同服务端 `SESHAT_AUTH_TOKEN`）按以�
 - `416` 由标准内容服务产生，响应体是 Go 标准库的纯文本（不是本服务的错误 JSON）；它同样
   不携带任何服务端内部信息。
 - 根 tag 是唯一允许出现在错误信息里的「配置相关」字段，物理路径始终不出现。
+- **已知不一致**（记 `openspec/tech-debt.md`「错误 message 反射客户端可控 path」）：部分端点的
+  message 会回显**客户端自己传入的** `path`（如「文件 %s 在版本 %s 中不存在」）。它不泄漏
+  服务端信息（回显的是输入而非物理路径），但与「固定中文文案」的措辞不完全一致，且把一个
+  可控字符串带进了响应体（换行/控制字符需转义）。
 
 ### 8.6 维护端点与令牌模型
 
 - `POST /api/resources/rescan` 挂在 `/api/` 之下，与其它端点共用**主令牌**认证；节点令牌
-  不覆盖 `/api/`。除「同一时刻只允许一次」（`rescanRunning` CAS，抢不到立即 `409`）外
-  **没有任何频率限制或配额**。
+  不覆盖 `/api/`。它有两层成本护栏：**并发互斥**（`rescanRunning` CAS，抢不到立即 `409
+  rescan_in_progress`，不排队）与**频率限制**（距上一次重扫**结束**不足 60 秒 → `429
+  rate_limited` + `Retry-After: <秒>`，向上取整且 ≥1）。两者语义刻意分开：`409` 是「另一次
+  重扫正在进行中」，`429` 是「上一次已结束但还没过最小间隔」——客户端对前者退避重发、对后者
+  按 `Retry-After` 等待。
+  - 最小间隔是包级 `var rescanMinInterval = 60 * time.Second`（**不是配置项**，仅测试可临时
+    覆写）；`rescanLastAt` 记「上一次重扫**结束**的时刻」，因此并发到达的多个请求看到的是旧
+    值 → 只有 1 个抢到 CAS、其余 `409`（正在进行中 ≠ 被限流）。
+  - `429` 分支**不抢占互斥锁、不写 `lastAt`**，故重试既不会延长禁用窗口、也无后端成本
+    （只有一次时间比较）；失败的重扫同样写 `lastAt`，防止用注定失败的请求刷频。
+  - 进程内限流在**单实例部署**下等价于全局限流——`deploy/` 的单元模板与 compose 文件都按
+    单实例定位，不做多副本共享限流状态。
 - 这意味着**令牌即全权限**：持有主令牌者可以反复触发全量扫描（成本随文件数 × 内容哈希
-  增长），也可以读写任何 `mirror` 根、删除目录、发起 revert。主令牌应按「管理员口令」
-  对待（仅存于服务端与受信客户端、只经 TLS 传输、泄露即轮换，见 §3.4、§4.3），不要下发给
-  多用户客户端。
+  增长，现被 60 秒间隔压到每分钟至多一次），也可以读写任何 `mirror` 根、删除目录、发起
+  revert。主令牌应按「管理员口令」对待（仅存于服务端与受信客户端、只经 TLS 传输、泄露即
+  轮换，见 §3.4、§4.3），不要下发给多用户客户端。
 
 ### 8.7 已知残余（明确未解决）
 
-1. **安全响应头只覆盖两个入口**：Web UI（首页与 `/static/`）已有 `nosniff` +
-   `X-Frame-Options: DENY` + CSP（`internal/api/embed.go` 的 `setWebUISecurityHeaders`），
-   `GET /api/files` 的**所有下载**已有 `nosniff`、对主动内容强制 `attachment`
-   （`internal/api/files.go`）；但 `/api/` 的**其它**响应（JSON 端点与错误响应）仍不带任何
-   安全头，`Strict-Transport-Security` 一概留给反代（§5）。这些入口直连服务端端口时仍无
-   浏览器侧防护。
+1. ~~**安全响应头只覆盖两个入口**~~ —— **已解决（A 批，2026-10-26）**：安全响应头改为
+   套住**全部路由**的统一中间件（`internal/api/security.go` 的 `securityHeaders`，见 §5），
+   `/api/` 的 JSON 端点与 401/4xx/5xx 错误响应、mux 的 404/405、Web UI 首页与 `/static/`
+   一律带 `nosniff` + `X-Frame-Options: DENY` + `Referrer-Policy: no-referrer`；CSP 仍只
+   由 Web UI 的 `setWebUISecurityHeaders` 设置（中间件不设，避免覆盖 `script-src 'self'`）。
+   `/dav/` 与 `/public/` 由 `internal/webdav` 的 `SandboxContent` 加 `nosniff` + `CSP:
+   sandbox`（§8.8）。**唯一仍留给反代的是 `Strict-Transport-Security`**（理由见 §5：TLS 在
+   反代终止）。
 2. **Emacs 端 uid 缓存不随服务端重建失效**：服务端重建登记表（DB 重来、切 base-url）后
    uid 变化，客户端缓存的旧 uid 会持续 `404 unknown_uid`，需手动清缓存或等同步失败后重解析。
 3. **`registry.Apply` 的读-改-写非原子**：`GetResourceByUID` 在事务之外执行，「查现状 → 写
    登记」之间存在 TOCTOU 窗口（并发写同一路径时可能重复处理或漏写事件）。
-4. **`rescan` 可反复触发**：见 §8.6，只有并发互斥，没有频率限制与审计记录。
+4. ~~**`rescan` 可反复触发**~~ —— **已解决（A 批，2026-10-26）**：加 60 秒最小间隔 + `429
+   rate_limited` + `Retry-After`（见 §8.6）。**未做**的是审计记录（谁在何时触发了多少次）
+   ——仍只有常规 `slog` 日志。
 5. ~~**WebDAV 出口未做独立的软链拒绝**~~ —— **已解决（S1，2026-10-18）**：新增
    `internal/webdav/symlink.go` 的 `symlinkGuardFS`，接入 `/dav/` 与 `/public/` 两个出口
    （包装顺序 `webdav.Dir → extWhitelistFS → readOnlyFS → symlinkGuardFS → dotPathFS →
@@ -368,6 +404,16 @@ Android 客户端的访问令牌（等同服务端 `SESHAT_AUTH_TOKEN`）按以�
    （`cmd/server/main.go`）不使用它。
 6. **符号链接策略的覆盖面**：`DELETE` 目录的子树收敛作用于登记表（不含软链），但「目录内
    存在软链」与「软链指向根外」的组合未被专门测试覆盖。
+7. **`/api/files/` 的内联响应没有 `CSP: sandbox`**（A 批记录，**评估后决定不加**）：白名单
+   内的 PDF/EPUB/图片按声明类型内联返回，浏览器会以原生解析器渲染**攻击者可控的二进制**
+   （一个 PUT 上来的 PDF/EPUB 即可），主风险是解析器漏洞而非同源脚本执行。加
+   `CSP: sandbox` 会让 PDF 预览失效（Chrome/Firefox 的内置 PDF 阅读器在 `sandbox` 指令下
+   被禁），代价大于收益；缓解手段是「只有白名单扩展名才内联」+ `nosniff`。WebDAV 出口
+   相反——那里 Content-Type 由客户端解释、必须内联，故套 `CSP: sandbox`（§8.8）。
+8. **目录删除的截断只有服务端日志可见**：撞到 `deleteListLimit`（100000）时记 `slog.Warn`
+   （含 `root` / `prefix` / `limit`），但响应体没有「已截断」字段，客户端无法自助发现；
+   漏写墓碑的那部分资源会一直保留在客户端本地，直到下一次 `rescan` 把它们按「磁盘上已不
+   存在」写墓碑。分批删除留 B 批。
 
 ### 8.8 WebDAV 出口的差异（M7 安全复审，2026-10-18）
 
@@ -379,7 +425,7 @@ Android 客户端的访问令牌（等同服务端 `SESHAT_AUTH_TOKEN`）按以�
 | 点路径（`.git`、任一 `.` 开头的段） | 拒绝 → `400 invalid_argument` | 拒绝 → `403 Forbidden`（`dotPathFS`）——**已落地** |
 | 符号链接（目标自身或中间段） | 目标自身：读 `404` / 写 `400`；中间段：`400`（`physicalPathChecked` + `rejectSymlinkAncestors`，见 §8.2） | 拒绝 → `403 Forbidden`（`symlinkGuardFS`）；**口径更严**：不看软链指向根内还是根外，任何软链中间段都拒；PROPFIND 中该项被静默跳过 ——**已落地** |
 | 条件写 `If-Match` / `If-None-Match` | 支持，两者同时出现时**都校验**，且比较与写入在同一临界区（§8.3） | **不支持**：`x/net/webdav` v0.61.0 的 `handlePut` 不解析这两个头，客户端条件写被**静默忽略**（退化为无条件覆盖） |
-| 危险扩展名（`.html`/`.svg` 等主动内容） | 强制 `application/octet-stream` + `Content-Disposition: attachment`，所有下载加 `nosniff` | 不适用（WebDAV 客户端自行解释 `Content-Type`；本出口不做强制下载）。WebDAV 出口**不**强制下载；浏览器在 Basic 认证后可能按扩展名内联渲染（残余风险，需客户端自行约束） |
+| 危险扩展名（`.html`/`.svg` 等主动内容） | **白名单内联**（A 批，2026-10-26）：只有 17 项被测为「被动」的扩展名按固定 `Content-Type` 内联（见下），**名单外一律** `application/octet-stream` + `Content-Disposition: attachment`，所有下载加 `nosniff` | 本出口**不做强制下载**（强制 `attachment` 会破坏 Calibre / Obsidian 等按 `Content-Type` 处理文件的客户端），改为给全部响应加 `X-Content-Type-Options: nosniff` + `Content-Security-Policy: sandbox`（`internal/webdav/security.go` 的 `SandboxContent`）：文档进入不透明源、脚本与同源 DOM 访问被禁，`Content-Type` 与字节不变 |
 | 写与提交的临界区 | 落盘 + commit + 登记全在 `repo` 锁内 | 库自行落盘，钩子只保护「暂存 + 提交」——锁不对称 |
 
 对应技术债见 `openspec/tech-debt.md`：`WebDAV 出口不支持条件写`、
@@ -390,17 +436,48 @@ Android 客户端的访问令牌（等同服务端 `SESHAT_AUTH_TOKEN`）按以�
 或改用 `ETag` + `GET /api/merge-base` 自行检测冲突；WebDAV 出口只适合「最后写入即算数」的
 场景（例如把整棵目录当普通网盘挂载）。
 
-**危险扩展名强制下载：已实现（S2，2026-10-18）**。`GET /api/files` 对主动内容扩展名
-（`.html` / `.htm` / `.xhtml` / `.shtml` / `.ehtml` / `.xht` / `.svg` / `.svgz` / `.xml` /
-`.xsl` / `.js` / `.mjs` / `.mht` / `.rdf`，大小写不敏感）强制
-`Content-Type: application/octet-stream` + `Content-Disposition: attachment`，并且**所有**
-文件下载响应都带 `X-Content-Type-Options: nosniff`（`internal/api/files.go`）。黑名单为**枚举式**
-（`.html/.htm/.xhtml/.shtml/.ehtml/.xht/.svg/.svgz/.xml/.xsl/.js/.mjs/.mht/.rdf`），新出现的
-可执行类型需显式加入；更稳的做法是反转为「安全类型白名单才内联」，已记 tech-debt。Web UI 的首页
-与 `/static/` 另由 `setWebUISecurityHeaders` 加 `nosniff` + `X-Frame-Options: DENY` + CSP
-（`default-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'`，
-`internal/api/embed.go`）。**残余**：`/api/` 的其它响应（JSON 端点与错误响应）仍无安全头，
-`Strict-Transport-Security` 仍由反代负责（§5）。
+**危险扩展名策略：已反转为白名单内联（A 批，2026-10-26）**。`GET /api/files` 的
+Content-Type 判定不再用「枚举主动内容黑名单」，而是「**静态白名单内联**」
+（`internal/api/files.go` 的 `inlineContentTypes`，17 项，键为小写含点扩展名）：
+
+| 扩展名 | Content-Type | 扩展名 | Content-Type |
+|---|---|---|---|
+| `.txt` | `text/plain; charset=utf-8` | `.pdf` | `application/pdf` |
+| `.md` / `.markdown` | `text/markdown; charset=utf-8` | `.epub` | `application/epub+zip` |
+| `.org` | `text/plain; charset=utf-8` | `.png` | `image/png` |
+| `.csv` | `text/csv; charset=utf-8` | `.jpg` / `.jpeg` | `image/jpeg` |
+| `.json` | `application/json` | `.gif` | `image/gif` |
+| `.webp` | `image/webp` | `.bmp` | `image/bmp` |
+| `.ico` | `image/vnd.microsoft.icon` | `.tif` / `.tiff` | `image/tiff` |
+
+命中名单 → 按上表的固定值内联（**不查宿主 MIME 数据库**）；**名单外一律**
+`Content-Type: application/octet-stream` + `Content-Disposition: attachment;
+filename="..."`（文件名取最后一段，引号/反斜杠/控制字符替换为 `_` 以防头注入），并且
+**所有**文件下载响应都带 `X-Content-Type-Options: nosniff`。
+
+反转的三个理由：① **默认安全**——新增/未知扩展名（`.shtml`、`.xhtmlz`、`.htc`、任何厂商
+扩展名）自动落到强制下载，不再需要「想起来把它加进黑名单」，漏项不再形成 XSS 缝隙；
+② **不依赖宿主环境**——静态表使「哪些类型可内联」在任何机器上都是同一答案（旧的
+`mime.TypeByExtension` 会读 `/usr/share/mime/globs2` / `/etc/mime.types`，同一文件在不同
+MIME 数据库版本下得到不同 `Content-Type`）；③ 安全属性可判定——表里只列「确定被动」的类型。
+
+**行为变更（唯一一项）**：`.org` 的 `Content-Type` 由 `text/org; charset=utf-8`（来自本机
+MIME 数据库）改为 `text/plain; charset=utf-8`（静态表）。其余 16 项的取值与客户端既有行为
+一致——Emacs 与 Android 的下载/阅读路径都不依赖 `Content-Type`。
+
+**WebDAV 出口不做白名单，而是套 `CSP: sandbox`**（`internal/webdav/security.go` 的
+`SandboxContent`，`/dav/` 与 `/public/` 均包装）。原因：该出口的 `Content-Type` 仍由
+`x/net/webdav` 按扩展名推断并内联返回，强制 `attachment` 会让 Calibre / Obsidian 等按
+`Content-Type` 处理文件的第三方客户端失效；`CSP: sandbox` 只让文档进入**不透明源**并禁掉
+脚本与同源 DOM 访问（因此读不到 Web UI 存在 `localStorage` 里的令牌），而 `Content-Type`
+与字节内容都不变。**这不是白名单**：能内联的类型仍是「任何扩展名」，只是内联后无法执行
+脚本（记入 `openspec/tech-debt.md`）。这关闭了「`PUT` 一个 `.html` 再诱导浏览器导航过去」的
+同源脚本执行通道。
+
+Web UI 的首页与 `/static/` 另由 `setWebUISecurityHeaders` 加 `nosniff` +
+`X-Frame-Options: DENY` + CSP（`default-src 'self'; script-src 'self'; object-src 'none';
+base-uri 'none'`，`internal/api/embed.go`）；`/api/` 的其余响应（JSON 端点与错误响应）自
+A 批起也由统一中间件加基础安全头，详见 §5 与 §8.7 第 1 条。
 
 ## 9. 客户端防御上限（M12，2026-10-22）
 

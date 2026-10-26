@@ -255,6 +255,11 @@ server {
     ssl_certificate     /etc/letsencrypt/live/seshat.example.com/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/seshat.example.com/privkey.pem;
 
+    # HSTS：服务端**不**下发（TLS 在这里终止，服务端判断不了真实 scheme），由反代负责。
+    # `always` 是关键——nginx 的 add_header 默认只作用于 2xx/3xx，加 always 才让
+    # 401/4xx/5xx 响应也带上该头。上线前先确认 HTTPS 全站可用（HSTS 会被浏览器记住）。
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+
     # 大文件上传：放宽请求体上限（按需调整，单位 g）
     client_max_body_size 2g;
 
@@ -288,8 +293,14 @@ server {
 seshat.example.com {
     # Caddy 自动申请并续期 Let's Encrypt 证书
     reverse_proxy 127.0.0.1:8080
+
+    # Caddy **默认不下发** HSTS——需要显式添加。服务端不代发（TLS 在此终止，
+    # 服务端看不到真实 scheme，见 docs/security.md §5）。
+    header Strict-Transport-Security "max-age=31536000; includeSubDomains"
 }
 ```
+
+> Caddy 的 `header` 指令对全部响应生效（含 4xx/5xx），不需要 nginx 那样的 `always`。
 
 ### 7.3 代理要点
 
@@ -302,7 +313,11 @@ seshat.example.com {
 - **认证透传**：不要把 `Authorization` 头改写或剥离；REST 的 Bearer 与 WebDAV 的
   Basic 都由服务端校验。
 - **仅环回暴露**：服务只监听 `127.0.0.1:8080`，明文端口不直接暴露公网。
-- 安全响应头（如 HSTS）可在反向代理统一设置。
+- **安全响应头分工**：`nosniff` / `X-Frame-Options: DENY` / `Referrer-Policy: no-referrer`
+  由**服务端**对全部路由下发（`internal/api/security.go`，见 [安全说明 §5](security.md#5-传输安全)），
+  反代不必重复配置；**只有 HSTS 必须在反代设置**——TLS 在此终止，服务端无法判断真实
+  scheme。nginx 记得加 `always`（否则 4xx/5xx 不带该头），Caddy 需用 `header` 指令显式添加
+  （默认不下发）。
 
 ## 8. 启动与验证
 
@@ -535,6 +550,10 @@ file data/seshat.db
       显示 `seshat` 运行中（`./data`、`./config.yaml` 卷与 `env_file: ./data/secrets.env`
       已就位，容器以非 root uid 1000 运行）
 - [ ] **TLS 已配置**：反向代理终止 HTTPS，证书有效期正常，明文端口未暴露公网
+- [ ] **反代已下发 HSTS**（服务端不代发：TLS 在反代终止，服务端看不到真实 scheme，见
+      [安全说明 §5](security.md#5-传输安全)）：nginx 用 `add_header Strict-Transport-Security
+      "max-age=31536000; includeSubDomains" always`（`always` 让 4xx/5xx 也带上），Caddy 用
+      `header Strict-Transport-Security …`。`curl -sI https://<域名>/api/roots` 应能看到该头
 - [ ] 启动验证通过：`[systemd]` `/api` 未认证返回 401、`PROPFIND /dav/` 返回 207、
       搜索端点返回 200；`[Docker]` `curl /` 返回 200、`/api/` 返回 401
 - [ ] **SQLCipher 生效**：`data/seshat.db` 文件头不是 `SQLite format 3`（非明文）

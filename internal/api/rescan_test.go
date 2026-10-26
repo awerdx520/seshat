@@ -18,9 +18,11 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"seshat/internal/auth"
 	"seshat/internal/registry"
@@ -40,6 +42,14 @@ type rescanFixture struct {
 // 并返回未套认证的 Server；调用方可经 handler() 取得完整 HTTP 栈。
 func newRescanFixture(t *testing.T) *rescanFixture {
 	t.Helper()
+
+	// 本 fixture 内把限流间隔置 0：本文件的既有用例普遍连续多次 POST（首次登记 →
+	// 删除后重扫 → 复活 → 收尾请求），生产值 60s 会把第二次调用判成 429。置 0 时
+	// `time.Since(last) < 0` 恒为 false，永不进入限流分支，因此既有断言一字不改。
+	// 限流行为由 TestRescanRateLimited / TestRescanRateLimitExpires 用独立构造覆盖。
+	prev := rescanMinInterval
+	rescanMinInterval = 0
+	t.Cleanup(func() { rescanMinInterval = prev })
 
 	db, err := storage.Open(filepath.Join(t.TempDir(), "seshat.db"), "")
 	if err != nil {
@@ -432,5 +442,104 @@ func TestRescanGetMethodFallsThroughToUIDHandler(t *testing.T) {
 	code := rescanErrorCode(t, rescanRequest(t, h, http.MethodGet, "/api/resources/rescan", rescanTestToken), http.StatusBadRequest)
 	if code != "invalid_uid" {
 		t.Fatalf("错误码 = %q, 期望 invalid_uid", code)
+	}
+}
+
+// newRateLimitFixture 构造限流用例专用的 fixture：结构同 newRescanFixture，但
+// **不覆写 rescanMinInterval**（限流用例自己控制窗宽，复用前者会把它置 0）。
+func newRateLimitFixture(t *testing.T) *rescanFixture {
+	t.Helper()
+
+	db, err := storage.Open(filepath.Join(t.TempDir(), "seshat.db"), "")
+	if err != nil {
+		t.Fatalf("打开测试数据库失败: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	root := t.TempDir()
+	svc := registry.New(db, nil)
+	if err := svc.SetRoots([]registry.Root{{Tag: "notes", Path: root}}); err != nil {
+		t.Fatalf("设置根清单失败: %v", err)
+	}
+	return &rescanFixture{server: newServer(db, nil, nil, svc, nil), root: root}
+}
+
+// TestRescanRateLimited 验证两次重扫之间的最小间隔：窗口内第二次请求 429 +
+// Retry-After（整数、≥1）+ rate_limited，且被拒的请求不推进窗口。
+//
+// 「不推进窗口」是本用例的第二个不变量：若 429 分支也写 rescanLastAt，客户端每次
+// 重试都会把窗口往后推，等于给自己造了一个永不结束的禁用期（也等于把「延长禁用」
+// 这个能力交给了任意客户端）。
+func TestRescanRateLimited(t *testing.T) {
+	f := newRateLimitFixture(t)
+	h := f.handlerWithAuth()
+	writeRootFile(t, f.root, "a.org", "alpha")
+
+	prev := rescanMinInterval
+	rescanMinInterval = 60 * time.Second
+	t.Cleanup(func() { rescanMinInterval = prev })
+
+	if stats := rescanStats(t, rescanRequest(t, h, http.MethodPost, "/api/resources/rescan", rescanTestToken)); stats["created"] != 1 {
+		t.Fatalf("首次重扫计数 = %v, 期望 created=1", stats)
+	}
+
+	second := rescanRequest(t, h, http.MethodPost, "/api/resources/rescan", rescanTestToken)
+	if code := rescanErrorCode(t, second, http.StatusTooManyRequests); code != "rate_limited" {
+		t.Fatalf("错误码 = %q, 期望 rate_limited", code)
+	}
+	raw := second.Header().Get("Retry-After")
+	if raw == "" {
+		t.Fatal("429 响应缺少 Retry-After 头")
+	}
+	t.Logf("第二次重扫 → 429 Retry-After=%q (body=%s)", raw, strings.TrimSpace(second.Body.String()))
+	secs, err := strconv.Atoi(raw)
+	if err != nil {
+		t.Fatalf("Retry-After = %q, 期望十进制整数秒", raw)
+	}
+	if secs < 1 {
+		t.Errorf("Retry-After = %d, 期望 ≥ 1（向上取整，0 会被客户端当成可立即重试）", secs)
+	}
+	if secs > 60 {
+		t.Errorf("Retry-After = %d, 期望 ≤ 60（不得超过最小间隔本身）", secs)
+	}
+
+	// 再撞一次：仍 429，且 Retry-After 不会变大（被拒请求不写 lastAt，窗口只会
+	// 随时间流逝而缩短）。
+	third := rescanRequest(t, h, http.MethodPost, "/api/resources/rescan", rescanTestToken)
+	if code := rescanErrorCode(t, third, http.StatusTooManyRequests); code != "rate_limited" {
+		t.Fatalf("第三次请求错误码 = %q, 期望 rate_limited", code)
+	}
+	secs3, err := strconv.Atoi(third.Header().Get("Retry-After"))
+	if err != nil {
+		t.Fatalf("第三次 Retry-After 非法: %q", third.Header().Get("Retry-After"))
+	}
+	if secs3 > secs {
+		t.Errorf("第三次 Retry-After = %d 大于第一次的 %d，说明 429 分支推进了限流窗口", secs3, secs)
+	}
+}
+
+// TestRescanRateLimitExpires 验证窗口过期后可以再次重扫：把最小间隔缩到 1ns 后
+// 同一 Server 上的请求立刻恢复 200（证明 429 只由时间窗口造成）。
+func TestRescanRateLimitExpires(t *testing.T) {
+	f := newRateLimitFixture(t)
+	h := f.handlerWithAuth()
+	writeRootFile(t, f.root, "a.org", "alpha")
+
+	prev := rescanMinInterval
+	rescanMinInterval = 60 * time.Second
+	t.Cleanup(func() { rescanMinInterval = prev })
+
+	if stats := rescanStats(t, rescanRequest(t, h, http.MethodPost, "/api/resources/rescan", rescanTestToken)); stats["created"] != 1 {
+		t.Fatalf("首次重扫计数 = %v, 期望 created=1", stats)
+	}
+	// 前置确认：60s 窗口下此刻确实是 429（否则后面的 200 不能归因于窗口过期）。
+	if rec := rescanRequest(t, h, http.MethodPost, "/api/resources/rescan", rescanTestToken); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("窗口内状态码 = %d, 期望 429 (body=%q)", rec.Code, rec.Body.String())
+	}
+
+	rescanMinInterval = time.Nanosecond
+	stats := rescanStats(t, rescanRequest(t, h, http.MethodPost, "/api/resources/rescan", rescanTestToken))
+	if stats["unchanged"] != 1 || stats["created"] != 0 {
+		t.Fatalf("窗口过期后重扫计数 = %v, 期望 unchanged=1 created=0", stats)
 	}
 }

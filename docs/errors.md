@@ -23,6 +23,7 @@
 | `rescan_in_progress` | 409 | 已有一次全量重扫在进行中 | 并发调用 `POST /api/resources/rescan`（不排队，直接拒绝） |
 | `etag_mismatch` | 412 | 条件写的前提不成立，**内容未被修改** | `If-Match` 与当前内容不符或资源不存在；`If-None-Match: *` 命中已存在资源 |
 | `range_not_satisfiable` | 416 | `Range` 区间不可满足（**M7 修复后由标准内容服务产生**：仅保留状态码语义，**不再返回 JSON 错误体**，响应体为纯文本 + `Content-Range: bytes */<size>`） | 区间语法非法、多区间、起点越界、空文件的后缀请求。客户端按 `416` 状态码分支，不要解析 `{"error":{...}}` |
+| `rate_limited` | 429 | 请求过于频繁 | `POST /api/resources/rescan` 距上一次重扫**结束**不足 60 秒（响应带 `Retry-After: <秒>`；与「正在进行中」的 `409 rescan_in_progress` 是两回事，见下） |
 | `internal` | 500 | 服务端内部错误 | 数据库读写失败、schema 版本不兼容、登记失败、根物理路径与版本库根不一致、响应序列化失败 |
 | `unavailable` | 503 | 服务端**能力未就绪**（handler 内联） | 未装配资源登记（身份/变更/根/文件/引用/重扫端点）或未启用索引器（`/api/search`） |
 
@@ -80,7 +81,7 @@ M7 起状态端点以 **uid** 为文档键（`document_id` 不再接受），身
 | 文件 | `GET` / `PUT` / `DELETE` `/api/files/{path...}`、`POST /api/resources/{uid}/move` | `invalid_argument`、`invalid_uid`、`unauthorized`、`unknown_uid`、`root_read_only`、`etag_mismatch`、`range_not_satisfiable`（仅 GET，且只保留状态码语义）、`unavailable`、`internal` |
 | 变更流 | `GET /api/changes` | `invalid_argument`、`unauthorized`、`unavailable`、`internal` |
 | 引用 | `GET /api/refs` | `invalid_argument`、`invalid_uid`、`unauthorized`、`unknown_uid`、`unavailable`、`internal` |
-| 维护 | `POST /api/resources/rescan` | `unauthorized`、`rescan_in_progress`、`unavailable`、`internal` |
+| 维护 | `POST /api/resources/rescan` | `unauthorized`、`rate_limited`（距上一次重扫结束不足 60 秒，带 `Retry-After`）、`rescan_in_progress`（已有一次在跑）、`unavailable`、`internal` |
 
 批注相关端点的 `invalid_argument` 按 `kind` 分支（schema v8 起）：`POST /api/annotations` 与
 `PUT /api/annotations/{id}` 只要求 `uid`（仅 POST）/ `location` 非空，**`text` 仅在 `kind=note` 时必填**；
@@ -102,6 +103,7 @@ M7 起状态端点以 **uid** 为文档键（`document_id` 不再接受），身
 | `conflict` | 重新 `GET` 当前值，按业务规则合并后再写 | 重试前必须先重读 |
 | `etag_mismatch` | 重新 `GET` 取新 `ETag`，基于新内容重做改动 | 重试前必须先重读 |
 | `rescan_in_progress` | 保持请求体不变，退避后再发 | 可退避重试（指数退避，勿并发） |
+| `rate_limited` | **按 `Retry-After` 响应头（秒）退避后重试**，不要立即重发 | 有限次重试；重试不会延长禁用窗口（服务端在 `429` 分支不记录时间戳），也不会消耗后端成本。没有 `Retry-After` 时按 60 秒退避 |
 | `range_not_satisfiable` | 放弃 `Range` 请求，改全量 `GET`；或修正区间（该 `416` 响应体不是 JSON 错误结构） | 不重试 |
 | `internal` | 记录日志；幂等读可退避重试 | 有限重试（如 2 次） |
 | `unavailable` | 视为部署/能力问题（未装配 registry 或索引器）；提示用户或等待运维修复 | 有限退避重试，不要高频轮询 |

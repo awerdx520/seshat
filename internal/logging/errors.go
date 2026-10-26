@@ -37,6 +37,12 @@ const (
 	// 对外映射为 409。重扫是维护动作且写登记表，同一时刻只允许一次；
 	// 客户端据此稍后重试，而不是把它当成参数错误去修改请求。
 	ErrRescanInProgress Code = "rescan_in_progress"
+	// ErrRateLimited 表示同一维护动作被请求得过于频繁（如距上次全量重扫结束
+	// 不足最小间隔），对外映射为 429，通常伴随 Retry-After 头。
+	// 与 ErrRescanInProgress 分开：409 是「此刻正有同类操作在跑」，429 是
+	// 「上一次已结束但离得太近」，两者客户端的正确动作不同（前者等当前结束，
+	// 后者按 Retry-After 退避），混用会让客户端无法判断该等多久。
+	ErrRateLimited Code = "rate_limited"
 )
 
 // AppError 是应用统一错误类型：错误码 + 用户可读信息 + 底层错误。

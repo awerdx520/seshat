@@ -193,3 +193,35 @@ func TestRevertUnauthorized(t *testing.T) {
 		t.Fatalf("缺失令牌时状态码 = %d, 期望 401", rec.Code)
 	}
 }
+
+// TestRevertRejectsUnsafePath 验证 revert 的路径必须过与其它写端点相同的严格口径。
+//
+// 为什么这条不变量必须单独锁：repo.Revert 落到 gitver.resolve，那里为了按名字取
+// blob 而把 AllowDotSegments / AllowParentSegments 全开；若 handleRevert 不先过
+// cleanRelPath，隐藏文件（.hidden.org）与 .git 内部路径都能经 revert 落盘，绕过
+// 「隐藏文件不可写」「.git 不可经 API 访问」两条不变量。
+//
+// hash 传任意非空值即可：路径校验发生在 repo.Revert 之前，不会触达 hash 解析。
+func TestRevertRejectsUnsafePath(t *testing.T) {
+	h, _, root, commits := diffEnv(t)
+
+	cases := []struct{ name, path string }{
+		{"隐藏文件", ".hidden.org"},
+		{"git 内部路径", ".git/config"},
+		{"上跳段", "../outside.org"},
+		{"点目录", ".obsidian/workspace.json"},
+		{"NUL 字节", "a\x00.org"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := do(t, h, http.MethodPost, "/api/revert", testToken,
+				map[string]string{"path": tc.path, "hash": commits[0]}, nil)
+			assertErrorCode(t, rec, http.StatusBadRequest, "invalid_argument")
+		})
+	}
+
+	// 落盘副作用必须为零：被拒的隐藏文件不得出现在工作区（哪怕内容为空）。
+	if _, err := os.Stat(filepath.Join(root, ".hidden.org")); !os.IsNotExist(err) {
+		t.Fatalf("隐藏文件经 revert 落盘了: stat err = %v", err)
+	}
+}

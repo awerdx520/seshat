@@ -33,6 +33,7 @@
 | `internal/index` | 全文索引 FTS5（仅覆盖笔记根） |
 | `internal/llm` | LLM 接入层（云端 + 本地处理节点） |
 | `internal/registry` | **M7 新增**：文件身份与增量同步地基——uid 生成/校验、事件应用（`resources` + `changes` 同事务）、引用解析（`refs`）、文件系统 → 登记表的 bootstrap / rescan |
+| `internal/pathguard` | **A 批新增**：「仓库内相对路径」安全规则的唯一实现（`CleanRel` / `IsDotName` / `HasDotSegment` + `Options`），五个入口改为薄包装；只依赖标准库 |
 
 **`internal/storage` 的三张新表**（v6 单条迁移建档；v7 只重建状态表，不动这三张）：
 
@@ -45,6 +46,58 @@
 `internal/webdav` 的 **registry 钩子**（`registryAfterWrite`）包在 commit 钩子外层、FTS 索引钩子内层，仅 2xx 写响应生效：把「文件已落盘」的事实登记为身份与事件，与 REST 写路径共用同一个 `registry.Apply`，因此两个出口写入同一文件得到同一个 uid。
 
 `internal/api` 的新端点类别（细节见 [`docs/api.md`](api.md)）：资源登记（`/api/resources`、`/api/resources/{uid}`）、路径解析（`/api/resolve`）、根映射（`/api/roots`）、文件读写（`/api/files/{path...}`、`/api/resources/{uid}/move`）、变更流（`/api/changes`）、引用（`/api/refs`）与维护（`/api/resources/rescan`）。
+
+## 路径安全：`internal/pathguard` 单一真源
+
+**背景（A 批，2026-10-26）**：同一套「仓库内相对路径」不变量（拒 NUL、拒 `..` 段、拒 `.git`
+段与点段、`path.Clean` 折叠）此前有**五份**实现，分散在五个包里，靠注释「两处必须同步修改」
+维系：
+
+| 入口 | 位置 | 历史形态 |
+|---|---|---|
+| REST 文件端点 | `internal/api/files.go` 的 `cleanRelPath` | TrimSpace + 自己的判定 + `logging` 错误码包装 |
+| 登记表键规范化 | `internal/registry/service.go` 的 `normalizeResourcePath` | 同上 |
+| WebDAV 出口策略 | `internal/webdav/policy.go` 的 `hasDotSegment` | `path.Clean` **折叠** `..`，只判点段 |
+| bootstrap 逐项判定 | `internal/registry/bootstrap.go` 的 `isDotName` | 单段名字判定 |
+| 版本层路径解析 | `internal/gitver/version.go` 的 `resolve` / `resolveAny` | 折叠 `..`，并额外拒「指向仓库根」 |
+
+**现状**：规则本体唯一——`pathguard.CleanRel(rel, Options)`（另有 `IsDotName` 与
+`HasDotSegment` 两个便捷判定）。五个入口都是**薄包装**：保留原函数名与签名（调用点与测试
+大量按这些名字构造），只负责「TrimSpace（部分入口）+ 把 pathguard 的哨兵错误包成本入口既有的
+错误码与中文文案」。**对外错误码与中文文案零变化**——`docs/api.md` 与 `docs/errors.md` 的
+契约未动。
+
+`Options` 的三个开关**零值即最严格**（拒空、拒 `..` 段、拒点段），且**只能放宽、不能收紧**：
+
+| 开关 | 放宽的语义 | 谁需要它 |
+|---|---|---|
+| `AllowEmpty` | 规范化结果为空时返回 `""` 而非报错 | WebDAV 挂载根本身、`gitver` 的仓库根 |
+| `AllowParentSegments` | `..` 段**折叠**而不是拒绝（`a/../b` → `b`） | WebDAV 出口、`gitver`（与历史 `path.Clean` 语义逐字等价） |
+| `AllowDotSegments` | 允许 `.git` 与以 `.` 开头的段 | `gitver`（版本表达式可含点名字） |
+
+两处「折叠 `..` 而非拒绝」是**显式传参**的例外，不靠零值兜底：`HasDotSegment` 内部传
+`AllowParentSegments: true`（否则 `a/../b` 会被拒，是 WebDAV 出口的行为变更），`gitver` 的
+`resolve` 传三个开关全开。它们与历史实现**逐字节等价**——抽取时用 12 个输入（`a/../b`、
+`../x`、`a/b/..`、`.git/x`、`A.GIT/x`、`.hidden`、含 NUL、纯空白、`//a.org`、`/a.org`、
+`a/./b`、`a//b`）逐条比对改动前后输出，无一差异；`HasDotSegment` 改传 `AllowDotSegments:
+true` 后 13 个输入 0 差异（见 `openspec/decisions.md` 2026-10-26 条）。
+
+**不变量**：**新增任何路径入口都必须调用 `pathguard`**，不得自写 `path.Clean("/"+…)` 或
+自己拼点段判定。判断「这个入口算不算路径入口」的判据是「入参是否来自客户端或文件名」——
+新增 HTTP 端点、新的 WebDAV 包装层、新的版本查询入口都算。测试侧对应 `internal/pathguard`
+的表驱动拒绝矩阵，它是不变量的唯一可机械检查形态。
+
+**已知未收敛（技术债，非本批范围）**：下面三处仍是**纯折叠**（`path.Clean` 去前导斜杠，不判
+点段、不判 `..`），尚未改为调用 pathguard：
+
+| 位置 | 现状 |
+|---|---|
+| `internal/gitver/merge.go` 的 `cleanTreePath` | git tree 内条目名规范化，只折叠 |
+| `internal/webdav/symlink.go` 的 `cleanRel` | 软链守卫里的请求路径规范化，只折叠 |
+| `internal/webdav/versioned.go` 的 `blobPath` | 版本化包装层的 blob 路径拼接，只折叠 |
+
+三者的入参都先经过各自出口的 pathguard 判定或来自 git tree（非客户端直传），因此当前不构成
+绕过；但仍记在 `openspec/tech-debt.md`，作为「路径规则单一真源」这条技术债的残余。
 
 ## 身份与增量同步（M7）
 

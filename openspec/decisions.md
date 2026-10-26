@@ -842,3 +842,31 @@ refit 按当前窗口尺寸做一次几何适配 + 重渲染，一次到位。
 
 **代价与约束**：① **同步阻塞**——入口在 Emacs 主线程渲染，耗时与一次 `wait_for_cached_page` 同量级，故 P0 不接入任何显示路径，P1 必须自己做视口虚拟化（只渲染可见页 + 少量预取）。② **双份内存**——spec 的 `:data` 是 PNM 的 Lisp 堆副本，C 侧 `CachedPage.img_data` 与 MuPDF image cache 各自另存，单页 72 dpi 1.42 MB / 150 dpi 6.16 MB；缓存上限因此固定 8 且不许调过 16；实测顺序访问超过 8 页时命中率跌到 0（先进先出淘汰），P1 的视口驻留页数必须 ≤ 上限或改淘汰策略。③ **hscroll 仍是窗口级**——宽页横向滚动会让整栏（含邻页）一起左右移动，多页布局下是观感缺陷，本期不解决。④ **`--refresh-highlights` 只重绘当前窗口 ±5 页**——多页布局下视口可能跨更多页，装饰刷新范围要重算。⑤ **多窗口「各看不同页」的能力将丢失**（决策 6 的直接代价）：同一文档在多个窗口的滚动位置互相独立，旧的 window 参数同步机制不再是真相来源。
 
+## 2026-10-26 · 主动内容策略选「静态白名单内联」而非「枚举黑名单强制下载」
+
+**决策**：`GET /api/files/{path...}` 的 `Content-Type` 判定从「枚举 14 项主动内容黑名单 → 命中则强制 `octet-stream` + `attachment`，其余按宿主 MIME 推断内联」改为「**17 项静态白名单（ext → 固定 `Content-Type`）→ 命中才内联，名单外一律 `octet-stream` + `attachment`**」（`internal/api/files.go` 的 `inlineContentTypes`）。表内**不查**宿主 MIME 数据库。白名单：`.txt` `.md` `.markdown` `.org` `.csv` `.json` `.pdf` `.epub` `.png` `.jpg` `.jpeg` `.gif` `.webp` `.bmp` `.ico` `.tif` `.tiff`。**WebDAV 出口不采用白名单**，改由 `Content-Security-Policy: sandbox` 缓解（`internal/webdav/security.go` 的 `SandboxContent`）。
+
+**理由**：① **默认安全**——黑名单是「枚举坏东西」，Go 或厂商新增的 MIME 映射（`.shtml`/`.ehtml`/`.xht` 一类）一旦漏在名单外，服务端就会**显式声明**主动类型，而 `nosniff` 不阻止显式声明的类型被当作 HTML 执行，于是 `PUT` 一个 `evil.shtml` + `GET` 即可在服务端源下执行脚本（可读 `localStorage` 里的令牌）；白名单下「没列出来」自动等于「强制下载」，漏项不再是安全缝隙。② **不依赖宿主 MIME 数据库**——`mime.TypeByExtension` 会读 `/usr/share/mime/globs2` 或 `/etc/mime.types`，同一文件在不同机器/不同 MIME 库版本上得到不同 `Content-Type`（`.org` 就可能是 `text/org` / `text/plain` / `application/vnd.lotus-organizer`）；静态表使「哪些类型可内联」在任何机器上答案一致。③ **安全属性可判定**——表里只列「确定被动」的类型，评审时看表即可，不需要推理「还漏了哪些可执行扩展名」。
+
+**代价**：**`.org` 的 `Content-Type` 从 `text/org; charset=utf-8` 变为 `text/plain; charset=utf-8`**（本机 `globs2` 此前给的是前者）。这是唯一的行为变更，其余 16 项取值与改造前一致；Emacs 与 Android 的下载/阅读路径都不依赖 `Content-Type`，故无客户端改动（见 CHANGELOG「变更」条）。
+
+**WebDAV 出口为何不套白名单**：该出口的 `Content-Type` 由 `x/net/webdav` 按扩展名推断并**内联**返回，第三方客户端（Calibre、Obsidian、文件管理器挂载）按 `Content-Type` 处理文件——强制 `attachment` 会让这些客户端行为异常；而只对浏览器生效的白名单又不适用于「客户端自行解释类型」的协议出口。改用 `CSP: sandbox`：文档进入**不透明源**，脚本与同源 DOM 访问被禁（读不到 Web UI 的令牌），`Content-Type` 与字节内容都不变，客户端无感。**这不是白名单**——能内联的类型仍是任意扩展名，只是无法执行脚本，故残余风险与「装配点无集成断言」记入 `openspec/tech-debt.md`。
+
+## 2026-10-26 · HSTS 不由服务端下发
+
+**决策**：服务端**不设置** `Strict-Transport-Security`，也不提供「HSTS 开关」配置项；HSTS 一律由反向代理下发。`docs/deploy.md` §7 给出 nginx 与 Caddy 的配置行，§11 检查清单有对应核对项。
+
+**理由**：TLS 在反向代理终止，服务端看到的永远是环回地址上的明文 HTTP——它**无法判断**真实 scheme（`X-Forwarded-Proto` 可被伪造，也没有可依赖的信任边界），因此任何「服务端自动下发 HSTS」的实现都只能是「按配置项无条件发」。加一个**永远默认关闭**的开关只增加配置面与文档面（多一个会被误配的旋钮、多一处「为什么我配了但没生效」的排查点），而不带来任何收益：反代已经在终止 TLS，它本来就知道 scheme。
+
+**代价与约束**：① 部署者必须自己在反代加 HSTS 行，漏了就是一个「未被提醒的缺口」——因此 `docs/deploy.md` 的检查清单新增了显式核对项（`curl -sI` 应能看到该头），并在 nginx 示例里注明 `always` 的作用（`add_header` 默认只作用于 2xx/3xx，不加 `always` 则 401/4xx/5xx 不带该头）。② 服务端**其余基础安全头**（`nosniff` / `X-Frame-Options: DENY` / `Referrer-Policy: no-referrer`）与 HSTS 走相反路线——由 `internal/api/security.go` 的中间件对全部路由下发，因为这三条与 scheme 无关、服务端能正确判断；只有 CSP 仍归 Web UI（中间件不设，避免覆盖含 `script-src 'self'` 的那份）。
+
+## 2026-10-26 · 路径规则抽取到 `internal/pathguard` 的等价性核验
+
+**决策**：把「仓库内相对路径」的五份实现（`api.files.cleanRelPath`、`registry.service.normalizeResourcePath`、`webdav.policy.hasDotSegment`、`registry.bootstrap.isDotName`、`gitver.version.resolve/resolveAny`）收敛到新建 `internal/pathguard`（`CleanRel(rel, Options)` / `IsDotName` / `HasDotSegment`），五个入口改为**薄包装**（保留原函数名与签名）。`Options` 的**零值即最严格**（拒空、拒 `..` 段、拒点段），三个开关只能放宽。
+
+**等价性核验（本次重构的唯一验收判据）**：抽取前后用 **12 个输入**逐条比对改动前后的**输出字节**——`a/../b`、`../x`、`a/b/..`、`.git/x`、`.hidden`、含 NUL、纯空白、`//a.org`、`/a.org`、`a/./b`、`a//b`、`./a`，五个入口的「接受/拒绝 + 规范化结果」**逐字节一致**，12/12 等价。`HasDotSegment` 改传 `AllowDotSegments: true` 后另跑 **13 个输入**，**0 差异**（其中 `A.GIT/x` 是**放行**项——`A.GIT` 少了前导点，既非 `.git` 的大小写变体也不以 `.` 开头；真正的变体是 `.GIT/x`，判拒绝）。
+
+**结论**：本次是**零行为变化的重构**——对外错误码与中文文案一字未改（`docs/api.md` / `docs/errors.md` 的契约不动），既有测试零改动通过，**不需要用户迁移**。两处「折叠 `..` 而非拒绝」的特例改为**显式传参**（`HasDotSegment` 与 `gitver.resolve` 传 `AllowParentSegments: true`），不靠零值兜底：把「折叠」写成显式选项，才不会有人误以为收紧成拒绝是「顺手的改进」（那会是 WebDAV 出口与 gitver 的行为变更）。
+
+**代价与约束**：① 「新增路径入口必须调 pathguard」成为不变量，但三处纯折叠（`gitver/merge.go:cleanTreePath`、`webdav/symlink.go:cleanRel`、`webdav/versioned.go:blobPath`）尚未收敛，记入 `openspec/tech-debt.md`；② `pathguard` **不做 TrimSpace**（api/registry 侧 TrimSpace、gitver 侧不 TrimSpace 的历史差异留在调用方），也不产出用户可见文案（错误以 5 个哨兵返回，由调用方按各自错误码包装）——这两条都是刻意的边界，写进包注释以免下次被「统一化」。
+

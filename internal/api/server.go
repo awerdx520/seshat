@@ -55,6 +55,10 @@ type Server struct {
 	// 手段，而排队等待会掩盖调用方定时任务重叠的误用）。CAS false→true 成功
 	// 者独占，defer 归还。
 	rescanRunning atomic.Bool
+
+	// rescanLastAt 记「上一次全量重扫**结束**的时刻」（UnixNano，0 = 从未跑过）。
+	// 记结束而非开始：并发请求应看到「正在进行中」(409) 而不是「被限流」(429)。
+	rescanLastAt atomic.Int64
 }
 
 // progressResponse 是阅读进度的对外表示。
@@ -298,7 +302,11 @@ func (s *Server) handler(a *auth.Authenticator) http.Handler {
 	// GET /{$} 精确匹配根路径（不含其下子路径），避免与 "/api/" 子树路由冲突。
 	root.Handle("GET /{$}", webIndexHandler())
 	root.Handle("GET /static/", webStaticHandler())
-	return root
+
+	// 基础安全响应头统一加在最外层：root 才是完整的路由树，套在这里才能同时覆盖
+	// /api/（含认证失败 401 与 writeError 的 4xx/5xx 分支）、Web UI 首页与
+	// /static/。中间件不设 CSP，CSP 仍由 setWebUISecurityHeaders 提供。
+	return securityHeaders(root)
 }
 
 // routes 构建全部 API 路由；版本查询路由仅在 repo 非 nil 时注册。
@@ -660,7 +668,8 @@ func (s *Server) handleDiff(w http.ResponseWriter, r *http.Request, path string)
 // 请求体形如 {"path":"a.org","hash":"<commit>"}；成功返回 200 +
 // {"status":"reverted","hash":"<恢复后的 HEAD>"}（恢复只追加提交，不改写历史；
 // 内容与目标版本一致时不产生新提交，hash 即为原 HEAD）。path 或 hash 为空
-// 返回 400；文件在该版本不存在返回 404；版本无法解析返回 400。
+// 返回 400；路径不合法（含 ".."、.git 段、以 '.' 开头的段）返回 400；
+// 文件在该版本不存在返回 404；版本无法解析返回 400。
 func (s *Server) handleRevert(w http.ResponseWriter, r *http.Request) {
 	var req revertRequest
 	if err := decodeBody(w, r, &req); err != nil {
@@ -671,8 +680,20 @@ func (s *Server) handleRevert(w http.ResponseWriter, r *http.Request) {
 		writeError(w, logging.NewAppError(logging.ErrInvalidArgument, "path 与 hash 均为必填"))
 		return
 	}
+	// 路径必须先过严格口径（cleanRelPath，零值 Options）：repo.Revert 最终落到
+	// gitver.resolve，后者的 AllowDotSegments / AllowParentSegments 全开（tree 查找
+	// 需要按名字取 blob，不能拒绝任何段）。若不在此处先收紧，隐藏文件（如
+	// .hidden.org）就能经 revert 落盘，绕过「隐藏文件不可写」这条不变量——REST 写
+	// 端点与 registry 登记层都按零值口径拒绝点段，revert 是唯一能绕过它们的入口。
+	// 空值校验保留在上方：它给出的是「path 与 hash 均为必填」这一既有对外文案，
+	// cleanRelPath 对空路径另有「路径不能为空」，两者不可互相替代（文案已对外承诺）。
+	path, err := cleanRelPath(req.Path)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
 
-	if err := s.repo.Revert(req.Path, req.Hash); err != nil {
+	if err := s.repo.Revert(path, req.Hash); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -993,6 +1014,11 @@ func statusForCode(code logging.Code) int {
 	// 客户端的正确动作是稍后重试（不修改请求体），故用 409 而非 400/503。
 	case logging.ErrRescanInProgress:
 		return http.StatusConflict
+	// 请求过于频繁（如距上次全量重扫结束不足最小间隔）：用 429 而非 409/403，
+	// 并可带 Retry-After 告诉客户端何时可以重试。与 ErrRescanInProgress 的区别：
+	// 409 表示「此刻另一件事正在进行」，429 表示「你来得太早了，等一会儿再来」。
+	case logging.ErrRateLimited:
+		return http.StatusTooManyRequests
 	// 条件写失败（If-Match 内容不符 / If-None-Match: * 命中已存在）是「前提不成立」，
 	// 用 412 而非 409：客户端的正确动作是重新拉取当前内容后再试。
 	case logging.ErrETagMismatch:

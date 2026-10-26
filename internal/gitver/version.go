@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
-	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -34,6 +33,7 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/storer"
 
 	"seshat/internal/logging"
+	"seshat/internal/pathguard"
 )
 
 // identityName / identityEmail 是版本化仓库的默认提交身份。
@@ -311,7 +311,7 @@ func (r *Repo) RemoveAndCommit(name, msg string) error {
 // sha1("blob <size>\0<content>")，与 git 对象格式一致。
 //
 // name 为仓库内相对路径（允许前导 "/"）。与 webdav.Dir 的策略一致，
-// 路径先经 path.Clean("/"+name) 规范化，因此 ".." 无法逃出工作区根
+// 路径先在 internal/pathguard 内折叠（".." 折叠到根内），因此无法逃出工作区根
 // （不存在的文件，或不是普通文件如目录时，返回空串与 nil error）。
 func (r *Repo) BlobHash(name string) (string, error) {
 	r.mu.Lock()
@@ -410,10 +410,24 @@ func (r *Repo) Log(limit int) ([]string, error) {
 }
 
 // resolve 把仓库内相对路径（允许前导 "/"）解析为工作区内的绝对路径。
-// 与 webdav.Dir 相同，先做 path.Clean("/"+name)，".." 因此被规范化到
-// 挂载根内，无法逃出；若结果仍越界则返回错误（防御性兜底）。
+//
+// 规范化交给 internal/pathguard（单一真源），选项为「全放开」：
+//   - AllowEmpty：空路径 / "/" 折叠为空串，是仓库根本身（BlobHash 等有意接受）；
+//   - AllowParentSegments：与 webdav.Dir 相同，".." 被折叠到挂载根内而**不拒绝**
+//     （"../x" → "x"），故无法逃出；
+//   - AllowDotSegments：本层不做点路径策略（点路径由 WebDAV 出口与登记层各自拒绝），
+//     这里必须保留「能解析 .git/config」的历史语义，否则 gitver 既有用例与内部访问会破。
+//
+// 若结果仍越界则返回错误（防御性兜底）。
 func (r *Repo) resolve(name string) (string, error) {
-	clean := strings.TrimPrefix(path.Clean("/"+filepath.ToSlash(name)), "/")
+	clean, err := pathguard.CleanRel(name, pathguard.Options{
+		AllowEmpty:          true,
+		AllowParentSegments: true,
+		AllowDotSegments:    true,
+	})
+	if err != nil {
+		return "", fmt.Errorf("路径 %q 不合法: %w", name, err)
+	}
 	full := filepath.Join(r.root, filepath.FromSlash(clean))
 
 	rel, err := filepath.Rel(r.root, full)

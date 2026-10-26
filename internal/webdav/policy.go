@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"path"
 	"path/filepath"
 	"strings"
 
@@ -20,6 +19,7 @@ import (
 	"seshat/internal/auth"
 	"seshat/internal/gitver"
 	"seshat/internal/index"
+	"seshat/internal/pathguard"
 	"seshat/internal/registry"
 )
 
@@ -167,25 +167,17 @@ func errDotPath(name string) error {
 
 // hasDotSegment 判断 WebDAV 请求路径是否含「点段」。
 //
-// 判定口径与 internal/registry 的 normalizeResourcePath 一致：
+// 规则本体在 internal/pathguard（单一真源）；本包装保留挂载根例外与 `..` 折叠语义
+// （pathguard.HasDotSegment 内部传 AllowEmpty + AllowParentSegments）：
 //   - 先折叠路径（去前导斜杠、合并重复斜杠、折叠 "."）：使 "/a.org"、"//a.org"、
 //     "/./a.org" 这类等价写法得到同一结论，避免「多写一个 './' 就绕过策略」；
+//   - ".." 段走折叠而非拒绝（a/../b → b 放行），与历史上 path.Clean 的行为逐字等价；
 //   - 折叠后任一段为 .git（大小写不敏感，兼顾大小写不敏感的卷）或以 '.' 开头
 //     （隐藏文件/隐藏目录）即视为点路径。
 //
 // 挂载根本身（"" 或 "/"）折叠后为空串，不算点路径——否则 PROPFIND 根目录会被拒。
 func hasDotSegment(name string) bool {
-	slashed := filepath.ToSlash(name)
-	clean := strings.TrimPrefix(path.Clean("/"+slashed), "/")
-	if clean == "" {
-		return false
-	}
-	for _, seg := range strings.Split(clean, "/") {
-		if strings.EqualFold(seg, ".git") || strings.HasPrefix(seg, ".") {
-			return true
-		}
-	}
-	return false
+	return pathguard.HasDotSegment(name)
 }
 
 // dotPathFS 包装一个 webdav.FileSystem，拒绝一切落在「点路径」上的访问：

@@ -66,6 +66,11 @@
 - `code`：稳定、机器可读的标识（客户端据此分支），完整清单见 §13；
 - `message`：面向用户的可读信息，可能随版本调整，**不要**用于分支判断。
 
+**安全响应头**（A 批，2026-10-26）：全部响应——成功响应、上面的错误响应、mux 产生的
+404/405，以及 Web UI 与 `/static/`——都带 `X-Content-Type-Options: nosniff` +
+`X-Frame-Options: DENY` + `Referrer-Policy: no-referrer`（`internal/api/security.go` 的
+中间件）。CSP 只给 Web UI（取值见 `docs/security.md` §8.8），HSTS 仍由反向代理下发。
+
 ### 1.4 身份：uid
 
 M7 起，服务端所有文档标识**一律使用 uid**（客户端不再自行构造文档 id）：
@@ -620,7 +625,10 @@ GET /api/roots
 GET /api/files/{path...}?root={tag}
 ```
 
-- `{path...}`：根内逻辑相对路径（可含 `/`）；非法路径（含 `..`、NUL、空）→ `400`；
+- `{path...}`：根内逻辑相对路径（可含 `/`）。**路径规则**（实现于 `internal/pathguard`
+  单一真源，REST / WebDAV / 登记层 / 版本层共用）：拒 NUL、拒任一 `..` 段（**含中间段**，
+  `a/../b` 也拒）、拒 `.git` 段（大小写不敏感）、拒任一以 `.` 开头的段；`path.Clean` 折叠
+  重复斜杠与 `.`；去前导 `/`；空路径拒绝。任一不通过 → `400 invalid_argument`；
 - **点路径一律拒绝**：路径任意一段为 `.git`（大小写不敏感）或以 `.` 开头时 → `400
   invalid_argument`。规范化的判定在 REST 与 WebDAV 两侧完全一致（WebDAV 内部出口
   `/dav/` 与对外出口 `/public/` 同样拒绝，返回 `403 Forbidden`），因此 `.git/`、
@@ -641,17 +649,36 @@ GET /api/files/{path...}?root={tag}
   实现；WebDAV 的 `/dav/` 与 `/public/` 由 `internal/webdav/symlink.go` 的 `symlinkGuardFS`
   实现，且口径**更严**——不看软链是否指向根内，请求路径的父链或目标自身只要有软链就拒绝，
   客户端看到 `403 Forbidden`（PROPFIND 遍历时该项被静默跳过，不使整次列目录失败）。
-- 响应头：`ETag`（带引号的内容 blob hash）、`Content-Type`（按扩展名推断，未知为
-  `application/octet-stream`）、`Accept-Ranges: bytes`、`Content-Length`、`Last-Modified`；
-- **危险扩展名的强制下载（已实现）**：扩展名属于**主动内容**（`.html` / `.htm` / `.xhtml` /
-  `.svg` / `.xml` / `.xsl` / `.js` / `.mjs`，大小写不敏感）时，服务端**强制降级**
-  `Content-Type: application/octet-stream` 并加 `Content-Disposition: attachment;
-  filename="..."`（文件名取最后一段，引号/反斜杠/控制字符替换为 `_` 以防头注入）——堵住
-  「一次 PUT 附件即形成同源存储型 XSS」的路径。其余扩展名按推断类型返回。
+- 响应头：`ETag`（带引号的内容 blob hash）、`Content-Type`（见下「白名单内联」）、
+  `Accept-Ranges: bytes`、`Content-Length`、`Last-Modified`；
+- **白名单内联（A 批，2026-10-26）**：`Content-Type` 由**静态白名单**决定
+  （`internal/api/files.go` 的 `inlineContentTypes`，键为小写扩展名，**不查宿主 MIME 表**）：
+
+| 扩展名 | `Content-Type` | 扩展名 | `Content-Type` |
+|---|---|---|---|
+| `.txt` | `text/plain; charset=utf-8` | `.pdf` | `application/pdf` |
+| `.md` / `.markdown` | `text/markdown; charset=utf-8` | `.epub` | `application/epub+zip` |
+| `.org` | `text/plain; charset=utf-8` | `.png` | `image/png` |
+| `.csv` | `text/csv; charset=utf-8` | `.jpg` / `.jpeg` | `image/jpeg` |
+| `.json` | `application/json` | `.gif` | `image/gif` |
+| `.webp` | `image/webp` | `.bmp` | `image/bmp` |
+| `.ico` | `image/vnd.microsoft.icon` | `.tif` / `.tiff` | `image/tiff` |
+
+  命中名单 → 按上表的值内联。**名单外一律** `Content-Type: application/octet-stream` +
+  `Content-Disposition: attachment; filename="..."`（文件名取最后一段，引号/反斜杠/控制
+  字符替换为 `_` 以防头注入）——`.html` / `.svg` / `.js` / 无扩展名 / 任何未知扩展名都落到
+  这里，堵住「一次 PUT 附件即形成同源存储型 XSS」的路径。
+  **行为变更**：`.org` 的 `Content-Type` 由 `text/org; charset=utf-8`（宿主 MIME 数据库给
+  的值）改为 `text/plain; charset=utf-8`（静态表）；其余 16 项不变。
 - **所有 `GET /api/files` 响应一律带 `X-Content-Type-Options: nosniff`**（含降级为
   `octet-stream` 的情况，防旧版 IE/Edge 忽略类型自行嗅探）。
-- 注意：`/api/` 的**其它**响应（JSON 端点与错误响应）仍不带安全头，`X-Frame-Options` /
-  CSP 只覆盖 Web UI 页面（见 `docs/security.md` §8.7 第 1 条）。
+- **安全响应头（A 批，2026-10-26）**：全部响应（本端点、`/api/` 的 JSON 端点与 401/4xx/5xx
+  错误响应、404/405、Web UI、`/static/`）都带 `X-Content-Type-Options: nosniff` +
+  `X-Frame-Options: DENY` + `Referrer-Policy: no-referrer`（`internal/api/security.go` 的
+  中间件）；CSP 仍只给 Web UI，HSTS 仍由反代下发（见 `docs/security.md` §5）。
+- **内联响应没有 `CSP: sandbox`**：PDF/EPUB/图片按声明类型内联，浏览器以原生解析器渲染
+  PUT 上来的二进制（主风险为解析器漏洞）；评估后不加，因为 `sandbox` 会让 PDF 预览失效
+  （见 `docs/security.md` §8.7 第 7 条）。
 - **流式传输**：响应体经 Go 标准库的内容服务（`http.ServeContent`）流式写出，不在内存中
   整体读入，大文件（如 EPUB/PDF）按需分块发送，服务端内存占用不随文件大小增长；
 - 条件读与区间请求全部由该标准语义处理，服务端不自行解析：`If-None-Match` 命中 →
@@ -682,9 +709,10 @@ PUT /api/files/{path...}?root={tag}
 - 请求体为**原始字节**（非 JSON），上限 32 MiB；
 - **仅 `mirror` 根可写**：对 `ondemand` 根写入 → `403 root_read_only`（客户端应回退为
   只读展示，而不是重试）；
-- **不可写路径**：路径任意一段为 `.git`（大小写不敏感）或以 `.` 开头 → `400
-  invalid_argument`（判定与 GET 完全一致，见 §8.1；这是「服务端不写自身元数据目录」的
-  硬约束，不能靠客户端自律）；
+- **不可写路径**（统一路径规则，实现于 `internal/pathguard`，与 §8.1 同一套）：拒 NUL、拒任一
+  `..` 段（含中间段）、拒 `.git` 段（大小写不敏感）、拒任一以 `.` 开头的段、`path.Clean`
+  折叠重复斜杠与 `.`、去前导 `/`、空路径拒绝 → `400 invalid_argument`。这是「服务端不写自身
+  元数据目录」的硬约束，不能靠客户端自律；
 - **符号链接不可写**：目标自身是符号链接 → `400 invalid_argument`（不写穿链接）；
   父目录链的真实路径越出该根 → `400 invalid_argument`（写入前校验，新建多级父目录时
   同样适用）；
@@ -749,7 +777,8 @@ DELETE /api/files/{path...}?root={tag}
 ```
 
 - 仅 `mirror` 根可写（`403 root_read_only`）；
-- **不可删路径**：路径任意一段为 `.git`（大小写不敏感）或以 `.` 开头 → `400
+- **不可删路径**（统一路径规则，实现于 `internal/pathguard`，与 §8.1 一致）：拒 NUL、拒任一
+  `..` 段（含中间段）、拒 `.git` 段（大小写不敏感）、拒任一以 `.` 开头的段 → `400
   invalid_argument`；目标自身是符号链接 → `400 invalid_argument`（不删穿链接，也不删除
   链接指向的目标）；父目录链真实路径越出该根 → `400 invalid_argument`；
 - 目录删除按**路径段边界**收敛：匹配「`path` 恰等于目标」**或**「以 `目标 + '/'` 开头」，
@@ -772,6 +801,11 @@ DELETE /api/files/{path...}?root={tag}
 
 `uid` 只在单资源删除（`uids` 长度为 1）时有值；目录删除时为空串，只看 `uids`。
 
+- **目录删除的列举上限（100000 条）**：一次列举尽量取全登记行；撞到上限时服务端记 warning
+  日志（`root` / `prefix` / `limit`），**超出部分不写墓碑**，响应体也不带「已截断」标记（A 批
+  现状）。客户端若发现某个大树删除后仍有资源出现在清单里，应触发一次 `POST
+  /api/resources/rescan` 让登记表与磁盘对齐；分批删除待实现（见 `docs/security.md` §8.7
+  第 8 条）。
 - 错误：`400 invalid_argument`、`403 root_read_only`、`404 unknown_uid`（路径未登记；
   物理文件可能仍在磁盘上，应重新拉取清单而不是重复删除）、`503`、`401`、`500`。
 
@@ -787,8 +821,10 @@ POST /api/resources/{uid}/move
 {"to": "journal/2026/2026-10-18.org"}
 ```
 
-- `to` 为目标路径（相对**同一个根**，不允许 `..` 逃逸，也不允许 `.git` 段或以 `.` 开头的
-  段——判定与 §8.1 同一套规则）；uid 不变，事件为 `rename`（`old_path` 记原路径）；
+- `to` 为目标路径（相对**同一个根**）。路径规则与 §8.1 / §8.2 完全一致（实现于
+  `internal/pathguard` 单一真源）：拒 NUL、拒任一 `..` 段（含中间段，`a/../b` 也拒）、
+  拒 `.git` 段、拒任一以 `.` 开头的段、`path.Clean` 折叠重复斜杠与 `.`、去前导 `/`、
+  空路径拒绝；uid 不变，事件为 `rename`（`old_path` 记原路径）；
 - **为什么不用 `POST /api/files/{path...}/move`**：Go 1.22 的 `ServeMux` 不允许通配段
   `{path...}` 之后再出现字面量段（注册 `.../{path...}/move` 会在注册期 panic：
   `wildcard not at end`）。因此移动端点以 uid 定位、目标路径放请求体。同一限制也解释了
@@ -982,6 +1018,16 @@ POST /api/resources/rescan
   `resources` 重新对齐，并把漏记的变更补写进 `changes`（客户端仍按游标消费）；
 - 并发：同一时刻只允许一次重扫，第二次请求立即返回 `409 rescan_in_progress`
   （**不排队**——维护端点等待会掩盖调用方定时任务重叠的误用）；
+- **限流（A 批，2026-10-26）**：两次重扫之间至少间隔 **60 秒**（以**上一次重扫结束**时刻
+  为基准）。距上次结束不足 60 秒时返回 `429 rate_limited` 并带 `Retry-After: <秒>`
+  （整数、向上取整、最小 1）：
+  - `409 rescan_in_progress` 与 `429 rate_limited` **语义不同**：前者是「另一次重扫**正在
+    执行**」（客户端看到它说明有并发调用，应退避重发）；后者是「上一次**已经结束**，只是
+    还没过最小间隔」（应等 `Retry-After` 秒再发，立即重发仍会被拒）。
+  - `429` 分支**不抢占独占权、不记录时间戳**，因此重试既不会延长禁用窗口、也没有后端成本
+    （只有一次时间比较）。
+  - 最小间隔不是配置项（包级 `var`，仅测试可临时覆写）；单实例部署下进程内限流等价于全局
+    限流。
 - 成功响应 `200`：
 
 ```json
@@ -1004,8 +1050,21 @@ POST /api/resources/rescan
 | `deleted` | 登记中存活但本次未遍历到、已写墓碑的资源数 |
 | `failed` | 读元数据或写登记失败的文件数（不阻断整体扫描，重跑即可补齐） |
 
-- 错误：`409 rescan_in_progress`、`503 unavailable`、
-  `400 invalid_argument`（如根目录不可读）、`401`、`500`。
+- 错误：`409 rescan_in_progress`、`429 rate_limited`（距上一次重扫结束不足 60 秒，响应带
+  `Retry-After`）、`503 unavailable`、`400 invalid_argument`（如根目录不可读）、`401`、`500`。
+
+`429` 响应示例（错误体结构不变，多一个响应头）：
+
+```
+HTTP/1.1 429 Too Many Requests
+Retry-After: 42
+Content-Type: application/json; charset=utf-8
+X-Content-Type-Options: nosniff
+X-Frame-Options: DENY
+Referrer-Policy: no-referrer
+
+{"error":{"code":"rate_limited","message":"重扫过于频繁，请稍后重试"}}
+```
 
 ```bash
 curl -s -X POST -H "Authorization: Bearer $SESHAT_AUTH_TOKEN" \
@@ -1071,8 +1130,12 @@ POST /api/revert
 
 - 语义：把工作区文件恢复到指定历史版本并追加一次提交（不改写历史；内容已一致时
   不产生新提交）；
+- **`path` 先过与其它文件端点相同的路径校验**（A 批，2026-10-26 补齐）：拒 NUL、拒任一 `..`
+  段（含中间段）、拒 `.git` 段、拒任一以 `.` 开头的段、`path.Clean` 折叠、去前导 `/`、空路径
+  拒绝 → `400 invalid_argument`。规则实现于 `internal/pathguard` 单一真源。补齐前隐藏文件
+  可经 `POST /api/revert` 落到工作区（该端点此前只判 `path` 非空）；
 - 成功响应 `200`：`{"status":"reverted","hash":"<恢复后的 HEAD>"}`；
-- 错误：`400 invalid_argument`（`path`/`hash` 为空、版本无法解析）、
+- 错误：`400 invalid_argument`（`path`/`hash` 为空、`path` 违反上述路径规则、版本无法解析）、
   `404 not_found`（文件在该版本不存在）、`401`、`500`。
 
 ### 12.5 LLM 任务与节点
@@ -1122,6 +1185,7 @@ POST /api/revert
 | `rescan_in_progress` | 409 | 已有一次全量重扫在跑 | 并发调用 `POST /api/resources/rescan`（稍后重试，不要修改请求） |
 | `etag_mismatch` | 412 | 条件写的前提不成立，内容未被修改 | `If-Match` 与当前内容不符或资源不存在；`If-None-Match: *` 命中已存在资源 |
 | `range_not_satisfiable` | 416 | `Range` 区间不可满足（**M7 修复后由标准内容服务产生**，不再返回 JSON 错误体，仅保留状态码语义） | 区间语法非法、多区间、起点越界、空文件的后缀请求；响应带 `Content-Range: bytes */<size>`，响应体为纯文本。客户端按 `416` 状态码分支，不要解析错误 JSON |
+| `rate_limited` | 429 | 请求过于频繁（A 批新增） | `POST /api/resources/rescan` 距上一次重扫**结束**不足 60 秒；响应带 `Retry-After: <秒>`（向上取整、最小 1）。与 `409 rescan_in_progress`（另一次**正在执行**）语义不同，见 §11 |
 | `internal` | 500 | 服务端内部错误 | 数据库读写失败、schema 版本不兼容、登记失败、序列化失败 |
 | `unavailable` | 503 | 能力未就绪（handler 内联） | 未装配资源登记（身份/变更/根/文件/引用/重扫端点）或未启用索引器（`/api/search`） |
 

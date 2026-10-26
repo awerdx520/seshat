@@ -9,14 +9,13 @@ package registry
 
 import (
 	"errors"
-	"path"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"seshat/internal/gitver"
 	"seshat/internal/logging"
+	"seshat/internal/pathguard"
 	"seshat/internal/storage"
 )
 
@@ -410,11 +409,15 @@ func (s *Service) defaultRoot() (string, error) {
 
 // normalizeResourcePath 把路径规范化为登记表使用的形态。
 //
-// 基本规则：去空白、斜杠统一为 '/'、折掉前导 '/' 与重复斜杠、折叠 '.'；含 ".." 段
-// 的路径直接拒绝（与 webdav/gitver 的「吸收 ..」不同——登记表的键必须可被调用方
-// 预测，静默改写会让「引用某路径」与「登记某路径」指向不同字符串）。
+// 规则本体在 internal/pathguard（单一真源），本函数只做两件调用方特有的事：
+//  1. 去空白（与 API 侧一致；pathguard 不做 TrimSpace，差异留在这里）；
+//  2. 把 pathguard 的哨兵错误按登记层文案与错误码包装成 AppError。
 //
-// 另拒绝三类路径，理由都是「登记表的键会因此与其它层不一致」：
+// 零值口径（拒绝 ".." 段与点段）正是登记表需要的：含 ".." 段的路径直接拒绝
+// （与 webdav/gitver 的「吸收 ..」不同——登记表的键必须可被调用方预测，静默改写会让
+// 「引用某路径」与「登记某路径」指向不同字符串）。
+//
+// 三类被拒路径的理由都是「登记表的键会因此与其它层不一致」：
 //   - 含 NUL：SQLite 文本列遇 NUL 会截断，写入的键与查回的键不再相同；
 //   - 任一段为 .git（大小写不敏感，兼顾大小写不敏感的卷）：Apply 可写的键等同于
 //     「可被登记的路径」，放行 .git 会让写入路径直达版本库内部目录并破坏仓库；
@@ -422,40 +425,42 @@ func (s *Service) defaultRoot() (string, error) {
 //     的文件，若 Apply 接受点路径就会出现「登记表里有、扫描看不到」的不一致——Rescan
 //     会把它当作磁盘上已消失的资源写墓碑，客户端也会看到无法通过扫描恢复的条目。
 //
-// 点段检查放在规范化之后：'./a.org' 这类输入折叠后不含点段，与 WalkDir 给出的名字
-// 口径一致（bootstrap 侧永远不会产生 './' 前缀）。
+// 点段检查由 pathguard 在规范化之后做：'./a.org' 这类输入折叠后不含点段，与 WalkDir
+// 给出的名字口径一致（bootstrap 侧永远不会产生 './' 前缀）。
 func normalizeResourcePath(p string) (string, error) {
 	trimmed := strings.TrimSpace(p)
+	// 先单独处理空白输入：它的文案是「不能为空」，与「规范化后为空」（"/"、"." 等）
+	// 不同，两者历史上就分开报，此处保持。
 	if trimmed == "" {
 		return "", logging.NewAppError(logging.ErrInvalidArgument, "资源路径不能为空")
 	}
-	if strings.ContainsRune(trimmed, 0) {
-		return "", logging.NewAppError(logging.ErrInvalidArgument, "资源路径不能包含 NUL 字符")
-	}
-
-	slashed := filepath.ToSlash(trimmed)
-	for _, seg := range strings.Split(slashed, "/") {
-		if seg == ".." {
-			return "", logging.NewAppError(logging.ErrInvalidArgument, `资源路径不能包含 ".."`)
-		}
-	}
-
-	clean := strings.TrimPrefix(path.Clean("/"+slashed), "/")
-	if clean == "" || clean == "." {
-		return "", logging.NewAppError(logging.ErrInvalidArgument, "资源路径规范化后为空")
-	}
-
-	for _, seg := range strings.Split(clean, "/") {
-		if strings.EqualFold(seg, ".git") {
-			return "", logging.NewAppError(logging.ErrInvalidArgument,
-				"资源路径不能包含 .git 段（版本库内部目录不登记）")
-		}
-		if strings.HasPrefix(seg, ".") {
-			return "", logging.NewAppError(logging.ErrInvalidArgument,
-				"资源路径不能包含以 '.' 开头的段（隐藏文件/目录不登记）")
-		}
+	clean, err := pathguard.CleanRel(trimmed, pathguard.Options{})
+	if err != nil {
+		return "", resourcePathError(err)
 	}
 	return clean, nil
+}
+
+// resourcePathError 把 pathguard 的哨兵错误映射为登记层的错误码与中文文案。
+//
+// 文案与错误码与收敛前逐字一致（既有用例按文案断言）。
+func resourcePathError(err error) error {
+	var msg string
+	switch {
+	case errors.Is(err, pathguard.ErrNUL):
+		msg = "资源路径不能包含 NUL 字符"
+	case errors.Is(err, pathguard.ErrParentSegment):
+		msg = `资源路径不能包含 ".."`
+	case errors.Is(err, pathguard.ErrGitSegment):
+		msg = "资源路径不能包含 .git 段（版本库内部目录不登记）"
+	case errors.Is(err, pathguard.ErrDotSegment):
+		msg = "资源路径不能包含以 '.' 开头的段（隐藏文件/目录不登记）"
+	case errors.Is(err, pathguard.ErrEmpty):
+		msg = "资源路径规范化后为空"
+	default:
+		msg = "资源路径不合法"
+	}
+	return logging.NewAppError(logging.ErrInvalidArgument, msg)
 }
 
 // isNotFound 判断 err 是否为 ErrNotFound 错误码。

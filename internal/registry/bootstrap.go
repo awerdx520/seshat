@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"seshat/internal/logging"
+	"seshat/internal/pathguard"
 	"seshat/internal/storage"
 )
 
@@ -139,11 +140,13 @@ func (s *Service) tombstoneLegacy(item storage.Entry) error {
 
 // isDotName 判断单个目录项名字是否为点路径（.git 或任何以 '.' 开头的名字）。
 //
-// 与 service.go 的 normalizeResourcePath 同口径（任一段为 .git 或以 '.' 开头即拒绝）：
+// 规则本体在 internal/pathguard（单一真源）；本包装保留在此是为了让调用点与既有
+// 用例继续按这个名字断言。
+//
 // WalkDir 是逐层回调的，点目录整棵被 SkipDir 剪掉，因此「逐项检查名字」等价于
-// 「检查路径的全部段」。
+// 「检查路径的全部段」（与 service.go 的 normalizeResourcePath 同口径）。
 func isDotName(name string) bool {
-	return strings.EqualFold(name, ".git") || strings.HasPrefix(name, ".")
+	return pathguard.IsDotName(name)
 }
 
 // scanRoot 遍历单个根目录并逐文件登记，返回本次实际遍历到的相对路径集合。

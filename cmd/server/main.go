@@ -255,8 +255,10 @@ func buildMux(cfg *config.Config, db *storage.DB, repo *gitver.Repo, indexer *in
 	// WebDAV 挂载点，只能经 REST 按需读取。
 	// 写入成功后除 commit 与 FTS 索引外，还会把该写操作登记进 registry（uid 生成/
 	// 复用规则见 webdav.registryAfterWrite）。
-	mux.Handle(internalMount, webdav.VersionedHandlerWithRegistry(
-		notesRoot, authenticator, webdav.SourceInternal, repo, indexer, reg))
+	// SandboxContent 补 nosniff + CSP: sandbox：WebDAV 按扩展名内联返回 Content-Type，
+	// 不加固则 PUT 的 .html 被浏览器直接导航即在与服务端同源的文档里执行脚本。
+	mux.Handle(internalMount, webdav.SandboxContent(webdav.VersionedHandlerWithRegistry(
+		notesRoot, authenticator, webdav.SourceInternal, repo, indexer, reg)))
 
 	// 对外 WebDAV：公开目录为空则跳过。handler 前缀传 publicPrefix（与挂载点
 	// 一致），使 PROPFIND 等响应生成的 href 落在 /public/ 而非默认的 /dav/；同时
@@ -278,7 +280,8 @@ func buildMux(cfg *config.Config, db *storage.DB, repo *gitver.Repo, indexer *in
 				AllowExts: cfg.WebDAV.PublicAllowExts,
 			},
 			repo, indexer, reg, publicPrefix, offset)
-		mux.Handle(publicMount, publicHandler)
+		// 公开出口同样补 nosniff + CSP: sandbox（理由见 webdav.SandboxContent）。
+		mux.Handle(publicMount, webdav.SandboxContent(publicHandler))
 	}
 
 	return mux, nil
