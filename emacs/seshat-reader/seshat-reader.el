@@ -84,8 +84,10 @@
 	(add-hook 'compilation-finish-functions #'seshat-reader--post-build nil t)))))
 
 ;; Try but don't handle error here directly for byte-comp purposes.
-(with-demoted-errors
-    (require 'seshat-render-core))
+;; FORMAT is mandatory since Emacs 30 -- pass it explicitly instead of the
+;; old (with-demoted-errors BODY) form, which byte-compile warns about.
+(with-demoted-errors "seshat-render-core: %S"
+  (require 'seshat-render-core))
 
 ;; If the module doesn't exist, compile and load it.
 (unless (seshat-reader--module-built-p)
