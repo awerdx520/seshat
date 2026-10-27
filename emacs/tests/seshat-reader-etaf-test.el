@@ -24,8 +24,8 @@
 
 ;; `seshat-reader-etaf' 渲染层与三态降级（`enabled'=nil / `require'
 ;; 失败 / 渲染抛错）的 ERT 测试套件。它把 M11.9 的 T4–T6 batch 断言固化为
-;; 可重复用例：items 合成、动作命令的取值路径、ETAF 面板文本、gt 渲染对象
-;; 的隐藏中转配置、以及面板 `:keys' 注册。
+;; 可重复用例：items 合成、动作命令的取值路径、ETAF 面板文本（含跨页批注的
+;; 页码跨度 `p.1-2'）、gt 渲染对象的隐藏中转配置、以及面板 `:keys' 注册。
 ;;
 ;; 运行方式（在仓库根目录执行）。下条命令**可直接复制运行**：其中写作
 ;; `"emacs"' 的是 Emacs 可执行文件名，加引号只为让 checkdoc 的专有名词检查
@@ -425,6 +425,36 @@
             ;; 至少一个空白。
             (should (string-match-p "▌[[:space:]]+p\\.12" text)))
           (should (etaf-runtime-for-buffer buf)))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
+
+(ert-deftest seshat-reader-etaf-test--card-page-label-shows-page-span ()
+  "卡片页码列优先取 `:page-label'：跨页显示 `p.1-2'，旧形态仍显示 `p.12'.
+跨页批注的 location 是 `pages:1-2;rect@1:…;rect@2:…'（`--etaf-items' 为此给出
+`:page-label' = \"1-2\"、`:page' = 首页 1）。卡片此前只读 `:page'，跨页批注因此
+显示 `p.1'（看着像单页批注）；改为 `:page-label' 优先后，单页批注的
+`:page-label' 仍是 nil，页码显示与改造前逐字节相同。"
+  (skip-unless (seshat-reader-etaf-test--fetch-etaf-module))
+  (skip-unless (seshat-reader-etaf-available-p))
+  (let* ((items (seshat-reader-annotation--etaf-items
+                 '(((id . 201)
+                    (location . "pages:1-2;rect@1:10,20,30,40;rect@2:50,60,70,80")
+                    (text . "跨页批注正文"))
+                   ((id . 202) (location . "page:12;rect:1,2,3,4")
+                    (text . "单页批注正文")))
+                 nil))
+         (buf (get-buffer-create
+               (seshat-reader-etaf-test--reset-list-buffer)))
+         (seshat-reader-etaf--items (etaf-ref nil))
+         (seshat-reader-etaf--selected (etaf-ref nil)))
+    (unwind-protect
+        (progn
+          (seshat-reader-etaf-render-annotations buf items "doc-page-span")
+          (let ((text (seshat-reader-etaf-test--buffer-text buf)))
+            (should (string-match-p "p\\.1-2" text))
+            (should (string-match-p "p\\.12" text))
+            ;; 跨页条目不得退化成 `p.1'：列宽补位会让它后面紧跟空白
+            (should-not (string-match-p "p\\.1[[:space:]]" text))))
       (when (buffer-live-p buf)
         (kill-buffer buf)))))
 

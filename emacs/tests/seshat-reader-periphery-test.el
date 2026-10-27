@@ -21,7 +21,8 @@
 ;; 之后的行为断言，全部围绕「页号从哪来、页内偏移怎么记、装饰怎么刷新」：
 ;;
 ;;   · 选区：`seshat-reader-select-posn-page' 按 posn 落在哪一页行反查页号，
-;;     跨页拖选 `user-error'，同页拖选行为不变，拖拽不动选中窗口/window-start。
+;;     跨页拖选按页取文（P2-A T2 起不再 `user-error'），同页拖选行为不变，
+;;     拖拽不动选中窗口/window-start。
 ;;   · 书签/saveplace：page + offset（页内像素偏移）+ hscroll + scale +
 ;;     fit-mode 的保存与恢复，以及旧记录 `vscroll' → `offset' 的迁移。
 ;;   · 搜索/引用跳转：落在页首（vscroll 归 0），页号取视口顶页。
@@ -154,25 +155,46 @@ third element of the fake position list, `posn-object' a page image and
                             window))))))
       (kill-buffer buffer))))
 
-;;;; 2/3. 选区：跨页拒绝与同页不变
+;;;; 2/3. 选区：跨页取文与同页不变
 
-(ert-deftest seshat-reader-periphery-test--select-extract-rejects-cross-page ()
-  "A drag spanning two pages signals `user-error' with the D7 message."
+(ert-deftest seshat-reader-periphery-test--select-extract-cross-page-extracts-text ()
+  "A drag spanning two pages extracts both pages instead of signalling.
+P2-A T2 移除了「暂不支持跨页选择」：跨页拖选按页取文、页间插一个换行，
+`:page' / `:rect' 仍归属**起点页**。跨页取文的逐页几何与页号换算见
+`seshat-reader-select-cross-page-test'，此处只钉住本套件的集成点。"
   (let* ((buffer (seshat-reader-periphery-test--reader-buffer '(1 2 3)))
-         (window (selected-window)))
+         (window (selected-window))
+         (seshat-reader-select-last nil))
     (unwind-protect
         (seshat-reader-periphery-test--with-window-buffer buffer
           (with-current-buffer buffer
             (seshat-reader-periphery-test--load-select-source)
             (set-window-parameter window 'scale 1.0)
             (seshat-reader-periphery-test--with-posn-stubs window
-              (let ((start (seshat-reader-periphery-test--fake-posn
-                            window (seshat-reader-periphery-test--row-start 1)))
-                    (end (seshat-reader-periphery-test--fake-posn
-                          window (seshat-reader-periphery-test--row-start 2))))
-                (let ((err (should-error (seshat-reader-select-extract start end)
-                                         :type 'user-error)))
-                  (should (string-match-p "跨页" (error-message-string err))))))))
+              (cl-letf (((symbol-function 'posn-object-width-height)
+                         (lambda (_posn) (cons 600 800)))
+                        ((symbol-function 'seshat-reader-dyn--text-in-rect)
+                         (lambda (page &rest _) (format "p%d" (1+ page))))
+                        ((symbol-function 'seshat-reader-select--rects-in-rect)
+                         (lambda (&rest _) nil))
+                        ((symbol-function 'seshat-reader-select--flash-selection)
+                         (lambda (&rest _) t))
+                        ((symbol-function 'message) (lambda (&rest _) nil)))
+                (let ((start (seshat-reader-periphery-test--fake-posn
+                              window (seshat-reader-periphery-test--row-start 1)))
+                      (end (seshat-reader-periphery-test--fake-posn
+                            window (seshat-reader-periphery-test--row-start 2)
+                            (cons 200 300))))
+                  (should (equal "p1\np2"
+                                 (seshat-reader-select-extract start end)))
+                  (should (= 1 (plist-get seshat-reader-select-last :page)))
+                  ;; 首页从拖拽点裁到页底（页高 800，见上面的桩）。
+                  (should (equal '(10.0 20.0 200.0 800.0)
+                                 (plist-get seshat-reader-select-last :rect)))
+                  ;; 无几何时 `:page-rects' 与 `:rects' 同为 nil（一一对应）。
+                  (should-not (plist-get seshat-reader-select-last :rects))
+                  (should-not (plist-get seshat-reader-select-last
+                                         :page-rects)))))))
       (kill-buffer buffer))))
 
 (ert-deftest seshat-reader-periphery-test--select-extract-same-page-returns-text ()

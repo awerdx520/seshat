@@ -1079,12 +1079,14 @@ buffer 之前**取（C 侧矩形查询要求当前 buffer 就是文档 buffer）
         (buffer (get-buffer-create seshat-reader-search-sidebar-buffer-name))
         (index 0))
     ;; 片段**必须**在阅读 buffer（= 当前 buffer，也就是调用者）里取：C 侧的
-    ;; `--lines-in-rect' / `--text-in-rect' 先经 `get_reader_current_state' 校验
-    ;; 「当前 buffer 就是文档 buffer」（文档状态指针是 permanent buffer-local，
-    ;; overlay 的 buffer 还必须等于 `(current-buffer)'）。在侧栏 buffer 里调用
-    ;; 一律失败且 `--snippet' 静默降级，于是每条只剩「[p.N]」——这正是真机上
-    ;; 「匹配信息显示不完整」的成因。故先在这里逐条算出整行文本，再进侧栏
-    ;; buffer 写入。
+    ;; `--lines-in-rect' / `--text-in-rect' 经 `prepare_rect_query' 只读 buffer-local
+    ;; 的 `seshat-reader-current-doc-state-ptr'（`get_doc_state_ptr'）来解析文档，
+    ;; 该变量是 permanent buffer-local，在别的 buffer 里取到的是被清空的默认值
+    ;; nil，于是静默返回 false。（P2-A 真机修复后不再校验 overlay / selected
+    ;; window，故不再有「overlay 的 buffer 必须等于 `(current-buffer)'」这一条。）
+    ;; 在侧栏 buffer 里调用一律失败且 `--snippet' 静默降级，于是每条只剩
+    ;; 「[p.N]」——这正是真机上「匹配信息显示不完整」的成因。故先在这里逐条
+    ;; 算出整行文本，再进侧栏 buffer 写入。
     (let ((rows (mapcar (lambda (entry)
                           (cons entry (seshat-reader-search--sidebar-line entry)))
                         entries)))

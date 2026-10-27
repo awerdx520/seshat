@@ -270,6 +270,9 @@ COLORS 为 `seshat-reader-etaf--colors' 返回的 alist。一行一卡，列结�
   项该列留空格占位，故各行文字起点不会因选中而错位。该列宽取 `(ch 2)'：
   `▌'（U+258C）在 ETAF 里按 2 列测量，`(ch 1)' 的盒子会把它裁成空格（实测）；
 - 页码列宽固定 `(ch 6)'，`p.9' 与 `p.112' 因此右对齐在同一条竖线上；
+  跨页批注（`pages:<a>-<b>;rect@<p>:…' 形态）显示页跨度 `p.1-2'——取
+  `seshat-reader-annotation--etaf-items' 给出的 `:page-label'（旧形态下为
+  nil，故仍显示单个页码，与改造前逐字节相同）；
   location 为 EPUB 的 `chapter:' 形态时该列显示「章 N」（见
   `seshat-reader-annotation--chapter-from-location'），仍解析不出时显示
   `p.?'；
@@ -279,7 +282,8 @@ COLORS 为 `seshat-reader-etaf--colors' 返回的 alist。一行一卡，列结�
 本函数只负责**一张**卡片；哪些条目出卡片由 `seshat-reader-etaf--annotations-view'
 决定——列表**全量**渲染（不分页、不切片）。选中态（`▌' 与底色）取
 `seshat-reader-etaf--selected'。"
-  (let* ((page (seshat-reader-etaf--item-page it))
+  (let* ((page (or (plist-get it :page-label)
+                   (seshat-reader-etaf--item-page it)))
          (chapter (and (null page)
                        (seshat-reader-annotation--chapter-from-location
                         (plist-get it :location))))

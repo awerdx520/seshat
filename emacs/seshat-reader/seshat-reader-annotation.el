@@ -40,12 +40,28 @@
 ;; 判据：凡「发给服务端」的实参一律 uid，凡「写进 buffer / 链接 / 文案」的
 ;; 一律 doc-id。二者不可互换——服务端只认 uid，链接文本只认 doc-id。
 ;;
-;; 位置（`location'）约定为 \"page:<n>;rect:<x0>,<y0>,<x1>,<y1>[;rect:...]\"：
-;; 页码 `<n>' 为 **1-based** 十进制整数，矩形为**页面坐标**（PDF point 空间、
-;; 原点左上、y 向下），不含缩放与旋转，四个坐标各保留两位小数。字级高亮按行
-;; 展开成**多段** `rect:'（顺序即绘制顺序，段数上限见
-;; `seshat-reader-annotation--anchor-max-segments'），服务端把 location 当
-;; 不透明串保存，故多段不需要任何后端改动。
+;; 位置（`location'）有**两种**形态（服务端只存不解析，故两者都无需后端改动）：
+;;
+;; 1. 单页形态 \"page:<n>;rect:<x0>,<y0>,<x1>,<y1>[;rect:...]\"：页码 `<n>' 为
+;;    **1-based** 十进制整数，其后是零到多段 `rect:'（字级高亮按行展开，顺序
+;;    即绘制顺序，段数上限见 `seshat-reader-annotation--anchor-max-segments'）。
+;; 2. 跨页形态 \"pages:<a>-<b>;rect@<p>:<x0>,<y0>,<x1>,<y1>[;rect@<q>:...]\"：
+;;    `<a>'/`<b>' 是实际有矩形的页号的最小/最大值（同为 1-based），每段矩形
+;;    **自带页号**，因此同一条批注的几何可以落在不同页上。构造见
+;;    `seshat-reader-annotation--anchor'，解析见
+;;    `seshat-reader-annotation--pages-from-location' 与
+;;    `seshat-reader-annotation--page-rects-from-location'。
+;;
+;; 向后兼容（**刻意如此，不要「修好」**）：旧解析器只认单页形态——页码入口
+;; `--page-from-location' 只匹配 `page:'，矩形入口 `--rects-from-location' 只
+;; 接受 `rect:' 前缀，于是旧客户端读到跨页形态时**整条跳过**该批注（页码为 nil
+;; 即不参与装饰），既不会画错也不会报错；Android 的 `LocationCodec.parsePage'
+;; 则落到 `Parsed.Unknown'（多 `rect:' 段今天已不支持）。因此**不要**让这两个
+;; 旧入口接受新形态——那会把两页的矩形都画到第一页上（反向断言见
+;; `seshat-reader-annotation-cross-page-location-test'）。
+;;
+;; 两种形态的矩形都是**页面坐标**（PDF point 空间、原点左上、y 向下），不含
+;; 缩放与旋转，四个坐标各保留两位小数。
 ;;
 ;; 手写笔迹另用一条 location 形态 "page:<n>;ink:<color>,<widthPt>,<x0>,<y0>,…"
 ;; （一笔一条批注，见 `docs/api.md' §4.5.1）：解析入口是
@@ -250,23 +266,62 @@ FILE 为文档文件路径，可以是相对路径。返回值**只用于**列�
 区，故只提示首次。用户可 `(setq seshat-reader-annotation--anchor-truncation-warned nil)'
 复位。")
 
-(defun seshat-reader-annotation--anchor-segments (rects)
-  "把 RECTS（单 rect 或 rect 列表）归一化为 rect 列表.
-单 rect 是四元素**数字**列表 (X0 Y0 X1 Y1)，rect 列表则是它的列表；两者靠
-首元素是否为数字区分，因此老调用点（`seshat-reader-reference--current-location'、
-翻译面板）继续传单 rect 时行为不变。nil 返回 nil（页级锚）。列表里不是
-「前四个元素都是数字」的坏元素被跳过，不让一条坏数据毁掉整个锚。"
+(defun seshat-reader-annotation--anchor-segment (rect page)
+  "把单段 RECT 归一化为带页号的段 (PAGE X0 Y0 X1 Y1)；坏段返回 nil.
+RECT 有两种合法形态：
+
+- **带页号段** `(PAGE X0 Y0 X1 Y1)`：五元素、五个都是数字且**页号是整数**，
+  页号取段内值，PAGE 参数不参与——跨页选区的 `:page-rects' 即此形态；
+- **裸 rect** `(X0 Y0 X1 Y1)`：四元素且四个都是数字，页号用 PAGE 补齐；
+  PAGE 为 nil 时返回 nil（没有页号可补，宁可不画也不猜页号）。
+
+页号必须是**整数**：写入端后面用 `(format \"page:%d\" …)' /
+`(format \"rect@%d:…\" …)' 渲染，浮点页号（1.0）会让 `%d' 抛
+`wrong-type-argument' 打断整条批注的创建；解析端读回的页号也是 `[0-9]+'
+口径的整数，两端必须一致。故 `(1.0 10 20 30 40)' 这类段按坏段处理（返回
+nil，由调用方跳过），不猜也不取整。
+
+长度大于 4 而第五个元素不是数字的形态按**裸 rect** 处理（前四个元素当坐标），
+与改造前「只看 `(nth 0..3)'」的口径一致。坐标不做重排。"
+  (when (consp rect)
+    (let ((len (ignore-errors (length rect)))
+          (coords-ok (and (numberp (nth 0 rect))
+                          (numberp (nth 1 rect))
+                          (numberp (nth 2 rect))
+                          (numberp (nth 3 rect)))))
+      (cond
+       ;; 五元素且五个都是数字 = 带页号段：页号必须是整数（审查修复 F2）。
+       ;; 浮点页号**不落回**下面的裸 rect 分支——那会让页号变成 x0、y1 被丢弃，
+       ;; 正是五元组分支存在要防的确定性数据损坏。
+       ((and (= len 5) coords-ok (numberp (nth 4 rect)))
+        (when (integerp (nth 0 rect))
+          (list (nth 0 rect) (nth 1 rect) (nth 2 rect)
+                (nth 3 rect) (nth 4 rect))))
+       ((and (>= (or len 0) 4) coords-ok (numberp page))
+        (list page (nth 0 rect) (nth 1 rect) (nth 2 rect) (nth 3 rect)))
+       (t nil)))))
+
+(defun seshat-reader-annotation--anchor-segments (rects &optional page)
+  "把 RECTS（单 rect 或 rect 列表）归一化为**带页号**的段列表.
+返回 ((PAGE X0 Y0 X1 Y1) …)，每段都带页号；nil 返回 nil（页级锚）。单 rect
+（首元素是数字）与 rect 列表靠首元素是否为数字区分，因此老调用点（
+`seshat-reader-reference--current-location'、翻译面板）继续传单 rect 时行为
+不变。每段的页号来源见 `seshat-reader-annotation--anchor-segment'：五元素段
+用自身页号、四元素段用 PAGE 补齐。坏元素被跳过（不让一条坏数据毁掉整个锚），
+顺序保持输入顺序。
+
+**五元组分支是必须的**：改造前本函数只认「前四个元素都是数字」，于是
+`(PAGE X0 Y0 X1 Y1)' 会被当成裸 rect（PAGE 变 x0、Y1 被丢弃），是确定性的
+数据损坏（见 `seshat-reader-annotation--anchor' 的跨页形态）。"
   (cond
    ((null rects) nil)
-   ((numberp (car rects)) (list rects))
+   ((numberp (car rects))
+    (let ((segment (seshat-reader-annotation--anchor-segment rects page)))
+      (when segment (list segment))))
    (t (let (result)
         (dolist (rect rects)
-          (when (and (consp rect)
-                     (numberp (nth 0 rect))
-                     (numberp (nth 1 rect))
-                     (numberp (nth 2 rect))
-                     (numberp (nth 3 rect)))
-            (push rect result)))
+          (let ((segment (seshat-reader-annotation--anchor-segment rect page)))
+            (when segment (push segment result))))
         (nreverse result)))))
 
 (defun seshat-reader-annotation--warn-anchor-truncated (count max)
@@ -281,49 +336,203 @@ variable `inhibit-message' 在此被临时置 nil：这是**数据丢失**提示
        "Seshat Reader annotation: 选区共 %d 段矩形，超出锚上限 %d 段，只写入前 %d 段"
        count max max))))
 
-(defun seshat-reader-annotation--anchor (page rects)
-  "由 PAGE 与 RECTS 构造批注**锚**（页锚 + 可选几何尾段）.
-锚由两段构成：**页锚** `page:<n>' 是唯一的跳转真值；**几何尾段**
-`;rect:<x0>,<y0>,<x1>,<y1>' 可有**零到多段**（页级锚只有页锚，见
-`seshat-reader-reference--current-location' 的退化分支），且只用于渲染，
-不参与导航判定。多段正是字级高亮的落地形态：一行一段，解析端由
-`seshat-reader-annotation--rects-from-location' 逐段读回。
+(defun seshat-reader-annotation--anchor-rect-segments (segments)
+  "把带页号段 SEGMENTS 渲染为 `;rect:…' 尾串（不含页锚）；无段时为空串.
+每段形如 (PAGE X0 Y0 X1 Y1)，坐标各保留两位小数（`%.2f'，与单段时代逐字
+一致）；页号在这里**不输出**——单页形态的页信息由 `page:<n>' 页锚承载。"
+  (mapconcat (lambda (segment)
+               (format ";rect:%.2f,%.2f,%.2f,%.2f"
+                       (nth 1 segment) (nth 2 segment)
+                       (nth 3 segment) (nth 4 segment)))
+             segments ""))
 
-PAGE 为 **1-based 正整数**页码；RECTS 可以是**单 rect**（页面坐标的四个
-数字，如 (X0 Y0 X1 Y1)，即老调用点的形态），也可以是**rect 列表**（由若干
-四元素列表组成的列表），元素为**页面坐标**浮点数（顺序不做重排，由调用方
-保证已归一）；nil 时输出纯页锚。返回
-\"page:<n>;rect:<x0>,<y0>,<x1>,<y1>[;rect:…]\"，其中页码为 1-based 十进制
-整数，四个坐标各保留两位小数（`%.2f'，与单段时代逐字一致）。段数超过
-`seshat-reader-annotation--anchor-max-segments' 时只写前 N 段并提示一次（见
-`seshat-reader-annotation--warn-anchor-truncated'）。PAGE 不是正整数时以
-`user-error' 明确报错，不以 1 兜底。"
+(defun seshat-reader-annotation--anchor-page-segments (segments)
+  "把带页号段 SEGMENTS 渲染为 `;rect@<page>:…' 尾串（跨页形态）.
+每段形如 (PAGE X0 Y0 X1 Y1)：页号输出为 1-based 十进制整数，坐标各保留
+两位小数。段序由调用方按阅读顺序给好（本函数不重排）。"
+  (mapconcat (lambda (segment)
+               (format ";rect@%d:%.2f,%.2f,%.2f,%.2f"
+                       (nth 0 segment) (nth 1 segment) (nth 2 segment)
+                       (nth 3 segment) (nth 4 segment)))
+             segments ""))
+
+(defun seshat-reader-annotation--anchor-pages (segments)
+  "返回带页号段 SEGMENTS 涉及的页号（去重、升序）；无段时返回 nil."
+  (let ((pages (mapcar #'car segments)))
+    (when pages
+      (sort (delete-dups (copy-sequence pages)) #'<))))
+
+(defun seshat-reader-annotation--anchor-degrades-p (segments)
+  "SEGMENTS 跨页且「页数 + 段数」超出锚上限时返回 t（D7）.
+跨页形态的串长由**页数**与**矩形段数**共同决定（每段都要带 `rect@<page>:'
+前缀，比单页形态的 `rect:' 多出页号开销），故计数取二者之和；单页形态只按
+段数计数，不适用本判定（见 `seshat-reader-annotation--anchor'）。"
+  (let ((pages (seshat-reader-annotation--anchor-pages segments)))
+    (and (cdr pages)
+         (> (+ (length pages) (length segments))
+            seshat-reader-annotation--anchor-max-segments))))
+
+(defun seshat-reader-annotation--warn-anchor-degraded
+    (pages segments max first-page kept)
+  "提示「跨页锚超限已降级为首页矩形」.
+PAGES 为选区涉及的页数、SEGMENTS 为段数、MAX 为锚上限、FIRST-PAGE 为降级
+后保留的页号、KEPT 为实际写入的段数。走 `display-warning' 而非 `message'：
+降级是**数据丢失**且确定发生（同一选区反复创建都会命中），进入
+`*Warnings*' 才不会被后续回显冲掉、也便于事后追查。"
+  (display-warning
+   'seshat-reader-annotation
+   (format
+    (concat "跨页选区共 %d 页 %d 段矩形，超出锚上限 %d（页数 + 段数），"
+            "已降级为只保留第 %d 页的 %d 段矩形")
+    pages segments max first-page kept)
+   :warning))
+
+(defun seshat-reader-annotation--anchor (page rects)
+  "由 PAGE 与 RECTS 构造批注**锚**；单页与跨页两种形态.
+锚的第一段永远是**页信息**，其后是零到多个**几何段**（页级锚没有几何段，
+见 `seshat-reader-reference--current-location' 的退化分支）；几何段只用于
+渲染，不参与导航判定。
+
+- **单页形态**（含同页多矩形）：
+  \"page:<n>;rect:<x0>,<y0>,<x1>,<y1>[;rect:…]\"。页锚 `page:<n>' 是唯一
+  跳转真值，多段正是字级高亮的落地形态（一行一段，解析端由
+  `seshat-reader-annotation--rects-from-location' 逐段读回）。**与改造前
+  逐字节一致**。
+- **跨页形态**：
+  \"pages:<a>-<b>;rect@<p>:x0,y0,x1,y1[;rect@<q>:…]\"。<a>/<b> 取实际有
+  矩形的页号的**最小/最大值**，段按阅读顺序（页升序、页内原顺序），每段自带
+  页号。旧客户端读到该形态会**整条跳过**（`--page-from-location' 只认
+  `page:' 前缀、`--rects-from-location' 只认 `rect:' 前缀），因此不会画错，
+  只是不画。
+
+PAGE 为 **1-based 正整数**（起点页）；RECTS 可以是**单 rect**
+（`(X0 Y0 X1 Y1)`，老调用点的形态），也可以是**rect 列表**；元素既可以是
+裸 rect（用 PAGE 补页号），也可以是**带页号段** `(PAGE X0 Y0 X1 Y1)`（用
+自身页号，见 `--anchor-segments'）。坐标单位是**页面坐标**（PDF point 空间、
+原点左上、y 向下，不含缩放与旋转）。nil 时输出纯页锚 \"page:<n>\"。坐标各
+保留两位小数；页码为 1-based 十进制整数。
+
+**段数上限（D7）**：单页形态按段数计数，超过
+`seshat-reader-annotation--anchor-max-segments' 时只写前 N 段并提示一次
+（`--warn-anchor-truncated'）；跨页形态按「页数 + 段数」计数，超限时**降级**
+为「只保留首页（页号最小的那一页）的矩形」，落成单页形态并
+`display-warning' 提示——降级而非静默丢段，也不写出会被解析端截断的超长串。
+降级时调用方（`seshat-reader-annotation-create'）须把正文同步截断到首页，
+以免「正文含第二页、高亮只在第一页」。
+
+**两种降级保留的页不同，勿混**：段数超限降级（D7，本函数）保留**页号最小的
+那一页**（`pages:<a>-<b>' 的 a，因为降级目标是尽量多留有用的矩形，阅读顺序
+从最小页号开始）；`seshat:' 引用链接降级（D5b，
+`seshat-reader-reference--current-location'）保留**起点页**（`page:<起点页>'，
+因为引用只需可复现的落点，而起点页才是用户按下的那一页）。两者语义不同且
+各自自洽：反向拖拽（起点在较大页号那页）时前者仍取最小页号页、后者取起点页，
+同一选区可能落到不同页——这是预期行为，不是缺陷。
+
+PAGE 不是正整数时以 `user-error' 明确报错，不以 1 兜底。"
   (unless (and (integerp page) (> page 0))
     (user-error "Seshat Reader annotation: page 必须是正整数（1-based），实际为 %S"
                 page))
-  (let* ((segments (seshat-reader-annotation--anchor-segments rects))
-         (count (length segments))
-         (max seshat-reader-annotation--anchor-max-segments)
-         (kept (if (> count max)
-                   (butlast segments (- count max))
-                 segments)))
-    (when (> count max)
-      (seshat-reader-annotation--warn-anchor-truncated count max))
-    (concat (format "page:%d" page)
-            (mapconcat (lambda (rect)
-                         (format ";rect:%.2f,%.2f,%.2f,%.2f"
-                                 (nth 0 rect) (nth 1 rect)
-                                 (nth 2 rect) (nth 3 rect)))
-                       kept ""))))
+  (let* ((segments (seshat-reader-annotation--anchor-segments rects page))
+         (pages (seshat-reader-annotation--anchor-pages segments))
+         (max seshat-reader-annotation--anchor-max-segments))
+    (cond
+     ;; 页级锚：无几何段
+     ((null segments) (format "page:%d" page))
+     ;; 单页形态（含同页多矩形）：旧形态，逐字节不变
+     ((null (cdr pages))
+      (let* ((count (length segments))
+             (kept (if (> count max)
+                       (butlast segments (- count max))
+                     segments)))
+        (when (> count max)
+          (seshat-reader-annotation--warn-anchor-truncated count max))
+        (concat (format "page:%d" (car pages))
+                (seshat-reader-annotation--anchor-rect-segments kept))))
+     ;; 跨页超限：降级为首页矩形（单页形态）+ display-warning
+     ((seshat-reader-annotation--anchor-degrades-p segments)
+      (let* ((first-page (car pages))
+             (first-segments
+              (let (kept)
+                (dolist (segment segments)
+                  (when (= (car segment) first-page)
+                    (push segment kept)))
+                (nreverse kept)))
+             (count (length first-segments))
+             (kept (if (> count max)
+                       (butlast first-segments (- count max))
+                     first-segments)))
+        (seshat-reader-annotation--warn-anchor-degraded
+         (length pages) (length segments) max first-page (length kept))
+        (concat (format "page:%d" first-page)
+                (seshat-reader-annotation--anchor-rect-segments kept))))
+     ;; 跨页形态：段按页升序（页内保持原顺序）重排后输出
+     (t
+      (let (ordered)
+        (dolist (current pages)
+          (dolist (segment segments)
+            (when (= (car segment) current)
+              (push segment ordered))))
+        (concat (format "pages:%d-%d" (car pages) (car (last pages)))
+                (seshat-reader-annotation--anchor-page-segments
+                 (nreverse ordered))))))))
 
 (defun seshat-reader-annotation--selection-rects (selection)
   "取选区 SELECTION 中用于构造锚的矩形序列.
-优先用 `:rects'——`seshat-reader-select-last' 中按行合并后的**多段**矩形
-（字级高亮的几何真值）；为 nil 时回落到 `:rect'（整体 bbox，老版本选区与
-模块不报告逐字符矩形时只有它）；两者都没有时返回 nil（锚退化为页级）。"
-  (or (plist-get selection :rects)
+优先用 `:page-rects'——`seshat-reader-select-last' 的**逐页**几何，元素为
+带页号的 `(PAGE X0 Y0 X1 Y1)'，是跨页选区的唯一真值；没有该字段（或为空）时
+回落到 `:rects'（按行合并后的多段矩形，属**起点页**）；仍为 nil 时回落
+`:rect'（整体 bbox，老版本选区与模块不报告逐字符矩形时只有它）；三者都没有
+时返回 nil（锚退化为页级）。
+
+单页选区下 `:page-rects' 每段的页号都等于 `:page'，且坐标与 `:rects' 逐值
+相等，因此改取 `:page-rects' 后**单页锚的输出逐字节不变**（回归断言见
+`seshat-reader-annotation-decoration-test'）。"
+  (or (plist-get selection :page-rects)
+      (plist-get selection :rects)
       (let ((rect (plist-get selection :rect)))
         (when rect (list rect)))))
+
+(defun seshat-reader-annotation--selection-pages (selection)
+  "返回选区 SELECTION 的几何涉及的页号（去重、升序）；无几何时返回 nil.
+只读 `:page-rects'：这是「选区是否跨页」的**唯一判定信号**。`:rects' 与
+`:rect' 都只描述起点页，单页多矩形时页号全同，故用本函数判定不会把单页选区
+误判成跨页。"
+  (let ((page-rects (plist-get selection :page-rects)))
+    (when page-rects
+      (sort (delete-dups (delq nil (mapcar #'car page-rects))) #'<))))
+
+(defun seshat-reader-annotation--selection-cross-page-p (selection)
+  "判断选区 SELECTION 是否**跨页**（`:page-rects' 去重页号多于一个）.
+`seshat:' 引用链接的降级判定（D5b）与锚形态选择共用本函数，避免两处口径
+漂移。无 `:page-rects'（老选区、无几何选区）时返回 nil。"
+  (let ((pages (seshat-reader-annotation--selection-pages selection)))
+    (and pages (cdr pages) t)))
+
+(defun seshat-reader-annotation--first-page-text (page rects)
+  "取 RECTS 中**页号最小**那一页的矩形包络内的文本；取不到时返回 nil.
+供 D7 的跨页锚降级使用：锚降级为「只保留首页（页号最小的那一页）矩形」时，
+正文必须同步截断到**同一页**，否则会出现「正文含第二页、高亮只在第一页」的
+不一致。PAGE 是起点页（用于给裸 rect 补页号），RECTS 形同
+`seshat-reader-annotation--anchor-segments' 的入参。
+
+页号最小 ≠ 起点页：从第 3 页反向拖到第 1 页时起点页是 3 而首页是 1，因此本
+函数按**段内页号**取首页，不读 `:page'。矩形包络取该页所有段的最小/最大
+坐标，再经 `seshat-reader-dyn--text-in-rect'（0-based 页号）取文；模块不可
+用、或该页没有段时返回 nil（调用方据此保留原正文）。"
+  (let* ((segments (seshat-reader-annotation--anchor-segments rects page))
+         (first (car (seshat-reader-annotation--anchor-pages segments))))
+    (when (and first (fboundp 'seshat-reader-dyn--text-in-rect))
+      (let (x0 y0 x1 y1)
+        (dolist (segment segments)
+          (when (= (car segment) first)
+            (setq x0 (if x0 (min x0 (nth 1 segment)) (nth 1 segment))
+                  y0 (if y0 (min y0 (nth 2 segment)) (nth 2 segment))
+                  x1 (if x1 (max x1 (nth 3 segment)) (nth 3 segment))
+                  y1 (if y1 (max y1 (nth 4 segment)) (nth 4 segment)))))
+        (when x0
+          (ignore-errors
+            (seshat-reader-dyn--text-in-rect
+             (1- first) x0 y0 x1 y1)))))))
 
 ;;; 离线队列接入
 
@@ -401,7 +610,14 @@ ink 聚合），故高亮条目的标题就是选区原文。
 运行前置：必须先用鼠标拖拽选中页面区域（文本型 PDF 选中文字、扫描版 /
 无文本层区域直接框住目标位置），使 `seshat-reader-select-last' 非 nil；该
 变量在创建成功后**不会被清除**，因此可对同一选区连续创建多条批注（这是
-有意的语义）。旋转页面上的选区不受支持。
+有意的语义）。旋转页面上的选区已由 `seshat-reader-select-posn->page' 的
+逆变换换算回页面空间（旋转页可以正常创建批注）。
+
+锚的形态由选区是否跨页决定（见 `seshat-reader-annotation--anchor'）：单页
+（含同页多矩形）写旧形态 `page:<n>;rect:…'，跨页写
+`pages:<a>-<b>;rect@<p>:…'。跨页且「页数 + 段数」超出锚上限时锚降级为只
+保留首页矩形，此时**正文也同步截断到首页**（取首页矩形包络内的文本），
+以免出现「正文含第二页、高亮只在第一页」的不一致。
 
 服务端返回含 `id' 的结果时 `message' 报告该 `id'，并在本地队列非空时
 机会性地触发一次队列同步（同步失败不影响本次创建成功的结果）。服务端
@@ -417,12 +633,23 @@ ink 聚合），故高亮条目的标题就是选区原文。
       (unless file
         (user-error "Seshat Reader annotation: 选区未记录文档文件，无法派生文档标识"))
       (let* ((page (plist-get selection :page))
-             ;; 字级高亮：优先多段 `:rects'，为 nil 时回落整体 bbox `:rect'。
+             ;; 字级高亮：优先 `:page-rects'（逐页、带页号），无则回落
+             ;; `:rects' / `:rect'（起点页内的多段 / 整体 bbox）。
              (rects (seshat-reader-annotation--selection-rects selection))
+             ;; D7：跨页锚按「页数 + 段数」超限时会降级为只保留首页矩形，
+             ;; 正文必须同步截断到首页，否则出现「正文含第二页、高亮只在
+             ;; 第一页」的不一致（`--anchor' 用的是同一个判定函数）。
+             (degraded
+              (seshat-reader-annotation--anchor-degrades-p
+               (seshat-reader-annotation--anchor-segments rects page)))
              (selection-text (plist-get selection :text))
              (selected (when (and (stringp selection-text)
                                   (not (string-empty-p (string-trim selection-text))))
-                         selection-text))
+                         (if degraded
+                             (or (seshat-reader-annotation--first-page-text
+                                  page rects)
+                                 selection-text)
+                           selection-text)))
              (note (when (and (stringp body)
                               (not (string-empty-p (string-trim body))))
                      body))
@@ -666,8 +893,10 @@ TEXT 中的换行、回车与制表符被替换为空格；TEXT 为 nil 时返�
   "把一条批注 ANNOTATION 插入当前缓冲区的一行.
 ANNOTATION 为服务端返回的 alist 或渲染层的 plist，含 `id'、`location'、
 `text' 等字段（v8 契约还可能带 `kind' 与 `selected_text'）。
-该行以 **1-based** 页码开头；location 为 EPUB 的 `chapter:' 形态时改以
-\"章节 N\" 开头；两者都解析不出时显示 \"?\" 并在行尾标注。页码/章节之后是
+该行以 **1-based** 页码开头；location 为跨页形态 `pages:<a>-<b>' 时显示
+\"a-b\"（跳转仍落首页 A，见行属性 `seshat-reader-annotation-page'）；location
+为 EPUB 的 `chapter:' 形态时改以 \"章节 N\" 开头；都解析不出时显示 \"?\" 并在
+行尾标注。页码/章节之后是
 摘要，取 `seshat-reader-annotation--display-text' 的回退链（备注优先，其次
 选中原文，ink 条目走聚合文案）；整行携带 `seshat-reader-annotation-id'、
 `seshat-reader-annotation-page' 与 `seshat-reader-annotation-location'
@@ -681,10 +910,13 @@ QUEUED-UUID 非 nil 时表示该条来自本地离线队列、尚未同步到服
 批注」两条路径。"
   (let* ((id (seshat-reader-annotation--item-field annotation 'id))
          (location (seshat-reader-annotation--item-field annotation 'location))
-         (page (seshat-reader-annotation--page-from-location location))
+         ;; 跳转页号：旧形态取 `page:<n>'，跨页形态取 `pages:<a>-<b>' 的首页 A。
+         (page (seshat-reader-annotation--location-page location))
+         ;; 显示页码：旧形态是数字页号，跨页形态是 "a-b"。
+         (page-label (seshat-reader-annotation--page-label location))
          (chapter (and (null page)
                        (seshat-reader-annotation--chapter-from-location location)))
-         (label (cond (page (number-to-string page))
+         (label (cond (page-label page-label)
                       (chapter (format "章节 %s" chapter))
                       (t "?")))
          (start (point))
@@ -693,7 +925,8 @@ QUEUED-UUID 非 nil 时表示该条来自本地离线队列、尚未同步到服
     (insert (format "  %5s  %s%s%s\n"
                     label
                     (if (string-empty-p summary) "（无正文）" summary)
-                    (if (or page chapter) "" "  [无法从 location 解析页码]")
+                    (if (or page-label chapter) ""
+                      "  [无法从 location 解析页码]")
                     (if queued-uuid "  [待同步]" "")))
     (add-text-properties start (point)
                          (list 'seshat-reader-annotation-id id
@@ -738,6 +971,9 @@ HTTP 非 2xx（如 401 鉴权失败、400 uid 非法、500 服务端错误）时
 (declare-function seshat-reader-dyn--add-stroke "seshat-render-core"
                   (page r g b alpha width points))
 (declare-function seshat-reader-dyn--clear-highlights "seshat-render-core" ())
+
+(declare-function seshat-reader-dyn--text-in-rect
+                  "seshat-render-core" (page x0 y0 x1 y1))
 
 (defcustom seshat-reader-annotation-highlight-enabled t
   "是否把批注 location 中的 `rect:' 段绘制为页面高亮.
@@ -850,6 +1086,93 @@ LOCATION 来自不可信的服务端响应，故解析**有界**：长度先按
             (setq count (1+ count))))
         (setq rest (cdr rest)))
       (nreverse rects))))
+
+(defun seshat-reader-annotation--pages-from-location (location)
+  "从 LOCATION 解析跨页形态的页跨度 `pages:<a>-<b>'，返回 (A B)；否则 nil.
+严格匹配：串**开头**即 `pages:'，其后为十进制 <a>、连字符、十进制 <b>，且
+紧跟 `;' 或串尾——锚点 `\\=' 与 `\\'' 是刻意加的，否则
+\"xpages:1-2;…\" 之类的畸形串会被误认成跨页锚。A/B 为 1-based 页码（与
+`page:<n>' 同域）。
+
+旧形态 \"page:<n>;rect:…\"、EPUB 的 \"chapter:…\" 与任何未知形态一律返回
+nil。**本函数不改变 `seshat-reader-annotation--page-from-location' 的语义**
+——后者对新形态继续返回 nil，旧客户端的「整条跳过」行为（F8）依赖这一点。"
+  (when (and (stringp location)
+             (string-match
+              "\\`pages:\\([0-9]+\\)-\\([0-9]+\\)\\(?:;\\|\\'\\)" location))
+    (list (string-to-number (match-string 1 location))
+          (string-to-number (match-string 2 location)))))
+
+(defun seshat-reader-annotation--page-rect-from-segment (segment)
+  "把单个 \"rect@<page>:\" 段 SEGMENT 解析为 (PAGE X0 Y0 X1 Y1)；失败时 nil.
+SEGMENT 须以 \"rect@<page>:\" 开头（<page> 为 1-based 十进制、须为正），
+其后为四个逗号分隔的数字。字段级校验**复用**既有口径：拼成 \"rect:...\" 后
+交给 `seshat-reader-annotation--rect-from-segment'，因此字段数、数字性、
+负面积三条判定与旧形态逐条一致（非法即丢该段，不抛错）。"
+  (when (and (stringp segment)
+             (string-match "\\`rect@\\([0-9]+\\):" segment))
+    (let ((page (string-to-number (match-string 1 segment)))
+          (rect (seshat-reader-annotation--rect-from-segment
+                 (concat "rect:" (substring segment (match-end 0))))))
+      (when (and (> page 0) rect)
+        (cons page rect)))))
+
+(defun seshat-reader-annotation--page-rects-from-location (location)
+  "从 LOCATION 解析跨页形态的**带页号**矩形，返回 ((PAGE X0 Y0 X1 Y1) …).
+按 \";\" 切段后**只**处理以 \"rect@<page>:\" 开头的段（旧形态的 \"rect:\"
+段因此被忽略，旧 location 一律得到 nil），顺序与串内一致。每段的校验见
+`seshat-reader-annotation--page-rect-from-segment'：任一条件不满足即跳过该
+段，不抛错。
+
+LOCATION 来自不可信的服务端响应，故解析**有界**，与
+`seshat-reader-annotation--rects-from-location' 同口径：长度先按
+`seshat-reader-annotation--location-max-length' 截断（截断后仍解析前面合法
+的段），解析出的段数达到 `seshat-reader-annotation--rect-max-segments' 即
+停止（保留已解析的）。"
+  (when (stringp location)
+    (let* ((limit seshat-reader-annotation--location-max-length)
+           (text (if (> (length location) limit)
+                     (substring location 0 limit)
+                   location))
+           (rest (split-string text ";"))
+           (rects nil)
+           (count 0))
+      ;; 用 while 而非 dolist：达到段数上限后不再继续尝试解析后续段。
+      (while (and rest (< count seshat-reader-annotation--rect-max-segments))
+        (let ((rect (seshat-reader-annotation--page-rect-from-segment
+                     (string-trim (car rest)))))
+          (when rect
+            (push rect rects)
+            (setq count (1+ count))))
+        (setq rest (cdr rest)))
+      (nreverse rects))))
+
+(defun seshat-reader-annotation--page-label (location)
+  "返回 LOCATION 的**显示用**页码串；两种形态都识别，取不到时 nil.
+旧形态（及任何含 `page:<n>' 的串）返回十进制页号字符串；跨页形态
+`pages:<a>-<b>' 返回 \"<a>-<b>\"。列表与 ETAF 卡片用它显示 \"1-2\"，跳转
+仍用 `seshat-reader-annotation--page-from-location' 给的首个页号。"
+  (let ((page (seshat-reader-annotation--page-from-location location)))
+    (cond
+     (page (number-to-string page))
+     (t (let ((span (seshat-reader-annotation--pages-from-location location)))
+          (when span (format "%d-%d" (car span) (cadr span))))))))
+
+(defun seshat-reader-annotation--page-span-label (location)
+  "返回 LOCATION 的显示用**页跨度** \"<a>-<b>\"；非跨页形态时返回 nil.
+与 `seshat-reader-annotation--page-label' 的区别：后者对旧形态也返回十进制
+页号（供文本列表的行首页码用），本函数**只**为跨页形态产出跨度串，因此
+`--etaf-items' 的 `:page-label' 在旧形态下是 nil——消费方继续用 `:page'。"
+  (let ((span (seshat-reader-annotation--pages-from-location location)))
+    (when span (format "%d-%d" (car span) (cadr span)))))
+
+(defun seshat-reader-annotation--location-page (location)
+  "返回 LOCATION 的**1-based 跳转页号**：跨页形态取首页 A；否则 nil.
+旧形态走 `seshat-reader-annotation--page-from-location'（语义不变）；跨页
+形态取 `pages:<a>-<b>' 的 A——批注列表里的 `RET' 与 ETAF 卡片的跳转都落到
+首页，与 `seshat-reader-annotation--page-label' 的 \"a-b\" 显示一致。"
+  (or (seshat-reader-annotation--page-from-location location)
+      (car (seshat-reader-annotation--pages-from-location location))))
 
 (defconst seshat-reader-annotation--ink-max-points 1024
   "单笔手写笔迹最多保留的点数（与 C 侧 `DECORATION_MAX_POINTS' 一致）.
@@ -1174,11 +1497,21 @@ RECT 为页面坐标四元素列表 (X0 Y0 X1 Y1)。KIND 取：
 (defun seshat-reader-annotation--annotation-decorations (items)
   "把条目列表 ITEMS 解析为装饰描述列表，元素形如 (PAGE X0 Y0 X1 Y1 KIND).
 ITEMS 的元素形态见 `seshat-reader-annotation--item-location'（plist 或
-服务端 alist 皆可）；没有 location、location 里没有可用 `rect:' 段或页码
-无法解析的条目直接跳过。坐标为浮点数、PAGE 为 1-based 整数；KIND 已归一
-（见 `seshat-reader-annotation--drawing-kind'，取 \"highlight\" /
-\"underline\" / \"strikeout\"）。顺序与服务端返回的条目顺序一致，同一条
-的多段 location 按**段**展开。
+服务端 alist 皆可）。location 的两种形态都支持：
+
+- **旧形态** `page:<n>;rect:…`：PAGE 取页锚，矩形由
+  `seshat-reader-annotation--rects-from-location' 逐段读回（行为不变）；
+- **跨页形态** `pages:<a>-<b>;rect@<p>:…`：逐段用**段内页号**，由
+  `seshat-reader-annotation--page-rects-from-location' 读回，因此同一条批注
+  的矩形可以落在不同的页上。
+
+没有 location、没有可用几何段、或（旧形态下）页码无法解析的条目直接跳过——
+跨页形态不依赖 `seshat-reader-annotation--page-from-location'（它对
+`pages:' 返回 nil），所以「旧形态跳过」与「新形态展开」是两条互斥路径。
+坐标为浮点数、PAGE 为 1-based 整数；KIND 已归一（见
+`seshat-reader-annotation--drawing-kind'，取 \"highlight\" / \"underline\" /
+\"strikeout\"）。顺序与服务端返回的条目顺序一致，同一条的多段 location 按
+**段**展开。
 
 本函数是**纯解析**：既不清空也不投喂，供
 `seshat-reader-annotation--redraw-highlights' 消费。"
@@ -1188,11 +1521,18 @@ ITEMS 的元素形态见 `seshat-reader-annotation--item-location'（plist 或
              (page (seshat-reader-annotation--page-from-location location))
              (kind (seshat-reader-annotation--drawing-kind
                     (seshat-reader-annotation--kind item))))
-        (when page
+        (cond
+         (page
           (dolist (rect (seshat-reader-annotation--rects-from-location location))
             (push (list page (nth 0 rect) (nth 1 rect) (nth 2 rect) (nth 3 rect)
                         kind)
-                  decorations)))))
+                  decorations)))
+         (t
+          (dolist (rect (seshat-reader-annotation--page-rects-from-location
+                         location))
+            (push (list (nth 0 rect) (nth 1 rect) (nth 2 rect) (nth 3 rect)
+                        (nth 4 rect) kind)
+                  decorations))))))
     (nreverse decorations)))
 
 (defun seshat-reader-annotation--annotation-rects (items)
@@ -1581,11 +1921,17 @@ LOCATION 与 TEXT 为该批注的位置与正文。KIND 与 SELECTED-TEXT 为可
   "把 ANNOTATIONS 与 QUEUED 合成为 ETAF 渲染层使用的 plist 列表.
 ANNOTATIONS 为服务端返回的批注 alist 列表，QUEUED 为本地离线队列中待同步
 的 create 条目 plist 列表。每个元素形如
-`(:id ID :uuid UUID :location LOCATION :page PAGE :text TEXT :dirty DIRTY)'：
+`(:id ID :uuid UUID :location LOCATION :page PAGE :page-label LABEL
+  :text TEXT :dirty DIRTY)'：
 
 - 服务端项取 `:id'（`:uuid' 为 nil，`:dirty' 为 nil），页码由
-  `seshat-reader-annotation--page-from-location' 从 `:location' 解析；
+  `seshat-reader-annotation--location-page' 从 `:location' 解析（旧形态是
+  `page:<n>' 的数字，跨页形态是 `pages:<a>-<b>' 的首页 A）；
 - 本地待同步项取队列条目的 `:uuid'（`:id' 为 nil，`:dirty' 为 t）。
+
+`:page-label' 是**显示用**页码串（`seshat-reader-annotation--page-label'）：
+旧形态为 nil（消费方继续用 `:page'），跨页形态为 \"a-b\"。两者分开是为了让
+跳转/排序始终拿到数字页号，而显示可以写 \"a-b\"。
 
 v8 契约的 `kind' / `selected_text' 一并转成 `:kind' / `:selected-text'：
 缺键时 `:kind' 为 \"note\"、`:selected-text' 为 nil，故两条渲染路径对老
@@ -1599,7 +1945,9 @@ v8 契约的 `kind' / `selected_text' 一并转成 `:kind' / `:selected-text'：
                (list :id (alist-get 'id annotation)
                      :uuid nil
                      :location location
-                     :page (seshat-reader-annotation--page-from-location location)
+                     :page (seshat-reader-annotation--location-page location)
+                     :page-label (seshat-reader-annotation--page-span-label
+                                  location)
                      :text (alist-get 'text annotation)
                      :selected-text (seshat-reader-annotation--selected-text
                                      annotation)
@@ -1611,7 +1959,9 @@ v8 契约的 `kind' / `selected_text' 一并转成 `:kind' / `:selected-text'：
                (list :id nil
                      :uuid (plist-get entry :uuid)
                      :location location
-                     :page (seshat-reader-annotation--page-from-location location)
+                     :page (seshat-reader-annotation--location-page location)
+                     :page-label (seshat-reader-annotation--page-span-label
+                                  location)
                      :text (plist-get entry :text)
                      :selected-text (seshat-reader-annotation--selected-text
                                      entry)

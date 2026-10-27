@@ -788,7 +788,12 @@ PATH 为 `seshat:' 链接的路径部分（可带或不带 \"seshat:\" 前缀）
 当前文件等价且 `:page'/`:rect' 齐备）构造的完整锚（页锚 + 几何尾段），否则
 退化为纯页锚 \"page:<n>\"（此时若 `seshat-reader-current-doc-pagenumber'
 取不到整数页码，说明当前缓冲区不是阅读器视图，`user-error' 提示先打开
-文档）。几何尾段只写进链接片段供将来取用，**本模块不据此渲染任何内容**。
+文档）。**跨页选区降级为纯页锚** \"page:<起点页>\" 并 `message' 提示（D5b，
+判定与 `seshat-reader-reference--current-location' 共用
+`seshat-reader-annotation--selection-cross-page-p'）：`org-store-link' 独立
+调用 `seshat-reader-annotation--anchor'、不经过 `--current-location'，两条
+写端必须各自接同一判定，否则一条降级、一条不降级。
+几何尾段只写进链接片段供将来取用，**本模块不据此渲染任何内容**。
 描述在有选区文本时用 `seshat-reader-reference--summary'，否则用
 `seshat-reader-reference--description'。链接本身由
 `seshat-reader-reference--link-for' 构造——**能零网络解析出 uid 时存的是 uid
@@ -808,9 +813,19 @@ PATH 为 `seshat:' 链接的路径部分（可带或不带 \"seshat:\" 前缀）
                             (file-equal-p (plist-get selection :file) file))
                        ;; 引用锚只取整体 bbox（:rect），不含字级多段 :rects；
                        ;; `--anchor' 单 rect / rect 列表两种入参都接受。
-                       (seshat-reader-annotation--anchor
-                        (plist-get selection :page)
-                        (plist-get selection :rect))
+                       ;; D5b：跨页选区降级为纯页锚（起点页）并提示——与
+                       ;; `seshat-reader-reference--current-location' 共用同一
+                       ;; 判定函数 `--selection-cross-page-p'，两处不会漂移。
+                       (if (seshat-reader-annotation--selection-cross-page-p
+                            selection)
+                           (progn
+                             (message
+                              "Seshat Reader reference: 跨页选区引用已降级为起点页锚点（第 %d 页）"
+                              (plist-get selection :page))
+                             (format "page:%d" (plist-get selection :page)))
+                         (seshat-reader-annotation--anchor
+                          (plist-get selection :page)
+                          (plist-get selection :rect)))
                      (let ((page (seshat-reader-current-doc-pagenumber)))
                        (unless (integerp page)
                          (user-error "Seshat Reader reference: 当前缓冲区不是阅读器视图，无法确定页码，请先在阅读器中打开文档"))
@@ -939,6 +954,13 @@ T6 的批注引用复用。"
 存储，多段几何对跳转没有任何增益。`seshat-reader-annotation--anchor' 两种
 入参都接受（单 rect / rect 列表），因此这里继续传单 rect 完全合法。
 
+**跨页选区降级（D5b）**：选区跨页（`seshat-reader-annotation--selection-cross-page-p'
+非 nil，判据是 `:page-rects' 去重页号多于一个）时返回**纯页锚**
+\"page:<起点页>\" 并 `message' 提示，不输出 `pages:' 形态——读端
+（`seshat-reader-reference--goto-location'、`--description'）只认 `page:'，
+写一个读不动的串比降级更糟。单页选区（含同页多矩形）走原路径，输出与改动前
+**逐字节一致**。
+
 当前缓冲区不是阅读器视图（`seshat-reader-current-doc-pagenumber' 取不到整数
 页码）时 `user-error'，提示先在阅读器中打开文档，而不是抛出
 `wrong-type-argument'。"
@@ -950,8 +972,18 @@ T6 的批注引用复用。"
              (plist-get selection :page)
              (plist-get selection :rect)
              (file-equal-p (plist-get selection :file) file))
-        (seshat-reader-annotation--anchor (plist-get selection :page)
-                                          (plist-get selection :rect))
+        (if (seshat-reader-annotation--selection-cross-page-p selection)
+            ;; D5b：跨页选区的引用锚**降级为纯页锚**（起点页）。引用链接只需
+            ;; 「可复现落点」，不承载选区几何；`pages:<a>-<b>' 读端（
+            ;; `--goto-location' / `--description'）都只认 `page:'，写进去等于
+            ;; 造一个跳不动的链接。降级必须可见：`message' 明确告知。
+            (progn
+              (message
+               "Seshat Reader reference: 跨页选区引用已降级为起点页锚点（第 %d 页）"
+               (plist-get selection :page))
+              (format "page:%d" (plist-get selection :page)))
+          (seshat-reader-annotation--anchor (plist-get selection :page)
+                                            (plist-get selection :rect)))
       (let ((page (seshat-reader-current-doc-pagenumber)))
         (unless (integerp page)
           (user-error "Seshat Reader reference: 当前缓冲区不是阅读器视图，无法确定页码，请先在阅读器中打开文档"))

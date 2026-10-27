@@ -38,8 +38,9 @@
 ;; `seshat-render-core'.
 ;;
 ;; The last selection is also recorded, as a plist, in the variable
-;; `seshat-reader-select-last' (:text, :page, :rect, :file), so that
-;; annotation commands can reuse it without asking the user to drag again.
+;; `seshat-reader-select-last' (:text, :page, :rect, :rects, :page-rects,
+;; :file), so that annotation commands can reuse it without asking the user
+;; to drag again.
 ;;
 ;; Dependencies:
 ;;
@@ -53,10 +54,13 @@
 ;;
 ;; Known limitations:
 ;;
-;;   - Pages rotated away from zero degrees are not supported.  The
-;;     rotation lives only in the C side `EmacsWinState' and is not
-;;     readable from Lisp, so a rotated page yields silently wrong
-;;     coordinates.
+;;   - Pages rotated away from zero degrees are supported since P1 made
+;;     the rotation a Lisp-side value: `seshat-reader--multipage-rotate' is
+;;     buffer-local and readable here, so every coordinate a drag produces
+;;     is un-rotated to page space before it reaches the module (see
+;;     `seshat-reader-select--unrotate-point').  The C side
+;;     `EmacsWinState' still carries the rotation of the legacy single-page
+;;     overlay; this module neither reads nor needs it.
 ;;   - The visual feedback for a selection is limited to a short-lived
 ;;     "flash": the C renderer's rect highlight table is filled with the
 ;;     selection rectangle right after the button is released and cleared
@@ -80,9 +84,9 @@
 ;;     only selected when one of its own characters was touched.  Set
 ;;     `seshat-reader-select-highlight-granularity' to `character' for one
 ;;     rectangle per character instead (`region' scope only; whole-line
-;;     rectangles are never split).  It is still not a text-shaping
-;;     highlight: rotated pages remain unsupported, as they are for the
-;;     selection itself.
+;;     rectangles are never split).  Line clustering assumes horizontal
+;;     lines in page space, which is also what a rotated page is mapped back
+;;     to, so the rectangles of a quarter turn stay axis-aligned.
 ;;   - Only pages carrying a text layer can be read; scanned images
 ;;     produce no text.
 ;;   - The frame scale used here is sampled from the frame displaying
@@ -602,13 +606,15 @@ The plist holds the keys
 
   :text  the selected text, or nil when the rectangle held no text;
   :page  the page number the selection was made on, 1-based, as
-         returned by `seshat-reader-current-doc-pagenumber';
+         returned by `seshat-reader-current-doc-pagenumber'; for a drag
+         that spans several pages this is the page it **started** on;
   :rect  the selection rectangle as a list (X0 Y0 X1 Y1) in page
          coordinates (floats, as accepted by
          `seshat-reader-dyn--text-in-rect'), i.e. the bounding box of
          the drag — kept for the consumers that only need a position
          (translate, reference) and for the annotation path of older
-         versions;
+         versions.  It always belongs to :page, so for a cross-page drag
+         it is the part of the selection on the page the drag started on;
   :rects the selection rectangles to draw, as a list of
          (X0 Y0 X1 Y1) lists, or nil when the module could not report
          them (neither `seshat-reader-dyn--lines-in-rect' nor
@@ -617,7 +623,18 @@ The plist holds the keys
          at its default `line' these rectangles span whole text lines;
          with `region' they hug the selected characters.  Consumers
          that draw geometry should prefer this and fall back to :rect
-         when it is nil;
+         when it is nil.  Like :rect they belong to :page, i.e. they
+         cover the page the drag started on, never another page;
+  :page-rects
+         the same rectangles, each tagged with the page it belongs to,
+         as a list of (PAGE X0 Y0 X1 Y1) lists in reading order.  For a
+         single-page selection every PAGE equals :page and the value is
+         one-to-one with :rects: `cdr' of each of its elements equals
+         the matching `:rects' element, in the same order.  So :rects
+         stays the field to read when only one page is involved.  For a
+         cross-page drag it carries the rectangles of
+         every page covered, in page order, which is what drawing several
+         pages needs; nil when :rects is nil;
   :file  the file name of the selected document, taken from the
          variable `buffer-file-name' (nil for a buffer without a file).
 
@@ -644,6 +661,94 @@ window-local in `seshat-reader-mode'; the window argument is mandatory
 there and is passed through."
   (let ((scale (ignore-errors (seshat-reader-current-doc-scale-value window))))
     (and (numberp scale) (> scale 0) (float scale))))
+
+(defun seshat-reader-select--page-rotate (&optional window)
+  "Return the rotation of the page shown in WINDOW, in degrees.
+The value is one of 0, 90, 180 and 270.  Since P1 the pages are buffer rows
+and every window showing the buffer sees the same rotation, so the source of
+truth is the buffer-local `seshat-reader--multipage-rotate' of the buffer
+WINDOW displays.  When WINDOW is not a live window, or the buffer it shows
+does not carry that variable (something that is not in `seshat-reader-mode'),
+the value of the current buffer is used instead; the drag path runs with the
+reader buffer current, so the two agree there.
+
+A value that is not a multiple of 90 is reported as 0, which is what the
+native renderer answers for an unsupported angle as well (it returns a nil
+image spec rather than an image rotated by an arbitrary angle)."
+  (let* ((buffer (or (and (windowp window) (window-buffer window))
+                     (current-buffer)))
+         (raw (cond
+               ((and (buffer-live-p buffer)
+                     (local-variable-p 'seshat-reader--multipage-rotate buffer))
+                (buffer-local-value 'seshat-reader--multipage-rotate buffer))
+               ((local-variable-p 'seshat-reader--multipage-rotate)
+                seshat-reader--multipage-rotate)
+               (t 0))))
+    (if (and (numberp raw) (zerop (mod (round raw) 90)))
+        (mod (round raw) 360)
+      0)))
+
+(defun seshat-reader-select--unrotate-size (size rotate)
+  "Exchange the sides of SIZE when ROTATE is a quarter turn.
+SIZE is the (W . H) of a page in page coordinates and ROTATE a rotation in
+degrees.  A bitmap of a page rotated by 90 or 270 degrees is as wide as the
+page is tall, so the two sides swap; 0 and 180 keep them.  The mapping is its
+own inverse, which is why the same function converts a rotated size back to
+the unrotated one."
+  (if (memq (mod (or rotate 0) 360) '(90 270))
+      (cons (cdr size) (car size))
+    (cons (car size) (cdr size))))
+
+(defun seshat-reader-select--unrotate-point (point rotate size)
+  "Map POINT from rotated image space back to unrotated page space.
+POINT is a cons (X . Y) in the coordinate system of the rendered page, i.e.
+in image space **after** ROTATE degrees have been applied, expressed in page
+coordinates rather than device pixels.  SIZE is the **unrotated** size of the
+page as a cons (W . H) in the same units; the quarter turns and 180 need it
+because the mapping mirrors a coordinate, and it is ignored for ROTATE 0.
+
+The mapping inverts the transform the native renderer builds with
+`fz_transform_page' (`render/render-core.c'), which turns the page clockwise
+on screen by ROTATE degrees.  Written in image space, a point (X Y) of the
+unrotated page (origin top-left, X to the right, Y down) lands at
+
+    rotate    image x    image y
+    0         X          Y
+    90        H - Y      X
+    180       W - X      H - Y
+    270       Y          W - X
+
+so the top-left corner (0, 0) of a page rotated by 90 degrees ends up in the
+top-right corner of the bitmap, and the bitmap of that page is H wide and W
+tall.  Both facts were checked against the renderer itself with a
+four-quadrant probe page rendered at all four angles (2026-10-27), not only
+derived from the formula."
+  (let ((x (car point))
+        (y (cdr point)))
+    (cond
+     ((= rotate 90) (cons y (- (cdr size) x)))
+     ((= rotate 180) (cons (- (car size) x) (- (cdr size) y)))
+     ((= rotate 270) (cons (- (car size) y) x))
+     (t (cons x y)))))
+
+(defun seshat-reader-select--unrotate-rect (rect rotate size)
+  "Map RECT from rotated image space back to unrotated page space.
+RECT is (X0 Y0 X1 Y1) in the image space of a page rotated by ROTATE degrees
+and SIZE is the unrotated page size (W . H); the arithmetic is
+`seshat-reader-select--unrotate-point'.  Both opposite corners are mapped and
+the result normalized, because a quarter turn changes which of them is the
+low corner; for ROTATE 0 the value is the bounding box of the same two
+corners, i.e. RECT itself for the normalized rectangles this module deals
+in."
+  (let* ((a (seshat-reader-select--unrotate-point
+             (cons (nth 0 rect) (nth 1 rect)) rotate size))
+         (b (seshat-reader-select--unrotate-point
+             (cons (nth 2 rect) (nth 3 rect)) rotate size))
+         (x0 (car a))
+         (x1 (car b))
+         (y0 (cdr a))
+         (y1 (cdr b)))
+    (list (min x0 x1) (min y0 y1) (max x0 x1) (max y0 y1))))
 
 (defun seshat-reader-select-posn-page (posn &optional window)
   "Return the 1-based page number POSN points into, or nil.
@@ -684,9 +789,19 @@ The coordinates are computed as
 where the image pixel offset comes from `posn-object-x-y' (which
 already accounts for window scrolling and page centering), the
 frame scale from `frame-scale-factor' and the page scale from
-`seshat-reader-current-doc-scale-value'.  The result is valid only for an
-unrotated page and is meant to be passed, over the rectangle formed
-by two such positions, to `seshat-reader-dyn--text-in-rect'.
+`seshat-reader-current-doc-scale-value'.  The result is meant to be passed,
+over the rectangle formed by two such positions, to
+`seshat-reader-dyn--text-in-rect'.
+
+That arithmetic describes the page as it is **displayed**, i.e. after
+`seshat-reader--multipage-rotate' was applied by the renderer, while the
+module takes rectangles in unrotated page coordinates.  The value is
+therefore mapped back through `seshat-reader-select--unrotate-point' using
+the page size measured by `seshat-reader-select--posn-page-extent'.  For
+rotation 0 the mapping is the identity and the returned value is exactly what
+the formula above gives; for the other angles it is the same point expressed
+in page space, and nil is returned (with a message) when the page size is
+unknown, because a quarter turn cannot be undone without it.
 
 The result is **page-local**: `posn-object-x-y' reports the offset inside the
 image under the mouse, so the coordinates already belong to the page the click
@@ -713,11 +828,24 @@ drag across a page boundary is a real case, not an edge case)."
           (message "Seshat Reader select: page scale is zero or invalid.")
           nil)
          (t
-          (let ((factor (/ (seshat-reader-select--frame-scale
-                            (window-frame window))
-                           scale)))
-            (cons (* (float (car xy)) factor)
-                  (* (float (cdr xy)) factor))))))))))
+          (let* ((factor (/ (seshat-reader-select--frame-scale
+                             (window-frame window))
+                            scale))
+                 (rotate (seshat-reader-select--page-rotate window))
+                 (point (cons (* (float (car xy)) factor)
+                              (* (float (cdr xy)) factor)))
+                 ;; 只有 rotate=0 才不需要页尺寸，其余角度都要靠它镜像坐标；
+                 ;; 量不到时宁可报错返回 nil，也不把「旋转后坐标」当成页面
+                 ;; 坐标交给模块（那会静默取到错位置的字）。
+                 (size (and (/= rotate 0)
+                            (seshat-reader-select--posn-page-extent
+                             posn window))))
+            (cond
+             ((= rotate 0) point)
+             ((null size)
+              (message "Seshat Reader select: page size unknown, cannot map a rotated page.")
+              nil)
+             (t (seshat-reader-select--unrotate-point point rotate size)))))))))))
 
 (defun seshat-reader-select--report (text)
   "Report the extracted TEXT as a line count and a character count.
@@ -792,6 +920,228 @@ error, and must not produce a message."
        (ignore-errors
          (seshat-reader-dyn--rects-in-rect page x0 y0 x1 y1)))))))
 
+;;; Cross-page selections (P2-A T2)
+
+;; A drag can start on one page and end on the next once several pages share a
+;; window, so the selection is no longer one rectangle: it is one rectangle per
+;; page covered, clipped to the page boundaries, and the module is asked page by
+;; page (it only ever reads a single page).  Nothing here touches the C side.
+
+(defconst seshat-reader-select--page-extent-fallback 1.0e7
+  "Page height assumed when the pixel size of a page cannot be measured.
+Clipping a cross-page selection to the page boundary needs the height of
+the page; `posn-object-width-height' answers it, but only when redisplay
+information is available (a batch frame carries none).  A value this large
+covers any page: the native module only reports text the page really
+holds, so an over-long rectangle cannot reach anything outside it.")
+
+(defun seshat-reader-select--posn-page-extent (posn window)
+  "Return the size of the page under POSN as (W . H), in page coordinates.
+POSN is a position list as returned by `event-start' or `event-end', and
+WINDOW the window showing the page.  The size is the image size of the
+page (`posn-object-width-height', in image pixels) scaled with the very
+factor `seshat-reader-select-posn->page' applies to a position, i.e. frame
+scale over page scale, so a rectangle built from it lives in the same
+coordinate system as the two converted drag positions.
+
+The image size is the size of the **rendered** page, i.e. of the bitmap after
+`seshat-reader--multipage-rotate' was applied, and a quarter turn makes that
+bitmap as wide as the page is tall.  The value is therefore passed through
+`seshat-reader-select--unrotate-size', so what comes back always describes
+the unrotated page — the coordinate system the module takes rectangles in.
+
+nil is returned when the size cannot be measured: POSN is not over a page
+image, WINDOW has no usable page scale, or `posn-object-width-height' answers
+nil (a batch frame carries no redisplay information)."
+  (when (and (windowp window)
+             (eq (car-safe (posn-object posn)) 'image))
+    (let ((size (ignore-errors (posn-object-width-height posn)))
+          (scale (seshat-reader-select--page-scale window)))
+      (when (and (consp size)
+                 (numberp (car size))
+                 (numberp (cdr size))
+                 scale)
+        (let ((factor (/ (seshat-reader-select--frame-scale
+                          (window-frame window))
+                         scale)))
+          (seshat-reader-select--unrotate-size
+           (cons (* (float (car size)) factor)
+                 (* (float (cdr size)) factor))
+           (seshat-reader-select--page-rotate window)))))))
+
+(defun seshat-reader-select--page-space-size (page window)
+  "Return the unrotated size of PAGE as (W . H) in page coordinates, or nil.
+PAGE is a 1-based page number and WINDOW the window showing it.  The size
+comes from `seshat-reader--multipage-native-size', i.e. from the bitmap the
+row already displays divided by the scale it was rendered at — no rendering
+happens here.  Because that bitmap carries the current rotation, the size is
+passed through `seshat-reader-select--unrotate-size' to describe the unrotated
+page, and the frame scale factor lifts it to the unit
+`seshat-reader-select-posn->page' converts positions into.
+
+nil means the page has no row, has not been rendered yet, or the vendored
+reader does not expose the native size; callers then fall back to the size
+measured on the page the drag started on."
+  (when (and (integerp page) (windowp window))
+    (let ((native (and (fboundp 'seshat-reader--multipage-native-size)
+                       (ignore-errors
+                         (seshat-reader--multipage-native-size page)))))
+      (when (and (consp native)
+                 (numberp (car native)) (> (car native) 0)
+                 (numberp (cdr native)) (> (cdr native) 0))
+        (let ((factor (seshat-reader-select--frame-scale (window-frame window))))
+          (seshat-reader-select--unrotate-size
+           (cons (* (float (car native)) factor)
+                 (* (float (cdr native)) factor))
+           (seshat-reader-select--page-rotate window)))))))
+
+(defun seshat-reader-select--selection-page-rects (start-page start-number
+                                                              end-page end-number
+                                                              start-posn window)
+  "Return the drag rectangle of every page covered, as (PAGE . RECT) pairs.
+START-PAGE and END-PAGE are the two drag positions converted to page
+coordinates by `seshat-reader-select-posn->page', while START-NUMBER and
+END-NUMBER are the pages those positions landed on, as answered by
+`seshat-reader-select-posn-page'.  Either number may be nil; the selection
+is then treated as covering the number that is known, or page 1 when none
+is.  START-POSN and WINDOW locate the page image whose size a clipped page
+is measured on.
+
+The value is in reading order (ascending page number) and every rectangle
+is in page coordinates.  The horizontal extent is the same on every page —
+a drag selects one column band — while the vertical one is clipped to the
+page: the first page is selected from the drag position down to its bottom
+edge, the last one from its top edge down to the drag position, and the
+pages in between in full.  A drag that covers a single page therefore
+yields exactly the bounding box of its two positions, which is what the
+single-page code stored before cross-page selections existed.
+
+The bottom edge of a page is that page's **own** height, because the pages of
+one document do not have to be equally tall — a cover page next to body pages
+is the common case, and clipping every page with the height of the page the
+drag started on would cut text away on a taller page.  The own height is read
+from the native size of the page's row (`seshat-reader-select--page-space-size')
+and **calibrated** by the ratio measured on the start page: that ratio is the
+only link between the unit of `--posn-page-extent' (image pixels times frame
+scale over page scale) and the unit of `--page-space-size' (native pixels times
+frame scale), and the two agree only when the page was rendered at the page
+scale.  The height therefore comes from three paths, in this order:
+
+  1. the page's own size scaled by the start page ratio, when both the start
+     page extent and that own size are measurable;
+  2. the height measured on the start page (`--posn-page-extent'), when the
+     ratio cannot be measured — the own size is **never** used raw in that
+     case: the two units differ by the ratio of render scale to page scale, so
+     an uncalibrated own size can be too short and cut text away;
+  3. `seshat-reader-select--page-extent-fallback' when that is unknown too.
+
+Erring long is deliberate and harmless (the native module only reports text
+the page really holds), while a short rectangle loses text, so every fallback
+goes to the longer value.  All sizes are unrotated, i.e. they live in the same
+page space as the rectangles."
+  (let* ((first (or (and start-number end-number (min start-number end-number))
+                    start-number
+                    end-number
+                    1))
+         (last (if (and start-number end-number)
+                   (max start-number end-number)
+                 first))
+         (x0 (min (car start-page) (car end-page)))
+         (x1 (max (car start-page) (car end-page))))
+    (if (= first last)
+        (list (cons first (list x0
+                                (min (cdr start-page) (cdr end-page))
+                                x1
+                                (max (cdr start-page) (cdr end-page)))))
+      (let* ((extent (seshat-reader-select--posn-page-extent start-posn window))
+             (height (or (cdr extent)
+                         seshat-reader-select--page-extent-fallback))
+             (start-on-first (and start-number (= first start-number)))
+             (first-y (if start-on-first (cdr start-page) (cdr end-page)))
+             (last-y (if start-on-first (cdr end-page) (cdr start-page)))
+             ;; 每页有自己的高度（批次 2）：`--posn-page-extent' 只量到起点页，
+             ;; 而封面与正文的页高经常不同，用同一个高度裁剪会让中间页的矩形
+             ;; 越界或不足（越界无害，模块只报页内真有的字；不足会丢字）。
+             ;; 比例把 native 尺寸换算到 `--posn-page-extent' 的口径——两者的
+             ;; 单位约定不同（前者是 scale 1.0 的页尺寸，后者是已过 frame
+             ;; scale / page scale 的坐标），用起点页做基准即可让起点页的结论
+             ;; 与只用 extent 时逐值相同，其余页按同一比例缩放。
+             ;; 比例量不到（起点 extent 为 nil）时**不采信 own 的绝对值**：
+             ;; 渲染 scale 与 page scale 不等时那个值会偏短，按 `height' 兜底
+             ;; （宁可过长：模块只报页内真有的字，过长无副作用）。
+             (ratio (let ((own (seshat-reader-select--page-space-size
+                                (if start-on-first first last) window)))
+                      (when (and extent own
+                                 (> (car own) 0)
+                                 (> (cdr own) 0))
+                        (cons (/ (float (car extent)) (car own))
+                              (/ (float (cdr extent)) (cdr own))))))
+             rects)
+        (cl-labels ((page-height (page)
+                      "Height of PAGE in page coordinates, or the fallback."
+                      (let ((own (seshat-reader-select--page-space-size
+                                  page window)))
+                        (cond
+                         ((and own ratio) (* (cdr own) (cdr ratio)))
+                         (t height)))))
+          (cl-loop for page from first to last
+                   do (push (cons page
+                                  (list x0
+                                        (if (= page first) first-y 0.0)
+                                        x1
+                                        (if (= page last) last-y
+                                          (page-height page))))
+                            rects)))
+        (nreverse rects)))))
+
+(defun seshat-reader-select--page-selection (page-rects)
+  "Return the text and the geometry of every page in PAGE-RECTS.
+PAGE-RECTS is the (PAGE . RECT) list answered by
+`seshat-reader-select--selection-page-rects', i.e. in reading order.
+Every page is read on its own with the native module, the 1-based page
+number converted to the 0-based one the module takes.  The value is a list
+of (PAGE TEXT RECTS) items, one per page, where TEXT is what the page
+rectangle holds and RECTS the per-line geometry of that page (nil when the
+module cannot report it)."
+  (mapcar (lambda (entry)
+            (cl-destructuring-bind (page x0 y0 x1 y1) entry
+              (list page
+                    (seshat-reader-dyn--text-in-rect (1- page) x0 y0 x1 y1)
+                    (seshat-reader-select--rects-in-rect (1- page)
+                                                         x0 y0 x1 y1))))
+          page-rects))
+
+(defun seshat-reader-select--join-page-texts (texts)
+  "Join TEXTS, the text read on each selected page, into one string.
+A single page keeps its text untouched — no trimming and no filtering — so a
+one-page selection stays byte-identical to what the pre-cross-page code
+reported.  Several pages are joined in reading order with one newline between
+two pages, because `seshat-reader-dyn--text-in-rect' does not keep the line
+breaks; pages that contributed no text at all (an image page, or a page whose
+rectangle held nothing) are dropped **before** the join, so a selection whose
+first or last page is empty does not begin or end with a bare newline.  nil
+when no page contributed any text, which is how the single-page code reported
+an empty selection."
+  (when (cl-some #'identity texts)
+    (if (cdr texts)
+        (when-let* ((kept (cl-remove-if (lambda (text)
+                                          (or (null text) (equal text "")))
+                                        texts)))
+          (mapconcat #'identity kept "\n"))
+      (car texts))))
+
+(defun seshat-reader-select--flatten-page-rects (pages)
+  "Flatten PAGES, as answered by `seshat-reader-select--page-selection'.
+Every rectangle becomes a (PAGE X0 Y0 X1 Y1) item, in reading order, so a
+consumer that has to draw several pages at once can tell them apart.  Pages
+that reported no geometry contribute nothing, which keeps the value
+one-to-one with `:rects' for a single page."
+  (let (flat)
+    (dolist (item pages)
+      (dolist (rect (nth 2 item))
+        (push (cons (car item) rect) flat)))
+    (nreverse flat)))
+
 (defun seshat-reader-select-extract (start end)
   "Extract the text between the mouse positions START and END.
 START and END are position lists, as produced by `event-start' and
@@ -802,19 +1152,24 @@ Return the extracted text, or nil when the two positions are not in
 the same window, when either of them cannot be converted to page
 coordinates, or when the corresponding rectangle contains no text.
 
-The two positions must belong to the **same page**: with the multi-page
-layout a drag can start on one page and end on the next, which cannot be
-mapped to one rectangle, so `user-error' is signalled with “暂不支持跨页选择”
-\(decision D7) instead of silently extracting half the selection.  The page of
-each position is `seshat-reader-select-posn-page', i.e. looked up from the row
-the event landed on.
+The two positions may belong to **different pages**: with the multi-page
+layout a drag can start on one page and end on the next.  The pages between
+them are then read one by one, each page rectangle clipped to the page
+boundary, and their texts are joined in reading order with one newline
+between two pages (the module does not keep line breaks).  Which page a
+position landed on is `seshat-reader-select-posn-page', i.e. looked up from
+the row the event landed on; a position in the gap that follows a page row
+belongs to that page, so the answer only changes at the start of the next
+row — no \"nearest page\" rule is applied.
 
 Besides reporting the text, the selection is recorded in
-`seshat-reader-select-last': the drag's bounding box under :rect and
-the per-line rectangles hugging the selected characters under :rects
-\(nil when the module cannot report them).  The flash that confirms the
-selection uses those per-line rectangles, falling back to the bounding
-box when there are none."
+`seshat-reader-select-last': the drag's bounding box under :rect, the
+per-line rectangles hugging the selected characters under :rects and those
+same rectangles tagged with their page under :page-rects.  :page, :rect and
+:rects always describe the page the drag **started** on — the whole
+selection for a one-page drag, its first page only for a cross-page one.
+The flash that confirms the selection uses those per-line rectangles,
+falling back to the bounding box when there are none."
   (let ((window (posn-window start)))
     (cond
      ((not (eq window (posn-window end)))
@@ -826,37 +1181,37 @@ box when there are none."
             ;; 两端各落在哪一页（按 posn 的 buffer 位置反查，不是视口顶页）。
             (start-page-number (seshat-reader-select-posn-page start window))
             (end-page-number (seshat-reader-select-posn-page end window)))
-        (when (and start-page end-page
-                   start-page-number end-page-number
-                   (/= start-page-number end-page-number))
-          ;; 决策 D7：一屏多页之后「一次拖拽横跨两页」是常见操作，但把它映射
-          ;; 成「跨页文本」需要跨页排序与拼接，本批不做，明确拒绝而不是悄悄
-          ;; 只取一半。T9 再补实现。
-          (user-error "暂不支持跨页选择"))
+        ;; 跨页拖拽不再拒绝：页区间与逐页取文由 `--selection-page-rects' /
+        ;; `--page-selection' 完成，单页时它们退化成 P2-A 之前的同一个 bbox。
         (when (and start-page end-page)
-          (let* ((x0 (min (car start-page) (car end-page)))
-                 (x1 (max (car start-page) (car end-page)))
-                 (y0 (min (cdr start-page) (cdr end-page)))
-                 (y1 (max (cdr start-page) (cdr end-page)))
-                 (page (1- (or start-page-number end-page-number 1)))
-                 ;; The four coordinates already come from (min ...) /
-                 ;; (max ...) applied to float coordinates, so they are
-                 ;; floats; the module function `seshat-reader-dyn--text-in-rect'
-                 ;; does not accept integers.
-                 (text (seshat-reader-dyn--text-in-rect page x0 y0 x1 y1))
-                 ;; 选区几何：默认按 scope=line 由模块返回整行矩形；scope=region
-                 ;; 时退回逐字符矩形并按行合并（纯函数）；模块缺失或无命中时为 nil
-                 (rects (seshat-reader-select--rects-in-rect page x0 y0 x1 y1))
-                 (bbox (list x0 y0 x1 y1)))
+          (let* ((page-rects (seshat-reader-select--selection-page-rects
+                              start-page start-page-number
+                              end-page end-page-number
+                              start window))
+                 ;; 逐页取文与几何；模块的页号是 0-based，页区间是 1-based，
+                 ;; 换算只在 `--page-selection' 里做一次。
+                 (pages (seshat-reader-select--page-selection page-rects))
+                 ;; :page / :rect / :rects 都描述**起点页**：单页拖拽时就是整个
+                 ;; 选区，跨页时只是首页那一段（见 `seshat-reader-select-last'）。
+                 (index (or (and start-page-number
+                                 (cl-position start-page-number page-rects
+                                              :key #'car :test #'=))
+                            0))
+                 (text (seshat-reader-select--join-page-texts
+                        (mapcar #'cadr pages)))
+                 (bbox (cdr (nth index page-rects)))
+                 (rects (nth 2 (nth index pages))))
             (setq seshat-reader-select-last
                   (list :text text
                         ;; :page must be the 1-based page number reported by
-                        ;; seshat-reader; the local `page' above is 0-based (for
-                        ;; the module) and therefore must not be reused here.
+                        ;; seshat-reader; the module takes a 0-based one, which
+                        ;; `--page-selection' subtracts once per page.
                         :page (or start-page-number
                                   (seshat-reader-current-doc-pagenumber window))
                         :rect bbox
                         :rects rects
+                        :page-rects (seshat-reader-select--flatten-page-rects
+                                     pages)
                         :file (buffer-file-name (window-buffer window))))
             (seshat-reader-select--report text)
             ;; 选区已确定（不论矩形内是否有文本）就用高亮闪一下，让用户看到自己
