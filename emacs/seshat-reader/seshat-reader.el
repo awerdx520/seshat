@@ -3280,6 +3280,31 @@ mode maps."
   (seshat-reader--evil-set-initial-states)
   (seshat-reader--disable-evil-in-existing-buffers))
 
+;;; hl-line 关闭（多页布局下一行 = 一整页）
+
+(defun seshat-reader--disable-hl-line ()
+  "在阅读 buffer 里关掉 `hl-line-mode'.
+
+多页布局下阅读 buffer 的「一行」就是一整页图像：`hl-line' 的 overlay 按行
+边界（`line-beginning-position' / `line-end-position'）染色，于是把当前页那
+一行的**左右留白**也染成 `hl-line' 底色（实测 #2A2E38），而上下相邻页的行仍
+是主题底色（#242730）——同屏两页两侧留白颜色不一致。留白不属于任何页面
+位图，染色只暴露「这个 buffer 其实是文本行」这一实现细节。
+
+`global-hl-line-mode' 是**全局化** minor mode，它在
+`after-change-major-mode-hook' 上为每个新 major mode 重新打开
+`hl-line-mode'；因此 mode body 里直接 `(hl-line-mode -1)' 关不住——body 先
+跑、hook 后跑，同 `seshat-reader--disable-evil' 遇到的时序坑。本函数由
+`seshat-reader-mode' 以 DEPTH t 追加到该 hook 的 **buffer-local** 值末尾：
+实测（Emacs 31.1）本地值成为 `(t FUNC)'，运行时全局部分先跑、FUNC 后跑，
+故关闭能粘住；本地值里那个标记元素同时保证全局化的其他 minor mode 在本
+buffer 仍照常运行（buffer-local 值不会顶掉全局 hook）。
+
+只对 `seshat-reader-mode' 系列 buffer 生效——侧栏 / 大纲 / 标注列表等列表
+导航仍需要 hl-line，它们的 buffer 上不会注册本函数。"
+  (when (bound-and-true-p hl-line-mode)
+    (hl-line-mode -1)))
+
 ;;;###autoload
 (define-derived-mode seshat-reader-mode special-mode "Seshat Reader"
   "Major mode for viewing documents in The Seshat Reader.
@@ -3306,6 +3331,12 @@ Keybindings:
 	      left-fringe-width 8)
   (set-buffer-modified-p nil)
   (seshat-reader--disable-evil)
+  ;; `global-hl-line-mode'（全局化 minor mode）会在
+  ;; `after-change-major-mode-hook' 上把 `hl-line-mode' 重新打开，故这里只注册
+  ;; 收尾函数、不在 body 里直接关：DEPTH t 让本地值成为 `(t FUNC)'，全局部分
+  ;; （含全局化 checker）先跑、FUNC 后跑，关掉才粘得住。见
+  ;; `seshat-reader--disable-hl-line'。
+  (add-hook 'after-change-major-mode-hook #'seshat-reader--disable-hl-line t t)
   (setq-local next-screen-context-lines
               (max 0 seshat-reader-screen-context-lines))
   (blink-cursor-mode 0)
