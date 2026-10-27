@@ -948,3 +948,22 @@ refit 按当前窗口尺寸做一次几何适配 + 重渲染，一次到位。
 **约束**：① 分隔区选项在**页行插入时**读取，改动后需重开文档或触发一次重排（`seshat-reader--multipage-relayout`），本轮**不做** defcustom `:set` 自动重排——避免「改一个选项就整本重排」的隐式副作用，另立任务再议；② ERT 只断言文本结构与属性（行数、`display`、`face`），`emacs --batch` 无 redisplay，像素正确性由 GUI 探针与真机目视承担。
 
 （来源计划：[openspec/completed/2026-10-27-reader-page-separator.md](completed/2026-10-27-reader-page-separator.md) 的 D1–D4 与「T0 实测结论」小节；`line-height` 阶梯、face `:height` 下限、`(space :align-to)` 行宽的原始读数见该计划的实测表格。）
+
+## 2026-10-27 · 跨页选区的 location 形态与引用链接降级
+
+**决策**（4 点）：
+
+| # | 决策 | 理由 |
+|---|---|---|
+| 1 | 跨页锚用**新前缀** `pages:<a>-<b>;rect@<page>:x0,y0,x1,y1;…`，单页锚（含同页多矩形）**继续写旧形态** `page:<n>;rect:…` 且逐字节不变 | 旧前缀 `page:` 的语义是「这条批注属于第 n 页」——一个页锚。跨页选区没有唯一的页可归，另立前缀才能让「读不懂新形态」的旧解析器可靠地**认出自己读不懂**（见决策 2）。`<a>`/`<b>` 取**实际有矩形**的页号最小/最大值而非「起点页 + 页数」：首尾页整页落在框外时跨度会自动收窄，避免写出 `pages:3-5` 却只有第 3、5 两页有几何的误导性串。单页路径不动是硬要求——存量批注数以千计，任何「顺手统一格式」都会让旧客户端把老数据读成 nil |
+| 2 | **否决**「同串多 `page:` 段」（如 `page:1;rect:…;page:2;rect:…`） | 旧解析器会把它读成**画错**而不是降级：`--page-from-location` 取串内**第一个** `page:<n>`（正则未加锚点）、`--rects-from-location` 只按 `;` 切段且只认 `rect:` 前缀、**与页号无关**——于是第二页的 `rect:` 段会被全部收集到第一页，高亮叠在第 1 页的错误位置，且没有任何报错线索。新前缀的好处正在于「旧解析器取不到页号 → 整条跳过」（装饰路径 `when page` 分支不进入），代价是旧客户端不画，收益是它不会画错。**这是一条不变量：任何新 location 形态对旧读取方必须是「跳过」而非「误读」。** |
+| 3 | 选区 plist 的 `:rects` **保持 4 元组**语义不变，跨页信息放新字段 `:page-rects`（`(PAGE X0 Y0 X1 Y1)` 列表），而非把 `:rects` 元素扩成 5 元组 | `:rects` 的唯一生产读取点（`seshat-reader-annotation--selection-rects`）把元素直接交给 `--anchor-segments`，而后者按 `(nth 0..3 rect)` 判合法——5 元组会被当成 4 元组解析（PAGE 当 x0、Y1 被丢弃），是**确定性数据损坏**。改元素形态就必须同批改造解析端，回归面覆盖 `translate` / `reference` / 装饰 / 测试桩十几处读取方；新增字段可让**旧消费者零改动**，单页时 `(mapcar #'cdr :page-rects)` 与 `:rects` 逐值相等（有 ERT 断言），跨页时 `:rect` / `:rects` 仍是起点页几何（供只支持单 bbox 的消费方使用）。 |
+| 4 | `seshat:` 引用链接在跨页时**降级为纯页锚** `page:<起点页>`（不带 `rect:`、不带 `pages:`）并 `message` 提示 | 引用链接的职责是「可复现落点」，不承载选区几何（`seshat-reader-reference.el` 的既有哲学：链接串短更利于阅读）。写 `pages:` 形态的收益为零（读端 `--goto-location` 只取页号），却会让旧客户端的链接**无法跟随**（页号取不到 → 落点丢失）。降级为纯页锚则在任何版本都能跳、且跳到的正是用户开始拖选的那页。两处写端（`--current-location` 与 org `:store`）**共用**同一判定函数 `--selection-cross-page-p`（`:page-rects` 去重页号 > 1），不做两份判定以防漂移；单页路径逐字节不变、读端零改动 |
+
+**上限与降级的取舍**：写入端上限仍是 500 段（`--anchor-max-segments`），但跨页形态按「**页数 + 段数**」计数——每段要多带 `rect@<page>:` 前缀，串长由两者共同决定，只数段数会低估。超限时**降级为只保留首页矩形**（单页形态）并 `display-warning`（不是 `message`：降级是确定性数据丢失，需要留在 `*Warnings*` 里可追），批注正文同时截断到首页，避免「正文含第二页、高亮只在第一页」的不一致。选择「降级」而不是「截断到前 N 段」：截断会在页中间突然失去高亮且用户无法判断哪页被丢，降级则给出「这是一次跨页选区、已被压缩到首页」的完整叙事。
+
+**兼容与零改动边界**：服务端不解析 `location`（只校验非空），**零改动**；Android `LocationCodec.parsePage` 在 `segments.size > 2` 时返回 `Parsed.Unknown`（多段 `rect:` 今日同样落这里），表现为**无高亮但不崩溃**，已记入 `openspec/tech-debt.md`；**C 侧零改动**（`render/*.c` / `*.h` 一行未动，`VENDORED.md` 未变）——跨页取文只是逐页调用既有的单页 0-based 接口后在 elisp 侧拼接。
+
+**残余限制**（同记 tech-debt）：跨页 explain / 翻译的上下文只覆盖起点页（`:rect` 是起点页 bbox 的必然结果，翻译对象本身仍是全文）；跨页选区确认时的高亮闪现只落在起点页（`--flash-selection` 仍只吃 `:rects`）；Android 不渲染 `pages:`。
+
+（来源计划：[openspec/completed/2026-10-27-reader-multipage-p2a-cross-page-selection.md](completed/2026-10-27-reader-multipage-p2a-cross-page-selection.md) 的 D1–D7、D5b 与「事实基线」F7/F8/F11；变异自检（把 `--page-from-location` 改成也认 `pages:`）记录见该计划「批次 3」小节）

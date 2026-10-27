@@ -365,7 +365,7 @@ page:<n>;rect:<x0>,<y0>,<x1>,<y1>
 - `n` 为 **1-based** 页码。
 - `x0,y0,x1,y1` 为矩形四角在**页面坐标**中的值（PDF point 空间，原点在左上、y 轴向下），保留两位小数。
 - 坐标**不含缩放**：取自页面坐标系，与客户端当前缩放级别无关，便于跨端复现。
-- **不支持已旋转页面**：页面旋转状态存在于客户端渲染器内部，本约定无法表达，旋转页面上采集的坐标会**静默错误**（无报错但位置不再正确）。
+- **旋转页面**：`rect` / `ink` 的坐标一律是**未旋转页面坐标**——约定不表达旋转状态（旋转只存在于客户端视图层）。Emacs 客户端自 2026-10-27 起在采集点按 `seshat-reader--multipage-rotate` 做逆变换（0 / 90 / 180 / 270，90 / 270 交换宽高），因此旋转页上框选写出的坐标落在标准页面空间、与 C 侧渲染 `ctm` 一致（此前无逆变换，旋转页坐标会**静默错误**）。Android 侧本轮未改动，其旋转页行为以 Android 现状为准（导出副本仍跳过 `/Rotate ≠ 0` 的页，见 `openspec/tech-debt.md`）。
 - **渲染（M12 起）**：`rect` 段自 M12 起在 Emacs 客户端**会被渲染为页面上的半透明高亮**（缩放/旋转后按同一变换对齐）；`kind` 为 `underline` / `strikeout` 时同一 `rect` 段改绘为细条（见 §4.5.2）。`ink:` 段自 2026-10-25 起在 Emacs 客户端**也会被渲染为页面手写笔迹**（开关 `seshat-reader-annotation-ink-enabled`，默认 `t`；其坐标是页面 pt、与 `rect:` 同空间，见 §4.5.1）。高亮由 C 渲染层在页面位图上绘制（开关 `seshat-reader-annotation-highlight-enabled`，刷新命令 `C-c C-h`），详见 [配置说明](configuration.md) 与 [架构设计](architecture.md)。
 
 示例（第 12 页的矩形区域）：
@@ -374,13 +374,14 @@ page:<n>;rect:<x0>,<y0>,<x1>,<y1>
 page:12;rect:50.00,100.00,545.50,140.00
 ```
 
-PDF 的 `location` 是**页锚 + 可选几何尾段**：`page:<n>`（**页锚**）是唯一的跳转真值；第一个 `;` 之后的 `rect:` / `ink:` 段是**可选几何尾段**，只供渲染（Emacs M12 起渲染 `rect:` 高亮，2026-10-25 起渲染 `ink:` 笔迹）与 `seshat:` 引用锚复用，**不参与导航判定**——因此「只有页锚」的 `page:<n>` 是完全合法的形态。共三形态：
+PDF 的 `location` 是**页锚 + 可选几何尾段**：`page:<n>`（**页锚**）是唯一的跳转真值；第一个 `;` 之后的 `rect:` / `ink:` 段是**可选几何尾段**，只供渲染（Emacs M12 起渲染 `rect:` 高亮，2026-10-25 起渲染 `ink:` 笔迹）与 `seshat:` 引用锚复用，**不参与导航判定**——因此「只有页锚」的 `page:<n>` 是完全合法的形态。共四形态（第四种是跨页选区，见 §4.5.3）：
 
 | 形态 | 串 | 谁在用 |
 |---|---|---|
 | 纯页号 | `page:<n>` | Android PDF 文本批注（顶栏「添加批注」按钮与长按菜单「添加本页备注」都走 `PdfReaderActivity.addAnnotation`，只写 `page:<当前页>`）——`text` 承载备注，`location` 只记页。Emacs 侧**不产**此形态：`seshat-reader-annotation--anchor`（页锚 + 几何尾段）恒带 `rect:` |
-| 页号 + 矩形 | `page:<n>;rect:<x0>,<y0>,<x1>,<y1>` | Emacs 选区批注（M11.3 起），也是 Emacs M12 高亮的唯一数据来源 |
+| 页号 + 矩形 | `page:<n>;rect:<x0>,<y0>,<x1>,<y1>` | Emacs 选区批注（M11.3 起），也是 Emacs M12 高亮的唯一数据来源（同页多矩形见 §4.5.2） |
 | 页号 + 笔迹 | `page:<n>;ink:<color>,<widthPt>,...` | Android PDF 手写（见 §4.5.1） |
+| 页区间 + 逐页矩形 | `pages:<a>-<b>;rect@<page>:<x0>,<y0>,<x1>,<y1>;...` | Emacs **跨页**选区批注（2026-10-27 起，见 §4.5.3）；旧客户端与 Android 对它的处理见表 |
 
 > **本轮范围**：**Android 侧** PDF 文本批注不产 `rect:`——`PdfReaderActivity.addAnnotation` 只写
 > `page:<当前页>` 定页，矩形采集（`rect:`）不在 M10.3 范围内（见 `openspec/tech-debt.md`）。
@@ -431,6 +432,42 @@ page:<n>;rect:<x0>,<y0>,<x1>,<y1>;rect:<x0>,<y0>,<x1>,<y1>;...
   - 即：同一串 `page:3;rect:10.00,20.00,30.00,40.00` 在 `highlight` 下要填满整个框，在 `underline` 下只需画底部那条细线——**框是数据，细条是解释**。
 - **跨端现状（2026-10-25）**：Emacs 产多段 `rect:`（字级高亮 + `underline` / `strikeout` 细条）；**Android 仍不产 `rect:`**（PDF 文本批注只写 `page:<n>`，见 §4.5 表格与 `openspec/tech-debt.md`），Android 读多段 `rect:` 时按整体 bbox 或逐段着色自行决定，尚无统一样式约定。
 
+#### 4.5.3 跨页选区形态（`pages:`，2026-10-27）
+
+一次拖选横跨两页或多页时（多页连续布局下滚过页边界即会发生），几何不再能挂在**一个**页锚上，Emacs 客户端因此写入第四种形态：
+
+```
+pages:<a>-<b>;rect@<page>:<x0>,<y0>,<x1>,<y1>;rect@<page>:<x0>,<y0>,<x1>,<y1>;...
+```
+
+- `<a>` / `<b>` = **实际存在矩形的页号的最小值 / 最大值**（1-based），不是「起点页 + 页数」——首尾页若没有矩形（例如整页落在框外），跨度会自动收窄。
+- 每个 `rect@<page>:` 段自带页号，段序 = **阅读顺序**（页升序、页内保持原顺序）；同页多段与 §4.5.2 一致，只是每段多带了页号前缀。
+- 坐标口径与单页形态完全相同（PDF point 空间、原点左上、y 向下、两位小数、不含缩放与旋转）。
+- **旧形态 `page:<n>;rect:…` 的语义零变化**：全部矩形落在同一页时（含同页多矩形）Emacs 仍写旧形态，输出与改造前**逐字节一致**；带 `ink:` 的旧批注、只带页锚的 `page:<n>` 也都不受影响。
+
+**兼容表现**（新形态对旧读取方一律「整条跳过」，不是「画错」）：
+
+| 读取方 | 读到 `pages:` 时的行为 |
+|---|---|
+| 旧版 Emacs 客户端 | `seshat-reader-annotation--page-from-location` 只认 `page:` 前缀 → 返回 `nil`；装饰路径的 `when page` 分支因此不进入 → **该条批注不参与绘制**，不报错、也不会把两页的矩形叠到第一页上 |
+| 新版 Emacs 客户端（2026-10-27 起） | `--pages-from-location` 解析页跨度、`--page-rects-from-location` 逐段解析 `rect@<page>:` → 按每段自己的页号展开装饰，两页都落在正确位置；列表与 ETAF 卡片的页码列显示 `a-b`，`RET` 跳首页 |
+| 服务端 | **不解析** `location`，只校验非空、原样保存与回传（与其它形态一致，新增形态**无需服务端改动**） |
+| Android | `LocationCodec.parsePage` 在 `segments.size > 2` 时返回 `Parsed.Unknown`（多段 `rect:` 今日同样落在这里）→ **无高亮，但不抛异常、不崩溃**；跨页批注在 Android 侧看不到高亮（见 `openspec/tech-debt.md`） |
+
+**限制与降级**：
+
+- **写入端上限 500**（Emacs `seshat-reader-annotation--anchor-max-segments`）：跨页形态按「**页数 + 段数**」计数——每段都要多带 `rect@<page>:` 前缀，串长由两者共同决定，故计数取二者之和。超限时**降级**为「只保留页号最小的那一页的矩形」，落成单页形态（`page:<a>;rect:…`），并用 `display-warning` 明示条数（走 `*Warnings*` 而非 echo area，避免被后续消息冲掉）。降级同时**把批注正文截断到首页**（取首页矩形包络内的文本），以免出现「正文含第二页、高亮只在第一页」的不一致；首页取不到文本时保留原全量正文（已知降级）。
+- **解析端上限 2000 段 / 65536 字符**（`seshat-reader-annotation--rect-max-segments` / `--location-max-length`）：与 §4.5.2 同一组常量、同一有界循环，超出的段被丢弃。
+- **`seshat:` 引用链接跨页时降级为纯页锚**：引用只需「可复现落点」、不承载选区几何，故跨页选区产生的引用链接输出 `page:<起点页>`（不带 `rect:`、不带 `pages:`），并 `message` 提示「跨页选区引用已降级为起点页锚点（第 N 页）」。单页选区产生的引用链接与改造前逐字节一致；读端（`:follow` / `:export` / 批注引用插入）零改动。
+- **C 侧在 P2-A 内曾有两次改动（真机缺陷修复，2026-10-27）**：批次 A 的前四批确实一行未动 `render/*.c`，但真机验收时拖选直接崩溃——`seshat-reader-select-extract` 抛 `Wrong type argument: overlayp, nil`，backtrace 落在 `overlay-buffer(nil)` ← `seshat-reader-dyn--text-in-rect`。根因两条：① `check_current_overlay` / `get_current_doc_overlay` 用 `emacs_value` **指针相等**比较 nil（`overlay == EMACS_NIL`），而模块 API 的句柄不保证唯一，nil 一旦真的到达就漏判；② `prepare_rect_query` 经 `get_reader_current_state` 要求「selected window 的 overlay 有效」，而 P1 的多页布局里拖选刻意不 `select-window`（窗口上也没有 overlay），前提本身错误。修法：比较改 `env->eq`；`prepare_rect_query` 改为只读 buffer-local 的 `seshat-reader-current-doc-state-ptr`（`get_doc_state_ptr`），不再看 overlay / `EmacsWinState`，`win_state->closing` 检查随之下线（reload 早退保留）。**跨页取文本身仍只是逐页调用既有的单页 0-based 接口**（`--text-in-rect` / `--rects-in-rect` / `--lines-in-rect`）后在 elisp 侧拼接；`VENDORED.md` 未变。详见 `openspec/completed/2026-10-27-reader-multipage-p2a-cross-page-selection.md`「真机缺陷修复：overlayp nil 崩溃」。
+- **矩形查询的 buffer 归属要求（供调用方参考）**：三个 rect 入口只按**当前 buffer** 的 buffer-local 文档指针解析文档，因此必须在阅读 buffer 里调用（在侧栏等其它 buffer 里调用会静默返回 nil）；它们**不要求**被选窗口属于该 buffer，也不要求窗口上有 overlay。
+
+示例（第 1 页两段 + 第 2 页一段）：
+
+```
+pages:1-2;rect@1:50.00,100.00,545.50,140.00;rect@1:50.00,142.00,300.00,152.00;rect@2:50.00,80.00,545.50,120.00
+```
+
 ### 4.6 location 约定（EPUB）
 
 EPUB 没有「页」，位置由「章 + 章内字符偏移」表达（`M10.3` 定稿，取代此前「EPUB 待定」）：
@@ -454,6 +491,7 @@ PDF 与 EPUB 的 location 形态并列表：
 |---|---|---|
 | PDF 文本批注（Android） | `page:<n>`（1-based） | 页 |
 | PDF 文本批注 / 高亮（Emacs） | `page:<n>;rect:<x0>,<y0>,<x1>,<y1>` | 页 + 页面矩形 |
+| PDF 跨页选区批注（Emacs，2026-10-27 起） | `pages:<a>-<b>;rect@<p>:<x0>,<y0>,<x1>,<y1>;...` | 页区间 + 逐页矩形 |
 | PDF 手写（Android） | `page:<n>;ink:<color>,<widthPt>,<x0>,<y0>,...`（一笔一条） | 页 + 笔迹点列 |
 | EPUB | `chapter:<spineIndex>@<startOffset>-<endOffset>` | 章 + 章内字符区间 |
 | EPUB（退化） | `chapter-<n>` | 章 |

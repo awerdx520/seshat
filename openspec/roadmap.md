@@ -231,6 +231,7 @@ M0–M6 已完成并归档，见 `openspec/completed/personal-notes-system.md`�
 |---|---|---|
 | P0 | 按页渲染返回 spec 的 C 接口 + elisp 缓存 | ✅ 完成（2026-10-26）；见 openspec/completed/2026-10-26-reader-multipage-p0-page-spec-api.md |
 | P1 | buffer 多页布局 + 页号派生 + 删 strip 全族 | ✅ 完成（2026-10-27）；见 openspec/completed/2026-10-26-reader-multipage-p1-layout.md |
+| P2-A | 跨页选区（P2-2）+ 旋转页选区坐标（P2-8） | ✅ **已完成并归档（2026-10-27）**；见 openspec/completed/2026-10-27-reader-multipage-p2a-cross-page-selection.md |
 
 - **P0 已交付**：C 入口 `seshat-reader-dyn--page-image-spec`（arity `2..3`，1-based，同步、零副作用）+ elisp `seshat-reader--page-spec`（上限 8 的会话内缓存）+ 13 例 ERT（真实 `.so` + 真实 PDF）。**零用户可见行为变更**：不接入任何显示/滚动路径。
 - **P0 实测结论（决定 P1 设计）**：单页 0.7–11 ms（72 dpi，与既有 `wait_for_cached_page` 同量级）；缓存收益只在工作集 ≤ 8 页时成立（8 页第二轮 22.3 → 0.0 ms），顺序扫 20 页命中率 **0**（先进先出淘汰）；`VmRSS` 增量 ≈ 0.9 MB/页（首轮 20 页 +17.9 MB），Lisp 侧 `gcs-done` / `memory-info` 不具备分辨力。数据见 P0 计划「## 实测数据」。
@@ -238,6 +239,9 @@ M0–M6 已完成并归档，见 `openspec/completed/personal-notes-system.md`�
 - **2026-10-27 进展（P1 完成并归档）**：T1–T10 全部落地，计划归档于 `openspec/completed/2026-10-26-reader-multipage-p1-layout.md`（含逐批执行记录与偏差）。commit 清单：`d7ef467`（T1 布局骨架）/ `12d8911`+`4590f0b`（T1b+T2+T3）/ `19a5a91`+`80eb582`（T4 逐页几何）/ `c6caf85`+`4751929`+`27bdbbe`（像素级滚动三次修复）/ `78b273a`（计划回写）/ `b82e03d`（T5 缩放与 refit）/ `f83bb64`（T6 缓存与虚拟化）/ `e27dd78`（T7 删死族 + 真机三报错）/ `365198a`（T8 外围适配）/ `e2c6f02`（T9 测试基建）。验证基线：`make -C emacs/seshat-reader clean all` EXIT 0、warning 24（P0 基线 33 → 24，零新增）、checkdoc 0；`make -C emacs/tests ert` → 31 文件 / 1213 例 / 0 unexpected / 0 skipped。真机验收要点：滚动为像素级连续（`j` 不再等同 `n`）、逐页居中与宽页贴左、`W`/`H`/`+`/`-`/`0` 缩放后全部可见页同步清晰、跨页滚动 scale 不跳变、滚轮与按键手感一致（步长可配置）。遗留项（跨页选区、横向滚动整栏平移、异步渲染、C 侧 overlay 兼容外壳等）见 `openspec/tech-debt.md`「2026-10-27 阅读器多页布局（P1）遗留」。
 
 - **P2 候选已登记（2026-10-27）**：异步渲染与 idle 预取、跨页选区、横向滚动整栏平移、C 侧单页 overlay 机制退役、内存与驻留策略、L3 收尾确认、渲染基准回退分支、旋转页高亮坐标复核 —— 见 `openspec/active/2026-10-27-reader-multipage-p2-followups.md`（候选池，范围待用户圈定）。**P1 已完成并归档（31 文件 1219 例双零、warning 24、checkdoc 0；code-reviewer 三轮「可合入」）。**
+
+- **2026-10-27 进展（P2-A 已实现并归档，残余细项转「使用中观察」）**：用户圈定本轮范围 = **P2-2（跨页选区）+ P2-8（旋转页选区坐标）**，Android 本轮不改（另记 tech-debt）；C 侧在批次 A 前四批零改动，真机验收暴露的 `overlayp nil` 崩溃随后促成本批次唯一一次 C 侧改动（`render/elisp-helpers.c` 两处 nil 判定改 `env->eq` + `render-core.c` 的 `prepare_rect_query` 改为只读 buffer-local 文档指针，详见 `CHANGELOG.md`「修复 → 拖选抛 `overlayp nil`」）。已落地：跨页拖选不再 `user-error`，逐页取文取几何（`:page-rects`）、批注 `location` 新增 `pages:<a>-<b>;rect@<p>:…` 形态（单页仍写旧形态、逐字节不变）、旋转页坐标在 `seshat-reader-select-posn->page` 出口逆变换回未旋转页面空间、引用链接跨页降级为 `page:<起点页>`、ETAF/列表页码显示 `a-b`。文档同步：`docs/api.md` §4.5.3、`docs/emacs-reader.md` §5/§7/§12、`CHANGELOG.md`、`openspec/decisions.md`、`openspec/tech-debt.md`。验证：全量 ERT **37 文件 / 1327 例 / 0 unexpected / 0 skipped**、`make -C emacs/seshat-reader clean all` EXIT 0 且 warning **20** = 基线、checkdoc 0。**T9 真机验收 ⚠️ 部分**：用户 2026-10-27 报告 `overlayp nil` 修复后「生效了」（拖选取文可用、不再报错）；六项中的 ② 两页高亮位置、③ `a-b` 页码与 `RET` 跳首页、④ 旋转 90/180/270 框选位置、⑤ 旋转 + 跨页组合、⑥ 旧批注位置不变，以及 ETAF 卡片 `p.1-2`、500 段降级 `*Warnings*` 两个补充项**未逐项确认**，转「使用中观察」。**计划已归档**：`openspec/completed/2026-10-27-reader-multipage-p2a-cross-page-selection.md`（T0–T9 全 `[x]`，验收细则见其「执行记录 → T9 真机验收（用户）」）。
+- **候选池状态（2026-10-27）**：`P2-2`、`P2-8` 已完成并归档（见上）；`P2-1`（异步渲染 + idle 预取）、`P2-3`（横向滚动整栏平移）、`P2-4`（C 侧单页 overlay 退役）、`P2-5`（内存与驻留策略）、`P2-6`（P1 的 L3 十五项逐条复核）、`P2-7`（渲染基准回退分支）**仍在候选池**，未开工。
 
 ### M12 后续：阅读器暗色 5 档配色预设 + `T` 键循环切换（已完成）
 
@@ -269,7 +273,7 @@ M0–M6 已完成并归档，见 `openspec/completed/personal-notes-system.md`�
 2. GTD 深度（只读 / 可编辑 / repeater·DEADLINE·状态流转）—— M9.4 需要
 3. Reader「基础功能」清单（排除 TTS/词典/统计？）—— M10 需要
 4. EPUB 的 location 约定（CFI vs `chapter:x`）—— M10.3 需要 —— ✅ 已定稿（2026-10-22）：`chapter:<spineIndex>@<startOffset>-<endOffset>`（spine 0-based、章内字符偏移半开区间、UTF-16 code unit；退化形态 `chapter-<n>`），见 `docs/api.md` §4.6 与 `openspec/decisions.md` 2026-10-22
-5. M11.8 T6（`SPC o P` 全局键位）未做，属 UX 待办（见 tech-debt）
+5. M11.8 T6（`SPC o P` 全局键位）—— ✅ 已解决（2026-10-27）：`/home/thomas/thomas-emacs/lisp/init-reader.el` 的 `use-package seshat-reader` `:general` 段新增 `oP` 前缀 4 键（`p` 开合 / `a` 批注列表 / `t` 翻译 / `e` 解释），`make full-check` EXIT=0、ERT 271 例 0 unexpected、verify 实例四条 `key-binding` 断言 PASS
 6. PDF 手写批注的 `location` 协议（现有约定仅支持 `page:<n>;rect:x0,y0,x1,y1`，多点笔迹需扩展，例如 `page:<n>;ink:...`；需与 Emacs 端 rect 约定共存）—— M10.5 需要（已定稿：`page:<n>;ink:<color>,<widthPt>,<x0>,<y0>,...`，页面坐标，见 docs/api.md 4.5.1；2026-10-18）
 7. 含 `#`/`%` 的文档名引用 —— ✅ 已缓解（M7 引入 uid 形态承载身份：服务端 `refs` 支持 uid 形态，解析不再受文件名字符限制；Emacs 侧 `seshat:` 链接文本仍为 doc-id 形态，故为「缓解」而非「解决」，见 tech-debt「含 `#`/`%` 的文档名不支持引用」）
 

@@ -202,9 +202,10 @@
 - 影响：popper 的 `popper--delete-popup` 走 `quit-window`，不调本包 `--capture-state`；用户在 popper 关闭前手动 resize 的高度不会被记住（best-effort，接受为已知差异）。
 - 建议：若需精确记忆，可在 `window-size-change-functions` 或关闭钩子里捕获；当前不做。
 
-## 全局入口 `SPC o P` 未实现（M11.8 遗留，2026-10-17）
+## 全局入口 `SPC o P`（M11.8，2026-10-17）——已解决（M11.8 T6，2026-10-27）
 - 影响：面板只能从阅读器/批注命令内拉起，没有跨 buffer 的全局开关键（`seshat-reader-sidebar-toggle` 需 `M-x` 或 buffer 内 `q` 键）；面板内键位已由 M11.9 的 ETAF `:keys` 承担，但 `:keys` 只作用于面板 buffer 内部，技术上无法承担全局入口。
 - 建议：在 `thomas-emacs/lisp/init-keybind.el`（或 `init-reader.el`）加 `SPC o P` 前缀与 4 个绑定（`p` 批注 / `a` 添加 / `t` 翻译 / `e` 解释，以最终配置为准）；仅在 evil 的 normal/visual/motion 态生效（`leader!` 定义域）。
+- 解决：落在 `/home/thomas/thomas-emacs/lisp/init-reader.el` 的 `use-package seshat-reader` `:general` 段——`oP` 前缀 + 4 个绑定：`SPC o P p` → `seshat-reader-sidebar-toggle`（开合全部面板，无面板时重开最近一个）、`SPC o P a` → `seshat-reader-annotation-list`（批注列表）、`SPC o P t` → `seshat-reader-translate-selection`（翻译最近选区）、`SPC o P e` → `seshat-reader-translate-explain-selection`（解释最近选区）；包内零改动（四个命令早已存在）。键义与上述「建议」略有出入：`p` 落地为开合、`a` 为批注列表。生效域沿用 `leader!` 定义域（`:states '(normal visual motion)` + `:keymaps 'override`），故只在 evil 的 normal/visual/motion 态生效，insert/emacs 态无绑定；阅读 buffer 内仍用包内 `C-c C-o`，面板内 `q`。放在 `use-package seshat-reader`（无 `:defer`，启动即加载）的 `:general`，而非 `use-package seshat-reader-sidebar`（`:defer t`，绑定要等包加载才建立，首次打开面板前 `SPC o P` 是空的）。验证：`make -C /home/thomas/thomas-emacs full-check` EXIT=0（括号检查「所有文件括号检查通过。」/ `mcp-register-check` MCP registration OK（20 自定义 spec）/ ERT `Ran 271 tests, 270 results as expected, 0 unexpected, 1 skipped`）；verify 隔离实例四条 `key-binding` 断言全 PASS 且 `SPC o P` 前缀 `keymapp = t`。
 
 ## ETAF 在 pty/终端 frame 下挂起（M11.9，2026-10-17）
 - 影响：`script -qec … emacs -Q -nw` 等 **pty / 终端 frame** 下 `etaf-mount` 会挂起不返回；真机 GUI frame 正常（用户已 smoke 验证 `ETAF-SMOKE: OK 43`）。
@@ -961,10 +962,10 @@
 - 建议：`submit_job` 内对 `malloc` 判空，失败时返回 false，由调用方把该 CachedPage 置 `PAGE_STATUS_ERROR`（已有 `mark_cp_error` 可用），让渲染失败降级为错误页而不是崩溃。
 - 触发条件：内存紧张环境，或下次改 job 提交路径时。
 
-## 旋转页的 rect 采不准导致高亮可能错位（M12，2026-10-22）
-- 现状：`seshat-reader-select.el` 的选区取文**明确不支持旋转页**（`docs/api.md` §4.5 已把「不支持已旋转页面」写进 `location` 约定：页面旋转状态存于客户端渲染器内部，约定无法表达，旋转页上采集的坐标**静默错误**）。M12 的高亮按 `rect` 在 C 层按页面 `ctm` 绘制——`ctm` 含 `rotate`/缩放，而 `rect` 本身是「未旋转页面坐标」，两者对同一个 `rect` 的解释在旋转页上不一致。
-- 影响：旋转页上的批注高亮位置可能偏移（数据本身已错，渲染忠实反映了错的数据）；不旋转的页无此问题。
-- 建议：二选一——① 旋转页禁用高亮（渲染/投喂时按当前 `rotate` 跳过该页，用 `DocState` 或模块函数暴露的 `rotate` 判定）；② 让 C 暴露当前 `rotate` / `frame_scale` 供 elisp 侧先做坐标校正再投喂。②的收益更大（顺带修好 `location` 采集本身），但需要先在选区采集端对齐同一变换。
+## 旋转页的 rect 采不准导致高亮可能错位（M12，2026-10-22）——已解决（P2-A，2026-10-27：`seshat-reader-select-posn->page` 出口按 `seshat-reader--multipage-rotate` 逆变换回未旋转页面空间）
+- 现状（解决前）：`seshat-reader-select.el` 的选区取文**明确不支持旋转页**（`docs/api.md` §4.5 曾把「不支持已旋转页面」写进 `location` 约定）。M12 的高亮按 `rect` 在 C 层按页面 `ctm` 绘制——`ctm` 含 `rotate`/缩放，而 `rect` 本身是「未旋转页面坐标」，两者对同一个 `rect` 的解释在旋转页上不一致。
+- 影响（解决前）：旋转页上的批注高亮位置可能偏移（数据本身已错，渲染忠实反映了错的数据）；不旋转的页无此问题。
+- 建议（已采纳 ② 的 elisp 侧版本）：不新增 C 接口——`seshat-reader--multipage-rotate` 自 P1 起在 Lisp 侧可读（`defvar-local`，取值 ∈ {0,90,180,270}），坐标公式（0/90/180/270，90/270 交换宽高）经 C 侧 `fz_transform_page` 源码、同版本 MuPDF 实现与四象限灰度 PDF 像素实测三方核对；逆变换只在 `select-posn->page` 一处施加，避免多处换算叠加。残余项见本文件「`--page-space-size` 的 frame-scale 标定待真机」条。
 
 ## 高亮刷新与 strip 缓存的多窗口局限（M12，2026-10-22）
 - 现状：① `--refresh-highlights` 只重建**当前窗口**的 ±5 页缓存（`wait_for_win_jobs` → `nullify_window_cache` → `build_cache_window` → `display_cached_page`，均以当前 `EmacsWinState` 为作用域），同文档的其它窗口在各自下次 redisplay 前仍显示旧位图；② 跨页 strip 用的上一页 image spec 缓存 `seshat-reader--page-image-specs` 是 **buffer 级** `defvar-local`（上限 5 条），而记录时页号取「当前选中窗口」显示的页——多窗口显示同一文档的不同页时，strip 取到的「上一页」可能与自身窗口的上一页不符。
@@ -1666,11 +1667,11 @@
 ## 2026-10-27 阅读器多页布局（P1）遗留
 
 - **多页布局的内存上限**：同时驻留 spec ≤ 6 页（K=2），按 150 dpi ≈6.2 MB/页 × 2（Lisp 堆 + C 侧）≈ 75 MB 为告警线（`seshat-reader-multipage-memory-warning-mb`）；P1 不做异步预取与内存回收策略，长期滚动仍依赖视口淘汰。
-- **跨页选区未实现**：首期 `user-error`（决策 D7）；需「按阅读顺序拼接两页文本 + 跨页矩形集合（带页号）」。
+- **跨页选区未实现**：首期 `user-error`（决策 D7）；需「按阅读顺序拼接两页文本 + 跨页矩形集合（带页号）」。——**已解决（P2-A，2026-10-27）**：页区间由 `--posn-page-extent` / `--selection-page-rects` 求出、逐页调 C 侧单页接口取文取几何，文本按阅读顺序拼接（页间一个换行），几何存 `:page-rects`（`(PAGE X0 Y0 X1 Y1)`），location 写 `pages:<a>-<b>;rect@<p>:…`（单页仍写旧形态、逐字节不变）。落点：`openspec/completed/2026-10-27-reader-multipage-p2a-cross-page-selection.md`（批次 1–3）+ `docs/api.md` §4.5.3 + `openspec/decisions.md` 2026-10-27「跨页选区的 location 形态与引用链接降级」；残余降级见本文件「跨页选区的四类残余降级」条。
 - **横向滚动整栏平移**：`height` 模式与手动放大下，宽页横向滚动会让整栏（含邻页）一起移动（窗口级 hscroll）。
 - **宽页按宽裁剪的取舍**：基准页取「打开文档那一页」，异常宽页被缩到刚好不溢窗；若改用「全文档最大页」需新增 C 侧批量查页尺寸接口。
 - **异步渲染未做**：P1 全同步（0.7–11 ms/页），滚动到新页会阻塞；P2 再做异步 + idle 预取。
-- **C 侧单页 overlay 机制仅剩兼容外壳**：`init_overlay` / `init_win_state_ptr` / `get_win_state_ptr` / `--refresh-highlights` / `--window-close` 仍存在但 elisp 侧除 `--window-close`（释放 EmacsWinState）外已无调用；`elisp-helpers.c:279-287` 的 `overlay-put` 无 nil 守卫（`overlayp, nil` 的潜在来源）。
+- **C 侧单页 overlay 机制仅剩兼容外壳**：`init_overlay` / `init_win_state_ptr` / `get_win_state_ptr` / `--refresh-highlights` / `--window-close` 仍存在但 elisp 侧除 `--window-close`（释放 EmacsWinState）外已无调用；`elisp-helpers.c:279-287` 的 `overlay-put` 无 nil 守卫（`overlayp, nil` 的潜在来源）。——**已解决（P2-A 真机修复，2026-10-27）**：`overlayp nil` 不再有任何真实路径可达——① `check_current_overlay` / `get_current_doc_overlay` 的 nil 判定由 `emacs_value` 指针相等改为 `env->eq`（句柄相等不可靠，nil 真到达时原写法漏判，把 nil 喂进 `overlay-buffer` 即崩溃）；② `prepare_rect_query`（三个 rect 入口的唯一前半段）不再走 `get_reader_current_state`，改为只读 buffer-local 的 `seshat-reader-current-doc-state-ptr`（`get_doc_state_ptr`），overlay / `EmacsWinState` 与 `win_state->closing` 检查一并退出该路径。剩余外壳（`init_overlay` 等）**保留**：`--window-close` 仍需释放 `EmacsWinState`，且旧翻页/显示族 C 函数仍按自己的路径调用 `get_reader_current_state`；`elisp-helpers.c` 的 `overlay-put` 处未加 nil 守卫（无 elisp 调用者，加守卫等于给死代码加分支）。回归：`emacs/tests/seshat-reader-rect-query-overlay-test.el` 6 例（真实 `.so` + 真实 PDF，窗口 overlay 置 nil / 置外来 overlay / 置本 buffer 普通 overlay 三态对比），旧构建下 5/6 失败并复现 `(wrong-type-argument overlayp nil)`。
 - **`posn-*` 访问器在字节编译后被内联**：测试若要桩替必须加载同源 `.el`（已在 `emacs/tests/README.md` 记录）。
 
 ## 阅读器跨页落点无法用 ERT 覆盖 redisplay 交互（2026-10-27）
@@ -1755,3 +1756,42 @@
 - 影响：多 frame 且字体不同时，渲染高度与滚动几何可能差 ±1–2px（单 frame 无影响）；属「像素与 buffer 分叉」的最后一条残余路径。
 - 建议：给 `--multipage-page-span` 加 `&optional window`，并在 `--multipage-page-max-offset` 与 `--multipage-scroll` 的跨页循环里一路透传；改动面小，但需同步更新测试对 span 的调用。
 - 来源：`openspec/completed/2026-10-27-reader-page-separator.md`（归档后路径）。
+
+## 跨页选区的四类残余降级（P2-A，2026-10-27）
+
+- 现状：跨页选区（P2-A）已落地——拖选跨页不再 `user-error`，逐页取文取几何、location 写 `pages:<a>-<b>;rect@<p>:…`。以下四处是**本轮有意保留**的降级，不是缺陷，但也确实不是完整实现：
+  1. **跨页选区的 `seshat:` 引用链接降级为纯页锚** `page:<起点页>`（`--current-location` 与 org `:store` 两处写端共用 `--selection-cross-page-p` 判定），并 `message` 提示「跨页选区引用已降级为起点页锚点（第 N 页）」；
+  2. **跨页 explain / 翻译的上下文只覆盖起点页**：`translate.el` 的上下文扩展用 `:rect` 单 bbox，而 `:rect` 按 D1 恒为**起点页**的选区 bbox；翻译对象本身仍是 `:text` 全量；
+  3. **选区确认时的高亮闪现只落在起点页**：`--flash-selection` 仍只吃 `:rects`（起点页多段）；
+  4. **Android 不渲染 `pages:` 形态**（见下一条）。
+- 影响：①②③ 只在「跨页选区」这一新场景下可见——单页选区的行为与改造前完全一致；②会让跨页解释的模型输入缺少第二页上下文（用户可能以为模型看得到整段）；③会让用户确认选区时只看到首页闪一下（第二页无反馈，容易以为没选中）。
+- 建议：①引用链接若要保真，需先让读端 `--goto-location` / `--description` 支持 `pages:` 并定义「跳到哪一页」（当前哲学是「引用只需可复现落点」，改动前先确认需求）；②给 `translate.el` 的上下文装配加一条「跨页时按 `:page-rects` 逐页扩行」的路径，注意它会放大送模型的字符数（`seshat-reader-translate-context-max-chars` 需同步评估）；③要闪多页，得先让 `--normalize-flash-rects` / `--rect-valid-p` 接受 5 元组（目前只认 4 元组与 `(PAGE X0 Y0 X1 Y1)` 之外的形态各自归一），属批次 3 之后的独立改动。
+- 来源：`openspec/completed/2026-10-27-reader-multipage-p2a-cross-page-selection.md`（批次 1–4 的「偏差与遗留」小节）、`docs/emacs-reader.md` §5「跨页选区」与 §12 第 9 条。
+
+## Android 不解析 `pages:` 跨页形态（P2-A，2026-10-27）
+
+- 现状：`android/app/src/main/java/com/seshat/app/reader/LocationCodec.kt` 的 `parsePage` 在 `text.split(';').size > 2` 时直接返回 `Parsed.Unknown(location)`（多段 `rect:` 今日同样落这里），`pages:` 前缀也不在 `parse` 的分派表里。Android 端因此对跨页批注**不画高亮**，但**不抛异常、不崩溃**，批注本体（`text`）照常可读。
+- 影响：Emacs 产出的跨页批注在 Android 上没有页面高亮（列表里仍能看到该条批注与其正文）；用户若只在 Android 阅读，会觉得「这条批注怎么没有框」。属跨端能力差异，不是数据损坏——服务端按不透明串保存，原样回传给能解析的端。
+- 建议：需要时改 `LocationCodec.parsePage`——先按 `pages:` 前缀分派，解析 `a-b` 跨度与逐段 `rect@<page>:`，返回新的 `Parsed.PageRects`（多页矩形）；注意 `Parsed` 是封闭 union（`Unknown` / `Page` / `PageRect` / `Chapter` / `Ink`），新增分支要同时覆盖 `PdfReaderActivity` 与 EPUB 侧的所有 `when` 分支，并补单测（现有 Android 测试对多段 `rect:` 已断言「落 Unknown」，改语义会打红，属预期）。按 2026-10-27 用户确认，本轮（批次 A）**不改 Android**。
+- 来源：`docs/api.md` §4.5.3 的兼容表；`LocationCodec.kt:97`、`:107-119`。
+
+## `--page-space-size` 的 frame-scale 标定待真机（P2-A，2026-10-27）
+
+- 现状：`seshat-reader-select--page-space-size` 对「页面坐标单位」的假设是 `native × frame-scale`（与 `posn->page` 的 `image_px × frame_scale / page_scale` 对齐，`native` = 已旋转位图尺寸 ÷ 渲染 scale）。为不把单位误差带进几何，`--selection-page-rects` **不直接采信绝对值**，而用**起点页**的 `extent / native` 实测比例做标定（起点页结论与批次 1 逐值一致，其余页按同比例缩放），标定不可用时才退回绝对值。
+- 影响：真机上 `frame_scale ≠ 1` 或 `page_scale ≠ 渲染 scale` 时，中间页的 `y1`（非末页取该页自身高度）可能偏一个比例因子——表现为跨页高亮在第二页上下略有偏移。默认缩放下比例因子为 1，无影响。
+- 建议：T9 真机验收第 ⑤ 项（旋转页 + 跨页组合）时先在 `*Messages*` 里比对「标定比例」与 1 的差距；若发现偏移，优先查这里（而非旋转公式——旋转公式已由像素实测三方核对）。根治方式是让 C 侧把每页的 `page.width/height`（未旋转 pt 尺寸）批量暴露给 elisp，彻底去掉像素→pt 的换算假设。
+- 来源：`openspec/completed/2026-10-27-reader-multipage-p2a-cross-page-selection.md` 批次 2「偏差 ②（单位口径靠标定）」。
+
+## 矩形查询必须在阅读 buffer 内调用（`prepare_rect_query` 只看 buffer-local 文档指针，P2-A，2026-10-27）
+
+- 现状：`overlayp nil` 真机修复把 `prepare_rect_query`（`--text-in-rect` / `--rects-in-rect` / `--lines-in-rect` 三个入口共用的前半段）改为只依赖 buffer-local 的 `seshat-reader-current-doc-state-ptr`（`get_doc_state_ptr`），不再取窗口 overlay / `EmacsWinState`。
+- 影响：**任何在非阅读 buffer 里调用这三个入口的路径都会静默返回 nil**——早退刻意不 `message`（调用方可能在 redisplay 中），所以既不报错也不提示。写新测试或将来新增调用点时若忘了切到阅读 buffer，症状是「一个字符也取不到」而不是异常，比崩溃更难定位（改造前同类错误会以 `overlayp nil` 崩溃暴露，虽也不好但至少可见）。
+- 建议：新代码一律在阅读 buffer 上下文调用（`with-current-buffer` 到阅读 buffer，或沿用 `seshat-reader-select-drag` 的「在被拖窗口的 buffer 里执行整段手势」写法）；测试需要负向覆盖时，用显式「无文档指针 → 静默 nil」断言（见回归文件里的 `--no-doc-state-returns-nil`），不要指望它报错。
+- 来源：`CHANGELOG.md`「修复 → 拖选抛 `overlayp nil`」；`emacs/seshat-reader/render/render-core.c` 的 `prepare_rect_query`；`emacs/tests/seshat-reader-rect-query-overlay-test.el`。
+
+## `emacs/tests/Makefile` 无 `load-prefer-newer`，改 `.el` 不重编译 `.elc` 会静默跑旧代码（2026-10-27）
+
+- 现状：`emacs/seshat-reader/` 下存在 `seshat-reader.elc`、`seshat-reader-annotation.elc` 等构建产物（`.gitignore` 排除、不入库），而 `emacs/tests/Makefile` 的 ERT 入口只传 `-L`、没有 `(setq load-prefer-newer t)`，`.elc` 可用时即优先加载。于是只改 `.el` 而没重编译 `.elc` 时，ERT 断言的是旧代码——**静默假绿**，构建系统不报任何错。
+- 影响：任何改动 `emacs/seshat-reader/*.el` 的批次都必须记得 `make -C emacs/seshat-reader <file>.elc`，否则回归结论不可信。2026-10-27 的 `undo-outer-limit` 修复批次实测踩到：不重编译时新增用例仍失败（加载的是旧 `.elc`），重编译后才转绿。
+- 建议：二选一——① 在 `ert` 目标里加 `--eval "(setq load-prefer-newer t)"`（改一处，语义为「源码较新则用源码」）；② 给 `ert` 目标加 `.elc` 依赖（`%.elc: %.el`），由 make 保证同步。①更贴近「测试跑当前源码」的意图，②更接近真实加载路径，两者可并存，建议先做①。
+- 来源：`emacs/tests/Makefile`（`TEST_FILES := $(sort $(wildcard …))` 已能自动收集新增测试文件，问题只在 `.elc` 优先级）；本轮修复的执行记录。
