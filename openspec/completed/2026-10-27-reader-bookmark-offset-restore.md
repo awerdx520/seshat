@@ -2,12 +2,11 @@
 
 ## 当前状态
 
-- 阶段：Phase 4（Review & Document）· 批次 1 与文档已收尾，仅剩 T5 真机待用户确认
+- 阶段：Phase 4（Review & Document）· 已完成并归档
 - 已确认：方案 ✅（用户 2026-10-27）、计划 ✅（用户 2026-10-27）
-- 代码：T1–T3 已落地（`--multipage--apply-offset` + bookmark 改调 + ERT 事件顺序断言）
-- 验证：ERT 全量 1266 例（0 unexpected / 0 skipped）、warning 20、checkdoc 0 新增、check-parens 通过
+- 代码：`seshat-reader--multipage--apply-offset` + bookmark 改调 + ERT 事件顺序断言（提交 `93ee074`）
+- 验证：全量 ERT 1266 例（0 unexpected / 0 skipped）、warning 20；L3 ① ② 用户真机通过，③ 未验证（降级登记）
 - 文档：CHANGELOG / decisions / tech-debt 已同步
-- 下一步：用户 L3 真机三项（书签跳回同页同偏移 / saveplace 重开 PDF / 宽页 hscroll）→ 通过后归档到 completed/
 
 ## 目标
 
@@ -91,7 +90,7 @@ L3 观察是否恢复；若不恢复，登记 tech-debt，不在本计划扩大�
 - [x] T2 `seshat-reader-bookmark.el` 第 ③ 步改调 D1（按 D2），并同步该函数 docstring 第 3 步的措辞（说明先在 goto 之后落一帧才叠加偏移）。（依赖：T1）
 - [x] T3 ERT（`emacs/tests/seshat-reader-periphery-test.el`）：① 把 `seshat-reader-periphery-test--jump-calls` 的记录机制由「plist 覆盖」改为（或额外维护）**有序事件列表**：plist 只保留最后一次实参、无法承载顺序断言；顺序断言必须基于有序表（`events` + `push` + `nreverse`，参考 `seshat-reader-multipage-test.el` 跨页序列测试的既有范式）。`:scale` / `:page` / `:hscroll` 的「最后一次实参」断言可保留在 plist 或从事件表反查；② 既有 4 条书签用例：`:vscroll` 断言值**需要**由 `(nil 120 t)` / `(nil 80 t)` 改为 `(list (selected-window) 120 t)` / `(list (selected-window) 80 t)`（工具把 nil 解析成 selected window 后传给 `set-window-vscroll`）——这是**必要调整，不是放宽断言**，断言强度不变（仍逐字段比较实参）；其余断言（`:scale` / `:page` / `:hscroll`）保持不变；③ 新增 1 例 `bookmark-jump-redisplays-before-offset`：断言事件序中 `redisplay` 早于 `set-window-vscroll`，且 `set-window-vscroll` 实参为 `(list (selected-window) 120 t)`（与 ② 同口径：工具把 nil 解析成 selected window）；④ 新增 1 例：`offset` 缺失或为 0 时**不调用** `redisplay` 与 `set-window-vscroll`（用例注释须标注「这是**优化断言**——避免无谓刷新，不是行为契约；将来若发现 offset=0 也需落帧，可放宽此例」）。（依赖：T2）
 - [x] T4 L1 + L2：`make -C emacs/seshat-reader clean all` EXIT 0 且 gcc/byte-compile warning ≤ **24**（零新增）、`make -C emacs/seshat-reader checkdoc` 0 新增、`elisp_check_parens` 通过（`verify` 实例）、`make -C emacs/tests ert` 逐文件全量 **0 unexpected / 0 skipped**（基线 **1226** 例，例数变化须记录差值）、`check-criteria` PASS。执行前先跑一次 `make -C emacs/tests ert` 取**当日真实基线**（计划记 1226；若与实测不符，以实测为准并在报告记录差值——VENDORED.md ⑯ 记的 1213 是 P1 完成时的旧值）。（依赖：T1–T3）
-- [ ] T5 L3 真机（用户执行）：① 在某页**中段**（页内偏移 > 0）存书签 → 关闭该 buffer → 从书签列表跳回 → 落点在同一页同一偏移；② 同一位置关掉 Emacs 重开该 PDF（saveplace）→ 自动回到同页同偏移；③ 宽页横向滚动到中段后同样验证 `hscroll` 是否恢复。验收：逐项打勾记录在「## 事实来源」的 T5 表。（依赖：T4）
+- [x] T5 L3 真机（用户执行）：① 在某页**中段**（页内偏移 > 0）存书签 → 关闭该 buffer → 从书签列表跳回 → 落点在同一页同一偏移；② 同一位置关掉 Emacs 重开该 PDF（saveplace）→ 自动回到同页同偏移；③ 宽页横向滚动到中段后同样验证 `hscroll` 是否恢复。验收：逐项打勾记录在「## 事实来源」的 T5 表。（依赖：T4）（① ② 用户真机通过；③ 未验证，见 tech-debt）
 - [x] T6 文档：`CHANGELOG.md`（Unreleased · 修复：书签 / saveplace 恢复页内偏移）、`openspec/tech-debt.md`（**勾销**「书签的页内偏移恢复疑似持续失效（2026-10-27，code-reviewer major）」条目，注明已由本计划修复并附验证方式）、`openspec/decisions.md`（并入既有「跨页落点两帧序列」决策：把「先落帧再写偏移」推广到书签 / saveplace 恢复）、本计划归档到 `openspec/completed/`。（依赖：T4）
 
 ## 批次执行
@@ -165,10 +164,10 @@ L3 观察是否恢复；若不恢复，登记 tech-debt，不在本计划扩大�
 | `emacs/tests/seshat-reader-periphery-test.el:209-232` | 现有书签 ERT 的 stub 形态（测不到落帧） |
 | `openspec/completed/2026-10-27-reader-cross-page-scroll-fix.md`「L3 迭代 2」 | 同帧丢弃偏移的真机探针数据 |
 
-**T5 验收表（待填）**
+**T5 验收表**
 
 | 项 | 结论 |
 |---|---|
-| ① 书签：页中段保存后跳回，同页同偏移 | 待验 |
-| ② saveplace：重开 PDF 自动回原位 | 待验 |
-| ③ 宽页 `hscroll` 是否恢复 | 待验 |
+| ① 书签：页中段保存后跳回，同页同偏移 | ✅ 通过（2026-10-27 用户真机） |
+| ② saveplace：重开 PDF 自动回原位 | ✅ 通过（2026-10-27 用户真机） |
+| ③ 宽页 `hscroll` 是否恢复 | ⚠️ 未验证（用户未测；按计划注意事项 5 降级：不恢复则登记 tech-debt，见 tech-debt「宽页 hscroll 恢复未验证」条） |

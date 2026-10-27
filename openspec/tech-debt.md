@@ -1691,12 +1691,13 @@
 - 影响：行高与光标实际可见高度的差异会造成阈值边界处的保守/激进判断——阈值偏大时可能少移动一次 point（光标仍部分可见，Emacs 不会回滚偏移，安全）；阈值偏小时多移动一次（落到邻居页行首，同样安全）。当前两种误差都不影响正确性，只是落点可能与「光标刚好露出 1px」的边界不同。
 - 建议：若将来出现边界场景的观感问题，改用光标的实际度量（`(window-text-pixel-size)` 或 `window-cursor-pixel-height` 一类接口）后再校核；改动需真机复验。
 
-## 书签的页内偏移恢复疑似持续失效（2026-10-27，code-reviewer major）——已修复（2026-10-27，批次 A）
+## 书签的页内偏移恢复疑似持续失效（2026-10-27，code-reviewer major）——已修复并验证（2026-10-27，批次 A）
 
 - 现状：`emacs/seshat-reader/seshat-reader-bookmark.el:117-118` 先调 `seshat-reader--multipage-goto`（内部执行 `set-window-start`）再直接 `set-window-vscroll offset`，两步之间**没有落帧**。
 - 影响：与本轮确证的「同帧丢弃偏移」同根——若真机确认，则「存书签 → 跳回」的页内偏移会被清零（每次都落回页首），而 ERT 因为桩掉了 `set-window-vscroll` 看不出来。属**未验证的疑似缺陷**，本轮未改（计划明确不碰 bookmark）。
 - 建议：修复方式与本轮跨页序列一致——在 `set-window-start` 与写偏移之间补一次 `(redisplay t)`，或直接复用跨页序列；修复后必须真机验「设页内偏移 → 存书签 → 跳回 → 偏移仍在」，并同步补一条 tech-debt 之外的回归说明。
 - 已解决（2026-10-27）：按上面的「建议」落地——新增 `seshat-reader--multipage--apply-offset`（先 `(redisplay t)` 落帧再 `set-window-vscroll`；nil 窗口按 selected window 解析；非正数 offset 既不动作也不落帧），`seshat-reader-bookmark-jump` 第 ③ 步改调它，saveplace 经同一 handler 一并受益。**ERT 断言了落帧顺序**（事件序中 `redisplay` 早于 `set-window-vscroll`，实参 `(list (selected-window) 120 t)`），全量 **1266** 例 0 unexpected / 0 skipped。**T5 真机（书签跳回同页同偏移 / 关掉 Emacs 重开 PDF 验证 saveplace / 宽页 `hscroll`）待用户确认**——ERT 只能证明落帧发生在写偏移之前，不能证明偏移跨 redisplay 存活，故本条**暂留**于此，真机三项通过后再删。
+- 已完成（2026-10-27）：用户真机确认 ① 书签跳回同页同偏移、② saveplace 重开 PDF 自动回原位 均通过。③ 宽页 hscroll 未验证，另立条目跟踪。
 
 ## 阅读器跨页存在一帧「新页顶部」中间态（2026-10-27）
 
@@ -1724,3 +1725,9 @@
 - 建议：改为 `(with-demoted-errors "seshat-render-core: %S" (require 'seshat-render-core))`，语义不变且消除该告警；修完跑 L1 + L2 复核 warning 数（计划记 24 → 23，以当日实测为准）。
 - 备注：非本次修复引入，属既有问题；发现时机与上下文——L3 加载源码版时 `*Messages*` 里出现该 warning，随后追到 `seshat-reader.el:87`。复现命令：`emacs --batch -Q --eval '(prin1 (macroexpand-1 (quote (with-demoted-errors (require (quote seshat-render-core))))))'`。
 - 已解决（2026-10-27）：改为 `(with-demoted-errors "seshat-render-core: %S" (require 'seshat-render-core))`，`require` 语义不变（失败仍被 demote 成 `*Messages*` 一行），并补注释说明「必须给出 FORMAT」。**该 warning 在 `make all` 里出现 4 次**（`seshat-reader.el` 被编译 1 次 + 作为依赖被其余 3 个编译进程加载），故实测基线由 **24 → 20**（不是计划预估的 24 → 23，计划按 1 次计数估算）。验证：`make -C emacs/seshat-reader clean all` EXIT 0、warning **20**（改动前同命令实测 24，逐条 diff 只少这 4 条、零新增）、`make -C emacs/seshat-reader checkdoc` 0 报错、`check-parens` 通过、`make -C emacs/tests ert` **33** 文件 **1266** 例（0 unexpected / 0 skipped）、`make -C emacs/tests check-criteria` PASS。
+
+## 宽页水平滚动（hscroll）在书签恢复时是否保留未验证（2026-10-27）
+
+- 现状：`seshat-reader-bookmark-jump` 第 ④ 步用 `(set-window-hscroll nil hscroll)` 恢复横向位置，但尚未真机验证；书签偏移批次计划 `openspec/completed/2026-10-27-reader-bookmark-offset-restore.md` 注意事项 5 明确「若 L3 发现它也不恢复，登记 tech-debt 另议」。
+- 影响：宽页（页面宽于窗口）横向滚动到中段后存书签，跳回时可能回到最左侧，属体验缺陷，不影响垂直偏移的正确性。
+- 建议：下次阅读宽页文档时顺手验证；若不恢复，另开小计划（可能同样需要「落帧后再设 hscroll」的次序）。
