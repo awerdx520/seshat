@@ -3747,6 +3747,17 @@ Keybindings:
 	      ;; messes up centering(line-prefix) otherwise, the
 	      ;; default value is 8, so we keep it at that.
 	      left-fringe-width 8)
+  ;; 阅读 buffer 是**只读渲染视图**：正文由原生模块生成、buffer 永远只读，
+  ;; undo 历史对用户没有任何用途。但 `find-file' 会把整份文档读进 buffer，
+  ;; 随后 `seshat-reader--render-buffer' 的 `erase-buffer' 把这整份内容记成
+  ;; 一次 undo「saved text」（多页布局的重排还会反复全量重写，再记一份），
+  ;; 于是 undo 记录量 ≈ 文件大小。实测打开 32,085,636 字节的 PDF 时，undo
+  ;; 记录达到 32,086,307 字节，被 `undo-outer-limit' 判超限，Emacs 丢弃整份
+  ;; 记录并弹警告，白占内存。故在渲染之前把 `buffer-undo-list' 置 t（关闭
+  ;; 记录）——治本，而不是调大 `undo-outer-limit'（那只是把内存与崩溃风险往后
+  ;; 推）。必须早于下面的 `--render-buffer'：`erase-buffer' 一旦跑过就已经记
+  ;; 上了。
+  (setq-local buffer-undo-list t)
   (set-buffer-modified-p nil)
   (seshat-reader--disable-evil)
   ;; `global-hl-line-mode'（全局化 minor mode）会在
