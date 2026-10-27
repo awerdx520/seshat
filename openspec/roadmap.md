@@ -17,6 +17,7 @@
 - 2026-10-26 进展（阅读器面板宽度）：**译文/解释面板正文宽度跟随窗口 + valign** 实施完成并归档（计划 `openspec/completed/2026-10-26-reader-panel-width-follow-and-valign.md`，T1–T6 全部完成）：新增 defcustom `seshat-reader-translate-visual-fill-column-ratio`（默认 `0.94`，`nil` = 回退旧行为即正文固定全局 `fill-column`）与 `seshat-reader-translate-valign`（默认 `t`）；新增内部函数 `--vfcm-available-width`（与 vfcm `--window-max-text-width` 同源：`window-width` 取 `remap` 单位 → 扣左右 margin → 按 `text-scale` 折减，**不用 `window-body-width`**）、`--vfcm-follow-window`（设 buffer-local `visual-fill-column-width` = 可用宽 × ratio，再调公开命令 `visual-fill-column-adjust`）、`--vfcm-refresh`（hook 入口，`ignore-errors`）；`--prepare-view` 以 **prepend** 注册 buffer-local `window-state-change-functions`（vfcm 自身 `append`，顺序颠倒会退化为「第一次 resize 不变、第二次才变」），`--render-panel` 在显示之后补一次 refresh 收口首帧；valign 仅折行模式生效、非图形环境静默跳过；vfcm 的 `visual-fill-column-center-text` 不设，默认左对齐、右侧约 6% 留白；`seshat-reader-sidebar.el` 的承载分派 / 宽度记忆 / 差量算法**零改动**，仅补一处正文刷新兜底（新增 `--refresh-panel-text-width`，在 `--resize-width` 的两个成功出口显式调 `--vfcm-refresh`，`fboundp` 守卫、不 require translate）。L1 `make -C emacs/seshat-reader clean all` EXIT 0、warning **33** = 基线、checkdoc 0 报错；L2 translate **159** / sidebar **143** / 全仓 **28** 个测试文件 **1150** 例、0 unexpected / 0 skipped；文档八处同步（`docs/emacs-reader.md` / `docs/configuration.md` / `docs/architecture.md` / `emacs/seshat-reader/VENDORED.md` / `CHANGELOG.md` / `openspec/decisions.md` / `openspec/tech-debt.md` / 本路线图）；**T6 已完成，计划已归档（`openspec/completed/2026-10-26-reader-panel-width-follow-and-valign.md`）；L3 六项由用户真机实测通过（含扩大/恢复同步变宽收窄、阅读 buffer 中按 `w`、表格列对齐）；另修 `w` 的正文跟随不再依赖 hook（resize 出口显式 refresh）**。
 
 - 2026-10-26 进展（PDF 多页连续布局 P0）：**按页渲染查询接口 P0 已完成并归档**（计划 `openspec/completed/2026-10-26-reader-multipage-p0-page-spec-api.md`，T0–T8 全部完成）：新增 C 入口 `seshat-reader-dyn--page-image-spec`（arity `2..3`，1-based 页号，同步、零副作用；从 `draw_page_thread` 抽出 `render_page_to_buffer` 且 PNM 字节 sha256 与改造前一致）与 elisp 包装 `seshat-reader--page-spec`（含上限 8 的会话内缓存 + 两处清理挂点）；**零用户可见行为变更**（不接入任何显示/滚动路径）。L1 `make -C emacs/seshat-reader all` EXIT 0、warning **33** = 基线、checkdoc 0 报错；L2 全仓 ERT **29** 个测试文件 **1163** 例、0 unexpected / 0 skipped（新增 `seshat-reader-page-spec-test.el` 13 例，真实 `.so` + 真实 PDF）；L3 由既有翻页/缩放/批注冒烟覆盖（C 侧行为逐字节等价）。实测数据（单页 0.7–11 ms、缓存收益仅在工作集 ≤ 8 页时成立、`VmRSS` ≈ 0.9 MB/页）已写入计划的「## 实测数据」小节，并据此登记 P1 的 7 项前置技术债。**下一步：P1（buffer 多页布局 + 页号派生 + 删 strip 全族）待启动。**
+- 2026-10-27 进展（阅读器暗色）：**5 档配色预设 + `T` 键循环切换**两计划已完成并归档（`openspec/completed/2026-10-27-reader-dark-tint-presets.md` / `openspec/completed/2026-10-27-reader-dark-tint-cycle-key.md`）：C 侧新增 `--doc-tint`（走 MuPDF `fz_tint_pixmap`），暗色状态由「文档级 `DocState.invert`」改为**进程级**（`reset_doc_state` 不再清零 ⇒ 重载 / 新开文档自动保持），`graphite` 档保留历史 invert+gamma 路径作逐位一致的回退口；elisp 侧 5 档预设（默认 `charcoal`）+ `seshat-reader-dark-tint-cycle`（宿主配置层绑 `T`），并删除宿主历史补丁 `+seshat-reader-dark-after-render`。L1 warning 24 = 基线、L2 逐文件 32 文件 / 1244 例（排除并发新增文件的 2 例既有失败后 31 / 1238）0 unexpected、thomas-emacs `make full-check` EXIT 0；**L3 真机合并目测 13 项 + 删 advice 后复验 3 项全通过**（用户 2026-10-27）。
 
 ## 背景与起点
 
@@ -237,6 +238,20 @@ M0–M6 已完成并归档，见 `openspec/completed/personal-notes-system.md`�
 - **2026-10-27 进展（P1 完成并归档）**：T1–T10 全部落地，计划归档于 `openspec/completed/2026-10-26-reader-multipage-p1-layout.md`（含逐批执行记录与偏差）。commit 清单：`d7ef467`（T1 布局骨架）/ `12d8911`+`4590f0b`（T1b+T2+T3）/ `19a5a91`+`80eb582`（T4 逐页几何）/ `c6caf85`+`4751929`+`27bdbbe`（像素级滚动三次修复）/ `78b273a`（计划回写）/ `b82e03d`（T5 缩放与 refit）/ `f83bb64`（T6 缓存与虚拟化）/ `e27dd78`（T7 删死族 + 真机三报错）/ `365198a`（T8 外围适配）/ `e2c6f02`（T9 测试基建）。验证基线：`make -C emacs/seshat-reader clean all` EXIT 0、warning 24（P0 基线 33 → 24，零新增）、checkdoc 0；`make -C emacs/tests ert` → 31 文件 / 1213 例 / 0 unexpected / 0 skipped。真机验收要点：滚动为像素级连续（`j` 不再等同 `n`）、逐页居中与宽页贴左、`W`/`H`/`+`/`-`/`0` 缩放后全部可见页同步清晰、跨页滚动 scale 不跳变、滚轮与按键手感一致（步长可配置）。遗留项（跨页选区、横向滚动整栏平移、异步渲染、C 侧 overlay 兼容外壳等）见 `openspec/tech-debt.md`「2026-10-27 阅读器多页布局（P1）遗留」。
 
 - **P2 候选已登记（2026-10-27）**：异步渲染与 idle 预取、跨页选区、横向滚动整栏平移、C 侧单页 overlay 机制退役、内存与驻留策略、L3 收尾确认、渲染基准回退分支、旋转页高亮坐标复核 —— 见 `openspec/active/2026-10-27-reader-multipage-p2-followups.md`（候选池，范围待用户圈定）。**P1 已完成并归档（31 文件 1219 例双零、warning 24、checkdoc 0；code-reviewer 三轮「可合入」）。**
+
+### M12 后续：阅读器暗色 5 档配色预设 + `T` 键循环切换（已完成）
+
+计划与执行记录：`openspec/completed/2026-10-27-reader-dark-tint-presets.md` 与 `openspec/completed/2026-10-27-reader-dark-tint-cycle-key.md`（**均已归档，2026-10-27**）。
+
+| 子项 | 内容 | 状态 |
+|---|---|---|
+| — | **C 侧 tint 与进程级暗色状态**：新增 `seshat-reader-dyn--doc-tint`（`0xRRGGBB` 双色，`fz_tint_pixmap`）；暗色从「文档级 `DocState.invert`」改为 `atomic_bool g_dark_enabled` + 打包 tint 值，`reset_doc_state` 不再清零；`graphite` 走历史 invert+gamma（PNM sha256 逐位一致，回退口） | ✅ 2026-10-27 |
+| — | **elisp 侧 5 档预设 + 循环命令**：`seshat-reader-dark-tint-presets`（`graphite` / `midnight` / `charcoal` 默认 / `night-sepia` / `sepia`）+ `seshat-reader-dark-tint` defcustom + `seshat-reader-dark-tint-cycle`（表序前进 / 负前缀反向 / 表外值从表首起 / 暗色关着时自动开启且只重绘一次） | ✅ 2026-10-27 |
+| — | **宿主配置层**：`T` 绑到 `seshat-reader-mode-map` 本体（与 `d` 开关并列，包内无默认键位）；删除历史补丁 `+seshat-reader-dark-after-render`（进程级语义下冗余） | ✅ 2026-10-27 |
+
+- 状态：**已完成并归档（2026-10-27）**。L1 `make all` EXIT 0、warning **24** = 基线零新增、checkdoc 0；L2 逐文件 **32 文件 / 1244 例**（排除并发会话新建测试文件的 2 例既有失败后 31 / 1238）0 unexpected / 0 skipped；thomas-emacs `make full-check` EXIT=0。**L3 真机合并目测 13 项 + 删 advice 后复验 3 项全通过**（5 档循环与回绕、`graphite` 观感一致、关色后按 `T` 自动开启且只重绘一次、帮助页真实键位、`C-l` 重载保持暗色与预设、关暗色后重载保持白底）。
+- **外部可见的行为变化**：`--doc-invert` 由「文档级」改为「进程级开关」，且无文档时不再返回 `nil`（改为返回 `t`）。
+- 已知限制（见 `openspec/tech-debt.md`）：tint 按亮度映射到两色 ⇒ 彩图/彩色封面变单色调（用户 2026-10-27 明确接受）；配色进程级共享 ⇒ 同一 Emacs 内所有 reader buffer 同一档；`sepia` 亮底上默认黄色装饰偏淡。
 
 ## 风险登记
 

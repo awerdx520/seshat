@@ -1,15 +1,15 @@
 # 阅读器暗色模式：5 档配色预设（tint）与进程级暗色偏好
 
 ## 当前状态
-- 阶段：Phase 4（Review & Document）· 批次 3 完成，等待 L3 真机目测 + 配置侧收尾
-- 已确认：方案要素 ✅（用户 2026-10-27 选「全做，先给一档试用」，默认预设 `charcoal`）；计划 ✅（用户 2026-10-27 确认，plan-reviewer 有条件通过后已修订）；**D2 定稿 = A（进程级 static，用户 2026-10-27 拍板）**
+- 阶段：已完成（Phase 4 收尾完毕，2026-10-27 归档）
+- 已确认：方案要素 ✅（用户 2026-10-27 选「全做，先给一档试用」，默认预设 `charcoal`）；计划 ✅（用户 2026-10-27 确认，plan-reviewer 有条件通过后已修订）；**D2 定稿 = A（进程级 static，用户 2026-10-27 拍板）**、L3 目测 ✅（用户 2026-10-27：合并目测 13 项 + 删 advice 后复验 3 项全通过）、配置侧收尾 ✅（2026-10-27）
 - D2 定稿的后续已落地：`openspec/decisions.md` 已写入决策条目、`2026-10-26-reader-multipage-p1-layout.md` 的注记行已更新为「D2 已定为 A」
 - 与在飞计划的关系：`openspec/active/2026-10-26-reader-multipage-p1-layout.md` 的 **multipage T4 已落地（批次 3，commit `19a5a91` + `80eb582`）**，`seshat-reader--render-buffer` / `--redisplay-all-windows` / dark-mode body 都已是多页版；本计划在其结果上编辑，**只读** `--render-buffer` / `--redisplay-all-windows` / `--page-image-spec` 一族，不改其语义与布局逻辑
 - **共同编辑点（必须串行，风险项）**：`seshat-reader-dark-mode` 的 body（`emacs/seshat-reader/seshat-reader.el:2883-2894`，`--doc-invert` 调用在 `:2893`）是**本计划 T3** 与 **multipage 计划 T4** 的**共同编辑点**——两处**不得在同一 worktree 并行编辑**，必须**串行合并**：先落地者先合，后落地者在其上 rebase（本计划 T3 先落地 → multipage T4 rebase 其上；反之亦然）。合并后**必须重跑定向 ERT**（`seshat-reading-test` / `seshat-reader-multipage-test` / `seshat-reader-theme-test`）。现实风险：T3 需在 T4 **已落地代码**上编辑，merge 冲突概率低但**语义需复核**（尤其 `--redisplay-all-windows` 现为多页重绘，一次 dark 切换会重渲染全部可见页 ±2 页）
 - **已知影响（T4 落地后新增）**：dark-mode 每次切换 / 改配色都会触发多页重渲染（可见页 ±2，每页约 7ms 量级，**估算，L3 校准**；P0 实测单页 0.7–11 ms），切换预设时可见轻微延迟，属可接受开销
 - 执行状态：批次 0 ✅（基线 + 安全点）/ 批次 1 ✅（T1+T2 C 侧；`.so` md5 `26caf7e758c1a4286032ca2e291b4198`，gcc warning 0，`make clean all` EXIT 0）/ 批次 2 ✅（T3+T4 elisp 侧 + 新建 `seshat-reader-theme-test.el` 11 例；定向 ERT theme 11/11、reading 49/49、multipage 39/39）/ 批次 3a ✅（T5 全量验证：**31 文件 / 1166 例 / `unexpected = 0` / `skipped = 0`**，86.8 秒；byte-compile 25 条 = 基线零新增；`.invert` 残留 0；未触发修复循环/回滚）
-- 下一步：① **L3 真机目测**（T7，用户：重启 Emacs 后逐档确认 5 档观感 + 重载后保持暗色）；② **thomas-emacs 配置侧收尾**（T6 配置侧：删 `+seshat-reader-dark-after-render` advice、设 `(setq seshat-reader-dark-tint 'charcoal)`、配置仓 CHANGELOG 一条）
-- 注记（2026-10-27）：T7 的真机目测可直接用 `seshat-reader-dark-tint-cycle`（配置层绑定在阅读 buffer 的 `T`，见 `openspec/active/2026-10-27-reader-dark-tint-cycle-key.md`）逐档检查 5 档观感与「切档后立即刷新」。
+- 下一步：已归档到 `openspec/completed/2026-10-27-reader-dark-tint-presets.md`；配套计划 `2026-10-27-reader-dark-tint-cycle-key.md` 亦已归档；本计划遗留：thomas-emacs 侧（`lisp/init-reader.el` + `CHANGELOG.md`）已落盘但未提交，提交口径待与并发会话的未提交改动一并确定
+- 注记（2026-10-27）：T7 的真机目测可直接用 `seshat-reader-dark-tint-cycle`（配置层绑定在阅读 buffer 的 `T`，见 `openspec/completed/2026-10-27-reader-dark-tint-cycle-key.md`）逐档检查 5 档观感与「切档后立即刷新」。该计划已于 2026-10-27 归档。
 - 批次 0 ✅（2026-10-27）：基线 PNM 已采集并落盘（采集时 `HEAD = 80eb582`，`.so` 未重编、md5 `501eb339…`），安全点引用 `0f531f7`（`git stash create`，不改工作目录）。数据见下方「## 基线数据」；取证期间并行会话把 HEAD 推进到 `c6caf85`（仅 elisp），基线已在其上复验一致
 
 ## 目标
@@ -197,12 +197,16 @@ if (dark_enabled())
 
   **执行记录（批次 3a ✅）**：全量 ERT **31 文件 / 1166 例 / `unexpected = 0` / `skipped = 0` / 86.8 秒**（相对 1144 例基线 **+22**：新建 theme-test +11、multipage 28 → 39 即 +11）。**必须逐文件跑**——单进程一次跑完全量会出现 `annotation` / `annotation-queue` 共 **6 例既有假失败**，与本次改动无关，不是回归。`make -C emacs/seshat-reader clean all` EXIT 0、gcc warning **0**、`make checkdoc` **0 新增**；byte-compile 全仓 **25 条 = 基线**（其中 `seshat-reader.el` 单文件 **20 = 基线 20**）→ **零新增**。grep 不变量：`.invert` 残留 **0**、`DocState` 内 `invert` **0**、`doc-tint` 生产调用 **1** 处 + `declare-function` **1** 处 + 测试桩 **4** 处。**未触发修复循环、未触发回滚**（安全点 `0f531f7` 未使用，保留改动）。
 
-- [ ] T6 文档同步 + thomas-emacs 配置侧（逐条对应「文档清单」）：若 D2 定稿为 A → ① 在 `openspec/decisions.md` **追加**本计划给出的草稿条目（附在下方「## decisions.md 待写入草稿」，格式与既有条目一致：`## 日期 · 标题` + `**决策**` / `**理由**` / `**代价与约束**`）；② 删除 `lisp/init-reader.el` 的 `+seshat-reader-dark-after-render`（advice 定义 + `advice-add` 注册 + 相关注释）与 mode-hook 里「每次重新下发」的必要性说明；③ `init-reader.el` 里加 `(setq seshat-reader-dark-tint 'charcoal)` 作为试用默认；④ thomas-emacs `CHANGELOG.md` 记一条。若定稿为 B → 只保留配置侧「新增默认预设」一项，advice 不动。另外：在 `openspec/active/2026-10-26-reader-multipage-p1-layout.md` 的 T4 条目**末尾追加一行注记**（内容见「文档清单」），**不改其任务内容**——**D2 未定稿不得写这一行**。（依赖：T5 + D2 定稿）
+- [x] T6 文档同步 + thomas-emacs 配置侧（逐条对应「文档清单」）：若 D2 定稿为 A → ① 在 `openspec/decisions.md` **追加**本计划给出的草稿条目（附在下方「## decisions.md 待写入草稿」，格式与既有条目一致：`## 日期 · 标题` + `**决策**` / `**理由**` / `**代价与约束**`）；② 删除 `lisp/init-reader.el` 的 `+seshat-reader-dark-after-render`（advice 定义 + `advice-add` 注册 + 相关注释）与 mode-hook 里「每次重新下发」的必要性说明；③ `init-reader.el` 里加 `(setq seshat-reader-dark-tint 'charcoal)` 作为试用默认；④ thomas-emacs `CHANGELOG.md` 记一条。若定稿为 B → 只保留配置侧「新增默认预设」一项，advice 不动。另外：在 `openspec/active/2026-10-26-reader-multipage-p1-layout.md` 的 T4 条目**末尾追加一行注记**（内容见「文档清单」），**不改其任务内容**——**D2 未定稿不得写这一行**。（依赖：T5 + D2 定稿）
 
   - [x] **T6 文档部分 ✅（由批次 3b-1 代理执行）**：`openspec/decisions.md` 追加草稿条目（已于批次 0 落盘）+ `docs/architecture.md` / `docs/emacs-reader.md` / `docs/configuration.md` / `emacs/seshat-reader/VENDORED.md` / `CHANGELOG.md` / `emacs/seshat-reader/NEWS` / `openspec/tech-debt.md` + multipage 计划 T4 注记行（内容见「## 文档清单」）。
-  - [ ] **T6 配置侧（thomas-emacs）——未勾，待收尾**：② 删 `lisp/init-reader.el` 的 `+seshat-reader-dark-after-render`（定义 + `advice-add` + 注释）与 mode-hook 说明；③ 加 `(setq seshat-reader-dark-tint 'charcoal)`；④ thomas-emacs `CHANGELOG.md` 记一条。**前置**：L3 目测通过后再动配置仓（避免回退时改两处）。
+  - [x] **T6 配置侧（thomas-emacs）✅**：② 删 `lisp/init-reader.el` 的 `+seshat-reader-dark-after-render`（定义 + `advice-add` + 注释）与 mode-hook 说明；③ 加 `(setq seshat-reader-dark-tint 'charcoal)`；④ thomas-emacs `CHANGELOG.md` 记一条。**前置**：L3 目测通过后再动配置仓（避免回退时改两处）。
 
-- [ ] T7 L3 真机目测（用户执行）：**重启 Emacs**（新 `.so` 无法热加载）后，用 5 档预设各打开同一 PDF 的同一页，逐项确认：① `charcoal` 正文可久读、对比度可接受；② `graphite` 与改动前观感一致（回退口有效）；③ 彩图/封面单色调可接受；④ `sepia` 亮底可读、装饰（高亮/笔迹）仍可见；⑤ 重载（`C-l` 或重开文档）后仍是暗色与当前预设（D2-A 生效判据；D2-B 下应表现为回白底，与现状相同）；⑥ 切预设后立即刷新（不需重启）。验收：逐项打勾记录在计划「执行记录」。（依赖：T5、T6）
+    **执行记录（批次 3 · 配置侧 ✅）**：`lisp/init-reader.el` 删除 `+seshat-reader-dark-after-render`（defun + docstring + `advice-add` + 上方 HACK 注释，**−37 行 / +0**，纯删除，文件 292 → 255 行；② 项完成）；`grep -n 'dark-after-render\|advice-add' lisp/init-reader.el` → 零命中；`+seshat-reader--dark-target` / `+seshat-reader-theme-follow-h` / `(add-hook 'seshat-reader-mode-hook #'+seshat-reader-theme-follow-h)` 均完整保留。**计划 ③ 未执行（偏差）**：未加 `(setq seshat-reader-dark-tint 'charcoal)` —— 理由：包内 `seshat-reader-dark-tint` 的 defcustom 默认值已是 `'charcoal`（`emacs/seshat-reader/seshat-reader.el:3906`），宿主显式 `setq` 会覆盖用户日后通过 `customize` 保存的选择，属净负面；计划意图（试用默认 charcoal）已由 defcustom 满足。**连带修补（计划外）**：`+seshat-reader-theme-follow-h` 的 docstring 与文件头注释块里三处「DocState.invert 置 1/0」「下方 revert advice 语义相反」「重载后重应用」的过时陈述已改写为进程级语义 —— 删除 advice 后它们成了指向不存在代码的错误说明。④ 项完成：thomas-emacs `CHANGELOG.md` 在 `## [未发布]` 下、`T` 键条目之后插入 10 行条目（纯插入，`git diff -U0` 无 `-` 行；既有 eimg / 截图迁入 / markdown 卡顿三条零改动）。验证：`cd /home/thomas/thomas-emacs && make full-check` **EXIT=0**（`所有文件括号检查通过。` / `MCP registration OK（20 自定义 spec 全部通过校验）` / `Ran 271 tests, 270 results as expected, 0 unexpected, 1 skipped`，skip 为既有 `test-eca-stream-flush-interval`）；`init-reader.el` 独立 `check-parens` → `parens-ok`。**未提交**（该仓 `CHANGELOG.md` 与并发会话新增同处一个未提交块，提交口径待定）。**待办**：删除 advice 后「`C-l` 重载保持暗色 / 关暗色后重载保持白底」两条端到端需用户复验一次（此前 L3 那次是 advice 在起作用）；通过后勾 T7 并归档。
+
+- [x] T7 L3 真机目测（用户执行）：**重启 Emacs**（新 `.so` 无法热加载）后，用 5 档预设各打开同一 PDF 的同一页，逐项确认：① `charcoal` 正文可久读、对比度可接受；② `graphite` 与改动前观感一致（回退口有效）；③ 彩图/封面单色调可接受；④ `sepia` 亮底可读、装饰（高亮/笔迹）仍可见；⑤ 重载（`C-l` 或重开文档）后仍是暗色与当前预设（D2-A 生效判据；D2-B 下应表现为回白底，与现状相同）；⑥ 切预设后立即刷新（不需重启）。验收：逐项打勾记录在计划「执行记录」。（依赖：T5、T6）
+
+    **执行记录（批次 4 · L3 ✅）**：用户 2026-10-27 重启 daemon 后复验三项全通过：① `d` 开暗色 → `C-l` 重载 → **仍暗色且保持同一预设档位**；② `d` 关暗色（白底）→ `C-l` 重载 → **仍白底**（确认删除 advice 后不会「重载又变暗」）；③ 按 `T` 仍能切档且立即重绘（未因删除 advice 而退化）。加上此前与 `2026-10-27-reader-dark-tint-cycle-key.md` 计划的合并目测 13 项（5 档观感 + 循环与回绕 + 负前缀反向 + 关色后按 `T` 自动开启且只重绘一次 + 非 reader buffer 只改偏好 + 帮助页真实键位 + `graphite` 回退口一致性 + 切档即时生效），本计划 T7 六项验收全部通过（其中 ① `charcoal` 可久读 / ③ 彩图单色调可接受 / ④ `sepia` 亮底可读且装饰可见 / ⑤ 重载保持 / ⑥ 立即刷新 均由用户确认为「正常」）。
 
 ## 执行顺序（每批独立验收）
 
@@ -211,8 +215,8 @@ if (dark_enabled())
 | 0 ✅ | 采「改动前」PNM sha256 基线（T1 验收用）+ `git stash create` 安全点（`0f531f7`）→ 已完成，数据见「## 基线数据」 | — | 低 |
 | 1 ✅ | T1 + T2（C 侧，`clean all` 重编） | L1 + L2（`fboundp` / sha256 / 分支开关） | 中（像素级回归靠 sha256 守门） |
 | 2 ✅ | T3 + T4（elisp + 测试） | L1 + L2（定向 ERT） | 低 |
-| 3 ⏳（T5 ✅ / T6 文档 ✅、配置侧待） | T5（全量回归）+ T6（文档与配置侧，需 D2 定稿） | L1 + L2 + L3 文档一致性 | 低 |
-| 4 | T7 L3 真机（用户） | L3 | 中（观感只能目测） |
+| 3 ✅ | T5（全量回归）+ T6（文档与配置侧，需 D2 定稿） | L1 + L2 + L3 文档一致性 | 低 |
+| 4 ✅ | T7 L3 真机（用户） | L3 | 中（观感只能目测） |
 
 - 批次间不跨批提交；批内 C 与 elisp 若互相依赖（`--doc-tint` 未注册时 elisp 侧会 `void-function`），则合为 1 个 feat commit，并在报告中说明理由。
 

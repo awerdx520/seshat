@@ -1,9 +1,9 @@
 # 阅读器暗色配色预设：一键循环切换命令与 `T` 键位
 
 ## 当前状态
-- 阶段：Phase 4（Review & Document）· 文档同步完成，L3 目测待用户
-- 已确认：方案 ✅（用户 2026-10-27 确认，放置层选定 B：**命令进包、键位由配置层绑定**）、计划 ✅（用户 2026-10-27 确认，plan-reviewer 有条件通过后已修订）
-- 下一步：**L3 由用户重启 Emacs 后自测**（不做 `load` 热生效，遵循 I2：非用户显式要求不回写运行实例）。自测清单见 T7 条目末尾「L3 自测清单」。通过后：勾 T7 → 假设复盘 → 归档到 `openspec/completed/`
+- 阶段：已完成（Phase 4 收尾完毕，2026-10-27 归档）
+- 已确认：方案 ✅（用户 2026-10-27 确认，放置层选定 B：**命令进包、键位由配置层绑定**）、计划 ✅（用户 2026-10-27 确认，plan-reviewer 有条件通过后已修订）、L3 目测 ✅（用户 2026-10-27，13 项全通过）
+- 下一步：已归档到 `openspec/completed/2026-10-27-reader-dark-tint-cycle-key.md`；本计划遗留：thomas-emacs 侧 `T` 绑定与 CHANGELOG 已落盘、提交口径待与用户另定
 - 独立审查：plan-reviewer ⚠️ **有条件通过**（无阻塞项；4 个重要级 I1–I4 + 7 个建议 S1–S7）→ **已逐条修订**，处置表见「## 审查与修订」
 - 与在飞计划的关系：`openspec/active/2026-10-27-reader-dark-tint-presets.md`（已到 Phase 4，T7 真机目测未做）。本计划**只读**它在 T3 产出的 `seshat-reader-dark-tint-presets` / `seshat-reader-dark-tint` / `seshat-reader--dark-tint-colors` / `seshat-reader-dyn--doc-tint` 契约，**不改**其语义、不改 C 侧、不重编 `.so`。
 - **共同编辑点（必须串行，不得并行）**：与在飞暗色计划共有**三处**：
@@ -142,7 +142,7 @@
   **验收**：`cd /home/thomas/thomas-emacs && make full-check` 通过（thomas-emacs 的 L1 结构性门禁：check-parens + mcp-register-check + test；`validate` 目标属 `~/.config/eca` 仓，本仓不适用）；`ls -l` 复核 `init-reader.el` 的 diff 只含 `:general` 一行 + 注释，**未触碰** `+seshat-reader-dark-after-render`。
   **执行记录（批次 4 ✅）**：`lisp/init-reader.el` 在 `:general` 内 `"d"` 之后追加 `"T" #'seshat-reader-dark-tint-cycle`（第 `155` 行），并在相邻注释补 `d`/`T` 分工说明（`git diff` 仅这两处：`3` 行注释新增 + `:general` 内 `1` 增 `1` 改；**未触碰** `+seshat-reader-dark-after-render` 与 `add-hook 'seshat-reader-mode-hook` 注册，`git diff -- lisp/init-reader.el | grep -c after-render` = `0`）；`CHANGELOG.md` 在 `## [未发布]` 段首追加一条（`8` 行新增，未覆盖既有条目）。验证：验收句原写的目标在本仓**不存在**（`make: *** 没有规则可制作目标“validate”。 停止。`，EXIT=`2`；该目标是 ECA 配置仓的，计划 T6 验收句属跨仓笔误，已在本批改为 `make full-check`）——改跑本仓等价 L1 结构性门禁 `make full-check`（`check-parens` + `mcp-register-check` + `test`，见 `Makefile`）：EXIT=`0`（「所有文件括号检查通过。」/「MCP registration OK（20 自定义 spec 全部通过校验）」/`Ran 276 tests, 275 results as expected, 0 unexpected, 1 skipped`，skip 为既有 `test-eca-stream-flush-interval`）；`init-reader.el` 括号 `ok`（宿主 `emacs -Q --batch` 的 `check-parens` → `parens-ok`）；`git diff --stat` = `CHANGELOG.md | 8 ++++++++` + `lisp/init-reader.el | 5 ++++-`（`2 files changed, 12 insertions(+), 1 deletion(-)`）。与暗色计划 T6 配置侧的串行约束已遵守（该计划的配置侧改动仍未做）。
 
-- [ ] **T7 文档同步 + L3 目测**（依赖：T5、T6；其中文档同步只依赖 T5，L3 目测依赖 T6 的键位绑定，由用户执行）
+- [x] **T7 文档同步 + L3 目测**（依赖：T5、T6；其中文档同步只依赖 T5，L3 目测依赖 T6 的键位绑定，由用户执行）
   1. 按「文档清单」逐项更新（`docs/emacs-reader.md` / `docs/configuration.md` / `emacs/seshat-reader/NEWS` / `CHANGELOG.md`）。
   2. 在 `openspec/active/2026-10-27-reader-dark-tint-presets.md` 的「当前状态」追加一行注记：T7 目测可用本计划的 `T` 连续切档（**只加注记，不改其任务内容**）。
   3. L3（用户）：热生效到主实例（`make all` 后 `(load (locate-library "seshat-reader") nil nil)`，若 A5 复核为否改用 `straight-rebuild-package`）→ 打开 PDF 连按 `T` 走一遍 5 档，确认：无闪/无残留、`graphite` 与旧观感一致、非预设自定义值起步行为符合 D1、暗色关闭时按 `T` 会自动开启。
@@ -160,6 +160,17 @@
   8. 阅读 buffer 按 `?`：帮助页应出现「开合暗色模式」「切换暗色配色预设」两行；因配置层已绑 `d` / `T`，两行应显示真实键位而非 `M-x`。
   9. `graphite` 一档与改动前的满量程反色观感一致（回退口有效）。
   逐项打勾后把结论补在本条下；任一项不符则记录现象（哪一档、有无闪烁、echo 文案）并停下来报我。
+  **L3 结果（用户 2026-10-27 真机实测 ✅ 全部通过）**：按计划 T7 第 3 条与「L3 自测清单」9 项执行，另合并覆盖暗色计划的验收项（见下）。逐项：
+  ① **前置**：重启 daemon 后 `(fboundp 'seshat-reader-dark-tint-cycle)` = `t`、`(lookup-key seshat-reader-mode-map (kbd "T"))` = `seshat-reader-dark-tint-cycle`（配置层绑定加载成功）。
+  ② **前进与 echo**：打开 PDF 按 `T`，echo 显示 `Dark tint: night-sepia`（默认 `charcoal` 前进一档），画面立即换色。
+  ③ **五档循环与回绕**：连按 `T` 走完 `night-sepia → sepia → graphite → midnight → charcoal` 并回绕；每档无闪烁、无残留旧色页、滚动后仍保持当前档。
+  ④ **反向**：`C-u - T` 反向一档，echo 同步。
+  ⑤ **关色后按 `T`**：先按 `d` 回白底，再按 `T` 自动开启暗色，且只重绘一次（不闪两下）。
+  ⑥ **非 reader buffer**：`*scratch*` 里 `M-x seshat-reader-dark-tint-cycle` 只改 `seshat-reader-dark-tint` 全局偏好，已打开的 PDF 画面不变。
+  ⑦ **帮助页**：阅读 buffer 按 `?` 出现「开合暗色模式」「切换暗色配色预设」两行，且显示配置层真实键位 `d` / `T`（非 `M-x`）。
+  ⑧ **`graphite` 回退口**：与改动前的满量程反色观感一致。
+  ⑨ **切档即时生效**：任一切档后无需重启或 `C-l` 即刷新。
+  **合并覆盖暗色计划 `2026-10-27-reader-dark-tint-presets.md` 的 T7 项**：③ 覆盖其 ⑥「切预设后立即刷新」；另有主观项经用户确认可接受 —— `charcoal` 正文可久读、彩图/封面单色调可接受、`sepia` 亮底正文可读且高亮/笔迹装饰仍可见、切档重渲染的轻微延迟可接受（可见页 ±2 页）。
 
 ## 执行顺序（每批独立验收）
 
