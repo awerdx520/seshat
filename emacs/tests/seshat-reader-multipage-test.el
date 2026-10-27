@@ -894,6 +894,15 @@ one-line scroll into a page turn.")
 (defvar seshat-reader-multipage-test--scroll-syncs 0
   "How many times `--multipage-sync' was called.")
 
+(defvar seshat-reader-multipage-test--scroll-redisplays 0
+  "How many times `redisplay' was called by the code under test.
+
+A forced redisplay is expensive, so only the page-crossing path may ask for
+one: the scroll code flushes a frame there so that the new window start lands
+before the pixel scroll is written (Emacs drops a scroll that is set in the
+same frame as a new window start).  Scrolling inside a page must leave this
+at 0.")
+
 (defmacro seshat-reader-multipage-test--with-scroll-stubs (&rest body)
   "Run BODY with a stubbed window: no redisplay, recorded scroll calls.
 
@@ -908,7 +917,8 @@ line under point would be caught instead of silently matching the stub."
   (declare (indent 0) (debug t))
   `(let ((seshat-reader-multipage-test--scroll-starts nil)
          (seshat-reader-multipage-test--scroll-vscrolls nil)
-         (seshat-reader-multipage-test--scroll-syncs 0))
+         (seshat-reader-multipage-test--scroll-syncs 0)
+         (seshat-reader-multipage-test--scroll-redisplays 0))
      (cl-letf (((symbol-function 'window-start)
                 (lambda (&optional _window)
                   seshat-reader-multipage-test--scroll-start))
@@ -932,6 +942,11 @@ line under point would be caught instead of silently matching the stub."
                 (lambda (&optional _window)
                   (setq seshat-reader-multipage-test--scroll-syncs
                         (1+ seshat-reader-multipage-test--scroll-syncs))
+                  nil))
+               ((symbol-function 'redisplay)
+                (lambda (&optional _force _frame)
+                  (setq seshat-reader-multipage-test--scroll-redisplays
+                        (1+ seshat-reader-multipage-test--scroll-redisplays))
                   nil)))
        ,@body)))
 
@@ -974,8 +989,11 @@ the viewport on a line start, which cannot express \"half a page\"."
   "Scrolling past the bottom of a page moves the viewport to the next page row.
 
 The remainder of the distance becomes the pixel offset of the new page, which
-is what makes the transition continuous instead of a jump to the page top."
-  (let ((buffer (seshat-reader-multipage-test--scroll-fixture '(1 2))))
+is what makes the transition continuous instead of a jump to the page top.
+Point follows the viewport to the row of the page below: the row start of page
+2 is cut off by the 50px offset, and a point on a row that the offset pushed
+out of sight would let the redisplay drop that offset again."
+  (let ((buffer (seshat-reader-multipage-test--scroll-fixture '(1 2 3))))
     (unwind-protect
         (seshat-reader-multipage-test--window-pixels 1000 800
           (seshat-reader-multipage-test--with-window-buffer buffer
@@ -984,21 +1002,29 @@ is what makes the transition continuous instead of a jump to the page top."
                     (seshat-reader-multipage-test--row-position 1)
                     seshat-reader-multipage-test--scroll-offset 450)
               (seshat-reader-multipage-test--with-scroll-stubs
-                ;; 450 + 100 = 550 → 跨过 500px 的第 1 页，余 50px
+                ;; 450 + 100 = 550 → 跨过 500px 的第 1 页，余 50px。第 3 页必须
+                ;; 存在：末页的页内偏移受窗口高约束（页高 500 < 窗高 800 →
+                ;; 上限 0），落在末页会把 50px 的余量夹成 0。
                 (should (= 50 (seshat-reader--multipage-scroll 100)))
                 (should (= 50 seshat-reader-multipage-test--scroll-offset))
                 (should (equal (list (seshat-reader-multipage-test--row-position 2))
                                seshat-reader-multipage-test--scroll-starts))
                 (should (= (seshat-reader-multipage-test--row-position 2)
-                           seshat-reader-multipage-test--scroll-start))))))
+                           seshat-reader-multipage-test--scroll-start))
+                ;; point 落到视口里可见的下一个页行行首（第 3 页）
+                (should (= (seshat-reader-multipage-test--row-position 3)
+                           (point)))))))
       (kill-buffer buffer))))
 
 (ert-deftest seshat-reader-multipage-test--geometry-scroll-down-crosses-two-pages ()
   "A long scroll crosses several pages in one call, keeping the last remainder.
 
 1100px from 400px into page 1 lands 100px into page 3: the loop subtracts one
-page span per iteration instead of stopping at the first page change."
-  (let ((buffer (seshat-reader-multipage-test--scroll-fixture '(1 2 3))))
+page span per iteration instead of stopping at the first page change.  Page 4 is
+there so that the remainder is not clamped by the last-page ceiling (a 500px page
+in the stubbed 800px window allows 0), and point ends on the row of page 4, the
+page below the viewport."
+  (let ((buffer (seshat-reader-multipage-test--scroll-fixture '(1 2 3 4))))
     (unwind-protect
         (seshat-reader-multipage-test--window-pixels 1000 800
           (seshat-reader-multipage-test--with-window-buffer buffer
@@ -1010,7 +1036,9 @@ page span per iteration instead of stopping at the first page change."
                 (should (= 100 (seshat-reader--multipage-scroll 700)))
                 (should (= 100 seshat-reader-multipage-test--scroll-offset))
                 (should (= (seshat-reader-multipage-test--row-position 3)
-                           seshat-reader-multipage-test--scroll-start))))))
+                           seshat-reader-multipage-test--scroll-start))
+                (should (= (seshat-reader-multipage-test--row-position 4)
+                           (point)))))))
       (kill-buffer buffer))))
 
 (ert-deftest seshat-reader-multipage-test--geometry-scroll-down-clamps-at-last-page ()
@@ -1018,7 +1046,10 @@ page span per iteration instead of stopping at the first page change."
 
 The clamp is also what terminates the loop when there is no page left to
 cross: without it the target would keep growing and the scroll would show the
-blank space below the last page."
+blank space below the last page.  The last page is bounded by the window height
+too (`seshat-reader--multipage-page-max-offset'): page 2 is 500px high while the
+stubbed window body is 800px, so the page already fits the window and allows no
+in-page offset at all."
   (let ((buffer (seshat-reader-multipage-test--scroll-fixture '(1 2))))
     (unwind-protect
         (seshat-reader-multipage-test--window-pixels 1000 800
@@ -1028,9 +1059,9 @@ blank space below the last page."
                     (seshat-reader-multipage-test--row-position 2)
                     seshat-reader-multipage-test--scroll-offset 450)
               (seshat-reader-multipage-test--with-scroll-stubs
-                ;; 页高 500 → 页内最大偏移 499
-                (should (= 499 (seshat-reader--multipage-scroll 5000)))
-                (should (= 499 seshat-reader-multipage-test--scroll-offset))
+                ;; 末页上限 = 页高 500 − 窗高 800 → 0（不再是 页高 − 1 = 499）
+                (should (= 0 (seshat-reader--multipage-scroll 5000)))
+                (should (= 0 seshat-reader-multipage-test--scroll-offset))
                 (should (= (seshat-reader-multipage-test--row-position 2)
                            seshat-reader-multipage-test--scroll-start))
                 (should-not seshat-reader-multipage-test--scroll-starts)
@@ -1042,9 +1073,11 @@ blank space below the last page."
 (ert-deftest seshat-reader-multipage-test--geometry-scroll-up-stays-inside-page ()
   "A short upward scroll only reduces the pixel offset.
 
-The page does not change, so `set-window-start' stays untouched and the view
-does not snap to the page top."
-  (let ((buffer (seshat-reader-multipage-test--scroll-fixture '(1 2))))
+The page does not change, so `set-window-start` stays untouched and the view
+does not snap to the page top.  Page 2 is followed by page 3 on purpose: the last
+page of a document is bounded by the window height, and a 500px page in the
+stubbed 800px window would clamp the offset to 0 instead of 170."
+  (let ((buffer (seshat-reader-multipage-test--scroll-fixture '(1 2 3))))
     (unwind-protect
         (seshat-reader-multipage-test--window-pixels 1000 800
           (seshat-reader-multipage-test--with-window-buffer buffer
@@ -1063,7 +1096,9 @@ does not snap to the page top."
 
 Going up by 60px from 10px into page 2 lands 450px into page 1 (500 - 50), not
 at the top of page 1: the distance crosses the page boundary by 50px and the
-remainder is measured from the *bottom* of the previous page."
+remainder is measured from the *bottom* of the previous page.  Point moves to the
+row of page 2, i.e. to a row the scrolled viewport shows, instead of the row start
+that the offset hides."
   (let ((buffer (seshat-reader-multipage-test--scroll-fixture '(1 2))))
     (unwind-protect
         (seshat-reader-multipage-test--window-pixels 1000 800
@@ -1078,7 +1113,10 @@ remainder is measured from the *bottom* of the previous page."
                 (should (equal (list (seshat-reader-multipage-test--row-position 1))
                                seshat-reader-multipage-test--scroll-starts))
                 (should (= (seshat-reader-multipage-test--row-position 1)
-                           seshat-reader-multipage-test--scroll-start))))))
+                           seshat-reader-multipage-test--scroll-start))
+                ;; point 落在顶页下方那一页（第 2 页）的行首
+                (should (= (seshat-reader-multipage-test--row-position 2)
+                           (point)))))))
       (kill-buffer buffer))))
 
 (ert-deftest seshat-reader-multipage-test--geometry-scroll-up-clamps-at-first-page ()
@@ -1099,6 +1137,239 @@ stops the scroll; the viewport stays on page 1 with no pixel offset."
                 (should (= 0 seshat-reader-multipage-test--scroll-offset))
                 (should-not seshat-reader-multipage-test--scroll-starts)))))
       (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-screen-scroll-crosses-page ()
+  "A screen scroll crosses a page and keeps its large remainder on screen.
+
+`SPC' / `DEL' move by a whole screen (790px here: the 800px body minus one context
+line), so the remainder after a page cross is close to a whole page: 100 + 790
+crosses the 500px first page and leaves 390px of page 2 as the pixel offset.  That
+offset is far larger than one text line, so point has to follow the viewport to the
+row of page 3; leaving it on the row start of page 2 would let the redisplay drop
+the whole offset."
+  (let ((buffer (seshat-reader-multipage-test--scroll-fixture '(1 2 3)))
+        (next-screen-context-lines 1))
+    (unwind-protect
+        (seshat-reader-multipage-test--window-pixels 1000 800
+          (seshat-reader-multipage-test--with-window-buffer buffer
+            (with-current-buffer buffer
+              (setq seshat-reader-multipage-test--scroll-start
+                    (seshat-reader-multipage-test--row-position 1)
+                    seshat-reader-multipage-test--scroll-offset 100)
+              (seshat-reader-multipage-test--with-scroll-stubs
+                (should (= 790 (seshat-reader--scroll-screen-pixels
+                                (selected-window))))
+                (seshat-reader-scroll-down-screen)
+                (should (= 390 seshat-reader-multipage-test--scroll-offset))
+                (should (equal (list (seshat-reader-multipage-test--row-position 2))
+                               seshat-reader-multipage-test--scroll-starts))
+                (should (= (seshat-reader-multipage-test--row-position 3)
+                           (point)))))))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-scroll-up-crosses-page-with-gap ()
+  "Crossing a page upwards leads point to the next page row, never to a gap line.
+
+With `seshat-reader-page-gap-lines` > 0 the line after a page row is one of the gap
+lines of that page, so `(forward-line 1)` would leave point on a line whose screen
+position is `page height - vscroll` -- above the top of the window after an upward
+cross, which lets the redisplay drop the offset again.  The row of the page below
+(page 2 here) is the only correct landing place."
+  (let ((seshat-reader-page-gap-lines 2)
+        (buffer nil))
+    (unwind-protect
+        (progn
+          ;; gap 行在插入页行时生成，必须在建 fixture 之前绑定
+          (setq buffer (seshat-reader-multipage-test--scroll-fixture '(1 2 3)))
+          (seshat-reader-multipage-test--window-pixels 1000 800
+            (seshat-reader-multipage-test--with-window-buffer buffer
+              (with-current-buffer buffer
+                (let ((gap-line (save-excursion
+                                  (goto-char
+                                   (seshat-reader-multipage-test--row-position 1))
+                                  (point))))
+                  ;; fixture 真的有 gap 空行：第 1 页页行之后还不是第 2 页页行
+                  (should-not (= gap-line
+                                 (seshat-reader-multipage-test--row-position 2)))
+                  (setq seshat-reader-multipage-test--scroll-start
+                        (seshat-reader-multipage-test--row-position 2)
+                        seshat-reader-multipage-test--scroll-offset 10)
+                  (seshat-reader-multipage-test--with-scroll-stubs
+                    ;; span = 500 + 2 × 10 = 520；10 − 60 → 上一页页内余 470
+                    (should (= 470 (seshat-reader--multipage-scroll -60)))
+                    (should (= 470 seshat-reader-multipage-test--scroll-offset))
+                    (should (= (seshat-reader-multipage-test--row-position 1)
+                               seshat-reader-multipage-test--scroll-start))
+                    (should (= (seshat-reader-multipage-test--row-position 2)
+                               (point)))
+                    (should-not (= gap-line (point)))))))))
+      (when buffer (kill-buffer buffer)))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-scroll-syncs-before-vscroll ()
+  "A crossed page is flushed before the pixel scroll is written.
+
+Two Emacs behaviours shape this order: `seshat-reader--multipage-sync` inserts or
+recycles page rows, and modifying the buffer invalidates the window state and
+clears the pixel scroll that was just set; and a pixel scroll set in the same
+frame as a *new* `window-start` is dropped as well (measured on a real frame:
+3090 -> 0, while the same offset applied after the new start had been displayed
+survived).  The crossing path therefore zeroes the old offset, sets the new
+start, syncs, forces one `redisplay` and only then writes the offset.  What is
+asserted here is the recorded *order* of those calls, not just that they happen."
+  (let ((buffer (seshat-reader-multipage-test--scroll-fixture '(1 2 3)))
+        (events nil))
+    (unwind-protect
+        (seshat-reader-multipage-test--window-pixels 1000 800
+          (seshat-reader-multipage-test--with-window-buffer buffer
+            (with-current-buffer buffer
+              (setq seshat-reader-multipage-test--scroll-start
+                    (seshat-reader-multipage-test--row-position 1)
+                    seshat-reader-multipage-test--scroll-offset 450)
+              (cl-letf (((symbol-function 'window-start)
+                         (lambda (&optional _window)
+                           seshat-reader-multipage-test--scroll-start))
+                        ((symbol-function 'set-window-start)
+                         (lambda (_window pos &optional _noforce)
+                           (push (cons 'set-window-start pos) events)
+                           pos))
+                        ((symbol-function 'window-vscroll)
+                         (lambda (&optional _window _pixels-p)
+                           seshat-reader-multipage-test--scroll-offset))
+                        ((symbol-function 'set-window-vscroll)
+                         (lambda (_window value &optional _pixels-p)
+                           (push (cons 'set-window-vscroll value) events)
+                           (setq seshat-reader-multipage-test--scroll-offset value)
+                           value))
+                        ((symbol-function 'redisplay)
+                         (lambda (&optional _force _frame)
+                           (push (cons 'redisplay nil) events)
+                           nil))
+                        ((symbol-function 'seshat-reader--multipage-sync)
+                         (lambda (&optional _window)
+                           (push (cons 'sync nil) events)
+                           nil))
+                        ((symbol-function 'frame-char-height)
+                         (lambda (&optional _frame)
+                           seshat-reader-multipage-test--scroll-line-height)))
+                ;; 跨页一次：450 + 100 跨过第 1 页，余 50
+                (should (= 50 (seshat-reader--multipage-scroll 100)))
+                (setq events (nreverse events))
+                (should (equal '(set-window-vscroll set-window-start sync
+                                 redisplay set-window-vscroll)
+                               (mapcar #'car events)))
+                ;; 旧页偏移先清零，避免把它带进新页那一帧
+                (should (= 0 (cdr (nth 0 events))))
+                ;; 新 start 落在第 2 页页行，然后才落帧
+                (should (= (seshat-reader-multipage-test--row-position 2)
+                           (cdr (nth 1 events))))
+                ;; 落帧之后才写 clamp 后的最终偏移
+                (should (= 50 (cdr (nth 4 events))))))))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-scroll-inside-page-does-not-redisplay ()
+  "Scrolling inside a page never forces a frame.
+
+The forced `redisplay` exists only to give a new window start its own frame
+before the pixel scroll is written; an in-page scroll uses the window it already
+has, so it must not pay for a frame (and must not flash one)."
+  (let ((buffer (seshat-reader-multipage-test--scroll-fixture '(1 2 3))))
+    (unwind-protect
+        (seshat-reader-multipage-test--window-pixels 1000 800
+          (seshat-reader-multipage-test--with-window-buffer buffer
+            (with-current-buffer buffer
+              (setq seshat-reader-multipage-test--scroll-start
+                    (seshat-reader-multipage-test--row-position 1)
+                    seshat-reader-multipage-test--scroll-offset 100)
+              (seshat-reader-multipage-test--with-scroll-stubs
+                (should (= 130 (seshat-reader--multipage-scroll 30)))
+                (should (= 130 seshat-reader-multipage-test--scroll-offset))
+                (should-not seshat-reader-multipage-test--scroll-starts)
+                (should (= 0 seshat-reader-multipage-test--scroll-redisplays))
+                (should (= 1 seshat-reader-multipage-test--scroll-syncs))))))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-place-point-ignores-small-offset ()
+  "An offset of at most one text line leaves point on the page row start.
+
+A small pixel offset only cuts a sliver off the page row, so the cursor stays
+visible and Emacs keeps the scroll: point stays on the row start of the page at the
+top of the window (the old behaviour) instead of moving to the row of the page
+below.  One pixel more than a text line is already enough to move it."
+  (let ((buffer (seshat-reader-multipage-test--scroll-fixture '(1 2 3))))
+    (unwind-protect
+        (seshat-reader-multipage-test--window-pixels 1000 800
+          (seshat-reader-multipage-test--with-window-buffer buffer
+            (with-current-buffer buffer
+              (seshat-reader-multipage-test--with-scroll-stubs
+                ;; 行高桩为 10px：5px 与 10px 都不超过一行
+                (dolist (vscroll (list 5 seshat-reader-multipage-test--scroll-line-height))
+                  (goto-char (point-max))
+                  (seshat-reader--multipage--place-point (selected-window) 1 vscroll)
+                  (should (= (seshat-reader-multipage-test--row-position 1)
+                             (point))))
+                ;; 11px > 一行 → 落到第 2 页页行行首
+                (goto-char (point-max))
+                (seshat-reader--multipage--place-point (selected-window) 1 11)
+                (should (= (seshat-reader-multipage-test--row-position 2)
+                           (point)))))))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-place-point-needs-next-page-row ()
+  "Without a row for the page below, point stays on the current page row.
+
+`seshat-reader--multipage--place-point` runs after `seshat-reader--multipage-sync`
+settled the resident set, so it must not render the missing page: the row of the
+page below is looked up in the resident set, and when it is absent point goes to
+the row start of the page at the top of the window while no page row is added."
+  (let ((buffer (seshat-reader-multipage-test--scroll-fixture '(1 2 3))))
+    (unwind-protect
+        (seshat-reader-multipage-test--window-pixels 1000 800
+          (seshat-reader-multipage-test--with-window-buffer buffer
+            (with-current-buffer buffer
+              (seshat-reader--multipage-recycle-page 2)
+              (should (equal '(1 3) (seshat-reader-multipage-test--page-numbers)))
+              (goto-char (point-max))
+              (seshat-reader-multipage-test--with-scroll-stubs
+                (seshat-reader--multipage--place-point (selected-window) 1 400)
+                (should (= (seshat-reader-multipage-test--row-position 1)
+                           (point)))
+                ;; 没有渲染出来的第 2 页行：驻留集原样
+                (should (equal '(1 3)
+                               (seshat-reader-multipage-test--page-numbers)))))))
+      (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-page-max-offset-last-page-bounds ()
+  "The last page is bounded by the window height, every other page by the span.
+
+A last page taller than the window stops when its bottom reaches the bottom of the
+window, i.e. at `page height - window body height`; a last page that already fits
+the window allows no in-page offset at all; a page with a follower keeps the old
+ceiling of `span - 1`.  The window body is stubbed to 800px, so the 1000px page
+allows 200px and the 500px page 0.  The document page count is what tells the last
+page apart, so every buffer sets it the way the native module does."
+  (seshat-reader-multipage-test--window-pixels 1000 800
+    ;; 末页高于窗口：1000 − 800 = 200
+    (let ((tall (seshat-reader-multipage-test--geometry-buffer '(1) 400 1000)))
+      (unwind-protect
+          (with-current-buffer (car tall)
+            (setq-local seshat-reader-current-doc-pagecount 1)
+            (should (= 200 (seshat-reader--multipage-page-max-offset 1))))
+        (kill-buffer (car tall))))
+    ;; 末页矮于窗口：0
+    (let ((short (seshat-reader-multipage-test--geometry-buffer '(1) 400 500)))
+      (unwind-protect
+          (with-current-buffer (car short)
+            (setq-local seshat-reader-current-doc-pagecount 1)
+            (should (= 0 (seshat-reader--multipage-page-max-offset 1))))
+        (kill-buffer (car short))))
+    ;; 非末页：span − 1 = 499；同一 buffer 的末页：0
+    (let ((pair (seshat-reader-multipage-test--geometry-buffer '(1 2) 400 500)))
+      (unwind-protect
+          (with-current-buffer (car pair)
+            (setq-local seshat-reader-current-doc-pagecount 2)
+            (should (= 499 (seshat-reader--multipage-page-max-offset 1)))
+            (should (= 0 (seshat-reader--multipage-page-max-offset 2))))
+        (kill-buffer (car pair))))))
 
 (ert-deftest seshat-reader-multipage-test--geometry-screen-scroll-pixels ()
   "One screen is the window body height minus the context lines, in pixels.

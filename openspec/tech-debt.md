@@ -1671,3 +1671,27 @@
 - **异步渲染未做**：P1 全同步（0.7–11 ms/页），滚动到新页会阻塞；P2 再做异步 + idle 预取。
 - **C 侧单页 overlay 机制仅剩兼容外壳**：`init_overlay` / `init_win_state_ptr` / `get_win_state_ptr` / `--refresh-highlights` / `--window-close` 仍存在但 elisp 侧除 `--window-close`（释放 EmacsWinState）外已无调用；`elisp-helpers.c:279-287` 的 `overlay-put` 无 nil 守卫（`overlayp, nil` 的潜在来源）。
 - **`posn-*` 访问器在字节编译后被内联**：测试若要桩替必须加载同源 `.el`（已在 `emacs/tests/README.md` 记录）。
+
+## 阅读器跨页落点无法用 ERT 覆盖 redisplay 交互（2026-10-27）
+
+- 现状：滚动族用例把 `window-start` / `set-window-vscroll` / `redisplay` / `--multipage-sync` 全部桩掉，能证明的只有「命令内的调用顺序与数值」（例如 `set-window-vscroll(0) → set-window-start → sync → redisplay → set-window-vscroll(offset)`），**不能**证明偏移能否跨 redisplay 存活。
+- 影响：「与新设 `window-start` 同帧的像素偏移会被 Emacs 丢弃」这类行为只靠 ERT 永远测不出来——本次缺陷（`k` 跨页跳回上一页顶部）就这样逃过了当时全量 1224 例。任何声称「跨页落点已验证」的结论，若只有 ERT 支撑都不算通过。
+- 建议：保持「命令内顺序/数值靠 ERT、跨 redisplay 行为必须真机」的分工；真机探针读数（四条，含 `3090 → 0` / 先落帧后保留 `3090`）已记入 `openspec/completed/2026-10-27-reader-cross-page-scroll-fix.md` 的「真机诊断记录」。将来改这一段滚动逻辑，先跑同样的探针再下结论。
+
+## 阅读器 `pagecount` 未就绪期间末页上限不生效（2026-10-27）
+
+- 现状：`seshat-reader--multipage-page-max-offset` 用 `seshat-reader--multipage-pagecount` 判断「是否末页」；该值在文档加载初期与 `revert-buffer` 之后为 `nil`，此时一律按**非末页**公式（`span − 1`）处理。单页文档在这一瞬间会退化为旧公式，可被滚出页面底部。
+- 影响：瞬态（pagecount 就绪即自愈），但用户若恰在此窗口内快速下滑，仍可能看到一次空白「假页」。
+- 建议：接受现状（保守回退，行为与修复前一致），不做「按已驻留页数猜末页」的推断——那会在多页文档里把中间页误判为末页。若要消除，需在 C 侧保证 doc load 完成前不暴露滚动路径，属跨层改动。
+
+## 阅读器落点阈值用 `frame-char-height` 近似光标高（2026-10-27）
+
+- 现状：`seshat-reader--multipage--place-point` 用「`vscroll` 是否大于一个文本行高（`frame-char-height`）」判断顶页行首的光标是否已被切出视口，而不是精确比较光标（glyph）高度。
+- 影响：行高与光标实际可见高度的差异会造成阈值边界处的保守/激进判断——阈值偏大时可能少移动一次 point（光标仍部分可见，Emacs 不会回滚偏移，安全）；阈值偏小时多移动一次（落到邻居页行首，同样安全）。当前两种误差都不影响正确性，只是落点可能与「光标刚好露出 1px」的边界不同。
+- 建议：若将来出现边界场景的观感问题，改用光标的实际度量（`(window-text-pixel-size)` 或 `window-cursor-pixel-height` 一类接口）后再校核；改动需真机复验。
+
+## 阅读器跨页存在一帧「新页顶部」中间态（2026-10-27）
+
+- 现状：两帧方案里 `(redisplay t)` 落帧时像素偏移尚未写入，那一帧显示的是「新页 + 偏移 0」；紧接着才写最终偏移并落 point。
+- 影响：快速连滚时理论上可见一帧跳动（每跨页一次）；实测未观察到用户可感的中间帧，正常翻页速度下不可见。
+- 建议：若要消除，必须同时重估 Emacs 的「同帧丢弃偏移」行为（例如寻找不需要两次设置偏移的写法，或让跨页与偏移在同一次窗口状态变更里完成），属需要真机探针先行的高风险改动；不要在不重新探针的前提下「优化掉这次 redisplay」——那会直接回退成 `k` 跳页首。

@@ -1832,22 +1832,47 @@ scrolling loop always advances: a page without a rendered spec has a span of
   (max 1 (+ (seshat-reader--multipage-page-pixel-height page)
             (seshat-reader--multipage-page-gap-pixels))))
 
-(defun seshat-reader--multipage-page-max-offset (page)
+(defun seshat-reader--multipage-page-max-offset (page &optional window)
   "Return the largest vertical scroll, in pixels, that PAGE allows.
 
-One pixel less than the **span** of PAGE (page height + the gap that follows
-it, see `seshat-reader--multipage-page-span'), or 0 for a page without a
-rendered spec.  Clamping to this value is what stops the scroll loop when
-there is no page left to cross.
+PAGE is a 1-based page number and WINDOW is the window the scroll happens in;
+a missing or non-live WINDOW defaults to the selected one.  Clamping to this
+value is what stops the scroll loop when there is no page left to cross.
 
-The ceiling must cover the gap, not just the bitmap: the scroll loop crosses to
-the next page when `window-vscroll + step` reaches the span, so a ceiling of
-`page-height - 1` would clamp back every attempt to accumulate the gap pixels --
-those pixels are neither inside the page nor past the span, so the page bottom
-became a dead zone (with `seshat-reader-page-gap-lines' > 0 the reader could
-never scroll past the last `gap' pixels of a page).  Using the span keeps the
-clamp and the crossing test on the same number."
-  (max 0 (1- (seshat-reader--multipage-page-span page))))
+A page with a follower allows one pixel less than its **span** (page height
+plus the gap that follows it, see `seshat-reader--multipage-page-span'), or 0
+for a page without a rendered spec.  The ceiling must cover the gap, not just
+the bitmap: the scroll loop crosses to the next page when
+`window-vscroll + step` reaches the span, so a ceiling of `page-height - 1`
+would clamp back every attempt to accumulate the gap pixels -- those pixels
+are neither inside the page nor past the span, so the page bottom became a
+dead zone (with a positive `seshat-reader-page-gap-lines` the reader could
+never scroll past the gap pixels of a page).  Using the span keeps the
+crossing test and the clamp on the same number.
+
+The last page of the document is bounded differently: no page follows it to
+fill the rest of the window, so allowing the whole span would push the page
+entirely out of the viewport and leave blank space below the document.  Its
+ceiling is the page height minus the pixel body height of WINDOW, i.e. the
+page bottom stops at the bottom of the window; the value is never negative (a
+page that already fits the window allows no in-page offset at all) and never
+larger than `span - 1`.  The gap is subtracted by that difference, which is
+why the page height -- not the span -- is the left operand.
+
+The document page count is nil while a document is loading or after a reload;
+that state counts as \"not the last page\", which keeps the behaviour of the
+pages the buffer holds.  A one-page document therefore falls back to the
+non-last-page formula until the page count arrives, so for that short while it
+can still be scrolled past its own bottom; the ceiling heals itself as soon as
+the count is known."
+  (let* ((win (if (window-live-p window) window (selected-window)))
+         (span (seshat-reader--multipage-page-span page))
+         (count (seshat-reader--multipage-pagecount)))
+    (if (and count (>= page count))
+        (max 0 (min (1- span)
+                    (- (seshat-reader--multipage-page-pixel-height page)
+                       (or (window-body-height win t) 0))))
+      (max 0 (1- span)))))
 
 (defun seshat-reader--multipage-page-neighbour (page delta)
   "Return the page DELTA pages away from PAGE, or nil when there is none.
@@ -1858,22 +1883,84 @@ use a nil answer to stop scrolling at the first or the last page."
     (and target (/= target page) target)))
 
 (defun seshat-reader--multipage--scroll-to-page (window page)
-  "Put the row of PAGE at the top of WINDOW without touching its vscroll.
+  "Put the row of PAGE at the top of WINDOW, leaving scroll and point alone.
 
 PAGE is a 1-based page number and the row is rendered first when it is not
 resident yet, so scrolling into a page the resident set has not reached works.
-`seshat-reader--multipage-goto' is not used on purpose: it resets the vertical
-scroll, and the caller is about to set that scroll to the remainder of the
-scrolling distance.  The row position is returned, or nil when PAGE has no row."
+
+\"Leaving scroll and point alone\" means that this function never writes either
+of them: the caller computes the final in-page offset only after this call and
+sets it itself, and `seshat-reader--multipage--place-point` decides where point
+has to be once the offset is known.  The vertical scroll is nevertheless reset
+*implicitly* here, because `set-window-start` without its NOFORCE argument makes
+the window start a fresh one and Emacs drops the pixel scroll that belonged to
+the old start; the page-crossing path uses that side effect to clear the offset
+of the previous page.  `seshat-reader--multipage-goto` is not used on purpose,
+since it resets the vertical scroll explicitly.  The row position is returned,
+or nil when PAGE has no row."
   (unless (assq page seshat-reader--pages)
     (seshat-reader--multipage-render-page page))
   (when-let* ((entry (assq page seshat-reader--pages))
               (pos (marker-position (cadr entry))))
     (set-window-start window pos)
-    (when (eq (window-buffer window) (current-buffer))
-      ;; 阅读 buffer 里 point 就是页面边框的落点，视口换页后要跟到页首。
-      (with-selected-window window (goto-char pos)))
     pos))
+
+(defun seshat-reader--multipage--place-point (window page vscroll)
+  "Put point on a row the scrolled viewport of WINDOW actually shows.
+
+WINDOW is the window that was just scrolled, PAGE is the page its top shows
+\(1-based) and VSCROLL is the vertical scroll the window received, i.e. the
+value the caller clamped before handing it to `set-window-vscroll`.
+
+Point has to follow the scroll: Emacs drops a pixel scroll on the next
+redisplay when the top of the window start line is cut off *and* point sits on
+that line, because the cursor would be invisible -- so the scroll silently
+returns to 0.  Real-frame probe: a 2000px scroll on a page row start vanished
+after one redisplay.  Moving point to the row of the page *after* PAGE keeps it
+visible (that row starts `span - VSCROLL` pixels below the top of the window)
+and the scroll then survives.
+
+Point is moved only when all three conditions hold: the page row start is
+really out of sight, i.e. VSCROLL is larger than one text line of WINDOW; the
+next page has a row; and that row starts inside the pixel body height of
+WINDOW.  A body height that cannot be measured counts as 0, the same reading
+`seshat-reader--multipage-page-max-offset` uses, so the answer degrades to the
+row start of PAGE instead of signalling.  Otherwise point goes to the row start
+of PAGE too, which is the old behaviour and correct there: a small offset leaves
+the cursor partially visible, and a page without a follower has nothing to put
+point on.
+
+The row of the next page is read from `seshat-reader--pages' and never
+rendered here, because this function must not modify the buffer: it runs after
+`seshat-reader--multipage-sync` settled the resident set, so an insertion now
+would send the sync through its recycling pass again.  For the same reason the
+row below is not taken with `(forward-line 1)`: with a positive
+`seshat-reader-page-gap-lines` the line after PAGE is one of the gap lines that
+belong to PAGE itself, whose screen position is `page height - VSCROLL` --
+negative after an upward crossing, i.e. invisible once more."
+  (when (and (window-live-p window)
+             (eq (window-buffer window) (current-buffer))
+             (assq page seshat-reader--pages))
+    (let* ((below-page (seshat-reader--multipage-page-neighbour page 1))
+           (below (and below-page
+                       (when-let* ((entry (assq below-page seshat-reader--pages))
+                                   (marker (cadr entry)))
+                         (marker-position marker))))
+           (own (when-let* ((entry (assq page seshat-reader--pages))
+                            (marker (cadr entry)))
+                  (marker-position marker)))
+           (target (if (and (> vscroll
+                                (seshat-reader--default-line-pixels window))
+                            below
+                            ;; 取不到窗口体高时按 0 处理：条件不成立，落点退回
+                            ;; 顶页行首，与 `--multipage-page-max-offset' 同口径
+                            (<= (- (seshat-reader--multipage-page-span page)
+                                   vscroll)
+                                (or (window-body-height window t) 0)))
+                       below
+                     own)))
+      (when target
+        (with-selected-window window (goto-char target))))))
 
 (defun seshat-reader--multipage-scroll (pixels &optional window)
   "Scroll WINDOW vertically by PIXELS, continuing across page boundaries.
@@ -1882,7 +1969,7 @@ WINDOW defaults to the selected window.  A positive PIXELS scrolls the view
 down (towards later pages), a negative one up.
 
 Every page is one buffer line whose height is the page image, so the built-in
-line scrolling (`scroll-up' / `scroll-down') jumps a whole page at a time and
+line scrolling (`scroll-up` / `scroll-down`) jumps a whole page at a time and
 makes in-page scrolling impossible.  This function therefore moves the window
 in two steps: the vertical scroll of the window is used for the part of the
 distance that stays inside the current page, and when the distance leaves the
@@ -1890,13 +1977,38 @@ page the window start is moved to the neighbouring page row and the remainder
 becomes the new vertical scroll.  That is what makes the scrolling continuous:
 reaching the bottom of a page continues into the next one instead of resetting.
 
-The vertical scroll is always pixelwise (Emacs measures `window-vscroll' in
+The vertical scroll is always pixelwise (Emacs measures `window-vscroll` in
 lines otherwise) and clamped to [0, height - 1] of the page at the top of the
-window, so a page can never be scrolled past its own end and the clamp — not
-the loop condition — is what stops at the first and the last page.  Every
+window, so a page can never be scrolled past its own end and the clamp -- not
+the loop condition -- is what stops at the first and the last page.  Every
 iteration advances the page, so a page without a spec cannot loop forever.
-The resident rows are synchronised afterwards, which pulls in the pages the
-new viewport asks for."
+The resident rows are synchronised before the scroll is written, which pulls
+in the pages the new viewport asks for, and the scroll is written last so that
+it gets the final word on the window state.  Two ways of losing the offset must
+be kept apart.  Confirmed on a real frame: Emacs drops a pixel scroll that is
+set in the same frame as a *new* window start -- `set-window-start` followed by
+`set-window-vscroll` inside one command ends up with a scroll of 0 (3090 -> 0),
+while the same offset survives when the new start has been displayed first.
+Not confirmed: whether the buffer modification made by
+`seshat-reader--multipage-sync` clears the scroll on its own (the probe that
+blamed it had that sync return early), so the order below is defensive about it
+rather than proven necessary.
+
+A crossing therefore runs in two frames: it drops the offset of the old page,
+moves the window start, syncs, forces `redisplay` -- so that the new start and
+the buffer modification land in their own frame -- and only then writes the
+offset, which now sticks.  The forced frame shows the new page at offset 0,
+which is the price of the scheme, and it is forced on purpose so that an
+inhibited redisplay cannot swallow it.  Scrolling inside a page skips all of
+it: no forced frame, no extra cost.  The point placement below reads the offset
+to decide whether the row start of the page is still visible, so it runs last.
+
+Crossing a page also has to move point (`seshat-reader--multipage--place-point`,
+called with the clamped offset and only when a page was crossed): the row start
+of the page now at the top is cut off by the vertical scroll, and Emacs resets
+the scroll to 0 on the next redisplay when point sits on a line that is scrolled
+out of sight.  That reset was the reason an upward cross page fell back to the
+top of the previous page."
   (let ((win (if (window-live-p window) window (selected-window))))
     (when (and (eq (window-buffer win) (current-buffer))
                seshat-reader--pages
@@ -1925,11 +2037,29 @@ new viewport asks for."
             (unless (assq page seshat-reader--pages)
               (seshat-reader--multipage-render-page page))
             (setq distance (+ distance (seshat-reader--multipage-page-span page)))))
+        ;; 跨页序列（两帧方案）：清旧偏移 → 设新 start → sync → 强制落帧 → 写偏移。
+        ;; - 落帧那一帧是「新页 + 偏移 0」的中间态（偏移此时还没写），这是两帧
+        ;;   方案的固有代价；快速连滚时理论上可见一帧跳动，要消除它必须同时重估
+        ;;   Emacs 的「同帧丢弃偏移」行为。
+        ;; - 这里的 (set-window-vscroll win 0 t) 与 set-window-start 的隐式重置
+        ;;   语义重叠：保留它是防御 + 表达意图，不是功能必需。
+        ;; - 已确证的清零源只有「与新设 window-start 同帧的偏移被丢弃」；sync 修改
+        ;;   buffer 是否单独清零偏移未确证（那次探针里 sync 早退了）。
+        ;; - 同一约束在书签 / saveplace 的恢复路径由
+        ;;   `seshat-reader--multipage--apply-offset' 承担（goto 之后先落帧再写偏移）。
+        (when moved
+          (set-window-vscroll win 0 t))
         (when moved
           (seshat-reader--multipage--scroll-to-page win page))
-        (set-window-vscroll
-         win (max 0 (min distance (seshat-reader--multipage-page-max-offset page))) t)
         (seshat-reader--multipage-sync win)
+        ;; force 是有意的：落帧必须无条件发生，不能被 inhibit-redisplay 静默吞掉
+        (when moved
+          (redisplay t))
+        (let ((offset (max 0 (min distance
+                                  (seshat-reader--multipage-page-max-offset page win)))))
+          (set-window-vscroll win offset t)
+          (when moved
+            (seshat-reader--multipage--place-point win page offset)))
         (window-vscroll win t)))))
 
 (defun seshat-reader--multipage-window-start-page (&optional window)

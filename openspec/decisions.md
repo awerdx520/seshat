@@ -900,4 +900,12 @@ refit 按当前窗口尺寸做一次几何适配 + 重渲染，一次到位。
 
 （来源计划：[openspec/completed/2026-10-26-reader-multipage-p1-layout.md](completed/2026-10-26-reader-multipage-p1-layout.md)；实现与逐批偏差见该计划「## 执行记录」）
 
+## 2026-10-27 · 阅读器跨页落点采用「两帧序列」，末页偏移上限受窗口高约束
 
+**决策**：① 跨页时按「清旧页偏移（`set-window-vscroll win 0 t`）→ `set-window-start` → `seshat-reader--multipage-sync` → 强制 `(redisplay t)` 落一帧 → 写像素偏移 → 落 `point`」的两帧序列执行；② 跨页后 `point` 落到**邻居页行首**（顶页行首已被偏移切出视口，落在那里会让偏移被丢弃）；③ 末页的页内偏移上限取 `页高 − 窗口文本区像素高`，中间页仍为 `span − 1`。
+
+**理由**：真机四条探针确证 Emacs 会丢弃「与**新设 `window-start` 同一帧**设置」的像素偏移——同帧设置时 3090 经一次 redisplay 变 0；先让新 start 落一帧、再设同一数值则保留 3090（窗高仅 1345，说明与窗口高度无关）。末页没有下一页填满视口，其上限必须受窗口文本区高约束，否则整页被推出视口、露出空白「假页」。跨页落点之所以取「邻居页行首」而不是 `forward-line` 的下一行：`seshat-reader-page-gap-lines > 0` 时下一行是顶页自己的空行，屏幕 y 可能为负。
+
+**代价与约束**：① 跨页多一次强制 redisplay（约一帧开销），并存在一帧「新页 + 偏移 0」的中间态；实测未观察到用户可感的中间帧跳动，正常翻页速度下不可见。② 该序列反直觉，理由必须固化在代码注释与本日志中——**任何「省掉这次 redisplay」的优化都会让 `k` 回到跳页首的旧缺陷**，改动前先跑真机探针。③ ERT 只能守住命令内的顺序与数值（`window-start` / `set-window-vscroll` / `redisplay` 均被桩替），跨 redisplay 的行为只能真机验证（见 `openspec/tech-debt.md`）。④ `pagecount` 未就绪期间末页上限退化为非末页公式（瞬态，已在 tech-debt 登记）。
+
+（来源计划：[openspec/completed/2026-10-27-reader-cross-page-scroll-fix.md](completed/2026-10-27-reader-cross-page-scroll-fix.md)；该计划的「真机诊断记录」保存四条探针的原始读数与 L3 迭代 1/2 的两次修正过程）
