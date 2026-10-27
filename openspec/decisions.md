@@ -931,3 +931,20 @@ refit 按当前窗口尺寸做一次几何适配 + 重渲染，一次到位。
 **影响面**：① 所有 fit / 渲染路径（首次 fit、尺寸变化 refit、`W` / `H`、`+` / `-`、书签恢复、演示模式）的窗口来源统一；正常路径（显式传窗口且显示当前 buffer）结果逐字不变。② **行为改进（A1b）**：不传窗口且 `selected-window` 不显示当前 buffer 时，解析结果由 `selected-window` 变为 `get-buffer-window` 命中的窗口——方向正确但属行为改变，已写入 `CHANGELOG.md`。③ minibuffer 期间默认冻结几何，代价是页面底部约 416 px 被裁切（minibuffer 展开 17 行 ≈ 400 px / 1275 px 阅读窗口），退出后由 `--after-minibuffer-exit` 自动 refit；设 `seshat-reader-freeze-layout-during-minibuffer` 为 nil 即恢复「跟随缩放」。④ 仍有 `--multipage-base-fit-scale` / `--apply-display-scale` / `--multipage-resize-spec` / `--multipage-refresh-decorations` 等旧写法未改（靠 `--multipage-target-scale` 内部解析兜底），已登记为 `openspec/tech-debt.md` 观察项。⑤ 回退单点：三处 fit 调用改回旧写法（新函数保留不调用）即回退 D1，把 defcustom 设为 nil 即回退 D2。
 
 （来源计划：[openspec/active/2026-10-27-reader-fit-minibuffer-window.md](active/2026-10-27-reader-fit-minibuffer-window.md) 的 D1 / D2 与「## 事实来源」「## 审查修订记录」；探针原始读数见该计划）
+
+## 2026-10-27 · 阅读器页间分隔采用「三段结构」+ face `:height` 压缩 + 拉满窗口的线
+
+**决策**（4 点）：
+
+| # | 决策 | 理由 |
+|---|---|---|
+| 1 | 页间视觉分隔采用**三段结构**——上空行 / 线 / 下空行，共 3 个 buffer 行，而非整行色带或页面边框 | 三段都能用 face `:height` 精确表达亚行高度，且「线多粗」（`-separator-thickness`）与「隔多远」（`-separator-height`）可独立调参；整行色带只能给出默认行高的整数倍，页面边框则要额外处理每页四边，并与居中用的 `before-string` + `:align-to`、横向滚动的 `line-prefix` 机制纠缠 |
+| 2 | 行高压缩用 face `:height` 的相对倍率（`目标像素 / frame-char-height`），**否决 `line-height` 文本属性** | T0 实测 `line-height` **只能加高、不能压矮**（0.25 / 1 / 8 全部渲染为 24px，下限 = 默认行高；1.5 → 30px、2 → 40px），face `:height` 是唯一能把行压到亚行高度的路径（下限约 2px）。由此**1px 线不可达**，`seshat-reader-page-separator-thickness` 的默认值由 1 改为 **2** |
+| 3 | 线宽用 `(space :align-to (- right 0))` 的 stretch space，而非按 `window-body-width` 算固定像素宽度、也不用填充 U+2500 字符 | 实测该行宽度**精确等于** `window-body-width`（713 == 713，多种 frame 宽度下均相等），随窗口自适应，无需监听 `window-size-change-functions` 重建，也不需要重写整行字符；填充字符方案在窗口缩放时必须重算行内容，改动面最大 |
+| 4 | **几何单一来源**：`seshat-reader--multipage-separator-segments` 返回 `(TOP LINE BOTTOM)` 像素三元组，同时供像素高度（滚动几何：`--multipage-page-span` / `--multipage-page-max-offset` / 跨页滚动）与行构造（三行行高）使用，**禁止两处独立计算** | P1 已在 `--multipage-page-max-offset` 的注释里记录过同类缺陷——两处口径分叉会在页底产生滚动死区、在末页凭空多出「假空白」。分隔区参与的是同一个 span，分叉即复发。**代价（明确接受）**：face `:height` 是阶梯取整，实际渲染与名义像素差 ±1–2px（实测名义 12px 渲染 13px），滚动几何一律使用**名义值**，不追求逐像素对齐，ERT 也不得对 ±1px 做严格断言 |
+
+**默认值变更属可见行为变更**：升级后默认页间出现 0.5 行分隔区（内含一条 2px、横贯窗口的线），与改造前「两页紧贴」的观感不同。**回退路径**：`(setq seshat-reader-page-separator nil)` 且 `seshat-reader-page-gap-lines` 保持 `0` → 不产生任何附加像素，行为与改造前一致。
+
+**约束**：① 分隔区选项在**页行插入时**读取，改动后需重开文档或触发一次重排（`seshat-reader--multipage-relayout`），本轮**不做** defcustom `:set` 自动重排——避免「改一个选项就整本重排」的隐式副作用，另立任务再议；② ERT 只断言文本结构与属性（行数、`display`、`face`），`emacs --batch` 无 redisplay，像素正确性由 GUI 探针与真机目视承担。
+
+（来源计划：[openspec/completed/2026-10-27-reader-page-separator.md](completed/2026-10-27-reader-page-separator.md) 的 D1–D4 与「T0 实测结论」小节；`line-height` 阶梯、face `:height` 下限、`(space :align-to)` 行宽的原始读数见该计划的实测表格。）

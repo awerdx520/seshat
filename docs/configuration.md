@@ -294,7 +294,11 @@ Emacs 端通过 `seshat-reader-annotation` 采集 PDF 页面选区并同步为�
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `seshat-reader-page-gap-lines` | `0` | **页间空行数**（P1 连续布局）：`0` = 相邻页紧贴（与 Android 连续滚动一致），正整数则在上一页底部与下一页顶部之间留这么多空行。改动在下次重建版式（重开文档 / `g` / 改缩放）后生效 |
+| `seshat-reader-page-gap-lines` | `0` | **页间空行数**（P1 连续布局）：`0` = 相邻页紧贴（与 Android 连续滚动一致），正整数则在上一页底部与下一页顶部之间留这么多空行。这是**分隔区之外**再追加的整行空白（见下面四行）。改动在下次重建版式（重开文档 / `g` / 改缩放 / 触发一次 `seshat-reader--multipage-relayout`）后生效 |
+| `seshat-reader-page-separator` | `t` | 是否显示页间**分隔区**（一条横贯窗口的线 + 上下各约 0.25 行留白）。设 `nil` **且** `page-gap-lines` 为 `0` 时完全不产生附加像素，回到改造前的「两页紧贴」。与 `page-gap-lines` 一样在页行插入时读取，改后需重开文档或触发一次重排才生效（无 `:set` 自动重排） |
+| `seshat-reader-page-separator-height` | `0.5` | 分隔区**总高**，单位为「默认文本行」，允许小数：`0.5` ≈ 12px（`frame-char-height` 24px 时），线垂直居中、上下各约 0.25 行；`0` = 不占空间。`0.5` 指**整段总高**，不是「线下方空 0.5 行」 |
+| `seshat-reader-page-separator-thickness` | `2` | 线的**像素粗细**（整数，夹紧到总高以内）。1px 拿不到——face `:height` 与 1px 图像在真实字体 frame 上的渲染下限都约 2px，故默认 `2`；想更醒目可调 `3`–`4` |
+| `seshat-reader-page-separator-face` | `((t (:background "gray70")))` | 线的颜色（**face**，不是 defcustom）：只取 `:background` 填充那条横贯窗口的 stretch space，高度由分隔区几何决定。暗色主题建议改 `gray40` 一类深色 |
 | `seshat-reader-scroll-step-ratio` | `0.15` | **一次滚动步长** = 窗口文本区像素高 × 比例。`j` / `k`（以及 remap 的 `next-line` / `previous-line`、`C-n` / `C-p`）与滚轮每档都按它移动，默认约 1/7 屏；比例非正数、或取整后不足 1 像素时回退「一行」= `frame-char-height`（绝不出现「按了没反应」） |
 | `seshat-reader-scroll-step-pixels` | `nil` | 非 nil 时**覆盖**上面的比例，把步长钉死为绝对像素（不随窗口大小变化，适合想要固定手感的人）；非正数视同 `nil`，仍走比例 |
 | `seshat-reader-multipage-memory-warning-mb` | `75` | 驻留 spec 的**内存估算告警线**（MB）：按每份缓存 spec 的 `:data` 字符串长度 ×2 估算（Lisp 堆一份 + C 侧一份），超过时 `message` 一次（每个 buffer 只报一次，重载 / 清缓存后重新武装）；`nil` 关闭告警 |

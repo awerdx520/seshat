@@ -16,7 +16,7 @@ Emacs 端文档阅读器（`emacs/seshat-reader/`）：MuPDF 负责栅格化、C
 | 跨页文本搜索 | `C-s`（会话内 `n` / `p` / `RET` / `C-g`；左侧结果侧栏内 `RET` / `n` / `p` / `q`） | 整本扫描、跨页跳转与回绕、命中以橙色装饰投喂，同时列进左侧搜索结果侧栏 |
 | 手写轨迹显示 | 自动（`seshat-reader-annotation-ink-enabled`） | 把 Android 手写批注的 `ink:` 段渲染为页面笔迹（只显示，不输入） |
 | 翻译/解释 | `C-c C-t` / `C-c C-e` | 依赖 go-translate；结果显示在面板（或 posframe）。同一组键是**开合**，且与语境一一对应：面板里显示的就是**译文**时 `C-c C-t` 关闭、否则翻译并替换内容；显示的是**解释**时 `C-c C-e` 关闭、否则解释并替换内容（不抢光标） |
-| 多页连续布局 | 自动（P1） | 一屏可见相邻两页、滚动连续跨页；页间空行由 `seshat-reader-page-gap-lines`（默认 `0`）控制 |
+| 多页连续布局 | 自动（P1） | 一屏可见相邻两页、滚动连续跨页；页间默认有**分隔区**（横贯窗口的线与上下留白，见 §7）并由 `seshat-reader-page-gap-lines`（默认 `0`）额外追加空行 |
 | 引用闭环 | `C-c C-r` / `M-x org-store-link` | `seshat:` 链接、摘录写入、`:complete` 补全、`:export` 导出 |
 | 离线队列 | 自动 | 服务端不可用时本地暂存批注，恢复后自动同步 |
 | 位置记忆 | saveplace / bookmark | 按文件记住「页号 + 页内像素偏移 + 横向位置 + 缩放 + fit 模式」，重启 Emacs 后回到同一位置 |
@@ -438,7 +438,7 @@ P1 起阅读器不再「一次只显示一页 + 翻页」，而是把整本排�
 
 | 项 | 行为 |
 |---|---|
-| 一屏多页 | 视口里通常能看到 2~3 页（取决于窗口高与缩放）。页与页之间由 `seshat-reader-page-gap-lines`（默认 `0`）决定留不留空行：`0` = 紧贴，与 Android 连续滚动一致 |
+| 一屏多页 | 视口里通常能看到 2~3 页（取决于窗口高与缩放）。页间由**分隔区**（一条横贯窗口的线 + 上下各约 0.25 行留白）隔开，由 `seshat-reader-page-separator` / `-separator-height` / `-separator-thickness` / `-separator-face` 控制；`page-gap-lines`（默认 `0`）是分隔区之外**额外**追加的整行空白 |
 | 滚动 | 像素级、连续：`j` / `k`（及 `C-n` / `C-p`、remap 的 `next-line` / `previous-line`）与**滚轮每档**都按 `seshat-reader-scroll-step-ratio`（默认 `0.15` ≈ 1/7 屏）移动；`SPC` / `DEL`、`C-v` / `M-v` 滚一屏（= 窗口文本区高 − `seshat-reader-screen-context-lines` 行）。想要固定手感时用 `seshat-reader-scroll-step-pixels` 把步长钉成绝对像素 |
 | 滚轮 / 触控板 | 每档一步、双击 2 步、三击 3 步。由 `pixel-scroll-precision` 的命令 **remap** 到本 mode（`pixel-scroll-precision-mode` 是全局 minor mode，键表优先级高于本 mode 的局部键表，故用 remap 而非局部绑定） |
 | 整页跳转 | `n` / `p` / `M-<` / `M->` / `M-g g` **停在页首**（页内像素偏移归零），不继承上一页滚到一半的位置 |
@@ -451,11 +451,28 @@ P1 起阅读器不再「一次只显示一页 + 翻页」，而是把整本排�
 
 **位置记忆**：书签与 saveplace 保存的是「页号 + **页内像素偏移** + 横向位置 + 缩放 + fit 模式」。旧记录只有单页时代的 `vscroll`，读取时按「页号 + 该值近似为页内偏移」迁移；读不到就落到页首，不会报错。**恢复时 fit 模式只在「新开文档」时应用**——从书签 / saveplace 打开一个未读过的文档（跳转前 buffer 不是阅读 buffer）按记录的 `fit-mode` + `scale` 恢复；而在**同一阅读 buffer 内**跳书签只恢复页号、页内偏移与横向位置，保留你此刻的 `W` / `H` / manual 与缩放（跳转不应改动正在使用的视图）。
 
+### 页间分隔区（2026-10-27）
+
+每页行之后先放 `seshat-reader-page-gap-lines`（默认 `0`）个整行空白，再跟一个**分隔区**。分隔区固定由 **3 个 buffer 行**组成：
+
+| 顺序 | 内容 | 高度 |
+|---|---|---|
+| 1 | 上空行 | 线上留白 = `(总高 − 线厚) / 2`，向下取整 |
+| 2 | 横贯窗口的线：`(space :align-to (- right 0))` 的 stretch space + `seshat-reader-page-separator-face` 的 `:background` | `seshat-reader-page-separator-thickness`（默认 `2` px） |
+| 3 | 下空行 | 总高 − 线厚 − 线上留白 |
+
+- **总高默认 0.5 行 ≈ 12px**（`frame-char-height` 为 24px 时），线垂直居中、上下各约 0.25 行。实测名义 5/2/5 = 12px 在真实字体 frame 上渲染为 5/3/5 = 13px（face `:height` 是阶梯取整，见 §12）。
+- **线厚默认 2px，1px 拿不到**：`line-height` 文本属性实测只能加高、不能压矮（下限 = 默认行高），因此行高压缩走 face `:height` 的相对倍率（`px / frame-char-height`），而 face / 1px 图像在真实字体 frame 上的渲染下限都是约 2px。
+- **线宽随窗口自适应**：线是 `(space :align-to (- right 0))` 的 stretch space，实测该行宽度精确等于 `window-body-width`，无需在 `window-size-change-functions` 里重建。
+- **改选项后需重开文档或触发一次重排**（`seshat-reader--multipage-relayout`）：分隔行在**页行插入时**生成，本轮未做 defcustom `:set` 自动重排。
+- **一键回退**：`seshat-reader-page-separator` 设 `nil` 且 `seshat-reader-page-gap-lines` 保持 `0` → 没有任何附加像素，完全回到改造前的「两页紧贴」。
+- **几何单一来源**：`seshat-reader--multipage-separator-pixels` / `--multipage-separator-segments` 返回 `(TOP LINE BOTTOM)` 像素三元组，与 `seshat-reader--multipage-page-gap-pixels` 同源；页跨度（span）、中间页偏移上限与跨页滚动都自动包含分隔区像素。
+
 ### 跨页落点与末页到底（2026-10-27）
 
 - **跨页是连续的**：滚动跨过页边界后，视口内容 = 上一页底部的残影 + 当前页上半部，页内像素偏移不被丢弃；`SPC` / `DEL` 一屏滚动与 `j` / `k` 逐步滚动在**两个方向**上都连续（`n` / `p` / `M-g g` 按设计仍停在页首）。
-- **跨页后 `point` 在「邻居页行首」**：Emacs 会丢弃「与**新设 `window-start` 同一帧**设置」的像素偏移，所以跨页时 `point` 被放到视口里可见的**下一个页行行首**，而不是顶页行首。因此 `M-:` 或自写命令里读 `(point)` 得到的不再是顶页行首；页号不受影响（一律由 `window-start` 派生）。`seshat-reader-page-gap-lines > 0` 时落点同样是邻居页行首，不会是顶页自己的空行。
-- **末页到底即停**：末页最大页内偏移 = `页高 − 窗口文本区像素高`（中间页仍是 `页高 + 页间空行 − 1`），因此文档末尾不会再出现「还能往下滚一屏、但那里没有 PDF 页」的空白。
+- **跨页后 `point` 在「邻居页行首」**：Emacs 会丢弃「与**新设 `window-start` 同一帧**设置」的像素偏移，所以跨页时 `point` 被放到视口里可见的**下一个页行行首**，而不是顶页行首。因此 `M-:` 或自写命令里读 `(point)` 得到的不再是顶页行首；页号不受影响（一律由 `window-start` 派生）。`seshat-reader-page-gap-lines > 0` 时落点同样是邻居页行首，不会是顶页自己的空行（落点取自页行 marker，不数间隔行；默认开启的分隔区同样不影响落点）。
+- **末页到底即停**：末页最大页内偏移 = `页高 − 窗口文本区像素高`（中间页仍是 `页高 + 页间像素 − 1`，页间像素 = `page-gap-lines` 空行 + 分隔区，见上文「页间分隔区」），因此文档末尾不会再出现「还能往下滚一屏、但那里没有 PDF 页」的空白。
 
 ## 8. 引用闭环
 
@@ -645,7 +662,11 @@ uid 形态本身**不可读**，可读性由 org 链接描述承担（`[[seshat:
 | `seshat-reader-enlarge-factor` | `1.25` | 放大倍率 |
 | `seshat-reader-shrink-factor` | `0.75` | 缩小倍率 |
 | `seshat-reader-default-fit` | `contain` | 新窗口 / 新文档的**初始适配模式**：`contain`（整页可见）/ `width`（填满宽度）/ `height`（填满高度）；`W` / `H` 只覆盖当前窗口且不跨会话；旧值 `seshat-reader-fit-to-width` / `-fit-to-height` 仍被接受（分别归一为 `width` / `contain`） |
-| `seshat-reader-page-gap-lines` | `0` | 页间空行数（连续布局）：`0` = 相邻页紧贴 |
+| `seshat-reader-page-gap-lines` | `0` | 页间空行数（连续布局）：`0` = 相邻页紧贴。这是**分隔区之外**再追加的整行空白（见下四行）；改动在下次重建版式（重开文档 / 触发一次重排）后生效 |
+| `seshat-reader-page-separator` | `t` | 是否显示页间**分隔区**（横贯窗口的线 + 上下各约 0.25 行留白）。设 `nil` 且 `page-gap-lines` 为 `0` 时完全回到改造前的「两页紧贴」——没有额外像素。选项在**页行插入时**读取，改后需重开文档或触发一次重排（无 `:set` 自动重排） |
+| `seshat-reader-page-separator-height` | `0.5` | 分隔区**总高**，单位为「默认文本行」，允许小数：`0.5` = 半行（`frame-char-height` 24px 时约 12px），线在垂直中部、上下各约 0.25 行；`0` = 不占空间。`0.5` 指**整段总高**，不是「线下方空 0.5 行」 |
+| `seshat-reader-page-separator-thickness` | `2` | 线的**像素粗细**（整数，夹紧到总高以内）。1px 拿不到——face 的 `:height` 与 1px 图像在真实字体 frame 上的渲染下限都约 2px，故默认 `2`；想更醒目可调 `3`–`4` |
+| `seshat-reader-page-separator-face` | `((t (:background "gray70")))` | 线的颜色（**face**，不是 defcustom）：只取 `:background` 填充那条横贯窗口的 stretch space，高度由分隔区几何决定。暗色主题建议改 `gray40` 一类深色 |
 | `seshat-reader-scroll-step-ratio` | `0.15` | 一次滚动步长 = 窗口文本区像素高 × 该比例（`j`/`k`、滚轮每档） |
 | `seshat-reader-scroll-step-pixels` | `nil` | 非 nil 时覆盖比例，步长钉死为绝对像素 |
 
@@ -907,6 +928,7 @@ evil 是 globalized minor mode，会在 mode body 之后重新启用自己，所
 28. **面板里的宽表格被右侧裁切**：`valign-mode` 用 `:align-to` 做**绝对像素**对齐，单元格宽度按表格自身最大内容宽度分配，与面板窗口宽度无关；因此列总宽超过面板可用宽时，**最右侧几列直接落到面板右缘之外**——不可见、不能折行，也不能横向滚动（面板正文不折行时才横向滚动，而那时 valign 本就不启用）。常态面板只有 0.25 屏宽，4 列以上且含长中文单元格时很容易命中，且**没有任何截断提示**，容易误判为模型少输出了内容。缓解：按 `w`（`C-c w`）把面板扩宽，或 `(setq seshat-reader-translate-valign nil)` 退回不依赖像素对齐的 Markdown 渲染。根治方案（表格宽度感知、渲染侧重排）见 tech-debt「面板宽表格溢出被裁切（valign 绝对像素对齐）」，本计划不解决，只保证不加剧。
 29. **暗色 tint 会把彩色插图/封面压成单色调**：`charcoal` / `midnight` / `sepia` 都把每像素亮度映射到 BG→FG 连线上，颜色信息因此整体丢失（彩色图变单色渐变）；`graphite` 走的是 `fz_invert_pixmap_luminance`，保留 chrominance，是唯一不回退的例外。
 30. **`sepia`（亮底）档下既有黄色高亮装饰几乎不可见**：批注高亮默认黄（RGB `1.0 0.85 0.0`、α `0.35`）在浅米底色上对比度极低，装饰配色未随预设自适应；需要时手动调 `seshat-reader-annotation-highlight-color` / `-alpha`。
+31. **页间分隔线的粗细受渲染下限约束、改动需重排才生效**：face `:height` 与 1px 图像在真实字体 frame 上的渲染下限都约 2px，`seshat-reader-page-separator-thickness` 取 `1` 也会渲染成 2px；且 face `:height` 是阶梯取整，实际渲染比名义像素多 ±1–2px（实测名义 12px 渲染 13px），而滚动几何用的是**名义值**，故页底理论上存在 ≤2px 的不可达残量（不影响体验，但 ERT 不得对 ±1px 做严格断言）。另外分隔行在**页行插入时**生成——改分隔区相关选项后需重开文档或触发一次重排（`seshat-reader--multipage-relayout`），本轮未做 defcustom `:set` 自动重排（见 tech-debt）。
 
 ## 13. 开发者备注
 

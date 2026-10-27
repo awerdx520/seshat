@@ -1732,3 +1732,26 @@
 - 影响：宽页（页面宽于窗口）横向滚动到中段后存书签，跳回时可能回到最左侧，属体验缺陷，不影响垂直偏移的正确性。
 - 建议：下次阅读宽页文档时顺手验证；若不恢复，另开小计划（可能同样需要「落帧后再设 hscroll」的次序）。
 - 已验证（2026-10-27，用户真机）：用户确认书签跳回后位置正确（含横向位置），宽页 `hscroll` 在书签恢复时被保留，本条可关闭。
+
+## 阅读器页间分隔区的渲染高度与名义像素有 ±1–2px 偏差（2026-10-27）
+
+- 现状：分隔区三行的高度用 face `:height` 的相对倍率表达（`目标像素 / frame-char-height`），而 face 行高是**阶梯函数**——名义 12px（5/2/5）在真实字体 frame 上渲染为 5/3/5 = **13px**。1px 同样不可达（face 与 1px 图像的渲染下限都约 2px），故 `seshat-reader-page-separator-thickness` 默认取 `2` 而不是 `1`。
+- 影响：滚动几何（`seshat-reader--multipage-page-span` / `--multipage-page-max-offset` / 跨页滚动）使用**名义值**（`seshat-reader--multipage-separator-pixels`），与实渲染最多差 ±1–2px，因此页底理论上存在 ≤2px 的不可达残量。不影响体验，也不构成滚动死区（几何口径仍然单一，行构造与滚动共用 `--multipage-separator-segments`）。
+- 建议：**不得在 ERT 里对 ±1px 做严格断言**——像素断言只允许断言「三段（TOP + LINE + BOTTOM）之和 == 名义分隔区像素」这类结构量；真机观感的粗细差异靠调 `seshat-reader-page-separator-height` / `-thickness` 吸收。若将来要求逐像素一致，只能改走「自绘一条 image 条」，需重估窗口宽自适应与 refit 路径（本轮已否决）。
+
+（来源计划：`openspec/completed/2026-10-27-reader-page-separator.md` 的「T0 实测结论」与 T1–T3 实测偏差段。）
+
+## 阅读器分隔区选项改动需重排才生效（2026-10-27）
+
+- 现状：`seshat-reader-page-separator` / `-separator-height` / `-separator-thickness` / `-separator-face` 与既有的 `seshat-reader-page-gap-lines` 一样，在**页行插入时**被读取（`seshat-reader--multipage-insert-page` 调用 `seshat-reader--multipage-separator-rows`）。已存在于 buffer 的页行与分隔行不会被重写，本轮**未实现** defcustom `:set` 自动重排。
+- 影响：`setq` / `customize-set-variable` 之后当前 buffer 观感不变，需重开文档或触发一次 `seshat-reader--multipage-relayout` 才生效；用户容易误判为「选项无效」。属与 `page-gap-lines` 一致的既有语义，不算回归，已在 docstring 与 `docs/emacs-reader.md` §7 写明。
+- 建议：若要消除，给这 5 个选项加 `:set` 回调，在「存在活的阅读 buffer」时调一次 `seshat-reader--multipage-relayout`；但必须先解决两个问题——① customize 逐项 set 会触发多次整本重排（需合并为一次 idle 重排，参照 `--schedule-refit` 的做法）；② 重排过程中不得递归触发自身。属独立任务，不要在修其它问题时顺手加。
+
+（来源计划：`openspec/completed/2026-10-27-reader-page-separator.md` 的「注意事项 4」与 D5。）
+
+## 滚动侧 span 未透传窗口（2026-10-27）
+
+- 现状：`seshat-reader--multipage-page-span` 只有 `(page)`，内部 `--multipage-page-gap-pixels` 不传 window，落到 `selected-window` 的 frame 取 `frame-char-height`；而**渲染侧**已改为按 `--multipage--display-window` 的 frame 烘焙分隔行 `:height`（本轮 code-reviewer 修复 1）。
+- 影响：多 frame 且字体不同时，渲染高度与滚动几何可能差 ±1–2px（单 frame 无影响）；属「像素与 buffer 分叉」的最后一条残余路径。
+- 建议：给 `--multipage-page-span` 加 `&optional window`，并在 `--multipage-page-max-offset` 与 `--multipage-scroll` 的跨页循环里一路透传；改动面小，但需同步更新测试对 span 的调用。
+- 来源：`openspec/completed/2026-10-27-reader-page-separator.md`（归档后路径）。

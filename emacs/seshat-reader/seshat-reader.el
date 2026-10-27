@@ -1152,6 +1152,51 @@ empty lines between the bottom of one page and the top of the next one."
   :group 'seshat-reader
   :type 'integer)
 
+(defcustom seshat-reader-page-separator t
+  "When non-nil, insert a separator region after every page row.
+
+The region is a rule that spans the whole window width plus the blank space
+that balances it above and below, see `seshat-reader-page-separator-height'.
+Turning this option off together with `seshat-reader-page-gap-lines' set to 0
+brings back the layout where two consecutive pages touch each other.
+
+The option is read while a page row is inserted, i.e. when the layout is
+built or reordered, so it applies to the layouts created afterwards and not
+to the rows a buffer already holds."
+  :group 'seshat-reader
+  :type 'boolean)
+
+(defcustom seshat-reader-page-separator-height 0.5
+  "Total height of the separator region, in default text lines.
+
+The value may be fractional: 0.5 is half a line and covers the rule together
+with the blank space above and below it, the three of them.  0 makes the
+region take no space at all.  How that total is split is decided by
+`seshat-reader-page-separator-thickness', see
+`seshat-reader--multipage-separator-segments'."
+  :group 'seshat-reader
+  :type 'number)
+
+(defcustom seshat-reader-page-separator-thickness 2
+  "Thickness of the separator rule, in pixels.
+
+The rule is a background-coloured stretch space, and neither a 1px image nor
+a shrunk face renders thinner than about 2px on a real font frame, which is
+why 2 is the default.  Larger values make the rule thicker; the value is
+clamped to the total height of the region."
+  :group 'seshat-reader
+  :type 'integer)
+
+(defface seshat-reader-page-separator-face
+  '((t :background "gray70"))
+  "Face whose colour the page separator rule takes.
+
+Only the colour is taken from it: the rule is a stretch space spanning the
+window width, and its height comes from the separator geometry, see
+`seshat-reader-page-separator-height'.  A darker colour such as \"gray40\"
+suits a dark theme."
+  :group 'seshat-reader)
+
 (defcustom seshat-reader-multipage-memory-warning-mb 75
   "Warn when the resident page bitmaps exceed this many megabytes.
 
@@ -1210,6 +1255,50 @@ as-is by decision D5b -- is the only way to see the rest of it."
    (t (concat (propertize " " 'display (seshat-reader--multipage-align-to spec))
               (propertize " " 'display spec)
               "\n"))))
+
+(defun seshat-reader--multipage-separator-row (pixels face &optional window)
+  "Return the buffer text of one separator line PIXELS pixels high.
+
+A nil FACE builds a blank line, a non-nil one builds the rule itself.  The
+height is expressed as the relative :height of a face and not through the
+`line-height' text property, because `line-height' can only make a line
+taller than the default and never shorter.  The rule is a space whose
+`display' property is (space :align-to (- right 0)): a stretch space that
+fills the window width -- measured equal to the window body width -- and
+follows a resize on its own.
+
+nil is returned when PIXELS is not positive, which lets the caller skip the
+line.  WINDOW defaults to the selected one and is only used to find the
+frame."
+  (when (> (or pixels 0) 0)
+    (let ((ratio (/ (float pixels)
+                    (max 1 (seshat-reader--default-line-pixels window)))))
+      (if (null face)
+          (concat (propertize "\n" 'face (list :height ratio)))
+        (concat (propertize " "
+                            'display '(space :align-to (- right 0))
+                            'face (list :inherit face :height ratio))
+                "\n")))))
+
+(defun seshat-reader--multipage-separator-rows (&optional window)
+  "Return the buffer text of the separator that follows a page row.
+
+That is the complete region between a page row and the row of the next page:
+the blank space, the rule in `seshat-reader-page-separator-face' and the
+blank space again, in the sizes
+`seshat-reader--multipage-separator-segments' reports.  A segment of 0
+contributes no line, and nil means the region takes no space at all.  WINDOW
+defaults to the selected one and is only used to find the frame."
+  (when-let* ((segments (seshat-reader--multipage-separator-segments window)))
+    (apply #'concat
+           (delq nil
+                 (list (seshat-reader--multipage-separator-row
+                        (nth 0 segments) nil window)
+                       (seshat-reader--multipage-separator-row
+                        (nth 1 segments) 'seshat-reader-page-separator-face
+                        window)
+                       (seshat-reader--multipage-separator-row
+                        (nth 2 segments) nil window))))))
 
 (defun seshat-reader--multipage-write-row (start spec &optional centered)
   "Write the display properties of the page row at START so it shows SPEC.
@@ -1373,7 +1462,7 @@ of the layout or that it is part of it but not rendered yet; callers that
 must tell those two cases apart test `seshat-reader--pages' with `assq'."
   (cddr (assq page seshat-reader--pages)))
 
-(defun seshat-reader--multipage-insert-page (page spec)
+(defun seshat-reader--multipage-insert-page (page spec &optional window)
   "Insert the row of PAGE holding SPEC, keeping the layout sorted by page.
 
 PAGE is a 1-based page number and SPEC is an image spec, or nil for a page
@@ -1382,8 +1471,19 @@ SPEC replaced and the function returns nil, so it is idempotent and can be
 called on every scroll step.  A new row goes before the first row of a
 greater page and at the end of the buffer when PAGE is greater than every
 page present; the newline count from `seshat-reader-page-gap-lines' is
-appended after the row.  The buffer is written under `inhibit-read-only'
-and left unmodified, and the marker of the row is returned."
+appended after the row and the separator region of
+`seshat-reader--multipage-separator-rows' after those newlines.  The buffer
+is written under `inhibit-read-only' and left unmodified, and the marker of
+the row is returned.
+
+WINDOW is the display window the row is built for, i.e. the window whose
+frame supplies the character height that bakes the `:height' ratio of the
+separator rows.  nil means \"resolve it for me\" through
+`seshat-reader--multipage--display-window', the same resolution every other
+layout function uses.  It has to be the same window the scroll arithmetic
+measures (`seshat-reader--multipage-page-gap-pixels'): on two frames with
+different fonts the baked row heights and the scrolled pixel distance would
+otherwise come from two different character heights and drift apart."
   (let ((entry (assq page seshat-reader--pages)))
     (if entry
         (let ((start (marker-position (cadr entry)))
@@ -1393,7 +1493,11 @@ and left unmodified, and the marker of the row is returned."
           (setcdr (cdr entry) spec)
           nil)
       (let ((inhibit-read-only t)
-            (start nil))
+            (start nil)
+            ;; 分隔行的高度按显示窗口所属 frame 的字符高度烘焙成 face :height
+            ;; 倍率，因此必须与滚动几何用同一个窗口来源；显式入参优先，
+            ;; nil 时按 `--multipage--display-window' 解析（与其它布局函数一致）。
+            (win (seshat-reader--multipage--display-window window)))
         ;; 页按页号升序存放，第一个页号更大的行就是插入点。
         (catch 'found
           (dolist (other seshat-reader--pages)
@@ -1406,6 +1510,7 @@ and left unmodified, and the marker of the row is returned."
             (insert (seshat-reader--multipage-page-row spec))
             (dotimes (_ seshat-reader-page-gap-lines)
               (insert "\n"))
+            (insert (or (seshat-reader--multipage-separator-rows win) ""))
             ;; marker 在插入之后创建：位置 = 页行行首，插入类型 t 保证之后在
             ;; 行首前插入别的页时它随文本后移，仍指向自己的页行。
             (let ((marker (copy-marker row-start t)))
@@ -1591,7 +1696,7 @@ render."
                   page scale seshat-reader--multipage-rotate)))
       (when spec
         (seshat-reader--multipage-record-native page spec scale))
-      (seshat-reader--multipage-insert-page page spec)
+      (seshat-reader--multipage-insert-page page spec window)
       (when spec
         ;; native 尺寸已记录，目标 scale 可能因此变小（宽页在 contain/width 下
         ;; 按宽裁剪），这里只改 spec 尺寸，不重渲染。
@@ -1903,16 +2008,63 @@ commands and the page gap need."
                                (selected-window)))))
     (max 1 (frame-char-height frame))))
 
-(defun seshat-reader--multipage-page-gap-pixels (&optional window)
-  "Return the pixel height of the gap lines that follow a page row.
+(defun seshat-reader--multipage-separator-pixels (&optional window)
+  "Return the nominal pixel height of the separator after a page row.
 
-The gap is `seshat-reader-page-gap-lines' empty lines, so their height is one
-default line height each (`seshat-reader--default-line-pixels') — not
-`line-pixel-height', which would report the height of the page row the gap
-belongs to.  The value is 0 — the default configuration — when the option is 0.
+That is `seshat-reader-page-separator-height' default text lines, rounded to
+whole pixels, one line being `seshat-reader--default-line-pixels' high.  The
+answer is 0 — never nil — when `seshat-reader-page-separator' is nil or its
+height is not positive, so that callers can add it without a nil test.
+WINDOW defaults to the selected one and is only used to find the frame."
+  (let ((height seshat-reader-page-separator-height))
+    (if (and seshat-reader-page-separator
+             (numberp height)
+             (> height 0))
+        (round (* height (seshat-reader--default-line-pixels window)))
+      0)))
+
+(defun seshat-reader--multipage-separator-segments (&optional window)
+  "Return the separator geometry as (TOP LINE BOTTOM), in pixels.
+
+This is the single source of truth for the geometry of the region: the scroll
+arithmetic and the construction of the rows both take their numbers from here
+and must not compute them on their own.  Two computations would drift apart,
+and the bottom of a page would then get a dead scroll zone, the bug
+`seshat-reader--multipage-page-max-offset' documents for the gap lines.
+
+TOP and BOTTOM are the blank space above and below the rule, LINE is the
+thickness of the rule, and the three add up to what
+`seshat-reader--multipage-separator-pixels' returns.  nil means the region
+takes no space and the reader can skip it altogether.  LINE is clamped to
+TOTAL, and a non-numeric `seshat-reader-page-separator-thickness' counts as
+0: the same reading `seshat-reader--multipage-separator-pixels' takes of a
+non-numeric height, so a bad customisation shrinks the rule instead of
+signalling out of the scroll arithmetic.  WINDOW defaults to the selected one
+and is only used to find the frame."
+  (let ((total (seshat-reader--multipage-separator-pixels window)))
+    (when (> total 0)
+      (let* ((line (min (if (numberp seshat-reader-page-separator-thickness)
+                            (max 0 seshat-reader-page-separator-thickness)
+                          0)
+                        total))
+             (top (/ (- total line) 2)))
+        (list top line (- total line top))))))
+
+(defun seshat-reader--multipage-page-gap-pixels (&optional window)
+  "Return the pixel height of everything that follows a page row.
+
+Two parts add up here: the gap lines, i.e. `seshat-reader-page-gap-lines'
+empty lines of one default line height each
+\(`seshat-reader--default-line-pixels'), plus the separator region of
+`seshat-reader--multipage-separator-pixels'.  Both of them sit between a page
+row and the row of the next page, so the scroll code needs their sum.
+
+Neither part is taken with `line-pixel-height', which would report the height
+of the page row the gap belongs to.  The value is 0 when both parts are 0.
 WINDOW defaults to the selected one and is only used to find the frame."
   (let ((lines (max 0 seshat-reader-page-gap-lines)))
-    (if (> lines 0) (* lines (seshat-reader--default-line-pixels window)) 0)))
+    (+ (if (> lines 0) (* lines (seshat-reader--default-line-pixels window)) 0)
+       (seshat-reader--multipage-separator-pixels window))))
 
 (defun seshat-reader--multipage-page-span (page)
   "Return the pixel distance from the top of PAGE's row to the next row.
