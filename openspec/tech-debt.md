@@ -1726,8 +1726,9 @@
 - 备注：非本次修复引入，属既有问题；发现时机与上下文——L3 加载源码版时 `*Messages*` 里出现该 warning，随后追到 `seshat-reader.el:87`。复现命令：`emacs --batch -Q --eval '(prin1 (macroexpand-1 (quote (with-demoted-errors (require (quote seshat-render-core))))))'`。
 - 已解决（2026-10-27）：改为 `(with-demoted-errors "seshat-render-core: %S" (require 'seshat-render-core))`，`require` 语义不变（失败仍被 demote 成 `*Messages*` 一行），并补注释说明「必须给出 FORMAT」。**该 warning 在 `make all` 里出现 4 次**（`seshat-reader.el` 被编译 1 次 + 作为依赖被其余 3 个编译进程加载），故实测基线由 **24 → 20**（不是计划预估的 24 → 23，计划按 1 次计数估算）。验证：`make -C emacs/seshat-reader clean all` EXIT 0、warning **20**（改动前同命令实测 24，逐条 diff 只少这 4 条、零新增）、`make -C emacs/seshat-reader checkdoc` 0 报错、`check-parens` 通过、`make -C emacs/tests ert` **33** 文件 **1266** 例（0 unexpected / 0 skipped）、`make -C emacs/tests check-criteria` PASS。
 
-## 宽页水平滚动（hscroll）在书签恢复时是否保留未验证（2026-10-27）
+## 宽页水平滚动（hscroll）在书签恢复时是否保留未验证（2026-10-27）——已验证通过（2026-10-27）
 
 - 现状：`seshat-reader-bookmark-jump` 第 ④ 步用 `(set-window-hscroll nil hscroll)` 恢复横向位置，但尚未真机验证；书签偏移批次计划 `openspec/completed/2026-10-27-reader-bookmark-offset-restore.md` 注意事项 5 明确「若 L3 发现它也不恢复，登记 tech-debt 另议」。
 - 影响：宽页（页面宽于窗口）横向滚动到中段后存书签，跳回时可能回到最左侧，属体验缺陷，不影响垂直偏移的正确性。
 - 建议：下次阅读宽页文档时顺手验证；若不恢复，另开小计划（可能同样需要「落帧后再设 hscroll」的次序）。
+- 已验证（2026-10-27，用户真机）：用户确认书签跳回后位置正确（含横向位置），宽页 `hscroll` 在书签恢复时被保留，本条可关闭。

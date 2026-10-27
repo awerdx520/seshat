@@ -206,8 +206,13 @@ third element of the fake position list, `posn-object' a page image and
 
 ;;;; 4/5. 书签：保存/恢复与旧字段迁移
 
-(defun seshat-reader-periphery-test--jump-calls (bookmark)
+(defun seshat-reader-periphery-test--jump-calls (bookmark &optional new-document)
   "Jump to BOOKMARK with every UI side effect stubbed, return what was called.
+NEW-DOCUMENT non-nil models a jump that *opens* a document: `derived-mode-p'
+answers nil until `bookmark-default-handler' has switched the buffer, which is
+exactly the gate the restore reads to decide whether the recorded fit applies.
+nil models jumping inside a buffer that is already in `seshat-reader-mode'.
+
 The returned plist holds :scale (args of `--multipage-set-scale'), :page (arg
 of `--multipage-goto'), :vscroll (args of `set-window-vscroll'), :hscroll (args
 of `set-window-hscroll') and :events, the calls in call order as a list of
@@ -216,13 +221,16 @@ and therefore cannot carry an order assertion; the restore has to force a frame
 *before* it writes the pixel offset, so the ordered :events list is what the
 order tests read."
   (let ((calls nil)
-        (events nil))
-    (cl-letf (((symbol-function 'bookmark-default-handler) (lambda (&rest _) nil))
+        (events nil)
+        (handled nil))
+    (cl-letf (((symbol-function 'bookmark-default-handler)
+               (lambda (&rest _) (setq handled t) nil))
               ((symbol-function 'file-exists-p) (lambda (&rest _) t))
               ((symbol-function 'switch-to-buffer) (lambda (&rest _) nil))
               ((symbol-function 'seshat-reader-mode) (lambda (&rest _) nil))
               ((symbol-function 'derived-mode-p)
-               (lambda (&rest _) 'seshat-reader-mode))
+               (lambda (&rest _)
+                 (and (or handled (not new-document)) 'seshat-reader-mode)))
               ((symbol-function 'seshat-reader--multipage-set-scale)
                (lambda (&rest args)
                  (push (cons 'set-scale args) events)
@@ -232,6 +240,11 @@ order tests read."
                  (push (cons 'goto page) events)
                  (setq calls (plist-put calls :page page))
                  page))
+              ;; 固定基准页 fit：`width' 记录走这条路，桩掉才能在批处理里观察到
+              ;; ① 步是否真的出手（真函数无窗口几何时返回 nil，会让
+              ;; 「应用了 fit」与「没应用」看起来一样 → 假绿）。
+              ((symbol-function 'seshat-reader--multipage-base-fit-scale)
+               (lambda (&optional _mode _window) 0.42))
               ((symbol-function 'redisplay)
                (lambda (&rest args)
                  (push (cons 'redisplay args) events)
@@ -254,7 +267,10 @@ order tests read."
                     (plist-get calls :events))))
 
 (ert-deftest seshat-reader-periphery-test--bookmark-round-trip ()
-  "Page, offset, hscroll and scale are restored, the zoom as `manual'."
+  "Page, offset, hscroll and scale are restored, the zoom as `manual'.
+
+整条记录（含缩放）的往返只在**新开文档**时成立：同一阅读 buffer 内跳转不应用
+记录的 fit / scale（见 `--bookmark-jump-same-buffer-keeps-current-fit'）。"
   (let* ((bookmark (list (cons 'filename "/tmp/doc.pdf")
                          (cons 'page 7)
                          (cons 'offset 120)
@@ -263,13 +279,74 @@ order tests read."
                          ;; `manual' 记录才用记录里的 scale；fit 模式走基准页
                          ;; fit（见 `--bookmark-restores-recorded-fit-mode'）
                          (cons 'fit-mode 'manual)))
-         (calls (seshat-reader-periphery-test--jump-calls bookmark)))
+         (calls (seshat-reader-periphery-test--jump-calls bookmark :new-document)))
     (should (equal '(1.5 manual manual) (plist-get calls :scale)))
     (should (= 7 (plist-get calls :page)))
     ;; 工具把 nil 解析成 selected window 后才写给 `set-window-vscroll'
     (should (equal (list (selected-window) 120 t)
                    (plist-get calls :vscroll)))
     (should (equal (list nil 40) (plist-get calls :hscroll)))))
+
+(ert-deftest seshat-reader-periphery-test--bookmark-jump-same-buffer-keeps-current-fit ()
+  "A jump inside a reader buffer moves the place, never the current fit.
+
+① 步（`fit-mode' / `scale'）整体跳过——跳转只该移动视图，不该改动用户正在使用
+的视图；② page / ③ offset / ④ hscroll 仍按记录恢复，且事件序不变（goto → 落帧
+→ 写偏移）。断言实参与顺序，不只断言「被调用过」。
+
+`width'（走基准页 fit 分支）与 `manual'（走记录的 scale 分支）两条记录各跑一遍：
+只测其中一条时，另一条分支若被误放行也照样绿。"
+  (dolist (bookmark (list ;; fit 模式分支
+                           (list (cons 'filename "/tmp/doc.pdf")
+                                 (cons 'page 7)
+                                 (cons 'offset 120)
+                                 (cons 'hscroll 40)
+                                 (cons 'scale 1.5)
+                                 (cons 'fit-mode 'width))
+                           ;; manual / 显式 scale 分支
+                           (list (cons 'filename "/tmp/doc.pdf")
+                                 (cons 'page 7)
+                                 (cons 'offset 120)
+                                 (cons 'hscroll 40)
+                                 (cons 'scale 1.5)
+                                 (cons 'fit-mode 'manual))))
+    (let ((calls (seshat-reader-periphery-test--jump-calls bookmark)))
+      ;; fit 与记录里的 scale 一个都不应用
+      (should-not (plist-get calls :scale))
+      (should-not (seshat-reader-periphery-test--jump-event-names
+                   calls 'set-scale))
+      ;; 位置照旧：页号 / 页内像素偏移 / 横向位置
+      (should (= 7 (plist-get calls :page)))
+      (should (equal (list (selected-window) 120 t)
+                     (plist-get calls :vscroll)))
+      (should (equal (list nil 40) (plist-get calls :hscroll)))
+      (should (equal '(goto redisplay set-window-vscroll)
+                     (seshat-reader-periphery-test--jump-event-names
+                      calls 'goto 'redisplay 'set-window-vscroll))))))
+
+(ert-deftest seshat-reader-periphery-test--bookmark-jump-new-buffer-restores-recorded-fit ()
+  "A jump that opens a document still applies the recorded fit and scale.
+
+跳转前不是阅读 buffer（从书签打开未读文档、saveplace 重开）时没有「当前视图」可
+继承，故 ① 步照旧执行：`--multipage-set-scale' 被调用、实参为记录值，且发生在
+跳页之前（页行高度变了，目标页的位置才稳定）。"
+  (let* ((bookmark (list (cons 'filename "/tmp/doc.pdf")
+                         (cons 'page 7)
+                         (cons 'offset 120)
+                         (cons 'hscroll 40)
+                         (cons 'scale 1.5)
+                         (cons 'fit-mode 'manual)))
+         (calls (seshat-reader-periphery-test--jump-calls bookmark :new-document)))
+    ;; 实参逐项：记录里的 scale + manual 来源（不是记录里那个 fit 模式）
+    (should (equal '(1.5 manual manual) (plist-get calls :scale)))
+    ;; 位置照旧恢复
+    (should (= 7 (plist-get calls :page)))
+    (should (equal (list (selected-window) 120 t)
+                   (plist-get calls :vscroll)))
+    (should (equal (list nil 40) (plist-get calls :hscroll)))
+    (should (equal '(set-scale goto redisplay set-window-vscroll)
+                   (seshat-reader-periphery-test--jump-event-names
+                    calls 'set-scale 'goto 'redisplay 'set-window-vscroll)))))
 
 (ert-deftest seshat-reader-periphery-test--bookmark-legacy-vscroll-migrates ()
   "A pre-P1 record carrying only `vscroll' is migrated to a pixel offset."
@@ -571,8 +648,14 @@ goto frame, where this order was impossible."
       (kill-buffer buffer))))
 
 (ert-deftest seshat-reader-periphery-test--bookmark-restores-recorded-fit-mode ()
-  "A recorded fit mode drives the restore; manual uses the recorded scale."
+  "Opening a document from a bookmark applies the recorded fit mode.
+
+这条用例是**新开文档**场景：跳转前 buffer 不是 `seshat-reader-mode'（`derived-mode-p'
+在 handler 之前返回 nil），此时没有「当前视图」可继承，记录值才生效。同一阅读
+buffer 内跳转不应用 fit 的行为由
+`--bookmark-jump-same-buffer-keeps-current-fit' 覆盖。"
   (let ((buffer (seshat-reader-periphery-test--reader-buffer '(1 2)))
+        (handled nil)
         (width-bookmark (list (cons 'filename "/tmp/doc.pdf")
                               (cons 'page 2)
                               (cons 'offset 0)
@@ -585,11 +668,13 @@ goto frame, where this order was impossible."
     (unwind-protect
         (with-current-buffer buffer
           (cl-letf (((symbol-function 'bookmark-default-handler)
-                     (lambda (&rest _) nil))
+                     (lambda (&rest _) (setq handled t) nil))
                     ((symbol-function 'file-exists-p) (lambda (&rest _) t))
                     ((symbol-function 'switch-to-buffer) (lambda (&rest _) nil))
                     ((symbol-function 'derived-mode-p)
-                     (lambda (&rest _) 'seshat-reader-mode))
+                     ;; 跳转前不是阅读 buffer（新开文档）；handler 之后才是。
+                     (lambda (&rest _)
+                       (and handled 'seshat-reader-mode)))
                     ((symbol-function 'seshat-reader--multipage-goto)
                      (lambda (&rest _) nil))
                     ((symbol-function 'set-window-vscroll) (lambda (&rest _) nil))
@@ -605,10 +690,14 @@ goto frame, where this order was impossible."
                     ((symbol-function 'seshat-reader--multipage-sync)
                      (lambda (&rest _) nil)))
             ;; 记录 width → base = 该模式的基准页 fit（0.42），不是记录里的 1.5
+            ;; 每次跳转前复位「已过 handler」标记：否则第二次跳转会被当成
+            ;; 「同一 buffer 内跳转」，① 步整段跳过、记录的 fit 不生效。
+            (setq handled nil)
             (seshat-reader-bookmark-jump width-bookmark)
             (should (eq 'width seshat-reader--multipage-fit-mode))
             (should (= 0.42 seshat-reader--multipage-base-scale))
             ;; 记录 manual → 用记录的显式 scale，并把 fit 模式置 manual
+            (setq handled nil)
             (seshat-reader-bookmark-jump manual-bookmark)
             (should (eq 'manual seshat-reader--multipage-fit-mode))
             (should (= 1.5 seshat-reader--multipage-base-scale))))

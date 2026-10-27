@@ -73,8 +73,15 @@ offset as-is and used as an approximation.  nil / a non-number falls back to
 The recorded place is restored in this order:
 
 1. `fit-mode' + `scale' — applied first, because resizing the pages changes
-   where the row of the target page sits.  The recorded **fit mode takes part
-   in the restore**: `manual' (or a missing mode) restores the recorded
+   where the row of the target page sits.  This step is **skipped when the
+   jump happens inside a `seshat-reader-mode' buffer**: the zoom mode (`W' /
+   `H' / manual) and the scale the user is looking at right now are kept as
+   they are, and only the place (steps 2-4) moves — a bookmark jump is meant
+   to move the view, not to change it, so a record saved days ago must not
+   undo a fit chosen for this window.  A jump that **opens a document** (the
+   buffer was not a reader buffer before the jump, e.g. `save-place' or a
+   bookmark of an unread document) has no current view to inherit and applies
+   the recorded values: `manual' (or a missing mode) restores the recorded
    explicit `scale' as a manual zoom, so a later window resize does not
    replace it with a fit; `contain' / `width' / `height' instead restore the
    base scale that mode implies for the reference page
@@ -93,6 +100,9 @@ The recorded place is restored in this order:
 4. `hscroll' — horizontal position, for a page wider than the window."
   (let ((page (bookmark-prop-get bookmark 'page))
         (file (bookmark-prop-get bookmark 'filename))
+        ;; 必须在 handler **之前**取：`bookmark-default-handler' 会切 buffer，
+        ;; 切完就再也看不出「跳转前」是不是已经在这个阅读 buffer 里了。
+        (reader-buffer-p (derived-mode-p 'seshat-reader-mode))
         (scale (bookmark-prop-get bookmark 'scale))
 	(hscroll (bookmark-prop-get bookmark 'hscroll))
 	(offset (seshat-reader-bookmark--entry-offset bookmark)))
@@ -101,18 +111,22 @@ The recorded place is restored in this order:
       (switch-to-buffer (current-buffer))
       (unless (derived-mode-p 'seshat-reader-mode)
 	(seshat-reader-mode))
-      ;; ① 先恢复缩放：页行高度变了，目标页的位置才稳定。记录的 fit 模式参与
-      ;; 恢复：`manual' 或缺失 → 用记录的显式 scale；`contain' / `width' /
-      ;; `height' → 用该模式的基准页 fit（resize 后行为一致，且不依赖记录里
-      ;; 那个已过期的 scale）。
-      (let ((mode (bookmark-prop-get bookmark 'fit-mode)))
-        (cond
-         ((memq mode '(contain width height))
-          (let ((fit (seshat-reader--multipage-base-fit-scale mode)))
-            (when (numberp fit)
-              (seshat-reader--multipage-set-scale fit 'fit mode))))
-         ((and (numberp scale) (> scale 0))
-          (seshat-reader--multipage-set-scale scale 'manual 'manual))))
+      ;; ① 缩放**只在「新开文档」时**按记录恢复（跳转前不是阅读 buffer）。
+      ;; 同一阅读 buffer 内跳书签时这一步整体跳过：用户此刻的 W/H/manual 与
+      ;; 缩放保持不动——跳转只该移动视图，不该改动正在使用的视图。新开文档
+      ;; 没有「当前视图」可继承，才用记录的 fit 模式（`manual' 或缺失 → 记录
+      ;; 的显式 scale；`contain' / `width' / `height' → 该模式的基准页 fit，
+      ;; resize 后行为一致，且不依赖记录里那个已过期的 scale）。这一步仍排在
+      ;; 页号之前：页行高度变了，目标页的位置才稳定。
+      (unless reader-buffer-p
+        (let ((mode (bookmark-prop-get bookmark 'fit-mode)))
+          (cond
+           ((memq mode '(contain width height))
+            (let ((fit (seshat-reader--multipage-base-fit-scale mode)))
+              (when (numberp fit)
+                (seshat-reader--multipage-set-scale fit 'fit mode))))
+           ((and (numberp scale) (> scale 0))
+            (seshat-reader--multipage-set-scale scale 'manual 'manual)))))
       ;; ② 跳到目标页（`--multipage-goto' 会把页内偏移清零，停在页首）。
       (when (numberp page)
         (seshat-reader--multipage-goto page))

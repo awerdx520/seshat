@@ -912,6 +912,16 @@ refit 按当前窗口尺寸做一次几何适配 + 重渲染，一次到位。
 
 **推广（批次 A，2026-10-27）**：同一约束同样适用于**书签 / saveplace 的恢复路径**——`seshat-reader-bookmark-jump` 第 ③ 步原先在 `seshat-reader--multipage-goto`（内部 `set-window-start`）之后**同一帧**写 `set-window-vscroll`，故记录里 `offset > 0` 时必然只回到页首（saveplace 经 `seshat-reader--saveplace-find-file` 复用同一 handler，一并受影响）。现两条渠道统一走新增的 `seshat-reader--multipage--apply-offset`：先 `(redisplay t)` 落帧、再 `set-window-vscroll`；`WINDOW` 传 `nil` 表示 selected window（内部按 `(if (window-live-p window) window (selected-window))` 解析，与 `--multipage-scroll` / `--multipage-sync` 同口径，**不对入参直接判活**）；解析后的窗口非 live 或 `OFFSET` 非正数时既不写偏移也不落帧。**约束不变**：跨页路径（`--multipage-scroll`）与恢复路径（`--multipage--apply-offset`）是同一约束的两种形态，**任何「省掉这次落帧」的优化都会让各自的行为退回「跳页首」**；ERT 只能钉住事件顺序（`redisplay` 早于 `set-window-vscroll`）与实参，偏移能否跨 redisplay 存活仍只能真机验证（见 `openspec/tech-debt.md` 该条与 `openspec/active/2026-10-27-reader-bookmark-offset-restore.md`）。
 
+## 2026-10-27 · 书签恢复的 fit-mode 只在「新开文档」时应用
+
+**决策**：`seshat-reader-bookmark-jump` 的第 ① 步（`fit-mode` / `scale`）只在**跳转前不是阅读 buffer**时执行——新开文档（saveplace 重开、从书签打开未读文档）按记录的 `fit-mode` + `scale` 恢复；在**同一阅读 buffer 内**跳书签时整段跳过，保留用户此刻的 `W` / `H` / manual 与缩放，只恢复页号（②）、页内像素偏移（③）与横向位置（④）。判定点在 `(bookmark-default-handler bookmark)` **之前**取 `(derived-mode-p 'seshat-reader-mode)` 存入局部变量——handler 会切 buffer，切完就再也看不出「跳转前」是哪个 buffer。
+
+**理由（用户偏好，2026-10-27 用户确认）**：跳转不应改动用户正在使用的视图。书签里的缩放是**保存那一刻**的选择，与当前窗口尺寸无关；把它套回当前窗口等于每次跳书签都强制改一次缩放，用户刚按 `H` 调好的适配会被几天前的记录推翻。新开文档没有「当前视图」可继承，记录值才是不二选择（否则打开后停在与记录无关的默认适配）。
+
+**代价与边界**：① 判据是「跳转前 buffer 的 major mode」，故在文档 A 的阅读 buffer 里跳到**文档 B 的书签**（未打开）也会跳过 ①——与「新开文档」的字面语义有偏差，属本决策**已知边界**；若要精确区分，判据应改为「跳转前后是否同一 buffer」（本轮按用户确认的语义实现，不扩大范围）。② 记录格式不变，`fit-mode` / `scale` 仍照旧写入，只是同一 buffer 内跳转不消费它。③ ERT 只能断言「① 步是否出手」与位置实参，观感仍由真机确认；变异自检（恒应用 / 恒不应用）各自能打红对应用例。
+
+（用户来源：2026-10-27 会话确认「书签跳回后，缩放模式（W/H/manual）跟**当前视图**走，不被书签记录覆盖」。）
+
 ## 2026-10-27 · 阅读器 fit / render 的窗口解析永不使用 minibuffer 窗口
 
 **决策**：① 页面几何的窗口解析收敛到单一函数 `seshat-reader--multipage--display-window`——候选顺序「显式入参 → `get-buffer-window` → `selected-window`」，每个候选必须同时满足「活窗口 + 不是 minibuffer 窗口（`window-minibuffer-p`）+ 显示当前 buffer」，都不满足时返回 `nil`，由调用方按「几何未知」处理（`--multipage-target-scale` 先返回基准 scale、`--multipage-fit-scale` 返回 nil、`--multipage-current-fit-mode` 只报 buffer-local 值）。**minibuffer 窗口永不作为返回值。** ② `--multipage-render-page` 增可选 `WINDOW` 参数并向下传给 `--multipage-target-scale` / `--multipage-resize-spec`，`--multipage-rerender-page` 与 `--redisplay-all-windows` 显式补传。③ 新增 `seshat-reader-freeze-layout-during-minibuffer`（默认 `t`）作为**纯 UX** 的版面冻结开关：`--refit-window` / `--schedule-refit` 在 minibuffer 激活期间直接返回，`--recenter-window` 跳过 `--apply-display-scale`（它内部会改 spec 尺寸）只保留居中，`--multipage-sync` 不冻结。
