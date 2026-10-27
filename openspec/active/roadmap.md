@@ -234,6 +234,8 @@ M0–M6 已完成并归档，见 `openspec/completed/personal-notes-system.md`�
 
 - **2026-10-27 进展（P1 完成并归档）**：T1–T10 全部落地，计划归档于 `openspec/completed/2026-10-26-reader-multipage-p1-layout.md`（含逐批执行记录与偏差）。commit 清单：`d7ef467`（T1 布局骨架）/ `12d8911`+`4590f0b`（T1b+T2+T3）/ `19a5a91`+`80eb582`（T4 逐页几何）/ `c6caf85`+`4751929`+`27bdbbe`（像素级滚动三次修复）/ `78b273a`（计划回写）/ `b82e03d`（T5 缩放与 refit）/ `f83bb64`（T6 缓存与虚拟化）/ `e27dd78`（T7 删死族 + 真机三报错）/ `365198a`（T8 外围适配）/ `e2c6f02`（T9 测试基建）。验证基线：`make -C emacs/seshat-reader clean all` EXIT 0、warning 24（P0 基线 33 → 24，零新增）、checkdoc 0；`make -C emacs/tests ert` → 31 文件 / 1213 例 / 0 unexpected / 0 skipped。真机验收要点：滚动为像素级连续（`j` 不再等同 `n`）、逐页居中与宽页贴左、`W`/`H`/`+`/`-`/`0` 缩放后全部可见页同步清晰、跨页滚动 scale 不跳变、滚轮与按键手感一致（步长可配置）。遗留项（跨页选区、横向滚动整栏平移、异步渲染、C 侧 overlay 兼容外壳等）见 `openspec/tech-debt.md`「2026-10-27 阅读器多页布局（P1）遗留」。
 
+- **P2 候选已登记（2026-10-27）**：异步渲染与 idle 预取、跨页选区、横向滚动整栏平移、C 侧单页 overlay 机制退役、内存与驻留策略、L3 收尾确认、渲染基准回退分支、旋转页高亮坐标复核 —— 见 `openspec/active/2026-10-27-reader-multipage-p2-followups.md`（候选池，范围待用户圈定）。**P1 已完成并归档（31 文件 1219 例双零、warning 24、checkdoc 0；code-reviewer 三轮「可合入」）。**
+
 ## 风险登记
 
 | # | 风险 | 影响 | 缓解 |
