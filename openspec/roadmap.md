@@ -1,5 +1,7 @@
 # Seshat 路线图（M7–M12）：资源 ID · 引用 · 增量同步
 
+> 常驻跟踪文档（里程碑流水与未决问题），**不是**可执行计划，不参与 `active/` 的归档流程。
+
 ## 当前状态
 
 - 阶段：M8 计划 C（多根分流收尾 / `seshat:` uid 稳定跟随 / 透明性验证）已完成并归档（Phase 4 收尾，2026-10-26）；M12 及其后续（尺寸自适应重贴合、平滑适配 + `W`/`H` 持久模式）均已归档；`openspec/active/` 下的「阅读器多页连续布局 P0」计划已完成并归档到 `openspec/completed/2026-10-26-reader-multipage-p0-page-spec-api.md`（P1 待启动，由本路线图跟踪）；`2026-10-26-reader-panel-width-follow-and-valign.md` 已归档到 `openspec/completed/`，由本路线图跟踪

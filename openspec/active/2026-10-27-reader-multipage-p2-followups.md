@@ -44,7 +44,7 @@ P1 把阅读器从「单页 overlay + 像素级 vscroll」改为「buffer 内多
 
 ## 文档清单（细化时按此同步）
 
-`docs/architecture.md`（异步渲染 / overlay 退役后的结构）、`docs/emacs-reader.md`（跨页选区的使用与限制、横向滚动语义）、`docs/configuration.md`（若有新选项）、`emacs/seshat-reader/VENDORED.md`（C 改动）、`CHANGELOG.md`、`openspec/decisions.md`（协议与取舍）、`openspec/tech-debt.md`（勾销已解决项）、`openspec/active/roadmap.md`。
+`docs/architecture.md`（异步渲染 / overlay 退役后的结构）、`docs/emacs-reader.md`（跨页选区的使用与限制、横向滚动语义）、`docs/configuration.md`（若有新选项）、`emacs/seshat-reader/VENDORED.md`（C 改动）、`CHANGELOG.md`、`openspec/decisions.md`（协议与取舍）、`openspec/tech-debt.md`（勾销已解决项）、`openspec/roadmap.md`。
 
 ## 注意事项
 
