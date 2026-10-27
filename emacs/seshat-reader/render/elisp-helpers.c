@@ -422,7 +422,14 @@ init_overlay(emacs_env *env, emacs_value window)
 bool
 check_current_overlay(emacs_env *env, emacs_value overlay)
 {
-	if (overlay == EMACS_NIL)
+	/* `emacs_value' is an opaque handle, not a pointer we may compare with
+	 * `==': the module API only guarantees `env->eq' knows about Emacs'
+	 * (possibly non-unique) representation of nil.  Comparing handles
+	 * directly silently failed once nil was actually reached here (the
+	 * reader's multi-page layout no longer puts an overlay on every
+	 * window), and the guard let `overlay-buffer(nil)' through — a crash
+	 * instead of the intended `false'. */
+	if (env->eq(env, overlay, EMACS_NIL))
 		return false;
 
 	emacs_value overlay_buffer = env->funcall(
@@ -449,8 +456,9 @@ get_current_doc_overlay(emacs_env *env)
 	    env, env->intern(env, "window-parameter"), 2,
 	    (emacs_value[]){ curr_win, env->intern(env, "overlay") });
 
-	// Check if overlay is valid for current buffer
-	if (current_overlay != EMACS_NIL
+	// Check if overlay is valid for current buffer.  `env->eq' (not `!='
+	// on the raw handle): see the note in `check_current_overlay'.
+	if (!env->eq(env, current_overlay, EMACS_NIL)
 	    && !check_current_overlay(env, current_overlay))
 	{
 		// Stale overlay, clear it

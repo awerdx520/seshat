@@ -2015,16 +2015,25 @@ stext_query_in_rect(emacs_env *env, DocState *doc_state, int page_number,
  *
  * The three rect-query entry points (`--text-in-rect', `--rects-in-rect'
  * and `--lines-in-rect') differ only in the shape of their answer, so the
- * whole front half of each call — reader state lookup, the reload/close
- * early-outs, page-number range check and the coordinate validation — is
+ * whole front half of each call — reader state lookup, the reload
+ * early-out, page-number range check and the coordinate validation — is
  * factored out here.  Keeping it in one place is what makes "the same
  * rectangle means the same thing" true across all three: they share one
  * notion of page space (`rect_to_page_space') and one set of messages.
  *
  * All failures return false with no result to build; some of them emit a
  * message (out-of-range page, non-finite coordinates) and some are
- * deliberately silent (no reader state, reload/close window — the caller
+ * deliberately silent (no reader state, reload in progress — the caller
  * is in the middle of a redisplay and a message would be noise).
+ *
+ * The document is resolved from the *buffer-local* state pointer only
+ * (`get_doc_state_ptr'), never from the selected window's overlay.  A rect
+ * query reads the document, not the display: the multi-page layout draws
+ * every visible page into its own overlay-less region and a drag therefore
+ * runs with an arbitrary selected window (the drag deliberately never calls
+ * `select-window', see `seshat-reader-select-drag').  Requiring a valid
+ * overlay here made every rect query fail — silently, since this helper
+ * stays quiet — which is exactly the "selection copies nothing" symptom.
  *
  * @param env             Emacs module environment.
  * @param args            Elisp args: page, x0, y0, x1, y1 (0-based page).
@@ -2038,15 +2047,18 @@ static bool
 prepare_rect_query(emacs_env *env, emacs_value *args, DocState **doc_state_out,
 		   int *page_number_out, fz_rect *rect_out)
 {
-	DocState *doc_state = NULL;
-	EmacsWinState *win_state = NULL;
-	emacs_value overlay = EMACS_NIL;
+	DocState *doc_state = get_doc_state_ptr(env);
 
-	if (!get_reader_current_state(env, &doc_state, &win_state, &overlay))
+	/* Silent: no reader state means this buffer is not a live reader (or
+	 * the module's user pointer is gone), and the caller may be inside a
+	 * redisplay where a message would only echo on every keystroke. */
+	if (!doc_state)
 		return false;
 
-	/* Bail out during reload/close windows to avoid use-after-free. */
-	if (doc_state->is_reloading || win_state->closing)
+	/* Bail out during reload to avoid use-after-free.  The window-close
+	 * branch that used to be checked here belonged to the overlay's
+	 * `EmacsWinState'; without a window there is nothing left to consult. */
+	if (doc_state->is_reloading)
 		return false;
 
 	int page_number = (int)env->extract_integer(env, args[0]);
@@ -2335,7 +2347,7 @@ emacs_text_in_rect(emacs_env *env, ptrdiff_t nargs, emacs_value *args,
  * emacs_rects_in_rect - Return the text quads intersecting a rectangle.
  *
  * The geometric sibling of `--text-in-rect': same page/coordinate
- * validation, same early-outs during reload/close, same
+ * validation, same reload early-out, same
  * `rect_to_page_space' notion of page space (so a rect handed to
  * `--add-highlight' lines up with the quads this returns), and the very
  * same stext traversal (see stext_query_in_rect).  Instead of
