@@ -175,6 +175,26 @@ Setting this to nil restores the previous behaviour, where a size change
 only recentred the page, without touching the rendering resolution or the
 vertical scroll.  It is an internal switch, not a user option.")
 
+(defcustom seshat-reader-freeze-layout-during-minibuffer t
+  "Non-nil means keep the page layout frozen while the minibuffer is open.
+
+This is a pure UX switch, not a correctness one: the page geometry is never
+computed from the minibuffer window (see
+`seshat-reader--multipage--display-window'), so the pages stay correct either
+way.  What it removes is the flicker of a layout that shrinks while a prompt
+\(`M-x', `find-file', a bookmark jump) is open and grows back afterwards.
+
+The price is cropping: an expanded minibuffer takes about 400 px (17 rows)
+out of a 1275 px reader window, and a frozen page keeps the 1275 px height it
+was laid out for, so roughly 416 px at the bottom are cut off by the window
+while the prompt is open.  Nothing is lost -- the refit that
+`seshat-reader--after-minibuffer-exit' schedules puts the layout back as soon
+as the minibuffer is closed.
+
+Set it to nil to let the pages follow the shrinking window again."
+  :group 'seshat-reader
+  :type 'boolean)
+
 ;; Setting of `auto-mode-list' fails if not autoloaded.
 ;;;###autoload
 (defconst seshat-reader-supported-formats (list "pdf" "epub" "mobi"
@@ -726,45 +746,92 @@ The buffer local `seshat-reader--multipage-fit-mode' wins, because every
 window showing this buffer shows the same scales; it is seeded from the
 window's fit mode by `seshat-reader--first-fit' and
 `seshat-reader--ensure-window-layout', so a window that never recorded one
-still gets the `seshat-reader-default-fit' behaviour.  WINDOW defaults to
-the selected one."
-  (or seshat-reader--multipage-fit-mode
-      (seshat-reader--window-fit-mode (or window (selected-window)))))
+still gets the `seshat-reader-default-fit' behaviour.
+
+WINDOW defaults to the window displaying this buffer
+\(`seshat-reader--multipage--display-window'), which is never a minibuffer
+window.  When no window displays the buffer the answer is the buffer local
+mode alone and may be nil: a window's fit mode only means something for the
+window being fitted, and the callers treat nil as \"geometry unknown\"."
+  (let ((window (seshat-reader--multipage--display-window window)))
+    (or seshat-reader--multipage-fit-mode
+        (and window (seshat-reader--window-fit-mode window)))))
 
 (defun seshat-reader--multipage-fit-scale (page mode &optional window)
   "Return the scale at which PAGE fits WINDOW under fit MODE.
 
 PAGE is a 1-based page number, MODE is one of `contain', `width' and
-`height', and WINDOW defaults to the selected one.  The native size of PAGE
-\(`seshat-reader--page-native-sizes') is what makes this page-based: a page
-only ever needed to fit on its own dimensions, which is what gives `contain'
-its `min (base scale, width fit)' shape through
+`height', and WINDOW defaults to the window displaying this buffer
+\(`seshat-reader--multipage--display-window'), never to a minibuffer window.
+The native size of PAGE (`seshat-reader--page-native-sizes') is what makes
+this page-based: a page only ever needed to fit on its own dimensions, which
+is what gives `contain' its `min (base scale, width fit)' shape through
 `seshat-reader--multipage-target-scale'.
 
 nil is returned while the native size of PAGE is unknown, i.e. before the
-page has been rendered once."
-  (let* ((window (if (window-live-p window) window (selected-window)))
+page has been rendered once, and also when no window displays the buffer:
+there is no geometry to fit the page to, and measuring the minibuffer window
+instead (102 px high) produced a 0.25 scaled strip."
+  (let* ((window (seshat-reader--multipage--display-window window))
          (native (seshat-reader--multipage-native-size page))
          (width (car-safe native))
-         (height (cdr-safe native))
-         (window-width (window-body-width window t))
-         (window-height (window-body-height window t)))
-    (when (and (numberp width) (> width 0) (numberp height) (> height 0))
-      (let ((width-fit (and (numberp window-width) (> window-width 0)
-                            (/ (float window-width) width)))
-            (height-fit (and (numberp window-height) (> window-height 0)
-                             (/ (float window-height) height))))
-        (pcase mode
-          ('width width-fit)
-          ('height height-fit)
-          (_ (and width-fit height-fit (min width-fit height-fit))))))))
+         (height (cdr-safe native)))
+    (when (and window
+               (numberp width) (> width 0) (numberp height) (> height 0))
+      (let ((window-width (window-body-width window t))
+            (window-height (window-body-height window t)))
+        (let ((width-fit (and (numberp window-width) (> window-width 0)
+                              (/ (float window-width) width)))
+              (height-fit (and (numberp window-height) (> window-height 0)
+                               (/ (float window-height) height))))
+          (pcase mode
+            ('width width-fit)
+            ('height height-fit)
+            (_ (and width-fit height-fit (min width-fit height-fit)))))))))
+
+(defun seshat-reader--multipage--display-window (&optional window)
+  "Return the window whose geometry the page layout of this buffer follows.
+
+WINDOW is used when it is a live window that is not a minibuffer window and
+that displays the current buffer.  Otherwise the window `get-buffer-window'
+finds for the current buffer is used, then the selected window, both under
+the same conditions, and nil is returned when none of them qualifies -- which
+is how the fit calculations learn that the geometry is unknown instead of
+measuring an unrelated window.
+
+A minibuffer window is never returned, whatever its buffer happens to be.
+While the minibuffer is active `(selected-window)' *is* the mini window, so
+resolving \"the selected window\" there means fitting the page to a 102 px
+high strip (four text lines): the height fit came out as 102 / 792 = 0.1288,
+the clamp raised it to its 0.25 floor and a 612x792 page was rewritten to a
+153x198 sliver.  The check is `window-minibuffer-p', a structural property of
+the window, so recursive minibuffers and child frame minibuffers are covered
+as well; a window whose buffer is `*Minibuf-N*' is skipped by the same test
+that skips the mini window itself, because `(window-buffer MINIWINDOW)' is
+exactly that buffer.
+
+WINDOW being nil is not an error: it means \"resolve it for me\"."
+  (catch 'seshat-reader--display-window
+    ;; 三个候选按可信度排序：显式入参 → 显示本 buffer 的窗口 → 选中窗口。
+    ;; 任一候选不满足「活窗口 + 非 minibuffer 窗口 + 显示本 buffer」就跳过，
+    ;; 全部不符合时返回 nil（调用方必须把 nil 当作「几何未知」处理）。
+    (dolist (candidate (list window
+                             (get-buffer-window (current-buffer) t)
+                             (selected-window)))
+      (when (and (windowp candidate)
+                 (window-live-p candidate)
+                 (not (window-minibuffer-p candidate))
+                 (eq (window-buffer candidate) (current-buffer)))
+        (throw 'seshat-reader--display-window candidate)))))
 
 (defun seshat-reader--multipage-target-scale (page &optional window)
   "Return the scale PAGE should be displayed at in WINDOW.
 
-PAGE is a 1-based page number and WINDOW defaults to the selected one.  The
-mode comes from `seshat-reader--multipage-current-fit-mode' and the table is
-the one decision D5 fixes:
+PAGE is a 1-based page number and WINDOW defaults to the window displaying
+this buffer (`seshat-reader--multipage--display-window'), which is never a
+minibuffer window.  The mode comes from
+`seshat-reader--multipage-current-fit-mode' and the table is the one decision
+D5 fixes:
 
   `contain'  min (base scale, width fit of PAGE) -- a wide page is cropped
              to the window width, so nothing overflows;
@@ -777,22 +844,33 @@ the one decision D5 fixes:
 The base scale is fixed for the document (\"first page reference\"), so
 scrolling across a page boundary never changes the zoom of the pages that
 stay on screen.  While the native size of PAGE is still unknown the base
-scale is returned, which is what the first render of a page uses."
-  (let* ((window (if (window-live-p window) window (selected-window)))
-         (mode (seshat-reader--multipage-current-fit-mode window))
-         (base (or seshat-reader--multipage-base-scale 1.0))
-         (native (seshat-reader--multipage-native-size page))
-         (width (car-safe native))
-         (window-width (window-body-width window t))
-         (width-fit (and (numberp width) (> width 0)
-                         (numberp window-width) (> window-width 0)
-                         (/ (float window-width) width))))
-    (seshat-reader--multipage-clamp-scale
-     (pcase mode
-       ('width (or width-fit base))
-       ('height (or (seshat-reader--multipage-fit-scale page 'height window) base))
-       ('manual base)
-       (_ (min base (or width-fit base)))))))
+scale is returned, which is what the first render of a page uses.
+
+The base scale is returned as well when no window displays the buffer, i.e.
+when even the selected window is a minibuffer window: there is no geometry to
+compute a fit from, and the fallback must stay in the fit calculation rather
+than in the window resolution, because a nil window cannot be measured at
+all (`window-body-width' would signal)."
+  (let* ((window (seshat-reader--multipage--display-window window))
+         (base (or seshat-reader--multipage-base-scale 1.0)))
+    (if (null window)
+        ;; 中文：解析不出窗口（minibuffer 激活即此情形）＝几何未知，只报基准
+        ;; scale。必须先返回，绝不能落到下面的 `window-body-width'（nil 会报错）。
+        (seshat-reader--multipage-clamp-scale base)
+      (let* ((mode (seshat-reader--multipage-current-fit-mode window))
+             (native (seshat-reader--multipage-native-size page))
+             (width (car-safe native))
+             (window-width (window-body-width window t))
+             (width-fit (and (numberp width) (> width 0)
+                             (numberp window-width) (> window-width 0)
+                             (/ (float window-width) width))))
+        (seshat-reader--multipage-clamp-scale
+         (pcase mode
+           ('width (or width-fit base))
+           ('height (or (seshat-reader--multipage-fit-scale page 'height window)
+                        base))
+           ('manual base)
+           (_ (min base (or width-fit base)))))))))
 
 (defun seshat-reader--fit-scale (&optional window)
   "Return the scale the page at the top of WINDOW should have.
@@ -1477,7 +1555,7 @@ buffer themselves, which is why this is separate from
   (setq seshat-reader--pages nil
         seshat-reader--multipage-last-range nil))
 
-(defun seshat-reader--multipage-render-page (page &optional force)
+(defun seshat-reader--multipage-render-page (page &optional force window)
   "Make sure PAGE has a row displaying its image spec and return the spec.
 
 PAGE is a 1-based page number.  A page without a row gets one built from
@@ -1487,6 +1565,13 @@ this on every scroll step is cheap.  FORCE non-nil renders the page again
 even when its row already carries a spec, which is what a re-render at a new
 resolution needs: the row keeps the spec object it had, so without FORCE the
 early return would answer with the stale bitmap.
+
+WINDOW defaults to the window displaying this buffer
+\(`seshat-reader--multipage--display-window') and is only used to derive the
+geometry: it is handed to `seshat-reader--multipage-target-scale' and
+`seshat-reader--multipage-resize-spec'.  Passing it explicitly on every call
+path keeps those two from having to guess, which matters while the minibuffer
+is open, where guessing means the mini window.
 
 The page is rendered at its target scale
 \(`seshat-reader--multipage-target-scale'), so a page that is scrolled into
@@ -1499,7 +1584,7 @@ render."
            (assq page seshat-reader--pages)
            (seshat-reader--multipage-page-spec page))
       (seshat-reader--multipage-page-spec page)
-    (let* ((scale (seshat-reader--multipage-target-scale page))
+    (let* ((scale (seshat-reader--multipage-target-scale page window))
            (spec (seshat-reader--page-spec
                   page scale seshat-reader--multipage-rotate)))
       (when spec
@@ -1508,7 +1593,7 @@ render."
       (when spec
         ;; native 尺寸已记录，目标 scale 可能因此变小（宽页在 contain/width 下
         ;; 按宽裁剪），这里只改 spec 尺寸，不重渲染。
-        (seshat-reader--multipage-resize-spec page)
+        (seshat-reader--multipage-resize-spec page window)
         (seshat-reader--multipage-set-page-centered
          page (seshat-reader--multipage-page-should-center-p page)))
       spec)))
@@ -1516,15 +1601,18 @@ render."
 (defun seshat-reader--multipage-rerender-page (page &optional window)
   "Render PAGE again at its target scale and update its row.
 
-PAGE is a 1-based page number and WINDOW defaults to the selected one.  The
-cached spec of the page is dropped first and the render is forced, so the
-rows of a page whose bitmap became invalid -- dark mode inverted the
-document, the page was rotated, the window was resized -- are rebuilt at the
-resolution the current geometry asks for.  Nothing is done for a page
-without a row."
+PAGE is a 1-based page number and WINDOW defaults to the window displaying
+this buffer (`seshat-reader--multipage--display-window'), never to a
+minibuffer window.  WINDOW is forwarded to
+`seshat-reader--multipage-render-page' so that the geometry comes from the
+window the page is really shown in.  The cached spec of the page is dropped
+first and the render is forced, so the rows of a page whose bitmap became
+invalid -- dark mode inverted the document, the page was rotated, the window
+was resized -- are rebuilt at the resolution the current geometry asks for.
+Nothing is done for a page without a row."
   (when (assq page seshat-reader--pages)
     (seshat-reader--multipage-forget-specs page)
-    (let ((spec (seshat-reader--multipage-render-page page t)))
+    (let ((spec (seshat-reader--multipage-render-page page t window)))
       (when spec
         (seshat-reader--multipage-set-page-centered
          page (seshat-reader--multipage-page-should-center-p page window)))
@@ -1732,7 +1820,7 @@ ready instead of blocking on the native renderer."
         (setq seshat-reader--multipage-last-range range)
         (let ((page first))
           (while (<= page last)
-            (seshat-reader--multipage-render-page page)
+            (seshat-reader--multipage-render-page page nil win)
             (setq page (1+ page))))
         (dolist (entry (copy-sequence seshat-reader--pages))
           (let ((page (car entry)))
@@ -1778,7 +1866,8 @@ show, and that offset would otherwise be inherited by the target page.  The
 buffer position of the row is returned."
   (let ((target (seshat-reader--multipage-clamp-page page)))
     (when target
-      (seshat-reader--multipage-render-page target)
+      (seshat-reader--multipage-render-page
+       target nil (seshat-reader--multipage--display-window))
       (seshat-reader--multipage--show-page target)
       (seshat-reader--multipage-sync)
       (let ((pos (seshat-reader--multipage--show-page target)))
@@ -1899,7 +1988,7 @@ of the previous page.  `seshat-reader--multipage-goto` is not used on purpose,
 since it resets the vertical scroll explicitly.  The row position is returned,
 or nil when PAGE has no row."
   (unless (assq page seshat-reader--pages)
-    (seshat-reader--multipage-render-page page))
+    (seshat-reader--multipage-render-page page nil window))
   (when-let* ((entry (assq page seshat-reader--pages))
               (pos (marker-position (cadr entry))))
     (set-window-start window pos)
@@ -2028,14 +2117,14 @@ top of the previous page."
                     page (1+ page)
                     moved t)
               (unless (assq page seshat-reader--pages)
-                (seshat-reader--multipage-render-page page)))
+                (seshat-reader--multipage-render-page page nil win)))
           ;; 向上：对称，补上上一页的行高（+gap）后才成为该页的页内偏移
           (while (and (< distance 0)
                       (seshat-reader--multipage-page-neighbour page -1))
             (setq page (1- page)
                   moved t)
             (unless (assq page seshat-reader--pages)
-              (seshat-reader--multipage-render-page page))
+              (seshat-reader--multipage-render-page page nil win))
             (setq distance (+ distance (seshat-reader--multipage-page-span page)))))
         ;; 跨页序列（两帧方案）：清旧偏移 → 设新 start → sync → 强制落帧 → 写偏移。
         ;; - 落帧那一帧是「新页 + 偏移 0」的中间态（偏移此时还没写），这是两帧
@@ -2103,6 +2192,9 @@ row is placed according to the current geometry."
                      (seshat-reader--multipage-clamp-page
                       (seshat-reader-current-doc-pagenumber))
                      1))
+         ;; 几何窗口先解析一次，重排循环里复用：显式传参比让每个渲染函数自己
+         ;; 猜更可靠（minibuffer 激活时「猜」会拿到 mini window）。
+         (window (seshat-reader--multipage--display-window))
          (preload (seshat-reader--multipage-effective-preload))
          (count (seshat-reader--multipage-pagecount))
          (first (max 1 (- target preload)))
@@ -2121,7 +2213,7 @@ row is placed according to the current geometry."
           seshat-reader--multipage-reference-native nil)
     (let ((number first))
       (while (<= number last)
-        (seshat-reader--multipage-render-page number)
+        (seshat-reader--multipage-render-page number nil window)
         (setq number (1+ number))))
     (seshat-reader--multipage-goto target)
     (seshat-reader--center-page)))
@@ -2405,6 +2497,31 @@ per event no matter how many windows match."
       (when matched
         (seshat-reader--schedule-refit))))))
 
+(defun seshat-reader--layout-frozen-p ()
+  "Return non-nil when the page layout has to be left alone for now.
+
+The layout is frozen while `seshat-reader-freeze-layout-during-minibuffer'
+is non-nil and a minibuffer is active, which is decided by
+`window-minibuffer-p' on the selected window: that is a structural property
+of the window, so recursive minibuffers and child frame minibuffers are
+covered.  The more precise alternative is `minibuffer-window-active-p', which
+also checks that the minibuffer is the *active* one; the two only disagree
+when the user manually selects a non-active minibuffer window of another
+frame, and freezing a layout nobody is looking at costs nothing, so the
+simpler test is used.
+
+Freezing is UX only -- correctness comes from
+`seshat-reader--multipage--display-window', which never returns a minibuffer
+window -- and the refit that puts the layout back is scheduled by
+`seshat-reader--after-minibuffer-exit'.  Three callers honour it:
+`seshat-reader--refit-window', `seshat-reader--schedule-refit' and the
+`seshat-reader--apply-display-scale' step of
+`seshat-reader--recenter-window'."
+  (let ((window (selected-window)))
+    (and seshat-reader-freeze-layout-during-minibuffer
+         (windowp window)
+         (window-minibuffer-p window))))
+
 (defun seshat-reader--recenter-window (window)
   "Recentre WINDOW synchronously, without re-rendering the bitmaps.
 
@@ -2427,7 +2544,18 @@ windows from being recentred.
 A burst of size changes (dragging a window divider) is detected by the
 interval between them: such events only recentre the rows, so that no spec
 is rewritten per frame, and the geometry is adapted once by the debounced
-refit when the drag stops."
+refit when the drag stops.
+
+Nothing is resized while the layout is frozen for an open minibuffer
+\(`seshat-reader--layout-frozen-p'): that skips
+`seshat-reader--apply-display-scale', so the specs keep the size they were
+laid out for and the pages are merely cropped by the smaller window instead
+of shrinking with it, until `seshat-reader--after-minibuffer-exit' refits
+them once the prompt is closed.  Centring still runs, because it rewrites the
+leading space of the rows and the horizontal scroll but never the spec sizes
+\(`seshat-reader--center-page' does not touch `:width'/`:height'; only
+`seshat-reader--multipage-resize-spec' does), and so does the sync, which only
+keeps the resident rows in step with the viewport."
   (when (and (window-live-p window)
              (eq (window-buffer window) (current-buffer)))
     (with-current-buffer (window-buffer window)
@@ -2437,10 +2565,15 @@ refit when the drag stops."
               ;; 拖拽中（两次 size-change 间隔小于阈值）只居中不缩放：改 spec 尺寸
               ;; 会让 redisplay 重新缩放整页位图，拖动时每帧一次会卡 1–2 秒。
               ;; 停手后由 idle 的 `--refit-window' 做一次几何适配 + 重渲染。
+              ;; minibuffer 展开期间（`--layout-frozen-p'）同理跳过缩放：这才是
+              ;; 真正的「几何冻结」——居中只改行首 space 与 hscroll，不改 spec 尺寸，
+              ;; 故页面按旧尺寸显示、底部被窗口裁切，退出后由 exit-hook 排的 refit
+              ;; 恢复（见 `seshat-reader--after-minibuffer-exit'）。
               (let ((dragging (and seshat-reader--last-size-change-delta
                                    (< seshat-reader--last-size-change-delta
-                                      seshat-reader--drag-threshold))))
-                (unless dragging
+                                      seshat-reader--drag-threshold)))
+                    (frozen (seshat-reader--layout-frozen-p)))
+                (unless (or dragging frozen)
                   (seshat-reader--apply-display-scale window)))
               (seshat-reader--center-page window)
               (seshat-reader--multipage-sync window))
@@ -2453,11 +2586,15 @@ refit when the drag stops."
 
 Scheduling cancels the timer armed by the previous event, so a burst of
 size changes results in a single refit.  Nothing is scheduled while a
-refit is being applied (`seshat-reader--refitting') or when refitting is
-disabled: a refit changes the window layout itself, so queueing another
-one from inside it only feeds the loop."
+refit is being applied (`seshat-reader--refitting'), when refitting is
+disabled, or while the layout is frozen for an open minibuffer
+\(`seshat-reader-freeze-layout-during-minibuffer'): a refit changes the
+window layout itself, so queueing another one from inside it only feeds the
+loop, and freezing has to skip the timer as well as `--refit-window' or the
+timer would simply run the refit a moment later."
   (unless (or seshat-reader--refitting
-              (not seshat-reader--resize-refit-enabled))
+              (not seshat-reader--resize-refit-enabled)
+              (seshat-reader--layout-frozen-p))
     (seshat-reader--cancel-pending-refit)
     (let ((buffer (current-buffer)))
       (setq seshat-reader--resize-refit-timer
@@ -2499,12 +2636,21 @@ moving.  The page rows are centred afterwards, because a page that got
 cropped for its width has to stop being centred while a page that now fits
 has to start.
 
+Nothing is done while the layout is frozen for an open minibuffer
+\(`seshat-reader--layout-frozen-p'): the pages then keep the size they were
+laid out for and are merely cropped by the smaller window, and
+`seshat-reader--after-minibuffer-exit' refits them once the prompt is gone.
+
 The window is skipped silently when it is no longer live, no longer shows
 the current buffer, or shows a buffer that has left `seshat-reader-mode'.  An
 error while refitting one window is reported and does not prevent the other
 windows from being refitted."
   (when (and (window-live-p window)
-             (eq (window-buffer window) (current-buffer)))
+             (eq (window-buffer window) (current-buffer))
+             ;; 中文：minibuffer 展开期间不重量几何（纯 UX 冻结，正确性由
+             ;; `--multipage--display-window' 保证）。判据集中在上面那个
+             ;; predicate 里，避免两处写入不同的判据。
+             (not (seshat-reader--layout-frozen-p)))
     (with-current-buffer (window-buffer window)
       (when (derived-mode-p 'seshat-reader-mode)
         (condition-case err
@@ -2516,6 +2662,88 @@ windows from being refitted."
           (error
            (message "seshat-reader: resize refit skipped in %s: %S"
                     (buffer-name) err)))))))
+
+(defun seshat-reader--after-minibuffer-exit ()
+  "Refit the reader layout the minibuffer was opened from, once it is closed.
+
+Registered on `minibuffer-exit-hook'.  With
+`seshat-reader-freeze-layout-during-minibuffer' the layout is left alone
+while the prompt is open, so this is what puts it back without asking the
+user for one more keypress.  With that switch nil nothing is scheduled at
+all: the layout was never frozen, every size change refits the windows as it
+happens, and a timer here would only redo that work -- which is also why the
+hook itself is installed unconditionally and the switch is read here, so
+toggling the option takes effect without reloading the file.
+
+The buffers to refit are collected from two sources, in this order:
+
+1. `minibuffer-selected-window', i.e. the window that was selected before
+   the minibuffer was entered.  Measuring Emacs 31.1 shows why this, and not
+   `(selected-window)', has to come first: inside `minibuffer-exit-hook' the
+   selected window is *still* the mini window and `(minibuffer-depth)' is
+   still 1 (the depth is decremented after the hook runs), so resolving the
+   buffer from `(selected-window)' answers ` *Minibuf-1*' (measured:
+   `(depth 1 sel-buffer \" *Minibuf-1*\" mb-selected-win \"*probe-plain*\")').
+
+2. Every window of every frame that shows a `seshat-reader-mode' buffer.
+   `window-list' with a nil FRAME only lists the selected frame, which would
+   miss a reader window on another frame, so `(frame-list)' is walked
+   explicitly; `'nomini' drops the minibuffer window, whose buffer
+   (` *Minibuf-N*') could never be a reader buffer and whose 102 px strip is
+   no geometry to refit against.  This is the fallback for the cases where
+   source 1 answers nil -- a child frame minibuffer, a mouse driven
+   minibuffer -- and an extra safety net when the hook runs from an
+   unexpected current buffer.
+
+The buffers found that way are de-duplicated with `memq', so a buffer shown
+in two windows is refitted once: `seshat-reader--run-pending-refit' already
+walks every window of its buffer.  Each buffer then gets one one-shot idle
+timer.  The timer handle is deliberately dropped: `--run-pending-refit'
+clears `seshat-reader--resize-refit-timer' and is idempotent (a scale within
+`seshat-reader--refit-scale-tolerance' is not rendered again), so the extra
+timers a nested minibuffer arms -- one exit per depth -- are harmless.
+
+The refit is not routed through `seshat-reader--schedule-refit': that gate
+reads `seshat-reader--layout-frozen-p', which is still true here (the mini
+window is still selected), and a timer armed now would have to outlive the
+freezing anyway.  An idle timer of our own runs after the command loop has
+returned from the minibuffer, where the depth is 0 and the reader window is
+selected again.
+
+Nothing happens when no window shows a `seshat-reader-mode' buffer, e.g. a
+prompt opened from a non-reader buffer."
+  (when seshat-reader-freeze-layout-during-minibuffer
+    (let ((buffers nil)
+          (primary (minibuffer-selected-window)))
+      ;; 主路径：进 minibuffer 之前选中的窗口在 hook 里仍可信（它已经不是
+      ;; mini window 了，退出时窗口树已复原）。
+      (when (and (windowp primary) (window-live-p primary))
+        (let ((buffer (window-buffer primary)))
+          (when (and (buffer-live-p buffer)
+                     (with-current-buffer buffer
+                       (derived-mode-p 'seshat-reader-mode)))
+            (push buffer buffers))))
+      ;; 兜底：`window-list' 的 FRAME 传 nil 只列 selected frame，故显式遍历
+      ;; `(frame-list)' 才能覆盖其它 frame 上的 reader 窗口；`'nomini' 排除
+      ;; minibuffer 窗口（buffer 是 ` *Minibuf-N*'，不可能是 reader buffer，
+      ;; 也没有可 refit 的几何）。已收集的 buffer 用 `memq' 跳过。
+      (dolist (frame (frame-list))
+        (dolist (window (window-list frame 'nomini))
+          (let ((buffer (window-buffer window)))
+            (when (and (buffer-live-p buffer)
+                       (not (memq buffer buffers))
+                       (with-current-buffer buffer
+                         (derived-mode-p 'seshat-reader-mode)))
+              (push buffer buffers)))))
+      ;; 中文：不用 `--schedule-refit'——它的冻结判据在此刻仍为真（selected
+      ;; window 还是 mini window），会把自己挡掉；idle timer 在 read_minibuf
+      ;; 返回、主循环 idle 后才跑，那时 depth 已归零、窗口已复原，最稳。
+      (dolist (buffer (nreverse buffers))
+        (run-with-idle-timer 0 nil #'seshat-reader--run-pending-refit buffer)))))
+
+;; `minibuffer-exit-hook' 是全局 hook：加载本文件时挂一次即可。`add-hook' 不会
+;; 重复添加同一个函数，故多次 `load'/`require' 是幂等的。
+(add-hook 'minibuffer-exit-hook #'seshat-reader--after-minibuffer-exit)
 
 
 ;; Scrolling is pixel based, not line based: a page is one buffer line whose
@@ -2974,7 +3202,7 @@ PAGE."
 			 (+ target preload)))
 		 (number first))
 	    (while (<= number last)
-	      (seshat-reader--multipage-render-page number)
+	      (seshat-reader--multipage-render-page number nil window)
 	      (setq number (1+ number)))
 	    (seshat-reader--multipage-goto target))
 	  ;; 文档文本由原生模块生成，buffer 永远不是用户意义上的「已编辑」。
@@ -3446,10 +3674,17 @@ The pages of the multi-page layout are not attached to a window, so the
 bitmaps are rebuilt once for the whole buffer -- that is what a document-wide
 change such as dark mode needs -- and every window showing the buffer is then
 synchronised, refitted to its own size and re-centred.  A window showing
-another buffer is left alone."
+another buffer is left alone.
+
+The render below happens before the per-window loop, so it has to pick one
+window for the geometry: it uses the window the buffer is really displayed
+in (`seshat-reader--multipage--display-window'), which is what keeps a
+document-wide re-render from measuring the minibuffer window while a prompt
+is open.  The sizes each window ends up with are set by the loop anyway."
   (ignore-errors (seshat-reader--page-spec-clear-cache))
-  (dolist (page (seshat-reader--multipage-page-numbers))
-    (seshat-reader--multipage-rerender-page page))
+  (let ((window (seshat-reader--multipage--display-window)))
+    (dolist (page (seshat-reader--multipage-page-numbers))
+      (seshat-reader--multipage-rerender-page page window)))
   (dolist (window (get-buffer-window-list (current-buffer) nil t))
     (with-selected-window window
       (seshat-reader--multipage-sync window)

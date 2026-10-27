@@ -142,6 +142,10 @@ ETAF 渲染层是可选外部依赖：`Makefile` 先探测 `~/Workspace/emacs-ta
 
 窗口变窄时页面会**缩小**以完整可见，而不是保持原尺寸被两侧裁切。自动 fit 分两段：**首次打开**取 `seshat-reader-default-fit` 的归一化初值（默认 `contain`）；**尺寸变化后**沿用窗口已记录的 `fit-mode`（由首次打开或 `W` / `H` 写入），因此改该选项不影响已打开窗口，只影响此后新开的窗口。旧值 `seshat-reader-fit-to-width` / `-fit-to-height` 仍被接受（分别归一为 `width` / `contain`）。
 
+> **fit 计算使用哪个窗口（2026-10-27）**：页面几何一律按**显示当前 buffer 的真实窗口**计算（`seshat-reader--multipage--display-window`：显式入参 → `get-buffer-window` → `selected-window`，每个候选都必须是活窗口、显示当前 buffer，且不能是 minibuffer 窗口）。**minibuffer 窗口永不被使用**——它的高度/宽度不代表阅读窗口：minibuffer 展开时 `(selected-window)` 就是那个只有 102 px 高（4 行字符高）的 mini window，按它做 `height` 适配会把 612×792 的页面压成 153×198 的窄条（2026-10-27 修复的缺陷）。三个候选都不合格时按「几何未知」处理——退回基准 scale、不猜一个窗口。
+>
+> **minibuffer 激活期间默认冻结几何**：`seshat-reader-freeze-layout-during-minibuffer`（默认 `t`，纯观感开关）让 `M-x` / `find-file` / 书签跳转等提示符展开时**不重排版面**——`--refit-window` 与 `--schedule-refit` 直接跳过，`--recenter-window` 也只居中（不改 spec 尺寸），`--multipage-sync` 照常维持驻留集。代价是**页面底部可能被窗口裁切**：提示符占去约 400 px，而页面仍按原窗口高度排版，约 416 px 暂时不可见（数据不丢失）；`minibuffer-exit-hook` 上的 `seshat-reader--after-minibuffer-exit` 会排一次 idle refit，退出后**自动**恢复，不必再按一次键。设 `nil` 则回到「跟随窗口缩放」的观感（页面随提示符展开而缩小、退出后再放大）。
+
 | 操作 | 键位 | 备注 |
 |---|---|---|
 | 下一页 / 上一页 | `n` / `p` | 队列化命令，可连续快速按键 |
@@ -632,6 +636,7 @@ uid 形态本身**不可读**，可读性由 org 链接描述承担（`[[seshat:
 | `seshat-reader-panel-truncate-lines` | `nil` | 面板正文是否**不折行**：`nil`（默认）= **折行**（`truncate-lines` 为 nil + 显式 `word-wrap`，可叠加 vfcm（正文宽度跟随 ratio）与 valign（表格对齐））；`t` = 不折行 + 横向滚动（`truncate-lines`/`auto-hscroll-mode` 为 t、`word-wrap` 为 nil） | 折行与 `visual-fill-column-mode` 互斥，`t` 时 vfcm **与 valign 一并跳过**；**2026-10-25 由 `t` 改为 `nil`** |
 | `seshat-reader-panel-follow-bottom` | `t` | 流式输出期间是否自动跟随底部（显示最新内容）；用户向上滚动后停止跟随、回到底部时恢复 | 仅 `childframe` 生效 |
 | `seshat-reader-panel-hide-on-buffer-change` | `t` | 当前 buffer 不再是阅读器 buffer 时关闭本包 child frame 面板；面板内容留在 buffer 里可 `M-o` 重开 | `nil` = 面板常驻 |
+| `seshat-reader-freeze-layout-during-minibuffer` | `t` | minibuffer（`M-x` / 提示符）激活期间冻结版面几何，退出后自动 refit | 设为 `nil` 恢复「随窗口缩放」的旧行为；纯观感开关，正确性由 `seshat-reader--multipage--display-window` 保证（minibuffer 窗口永不参与 fit，见 §3）；冻结期间页面底部可能被窗口裁切 |
 
 ### 阅读
 

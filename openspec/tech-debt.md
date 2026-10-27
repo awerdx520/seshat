@@ -1173,11 +1173,12 @@
 - 影响：两处口径若将来出现漂移（例如一方开始处理 `%` 或前导斜杠），会出现「同一条路径生成不同 URL」的静默不一致。
 - 建议：计划 B 接入 `seshat-conflict.el` 到 REST 条件写时，一并把两处收敛到 `seshat-rest--encode-path`（conflict 已经有对 `seshat-rest` 的依赖，方向合法）。
 
-## `seshat-reader.el` 的 `with-demoted-errors` 缺少 FORMAT 参数（M8-A 收尾发现，2026-10-24）
+## `seshat-reader.el` 的 `with-demoted-errors` 缺少 FORMAT 参数（M8-A 收尾发现，2026-10-24）——已修复（2026-10-27，见本文件「…缺 FORMAT 参数（Emacs 30+ 旧式用法，2026-10-27 发现）」一条）
 
 - 现状：`emacs/seshat-reader/seshat-reader.el:82-83` 的 `(with-demoted-errors (require 'seshat-render-core))` 未传 FORMAT 首参。`with-demoted-errors` 的首个参数是格式串，缺省时会用宏的默认消息，但字节编译/log 每轮都报 `Warning: Missing format argument in 'with-demoted-errors'`（14 个测试文件加载 reader 时各报一次）。
 - 影响：功能无影响（该 `require` 失败仍被静默降级），但会污染编译输出、掩盖真正的新警告；且该 `require` 失败后，后续 `seshat-render-core-*` 调用会以 `void-function` 在运行期才暴露，定位成本高。
 - 建议：改为 `(with-demoted-errors "seshat-reader: %S" (require 'seshat-render-core))`，与仓库其它 `with-demoted-errors` 用法对齐；属一行修复，可随下次阅读器改动顺带处理。
+- 已解决（2026-10-27）：实为 `"seshat-render-core: %S"` + `(require 'seshat-render-core)`（与本文件较新一条记录、即 2026-10-27 发现条同一处、同一修法），验证数字（warning 24 → 20 / ERT 1266 例）见该条。
 
 ## rename 判据 `size + mtime` 的两个盲区（M8-B，2026-10-24）
 
@@ -1690,8 +1691,36 @@
 - 影响：行高与光标实际可见高度的差异会造成阈值边界处的保守/激进判断——阈值偏大时可能少移动一次 point（光标仍部分可见，Emacs 不会回滚偏移，安全）；阈值偏小时多移动一次（落到邻居页行首，同样安全）。当前两种误差都不影响正确性，只是落点可能与「光标刚好露出 1px」的边界不同。
 - 建议：若将来出现边界场景的观感问题，改用光标的实际度量（`(window-text-pixel-size)` 或 `window-cursor-pixel-height` 一类接口）后再校核；改动需真机复验。
 
+## 书签的页内偏移恢复疑似持续失效（2026-10-27，code-reviewer major）——已修复（2026-10-27，批次 A）
+
+- 现状：`emacs/seshat-reader/seshat-reader-bookmark.el:117-118` 先调 `seshat-reader--multipage-goto`（内部执行 `set-window-start`）再直接 `set-window-vscroll offset`，两步之间**没有落帧**。
+- 影响：与本轮确证的「同帧丢弃偏移」同根——若真机确认，则「存书签 → 跳回」的页内偏移会被清零（每次都落回页首），而 ERT 因为桩掉了 `set-window-vscroll` 看不出来。属**未验证的疑似缺陷**，本轮未改（计划明确不碰 bookmark）。
+- 建议：修复方式与本轮跨页序列一致——在 `set-window-start` 与写偏移之间补一次 `(redisplay t)`，或直接复用跨页序列；修复后必须真机验「设页内偏移 → 存书签 → 跳回 → 偏移仍在」，并同步补一条 tech-debt 之外的回归说明。
+- 已解决（2026-10-27）：按上面的「建议」落地——新增 `seshat-reader--multipage--apply-offset`（先 `(redisplay t)` 落帧再 `set-window-vscroll`；nil 窗口按 selected window 解析；非正数 offset 既不动作也不落帧），`seshat-reader-bookmark-jump` 第 ③ 步改调它，saveplace 经同一 handler 一并受益。**ERT 断言了落帧顺序**（事件序中 `redisplay` 早于 `set-window-vscroll`，实参 `(list (selected-window) 120 t)`），全量 **1266** 例 0 unexpected / 0 skipped。**T5 真机（书签跳回同页同偏移 / 关掉 Emacs 重开 PDF 验证 saveplace / 宽页 `hscroll`）待用户确认**——ERT 只能证明落帧发生在写偏移之前，不能证明偏移跨 redisplay 存活，故本条**暂留**于此，真机三项通过后再删。
+
 ## 阅读器跨页存在一帧「新页顶部」中间态（2026-10-27）
 
 - 现状：两帧方案里 `(redisplay t)` 落帧时像素偏移尚未写入，那一帧显示的是「新页 + 偏移 0」；紧接着才写最终偏移并落 point。
 - 影响：快速连滚时理论上可见一帧跳动（每跨页一次）；实测未观察到用户可感的中间帧，正常翻页速度下不可见。
 - 建议：若要消除，必须同时重估 Emacs 的「同帧丢弃偏移」行为（例如寻找不需要两次设置偏移的写法，或让跨页与偏移在同一次窗口状态变更里完成），属需要真机探针先行的高风险改动；不要在不重新探针的前提下「优化掉这次 redisplay」——那会直接回退成 `k` 跳页首。
+
+## 窗口解析仍有多处旧写法 `(if (window-live-p window) window (selected-window))`（阅读器 fit 修复后观察，2026-10-27）
+
+- 现状：D1 只把 fit 计算的三处（`--multipage-target-scale` / `--multipage-fit-scale` / `--multipage-current-fit-mode`）改为 `seshat-reader--multipage--display-window`。计划点名的四处仍是旧写法——`--multipage-base-fit-scale`、`--apply-display-scale`、`--multipage-resize-spec`、`--multipage-refresh-decorations`（最后一个是 `(or window (selected-window))` 变体）。实测 `grep -n "window-live-p window) window (selected-window)"` 共命中 14 处（13 处代码 + 1 处 docstring 引用），涉及的函数除前三个外还有 `--fit-scale`、`--multipage-page-should-center-p`、`--multipage-prefetch`、`--multipage-page-max-offset`、`--multipage--apply-offset`、`--multipage-scroll`、`--centered-p`、`--center-page`、`--scroll-step-pixels`、`--scroll-screen-pixels`。
+- 影响：这些函数若在 minibuffer 激活期间被调用，仍会把 mini window 当几何来源。当前靠两层兜底不发病——上游调用点显式传的是「显示当前 buffer 的窗口」，且 `--multipage-target-scale` 内部自己再解析一次窗口，所以即便下游拿到 mini window，spec 尺寸仍由正确窗口算出。风险在**将来新增调用点**、或在 minibuffer 上下文里直接调用这些函数时以同样形式复现。
+- 建议：不做批量替换（十余处逐一改造的收益低于回归风险，且多数函数在 minibuffer 上下文里本来就不该被调用）。新增调用方一律走 `--multipage--display-window`；某一处出现真机症状时再按单点替换并补 ERT。
+
+## 冻结期间 `--multipage-sync` 仍可能按压缩后的可见范围回收页（2026-10-27，待真机确认）
+
+- 现状：`seshat-reader-freeze-layout-during-minibuffer` 冻结的是几何（`--refit-window` / `--schedule-refit` / `--recenter-window` 的 `--apply-display-scale` 步骤），**不冻结** `--multipage-sync`。同步按当前视口算驻留集，而 minibuffer 展开时视口变矮、页面仍按旧尺寸显示（被窗口裁切），算出的可见页范围随之缩小（range 缩小），可能把「已被裁掉、但仍属于版面」的页移出驻留集。
+- 影响：若被回收的页仍被页行引用，表现可能是**页面消失**（行还在、位图没了）而不是「底部被裁切」。理论上位置正确（重新渲染即可恢复），但观感是「展开提示符后底下几页空了」。ERT 覆盖不到（需真实 minibuffer + 真实 redisplay），本轮未真机复现。
+- 建议：按计划 L3 第 1 步真机确认——`M-x` 展开期间看页面底部是「被窗口裁切」还是「页行变空」。若出现后者，把 `seshat-reader--layout-frozen-p` 也接进 `--multipage-sync`（或让同步的视口计算沿用冻结时的窗口高度），并在 `--after-minibuffer-exit` 的 refit 里顺带重建驻留集。
+
+## seshat-reader.el 的 with-demoted-errors 缺 FORMAT 参数（Emacs 30+ 旧式用法，2026-10-27 发现）——已修复（2026-10-27）
+
+- 现状：`emacs/seshat-reader/seshat-reader.el:87` 写作 `(with-demoted-errors (require 'seshat-render-core))`。`with-demoted-errors` 的签名是 `(with-demoted-errors FORMAT &rest BODY)`，此处第一个实参 `(require 'seshat-render-core)` 被填进 FORMAT、BODY 为空——属**旧式（无 FORMAT）调用**。本机 Emacs 31.1 实测：该宏内保留了**兼容垫片**（非字符串 FORMAT 会被 push 回 BODY），故该 `require` **仍会执行**；但宏展开时必定发出 `Warning: Missing format argument in ‘with-demoted-errors’`（`macroexpand-1` 与 `batch-byte-compile` 两条路径均命中）。
+- 原拟结论（本次记录时的初判）：「该 `require` 实际不执行」——**已被实测证伪**。实测方式：`emacs --batch -Q -L <dir> --eval '(with-demoted-errors (require (quote fake-mod)))'`，随后 `fake-mod-loaded` = `t`，说明 BODY 确实执行。只有当宏定义退回到 Emacs ≤29 的旧实现（`(macroexp-progn body)` 直接展开、body 为空）时，该 `require` 才会被静默跳过。
+- 影响：当前**无功能故障**（实测 `(featurep 'seshat-render-core)` = t，模块另由其他路径加载）。实际风险有三：① 每次加载 / 编译都多一条 warning（当前 `make all` 的 warning 基线中属固定项）；② 上游宏内注释明确「这类剩余用法将来会被移除」，一旦移除，该 `require` 才会**真的不执行**，届时干净环境下首次加载就会缺 render-core；③ 加载错误被 demote 成 `*Messages*` 里的一行 `Error: ...`，容易被忽略，掩盖真正的加载失败原因。
+- 建议：改为 `(with-demoted-errors "seshat-render-core: %S" (require 'seshat-render-core))`，语义不变且消除该告警；修完跑 L1 + L2 复核 warning 数（计划记 24 → 23，以当日实测为准）。
+- 备注：非本次修复引入，属既有问题；发现时机与上下文——L3 加载源码版时 `*Messages*` 里出现该 warning，随后追到 `seshat-reader.el:87`。复现命令：`emacs --batch -Q --eval '(prin1 (macroexpand-1 (quote (with-demoted-errors (require (quote seshat-render-core))))))'`。
+- 已解决（2026-10-27）：改为 `(with-demoted-errors "seshat-render-core: %S" (require 'seshat-render-core))`，`require` 语义不变（失败仍被 demote 成 `*Messages*` 一行），并补注释说明「必须给出 FORMAT」。**该 warning 在 `make all` 里出现 4 次**（`seshat-reader.el` 被编译 1 次 + 作为依赖被其余 3 个编译进程加载），故实测基线由 **24 → 20**（不是计划预估的 24 → 23，计划按 1 次计数估算）。验证：`make -C emacs/seshat-reader clean all` EXIT 0、warning **20**（改动前同命令实测 24，逐条 diff 只少这 4 条、零新增）、`make -C emacs/seshat-reader checkdoc` 0 报错、`check-parens` 通过、`make -C emacs/tests ert` **33** 文件 **1266** 例（0 unexpected / 0 skipped）、`make -C emacs/tests check-criteria` PASS。
