@@ -339,6 +339,7 @@ Emacs 端通过 `seshat-reader-annotation` 采集 PDF 页面选区并同步为�
 - **进程级共享，不是逐 buffer**：配色与开关都由原生模块的进程级 static 承载（`seshat-reader-dyn--doc-invert` / `--doc-tint` 写入），因此**同一 Emacs 内所有 reader buffer 共用同一套配色**，也不能按文档分别设置；反过来**重载文档或新开另一本都保持当前选择**——暗色是用户偏好，不是文档属性。关闭 `seshat-reader-dark-mode` 时**不下发** tint（偏好保留），下次打开仍是同一档。
 - **非法值的处置**：未知预设符号、cons 里的元素不是整数或超出 `0..#xFFFFFF` 时，一律按「不下发 tint」处理（即回退旧满对比路径），只在 `*Messages*` 留一条 `message` 说明原因——**不报错、不静默换成另一档配色**。C 侧对 `>0xFFFFFF` 的参数返回 nil 并 `message`，非整数参数则不改状态。
 - **改后需重新 toggle**：修改 `seshat-reader-dark-tint` **不会自动重绘**已打开的 buffer——重新 toggle `seshat-reader-dark-mode`（`M-x` 两次）下发新配色，或按 `C-l` 让当前页重新渲染。
+- **想逐档试配色用循环命令（即时重绘）**：`M-x seshat-reader-dark-tint-cycle` 按预设表顺序逐档切换 `graphite → midnight → charcoal → night-sepia → sepia`（末档回绕到 `graphite`），`C-u -`（负前缀）反向；当前值若为表外自定义 `(BG . FG)` 或 `nil`，起点视为「表首之前」——反向一步落在表尾前一档（`night-sepia`），这是刻意的循环语义。每次切档都**即时下发并重绘**所有阅读 buffer，**不需要** toggle 也不需要 `C-l`。暗色关着时调用会自动开启（且只重绘一次）；当前值是表外自定义 `(BG . FG)` 或 `nil` 时从表首 `graphite` 起步；非阅读 buffer 里调用只改全局偏好、不重绘。该命令包内**无默认键位**，绑法示例见 `thomas-emacs` 的 `lisp/init-reader.el`（绑在阅读 buffer 的 `T`）。注意它改的仍是全局偏好——**`setq` / `customize` 本身依旧不触发重绘**，这条不受影响。
 - **新增预设不改 C 侧**：预设表就在 `seshat-reader.el` 的 `seshat-reader-dark-tint-presets` 里，加档只改 elisp，不需要重编 `seshat-render-core.so`。
 
 配置示例：

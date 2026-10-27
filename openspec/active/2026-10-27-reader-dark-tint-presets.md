@@ -9,6 +9,7 @@
 - **已知影响（T4 落地后新增）**：dark-mode 每次切换 / 改配色都会触发多页重渲染（可见页 ±2，每页约 7ms 量级，**估算，L3 校准**；P0 实测单页 0.7–11 ms），切换预设时可见轻微延迟，属可接受开销
 - 执行状态：批次 0 ✅（基线 + 安全点）/ 批次 1 ✅（T1+T2 C 侧；`.so` md5 `26caf7e758c1a4286032ca2e291b4198`，gcc warning 0，`make clean all` EXIT 0）/ 批次 2 ✅（T3+T4 elisp 侧 + 新建 `seshat-reader-theme-test.el` 11 例；定向 ERT theme 11/11、reading 49/49、multipage 39/39）/ 批次 3a ✅（T5 全量验证：**31 文件 / 1166 例 / `unexpected = 0` / `skipped = 0`**，86.8 秒；byte-compile 25 条 = 基线零新增；`.invert` 残留 0；未触发修复循环/回滚）
 - 下一步：① **L3 真机目测**（T7，用户：重启 Emacs 后逐档确认 5 档观感 + 重载后保持暗色）；② **thomas-emacs 配置侧收尾**（T6 配置侧：删 `+seshat-reader-dark-after-render` advice、设 `(setq seshat-reader-dark-tint 'charcoal)`、配置仓 CHANGELOG 一条）
+- 注记（2026-10-27）：T7 的真机目测可直接用 `seshat-reader-dark-tint-cycle`（配置层绑定在阅读 buffer 的 `T`，见 `openspec/active/2026-10-27-reader-dark-tint-cycle-key.md`）逐档检查 5 档观感与「切档后立即刷新」。
 - 批次 0 ✅（2026-10-27）：基线 PNM 已采集并落盘（采集时 `HEAD = 80eb582`，`.so` 未重编、md5 `501eb339…`），安全点引用 `0f531f7`（`git stash create`，不改工作目录）。数据见下方「## 基线数据」；取证期间并行会话把 HEAD 推进到 `c6caf85`（仅 elisp），基线已在其上复验一致
 
 ## 目标

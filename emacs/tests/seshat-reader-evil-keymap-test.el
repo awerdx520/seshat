@@ -256,5 +256,11 @@
   (should-not (boundp 'seshat-reader-sidebar--panel-normal-key-specs))
   (should-not (boundp 'seshat-reader-sidebar--panel-common-keys)))
 
+;;; 7. 大写 T 空闲：键位由配置层绑定
+
+(ert-deftest seshat-reader-evil-keymap-test--uppercase-t-is-free ()
+  "包内不占用大写 T：键位由用户配置层绑定，包只保证该键可用."
+  (should-not (lookup-key seshat-reader-mode-map (kbd "T"))))
+
 (provide 'seshat-reader-evil-keymap-test)
 ;;; seshat-reader-evil-keymap-test.el ends here

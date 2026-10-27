@@ -9,7 +9,7 @@ Emacs 端文档阅读器（`emacs/seshat-reader/`）：MuPDF 负责栅格化、C
 | 能力 | 入口 | 说明 |
 |---|---|---|
 | 打开文档 | `find-file` / `M-x seshat-reader-open-doc` | PDF/EPUB 等格式由 `auto-mode-alist` 关联到 `seshat-reader-mode` |
-| 连续阅读 | `j` / `k` / `SPC` / `n` / `p` / `M-g g` | 像素级滚动（步长可配）、整页跳转（停在页首）、缩放、旋转、适配、演示模式、暗色模式 |
+| 连续阅读 | `j` / `k` / `SPC` / `n` / `p` / `M-g g` | 像素级滚动（步长可配）、整页跳转（停在页首）、缩放、旋转、适配、演示模式、暗色模式（含 **5 档配色档位循环** `M-x seshat-reader-dark-tint-cycle`，包内无默认键位） |
 | 目录导航 | `o`（开合） | 左侧目录面板：层级、页码、当前章高亮、TAB 折叠、`f` 单键跳转；再按一次 `o` 关闭 |
 | 框选取文 | 鼠标 `down-mouse-1` 拖拽 | 松手后取文本并闪现选区矩形 |
 | 批注 | `C-c C-a` / `C-c C-l` | 创建、列表开合（已显示则关）、跳页、删除、页面高亮刷新 |
@@ -166,6 +166,7 @@ ETAF 渲染层是可选外部依赖：`Makefile` 先探测 `~/Workspace/emacs-ta
 | 关闭文档 | `Q` | |
 | 演示模式 | `M-x seshat-reader-presentation-mode` | 隐藏模式行并 fit-to-height；无默认键位 |
 | 暗色模式 | `M-x seshat-reader-dark-mode` | 5 档配色预设（默认 `charcoal`）；`graphite` 为满量程反色；无默认键位 |
+| 暗色配色档位循环 | `M-x seshat-reader-dark-tint-cycle` | 按预设表顺序逐档切换：`graphite → midnight → charcoal → night-sepia → sepia`，末档之后回绕到 `graphite`；`C-u -`（负前缀）反向；当前值是表外自定义 `(BG . FG)` 或 `nil` 时从表首 `graphite` 起步；暗色**关闭**时调用会先自动开启（按新值下发）再重绘，且**只重绘一次**；非阅读 buffer 里调用只改全局偏好、不重绘。配色是进程级偏好，同一 Emacs 内所有阅读 buffer 一起变。**无默认键位**（包内不绑；需要时由配置层绑定，示例见 `thomas-emacs` 的 `lisp/init-reader.el`，绑在阅读 buffer 的 `T`） |
 
 可用格式（取自包内 `README.org` 的 Supported Formats，经 MuPDF）：
 
@@ -538,6 +539,8 @@ uid 形态本身**不可读**，可读性由 org 链接描述承担（`[[seshat:
 | `M-o` | `seshat-reader-sidebar-toggle` | **全部面板**开合：有面板就全部关闭，没有就重开最近一个。同一键位在**所有面板**（译文/解释、批注列表、目录、搜索结果侧栏）内也生效——光标在面板里照样按得到，不必先切回阅读 window |
 | `C-c w` | `seshat-reader-sidebar-toggle-width` | 面板宽度**切换**：常态宽度（`seshat-reader-sidebar-width` / `seshat-reader-outline-sidebar-width`）↔ `seshat-reader-sidebar-expanded-width`（默认 `0.75`）；再按一次恢复原宽度。同一键位在译文面板 / 批注列表 / 目录面板 / 搜索结果侧栏内也生效 |
 | `?` | `seshat-reader-help` | 打开本帮助页：键位、功能简介与面板行为（`seshat-reader-help` 自带 autoload，无需 require，见「安装与加载」）。seshat buffer 已关闭 evil（`seshat-reader-disable-evil`），normal state 不会压掉本键 |
+
+> **本表只列包内 `seshat-reader-mode-map` 的默认绑定。** 另有两条**无默认键位**的命令需要时请自行绑定：暗色开关 `seshat-reader-dark-mode`、暗色配色档位循环 `seshat-reader-dark-tint-cycle`（按 `graphite → midnight → charcoal → night-sepia → sepia` 逐档切换、末档回绕、`C-u -` 反向、暗色关闭时自动开启并即时重绘）。配置层绑法示例见 `thomas-emacs` 的 `lisp/init-reader.el`（`d` 开关 / `T` 循环；两者都必须绑在 `seshat-reader-mode-map` 本体上，该 buffer 关了 evil，leader 前缀不生效）。
 
 `C-c C-o` **已解绑**（让给 org / `outline-minor-mode` 的结构操作）：单个 kind 的开合改由各自
 的键承担（`o` 目录、`C-c C-l` 批注列表、`C-c C-t` / `C-c C-e` 译文与解释），全部开合统一走

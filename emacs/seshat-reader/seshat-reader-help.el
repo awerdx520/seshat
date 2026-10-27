@@ -102,6 +102,8 @@ parameter，因此 `seshat-reader-sidebar-toggle' 之类的面板命令不管它
     (seshat-reader-annotation-toggle . "开合批注列表面板")
     (seshat-reader-sidebar-toggle . "全部面板开合（有面板即全关，否则重开最近一个）")
     (seshat-reader-sidebar-toggle-width . "面板宽度在常态与扩大值之间切换")
+    (seshat-reader-dark-mode . "开合暗色模式")
+    (seshat-reader-dark-tint-cycle . "切换暗色配色预设（按预设表循环，可反向）")
     (seshat-reader-help . "本帮助页"))
   "阅读 buffer 的**功能**键位表，形式为 (命令 . 一行说明).
 键位在 `seshat-reader-mode-map' 中解析。")

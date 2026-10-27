@@ -3502,6 +3502,16 @@ cons 一律视为非法。"
           (when (and (>= (car colors) 0) (>= (cdr colors) 0))
             colors)))))))
 
+(defun seshat-reader--push-dark-tint ()
+  "把 `seshat-reader-dark-tint' 解析后的两个端点色下发到原生模块.
+
+`graphite' 与非法取值下发 `-1 -1'，即让原生模块走旧的满量程反色路径。
+返回值仅供调试，调用方不消费。"
+  (let ((colors (seshat-reader--dark-tint-colors seshat-reader-dark-tint)))
+    (seshat-reader-dyn--doc-tint (if colors (car colors) -1)
+                                 (if colors (cdr colors) -1))
+    colors))
+
 (define-minor-mode seshat-reader-dark-mode
   "Toggle dark-mode for current seshat-reader document.
 
@@ -3521,10 +3531,67 @@ palette."
   (when (derived-mode-p 'seshat-reader-mode)
     (seshat-reader-dyn--doc-invert (if seshat-reader-dark-mode 1 0))
     (when seshat-reader-dark-mode
-      (let ((colors (seshat-reader--dark-tint-colors seshat-reader-dark-tint)))
-        (seshat-reader-dyn--doc-tint (if colors (car colors) -1)
-                                     (if colors (cdr colors) -1))))
+      (seshat-reader--push-dark-tint))
     (seshat-reader--redisplay-all-windows)))
+
+(defun seshat-reader-dark-tint-cycle (&optional n)
+  "Switch the dark palette to another preset and repaint the pages.
+
+The palettes are visited in the order of `seshat-reader-dark-tint-presets',
+wrapping around at either end.  N is the number of presets to advance, one by
+default; a negative N goes backwards, so a non-zero prefix argument walks the
+same table in reverse.  When the current value of `seshat-reader-dark-tint' is
+not one of the preset symbols -- a custom (BG . FG) cons, or nil -- the walk
+starts just before the head of the table, which makes the first forward step
+land on the first preset.
+
+The palette only means something while dark-mode is on, so the command turns
+`seshat-reader-dark-mode' on when it was off; the mode activation pushes the
+new palette itself.  With the mode already on, the new colours are pushed and
+the pages are repainted once, which is what makes the switch visible without
+toggling the mode twice.  In a buffer that is not a reader buffer only the
+global preference changes: nothing is pushed to the native module and no page
+is repainted, because the palette is process-wide and the current buffer has
+no pages to show.
+
+The new preset symbol is returned; the echo-area feedback is not part of the
+return value."
+  (interactive "p")
+  (let* ((presets (mapcar #'car seshat-reader-dark-tint-presets))
+         (len (length presets))
+         (step (or n 1))
+         (idx -1)
+         (i 0)
+         (next nil))
+    ;; 预设表被清空时下面会除零（`(mod x 0)` 抛 arith-error），显式报错更清楚。
+    ;; 报文首字母大写：checkdoc 的 `Messages should start with a capital letter'
+    ;; 会把小写开头的 `error' 记成一条新警告，破坏「零新增」判据。
+    (when (zerop len)
+      (error "Empty seshat-reader-dark-tint-presets, cannot cycle"))
+    ;; 本文件不 require `cl-lib' 也不 require `seq'，故手写线性查找定位当前
+    ;; 预设；找不到（自定义 cons / nil）时 idx 保持 -1，即「表首之前」。
+    (while (< i len)
+      (when (eq (nth i presets) seshat-reader-dark-tint)
+        (setq idx i))
+      (setq i (1+ i)))
+    (setq next (nth (mod (+ idx step) len) presets))
+    ;; 顺序不可颠倒：先改值，再让开启路径按**新值**下发；先开模式会下发旧值。
+    (setq seshat-reader-dark-tint next)
+    (cond
+     ((not (derived-mode-p 'seshat-reader-mode))
+      ;; 非阅读 buffer：只改全局偏好，不碰模块函数、不重绘。
+      nil)
+     (seshat-reader-dark-mode
+      (seshat-reader--push-dark-tint)
+      (seshat-reader--redisplay-all-windows))
+     (t
+      ;; 模式自己会下发 + 重绘，这里不得再补一次（否则重绘两次、肉眼闪）。
+      (seshat-reader-dark-mode 1)))
+    (message "Dark tint: %s%s" next
+             (if (eq next 'graphite)
+                 " (the old full-range inversion)"
+               ""))
+    next))
 
 (defvar-local seshat-reader--presentation-state nil
   "Zoom and fit mode the buffer had before presentation view was entered.

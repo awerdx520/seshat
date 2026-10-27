@@ -249,5 +249,98 @@ BODY 里三个记录变量可用：`tint-args'（每次下发按时间倒序压�
               (should (equal (cddr first) (cddr second))))))
       (kill-buffer buffer))))
 
+;;;; 循环切换预设（seshat-reader-dark-tint-cycle）
+
+(ert-deftest seshat-reader-theme-test-cycle-forwards ()
+  "前进一档：`charcoal' → `night-sepia'，按新值下发一次并只重绘一次."
+  (seshat-reader-theme-test--with-dark-toggle
+    (let ((seshat-reader-dark-tint 'charcoal))
+      (should (eq (seshat-reader-dark-tint-cycle) 'night-sepia))
+      (should (eq seshat-reader-dark-tint 'night-sepia))
+      (should (equal tint-args '((#x201d18 #xc0b49c))))
+      (should (= redisplay-calls 1)))))
+
+(ert-deftest seshat-reader-theme-test-cycle-backwards ()
+  "负前缀反向一档：`charcoal' → `midnight'."
+  (seshat-reader-theme-test--with-dark-toggle
+    (let ((seshat-reader-dark-tint 'charcoal))
+      (should (eq (seshat-reader-dark-tint-cycle -1) 'midnight))
+      (should (eq seshat-reader-dark-tint 'midnight))
+      (should (equal tint-args '((#x1c1c22 #xc8c4ba))))
+      ;; 暗色原本关着，由开启路径按新值下发并重绘一次。
+      (should (= redisplay-calls 1)))))
+
+(ert-deftest seshat-reader-theme-test-cycle-wraps-around-to-sentinel ()
+  "表尾回绕到表首：`sepia' 前进 → `graphite'，下发哨兵 `(-1 -1)'."
+  (seshat-reader-theme-test--with-dark-toggle
+    (let ((seshat-reader-dark-tint 'sepia))
+      (should (eq (seshat-reader-dark-tint-cycle) 'graphite))
+      (should (eq seshat-reader-dark-tint 'graphite))
+      (should (equal tint-args '((-1 -1)))))))
+
+(ert-deftest seshat-reader-theme-test-cycle-from-custom-cons-starts-at-table-head ()
+  "当前值不是预设符号时从表首起：自定义 cons 前进得到 `graphite'."
+  (seshat-reader-theme-test--with-dark-toggle
+    (let ((seshat-reader-dark-tint (cons #x101010 #xeeeeee)))
+      (should (eq (seshat-reader-dark-tint-cycle) 'graphite))
+      (should (eq seshat-reader-dark-tint 'graphite))
+      ;; `graphite' 走哨兵，下发的两端色都是 -1（旧满量程反色）。
+      (should (equal tint-args '((-1 -1)))))))
+
+(ert-deftest seshat-reader-theme-test-cycle-from-custom-cons-backwards-hits-before-last ()
+  "表外起点 + 负步长落在表尾前一档：自定义 cons 反向得到 `night-sepia'.
+
+这是**刻意的循环语义**，不是缺陷：表外起点视为 `idx = -1'（即「表首
+之前」），后退一步等价于「表尾之后」再退一步，于是落在 `(mod (+ -1 -1) 5)
+= 3'，即表尾 `sepia' 的前一档 `night-sepia'。若有人把「表外起点」改成
+「表尾」或「表首」，本例会失败——它在防止这种误「修复」（那会得到
+`sepia' 或 `graphite'）。"
+  (seshat-reader-theme-test--with-dark-toggle
+    (let ((seshat-reader-dark-tint (cons #x101010 #xeeeeee)))
+      (should (eq (seshat-reader-dark-tint-cycle -1) 'night-sepia))
+      (should (eq seshat-reader-dark-tint 'night-sepia))
+      (should (equal tint-args '((#x201d18 #xc0b49c)))))))
+
+(ert-deftest seshat-reader-theme-test-cycle-enables-dark-mode-once ()
+  "暗色关着时调用会自动开启，按新值下发一次，且只重绘一次（不是两次）."
+  (seshat-reader-theme-test--with-dark-toggle
+    (let ((seshat-reader-dark-tint 'charcoal))
+      ;; helper 已把 `seshat-reader-dark-mode' 动态绑定为 nil
+      (should-not seshat-reader-dark-mode)
+      (should (eq (seshat-reader-dark-tint-cycle) 'night-sepia))
+      (should (equal invert-args '(1)))
+      ;; 开启由 `seshat-reader-dark-mode' 完成并按**新值**下发，命令本身不得
+      ;; 再下发第二次（重复下发 + 重复重绘会让页面闪一次）。
+      (should (= 1 (length tint-args)))
+      (should (equal tint-args '((#x201d18 #xc0b49c))))
+      (should (= redisplay-calls 1)))))
+
+(ert-deftest seshat-reader-theme-test-cycle-non-reader-buffer-only-sets-preference ()
+  "非 reader buffer 里调用只改全局偏好：不下发 tint、不重绘.
+
+本例**不能**复用 `seshat-reader-theme-test--with-dark-toggle'：那个 helper
+会把 `major-mode' 设成 `seshat-reader-mode'，复用就不再是「非 reader
+buffer」。这里改用 `fundamental-mode' 的临时 buffer，只桩替三个入口并记
+录调用次数。"
+  (let ((tint-calls 0)
+        (invert-calls 0)
+        (redisplay-calls 0)
+        (seshat-reader-dark-tint 'charcoal))
+    (with-temp-buffer
+      (should (eq major-mode 'fundamental-mode))
+      (cl-letf (((symbol-function 'seshat-reader-dyn--doc-tint)
+                 (lambda (&rest _) (cl-incf tint-calls) t))
+                ((symbol-function 'seshat-reader-dyn--doc-invert)
+                 (lambda (&rest _) (cl-incf invert-calls)))
+                ((symbol-function 'seshat-reader--redisplay-all-windows)
+                 (lambda () (cl-incf redisplay-calls))))
+        (should (eq (seshat-reader-dark-tint-cycle) 'night-sepia))))
+    ;; 偏好照改
+    (should (eq seshat-reader-dark-tint 'night-sepia))
+    ;; 但模块函数与重绘一次都不许碰
+    (should (= tint-calls 0))
+    (should (= invert-calls 0))
+    (should (= redisplay-calls 0))))
+
 (provide 'seshat-reader-theme-test)
 ;;; seshat-reader-theme-test.el ends here

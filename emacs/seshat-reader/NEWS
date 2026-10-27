@@ -14,8 +14,19 @@ are to be recorded here.
 - =seshat-reader-dyn--doc-invert= no longer needs an open document.
   New module function =seshat-reader-dyn--doc-tint= sets the two colours
   (=BG= / =FG= as =#xRRGGBB=), and =-1 -1= clears the tint again.
+- New command =seshat-reader-dark-tint-cycle= steps through the five
+  presets in table order (=graphite=, =midnight=, =charcoal=,
+  =night-sepia=, =sepia=; the last one wraps around to the first) and
+  repaints the open buffers as it goes. A negative prefix argument
+  steps backwards. When the current value is a custom =(BG . FG)= cons
+  or =nil=, cycling starts from the first preset. It turns dark mode on
+  for you when dark mode is off, and in a non-reader buffer it only
+  changes the global preference. The package binds no key to it; bind
+  it in your own config if you want one.
 - Changing =seshat-reader-dark-tint= does not repaint open buffers:
-  toggle =seshat-reader-dark-mode= again or press =C-l=.
+  step through the presets with =seshat-reader-dark-tint-cycle= to
+  repaint as you go, or toggle =seshat-reader-dark-mode= again or press
+  =C-l=.
 - Note: the tint maps every pixel onto a two-colour ramp, so colour
   figures and covers become monochrome; the =sepia= preset also makes
   the existing yellow highlight decorations hard to see.
