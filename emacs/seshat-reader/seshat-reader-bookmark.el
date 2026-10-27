@@ -86,7 +86,10 @@ The recorded place is restored in this order:
    page and clears the pixel scroll of the window.
 3. `offset' — the page-internal pixel offset, re-applied on top of that top
    \\(old records only carry `vscroll', migrated by
-   `seshat-reader-bookmark--entry-offset').
+   `seshat-reader-bookmark--entry-offset').  This step has to force one frame
+   after the `goto' and only then write the offset: a pixel scroll set in the
+   same frame as the new `window-start' the `goto' installed is dropped, so
+   writing it in the same frame would leave the view on the top of the page.
 4. `hscroll' — horizontal position, for a page wider than the window."
   (let ((page (bookmark-prop-get bookmark 'page))
         (file (bookmark-prop-get bookmark 'filename))
@@ -113,9 +116,10 @@ The recorded place is restored in this order:
       ;; ② 跳到目标页（`--multipage-goto' 会把页内偏移清零，停在页首）。
       (when (numberp page)
         (seshat-reader--multipage-goto page))
-      ;; ③ 再叠加页内像素偏移。
+      ;; ③ 再叠加页内像素偏移。`--multipage--apply-offset' 会先强制落一帧再写
+      ;; 偏移：与新设 window-start 同帧的像素偏移会被 Emacs 丢弃。
       (when (and (numberp offset) (> offset 0))
-        (ignore-errors (set-window-vscroll nil offset t)))
+        (seshat-reader--multipage--apply-offset nil offset))
       ;; ④ 横向位置。
       (when (numberp hscroll)
         (set-window-hscroll nil hscroll)))))

@@ -2051,6 +2051,42 @@ negative after an upward crossing, i.e. invisible once more."
       (when target
         (with-selected-window window (goto-char target))))))
 
+(defun seshat-reader--multipage--apply-offset (window offset)
+  "Give WINDOW the pixel vertical scroll OFFSET once its start has settled.
+
+WINDOW may be nil, which stands for the selected window: it is resolved as
+`(if (window-live-p window) window (selected-window))', the same reading
+`seshat-reader--multipage-scroll' and `seshat-reader--multipage-sync' use.  The
+argument itself is therefore never tested with `window-live-p' alone -- nil has
+to be accepted, otherwise the offset could never be restored.  Nothing happens
+when the resolved window is not live or OFFSET is not a positive number; that
+guard replaces the `ignore-errors' the callers used to need, so real errors are
+no longer swallowed.  Invalid arguments skip the frame too: an offset that will
+not be written must not cost a redisplay.
+
+Emacs drops a pixel scroll that is set in the same frame as a *new* window
+start: `set-window-start' followed by `set-window-vscroll' inside one command
+ends up with a scroll of 0 (real-frame probe: 3090 -> 0), while the same offset
+survives once the new start has been displayed.  Restoration paths such as
+`seshat-reader-bookmark-jump' move the window start first, so they have to force
+a frame here before writing OFFSET.  The FORCE argument of `redisplay' is on
+purpose: the frame must happen even under an inhibited redisplay.
+
+That forced frame runs `pre-redisplay-functions' and may re-center the page,
+which rewrites the centering property of the page rows (the `:align-to' of the
+`before-string', `line-prefix' for a page wider than the window) and the
+horizontal scroll.  The order is still safe: centering touches neither
+`window-start' nor the vertical pixel scroll nor the row structure, and OFFSET
+is written after the frame, while the caller sets `hscroll' after this call.
+`seshat-reader--multipage-scroll' is the same constraint in another form, inside
+the page-crossing sequence, where the sync gives the new start its own frame."
+  (let ((win (if (window-live-p window) window (selected-window))))
+    (when (and (window-live-p win)
+               (numberp offset)
+               (> offset 0))
+      (redisplay t)
+      (set-window-vscroll win offset t))))
+
 (defun seshat-reader--multipage-scroll (pixels &optional window)
   "Scroll WINDOW vertically by PIXELS, continuing across page boundaries.
 

@@ -1338,6 +1338,50 @@ the row start of the page at the top of the window while no page row is added."
                                (seshat-reader-multipage-test--page-numbers)))))))
       (kill-buffer buffer))))
 
+(ert-deftest seshat-reader-multipage-test--geometry-apply-offset-after-redisplay ()
+  "The offset is written only after a frame has been forced.
+
+Confirmed on a real frame: a pixel scroll set in the same frame as a new window
+start is dropped (3090 -> 0), so a restore path has to display the new start
+first.  What is asserted here is the recorded *order* of the two calls plus the
+arguments the scroll is written with: a nil WINDOW is resolved to the selected
+window, the same reading `seshat-reader--multipage-scroll' uses."
+  (let ((events nil))
+    (cl-letf (((symbol-function 'redisplay)
+               (lambda (&optional _force _frame)
+                 (push (list 'redisplay nil) events)
+                 nil))
+              ((symbol-function 'set-window-vscroll)
+               (lambda (&rest args)
+                 (push (cons 'set-window-vscroll args) events)
+                 nil)))
+      (seshat-reader--multipage--apply-offset nil 120))
+    (setq events (nreverse events))
+    (should (equal '(redisplay set-window-vscroll) (mapcar #'car events)))
+    ;; 实参：解析后的窗口（selected window）+ 偏移 + 像素模式
+    (should (equal (list (selected-window) 120 t)
+                   (cdr (nth 1 events))))))
+
+(ert-deftest seshat-reader-multipage-test--geometry-apply-offset-skips-invalid ()
+  "A non-positive or non-numeric offset costs neither a scroll nor a frame.
+
+The guard inside the tool replaced the `ignore-errors' the callers used to
+wrap the write with: an offset that cannot be written is rejected *before* the
+forced frame, so restoring a record without a usable offset neither signals nor
+flashes the page for nothing."
+  (let ((events nil))
+    (cl-letf (((symbol-function 'redisplay)
+               (lambda (&optional _force _frame)
+                 (push 'redisplay events)
+                 nil))
+              ((symbol-function 'set-window-vscroll)
+               (lambda (&rest _args)
+                 (push 'set-window-vscroll events)
+                 nil)))
+      (dolist (offset (list 0 -5 "x"))
+        (seshat-reader--multipage--apply-offset nil offset)))
+    (should-not events)))
+
 (ert-deftest seshat-reader-multipage-test--geometry-page-max-offset-last-page-bounds ()
   "The last page is bounded by the window height, every other page by the span.
 

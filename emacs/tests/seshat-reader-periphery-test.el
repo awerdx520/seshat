@@ -209,8 +209,14 @@ third element of the fake position list, `posn-object' a page image and
 (defun seshat-reader-periphery-test--jump-calls (bookmark)
   "Jump to BOOKMARK with every UI side effect stubbed, return what was called.
 The returned plist holds :scale (args of `--multipage-set-scale'), :page (arg
-of `--multipage-goto'), :vscroll (args of `set-window-vscroll') and :hscroll."
-  (let ((calls nil))
+of `--multipage-goto'), :vscroll (args of `set-window-vscroll'), :hscroll (args
+of `set-window-hscroll') and :events, the calls in call order as a list of
+\(NAME . ARGS).  The plist entries keep only the *last* call of each function
+and therefore cannot carry an order assertion; the restore has to force a frame
+*before* it writes the pixel offset, so the ordered :events list is what the
+order tests read."
+  (let ((calls nil)
+        (events nil))
     (cl-letf (((symbol-function 'bookmark-default-handler) (lambda (&rest _) nil))
               ((symbol-function 'file-exists-p) (lambda (&rest _) t))
               ((symbol-function 'switch-to-buffer) (lambda (&rest _) nil))
@@ -218,15 +224,34 @@ of `--multipage-goto'), :vscroll (args of `set-window-vscroll') and :hscroll."
               ((symbol-function 'derived-mode-p)
                (lambda (&rest _) 'seshat-reader-mode))
               ((symbol-function 'seshat-reader--multipage-set-scale)
-               (lambda (&rest args) (setq calls (plist-put calls :scale args))))
+               (lambda (&rest args)
+                 (push (cons 'set-scale args) events)
+                 (setq calls (plist-put calls :scale args))))
               ((symbol-function 'seshat-reader--multipage-goto)
-               (lambda (page) (setq calls (plist-put calls :page page)) page))
+               (lambda (page)
+                 (push (cons 'goto page) events)
+                 (setq calls (plist-put calls :page page))
+                 page))
+              ((symbol-function 'redisplay)
+               (lambda (&rest args)
+                 (push (cons 'redisplay args) events)
+                 nil))
               ((symbol-function 'set-window-vscroll)
-               (lambda (&rest args) (setq calls (plist-put calls :vscroll args))))
+               (lambda (&rest args)
+                 (push (cons 'set-window-vscroll args) events)
+                 (setq calls (plist-put calls :vscroll args))))
               ((symbol-function 'set-window-hscroll)
-               (lambda (&rest args) (setq calls (plist-put calls :hscroll args)))))
+               (lambda (&rest args)
+                 (push (cons 'set-window-hscroll args) events)
+                 (setq calls (plist-put calls :hscroll args)))))
       (seshat-reader-bookmark-jump bookmark))
-    calls))
+    (plist-put calls :events (nreverse events))))
+
+(defun seshat-reader-periphery-test--jump-event-names (calls &rest wanted)
+  "Return the CALLS event names that are in WANTED, in call order."
+  (delq nil (mapcar (lambda (event)
+                      (and (memq (car event) wanted) (car event)))
+                    (plist-get calls :events))))
 
 (ert-deftest seshat-reader-periphery-test--bookmark-round-trip ()
   "Page, offset, hscroll and scale are restored, the zoom as `manual'."
@@ -241,7 +266,9 @@ of `--multipage-goto'), :vscroll (args of `set-window-vscroll') and :hscroll."
          (calls (seshat-reader-periphery-test--jump-calls bookmark)))
     (should (equal '(1.5 manual manual) (plist-get calls :scale)))
     (should (= 7 (plist-get calls :page)))
-    (should (equal (list nil 120 t) (plist-get calls :vscroll)))
+    ;; 工具把 nil 解析成 selected window 后才写给 `set-window-vscroll'
+    (should (equal (list (selected-window) 120 t)
+                   (plist-get calls :vscroll)))
     (should (equal (list nil 40) (plist-get calls :hscroll)))))
 
 (ert-deftest seshat-reader-periphery-test--bookmark-legacy-vscroll-migrates ()
@@ -251,7 +278,8 @@ of `--multipage-goto'), :vscroll (args of `set-window-vscroll') and :hscroll."
                          (cons 'vscroll 80)))
          (calls (seshat-reader-periphery-test--jump-calls bookmark)))
     (should (= 3 (plist-get calls :page)))
-    (should (equal (list nil 80 t) (plist-get calls :vscroll)))
+    (should (equal (list (selected-window) 80 t)
+                   (plist-get calls :vscroll)))
     ;; 旧记录没有 scale → 不缩放
     (should-not (plist-get calls :scale))))
 
@@ -266,6 +294,43 @@ of `--multipage-goto'), :vscroll (args of `set-window-vscroll') and :hscroll."
     (should (= 2 (plist-get calls :page)))
     ;; offset 非法 → 不设 vscroll（落到页首）
     (should-not (plist-get calls :vscroll))))
+
+(ert-deftest seshat-reader-periphery-test--bookmark-jump-redisplays-before-offset ()
+  "The restore forces a frame before it writes the page-internal offset.
+
+Emacs drops a pixel scroll that is set in the same frame as the new
+`window-start' that `seshat-reader--multipage-goto' installed (real-frame
+probe: 3090 -> 0), so the offset has to be written only after a displayed
+frame.  Asserting the call *order* -- not just that both calls happen -- is
+what catches the regression: the old implementation wrote the offset inside the
+goto frame, where this order was impossible."
+  (let* ((bookmark (list (cons 'filename "/tmp/doc.pdf")
+                         (cons 'page 5)
+                         (cons 'offset 120)))
+         (calls (seshat-reader-periphery-test--jump-calls bookmark)))
+    (should (equal '(redisplay set-window-vscroll)
+                   (seshat-reader-periphery-test--jump-event-names
+                    calls 'redisplay 'set-window-vscroll)))
+    ;; 实参：解析后的窗口（selected window）+ 偏移 + 像素模式
+    (should (equal (list (selected-window) 120 t)
+                   (cdr (assq 'set-window-vscroll
+                              (plist-get calls :events)))))))
+
+(ert-deftest seshat-reader-periphery-test--bookmark-jump-without-offset-does-not-redisplay ()
+  "A record without a usable offset forces no frame and writes no scroll.
+
+这是**优化断言**——避免无谓刷新，不是行为契约：落帧只服务于「写偏移」，`offset'
+缺失或为 0 时恢复就停在页首，没有任何偏移要写。将来若发现 offset=0 也需要落帧
+（例如为了让居中属性立即刷新），放宽此例即可，不必改实现。"
+  (dolist (bookmark (list (list (cons 'filename "/tmp/doc.pdf")
+                                (cons 'page 4))
+                          (list (cons 'filename "/tmp/doc.pdf")
+                                (cons 'page 4)
+                                (cons 'offset 0))))
+    (let ((calls (seshat-reader-periphery-test--jump-calls bookmark)))
+      (should (= 4 (plist-get calls :page)))
+      (should-not (seshat-reader-periphery-test--jump-event-names
+                   calls 'redisplay 'set-window-vscroll)))))
 
 (ert-deftest seshat-reader-periphery-test--bookmark-record-has-p1-fields ()
   "The record carries page/offset/hscroll/scale/fit-mode and no `vscroll'."
