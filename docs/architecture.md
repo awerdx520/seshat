@@ -278,12 +278,12 @@ M12 把 M11 的「单个底部面板」升级为「左目录 / 右信息 / 中�
 **装饰表（Decoration，渲染层）**：
 
 - **数据结构**：一张 `Decoration` 表取代原来的单色 `Highlight` 表，每条带 `kind`（`DECORATION_KIND_RECT` 填充矩形 / `DECORATION_KIND_STROKE` 折线）、几何（rect 四角，或 `fz_point *pts` + `pt_count`）、`color`（RGB ∈ [0,1]）与 `alpha`。rect 与 stroke **共用一张表**，因此渲染线程只遍历一次；`width` 只对 stroke 有意义，rect 恒为 0。上限：`DECORATION_MAX_COUNT`（100000 条）、`DECORATION_MAX_ABS_COORD`（±1e6 点）、`DECORATION_MAX_POINTS`（每笔 1024 点，超出**截断而非拒绝**）、`DECORATION_MAX_STYLE_GROUPS`（64 个样式分组）。
-- **为何必须改 C**：elisp 层无法在已有页面 image 上叠加半透明矩形——同一区域的 `display` 属性**互斥**（一处只有一份 `display` 规格生效），image 规格里也没有「第二个矩形」这一层。既有两个证据：M11.2b 计划记录（`openspec/completed/2026-10-12-m11.2b-reader-selection.md:25`）与 `seshat-reader-select.el` 的选区实现注释（只做文本属性、不做矩形绘制）。因此装饰在 `draw_page_thread` 内绘制。
-- **绘制顺序（不变）**：在暗色像素变换（暗色模式下 `fz_tint_pixmap`，未设 tint 时为 `fz_invert_pixmap_luminance` + `fz_gamma_pixmap`）**之后**、写 PNM **之前**。这一层是整页像素变换，若在装饰之后做会连装饰一起变色；写 PNM 之后再画则进不了缓存位图，翻页回来装饰消失。
+- **为何必须改 C**：elisp 层无法在已有页面 image 上叠加半透明矩形——同一区域的 `display` 属性**互斥**（一处只有一份 `display` 规格生效），image 规格里也没有「第二个矩形」这一层。既有两个证据：M11.2b 计划记录（`openspec/completed/2026-10-12-m11.2b-reader-selection.md:25`）与 `seshat-reader.el` 的选区实现注释（只做文本属性、不做矩形绘制）。因此装饰在 C 侧渲染函数（现为 `render_page_to_buffer`）内绘制：栅格化与像素变换之后、导出 BGRA 进 canvas 缓冲之前；原 worker 版 `draw_page_thread` 已随线程池删除。
+- **绘制顺序（不变）**：在暗色像素变换（暗色模式下 `fz_tint_pixmap`，未设 tint 时为 `fz_invert_pixmap_luminance` + `fz_gamma_pixmap`）**之后**、把 BGRA 字节写进 canvas 缓冲 **之前**。这一层是整页像素变换，若在装饰之后做会连装饰一起变色；写进 canvas 之后再画则进不了页面位图，翻页回来装饰消失。
 - **颜色分组与「重叠不叠深」**：rect 先扫一遍收集至多 64 组不同的 `(R,G,B,A)`，再**每组一条 `fz_path` + 一次 `fz_fill_path`**（`fz_identity` 下传，device 已持 ctm）；同组内重叠区域只被填充一次，因此多段高亮叠在一起仍是同一个透明度。越过组上限的 rect 各自单独填充（只是多几次 fill，语义不变）。
 - **`ctm` 复用**：直接复用该页 rasterize 用的同一个 `fz_transform_page(dp->bbox, resolution, rotate)`，因此缩放与旋转自动对齐，不必另算变换；`rect_to_page_space` 是「Emacs rect → MuPDF 页面空间」的**唯一**换算点（被 `--text-in-rect` / `--rects-in-rect` 与绘制共用）。
-- **快照深拷贝与所有权**：装饰表在派发时**快照**进 `DrawThreadArgs`（`deco` + `deco_count`），渲染线程不碰 `DocState`；快照归 job 所有，由 `free_draw_thread_args`（`draw_page_thread` 全部 7 条退出路径的唯一漏斗）经 `free_decoration_table` 释放。stroke 的点列是**堆分配**，struct 浅拷贝会让渲染线程与 `DocState` 共享 `pts`——因此快照对每条 stroke **逐条深拷贝 `pts`**；所有权规则写进 `Decoration` 结构体注释（「谁持有结构体谁释放 `pts`，且只有一份所有权」），`free_decoration_table` 是**唯一**释放路径（`--clear-highlights`、`free_doc_state`、`free_draw_thread_args` 共用），从机制上排除双 free。浅拷贝时代的 `args->hl` 裸 `free` 已替换，否则会漏掉每笔 stroke 的 `pts`。
-- **elisp 侧只改表**：三个入口改表并置 `decorations_dirty`，渲染线程不参与；`--refresh-highlights` 的重绘序列不变——非 dirty 直接返回 `t`；dirty 时 `wait_for_win_jobs` → `nullify_window_cache` → `build_cache_window` → `wait_for_cached_page` → `display_cached_page`（与 `seshat-reader-dyn-redisplay-doc` 同形），故不另建渲染管线、也不与既有缓存失效逻辑分叉。
+- **快照深拷贝与所有权**：装饰表在每次渲染调用开始时**快照**一份（`deco` + `deco_count`），渲染函数只读快照、不碰 `DocState`；快照由本次调用持有，收尾统一经 `free_decoration_table` 释放（worker 线程池与 `DrawThreadArgs` / `free_draw_thread_args` 已于 2026-10-28 删除）。stroke 的点列是**堆分配**，struct 浅拷贝会与 `DocState` 共享 `pts`——因此快照对每条 stroke **逐条深拷贝 `pts`**；所有权规则写进 `Decoration` 结构体注释（「谁持有结构体谁释放 `pts`，且只有一份所有权」），`free_decoration_table` 是**唯一**释放路径（`--clear-highlights`、`free_doc_state`、渲染路径共用），从机制上排除双 free。
+- **elisp 侧只改表**：三个入口改表并置 `decorations_dirty`，渲染线程不参与。**刷新链在 2026-10-28 已改写**：原「`--refresh-highlights` 内部 `wait_for_win_jobs` → `nullify_window_cache` → `build_cache_window` → `wait_for_cached_page` → `display_cached_page`」随 legacy 渲染路径**整条删除**（`--refresh-highlights` 入口、worker 池、`CachedPage`、overlay 显示路径均已不存在，见本节「渲染后端：canvas」）；现在的等价动作在 elisp 侧——清目标页 spec 缓存并重渲染驻留页（`seshat-reader--multipage-refresh-decorations`）。
 - **三个入口**（C 函数 / 注册 arity）：
   1. `--add-highlight`（`5,5`，`page x0 y0 x1 y1`）——历史入口，名字与 arity **均不变**，内部映射为「rect + 默认黄 1.0/0.85/0.0 + α 0.35」，是默认配色下的**像素级等价路径**。
   2. `--add-decoration`（`9,9`，`page x0 y0 x1 y1 r g b alpha`）——带颜色的 rect 入口；非有限颜色分量回退默认色、其余夹到 `[0,1]`。Lisp 侧在 `kind` 为 underline/strikeout 或用户改了高亮配色时走这条。
@@ -312,11 +312,44 @@ M12 把 M11 的「单个底部面板」升级为「左目录 / 右信息 / 中�
 | 搜索单页命中 | 1024（`SEARCH_PAGE_MAX_QUADS`；`limit` 另被夹到 1..10000） | 截断为前 1024 条，状态行提示「仅显示前 1024 条」 |
 | 搜索整次命中 | 20000（`seshat-reader-search-max-matches`） | 达到即停止扫描并提示「命中过多」 |
 
+### 渲染后端：canvas（2026-10-28，取代 PBM/PNM）
+
+每页位图的传输层由「PNM 编码成 Lisp 字符串 + `create-image :type pbm`」换成「MuPDF 直接写 Emacs canvas 的像素缓冲 + `canvas-refresh`」。canvas 是 **Emacs 32 的编译期特性**，因此本仓库**只支持 Emacs 32.0+**（29/30/31 不再支持，也不保留 pbm 双路径）。
+
+**像素链路（不用预乘、不做反预乘）**：
+
+1. `fz_new_pixmap_from_display_list(ctx, dl, ctm, fz_device_bgr(ctx), **0**)` — 第五参 `alpha = 0` 表示**不分配 A 通道**，得到 3 分量 BGR pixmap；MuPDF 把页面直接合成到不透明背景（初始像素 0 = **黑**），与旧 PNM/RGB 路径语义一致。通道序与 canvas 的 `0xAARRGGBB`（小端字节序 B, G, R, A）天然吻合，**零重排**。
+2. 因为起点不透明（没有 A 通道、也没有半透明合成），「预乘 alpha」问题根本不存在——**不需要预乘，也不需要反预乘**（改成 alpha=1 反而会拿到预乘像素、且 MuPDF 没有反预乘 API）。
+3. 渲染 → 暗色像素变换 → 装饰 wash（次序同前）。
+4. **导出为紧凑 BGRA**：逐行按 `fz_pixmap_stride` 取源行，每像素一次 32 位写 `0xFF000000 | R<<16 | G<<8 | B`（**A 恒填 255**）到一块 `data_w × data_h × 4` 的中间缓冲。
+5. **写进 canvas**：主线程取 `canvas_data`（**每次重取，禁止跨调用缓存**）→ 按行 `memcpy`（canvas 行宽 = `data_w × 4`，与中间缓冲同构，无需重排）→ `canvas-refresh`（第二参 nil）。
+
+**尺寸双轨制（硬约束）**：
+
+| 属性 | 语义 | 写权限 |
+|---|---|---|
+| `:data-width` / `:data-height` | **设备像素** = MuPDF pixmap 尺寸 | **只在渲染时设一次，之后任何路径禁止改写**——改它会重建缓冲并清零（残影 / 花屏） |
+| `:width` / `:height` | **逻辑像素** = 设备像素 ÷ `frame_scale` | 可随时 `setf`，即显示层缩放（拖分割线 / `W` / `H` / `+` / `-` / `0` 走这条） |
+
+**内存模型（Lisp 侧零常驻）**：
+
+- canvas spec 的 `:data` 为 **nil**——位图只存在 Emacs 的 canvas 缓冲里（`w*h*4` 字节），Lisp 堆**不持副本**；canvas 没有 `image-flush` 语义，代码里也**不再有**该调用。
+- 渲染期另有两块**临时**内存：MuPDF pixmap（3 分量 + alpha）与 BGRA 中间缓冲，渲染函数返回前释放。
+- 每页 612×792 从旧 ≈3.4 MB（Lisp 字符串副本 + C 侧副本）降到 ≈1.9 MB（**−43%**）。
+
+**刷新粒度 = 整张 canvas**：`canvas-refresh` 只有 `(image &optional reload-data)`，**没有局部区域刷新**。因此「只刷新一部分像素」只能靠「按页切分 canvas」——每页一个 canvas 对象是当前唯一的增量手段（多页布局正是每页一个 spec）。改一条批注仍要重渲染受影响页，代价见 `docs/emacs-reader.md`。
+
+**性能与取舍（实测）**：单页 `--page-image-spec` 中位 **0.589 → 1.22 ms**（scale 1.0）、**1.732 → 2.77 ms**（1.5）、**0.742 → 1.16 ms**（rotate 90），即 **+0.6~1.0 ms/页**，来源是 BGR→BGRA 的逐行扩展。三种优化写法（`memset` + 3 字节写、64 位块写、`-O3`）实测**均无收益**——瓶颈是「3 分量 pixmap → 中间缓冲 → memcpy 进 canvas 缓冲」的结构性往返，不是逐像素写循环。**明示取舍：不做结构重构**（真要回补只能改成渲染端直出 4 分量，见 `openspec/tech-debt.md`）。
+
+**legacy 路径已退役（净删 1714 行）**：`--redisplay-doc` / `--next-page` / `--prev-page` / `--first-page` / `--last-page` / `--goto-page` / `--scale-page` / `--rotate-page` / `--window-create` / `--window-close` / `--refresh-highlights` 共 **11 个 C 入口**、worker 线程池（`render/render-threads.c/.h` 整文件删除）、`CachedPage`、`EmacsWinState`、overlay 机制与 `image-flush` 调用**全部删除**，保留 14 个入口；`render/` 净删 **1714** 行（全仓 21 文件 **+786/−2423** 中的 `render/` 部分，21 文件合计 **+786/−2423**）。`--load-doc` 现在只建 `DocState`（不再建 overlay / win-state），渲染完成标志 `set_current_render_status` 移到 `--page-image-spec` 的成功路径。
+
+> **历史说明（避免去 grep 不存在的代码）**：下文与旧计划里出现的 `--refresh-highlights`、overlay 显示路径、`CachedPage`、`wait_for_win_jobs` / `build_cache_window` / `display_cached_page`、`render/render-threads.c` 一律**已删除**，描述仅保留作历史背景；当前有效路径只有 `--page-image-spec` → canvas。
+
 ### 暗色像素变换与状态存储（2026-10-27）
 
 暗色模式是**用户偏好**而非文档属性，因此在 C 侧同时改了两件事：像素变换的方式，以及这份状态的存储粒度。
 
-- **像素变换只有一条分支**：`render_page_to_buffer` 里 `dark_on && tint_set` → `fz_tint_pixmap(ctx, pixmap, bg, fg)`（把每像素亮度线性映射到 BG–FG 两端）；`dark_on` 但未设 tint → 旧的 `fz_invert_pixmap_luminance` + `fz_gamma_pixmap(1/1.4)`（满量程反色）。次序不变：**栅格化 → 像素变换 → 装饰 wash → PNM 编码**（理由见上节「绘制顺序」）。tint 是双端压缩，暗底不再等于「白变纯黑」，代价是彩色内容被压成单色调（见 `openspec/tech-debt.md`）。
+- **像素变换只有一条分支**：`render_page_to_buffer` 里 `dark_on && tint_set` → `fz_tint_pixmap(ctx, pixmap, bg, fg)`（把每像素亮度线性映射到 BG–FG 两端）；`dark_on` 但未设 tint → 旧的 `fz_invert_pixmap_luminance` + `fz_gamma_pixmap(1/1.4)`（满量程反色）。次序不变：**栅格化 → 像素变换 → 装饰 wash → 导出 BGRA 进 canvas 缓冲**（理由见上节「绘制顺序」）。tint 是双端压缩，暗底不再等于「白变纯黑」，代价是彩色内容被压成单色调（见 `openspec/tech-debt.md`）。
 - **状态是进程级原子字段**：`render-theme.c` 的 `g_dark_enabled` / `g_tint_set` / `g_tint_pair`（BG 与 FG 打包在一个 64 位字里）承载开关与配色，**不随 `reset_doc_state` 清零**——重载文档或新开另一本都保持用户当前选择。`DocState` 因此**没有** `invert` 字段（原字段已删除），`mupdf-helpers.c` 的 `reset_doc_state` 也不再初始化它。
 - **elisp 侧如何写**：`seshat-reader-dyn--doc-invert` 只翻进程级开关、**不再要求文档存在**（进程级标志没有「文档缺失」这种失败态，恒返回 `t`）；`seshat-reader-dyn--doc-tint`（arity `2`，`BG FG` 均为 `#xRRGGBB` 整数）写配色，`-1 -1` 是**清空 tint** 的哨兵（回退旧 invert+gamma，即 `graphite` 预设的「一键回旧观感」），`> 0xFFFFFF` 返回 nil 且只 `message`、不改状态，非整数同样不改状态。两者都**不重绘**，重绘由调用方显式触发。
 - **原子性**：三者均为 atomic（`atomic_bool` × 2 + `atomic_uint_fast64_t`，字段清单见上条）；主线程写（release）、渲染线程读（acquire），一帧只读一次整对端点色，避免混用两档配色。
@@ -326,17 +359,17 @@ M12 把 M11 的「单个底部面板」升级为「左目录 / 右信息 / 中�
 面向「PDF 多页连续布局」（路线 3，见 `openspec/decisions.md` 2026-10-26 条）的**前置地基**：本仓库第一次提供「渲染任意页并把 image spec 交回 Lisp」的通道。
 
 - **为什么需要**：改造前渲染结果**只**由 C 直接写进 per-window overlay（`display_img_to_overlay` → `overlay-put overlay 'display spec`），调用方拿不到 spec；所有翻页入口都走同一条 `wait_for_win_jobs` → `build_cache_window` → `wait_for_cached_page` → `display_cached_page` 模板并写 `selected-window` 的 `page` 参数。要做多页纵向布局，必须有「给定页号 → 得到该页位图」的纯查询能力，否则只能借「隐藏窗口预渲染」（每窗口独占 11 张位图，且会被 `--manage-window-overlays` 反复重建），代价过高。
-- **接口形态**：C 入口 `seshat-reader-dyn--page-image-spec`（arity `2..3`，`PAGE SCALE [ROTATE]`），页号 **1-based**、`SCALE` 为 72 dpi 的倍数并按既有 `MINRES/MAXRES` clamp、`ROTATE` 只接受 0/90/180/270；非法参数、页越界、`is_reloading` 一律**静默 nil**。elisp 包装 `seshat-reader--page-spec`。**同步**执行、**显式**给 scale / rotate、**不读写**任何窗口参数 / overlay / per-window 缓存槽——即调用前后显示状态逐项不变（ERT 有专门用例守门）。渲染段由 `draw_page_thread` 抽出的 `render_page_to_buffer` 承担，故新旧两条路径的 PNM 字节 sha256 一致；装饰走文档装饰表的深拷贝快照，渲染后 `free_decoration_table`。
-- **缓存上限 8 的理由**：spec 的 `:data` 是 PNM 字节的**一份 Lisp 堆副本**，C 侧 `CachedPage.img_data` 与 MuPDF image cache 各自另存——**一张页位图在内存里至少两份**。实测（72 dpi，612×792）单页 `:data` 1.42 MB，150 dpi 时 6.16 MB；`--page-spec-cache-limit` 因此固定为 8（`defvar`，不是 defcustom，不暴露给用户），使常驻增量落在 11–50 MB 量级而非无界。实测 20 页连测的 `VmRSS` 增量 ≈ 0.9 MB/页（首轮），这是 C 侧与 Lisp 侧叠加后的可观测值。
+- **接口形态**：C 入口 `seshat-reader-dyn--page-image-spec`（arity `2..3`，`PAGE SCALE [ROTATE]`），页号 **1-based**、`SCALE` 为 72 dpi 的倍数并按既有 `MINRES/MAXRES` clamp、`ROTATE` 只接受 0/90/180/270；非法参数、页越界、`is_reloading` 一律**静默 nil**。elisp 包装 `seshat-reader--page-spec`。**同步**执行、**显式**给 scale / rotate、**不读写**任何窗口参数 / overlay / per-window 缓存槽——即调用前后显示状态逐项不变（ERT 有专门用例守门）。渲染段由 `render_page_to_buffer` 承担；装饰走文档装饰表的深拷贝快照，渲染后 `free_decoration_table`。**2026-10-28 起返回 canvas spec**（`:data` 为 nil、像素直写 canvas 缓冲），与旧 pbm 基线**逐字节等价**（三组 `(scale, rotate)` 差异均为 0）。
+- **缓存上限 8 的理由**：spec 的 `:data` 为 nil（Lisp 侧零常驻），位图常驻在 Emacs 的 canvas 缓冲（每页 `w*h*4` 字节，612×792 ≈ 1.9 MB）。上限固定为 8（`defvar`，不是 defcustom，不暴露给用户），使常驻增量落在 15 MB 量级而非无界。内存估算 `seshat-reader--multipage-resident-spec-megabytes` 改按 `data-width × data-height × 4`（不再读 `:data` 长度）。
 - **边界（P0 明确不做）**：**不接入任何显示 / 滚动 / redisplay 路径**，只供显式调用与测量。同步阻塞主线程，实测 0.7–11 ms/页（72 dpi，与既有 `wait_for_cached_page` 同量级，见 `openspec/completed/2026-10-26-reader-multipage-p0-page-spec-api.md` 的「实测数据」）。另外**顺序扫超过 8 页时缓存命中率为 0**（上限 8 + 先进先出淘汰，第二轮开始前槽位已被后 8 页占满）——P1 的虚拟化必须让视口驻留页数 ≤ 上限，否则要先换淘汰策略。
-- **未改变的既有结构**：per-window 11 槽缓存、`--refresh-highlights` 的刷新范围、hscroll 的窗口级语义、多窗口各自的页号都**原样保留**；这些是多页布局落地时要处理的缺口，已登记在 `openspec/tech-debt.md`。
+- **未改变的既有结构**：hscroll 的窗口级语义、多窗口各自的页号、`--multipage-*` 的虚拟化与淘汰策略原样保留。**per-window 11 槽缓存与 `--refresh-highlights` 已不存在**（2026-10-28 随 legacy 路径删除），其历史缺口记录在 `openspec/tech-debt.md`。
 
 ## 多页连续布局（P1，2026-10-27）
 
-单页 overlay 模型已退役：elisp 侧**没有任何** `(window-parameter … 'overlay)` 读取点，C 侧仅保留 `--window-close`（释放 `EmacsWinState`）与 `--refresh-highlights`（兼容入口，elisp 已不再调用）。
+单页 overlay 模型已退役并**彻底删除**（2026-10-28）：elisp 侧**没有任何** `(window-parameter … 'overlay)` 读取点；C 侧原有 `--window-close`（释放 `EmacsWinState`）与 `--refresh-highlights`（兼容入口）两个残留入口也随 legacy 渲染路径一并移除，装饰刷新只走 elisp 的 spec 缓存失效 + 重渲染。
 
 - **buffer 结构**：**每页一行**。行 = 引导空格（`display` 取 `(space :align-to (+ center (-0.5 . SPEC)))`，让页面在窗口里居中且随 redisplay 求值）+ 图像空格（`display` 取页面 image spec）+ 换行。每个页行之后依次是 `seshat-reader-page-gap-lines`（默认 `0`）个整行空行 + **分隔区 3 行**（上空行 / 横贯窗口的线 / 下空行）——线是 `(space :align-to (- right 0))` 的 stretch space 配 `seshat-reader-page-separator-face` 的 `:background`，三段高度由 face `:height` 相对 `frame-char-height` 缩放，总和 = `seshat-reader-page-separator-height`（默认 `0.5`）行像素（名义值；face `:height` 阶梯取整会让实际渲染比名义多 ±1–2px，见 `docs/emacs-reader.md` §7 与 §12）。分隔区像素由 `seshat-reader--multipage-separator-segments`（返回 `(TOP LINE BOTTOM)`）**单一产出**，滚动几何（`--multipage-page-span` / `--multipage-page-max-offset`）与行构造共用它，避免口径分叉。页表 `seshat-reader--pages` 是升序 alist，元素 `(PAGE MARKER . SPEC)`，marker 指向**行首**（插入/删除页行时自动跟随，故页号永远由 marker 反查而不是由行号推算）。
-- **可见集与虚拟化**：驻留集 = 视口顶页 − `seshat-reader--multipage-preload` .. 视口底页 + 同值（默认 `2`）；越界页 recycle（删行 + 释放 spec），相邻一页保留 spec 缓存。spec 缓存 `seshat-reader--page-spec-cache` 上限 = `min 16 (2K+2)`（K = preload，下限 4），**视口外优先淘汰**；`--multipage-prefetch` 按滚动方向预热**一页**（只暖缓存、不插行）。内存：`--multipage-check-memory` 按 `:data` 长度 ×2 估算，超 `seshat-reader-multipage-memory-warning-mb`（默认 75）时每 buffer `message` 一次。
+- **可见集与虚拟化**：驻留集 = 视口顶页 − `seshat-reader--multipage-preload` .. 视口底页 + 同值（默认 `2`）；越界页 recycle（删行 + 释放 spec），相邻一页保留 spec 缓存。spec 缓存 `seshat-reader--page-spec-cache` 上限 = `min 16 (2K+2)`（K = preload，下限 4），**视口外优先淘汰**；`--multipage-prefetch` 按滚动方向预热**一页**（只暖缓存、不插行）。内存：`--multipage-check-memory` 按 `data-width × data-height × 4` 估算（canvas 缓冲的 ARGB32 像素，缺 `data-*` 时退回 `:width × :height × 4`，缩放 frame 下为低估），超 `seshat-reader-multipage-memory-warning-mb`（默认 75）时每 buffer `message` 一次。
 - **页号派生**：`seshat-reader-current-doc-pagenumber` = **视口顶页**（`window-start` 经 `--multipage-page-at-pos` 反查页行），不再读窗口参数 `page`；`goto-page`（及 `n` / `p` / `M-<` / `M->` / 搜索跳转 / 引用跳转）= 把目标页行设为 `window-start` 并把 `window-vscroll` 归零，故整页跳转恒停在页首。
 - **滚动原语**：一页一行、行高 = 整页位图高，因此**内置行滚动等于翻页**。滚动由 `seshat-reader--multipage-scroll` 实现：「页内用 `window-vscroll` 的像素偏移，跨页时改 `set-window-start` 到相邻页行，余量成为新页的偏移」；步长 = `seshat-reader-scroll-step-pixels`（绝对像素，优先）或 `scroll-step-ratio`（默认 `0.15`）× `(window-body-height WIN t)`，再退回一行（`frame-char-height`）。首尾由「页内偏移夹到 `[0, 高−1]`」自然截止，每轮必前进一页，占位页（spec 为 nil）不会死循环。
 - **几何**：`base-scale` 由**打开文档那一页**的 native 尺寸锚定（`seshat-reader--multipage-reference-native`，reload / rotate 时清空），保证 `W` / `H` / `0` 的基准稳定。每页 target 由分模式表给出：`contain` = `min(base, 该页 width-fit)`、`width` = 该页 width-fit、`height` = 该页 height-fit（**不裁剪**，可横向滚动）、`manual` = base；`contain` / `width` 下任一可见页宽度 ≤ 窗口宽。refit 闸门 `seshat-reader--refit-scale-tolerance`（`0.005`）：已渲染 scale 与目标 scale 差小于该值即视为「已清晰」，避免反复重渲染。
@@ -359,7 +392,7 @@ M12 把 M11 的「单个底部面板」升级为「左目录 / 右信息 / 中�
 
 1. **解析**（纯 Lisp，零 C 依赖，可单测）：`seshat-reader-annotation--ink-strokes-from-location` 把 `location` 的每个 `ink:` 段解为 `(PAGE R G B ALPHA WIDTH POINTS TRUNCATED)`。颜色只认恰好 8 位 `#AARRGGBB`；缺颜色/宽度、非有限数、坐标个数为奇数、点数为 0 均**整笔跳过**（画歪一笔比不画更误导）；超过 1024 点截断为前 1024 点并标记 `TRUNCATED`（整笔丢弃等于用户笔迹凭空消失）。解析有界：`location` 先按 64 KB 截断。
 2. **过滤与缓存**：重绘只投**当前文档**的批注（`--cached-entries` 做跨文档过滤），每页笔迹集合按 buffer 缓存（`--annotation-strokes`），避免每次重绘都重新解析整本文档。
-3. **投喂**：`--add-stroke`（`page r g b alpha width points`，页号 **1-based**，`points` 为扁平 `(x0 y0 x1 y1 …)`）→ C 侧 `Decoration` 表追加 `DECORATION_KIND_STROKE` 条目（`pts` 堆分配、派发快照时逐条深拷贝）→ 渲染线程在暗色像素变换（`fz_tint_pixmap`，或未设 tint 时的 `fz_invert_pixmap_luminance` + `fz_gamma_pixmap`）**之后**、写 PNM **之前**绘制（圆头圆角），因此缩放后与页面同变换对齐。
+3. **投喂**：`--add-stroke`（`page r g b alpha width points`，页号 **1-based**，`points` 为扁平 `(x0 y0 x1 y1 …)`）→ C 侧 `Decoration` 表追加 `DECORATION_KIND_STROKE` 条目（`pts` 堆分配、渲染时逐条深拷贝进快照）→ 渲染函数在暗色像素变换（`fz_tint_pixmap`，或未设 tint 时的 `fz_invert_pixmap_luminance` + `fz_gamma_pixmap`）**之后**、导出 BGRA 进 canvas 缓冲**之前**绘制（圆头圆角），因此缩放后与页面同变换对齐。
 4. **投喂顺序（唯一约定）**：`clear` → 批注 rect → 框选闪现 → 搜索命中 → **ink 笔迹** → `refresh`。ink 放在最后是因为它是唯一带 alpha 且可能很长的折线，先画不会被后画的半透明矩形叠加影响判断；顺序写进 `seshat-reader-annotation--redraw-highlights`，新增装饰路必须插进这条链而不是另起一条。
 5. **失败隔离**：缺 stroke 入口（旧 `.so`）或 ink 解析失败时只跳过 ink，rect 装饰照常投喂；返回值仍只统计批注 rect 条数（ink 不进这个计数）。
 6. **坐标**：ink 点与 `rect:` 同 page space（页面 pt、原点左上、y 向下），**不翻转**（数值证据见 `docs/emacs-reader.md` §5「手写轨迹显示」）。

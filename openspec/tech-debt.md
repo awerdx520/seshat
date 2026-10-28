@@ -1639,7 +1639,7 @@
   2. **`--refresh-highlights` 只重建当前窗口 ±5 页**：多页布局下视口可跨更多页，装饰（批注 / 框选闪现 / 搜索命中 / ink）刷新范围必须按视口实际页数重算，否则刚滚入视口的页会显示旧装饰。
   3. **hscroll 是窗口级**：整页横向滚动会让整栏（含相邻页）一起移动，宽页（如 A0 图纸）在多页布局下会把邻页推出视野。需改为按页对齐或按页单独横向偏移。
   4. **多窗口「各看不同页」的能力将丢失**：路线 3 的决策是「页号由视口顶页派生」，不再用 window 参数 `page` 作真相来源；同一文档在两个窗口停在不同位置后，依赖 `page` 参数同步的功能（书签恢复、`--centered-p`、侧栏跳转回写）都要改成按窗口各自派生。
-  5. **整页位图约 2 MB/张（实测 72 dpi 1.42 MB、150 dpi 6.16 MB），`--page-spec` 缓存 8 条即 Lisp 堆 ~11–50 MB + C 侧同量级**：C 侧 `CachedPage.img_data` 与 MuPDF image cache 各自另存一份，所以「一张位图在内存里至少两份」。实测 20 页连测的 `VmRSS` 增量 ≈ 0.9 MB/页；且顺序访问超过缓存上限（8）时命中率**跌到 0**（先进先出淘汰）——P1 必须先定「视口驻留页数上限 + 淘汰策略」，再谈上限值。
+  5. **整页位图内存与驻留策略（P2-5）——部分缓解（2026-10-28 canvas 后端）**：**已消除** ① Lisp 堆上的 PNM 字符串副本（旧口径 72 dpi 1.42 MB/页、150 dpi 6.16 MB/页）；② C 侧 `CachedPage.img_data`（`CachedPage` 已随 legacy 渲染路径删除）。**仍存在** ① Emacs image cache 内的 canvas 缓冲（每页 `w*h*4`，612×792 ≈ **1.9 MB**，比旧 ≈3.4 MB 降 **43%**）；② 渲染期临时内存——MuPDF pixmap（3 分量 + alpha）与 BGRA 中间缓冲，渲染函数返回前释放、不进缓存。**旧结论已被推翻**：「一张位图在内存里至少两份」不再成立，现状是「Emacs 侧一份常驻 + 渲染期最多两份临时」。**口径更新**：驻留估算改 `data-width × data-height × 4`（不再读 `:data` 长度）；上限仍由 `seshat-reader--page-spec-cache-limit`（8）与多页驻留集（视口 ± `seshat-reader--multipage-preload`）共同约束。**未做**：pin 引用而非复制（已无复制对象）、异步渲染与 idle 预取（P2-1 待办）。
   6. **`snapshot_page_decorations` 与 `submit_render_job` 渲染路径重复未合并**：P0 新增的静态 `snapshot_page_decorations`（`render/render-core.c`）与 `render/render-threads.c` 的 `submit_render_job` 内联的装饰快照逻辑**语义等价但是两份代码**（deep copy 规则、`pts` 逐条拷贝、失败降级策略），任一处修改都会让「屏幕上的位图」与「`--page-spec` 返回的位图」装饰不一致。合并时必须保证 `free_draw_thread_args` 仍是 worker 路径的唯一释放漏斗。
   7. **batch 下第二次渲染撞 `image-flush`**：`emacs --batch` 里连续多次渲染/写 overlay `display` 时 C 侧 `image-flush` 抛 `Window system frame should be used`，因此 P0 的 ERT 夹具必须 `(fset 'image-flush #'ignore)`。**GUI 侧未验证**是否有图像库警告或缓存行为差异——若 GUI 下 `image-flush` 被反复调用（例如每页替换 spec），可能有性能影响，需在 P1 的 GUI 冒烟里观察。
 - 影响：①②③ 是布局**正确性**前置（不处理会画错位置 / 显示旧装饰 / 邻页被推出视野）；④ 是**能力回退**（用户当前依赖的多窗口各看不同页会消失）；⑤ 是**内存上限**，处理不当会让打开大文档直接吃满内存；⑥⑦ 是**一致性与可测试性**债，短期不致命但会让「两条渲染路径取到不同位图」这类 bug 极难定位。
@@ -1795,3 +1795,51 @@
 - 影响：任何改动 `emacs/seshat-reader/*.el` 的批次都必须记得 `make -C emacs/seshat-reader <file>.elc`，否则回归结论不可信。2026-10-27 的 `undo-outer-limit` 修复批次实测踩到：不重编译时新增用例仍失败（加载的是旧 `.elc`），重编译后才转绿。
 - 建议：二选一——① 在 `ert` 目标里加 `--eval "(setq load-prefer-newer t)"`（改一处，语义为「源码较新则用源码」）；② 给 `ert` 目标加 `.elc` 依赖（`%.elc: %.el`），由 make 保证同步。①更贴近「测试跑当前源码」的意图，②更接近真实加载路径，两者可并存，建议先做①。
 - 来源：`emacs/tests/Makefile`（`TEST_FILES := $(sort $(wildcard …))` 已能自动收集新增测试文件，问题只在 `.elc` 优先级）；本轮修复的执行记录。
+
+## `Makefile` 缺头文件依赖，换 `.h` 后复用旧 `.o`（canvas 迁移 T1 发现）——已解决（2026-10-28）
+
+- 现状（修复前）：`emacs/seshat-reader/Makefile` 只有 `%.o: %.c` 规则，未生成/引用头文件依赖；`render/render-core.h`、`render/emacs-module.h` 等改动后，只要 `.c` 时间戳没变就**不会重编**——表现是「头文件升级已生效、行为却没变」或反向的诡异编译错误。
+- 处置：`CFLAGS` 增 `-MMD -MP`、Makefile 末尾 `-include $(OBJS:.o=.d)`、`clean` 一并删 `.d`。实测 `touch render/render-core.h` 后 4 个 `.o` 全部重编（gcc 命令可见），内容不变再跑则「已是最新」。
+- 来源：`openspec/completed/2026-10-28-reader-canvas-backend-migration.md`「验证记录 → 批次 T8a」第 ③ 项。
+
+## `emacs/tests/Makefile` 的 `BUILD_ROOT` 硬编码 `build-31.1`——已解决（2026-10-28）
+
+- 现状（修复前）：ERT 夹具把 straight 包目录写死为 `.../straight/build-31.1`，Emacs 升到 32 后所有第三方 `-L` 全部落空，相关用例静默 skip 或加载失败。
+- 处置：改为按 `emacs-major-version` / `emacs-minor-version` 推导 `build-<major>.<minor>`，并加「同前缀唯一目录」回退；推导不出唯一目录时直接 `$(error)`，**不静默降级成空 `-L`**（空 `-L` 会让测试跑但结论不可信）。本机解析为 `~/.local/straight/build-32.0.50`，8 个包的 `-L` 全部命中。
+- 来源：同上，「验证记录 → 批次 T8a」第 ④ 项。
+
+## `--page-text` 的 0 参路径引入 C→elisp 反向依赖（canvas 迁移 T6/T7，2026-10-28）
+
+- 现状：legacy 渲染路径删除后，C 侧不再持有窗口状态（`EmacsWinState` 已删），而 `seshat-reader-dyn--page-text` 允许省略 `PAGE` 参数。省略时由 C 侧 `current_page_from_elisp` 调用 elisp 函数 `seshat-reader-current-doc-pagenumber`（`env->intern` + `fboundp` 守卫 + `funcall`），把返回的 1-based 页号转成 C 侧 0-based 索引；函数不存在（如 `emacs -Q --batch` 里只 `module-load`）或返回非整数时，回退到 `--load-doc` 记录的页号。
+- 影响：① 模块不再「自包含」——C 代码调用了 elisp 层的函数名，改名或改语义会静默降级成「用 load-doc 的页号」而不是报错；② 该回退让「当前页」在无 elisp 环境时与真实视口不一致（batch 场景下可接受，交互场景下 elisp 总是存在）。**不得**在 C 侧缓存该调用的结果（页号随滚动变化）。
+- 建议：新增依赖 elisp 符号的 C 路径时，一律走「`fboundp` 守卫 + DocState 兜底」这一既有模式，并在函数注释里写清依赖的符号名；若将来要彻底消除反向依赖，可把 `PAGE` 参数改成必填、由 elisp 侧负责取页号（`--text-in-rect` 一族已有先例：0 参路径不存在，页号总是显式传）。
+- 来源：`emacs/seshat-reader/render/render-core.c` 的 `current_page_from_elisp`；迁移计划的 T6/T7 批次记录。
+
+## `.so` 未用 `-fvisibility=hidden`，内部符号仍对外导出（2026-10-28）
+
+- 现状：`seshat-render-core.so` 的编译选项没有 `-fvisibility=hidden`，也没有 `-Wl,--version-script` 或 `-Wl,-Bsymbolic` 之类的收口，实测 `nm -D --defined-only seshat-render-core.so | grep -c ' T \| D \| B '` = **48**，其中只有 **14** 个是 elisp 入口（`seshat-reader-dyn--*` 与 `emacs_module_init`），其余 30 余个是内部 helper 与全局变量。legacy 退役后仍如此（删除的是入口，不是可见性）。
+- 影响：① 内部符号进入动态符号表，同名符号在进程内可能与其它动态模块互相干扰（`emacs_module_init` 之外的重名风险）；② 无法靠符号表判断「哪些是本模块的公开 API」，review 时容易误以为内部函数可被 elisp 调用。当前**未观测到**实际冲突。
+- 建议：加 `-fvisibility=hidden` 并对 14 个入口显式 `__attribute__((visibility("default")))`（或维护一份 version script）。改动小但需要全量重编 + 重启 Emacs 后跑一遍 L2 与 14 入口冒烟；本轮不做，避免与迁移批次耦合。
+- 来源：canvas 迁移收尾盘点（`nm -D` 实测，2026-10-28）。
+
+## `transform-smoothing` 默认未开，放大是最近邻硬边（2026-10-28）
+
+- 现状：本包**不设置** canvas spec 的 `:transform-smoothing` 属性，取 Emacs 默认 `nil` → 放大/缩小都用最近邻。实测（整块像素统计）：放大 2 倍只有 2 色、格子周期 16px 硬边；缩小 0.5x 同样 2 色、四角内容齐全（**不是裁剪**）；显式设 `t` 后放大 6–10 色、缩小 18 色（平滑）。
+- 影响：放大阅读（`+` / `W` / 手动缩放）时笔画边缘是阶梯状；这既是「与旧 pbm 后端逐字节一致」的原因，也是部分用户会觉得「不如 PDF 阅读器柔和」的原因。`t` 的代价是每帧重采样（滚动/拖拽时 CPU 上升）。
+- 建议：保持 `nil` 为默认（性能优先，且不改变既有观感）；若有用户明确诉求，再做成 defcustom（例如 `seshat-reader-transform-smoothing`）在写 spec 时下发。**不要**按缩放比例自动切换——那会让同一份文档在不同缩放级别下观感不一致。
+- 来源：spike「补充验证」第 1 项（像素统计）；`docs/emacs-reader.md`「渲染后端、观感与性能 → 观感开关」。
+
+## 单页渲染比旧后端慢 0.6~1.0 ms（结构性往返，2026-10-28）
+
+- 现状：`--page-image-spec` 中位耗时 **0.589 → 1.22 ms**（scale 1.0）、**1.732 → 2.77 ms**（1.5）、**0.742 → 1.16 ms**（rotate 90），即 **+0.6~1.0 ms/页**。已排除的因素：`-O2`（已加，`-O3` 仅 1.08/2.76/1.07，无实质收益）、逐像素写法（`memset` + 3 字节写 1.51/2.80/1.15、64 位块写 1.22/2.85/1.15）。剩余成本在「3 分量 pixmap → BGRA 中间缓冲 → 逐行 memcpy 进 canvas 缓冲」这条链的**结构性往返**。
+- 影响：翻页/首屏渲染各多约 1 ms（相对一次 redisplay 可忽略）；批量预渲染（如一次性 `--page-image-spec` 扫全本）会累积成秒级差距。
+- 建议：**本轮明示取舍不做**。若将来要回补，只有一条路——让 MuPDF 直接产出 4 分量（`FZ_DEVICERGB` + alpha / 自建 device）或让 canvas 接受 3 分量缓冲（Emacs 侧不可能），即「渲染端直出 4 分量」；那需要重做 `render_page_to_buffer` 的输出契约与装饰 wash 的通道处理，属独立计划，不应搭在文档批里。
+- 来源：迁移计划「验证记录」批次 T2+T3 / T2b / T2c 的耗时对比。
+
+## batch ERT 无法断言 canvas 缓冲内容（2026-10-28，代码审查 minor 7）
+
+- 现状：canvas 后端的像素由 C 侧经 `env->canvas_data` 直写进 Emacs 持有的缓冲，elisp 侧的 spec `:data` 恒为 `nil`，也没有任何 Lisp 层访问器能读出缓冲像素。因此 ERT 里只能断言**形状**（`:type` 为 `canvas`、`:data` 为 nil、`:data-width` / `:data-height` / `:width` / `:height` 为正整数、清缓存后第二次渲染仍 `imagep` 且是新对象、`canvas-refresh` 后 `:type` 稳定），**无法断言缓冲是否真被填充**——模块漏写像素时 spec 形状完全正常，只有画面全黑。`seshat-reader-page-spec-test.el` 的新用例 `--canvas-buffer-fill-regression` 因此明确把「缓冲已填充」留给外部手段，而不是伪造断言。
+- 影响的缺口：单测层面抓不到「渲染成功但像素没写进去」这类回归（历史上 T2/T3 阶段是靠 `/tmp/canvas-baseline` 的临时 dump 模块 + 与 PNM 基线逐字节比对发现的）。目前该覆盖只存在于一次性回归脚本里，脚本不在仓库内（`dumpmod.c` 刻意不进仓库，因为要用未导出的 `canvas_data`）。
+- 建议：若要把它变成常规回归，需要一条**仓库内**的像素出口，二选一——① 给模块加一个仅在测试构建启用的入口（如 `--debug-canvas-hash`，返回缓冲的 FNV/sha 摘要，不返回整块像素，避免把几 MB 塞进 elisp）；② 让测试在临时目录编译一个小 dump 模块（与 `dumpmod.c` 同构）。①更可控，代价是多一个半公开 API，需在 docstring 里标明「仅测试/诊断用，不保证语义稳定」。本轮不做，因为改动会扩张模块入口面（当前 14 个入口刚在 canvas 迁移中收敛）。
+- 来源：`emacs/tests/seshat-reader-page-spec-test.el`（`--canvas-buffer-fill-regression` 的 docstring）、`render/elisp-helpers.c` 的 `data2elisp_canvas`；代码审查 minor 7。
+

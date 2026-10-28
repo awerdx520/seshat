@@ -967,3 +967,58 @@ refit 按当前窗口尺寸做一次几何适配 + 重渲染，一次到位。
 **残余限制**（同记 tech-debt）：跨页 explain / 翻译的上下文只覆盖起点页（`:rect` 是起点页 bbox 的必然结果，翻译对象本身仍是全文）；跨页选区确认时的高亮闪现只落在起点页（`--flash-selection` 仍只吃 `:rects`）；Android 不渲染 `pages:`。
 
 （来源计划：[openspec/completed/2026-10-27-reader-multipage-p2a-cross-page-selection.md](completed/2026-10-27-reader-multipage-p2a-cross-page-selection.md) 的 D1–D7、D5b 与「事实基线」F7/F8/F11；变异自检（把 `--page-from-location` 改成也认 `pages:`）记录见该计划「批次 3」小节）
+
+## 2026-10-28 · canvas 图像对象可行性（Emacs 32 S0 spike 结论）
+
+**决策**：canvas 可作为 seshat-reader 渲染后端的替代载体；实现分两步走——先「传输层替换」（PBM/PNM → ARGB32 直写 canvas 缓冲），再评估「底图 + 装饰合成」。三项未验证项已于同日补齐（见下方「补充验证」），实现阶段可启动。
+
+**理由（全部为 2026-10-28 真机实测，Emacs 32.0.50 pgtk/WSLg，独立 `emacs -Q` 进程）**：
+1. canvas spec 参与 `(space :align-to (+ center (-0.5 . SPEC)))` 居中计算，与 pbm spec 归一等价：pbm `offset 160` vs `(body-px 720 − 400)/2 = 160`、canvas `offset 156` vs `(713 − 400)/2 = 156.5`，差 4px 完全由两次测量间窗口宽差 7px 解释。
+2. **`:width` / `:height` 对 canvas 有效**（手册 `Canvas Images` 节点未列该二属性）：`setf :width 200 :height 150` → `image-size` = `(200 . 150)`，且居中按缩放后宽度重算（`offset 256 ≈ (713−200)/2`）。因此 2026-10-23「显示层缩放替代同步重渲染以消除两帧」的决策在 canvas 后端**继续成立**，传输层替换无缩放退化风险。
+3. 跨线程写法安全：主线程取 `canvas_data` 指针 → pthread 写满 400×300 缓冲 → join → 主线程 `canvas-refresh`，100 次读回 100/100 一致、中位 89µs（80–211µs）、无崩溃无 NULL。主线程阻塞在 C 调用内时不跑 Lisp，故 GC 不会回收缓冲。
+4. 改 `:data-width` / `:data-height` 会重建像素缓冲并**使旧指针失效**（400×300→800×600 后指针 `98410851808144` → `98410854208224`，+2.4 MB）。**硬约束**：`canvas_data` 每次调用必须重新获取，禁止跨调用缓存。
+5. `canvas-refresh` 签名仅 `(image &optional reload-data)`，**无局部区域刷新**（传区域参数报 `wrong-number-of-arguments`）→ 刷新粒度 = 整张 canvas，故「按页切分 canvas」是唯一的增量刷新手段。
+
+**补充验证（2026-10-28，同环境真机，截屏 + 整块像素统计 + 逐字节比对）**：
+1. **缩放像素质量**：canvas 与 pbm 的 `:width`/`:height` 缩放**逐字节相同**（`compare -metric AE = 0`）——两者走 Emacs 同一 image transform 路径，**无退化**。默认（`transform-smoothing=nil`）放大 2x 与缩小 0.5x 均为最近邻（整块仅 2 色，格子周期 16px / 4px 硬边）；显式 `:transform-smoothing t` 则平滑生效（放大 6–10 色、缩小 18 色）。**缩小不是裁剪**（0.5x 后四角色块红/绿/蓝/黄齐全）。
+2. **ARGB 通道序与 alpha**：通道序正确（`0xFFFF0000` 整块读数 `255,0,0`、`0xFF00FF00`→`0,255,0`、`0xFF0000FF`→`0,0,255`）；alpha 正常与背景混合（50% 红叠白底 = `#FF7F7F`，即 255/127/127）；`0x00000000` 区域露出背景（唯一色数 1，等同背景色）。
+3. **异步渲染 + GC**：worker 延迟 300ms 写缓冲期间，主线程执行 4×`garbage-collect` + 2 万次 cons 制造垃圾 + 2×`redisplay`（实测施压窗口 421ms / 561ms，覆盖写入时刻），两轮 `join-check` 读回均精确等于写入值 `0xFFAABBCC`，`canvas-refresh` 无错 → **Lisp 侧持 spec 强引用期间，GC 与 redisplay 都不会让缓冲失效**，P2-1 异步渲染路径可用。
+4. **新增实现期硬约束**：`setf :data-width`/`:data-height` 重建缓冲后内容清零（实测重建后首像素读回 `0`）→ **改尺寸后必须重画整页像素，不能假设内容保留**。
+
+**方法论提示**：以上像素结论均来自「整块统计 + 以已知参照（8px 棋盘 → 周期 run）反推样本身份 + 逐字节模板匹配确认落点」；用固定尺寸采样窗（如 60×60）判定缩放行为会因系统偏移（实测 dx=−26, dy=−23）采到相邻变体而得出错误结论（本 spike 首轮即因此误判一次，已在复核中纠正）。
+
+**代价与边界**：canvas 是 Emacs 32 的编译期特性（batch 下 `image-type-available-p 'canvas` 亦为 t，但 `image-size` 需真实 GUI frame）。若需继续支持 Emacs 31 及以下，必须保留 pbm 后端形成双路径；该取舍待实现计划阶段由用户决定。现有 `seshat-render-core.so` 由旧版 Emacs 头部编译，其与 32 的 ABI 兼容性未验证，属实现阶段的独立门禁。
+
+**证据**：`openspec/completed/2026-10-28-reader-canvas-s0-spike.md`（含 `result2.sexp` 原始数据与判据修正说明）。
+
+## 2026-10-28 · canvas 迁移落地记录（PBM/PNM → canvas，Emacs 32 单后端）
+
+**决策回顾**：上文「canvas 图像对象可行性（Emacs 32 S0 spike 结论）」判「可分两步走，先换传输层」。本条目记录实现阶段**实际怎么落地的**、与原计划的差异，以及实测得到的边界——不再重复 spike 的方法论。
+
+**实际做法（与计划的逐条对照）**：
+
+1. **像素路线比计划更简**：计划 v2 写的是「先 `fz_clear_pixmap_with_value(pix, 0)` 铺不透明底（alpha=255）→ 渲染 → 逐行扩展」。实现直接采用 **`fz_new_pixmap_from_display_list(…, fz_device_bgr(ctx), 0)`**——第五参 `alpha=0` 即**不分配 A 通道**（3 分量 BGR），MuPDF 把页面直接合成到不透明背景（初始像素 0 = 黑）；`fz_device_bgr` 的通道序（B,G,R）与 canvas 的 `0xAARRGGBB`（小端 B,G,R,A）天然吻合，**零重排**。计划里那一步「单独 clear 铺底」因此**整条不需要**：起点本就不透明 ⇒ 预乘渲染与直通值等价 ⇒ 无反预乘问题。计划中「用 `fz_new_pixmap_with_data` 直接绑 canvas 缓冲做零拷贝」被否（`fz_drop_pixmap` 对外部缓冲的所有权未明）。
+2. **canvas spec 构造**：`create-image nil 'canvas t` + `:data-width` / `:data-height`（设备像素）/ `:width` / `:height`（逻辑像素），**省略 `:id`**、**`:data` 留 nil**——Lisp 侧零常驻。建后做「`imagep` 非 nil + `canvas_data` 非 NULL」双自检，任一失败返回 nil 并打 stderr（不静默产出假 spec）。填充完像素后 `canvas-refresh`（第二参 nil）。
+3. **尺寸双轨制写成硬约束**：`:data-width` / `:data-height` **只允许渲染函数写一次**（改它会重建缓冲并清零）；`:width` / `:height` 才能随时 `setf`（显示层缩放）。这条不只写在文档里，也写进了 `seshat-reader.el` 的注释与 C 侧注释，作为 review 检查点。
+4. **退役按「elisp 生产调用点为空」判据执行**：11 个 C 入口（10 个无引用 + `--window-close`）、worker 线程池（`render/render-threads.c` / `.h` 整文件删除）、`CachedPage`、`EmacsWinState`、overlay 机制、`image-flush` 调用全部删除；`--load-doc` 只建 `DocState`；渲染完成标志 `set_current_render_status` 从 `--load-doc` 移到 `--page-image-spec` 的成功路径（先建 spec 后置位的时序），保留 14 个入口。`render/` 净删 **1714** 行（全仓 21 文件 **+786/−2423**）。
+
+**与计划的差异（执行期调整，均已回写计划「验证记录」）**：
+
+| 计划 | 实际 | 原因 |
+|---|---|---|
+| T2 / T3 / T4 / T5 四个独立批次 | 合并为**一个原子批次**（T2+T3，随后 T4+T5 同批） | 输出契约一变（PNM→BGRA），中间态无法既过编译又过 ERT；分批判定没有可用的绿点 |
+| T6（elisp 侧）与 T7（C 侧）分两批、各自回滚 | **合并为一批** | 两边的删改互为编译前提（elisp 侧删了调用点，C 侧才能删入口；反过来 C 侧删了入口，旧 elisp 会 void-function），拆开只会造出「两边都不绿」的中间态 |
+| 像素起点用 alpha=1 + 显式 clear 通道 | `fz_device_bgr` + `alpha=0`（3 分量 pixmap，不分配 A 通道，**没有** clear 调用） | 更少的调用与更少的通道搬运，语义等价（详见上节第 1 条） |
+| 「性能优化可留到后续」 | 补做 **T2b**（`CFLAGS` 加 `-O2`）与 **T2c**（`fz_try` 跨块变量 `volatile`） | `-O0` 下 1.57/3.90/1.57 ms 的性能数据不具代表性；`-O2` 又暴露 `-Wclobbered` 背后的真实隐患，必须加 `volatile` 而不是压告警 |
+
+**实测结果**：
+
+- **逐字节等价**：三组 `(scale, rotate)` = `(1.0, 0)` 612×792、`(1.5, 0)` 918×1188、`(1.0, 90)` 792×612，与旧 PNM 基线比较**差异 0**（剥 PNM 头、取 B,G,R 重排，并断言 A 全 255）。canvas 与 pbm 的 `:width` / `:height` 缩放亦**逐字节相同**（Emacs 同一条 image transform 路径）。
+- **内存**：每页 612×792 从旧 ≈3.4 MB（Lisp 字符串副本 + C 侧副本）降到 ≈1.9 MB（**−43%**）；Lisp 侧 `:data` 为 nil，常驻只剩 Emacs 的 canvas 缓冲。
+- **性能（取舍已明示）**：单页 `--page-image-spec` 中位 **0.589 → 1.22 ms**（1.0）、**1.732 → 2.77 ms**（1.5）、**0.742 → 1.16 ms**（r90），即 **+0.6~1.0 ms/页**。**不做结构重构**：三种写法（`memset`+3 字节写、64 位块写、`-O3`）实测均无收益，瓶颈是「3 分量 pixmap → BGRA 中间缓冲 → memcpy 进 canvas 缓冲」的往返；要回补只能让渲染端直出 4 分量，属大改。
+- **观感**：`transform-smoothing` 默认未开（nil）→ 放大/缩小均最近邻（硬边，缩小不裁剪）；显式 `t` → 平滑（放大 6–10 色、缩小 18 色）。
+- **验证基线**：L1 C **0 error 0 warning**、elisp warning **20**（基线，零新增，全量 `make -B` 口径）、checkdoc 0；L2 **37 文件 / 1327 例 / 0 unexpected / 0 skipped** + `check-criteria` PASS。
+
+**遗留（详见 `openspec/tech-debt.md`）**：P2-5「内存与驻留策略」降级为**部分缓解**（Lisp 字符串副本与 `CachedPage.img_data` 已消除；Emacs canvas 缓冲、渲染期 MuPDF pixmap + BGRA 中间缓冲仍在）；新增四项——`--page-text` 0 参路径引入 C→elisp 反向依赖、`.so` 未用 `-fvisibility=hidden`（仍导出 60+ 内部符号）、`transform-smoothing` 默认未开、单页渲染比旧版慢 0.6~1.0 ms。真机 L3 七项验收未做（见计划「验证标准」）。
+
+**来源**：`openspec/completed/2026-10-28-reader-canvas-backend-migration.md`（T0–T8 执行记录）+ `openspec/completed/2026-10-28-reader-canvas-s0-spike.md`（可行性实测）。

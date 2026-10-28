@@ -1,6 +1,6 @@
 # Emacs 阅读器使用手册
 
-> 本文对应 **P1 多页连续布局**（2026-10-27，一屏多页 + 像素级滚动），此前补入的跨页文本搜索（`C-s`）、手写轨迹（`ink:`）、暗色配色预设仍然有效。适用 Emacs 29.1 及以上，本仓库在 Emacs 31.1 实测。
+> 本文对应 **P1 多页连续布局**（2026-10-27，一屏多页 + 像素级滚动）+ **canvas 渲染后端**（2026-10-28），此前补入的跨页文本搜索（`C-s`）、手写轨迹（`ink:`）、暗色配色预设仍然有效。**要求 Emacs 32.0 及以上**——渲染后端用的是 Emacs 32 的 canvas 图像对象，29/30/31 不支持。
 
 Emacs 端文档阅读器（`emacs/seshat-reader/`）：MuPDF 负责栅格化、C 动态模块出图、elisp 负责版式与交互，并把**批注 / 译文 / 引用**接到 seshat 服务端。侧车（sidecar）性质——批注不写回 PDF 文件。上游来源、改名映射与本地改动见包内 [`VENDORED.md`](../emacs/seshat-reader/VENDORED.md)，展示层设计见 [`architecture.md`](architecture.md) 的「Emacs 阅读器：展示层与渲染层（M12）」节。
 
@@ -27,7 +27,7 @@ Emacs 端文档阅读器（`emacs/seshat-reader/`）：MuPDF 负责栅格化、C
 |---|---|
 | MuPDF | **≥ 1.26.0**（`Makefile` 的 `REQUIRED_VERSION := 1.26.0`，低于此版本构建直接报错） |
 | gcc、make、pkg-config | 构建 C 模块（`render/*.c` → `seshat-render-core.so`） |
-| Emacs | 29.1+（`seshat-reader.el` 头部 `Package-Requires` 仍声明 26.1，以实际可用版本为准；31.1 实测） |
+| Emacs | **32.0+（硬要求）**：canvas 是 Emacs 32 的编译期特性，`Makefile` 会检查主版本、低于 32 直接报错；不再支持 29/30/31，也没有 pbm 回退路径 |
 | go-translate（gt） | **软依赖**，仅翻译/解释需要，缺失时报错提示安装 |
 | markdown-mode、visual-fill-column、avy、evil | **软依赖**，缺失静默降级，不写入 `Package-Requires` |
 
@@ -82,6 +82,36 @@ ETAF 渲染层是可选外部依赖：`Makefile` 先探测 `~/Workspace/emacs-ta
 **改了 C 必须 `make clean all`**：`make clean` 会清掉 `*.o`、`seshat-render-core.so`、`*.elc` 与 autoloads；只跑 `make all` 时时间戳未变的 `.o` 不会重编，容易出现「改了 C 但行为没变」。
 
 **重要**：Emacs 已运行时替换 `.so` **必须重启 Emacs**。动态模块加载后不能卸载，覆盖磁盘上的 `.so` 不会影响已加载的模块实例；`make all` 顺带重编的 `.elc` 同理只在下次启动（或显式 `unload-feature` + 重新 `require`）后生效。
+
+## 渲染后端、观感与性能（2026-10-28）
+
+### 渲染后端：canvas（Emacs 32.0+）
+
+每页位图不再走「PNM 字符串 + `create-image :type pbm`」，而是 **MuPDF 直接写 Emacs canvas 对象的像素缓冲**后 `canvas-refresh`。
+
+- **只支持 Emacs 32.0 及以上**：canvas 是 Emacs 32 的**编译期特性**，29/30/31 没有它，本包也没有保留 pbm 双路径。`seshat-reader/Makefile` 在解析期检查 `emacs-major-version`，低于 32 直接 `$(error)` 报错退出（不会带着旧后端「半能用」）。
+- **链路**：`fz_new_pixmap_from_display_list(…, fz_device_bgr(ctx), 0)`（`alpha=0` ⇒ 3 分量 BGR、MuPDF 直接合成到不透明黑底）→ 暗色像素变换 → 装饰 wash → 逐行按 `fz_pixmap_stride` 写成紧凑 BGRA（A 恒 255、每像素一次 32 位写）→ 按行 `memcpy` 进 canvas 缓冲（行宽同为 `data_w*4`）→ `canvas-refresh`（第二参 nil）。**不用预乘、不做反预乘**——起点不透明，预乘值与直通值等价。
+- **尺寸双轨制**：`:data-width` / `:data-height` 是**设备像素**，渲染时设一次、之后任何代码都不改写（改写会重建缓冲并清零 → 残影/花屏）；`:width` / `:height` 是**逻辑像素**（设备像素 ÷ `frame_scale`），可随时改写做显示层缩放。
+- **`:data` 为 nil**：canvas 的内存由 Emacs 自己持有，Lisp 侧**零常驻**；也因此**没有 `image-flush`** 调用（canvas 无该语义，代码里已无该函数引用）。
+- **渲染完成标志**：`render-status` 由 `--page-image-spec` 成功产出 canvas spec 时置位（`--load-doc` 不再置位）。
+
+### 观感开关：`transform-smoothing`
+
+缩放由 image spec 的 `:transform-smoothing` 属性决定，**本包默认不设置它**（即 Emacs 默认 `nil`）：
+
+| 取值 | 放大 | 缩小 | 代价 |
+|---|---|---|---|
+| `nil`（默认） | 最近邻 → **硬边** | 最近邻（不裁剪，四角内容齐全） | 最省 CPU |
+| `t` | 平滑（实测放大 6–10 色过渡） | 平滑（实测缩小 18 色） | 更耗 CPU（每帧重采样） |
+
+- 与旧 pbm 后端**逐字节等价**：canvas 与 pbm 走的是 Emacs **同一条 image transform 路径**，`:width` / `:height` 缩放结果逐字节相同（`compare -metric AE` = 0），所以换后端不改缩放观感，也不改「放大硬边」这一默认表现。
+- 想让放大更柔和：对该 spec 设 `(setf (image-property spec :transform-smoothing) t)` 后触发一次 redisplay（缩放/滚动即触发）；本包不提供全局开关，避免把逐帧重采样的 CPU 成本默认加给所有人。若观感长期不满意，可提需求做成 defcustom（已登记 `openspec/tech-debt.md`）。
+
+### 内存与性能
+
+- **每页 ≈1.9 MB**（612×792，`w*h*4`）：Lisp 侧零常驻，位图只在 Emacs 的 canvas 缓冲里；渲染期另有 MuPDF pixmap 与 BGRA 中间缓冲两块临时内存，返回前释放。旧 pbm 路径每页 ≈3.4 MB（Lisp 字符串副本 + C 侧副本）→ **−43%**。
+- **单页渲染 ≈1.2 ms**（scale 1.0，`--page-image-spec` 中位；旧路径 0.59 ms）→ **+0.6~1.0 ms/页**。多出的时间用在「3 分量 pixmap → 中间缓冲 → memcpy」的往返上：`memset` + 3 字节写、64 位块写、`-O3` 三种写法实测**都无收益**，故**明确接受这点代价、不做结构重构**。
+- 缩放/滚动时**不重渲染**（只改 `:width` / `:height`），清晰化靠 idle 阶段重渲染一次；因此「+0.6 ms/页」只落在真正出图的那一次，不在拖动过程中累加。
 
 ## evil 与键位预设
 
@@ -295,7 +325,7 @@ ETAF 渲染层是可选外部依赖：`Makefile` 先探测 `~/Workspace/emacs-ta
 高亮/下划线/删除线都由 C 渲染层的**装饰表**（`render/render-core.c`）绘制，与页面共用同一 `ctm`，因此缩放/旋转自动对齐（旋转页的选区坐标已在采集端做逆变换、落回未旋转页面空间，见 §5「框选取文」）。
 
 - `seshat-reader-annotation-highlight-enabled`（默认 `t`）控制是否绘制批注装饰；`nil` 时只清空已有装饰并重绘。
-- `C-c C-h` = `seshat-reader-annotation-refresh-highlights`：手动刷新（重投当前文档矩形并触发 C 侧 `--refresh-highlights`）。自动刷新只发生在**批注列表拉取/刷新之后**——新建成功后的增量追加、删除后的列表重建都走这条路；**打开文档本身不拉批注，因此不会自动重绘**，需先 `C-c C-l` 一次。
+- `C-c C-h` = `seshat-reader-annotation-refresh-highlights`：手动刷新（清掉驻留页的 spec 缓存并重渲染，使新装饰烘进位图；C 侧 `--refresh-highlights` 入口已于 2026-10-28 canvas 迁移中删除）。自动刷新只发生在**批注列表拉取/刷新之后**——新建成功后的增量追加、删除后的列表重建都走这条路；**打开文档本身不拉批注，因此不会自动重绘**，需先 `C-c C-l` 一次。
 - **装饰表两类几何**：`rect`（填充矩形，用于高亮与下划线/删除线细条）与 `stroke`（折线，预留给手写轨迹，elisp 侧尚未使用）。每条装饰带 RGB + alpha；rect 按颜色**分组**进同一 path 一次性填充，因此「同色重叠**不叠深**」（多段高亮叠在一起仍是一个透明度）。
 - **装饰只是增强**：模块缺失（或加载的是缺 `--add-decoration` 的旧版）时提示一次即跳过，不抛错；提示措辞是「装饰模块不可用（模块未加载或缺少装饰入口）」。
 
@@ -324,7 +354,7 @@ ETAF 渲染层是可选外部依赖：`Makefile` 先探测 `~/Workspace/emacs-ta
   - 总量 `seshat-reader-search-max-matches`（默认 `20000`）：达到即**停止扫描**并提示「命中过多」。每条命中是一个五元素浮点列表，几十万条就是几十 MB，且每次跳转都要遍历一遍，故必须设总量闸。
 - **搜索结果侧栏（左侧）**：同一次搜索的命中同时列进左侧 side window（`*Seshat Search*`，面板 kind `search`，与目录同侧、排在目录之后的 slot）。每条一行「`[p.N] 片段`」，片段取该命中所在**整行**文本（整行才看得出这句话在讲什么），超过 80 字符截断。**打开时光标切到侧栏**——搜索已经结束，下一步是挑结果而不是翻页。侧栏内 `RET` 跳到该行命中所在页并高亮它，`n` / `p` 逐条移动，`q` **只关自己**（其它面板保留）。搜索侧栏与其它面板一致（`q` 只关自己、`M-o` 可重开、换文档自动清理）：侧栏把自己登记进 `seshat-reader-sidebar-extra-kinds`，故 `q` 与译文 / 批注 / 目录面板一样走 `seshat-reader-sidebar-quit`，`M-o` 能重开它，换文档时随搜索状态一起清空并关闭。侧栏与页面高亮是**并存视图**：命中全集仍是阅读 buffer 的状态，侧栏只记「行 → (页号, 下标, 矩形)」，跳转复用既有的 `--goto-page` + 全量重投，不存在第二条绘制链路。为免几千条命中逐条取文卡住界面，侧栏最多列出 **200** 条（`seshat-reader-search--sidebar-max-entries`），超出时标题写明显式条数；命中全集仍在页面与状态行里。
 - **双向同步**：阅读 buffer 里用 `n` / `p`（临时键表）切换命中时，左侧结果栏**跟随**——把对应条目滚到可见并高亮，**不抢光标、不切窗口**（只 `set-window-point` + `recenter`，焦点仍在阅读 buffer）。反向（侧栏里 `RET` / `n` / `p` → 阅读 buffer 跳页）同样成立，两条方向互为镜像。
-- **与批注装饰共存**：搜索命中走批注模块的扩展点 `seshat-reader-annotation-extra-decorations-function`，与批注 rect、框选闪现共用 C 侧**同一张**文档级装饰表，任何一方都不独占 `--clear-highlights`。批注模块未加载时降级为自投（`--clear-highlights` → `--add-decoration` → `--refresh-highlights`）。
+- **与批注装饰共存**：搜索命中走批注模块的扩展点 `seshat-reader-annotation-extra-decorations-function`，与批注 rect、框选闪现共用 C 侧**同一张**文档级装饰表，任何一方都不独占 `--clear-highlights`。批注模块未加载时降级为自投（`--clear-highlights` → `--add-decoration` → elisp 侧重渲染驻留页；C 侧 `--refresh-highlights` 已于 2026-10-28 删除）。
 - **无文本层**的扫描页优雅退化为「本页无结果」，不报错；模块缺 `--search-page` 时提示「搜索不可用」。
 
 ### 手写轨迹显示（`ink:`）
@@ -930,10 +960,10 @@ evil 是 globalized minor mode，会在 mode body 之后重新启用自己，所
 18. **手动缩放的来源不随书签保存**：书签只存 `scale` 数值、不存 `fit` / `manual` 来源，恢复后按 `fit` 处理——一旦窗口尺寸变化就会重新贴合，上次手选的比例可能被重置。
 19. **同一文档重设到同一窗口时页面可能贴右边缘**：用 `set-window-buffer` 把**同一条文档**重新指给同一个窗口（而非新窗口 / 新 frame）时，Emacs 同样归零 hscroll 但不触发 `window-buffer-change-functions`，兜底 recentre 覆盖不到；需重开文档或触发一次尺寸变化（见 tech-debt）。
 20. **尺寸变化期间的画面是位图插值缩放，清晰化有延迟**：几何在同一帧内到位（改的是 image spec 的 `:width` / `:height`，不是位图），清晰度靠 idle 阶段重渲染一次补齐，因此缩放后约 0.15 秒内页面是「正确尺寸 + 略模糊」，拖分割线过程中始终是缩放位图。只读表格等细线条内容时观感差异明显（见 tech-debt「位图缩放与 `image-flush` 的交互未在真机长时间验证」）。
-21. **反复缩放会让旧尺寸的位图滞留在 image cache**：cache 以 spec 内容（含 `:width` / `:height`）为键，改写尺寸后旧键条目到 `image-cache-eviction-delay`（默认 300s）才回收；拖分割线可在数秒内造出几十个 A4 级条目。已在改写前 `image-flush` 缓解，长时间拖拽的峰值内存仍缺真机观测（见 tech-debt「image cache 条目累积」）。
+21. **反复缩放会让旧尺寸的 entry 滞留在 image cache**：image cache 以 spec 内容（含 `:width` / `:height`）为键，改写尺寸后旧键条目要到 `image-cache-eviction-delay`（默认 300s）才回收；拖分割线可在数秒内造出几十个条目。canvas 后端下每个条目**共享同一个像素缓冲**（缓冲尺寸由 `:data-width` / `:data-height` 决定、缩放不改它），所以滞留的不是多份整页位图，而是多条指向同一 canvas 的缓存记录；`image-flush` 已随 legacy 路径删除，不再有主动 flush 手段。长时间拖拽的峰值内存仍未真机观测（见 tech-debt「image cache 条目累积」）。
 22. **manual 窗口在极端情形下会多一次重渲染**：`--refit-window` 的清晰度闸（比较已渲染分辨率 `render-scale` 与目标 `scale`）写在 `unless manual` 守卫之外；manual 窗口正常不改 `scale`、两者恒相等故不触发，但若将来 manual 路径写入不同值，会出现一次隐蔽的额外重渲染（见 tech-debt「image cache 条目累积」的附记）。
 23. **居中机制两套并存**：页面能完整放下时由 redisplay 求值居中（`before-string` + `:align-to`）；页面比窗口宽时仍走旧的 `line-prefix` + 横向滚动，只能**左对齐**、不居中。两套机制由 `--center-page` 的几何判定选择，`--centered-p` 与它各有判据（见 tech-debt）。
-24. **没有异步渲染**：滚动进入尚未驻留的页时，该页在主线程上**同步**渲染（实测 0.7–11 ms/页），快速滚动或大页文档上会有可感停顿；预取只暖 1 页（滚动方向那一页）、且只暖缓存不插行。真正异步渲染未做。
+24. **没有异步渲染**：滚动进入尚未驻留的页时，该页在主线程上**同步**渲染（canvas 后端实测 1.16–2.77 ms/页，见本手册「渲染后端、观感与性能」），快速滚动或大页文档上会有可感停顿；预取只暖 1 页（滚动方向那一页）、且只暖缓存不插行。真正异步渲染未做（worker 线程池已随 legacy 路径删除）。
 25. **首次打开的首帧位图是显示层缩放**：`--first-fit` 先把 image spec 改到最终几何（不重渲染），在 idle 重渲染前位图是插值放大的旧分辨率——表现为「尺寸一开始就正确、但略模糊，约 0.15 秒后转清晰」，不再有原先的「先小后大」两次变化。
 26. **`character` 粒度会撞 500 段锚上限**：逐字符矩形可达数千条，`--anchor` 按写入端上限只写前 500 段（并提示一次），页面下部因此**没有高亮**；批注本身仍可创建。`line` 粒度（默认）每页通常几十段，不受影响。解除条件见 tech-debt（先按行合并再写入，或提高上限并重估 64 KB location 长度）。
 27. **同一处多段高亮不会叠深**：装饰按颜色分组进同一 path 一次填充，因此多段重叠仍是一个透明度——这是有意的（避免出现深浅不匀的色块），不是渲染缺陷。
@@ -941,6 +971,7 @@ evil 是 globalized minor mode，会在 mode body 之后重新启用自己，所
 29. **暗色 tint 会把彩色插图/封面压成单色调**：`charcoal` / `midnight` / `sepia` 都把每像素亮度映射到 BG→FG 连线上，颜色信息因此整体丢失（彩色图变单色渐变）；`graphite` 走的是 `fz_invert_pixmap_luminance`，保留 chrominance，是唯一不回退的例外。
 30. **`sepia`（亮底）档下既有黄色高亮装饰几乎不可见**：批注高亮默认黄（RGB `1.0 0.85 0.0`、α `0.35`）在浅米底色上对比度极低，装饰配色未随预设自适应；需要时手动调 `seshat-reader-annotation-highlight-color` / `-alpha`。
 31. **页间分隔线的粗细受渲染下限约束、改动需重排才生效**：face `:height` 与 1px 图像在真实字体 frame 上的渲染下限都约 2px，`seshat-reader-page-separator-thickness` 取 `1` 也会渲染成 2px；且 face `:height` 是阶梯取整，实际渲染比名义像素多 ±1–2px（实测名义 12px 渲染 13px），而滚动几何用的是**名义值**，故页底理论上存在 ≤2px 的不可达残量（不影响体验，但 ERT 不得对 ±1px 做严格断言）。另外分隔行在**页行插入时**生成——改分隔区相关选项后需重开文档或触发一次重排（`seshat-reader--multipage-relayout`），本轮未做 defcustom `:set` 自动重排（见 tech-debt）。
+32. **Emacs 32 是硬要求，且放大默认是最近邻（硬边）**：canvas 是 Emacs 32 的编译期特性，29/30/31 无法加载本包的渲染模块（`Makefile` 直接报错）；`:transform-smoothing` 默认未开，放大 2 倍以上时边缘是硬边（缩小不裁剪、内容齐全），想要平滑需自行给 spec 设该属性并承担重采样 CPU 成本（见「渲染后端、观感与性能 → 观感开关」）。
 
 ## 13. 开发者备注
 
@@ -961,8 +992,8 @@ evil 是 globalized minor mode，会在 mode body 之后重新启用自己，所
 | `seshat-reader-etaf.el` | 批注列表的可选 ETAF 渲染层（硬依赖 `etaf-ui`，缺失则不编译） |
 | `seshat-reader-saveplace.el` | saveplace 集成（`save-place-after-find-file-hook` + `save-place-to-alist` advice） |
 | `seshat-reader-bookmark.el` | bookmark 记录与跳转 |
-| `render/render-core.c` | 模块入口、页面栅格化、`ctm`、高亮绘制、缓存与窗口状态 |
-| `render/render-threads.c` / `.h` | 渲染线程池、job 提交与缓存页生命周期 |
+| `render/render-core.c` | 模块入口、页面栅格化、`ctm`、装饰绘制、BGRA 导出与 canvas spec 构造 |
+| ~~`render/render-threads.c` / `.h`~~ | **已删除（2026-10-28）**：worker 线程池与 job 队列随 legacy 渲染路径退役，渲染改为在 `--page-image-spec` 内同步完成 |
 | `render/render-theme.c` / `.h` | tint / 反色 / gamma 等整页像素变换 + 进程级暗色状态 |
 | `render/mupdf-helpers.c` / `.h` | MuPDF 文档与页面封装 |
 | `render/elisp-helpers.c` / `.h` | emacs-module 参数编解码辅助 |
@@ -974,14 +1005,14 @@ evil 是 globalized minor mode，会在 mode body 之后重新启用自己，所
 (seshat-reader--page-spec-clear-cache)                  ; → nil（清当前 buffer 的缓存）
 ```
 
-按页号渲染任意页并**返回**它的 image spec（`create-image` 产物，与页面 overlay 的 `display` 同形），底层是 C 入口 `seshat-reader-dyn--page-image-spec`（arity `2..3`）。
+按页号渲染任意页并**返回**它的 image spec（canvas 对象，`:data` 为 nil、像素由 C 侧直接写入 canvas 缓冲），底层是 C 入口 `seshat-reader-dyn--page-image-spec`（arity `2..3`）。
 
 - `PAGE` **1-based**；`SCALE` 是 72 dpi 的倍数（`nil` → 1.0），按既有 `MINRES`/`MAXRES` 夹紧；`ROTATE` 缺省 0，只接受 `0` / `90` / `180` / `270`。页号越界 / 非整数、`SCALE` 非数字、`ROTATE` 非法（如 45）、文档正在 reload → 一律**返回 nil 且不发消息**（不做就近钳制，免得调用方以为旋转成功）。
 - **同步阻塞**：耗时与一次 `wait_for_cached_page` 同量级（实测 72 dpi 下 0.7–11 ms/页）。**仅供显式调用与测量**——P0 阶段没有任何显示 / 滚动 / redisplay 路径会调它，禁止接进去。
-- **会话内缓存**：同一 `(PAGE SCALE ROTATE)` 第二次请求直接返回同一个 spec 对象（不调 C），上限 `seshat-reader--page-spec-cache-limit` = **8**（`defvar`，非 defcustom）。上限取决于内存：spec 的 `:data` 是 PNM 字节的 Lisp 堆副本（72 dpi 1.42 MB、150 dpi 6.16 MB），而 C 侧另存一份。**顺带注意**：顺序请求超过 8 页时命中率为 0（先进先出淘汰），设计视口时须让驻留页数 ≤ 上限。
+- **会话内缓存**：同一 `(PAGE SCALE ROTATE)` 第二次请求直接返回同一个 spec 对象（不调 C），上限 `seshat-reader--page-spec-cache-limit` = **8**（`defvar`，非 defcustom）。spec 是 canvas 形态（`:data` 为 nil），内存占用 = `data-width × data-height × 4`（612×792 ≈ 1.9 MB/页，全部在 Emacs 的 canvas 缓冲里、Lisp 侧零常驻）。**顺带注意**：顺序请求超过 8 页时命中率为 0（先进先出淘汰），设计视口时须让驻留页数 ≤ 上限。
 - **旧 `.so` 兼容**：`seshat-reader--page-spec` 有 `fboundp` 守卫，加载改造前的 `.so` 时返回 nil 而不是报错。
 - 缓存由 `seshat-reader--clear-doc-memory` 与 `seshat-reader--render-buffer` 自动清空；`--page-spec-clear-cache` 供手动清（例如改 scale 后想重新测）。
-- 用途与边界见 `openspec/decisions.md`（2026-10-26）与 `docs/architecture.md` §「按页渲染查询接口（P0，2026-10-26）」；实测数据见 `openspec/completed/2026-10-26-reader-multipage-p0-page-spec-api.md`。注意与已有的 `seshat-reader--page-image-spec` **不是**同一个函数——后者是读页 overlay 的 `display`（只对当前显示页有效），不带页号参数。
+- 用途与边界见 `openspec/decisions.md`（2026-10-26 与 2026-10-28 两条）与 `docs/architecture.md` §「按页渲染查询接口（P0，2026-10-26）」/§「渲染后端：canvas（2026-10-28）」。注意与 `seshat-reader--page-image-spec` **不是**同一个函数——后者按窗口/buffer 取当前页的 spec，不带页号参数。
 
 ### 暗色开关与配色预设（进程级，内部接口）
 
@@ -1009,9 +1040,9 @@ ERT 套件在**顶层** `emacs/tests/`（不在包目录内），`load-path` 至
 cd /home/thomas/Workspace/seshat && \
 "emacs" --batch -Q \
   -L "emacs" -L "emacs"/seshat-reader \
-  -L /home/thomas/thomas-emacs/.local/straight/build-31.1/gt \
-  -L /home/thomas/thomas-emacs/.local/straight/build-31.1/pdd \
-  -L /home/thomas/thomas-emacs/.local/straight/build-31.1/posframe \
+  -L /home/thomas/thomas-emacs/.local/straight/build-32.0.50/gt \
+  -L /home/thomas/thomas-emacs/.local/straight/build-32.0.50/pdd \
+  -L /home/thomas/thomas-emacs/.local/straight/build-32.0.50/posframe \
   -l "emacs"/tests/seshat-reader-sidebar-test.el \
   -f ert-run-tests-batch-and-exit
 ```
@@ -1033,7 +1064,7 @@ cd /home/thomas/Workspace/seshat && \
 L="-L emacs -L emacs/seshat-reader"; \
 for d in gt pdd posframe etaf etaf/lisp etaf-ui ebox ebox/lisp ecss ecss/lisp \
          markdown-mode visual-fill-column; do \
-  L="$L -L /home/thomas/thomas-emacs/.local/straight/build-31.1/$d"; done; \
+  L="$L -L /home/thomas/thomas-emacs/.local/straight/build-32.0.50/$d"; done; \
 total=0; for f in emacs/tests/*-test.el; do \
   n=$(emacs --batch -Q $L -l "$f" -f ert-run-tests-batch-and-exit 2>&1 \
       | grep -o "Ran [0-9]* tests" | head -1 | grep -o "[0-9]*"); \
@@ -1058,7 +1089,7 @@ cd /home/thomas/Workspace/seshat && rm -f emacs/seshat-reader/*.elc && \
 L="-L emacs -L emacs/seshat-reader"; \
 for d in gt pdd posframe etaf etaf/lisp etaf-ui ebox ebox/lisp ecss ecss/lisp \
          markdown-mode visual-fill-column; do \
-  L="$L -L /home/thomas/thomas-emacs/.local/straight/build-31.1/$d"; done; \
+  L="$L -L /home/thomas/thomas-emacs/.local/straight/build-32.0.50/$d"; done; \
 for f in emacs/tests/*-test.el; do \
   emacs --batch -Q $L -l "$f" -f ert-run-tests-batch-and-exit || exit 1; done
 ```
@@ -1066,5 +1097,5 @@ for f in emacs/tests/*-test.el; do \
 ### 改 C 的纪律
 
 - 本目录是 vendored + 自研化改名的代码：任何 C 侧改动都必须在该文件「按文件的本地改动清单」中登记，否则下次对照上游时改动会丢失依据。
-- 渲染层的不变量（装饰在暗色像素变换（`fz_tint_pixmap`，或未设 tint 时的 `fz_invert_pixmap_luminance` + `fz_gamma_pixmap`）**之后**、写 PNM **之前**绘制；`rect_to_page_space` 是唯一坐标换算点；装饰表在派发时快照进 `DrawThreadArgs`，stroke 点列**逐条深拷贝**）改动前先读 [`architecture.md`](architecture.md) 对应小节。
+- 渲染层的不变量（装饰在暗色像素变换（`fz_tint_pixmap`，或未设 tint 时的 `fz_invert_pixmap_luminance` + `fz_gamma_pixmap`）**之后**、导出 BGRA 进 canvas 缓冲**之前**绘制；`rect_to_page_space` 是唯一坐标换算点；装饰表在每次渲染调用开始时快照、stroke 点列**逐条深拷贝**，收尾经 `free_decoration_table` 唯一出口释放）改动前先读 [`architecture.md`](architecture.md) 对应小节。**跨 `fz_try` 仍需使用的局部变量必须加 `volatile`**（`-O2` 下 `longjmp` 会丢寄存器值，见 `render-core.c` 的 20 处声明）。
 - 装饰条数 100000、坐标 ±1e6 点、每笔 stroke 1024 点、outline 标题 8192 字节、批注 `location` 64 KB / 2000 段 `rect:`（写入端 500 段）是防御上限，不要随手放宽。

@@ -301,7 +301,7 @@ Emacs 端通过 `seshat-reader-annotation` 采集 PDF 页面选区并同步为�
 | `seshat-reader-page-separator-face` | `((t (:background "gray70")))` | 线的颜色（**face**，不是 defcustom）：只取 `:background` 填充那条横贯窗口的 stretch space，高度由分隔区几何决定。暗色主题建议改 `gray40` 一类深色 |
 | `seshat-reader-scroll-step-ratio` | `0.15` | **一次滚动步长** = 窗口文本区像素高 × 比例。`j` / `k`（以及 remap 的 `next-line` / `previous-line`、`C-n` / `C-p`）与滚轮每档都按它移动，默认约 1/7 屏；比例非正数、或取整后不足 1 像素时回退「一行」= `frame-char-height`（绝不出现「按了没反应」） |
 | `seshat-reader-scroll-step-pixels` | `nil` | 非 nil 时**覆盖**上面的比例，把步长钉死为绝对像素（不随窗口大小变化，适合想要固定手感的人）；非正数视同 `nil`，仍走比例 |
-| `seshat-reader-multipage-memory-warning-mb` | `75` | 驻留 spec 的**内存估算告警线**（MB）：按每份缓存 spec 的 `:data` 字符串长度 ×2 估算（Lisp 堆一份 + C 侧一份），超过时 `message` 一次（每个 buffer 只报一次，重载 / 清缓存后重新武装）；`nil` 关闭告警 |
+| `seshat-reader-multipage-memory-warning-mb` | `75` | 驻留 spec 的**内存估算告警线**（MB）：按每份缓存 spec 的 `data-width × data-height × 4` 估算（canvas 缓冲的 ARGB32 像素；**不翻倍**，Lisp 侧不再有 `:data` 副本。缺 `data-*` 时退回 `:width × :height × 4`，即按逻辑像素计，缩放 frame 下为低估），超过时 `message` 一次（每个 buffer 只报一次，重载 / 清缓存后重新武装）；`nil` 关闭告警 |
 | `seshat-reader-annotation-highlight-enabled` | `t` | 是否把批注 `location` 的 `rect:` 段绘制为页面上的半透明高亮。`nil` 时只清空已有高亮并重绘（不添加矩形）；高亮由 C 渲染层绘制，与页面共用同一 `ctm`，故缩放/旋转自动对齐。改动后按 `C-c C-h` 立即刷新 |
 | `seshat-reader-annotation-ink-enabled` | `t` | 是否把批注 `location` 的 `ink:` 段绘制为页面手写笔迹（2026-10-25 起）。与 `annotation-highlight-enabled` **互相独立**：关掉它只影响 ink，rect 类装饰照常；ink 的坐标与 `rect:` 同 page space（页面 pt），不翻转 y。改动后按 `C-c C-h` 立即刷新 |
 | `seshat-reader-select-flash-duration` | `2.0` | 框选松手后闪现选区高亮的时长（秒），`<= 0` 关闭；不受 `annotation-highlight-enabled` 约束 |
@@ -315,7 +315,7 @@ Emacs 端通过 `seshat-reader-annotation` 采集 PDF 页面选区并同步为�
 说明：
 
 - **avy 是软依赖**：目录面板的 `f` 跳转由本包**零依赖自实现**（`seshat-reader-outline-avy-jump`），未安装 avy 时功能等价；标签字符表优先读 `avy-keys`（avy 已加载且其值为字符列表时），否则退回内置表。按本项目惯例（与 `markdown-mode` / `visual-fill-column` / `etaf-ui` 同类处理），**软依赖不写入 `Package-Requires`**，也不在加载期 `require`。
-- **`C-c C-h`**：批注高亮的手动刷新入口（重投当前文档的矩形并触发 C 侧 `--refresh-highlights`）；自动刷新发生在打开文档与批注列表增删之后。
+- **`C-c C-h`**：批注高亮的手动刷新入口（清掉目标页 spec 缓存并重渲染驻留页；C 侧 `--refresh-highlights` 入口已在 2026-10-28 canvas 迁移中删除）；自动刷新发生在打开文档与批注列表增删之后。
 - **`o`**：收起/展开左侧目录面板（目录不再 `pop-to-buffer` 抢窗口，改由承载层按 `seshat-reader-outline-sidebar-position` 显示）。只开合目录的命令 `seshat-reader-sidebar-toggle-outline` 不再绑键（与 `o` 功能重复），仍可 `M-x` 调用。
 
 ### 阅读器暗色模式配色（2026-10-27）
