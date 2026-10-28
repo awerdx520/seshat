@@ -470,17 +470,26 @@ displays, or nil while the page has not been rendered yet.  The list is
 kept sorted by PAGE; go through `seshat-reader--multipage-insert-page' and
 `seshat-reader--multipage-remove-page' rather than editing it directly.")
 
-(defun seshat-reader--multipage-align-to (spec)
-  "Return the display value that centres a page row showing SPEC.
+(defun seshat-reader--multipage-align-to (source)
+  "Return the display value that centres a page row SOURCE wide.
 
-The value is a zero-width `space' display specification whose `:align-to'
-form is `(+ center (-0.5 . SPEC))', so redisplay puts the image that follows
-in the middle of the window and recomputes the position on every frame -- a
-window resize is honoured in the same redisplay, with no hook and no stale
-prefix.  SPEC is referenced by identity on purpose: rewriting its `:width'
-in place (`seshat-reader--multipage-resize-spec') makes the centring follow
-the new size without touching the row."
-  (list 'space :align-to (list '+ 'center (cons -0.5 spec))))
+SOURCE is either the image spec the row displays or, for a row whose pixels
+have not been delivered yet, the pixel width of the page.  Either way the
+value is a zero-width `space' display specification whose `:align-to' form is
+the sum of `center' and half of SOURCE, so redisplay puts what follows in the
+middle of the window and recomputes the position on every frame -- a window
+resize is honoured in the same redisplay, with no hook and no stale prefix.
+
+A spec is referenced by identity on purpose: rewriting its `:width' in place
+with `seshat-reader--multipage-resize-spec' makes the centring follow the new
+size without touching the row.  A number is wrapped as `(WIDTH)' first,
+because a bare number inside a display specification is read as multiples of
+the frame font and not as pixels: both spellings then resolve to the same
+pixels, so a placeholder row is centred exactly where the rendered row it
+becomes will be."
+  (list 'space :align-to
+        (list '+ 'center
+              (cons -0.5 (if (numberp source) (list source) source)))))
 
 (defun seshat-reader--window-scale-source (&optional window)
   "Return WINDOW's scale source, `fit' or `manual' (default `fit').
@@ -993,6 +1002,69 @@ is the image spec the native module returned for it.  At most
 outside the resident set are dropped first (see
 `seshat-reader--page-spec-eviction-victim').")
 
+(defvar-local seshat-reader--multipage-page-sizes nil
+  "Buffer-local cache of per-page display sizes, newest entry first.
+
+Each element is a cons cell (KEY . (WIDTH . HEIGHT)), where KEY is the very
+key `seshat-reader--page-spec-key' builds for the spec cache -- (PAGE SCALE
+ROTATE) -- so the two caches can never disagree about what \"the same
+request\" means.  The limit and the eviction order come from the spec cache
+as well (`seshat-reader--multipage-cache-limit' and
+`seshat-reader--cache-eviction-victim'): there is one policy, used twice.
+
+WIDTH and HEIGHT are the pixels the page occupies on screen at that scale,
+i.e. the same numbers a rendered spec reports in `:width'/`:height', filled
+from `seshat-reader-dyn--page-size' which measures the page bounds and
+rasterizes nothing.  Keeping them next to (and independent of) the specs is
+what lets a page row take the exact image height before the pixels exist.
+
+Unlike the specs, these entries also survive a single-page recycle: see
+`seshat-reader--multipage-forget-specs' for why that is load bearing.")
+
+(defvar-local seshat-reader--multipage-render-generation 0
+  "Generation counter of the two-phase multi-page render, per buffer.
+
+A render started asynchronously (idle pass, periodic timer) records this
+number when it is queued and compares it against the current value before it
+writes anything back: cache entry, size entry or row pixels.  A mismatch means
+the geometry changed while the pixels were in flight, so the result is of the
+old generation and must be dropped instead of painted (decision D4) -- that is
+what keeps a stale bitmap from a previous scale, tint or document out of the
+layout.
+
+The counter is bumped in exactly one place,
+`seshat-reader--page-spec-clear-cache', i.e. only a **full** invalidation
+starts a new generation.  See that function for why the single-page
+`seshat-reader--multipage-forget-specs' must never bump it.
+
+It is 0 in a fresh buffer; callers compare with
+`seshat-reader--multipage-generation-current-p' rather than testing the number
+itself.")
+
+(defvar-local seshat-reader--multipage-render-failures nil
+  "Per-page render failure counts of the current buffer, as an alist.
+
+Each element is (PAGE . COUNT) with PAGE a 1-based page number, so a count
+talks about a page and not about one specific request.  **Why the page and
+not the (PAGE SCALE ROTATE) key the two caches use**: the tick re-derives the
+scale from `seshat-reader--multipage-target-scale' every pass, and the first
+render of a page is the one that records its native size, after which the
+fit scale moves (a wide page is cropped by width).  A count keyed by the full
+request would therefore restart at 1 whenever that happened, and the
+\"give up after 3 failures\" guard would never fire for exactly the pages it
+exists for (the ones the renderer keeps rejecting).  The invariant still says
+\"the same page failed three times\", it is only measured per page.
+
+T5 fills and reads this table: a page whose render keeps returning nil stops
+being queued for the asynchronous pass, and the count is cleared in the two
+places the invariant asks for -- a generation change
+\(`seshat-reader--page-spec-clear-cache', which empties the whole table) and
+the page becoming visible again
+\(`seshat-reader--multipage-reset-render-failure', which T6 calls per visible
+page; without it a transient failure would become permanent for the buffer as
+soon as the reader scrolled away and back, because plain scrolling does not
+advance the generation).")
+
 (defun seshat-reader--page-spec-key (page &optional scale rotate)
   "Return the cache key for PAGE rendered at SCALE and rotated by ROTATE.
 
@@ -1057,25 +1129,38 @@ page counts, because a cached bitmap of the page is what makes the render cheap
       (setq entries (cdr entries)))
     found))
 
-(defun seshat-reader--page-spec-eviction-victim ()
-  "Return the cache entry to drop when the cache is over its limit.
+(defun seshat-reader--cache-eviction-victim (entries)
+  "Return the entry of ENTRIES to drop when a page cache is over its limit.
 
+ENTRIES is a page cache list, newest entry first, i.e. the shape of both
+`seshat-reader--page-spec-cache' and `seshat-reader--multipage-page-sizes'.
 Entries whose page is outside the resident range go first, oldest of them
 first: the reader cannot see those pages any more, so their bitmaps are worth
 less than the ones on screen.  When every entry belongs to a resident page the
-oldest entry is dropped, which is the plain FIFO behaviour of P0."
+oldest entry is dropped, which is the plain FIFO behaviour of P0.
+
+Both caches evict through this one function, so the spec cache and the size
+cache stay in step as the viewport moves and neither grows a policy of its
+own."
   (let* ((range (seshat-reader--multipage-resident-page-range))
          (victim nil))
-    (dolist (entry seshat-reader--page-spec-cache)
+    (dolist (entry entries)
       (let ((page (car (car entry))))
         (unless (and range
                      (>= page (car range))
                      (<= page (cdr range)))
           ;; The list is newest first: the last match is the oldest match.
           (setq victim entry))))
-    (or victim (car (last seshat-reader--page-spec-cache)))))
+    (or victim (car (last entries)))))
 
-(defun seshat-reader--page-spec-remember (key spec)
+(defun seshat-reader--page-spec-eviction-victim ()
+  "Return the spec cache entry to drop when the cache is over its limit.
+
+The rule itself lives in `seshat-reader--cache-eviction-victim', which the
+size cache shares."
+  (seshat-reader--cache-eviction-victim seshat-reader--page-spec-cache))
+
+(defun seshat-reader--page-spec-remember (key spec &optional generation)
   "Cache SPEC under KEY, dropping entries above `--multipage-cache-limit'.
 
 The list is kept newest first.  Entries of pages that left the resident set are
@@ -1083,20 +1168,61 @@ evicted before the entries of pages still on screen (see
 `seshat-reader--page-spec-eviction-victim'), which is what keeps a viewport's
 worth of bitmaps alive while the reader scrolls: P0's plain FIFO cache with a
 fixed limit of 8 scored a 0% hit rate while scanning 20 pages, because the page
-that was just scrolled away was the first one to be dropped."
-  (push (cons key spec) seshat-reader--page-spec-cache)
-  (let ((limit (seshat-reader--multipage-cache-limit)))
-    (while (> (length seshat-reader--page-spec-cache) limit)
-      (let ((victim (seshat-reader--page-spec-eviction-victim)))
-        (if victim
-            (setq seshat-reader--page-spec-cache
-                  (delq victim seshat-reader--page-spec-cache))
-          ;; No victim means the cache is empty, i.e. the limit is 0; stop
-          ;; rather than spin.
-          (setq seshat-reader--page-spec-cache nil)))))
-  seshat-reader--page-spec-cache)
+that was just scrolled away was the first one to be dropped.
 
-(defun seshat-reader--page-spec (page &optional scale rotate)
+GENERATION is the render generation SPEC was produced in, or nil for \"do not
+check\" -- which is what every synchronous caller passes, so a two-argument
+call behaves exactly as before.  A non-nil GENERATION that no longer matches
+`seshat-reader--multipage-render-generation' means the geometry changed while
+SPEC was in flight: nothing is cached then and nil is returned, so the
+asynchronous caller (T5) learns that its result was dropped instead of pinning
+a stale bitmap into the layout (decision D4)."
+  (if (and generation
+           (not (seshat-reader--multipage-generation-current-p generation)))
+      nil
+    (push (cons key spec) seshat-reader--page-spec-cache)
+    (let ((limit (seshat-reader--multipage-cache-limit)))
+      (while (> (length seshat-reader--page-spec-cache) limit)
+        (let ((victim (seshat-reader--page-spec-eviction-victim)))
+          (if victim
+              (setq seshat-reader--page-spec-cache
+                    (delq victim seshat-reader--page-spec-cache))
+            ;; No victim means the cache is empty, i.e. the limit is 0; stop
+            ;; rather than spin.
+            (setq seshat-reader--page-spec-cache nil)))))
+    seshat-reader--page-spec-cache))
+
+(defun seshat-reader--multipage-page-size-remember (key size &optional generation)
+  "Cache SIZE under KEY, dropping entries above `--multipage-cache-limit'.
+
+KEY is the normalized (PAGE SCALE ROTATE) list built by
+`seshat-reader--page-spec-key' and SIZE is the cons (WIDTH . HEIGHT) the
+native module reported.  The list is kept newest first and is trimmed by
+`seshat-reader--cache-eviction-victim', i.e. with the very limit and the very
+policy `seshat-reader--page-spec-remember' uses -- the two caches are one
+budget spent on two kinds of entry, never two policies.
+
+GENERATION has the meaning it has in `seshat-reader--page-spec-remember' -- nil
+means \"do not check\", so the synchronous callers are unaffected, and a stale
+generation drops SIZE instead of caching a size measured for a geometry that no
+longer exists."
+  (if (and generation
+           (not (seshat-reader--multipage-generation-current-p generation)))
+      nil
+    (push (cons key size) seshat-reader--multipage-page-sizes)
+    (let ((limit (seshat-reader--multipage-cache-limit)))
+      (while (> (length seshat-reader--multipage-page-sizes) limit)
+        (let ((victim (seshat-reader--cache-eviction-victim
+                       seshat-reader--multipage-page-sizes)))
+          (if victim
+              (setq seshat-reader--multipage-page-sizes
+                    (delq victim seshat-reader--multipage-page-sizes))
+            ;; No victim means the cache is empty, i.e. the limit is 0; stop
+            ;; rather than spin.
+            (setq seshat-reader--multipage-page-sizes nil)))))
+    seshat-reader--multipage-page-sizes))
+
+(defun seshat-reader--page-spec (page &optional scale rotate generation)
   "Return the image spec of PAGE rendered at SCALE and rotated by ROTATE.
 
 PAGE is 1-based.  SCALE is a multiple of 72 dpi (1.0 when nil) and is
@@ -1112,7 +1238,17 @@ object without calling the native module again.  Rendering is synchronous
 and blocks the Emacs main thread, so this is a measurement/P1 hook only and
 must not be called from a scrolling or redisplay path.  The result is nil
 when the loaded native module predates the entry point, which keeps this
-file working with an older `seshat-render-core'."
+file working with an older `seshat-render-core'.
+
+GENERATION is the render generation the request was issued in, or nil for
+\"do not check\" -- which is what every synchronous caller passes, so a
+three-argument call behaves exactly as before.  It is forwarded to
+`seshat-reader--page-spec-remember', i.e. a freshly rendered spec is cached
+only while GENERATION is still current, and nil is returned when it is not:
+the asynchronous tick (T5) then learns that its result belongs to a geometry
+which no longer exists instead of painting it (decision D4).  A cache hit
+needs no check at all, because `seshat-reader--page-spec-clear-cache' -- the
+only place the generation advances -- empties the cache as well."
   (when (fboundp 'seshat-reader-dyn--page-image-spec)
     (let* ((key (seshat-reader--page-spec-key page scale rotate))
            (cached (assoc key seshat-reader--page-spec-cache)))
@@ -1123,8 +1259,55 @@ file working with an older `seshat-render-core'."
         (let ((spec (seshat-reader-dyn--page-image-spec
                      page (nth 1 key) (nth 2 key))))
           (when spec
-            (seshat-reader--page-spec-remember key spec))
-          spec)))))
+            ;; 代际校验落在这唯一一处写入：`--page-spec-remember' 在代际已变
+            ;; 时不缓存并返回 nil，于是这里也返回 nil（作废，而不是「失败」）。
+            (if (seshat-reader--page-spec-remember key spec generation)
+                spec
+              nil)))))))
+
+(defun seshat-reader--page-size (page scale &optional rotate)
+  "Return the display size of PAGE at SCALE and ROTATE, as (WIDTH HEIGHT).
+
+PAGE is 1-based; SCALE and ROTATE mean what they mean for
+`seshat-reader--page-spec'.  The result is in the logical pixels a rendered
+spec reports in `:width'/`:height', so a page row can take the image's exact
+height before the pixels exist (decision D2), and nil when the size is
+unknown: out-of-range page, invalid arguments, document being reloaded, or a
+module that predates the `seshat-reader-dyn--page-size' entry point.
+
+Nothing is rendered here.  The size is measured from the page bounds by the
+native entry point, which builds no display list and allocates no pixels, so
+this is the cheap synchronous half of the two-phase render -- the whole point
+of the split is that a scroll step may call it for every page it needs.
+
+Sizes are cached in `seshat-reader--multipage-page-sizes' under the key
+`seshat-reader--page-spec-key' builds, i.e. the very key of the spec cache,
+and only a miss reaches the native module; a hit costs one `assoc'.  A
+failure is never cached: nil may be transient (reload in progress, missing
+entry point) and caching it would make that transient state permanent for the
+buffer, the same reasoning D7 applies to pending pages.  Callers decide what
+a nil means for them; this function only reports it."
+  (when (fboundp 'seshat-reader-dyn--page-size)
+    (let* ((key (seshat-reader--page-spec-key page scale rotate))
+           (cached (assoc key seshat-reader--multipage-page-sizes)))
+      (if cached
+          (list (car (cdr cached)) (cdr (cdr cached)))
+        ;; The normalized key doubles as the argument list, so the scale and
+        ;; rotate defaults are applied in exactly one place (same trick as
+        ;; `seshat-reader--page-spec').
+        (let* ((result (ignore-errors
+                         (seshat-reader-dyn--page-size
+                          page (nth 1 key) (nth 2 key))))
+               ;; The entry point returns (WIDTH HEIGHT); accepting a cons as
+               ;; well keeps this wrapper from breaking on a module that
+               ;; reports the pair dotted.
+               (width (car-safe result))
+               (height (car-safe (cdr-safe result))))
+          (when (and (integerp width) (> width 0)
+                     (integerp height) (> height 0))
+            (seshat-reader--multipage-page-size-remember
+             key (cons width height))
+            (list width height)))))))
 
 (defun seshat-reader--page-spec-clear-cache ()
   "Drop every cached per-page image spec of the current buffer.
@@ -1134,10 +1317,49 @@ Called when the cached specs become stale: the document is closed
 \(`seshat-reader--render-buffer'), where the page bitmaps and the
 decorations painted into them are rebuilt from scratch.
 
+The size cache `seshat-reader--multipage-page-sizes' is dropped with it, and
+this is the only place sizes are dropped: a size is valid only for the
+geometry it was measured at, and every caller of this function -- rotate,
+close, reload, `seshat-reader--redisplay-all-windows' -- changes that
+geometry wholesale.  Single-page invalidation deliberately keeps the sizes
+instead (see `seshat-reader--multipage-forget-specs').
+
+This is also the **only** place the render generation is bumped, and the only
+place the per-page failure counts of
+`seshat-reader--multipage-render-failures' are cleared.  Why the generation is
+bumped here and *not* in `seshat-reader--multipage-forget-specs' (do not
+\"simplify\" this by moving it): `--multipage-forget-specs' is single-page and
+is called by `seshat-reader--multipage-recycle-page' every time a page leaves
+the resident set.  Bumping the generation there would mean \"recycling any far
+page invalidates every in-flight pending render\" -- while scrolling
+continuously the idle pass would then be voided over and over and the queue
+would fall back to the timeout's forced synchronous render, which is exactly
+the cost this plan exists to remove (review finding N1).  Full invalidation
+bumps the generation; a recycle or a single-page re-render does not.
+
 The memory warning is re-armed as well: a reloaded document starts from an
 empty cache, so the budget is worth reporting again if it is exceeded again."
-  (setq seshat-reader--page-spec-cache nil
+  (setq seshat-reader--multipage-render-generation
+        (1+ seshat-reader--multipage-render-generation)
+        seshat-reader--page-spec-cache nil
+        seshat-reader--multipage-page-sizes nil
+        ;; T5 使用：失败计数只在「全量失效」与「该页重新可见」两处清零。
+        seshat-reader--multipage-render-failures nil
         seshat-reader--multipage-memory-warned nil))
+
+(defun seshat-reader--multipage-generation-current-p (generation)
+  "Return non-nil when GENERATION is the current render generation.
+
+GENERATION is the number a render recorded when it was queued (see
+`seshat-reader--multipage-render-generation'); nil means \"no generation
+recorded\" and never matches, so a caller with a missing number drops its
+result instead of guessing.  This is the one comparison every asynchronous
+write-back does -- cache entry (`seshat-reader--page-spec-remember'), size
+entry (`seshat-reader--multipage-page-size-remember') and the eventual row
+fill of T5 -- so the rule lives in one function instead of being respelled as
+`(eq gen ...)' in each of them."
+  (and (integerp generation)
+       (= generation seshat-reader--multipage-render-generation)))
 
 ;;; Multi-page layout (P1)
 
@@ -1221,6 +1443,85 @@ Set it to nil to disable the warning."
   :group 'seshat-reader
   :type '(choice (const :tag "Do not warn" nil) (number :tag "Megabytes")))
 
+(defcustom seshat-reader-render-idle-delay 0.05
+  "Interval of the asynchronous render pass, in seconds.
+
+One number, two jobs: it is the delay of the idle timer that starts the
+first pass once Emacs has been quiet that long, and the period of the
+repeating timer that carries the queue on afterwards.  The idle timer is
+started with a nil REPEAT on purpose -- an idle timer fires once per idle
+window in a daemon Emacs (batch 0, probe G3b: one pulse was measured, no
+re-arm without new input), so it cannot drive a queue; the periodic timer is
+the only reliable source of further passes.  See
+`seshat-reader--schedule-async-render'.
+
+0.05 s is 20 passes per second, which is far more than a page render per pass
+needs (one pass renders up to `seshat-reader-render-idle-batch' pages of a few
+milliseconds each) while keeping the delay between a scroll and the pixels of
+the page it revealed imperceptible."
+  :group 'seshat-reader
+  :type 'number)
+
+(defcustom seshat-reader-render-idle-batch 2
+  "Maximum number of pages one asynchronous pass renders.
+
+The pass renders at most this many pages and then returns, leaving the rest
+of the queue to the next pulse of the periodic timer.  The bound exists
+because the pass runs on the Emacs main thread: rendering the whole queue in
+one go would hand the event loop a single long block instead of several short
+ones, and the reader would feel exactly the stall the asynchronous pass is
+meant to remove.  2 pages of a scanned book cost roughly 40-100 ms of main
+thread time, i.e. one command's worth of delay per pulse, which is the
+reason this is a knob and not a constant."
+  :group 'seshat-reader
+  :type 'integer)
+
+(defcustom seshat-reader-render-async t
+  "When nil, scroll rendering runs entirely on the command path.
+
+This is the rollback switch of the two-phase render.  While it is non-nil
+\(the default) a scroll step renders only the pages the reader is looking at
+right now -- the page point is on plus the next page in
+`seshat-reader--multipage-scroll-direction' -- and queues the rest of the
+visible range for the asynchronous pass, so the pixels of the pages that are
+about to come into view arrive after the command returned.
+
+nil means the pre-change behaviour, byte for byte: every page of the visible
+range is rendered synchronously, in page order, and the asynchronous queue,
+its timers and its timeout bookkeeping are dropped.  Nothing about the
+resulting layout differs -- the same specs are written to the same rows -- the
+setting only decides *when* the pixels are rendered.
+
+The option is read on every scroll step, so toggling it takes effect on the
+next command; no restart, no reload."
+  :group 'seshat-reader
+  :type 'boolean)
+
+(defcustom seshat-reader-render-async-timeout 1.0
+  "Seconds a non-empty render queue may stay pending before it is forced.
+
+The last of the three safety nets of the asynchronous pass, and the only one
+that does not depend on a timer firing: idle timers were measured to fire once
+per idle window in a daemon Emacs (batch 0, probe G3b) and a periodic timer
+can be missed while Emacs is busy, so a queue that never drains would leave
+blank placeholder pages on screen for as long as the reader stays there.
+
+The rule: when the queue has been non-empty for longer than this many seconds
+-- measured from the moment it first became non-empty -- the next
+`post-command-hook' entry of `seshat-reader--multipage-sync' renders the whole
+visible range synchronously, empties the queue and cancels both timers.  The
+visible pages are therefore blank for at most this long, whatever the timers
+do.
+
+1.0 s is above the worst case the timers can be late by (one pulse of
+`seshat-reader-render-idle-delay' per batch of pages, i.e. tens of
+milliseconds) and below what a reader would call \"stuck\".  The value is read
+when the deadline is checked; set it to 0 to force the synchronous path on the
+very next command, or set `seshat-reader-render-async' to nil to leave the
+asynchronous pass altogether."
+  :group 'seshat-reader
+  :type 'number)
+
 (defvar-local seshat-reader--multipage-preload 2
   "Number of pages kept resident above and below the visible ones.
 
@@ -1233,9 +1534,9 @@ pages the window currently shows.")
   "Direction of the last scroll: 1 towards later pages, -1 towards earlier.
 
 Set by `seshat-reader--multipage-scroll' and read by
-`seshat-reader--multipage-prefetch', which warms the cache one page beyond the
-resident set *in that direction*: the page the reader is about to reach, not
-the one it just left.")
+`seshat-reader--multipage-prefetch', which queues one page beyond the
+resident set *in that direction* for the asynchronous pass: the page the
+reader is about to reach, not the one it just left.")
 
 (defvar-local seshat-reader--multipage-memory-warned nil
   "Non-nil once the memory budget of this buffer has been reported.
@@ -1244,27 +1545,111 @@ The warning is per buffer and fires once: repeating it on every scroll would
 only fill the echo area, and the situation does not change by itself while the
 same document stays open (it is cleared when the document is reloaded).")
 
-(defun seshat-reader--multipage-page-row (spec &optional wide)
+(defun seshat-reader--multipage-page-cached-size (page)
+  "Return the newest cached size of PAGE as a cons (WIDTH . HEIGHT), or nil.
+
+PAGE is a 1-based page number.  `seshat-reader--multipage-page-sizes' is keyed
+by (PAGE SCALE ROTATE) and kept newest first, so the first entry of the page
+is the size measured for the geometry that page is about to be rendered at --
+which is exactly the size a placeholder row has to take.  Selecting by page
+alone is deliberate: the row builder has no scale to build a key from, and
+asking the native module for one on its own would cache a size belonging to
+another geometry and make the placeholder disagree with the spec that follows."
+  (catch 'found
+    (dolist (entry seshat-reader--multipage-page-sizes)
+      (when (equal (car (car entry)) page)
+        (throw 'found (cdr entry))))
+    nil))
+
+(defun seshat-reader--multipage-page-display-size (page)
+  "Return the pixel size the row of PAGE occupies, as a cons (WIDTH . HEIGHT).
+
+PAGE is a 1-based page number.  A row is either rendered -- it displays the
+image spec of PAGE -- or it is a placeholder: no spec yet, but the size of the
+page is already known from `seshat-reader--multipage-page-sizes' because
+`seshat-reader--page-size' measured it (decision D2: sizes first, pixels
+later).  Both states answer with the same numbers, and that is the whole
+point: the page height (`seshat-reader--multipage-page-pixel-height'), the
+horizontal bound (`seshat-reader--multipage-max-page-width') and the centring
+test (`seshat-reader--multipage-page-should-center-p') read this function and
+nothing else, so a row does not change its geometry when its pixels arrive.
+
+The spec wins where it carries the property, the cached size fills the gaps;
+either field may be nil on its own.  nil means the size is unknown, i.e. a
+page that was neither rendered nor measured."
+  (let* ((spec (seshat-reader--multipage-page-spec page))
+         (cached (seshat-reader--multipage-page-cached-size page))
+         (width (or (and spec (image-property spec :width)) (car cached)))
+         (height (or (and spec (image-property spec :height)) (cdr cached))))
+    (when (or (numberp width) (numberp height))
+      (cons width height))))
+
+(defun seshat-reader--multipage-page-spacer (page)
+  "Return the `space' display value giving PAGE the size it is known to have.
+
+nil when the size of PAGE is unknown, and also when only one of its two
+dimensions is known: a `space' specification with a missing dimension would
+collapse the row instead of reserving it."
+  (let ((size (seshat-reader--multipage-page-display-size page)))
+    (when (and (integerp (car-safe size)) (integerp (cdr-safe size)))
+      (list 'space
+            :width (list (car size))
+            :height (list (cdr size))))))
+
+(defun seshat-reader--multipage-row-properties (page spec)
+  "Return (GUIDE . BODY), the two `display' values the row of PAGE carries.
+
+GUIDE is the value that centres the row (`seshat-reader--multipage-align-to'),
+BODY is the value that gives it its size: the image spec SPEC when the page is
+rendered, otherwise the `space' specification of the size PAGE is known to
+have (`seshat-reader--multipage-page-spacer').  Both states build their
+geometry through this one function, which is what stops a placeholder row from
+drifting away from the rendered row it will become.
+
+nil means there is nothing to display: an unrendered page of unknown size
+keeps the historical empty row -- two spaces, no property, no height.
+
+The size is spelled `(W)' / `(H)' on purpose.  A bare number inside a display
+specification counts multiples of the frame font, and
+`(space :width 612 :height 792)' measured 19008px high -- 792 x the 24px line
+height -- against 792px for the pixel form (batch 0, S2)."
+  (let ((body (or spec (seshat-reader--multipage-page-spacer page))))
+    (when body
+      (cons (seshat-reader--multipage-align-to
+             (or spec
+                 (car-safe (seshat-reader--multipage-page-display-size page))))
+            body))))
+
+(defun seshat-reader--multipage-page-row (spec &optional wide page)
   "Return the buffer text of one page row displaying SPEC.
 
-SPEC is an image spec as returned by `seshat-reader--page-spec', or nil for
-a page that is not rendered yet.  A rendered row is two spaces followed by a
-newline: the first space carries the `:align-to' value of
+SPEC is an image spec as returned by `seshat-reader--page-spec', or nil for a
+page that is not rendered yet.  A row is two spaces followed by a newline: the
+first space carries the `:align-to' value of
 `seshat-reader--multipage-align-to' (which keeps the page horizontally
-centred), the second one carries SPEC itself as its `display' property.  The
-row therefore occupies exactly one buffer line and has a well-defined line
-start to anchor its marker on.  A placeholder row is the same width without
-any property, so that filling the page in later never shifts the layout.
+centred), the second one carries the `display' value that gives the row its
+size.  The row therefore occupies exactly one buffer line and has a
+well-defined line start to anchor its marker on.
+
+For a rendered page that value is SPEC itself.  For a page whose size is known
+but whose pixels are not (PAGE non-nil, see
+`seshat-reader--multipage-row-properties') it is a `space' specification of
+that size, so the placeholder is exactly as tall and as wide as the rendered
+row will be and filling the page in later shifts nothing -- neither the rows
+below it nor the ones above.  A page of unknown size stays an empty row of two
+spaces with no property and no height, as before.
 
 WIDE non-nil drops the centring space, which is what an overwide page needs:
 its image then starts at the left edge and horizontal scrolling -- kept
 as-is by decision D5b -- is the only way to see the rest of it."
-  (cond
-   (wide (concat " " (propertize " " 'display spec) "\n"))
-   ((null spec) "  \n")
-   (t (concat (propertize " " 'display (seshat-reader--multipage-align-to spec))
-              (propertize " " 'display spec)
-              "\n"))))
+  (let* ((properties (seshat-reader--multipage-row-properties page spec))
+         (body (cdr-safe properties)))
+    (cond
+     ((null body) "  \n")
+     (wide (concat " " (propertize " " 'display body) "\n"))
+     (t (concat (propertize " " 'display (car properties))
+                (propertize " " 'display body)
+                "\n")))))
 
 (defun seshat-reader--multipage-separator-row (pixels face &optional window)
   "Return the buffer text of one separator line PIXELS pixels high.
@@ -1310,23 +1695,29 @@ defaults to the selected one and is only used to find the frame."
                        (seshat-reader--multipage-separator-row
                         (nth 2 segments) nil window))))))
 
-(defun seshat-reader--multipage-write-row (start spec &optional centered)
+(defun seshat-reader--multipage-write-row (start spec &optional centered page)
   "Write the display properties of the page row at START so it shows SPEC.
 
 START is the first character of a row built by
 `seshat-reader--multipage-page-row', so the row always has the two leading
 characters this function writes to.  CENTERED non-nil gives the row the
 `:align-to' centring space, nil leaves the image flush with the left edge.
-A nil SPEC clears both properties, which is the placeholder state of a page
-that is not rendered yet.  The buffer is written under `inhibit-read-only'
-and left unmodified."
+PAGE is the page the row belongs to and is only needed when SPEC is nil: the
+row then keeps (or takes) the size the page is known to have, the same
+`space' specification `seshat-reader--multipage-page-row' builds for it.  Only
+text properties are written here -- never text -- so the row keeps its length,
+its marker and the position of every other page row: this is the function
+that fills a placeholder in, and moving a marker there would move a page.
+
+The buffer is written under `inhibit-read-only' and left unmodified."
   (let ((inhibit-read-only t)
-        (end (min (point-max) (+ start 2))))
-    (if (null spec)
+        (end (min (point-max) (+ start 2)))
+        (properties (seshat-reader--multipage-row-properties page spec)))
+    (if (null properties)
         (remove-text-properties start end '(display nil))
       (put-text-property start (1+ start) 'display
-                         (and centered (seshat-reader--multipage-align-to spec)))
-      (put-text-property (1+ start) end 'display spec))
+                         (and centered (car properties)))
+      (put-text-property (1+ start) end 'display (cdr properties)))
     (set-buffer-modified-p nil)))
 
 (defun seshat-reader--multipage-set-page-centered (page centered)
@@ -1338,25 +1729,44 @@ shows.  That in-place edit is what makes the frame that follows a resize
 correct without re-rendering anything."
   (when-let* ((entry (assq page seshat-reader--pages))
               (start (marker-position (cadr entry))))
-    (seshat-reader--multipage-write-row start (cddr entry) centered)))
+    (seshat-reader--multipage-write-row start (cddr entry) centered page)))
 
 (defun seshat-reader--multipage-page-centered-p (page)
-  "Return non-nil when the row of PAGE is centred on its current spec.
+  "Return non-nil when the row of PAGE is placed the way its geometry wants.
 
-The `:align-to' form has to reference the very spec object the row displays,
-and the row has to display that object too -- by identity, not by `equal':
-comparing multi-megabyte bitmaps by content on every redisplay hook entry
-would be pointless.  A mismatch means the spec was replaced by a re-render,
-or that the centring was cleared, and the row then counts as not centred."
+A rendered row's `:align-to' form has to reference the very spec object the
+row displays, and the row has to display that object too -- by identity, not
+by `equal': comparing multi-megabyte bitmaps by content on every redisplay
+hook entry would be pointless.  A mismatch means the spec was replaced by a
+re-render, or that the centring was cleared, and the row then counts as not
+centred.
+
+A placeholder row is checked against the size its page is known to have
+instead: the `:align-to' form references that width in pixels and the second
+space displays the `space' specification of the same size, so both are
+compared by value.  Without that branch a centred placeholder would look
+stale on every redisplay -- `seshat-reader--centered-p' compares this function
+with `seshat-reader--multipage-page-should-center-p' before every frame -- and
+the row would be rewritten once per frame."
   (when-let* ((entry (assq page seshat-reader--pages))
-              (spec (cddr entry))
               (start (marker-position (cadr entry))))
-    (let* ((guide (get-text-property start 'display))
+    (let* ((spec (cddr entry))
+           (properties (seshat-reader--multipage-row-properties page spec))
+           (guide (get-text-property start 'display))
            (align (and (consp guide) (eq (car guide) 'space)
                        (plist-get (cdr guide) :align-to)))
            (form (and (consp align) (eq (car align) '+) (nth 2 align)))
-           (image (get-text-property (1+ start) 'display)))
-      (and (consp form) (eq (cdr form) spec) (eq image spec) t))))
+           (image (get-text-property (1+ start) 'display))
+           (width (car-safe (seshat-reader--multipage-page-display-size page))))
+      (and properties
+           (consp form)
+           (if spec
+               (eq (cdr form) spec)
+             (equal (cdr form) (and (numberp width) (list width))))
+           (if spec
+               (eq image spec)
+             (equal image (cdr properties)))
+           t))))
 
 (defun seshat-reader--multipage-page-should-center-p (page &optional window)
   "Return non-nil when the row of PAGE fits the width of WINDOW.
@@ -1365,10 +1775,15 @@ PAGE is a 1-based page number and WINDOW defaults to the selected one.  A
 page wider than the window is left aligned so that horizontal scrolling can
 reach the rest of it, a page that fits is centred; that is the mechanical
 form of decision D5's \"crop wide pages by width\".  Unknown geometry counts
-as centred, which is what the placeholder rows of unrendered pages want."
+as centred, which is what the placeholder rows of unrendered pages want.
+
+The width comes from `seshat-reader--multipage-page-display-size', i.e. from
+the same place the row takes its geometry from, so a page whose size is known
+but whose pixels are not yet answers exactly like the rendered page it becomes
+instead of falling into the \"unknown, assume centred\" branch and jumping
+sideways when the bitmap arrives."
   (let* ((window (if (window-live-p window) window (selected-window)))
-         (spec (seshat-reader--multipage-page-spec page))
-         (width (and spec (image-property spec :width)))
+         (width (car-safe (seshat-reader--multipage-page-display-size page)))
          (window-width (window-body-width window t)))
     (or (not (numberp width)) (not (numberp window-width))
         (<= width window-width))))
@@ -1384,11 +1799,16 @@ and never the whole document."
 (defun seshat-reader--multipage-max-page-width ()
   "Return the width of the widest page row of the buffer, or nil.
 
-The value comes from the specs the rows display, i.e. from the size they are
-currently fitted to, which is what the horizontal scroll bound needs."
+The value comes from the geometry the rows currently have
+\(`seshat-reader--multipage-page-display-size'), i.e. from the spec of a
+rendered page and from the measured size of a page whose pixels are still to
+be delivered; the two states therefore report the same width and the
+horizontal scroll bound does not change when a bitmap arrives.  That width is
+what the caller needs."
   (let ((widest nil))
     (dolist (entry seshat-reader--pages widest)
-      (let ((width (and (cddr entry) (image-property (cddr entry) :width))))
+      (let ((width (car-safe
+                    (seshat-reader--multipage-page-display-size (car entry)))))
         (when (and (numberp width) (or (null widest) (> width widest)))
           (setq widest width))))))
 
@@ -1433,7 +1853,23 @@ page again."
 
 PAGE is a 1-based page number.  The spec the row currently displays is left
 in place: the caller replaces it with the freshly rendered one, so the row
-keeps its size in the meantime instead of collapsing."
+keeps its size in the meantime instead of collapsing.
+
+Only the spec cache is touched here: the size of PAGE stays in
+`seshat-reader--multipage-page-sizes' on purpose, because a far page that
+lost its size would fall back to the height-0 placeholder and change the
+scroll extent at the moment it is recycled (see the comment in the body)."
+  ;; 为什么不清尺寸（这是 T3 能否成立的前提，不要「顺手」改掉）：
+  ;; `seshat-reader--multipage-recycle-page' 会对离开驻留集的远页调本函数。
+  ;; 若这里连尺寸一起删掉，那些页就退回「尺寸未知」的占位态（高度 0、span
+  ;; 下限 1），**滚动范围在回收的那一刻立刻变化**——正是 P1/P2 反复踩过的
+  ;; 跳变坑。尺寸条目每页只有两个整数（整本 800 页也只有几十 KB），没有
+  ;; 回收必要；而保住它，才能让「已定尺寸、尚未渲染」的页与真实 image 同高。
+  ;;
+  ;; 同理，这里**也不自增渲染代际**（`--multipage-render-generation'）：本函数
+  ;; 是单页粒度且被 `--multipage-recycle-page' 高频调用，若在此自增，「滚动回收
+  ;; 一页」就等于「作废全部在途 pending」，idle 补位会被系统性作废（复审 N1）。
+  ;; 全量失效才自增，入口是 `seshat-reader--page-spec-clear-cache'。
   (setq seshat-reader--page-spec-cache
         (let (kept)
           (dolist (entry seshat-reader--page-spec-cache (nreverse kept))
@@ -1447,7 +1883,10 @@ PAGE is a 1-based page number and WINDOW defaults to the selected one.
 Return non-nil when the size of the spec changed.  Nothing is rendered here:
 only `:width' and `:height' of the spec are rewritten, which the next
 redisplay picks up, and the centring space keeps following the new size
-because `:align-to' references the spec object itself."
+because `:align-to' references the spec object itself.  A page that has no
+spec yet has nothing to resize and is left alone (nil): a placeholder row
+takes its size from `seshat-reader--multipage-page-sizes' instead, and
+rewriting a `:width' on a nil spec would signal."
   (let* ((window (if (window-live-p window) window (selected-window)))
          (spec (seshat-reader--multipage-page-spec page))
          (native (seshat-reader--multipage-native-size page))
@@ -1478,11 +1917,15 @@ must tell those two cases apart test `seshat-reader--pages' with `assq'."
   "Insert the row of PAGE holding SPEC, keeping the layout sorted by page.
 
 PAGE is a 1-based page number and SPEC is an image spec, or nil for a page
-that is not rendered yet.  A page that already has a row only gets its
-SPEC replaced and the function returns nil, so it is idempotent and can be
-called on every scroll step.  A new row goes before the first row of a
-greater page and at the end of the buffer when PAGE is greater than every
-page present; the newline count from `seshat-reader-page-gap-lines' is
+that is not rendered yet.  A page whose pixels are still missing but whose
+size is already known gets a row of that size instead of an empty one (see
+`seshat-reader--multipage-page-row'), so the layout is final before the
+bitmap exists and filling it in later moves nothing.  A page that already has
+a row only gets its SPEC replaced and the function returns nil, so it is
+idempotent and can be called on every scroll step.  A new row goes before the
+first row of a greater page and at the end of the buffer when PAGE is greater
+than every page present; the newline count from
+`seshat-reader-page-gap-lines' is
 appended after the row and the separator region of
 `seshat-reader--multipage-separator-rows' after those newlines.  The buffer
 is written under `inhibit-read-only' and left unmodified, and the marker of
@@ -1500,8 +1943,11 @@ otherwise come from two different character heights and drift apart."
     (if entry
         (let ((start (marker-position (cadr entry)))
               ;; 保持该页行当前的居中/贴左状态：换 spec 与换位置是两件事。
+              ;; 占位态的居中判定同样走这一条（见
+              ;; `seshat-reader--multipage-page-centered-p'），补位时不会先
+              ;; 贴左再居中。
               (centered (seshat-reader--multipage-page-centered-p page)))
-          (seshat-reader--multipage-write-row start spec centered)
+          (seshat-reader--multipage-write-row start spec centered page)
           (setcdr (cdr entry) spec)
           nil)
       (let ((inhibit-read-only t)
@@ -1518,8 +1964,14 @@ otherwise come from two different character heights and drift apart."
               (throw 'found t))))
         (save-excursion
           (goto-char (or start (point-max)))
-          (let ((row-start (point)))
-            (insert (seshat-reader--multipage-page-row spec))
+          (let* ((row-start (point))
+                 ;; 占位行的居中/贴左与已渲染行同源：比窗口宽的页从一开始就
+                 ;; 贴左，补位那一刻横向位置不会跳（`--center-page' 之后也会
+                 ;; 算一次，但插行时就算对，首帧就是对的）。
+                 (wide (and (null spec)
+                            (not (seshat-reader--multipage-page-should-center-p
+                                  page win)))))
+            (insert (seshat-reader--multipage-page-row spec wide page))
             (dotimes (_ seshat-reader-page-gap-lines)
               (insert "\n"))
             (insert (or (seshat-reader--multipage-separator-rows win) ""))
@@ -1835,35 +2287,527 @@ may have changed."
           (assq-delete-all page seshat-reader--page-render-scales))
     spec))
 
+;;; Asynchronous render pass (P2-B T5)
+
+;; 两阶段渲染的第二阶段：滚动路径只登记「哪些页还缺像素」，像素交给
+;; 「idle 首轮 + 周期 timer 推进」的队列。下面每条约束都来自批次 0 的实测
+;; （数值见 `openspec/active/2026-10-28-reader-multipage-p2b-async-render.md'）：
+;;
+;; - **idle timer 只做首轮启动，REPEAT 必须 nil**：daemon 下一个 idle 窗口只
+;;   fire 一次，回调自续不会让它再触发（探针 G3b：ticks = 1），所以它不是驱动
+;;   源，只是「Emacs 安静下来后先跑一轮」的触发器；
+;; - **队列推进只能靠 `run-at-time' 的重复 timer**：这是唯一可靠的持续驱动源；
+;; - **每轮有界**（`seshat-reader-render-idle-batch'）：渲染占 Emacs 主线程，
+;;   一轮渲染整队会把多次短停顿合并成一次长停顿，正好是本项要消除的手感；
+;; - **两个 timer 都存在 buffer-local 变量里，每次排程前先 cancel 旧的**：与
+;;   `seshat-reader--schedule-refit' 同一范式（cancel + 单 timer + buffer 入参），
+;;   避免一次滚动堆出多个 timer 同时推进同一队列。
+
+(defconst seshat-reader--multipage-render-failure-limit 3
+  "Number of failed renders after which a page stops being queued.
+
+The mechanical form of the non-blocking-render invariant: a page whose render
+keeps returning nil leaves the queue instead of being retried forever.  The
+count is cleared when the page becomes visible again
+\(`seshat-reader--multipage-reset-render-failure') and on a generation change
+\(`seshat-reader--page-spec-clear-cache'), so a transient failure is never
+turned into a permanent one.")
+
+(defvar-local seshat-reader--multipage-pending-renders nil
+  "Pages queued for the asynchronous render pass, oldest request first.
+
+Each element is a 1-based page number.  The queue is buffer-local and holds
+the union of what every window showing the buffer asked for (decision D8):
+window-local queues would overwrite each other as soon as two windows show
+the same buffer at different scroll positions.
+
+Only page numbers are stored -- not the scale, not the rotation, not the
+window.  Those are re-derived when the pass runs
+\(`seshat-reader--multipage-target-scale' plus
+`seshat-reader--multipage-rotate'), which is what makes the queue stay valid
+across a zoom: a queued page is rendered at the geometry that holds when its
+turn comes, and the generation recorded below is what drops the batch if that
+geometry changed instead.")
+
+(defvar-local seshat-reader--multipage-pending-generation nil
+  "Render generation the queue was filled in, or nil when it is empty.
+
+Recorded on the first queued page and compared by the pass before anything is
+rendered or written back: a mismatch means a full invalidation (zoom, tint,
+reload, relayout) ran while the pages waited, so the whole queue belongs to a
+geometry that no longer exists and is dropped (decision D4).")
+
+(defvar-local seshat-reader--multipage-async-idle-timer nil
+  "Idle timer that fires the first pass of this buffer, or nil.
+
+Always armed with a nil REPEAT: an idle timer fires once per idle window in a
+daemon Emacs (probe G3b), so it must never be treated as the driver of the
+queue.")
+
+(defvar-local seshat-reader--multipage-async-render-timer nil
+  "Repeating timer that advances the render queue of this buffer, or nil.
+
+Armed by `seshat-reader--schedule-async-render' and cancelled as soon as the
+queue is empty, so an idle reader has no timer running at all.")
+
+(defvar-local seshat-reader--multipage-async-rendering nil
+  "Non-nil while a render pass of this buffer is running.
+
+The guard against re-entry: a pass writes text properties, which can report a
+window state change, which can run the post-command path and queue more work;
+a second pass started from inside the first one would render the same page
+twice and interleave its writes with the outer pass (same idea as
+`seshat-reader--multipage-syncing' and `seshat-reader--refitting').")
+
+(defvar-local seshat-reader--multipage-async-pending-since nil
+  "`float-time' at which the render queue of this buffer became non-empty.
+
+nil means \"the queue is empty right now\".  The value is what the timeout net
+of `seshat-reader--multipage-sync' compares against
+`seshat-reader-render-async-timeout': it records when the *current* pending
+stretch began, not when a page was queued last, so a queue that keeps being
+refilled with new pages still ages out.
+
+It is cleared by every path that empties the queue -- the pass itself, a full
+invalidation, the forced synchronous render and the switch to
+`seshat-reader-render-async' = nil -- so a stale timestamp can never make the
+next scroll take the slow path.")
+
+(defun seshat-reader--multipage-pending-add (page)
+  "Queue PAGE for the asynchronous render pass, return non-nil when queued.
+
+PAGE is a 1-based page number.  Nothing is queued when the page is already
+queued, when its pixels are already known -- in the spec cache at any scale
+\(`seshat-reader--multipage-spec-cached-p') or in the row of the page -- or
+when its render already failed
+`seshat-reader--multipage-render-failure-limit' times, which is how the
+\"three failures then stop\" invariant is enforced at the entry point as well
+as in the pass itself.
+
+The generation is recorded with the first entry, so the queue as a whole
+belongs to one geometry; see
+`seshat-reader--multipage-pending-generation'."
+  (when (and (integerp page) (> page 0)
+             (not (memq page seshat-reader--multipage-pending-renders))
+             (not (seshat-reader--multipage-spec-cached-p page))
+             (not (and (assq page seshat-reader--pages)
+                       (seshat-reader--multipage-page-spec page)))
+             (not (seshat-reader--multipage-render-failed-p page)))
+    (unless seshat-reader--multipage-pending-renders
+      (setq seshat-reader--multipage-pending-generation
+            seshat-reader--multipage-render-generation
+            ;; 队列从空到非空的这一刻就是超时兜底的计时起点（T6 态 C）。
+            seshat-reader--multipage-async-pending-since (float-time)))
+    (setq seshat-reader--multipage-pending-renders
+          (append seshat-reader--multipage-pending-renders (list page)))
+    t))
+
+(defun seshat-reader--multipage-pending-remove (page)
+  "Drop PAGE from the asynchronous render queue.
+
+PAGE is a 1-based page number; a page that is not queued is ignored.  The
+recorded generation is cleared with the last entry, so an empty queue never
+claims a generation."
+  (setq seshat-reader--multipage-pending-renders
+        (delq page seshat-reader--multipage-pending-renders))
+  (unless seshat-reader--multipage-pending-renders
+    (setq seshat-reader--multipage-pending-generation nil
+          seshat-reader--multipage-async-pending-since nil)))
+
+(defun seshat-reader--multipage-pending-clear ()
+  "Empty the asynchronous render queue of the current buffer.
+
+Both the page numbers and the generation they were queued in are dropped: the
+queue is only meaningful for the geometry it was filled in.  The pending
+timestamp goes with them -- an empty queue has no age."
+  (setq seshat-reader--multipage-pending-renders nil
+        seshat-reader--multipage-pending-generation nil
+        seshat-reader--multipage-async-pending-since nil))
+
+(defun seshat-reader--multipage-prune-pending (pages)
+  "Keep only the queued pages that are also in PAGES.
+
+PAGES is a list of 1-based page numbers -- typically the visible range the
+caller just computed -- and the queue is trimmed to its intersection with it,
+so pages the reader scrolled past are never rendered.  The order of the
+surviving entries is kept.
+
+T6 calls this from `seshat-reader--multipage-sync' once it decides which pages
+are visible; T5 only provides it, because the sync path is deliberately left
+untouched in this batch."
+  (let (kept)
+    (dolist (page seshat-reader--multipage-pending-renders)
+      (when (memq page pages)
+        (push page kept)))
+    (setq seshat-reader--multipage-pending-renders (nreverse kept))
+    (unless seshat-reader--multipage-pending-renders
+      (setq seshat-reader--multipage-pending-generation nil
+            seshat-reader--multipage-async-pending-since nil))
+    seshat-reader--multipage-pending-renders))
+
+(defun seshat-reader--multipage-render-failure-count (page)
+  "Return how many times the render of PAGE has failed.
+
+PAGE is a 1-based page number; a page that never failed reports 0."
+  (or (cdr (assq page seshat-reader--multipage-render-failures)) 0))
+
+(defun seshat-reader--multipage-note-render-failure (page)
+  "Count one more failed render of PAGE and return the new count.
+
+PAGE is a 1-based page number.  The table stays an alist so that it stays
+readable in a backtrace and cheap to clear wholesale; a page appears at most
+once in it."
+  (let ((count (1+ (seshat-reader--multipage-render-failure-count page))))
+    (setq seshat-reader--multipage-render-failures
+          (cons (cons page count)
+                (assq-delete-all page
+                                 seshat-reader--multipage-render-failures)))
+    count))
+
+(defun seshat-reader--multipage-render-failed-p (page)
+  "Return non-nil when PAGE failed to render too many times to retry.
+
+PAGE is a 1-based page number.  The threshold is
+`seshat-reader--multipage-render-failure-limit'."
+  (>= (seshat-reader--multipage-render-failure-count page)
+      seshat-reader--multipage-render-failure-limit))
+
+(defun seshat-reader--multipage-reset-render-failure (page)
+  "Clear the failure count of PAGE so that it may be queued again.
+
+PAGE is a 1-based page number.  This is the second of the two places the
+non-blocking-render invariant clears the count -- the first one is the
+generation change inside `seshat-reader--page-spec-clear-cache' -- and it
+exists for the case the generation cannot cover: purely scrolling away and
+back does not advance the generation, so without this call a page that failed
+twice while it was off screen would be dropped permanently the next time it
+came into view.  T6 calls it for every visible page (see
+`seshat-reader--multipage-prune-pending' for the other T6 hook).
+
+The pass calls it as well when a page finally renders, so the count always
+describes consecutive failures."
+  (setq seshat-reader--multipage-render-failures
+        (assq-delete-all page seshat-reader--multipage-render-failures)))
+
+(defun seshat-reader--cancel-async-render-timers ()
+  "Cancel both timers of the asynchronous render pass of this buffer.
+
+`timerp' is deliberately not tested: the variables only ever hold a timer or
+nil, and a plain nil test keeps the function testable with a stub
+`run-at-time' that returns a symbol instead of a timer object."
+  (when seshat-reader--multipage-async-idle-timer
+    (cancel-timer seshat-reader--multipage-async-idle-timer))
+  (setq seshat-reader--multipage-async-idle-timer nil)
+  (when seshat-reader--multipage-async-render-timer
+    (cancel-timer seshat-reader--multipage-async-render-timer))
+  (setq seshat-reader--multipage-async-render-timer nil))
+
+(defun seshat-reader--multipage-clear-async-state ()
+  "Drop the render queue, both timers and the pending timestamp.
+
+The one call that returns the buffer to \"no asynchronous work in flight\":
+the switch to `seshat-reader-render-async' = nil uses it, and so does the
+timeout net before it renders the range synchronously.  Keeping the three
+pieces of state together means no path can clear two of them and leave the
+third to age out on its own."
+  (seshat-reader--multipage-pending-clear)
+  (seshat-reader--cancel-async-render-timers)
+  (setq seshat-reader--multipage-async-pending-since nil))
+
+(defun seshat-reader--multipage-note-pending-since ()
+  "Keep the pending timestamp in step with the queue.
+
+Sets it to the current time when the queue is non-empty and has no timestamp
+yet, clears it when the queue is empty.  A queue that is already aged keeps
+its original timestamp, which is the point: the deadline is the age of the
+*stretch*, not of the last page queued into it.  Idempotent, so every path
+that leaves the queue in an unknown state (the dispatch of
+`seshat-reader--multipage-sync', the forced synchronous pass) can call it
+without checking first."
+  (cond
+   ((null seshat-reader--multipage-pending-renders)
+    (setq seshat-reader--multipage-async-pending-since nil))
+   ((null seshat-reader--multipage-async-pending-since)
+    (setq seshat-reader--multipage-async-pending-since (float-time)))))
+
+(defun seshat-reader--multipage-async-overdue-p ()
+  "Return non-nil when the render queue has outlived its timeout.
+
+The mechanical form of the last safety net of decision D5: a non-empty queue
+whose pending timestamp is older than `seshat-reader-render-async-timeout'
+seconds.  Both the timestamp and the timeout are checked for being numbers, so
+a buffer whose queue was filled before the timeout was ever recorded (or a
+customisation that set the option to a non-number) simply reports \"not
+overdue\" instead of signaling.
+
+`float-time' is called through the symbol on purpose: the tests stub it to
+move the clock without sleeping."
+  (and seshat-reader--multipage-pending-renders
+       (numberp seshat-reader--multipage-async-pending-since)
+       (numberp seshat-reader-render-async-timeout)
+       (> (- (float-time) seshat-reader--multipage-async-pending-since)
+          seshat-reader-render-async-timeout)))
+
+(defun seshat-reader--multipage-placeholder-row (page window)
+  "Give PAGE a row of its final size without rendering its pixels.
+
+PAGE is a 1-based page number and WINDOW is used only to derive the geometry
+the row is about to have.  This is the synchronous half of the two-phase
+render for a page whose pixels are deferred: the page size comes from the
+native entry point (`seshat-reader--page-size', bounds only, microseconds) and
+the row is built from it, so the layout -- and with it the scroll extent -- is
+final before any bitmap exists (decision D2, and what makes the placeholder of
+T3 usable at all).
+
+The size is measured in two steps on purpose.  `--page-size' at scale 1.0
+answers the *native* size of the page; feeding it temporarily into
+`seshat-reader--page-native-sizes' lets
+`seshat-reader--multipage-target-scale' derive the target scale through the
+single fit table of decision D5 instead of a copy of it, and the second
+measurement then answers the size the page will really be displayed at.  The
+temporary entry is dropped when the function returns: a page is only
+\"rendered\" once `seshat-reader--page-render-scales' says so, and leaving a
+native size behind for a page whose bitmap does not exist would make
+`seshat-reader--multipage-refit-page' measure a page it never rendered.
+
+A page that already has a spec, or whose size cannot be measured (a module
+without the entry point), is left to
+`seshat-reader--multipage-insert-page': it only rewrites text properties for
+an existing row and inserts an empty one for an unknown size, exactly as
+before T3.  Nothing here renders."
+  (unless (seshat-reader--multipage-page-spec page)
+    (let* ((rotate seshat-reader--multipage-rotate)
+           (native (seshat-reader--page-size page 1.0 rotate))
+           (width (car-safe native))
+           ;; `--page-size' 返回的是二元列表 (W H)（不是 dotted pair），与它自
+           ;; 己解 C 返回值的方式保持一致。
+           (height (car-safe (cdr-safe native)))
+           (scale (if (and (integerp width) (> width 0)
+                           (integerp height) (> height 0))
+                      (let ((seshat-reader--page-native-sizes
+                             (cons (cons page (cons (float width) (float height)))
+                                   seshat-reader--page-native-sizes)))
+                        (seshat-reader--multipage-target-scale page window))
+                    (seshat-reader--multipage-target-scale page window))))
+      (when scale (seshat-reader--page-size page scale rotate))
+      ;; 行一律走 `--multipage-insert-page'（T3 的唯一入口）：已有的占位行只
+      ;; 重写属性、不动文本，缺行则按刚测到的尺寸建一条。
+      (seshat-reader--multipage-insert-page page nil window))))
+
+(defun seshat-reader--schedule-async-render (&optional buffer)
+  "Start (or restart) the asynchronous render pass of BUFFER.
+
+BUFFER defaults to the current buffer and is only used as the argument the
+two timers hand back to `seshat-reader--async-render-tick', which is what
+keeps the pass running in the right buffer whatever buffer is current when a
+timer fires (the `seshat-reader--schedule-refit' pattern).
+
+Any timer armed by the previous call is cancelled first, so a burst of scroll
+steps ends with exactly two timers instead of a pile of them.  Nothing is
+armed while the queue is empty: an idle reader runs no timer at all.
+
+The idle timer starts the first pass and is armed with a **nil REPEAT** on
+purpose -- in a daemon Emacs an idle timer fires once per idle window whether
+or not REPEAT is non-nil (probe G3b), so treating it as a repeating driver
+would silently stop the queue.  The repeating timer (`run-at-time' with the
+same delay as its period) is the only thing that carries the queue past the
+first pulse, and it cancels itself as soon as the queue is empty.
+
+The queue is returned, i.e. what is still pending after scheduling, which is
+nil when there was nothing to do."
+  (let ((buffer (or (and (buffer-live-p buffer) buffer) (current-buffer))))
+    (with-current-buffer buffer
+      (seshat-reader--cancel-async-render-timers)
+      (when seshat-reader--multipage-pending-renders
+        (let ((delay seshat-reader-render-idle-delay))
+          (setq seshat-reader--multipage-async-idle-timer
+                (run-with-idle-timer delay nil
+                                     #'seshat-reader--async-render-tick
+                                     buffer))
+          ;; 周期 timer 的闭包捕获 timer 自身：buffer 被 kill 之后没有人能再读
+          ;; 它的 buffer-local 变量，于是下一次 fire 由闭包自己取消，队列随
+          ;; buffer 一起消失，不会留下一个永远空转的周期 timer。
+          (let ((timer nil))
+            (setq timer
+                  (run-at-time
+                   delay delay
+                   (lambda (target)
+                     (if (buffer-live-p target)
+                         (seshat-reader--async-render-tick target)
+                       (when timer (cancel-timer timer))))
+                   buffer))
+            (setq seshat-reader--multipage-async-render-timer timer))))
+      seshat-reader--multipage-pending-renders)))
+
+(defun seshat-reader--async-render-batch ()
+  "Render at most `seshat-reader-render-idle-batch' queued pages.
+
+The queue of the current buffer is walked in request order.  For every page
+the scale is re-derived (`seshat-reader--multipage-target-scale', nil window
+meaning \"the window displaying this buffer\") and the rotation is the
+buffer-local one, so a page is rendered at the geometry that holds now rather
+than the one it was queued at.
+
+A successful render is written back in three steps: the spec is recorded on
+the page (the native size with it), the row is filled in when the page has
+one, and the failure count is cleared.  Filling in a row goes through
+`seshat-reader--multipage-insert-page', i.e. through
+`seshat-reader--multipage-write-row': only text properties are written, so no
+marker moves and no buffer text changes, which is what the placeholder of T3
+needs in order to be replaced in place.  A page without a row (a prefetched
+page the viewport has not reached) is only cached -- it must not add a row,
+or the scroll range would grow for a page nobody is looking at.
+
+A nil result is a failure: the count of the page goes up by one and the page
+leaves the queue, which is how it stops being retried after
+`seshat-reader--multipage-render-failure-limit' attempts.  A nil returned
+because the generation moved while the page was rendering is **not** a
+failure -- the geometry was invalidated, not the page -- so the whole batch is
+dropped instead.
+
+The number of pages the pass actually attempted is returned."
+  (let* ((generation seshat-reader--multipage-pending-generation)
+         (batch (max 1 (or seshat-reader-render-idle-batch 1)))
+         (queue seshat-reader--multipage-pending-renders)
+         (attempted 0)
+         (invalidated nil))
+    (while (and queue (< attempted batch) (not invalidated))
+      (let ((page (car queue)))
+        (setq queue (cdr queue))
+        (cond
+         ((not (seshat-reader--multipage-generation-current-p generation))
+          (setq invalidated t))
+         ((seshat-reader--multipage-render-failed-p page)
+          ;; 已放弃的页还留在队里（例如缩放前登记的），直接丢弃不再尝试。
+          (seshat-reader--multipage-pending-remove page))
+         (t
+          (setq attempted (1+ attempted))
+          (let* ((window (seshat-reader--multipage--display-window))
+                 (scale (seshat-reader--multipage-target-scale page window))
+                 (rotate seshat-reader--multipage-rotate)
+                 (spec (seshat-reader--page-spec page scale rotate generation)))
+            (cond
+             ((null spec)
+              (if (seshat-reader--multipage-generation-current-p generation)
+                  (progn
+                    (seshat-reader--multipage-note-render-failure page)
+                    (seshat-reader--multipage-pending-remove page))
+                (setq invalidated t)))
+             (t
+              (seshat-reader--multipage-reset-render-failure page)
+              (seshat-reader--multipage-record-native page spec scale)
+              (seshat-reader--multipage-pending-remove page)
+              (when (assq page seshat-reader--pages)
+                (seshat-reader--multipage-insert-page page spec window)
+                ;; native 尺寸刚记录下来，目标 scale 可能因此变小（宽页在
+                ;; contain/width 下按宽裁剪）；与同步路径一样只改 spec 尺寸，
+                ;; 不重渲染。
+                (seshat-reader--multipage-resize-spec page window)
+                (seshat-reader--multipage-set-page-centered
+                 page (seshat-reader--multipage-page-should-center-p
+                       page window))))))))))
+    (when invalidated
+      (seshat-reader--multipage-pending-clear))
+    attempted))
+
+(defun seshat-reader--async-render-tick (buffer)
+  "Advance the asynchronous render queue of BUFFER by one pass.
+
+BUFFER is the buffer the timers were armed for; nothing happens when it is no
+longer live (the periodic timer cancels itself in that case, see
+`seshat-reader--schedule-async-render').
+
+A pass returns immediately when one is already running: writing text
+properties can re-enter this function through the post-command path, and a
+nested pass would render the same page twice.
+
+The queue is dropped, together with both timers, when it is empty or when the
+generation it was filled in is no longer current -- the second case is a full
+invalidation (zoom, tint, reload, relayout) that ran while the pages waited,
+so their results belong to a geometry that no longer exists (decision D4).
+Otherwise one bounded batch is rendered
+\(`seshat-reader--async-render-batch') and the timers are left alone: the
+repeating timer fires again after its period, the idle timer is **not**
+re-armed -- that is the mechanical form of probe G3b, which measured that an
+idle timer fires once per idle window and cannot drive a queue."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (cond
+       (seshat-reader--multipage-async-rendering
+        nil)
+       ((null seshat-reader--multipage-pending-renders)
+        (seshat-reader--cancel-async-render-timers)
+        nil)
+       ((not (seshat-reader--multipage-generation-current-p
+              seshat-reader--multipage-pending-generation))
+        (seshat-reader--multipage-pending-clear)
+        (seshat-reader--cancel-async-render-timers)
+        nil)
+       (t
+        (let ((seshat-reader--multipage-async-rendering t))
+          (seshat-reader--async-render-batch))
+        (unless seshat-reader--multipage-pending-renders
+          (seshat-reader--cancel-async-render-timers))
+        nil)))))
+
 (defun seshat-reader--multipage-prefetch (&optional window)
-  "Warm the cache with the page just beyond WINDOW's resident set.
+  "Warm the page just beyond WINDOW's resident set, queued or synchronously.
 
 WINDOW defaults to the selected window.  The page is chosen from
-`seshat-reader--multipage-scroll-direction': scrolling down warms the page after
-the last resident one, scrolling up the page before the first.  The target is
-clamped to the document and skipped when it is already resident or already
-cached under any scale (`seshat-reader--multipage-spec-cached-p'), so a command
-that stays inside the same range costs nothing.
+`seshat-reader--multipage-scroll-direction': scrolling down takes the page
+after the last resident one, scrolling up the page before the first.  It is
+clamped to the document and skipped when it is resident, already cached under
+any scale (`seshat-reader--multipage-spec-cached-p'), already queued, or
+already given up on.
 
-Only the cache is warmed: no row is inserted and the buffer is not touched, so
-the resident row count stays what `--multipage-visible-range' asked for.  Errors
-are swallowed -- a prefetch is an optimisation and must never break scrolling --
-and a failed render simply does not populate the cache."
+`seshat-reader-render-async' decides **how** the page is warmed, and this
+function is the only place that decision is made -- the signature and every
+call site are the same in both modes, so a caller neither knows nor cares
+which half runs:
+
+- non-nil, the default -- the page is queued
+  (`seshat-reader--multipage-pending-add') and
+  `seshat-reader--schedule-async-render' arms the idle first pulse and the
+  periodic driver.  No row is inserted and no pixels are rendered here, so the
+  resident row count stays what `--multipage-visible-range' asked for and the
+  scroll step pays for neither a render nor a buffer change.  A queued page
+  that a pass never reaches is dropped by the next full invalidation or prune.
+- nil -- the pre-T5 behaviour, restored verbatim: the spec of the page is
+  rendered right here (`seshat-reader--page-spec', at the target scale of
+  WINDOW), so it lands in `seshat-reader--page-spec-cache' and the next scroll
+  step finds it.  Nothing is queued and no timer is armed, because state A of
+  `seshat-reader--multipage-sync' must leave no asynchronous state behind at
+  all.  This is what makes the rollback switch byte-for-byte equivalent to the
+  path before the two-phase render: same pages, same order, same one-page head
+  start.
+
+Errors are swallowed -- a prefetch is an optimisation and must never break
+scrolling.  The page number is returned when it was warmed (queued or
+rendered), nil when there was nothing to do."
   (ignore-errors
     (let ((range (seshat-reader--multipage-resident-page-range)))
       (when range
         (let* ((direction (if (eq seshat-reader--multipage-scroll-direction -1)
                               -1 1))
-               (window (if (window-live-p window) window (selected-window)))
                (edge (if (> direction 0) (cdr range) (car range)))
                (page (seshat-reader--multipage-clamp-page (+ edge direction))))
           (when (and page
-                     (not (and (>= page (car range)) (<= page (cdr range))))
-                     (not (seshat-reader--multipage-spec-cached-p page)))
-            (seshat-reader--page-spec
-             page
-             (seshat-reader--multipage-target-scale page window)
-             seshat-reader--multipage-rotate)))))))
+                     (not (and (>= page (car range)) (<= page (cdr range)))))
+            (if seshat-reader-render-async
+                (when (seshat-reader--multipage-pending-add page)
+                  (seshat-reader--schedule-async-render (current-buffer))
+                  page)
+              ;; 态 A 的同步预取：与 T5 之前的实现同口径（同样的「已缓存即跳
+              ;; 过」守卫、同样按窗口算目标 scale），但**不入队、不排 timer**
+              ;; —— 态 A 收尾时会把异步状态清干净，登记了也会被丢掉。走
+              ;; `--page-spec' 才进缓存，这一页的提前量才真的存在。
+              (unless (seshat-reader--multipage-spec-cached-p page)
+                (seshat-reader--page-spec
+                 page
+                 (seshat-reader--multipage-target-scale
+                  page (if (window-live-p window) window (selected-window)))
+                 seshat-reader--multipage-rotate)
+                page))))))))
 
 (defun seshat-reader--multipage-resident-spec-megabytes ()
   "Estimate the memory the cached page specs hold, in megabytes.
@@ -1915,8 +2859,16 @@ WINDOW is accepted for symmetry with the other sync helpers and is not used."
                  (length seshat-reader--page-spec-cache)
                  megabytes budget)))))
 
-(defun seshat-reader--multipage-sync (&optional window)
+(defun seshat-reader--multipage-sync-blocking (&optional window)
   "Keep the resident page rows of WINDOW in sync with its viewport.
+
+This is the synchronous half of `seshat-reader--multipage-sync', moved here
+verbatim when the two-phase render landed (P2-B T6): it renders every page of
+the visible range in page order and warms the page just beyond it.  It is
+called as-is when `seshat-reader-render-async' is nil -- the rollback path --
+and by the timeout net of the asynchronous path, which is why its body is
+deliberately untouched: \"byte for byte equivalent\" has to be auditable by
+diffing this function against the pre-T6 one.
 
 WINDOW defaults to the selected window.  The pages
 `seshat-reader--multipage-visible-range' asks for are rendered when they
@@ -1936,9 +2888,14 @@ at exactly the same scale as the pages that were already on screen
 \(decision D5's reference page anchoring).
 
 Once the range is settled the page just beyond it in the scrolling direction is
-warmed into the cache (`seshat-reader--multipage-prefetch') and the memory
-budget is checked, so the frame that scrolls one page further finds a bitmap
-ready instead of blocking on the native renderer."
+prefetched (`seshat-reader--multipage-prefetch') and the memory budget is
+checked, so the frame that scrolls one page further finds its bitmap ready
+instead of blocking on the native renderer.  Which half does the warming
+depends on `seshat-reader-render-async': queued for the asynchronous pass by
+default, rendered synchronously (the pre-T5 behaviour) when it is nil -- this
+function stays the single prefetch call site in both modes.  The rendering of
+the visible pages is what `seshat-reader--multipage-sync' moves off this path
+when the asynchronous pass is enabled."
   (let* ((win (or window (selected-window)))
          (range (and (window-live-p win)
                      (not seshat-reader--multipage-syncing)
@@ -1961,6 +2918,160 @@ ready instead of blocking on the native renderer."
         (seshat-reader--multipage-prefetch win)
         (seshat-reader--multipage-check-memory win))
       range)))
+
+(defun seshat-reader--multipage-sync (&optional window)
+  "Keep the resident page rows of WINDOW in sync with its viewport.
+
+The entry point of every scroll step (post-command-hook, window state
+changes, the cross-page scroll commands and zoom/goto), and the dispatcher of
+the three states of the two-phase render (P2-B T6):
+
+  A. `seshat-reader-render-async' is nil -- the asynchronous machinery is
+     dropped (queue, both timers, the pending timestamp) and
+     `seshat-reader--multipage-sync-blocking' does exactly what the whole
+     function did before T6: every page of the visible range rendered
+     synchronously, in page order, then the synchronous prefetch
+     (`seshat-reader--multipage-prefetch' takes its nil-mode branch and renders
+     the page itself) and the memory check.
+  B. asynchronous, the rule -- the page point is on and the page one step
+     further in `seshat-reader--multipage-scroll-direction' are rendered
+     synchronously (`seshat-reader--page-spec', so the reader never looks at a
+     blank page where it is reading), every other page of the visible range
+     gets its row built at its final size but no pixels
+     (`seshat-reader--multipage-placeholder-row') and is queued
+     (`seshat-reader--multipage-pending-add' +
+     `seshat-reader--schedule-async-render'), the queue is pruned to the
+     visible range (`seshat-reader--multipage-prune-pending') and the pages
+     that just came back into view get their failure count cleared
+     (`seshat-reader--multipage-reset-render-failure').
+  C. asynchronous and overdue -- the queue has been non-empty for longer than
+     `seshat-reader-render-async-timeout', i.e. neither the idle nor the
+     periodic timer managed to drain it; the whole visible range is rendered
+     synchronously, the queue is emptied and both timers are cancelled
+     (`seshat-reader--multipage-force-sync').  This is the net that keeps a
+     broken timer from leaving the reader on blank pages.
+
+The returned value is unchanged in all three states: the range that was
+synchronised, or nil when there was nothing to do.  The four groups of callers
+\(see the docstring of `seshat-reader--multipage-sync-blocking') only look at
+that value and at the side effects on the layout, so splitting the body behind
+the switch is invisible to them."
+  (if (not seshat-reader-render-async)
+      ;; 态 A：逐页同步渲染 + 预取。先丢掉异步侧的状态，切回异步时不会拿一份
+      ;; 「旧几何 + 已渲染」的队列继续跑；队列非空时把 `last-range' 置空，迫使
+      ;; 本轮的 blocking 真正重做一遍范围（否则区间没变即早退，占位页会一直空白）。
+      (progn
+        (when seshat-reader--multipage-pending-renders
+          (setq seshat-reader--multipage-last-range nil))
+        (seshat-reader--multipage-clear-async-state)
+        ;; 同步路径的预取现在按开关分流（`--multipage-prefetch' 内部）：态 A 下
+        ;; 它同步取 spec、不入队、不排 timer，所以这里跑完的第二次清理只是兜底
+        ;; （防某条尚未覆盖的路径留下残留），不再是「丢掉预取页」的代价。
+        (prog1 (seshat-reader--multipage-sync-blocking window)
+          (seshat-reader--multipage-clear-async-state)))
+    (let* ((win (or window (selected-window)))
+           (range (and (window-live-p win)
+                       (not seshat-reader--multipage-syncing)
+                       (eq (window-buffer win) (current-buffer))
+                       (seshat-reader--multipage-visible-range win))))
+      (cond
+       ((null range) nil)
+       ((seshat-reader--multipage-async-overdue-p)
+        (seshat-reader--multipage-force-sync win))
+       ((equal range seshat-reader--multipage-last-range) range)
+       (t (seshat-reader--multipage-sync-async win range))))))
+
+(defun seshat-reader--multipage-sync-async (window range)
+  "Render the within-reach pages of RANGE and queue the rest (state B).
+
+WINDOW is the live window the range belongs to and RANGE is the cons
+\(FIRST . LAST) `seshat-reader--multipage-visible-range' returned for it.
+
+The two pages rendered here are the page point is on and the page one step
+further in `seshat-reader--multipage-scroll-direction', i.e. the one the
+reader is reading and the one the next scroll reveals; both are clamped into
+the document.  Every other page of the range gets its row first -- measured
+with `seshat-reader--page-size' and built at the size it will finally have, so
+the scroll extent is final before any pixel exists (decision D1/D2, and the
+reason T3 introduced the placeholder row) -- and is then queued.
+
+The queue is pruned to this range afterwards, which is what keeps pages the
+reader scrolled past from ever being rendered, and the pages that were not in
+the previous range get their failure count cleared so that a transient failure
+is never turned into a permanent one (the second clearing point the
+non-blocking-render invariant requires).
+
+Out-of-range rows are recycled exactly like the synchronous path does, and
+both the prefetch and the memory check run once the range is settled, so the
+buffer state after this function is the one the blocking path would leave,
+except that the pixels of the queued pages do not exist yet.
+
+The monitored range is returned."
+  (let ((seshat-reader--multipage-syncing t)
+        (first (car range))
+        (last (cdr range))
+        (previous seshat-reader--multipage-last-range)
+        (pages (number-sequence (car range) (cdr range))))
+    (setq seshat-reader--multipage-last-range range)
+    (let* ((point-page (or (seshat-reader--multipage-page-at-pos (point))
+                           (seshat-reader--multipage-page-at-pos
+                            (window-start window))
+                           first))
+           (direction (if (eq seshat-reader--multipage-scroll-direction -1)
+                          -1
+                        1))
+           (sync-pages (delq nil
+                             (list point-page
+                                   (seshat-reader--multipage-clamp-page
+                                    (+ point-page direction))))))
+      (dolist (page pages)
+        (if (memq page sync-pages)
+            (progn
+              (seshat-reader--multipage-render-page page nil window)
+              ;; 刚同步渲染完的页若还在队里（上一次登记的），立刻出队：它的像素
+              ;; 已经到位，再让 tick 处理一遍只是白跑一趟。
+              (seshat-reader--multipage-pending-remove page))
+          (seshat-reader--multipage-placeholder-row page window)
+          (seshat-reader--multipage-pending-add page))))
+    (dolist (entry (copy-sequence seshat-reader--pages))
+      (let ((page (car entry)))
+        (when (or (< page first) (> page last))
+          (seshat-reader--multipage-recycle-page page))))
+    (seshat-reader--multipage-prune-pending pages)
+    (dolist (page pages)
+      (when (and (not (and previous
+                           (>= page (car previous))
+                           (<= page (cdr previous))))
+                 (> (seshat-reader--multipage-render-failure-count page) 0))
+        (seshat-reader--multipage-reset-render-failure page)))
+    (seshat-reader--multipage-prefetch window)
+    (seshat-reader--multipage-check-memory window)
+    (seshat-reader--schedule-async-render (current-buffer))
+    (seshat-reader--multipage-note-pending-since)
+    range))
+
+(defun seshat-reader--multipage-force-sync (window)
+  "Render the whole visible range of WINDOW synchronously (state C).
+
+The timeout net: the queue has been non-empty for longer than
+`seshat-reader-render-async-timeout', so the timers are not doing their job
+\(or Emacs never went idle) and the pages they were supposed to fill in are
+still blank.  The queue and both timers are dropped first -- a half-rendered
+queue must not be resumed after a forced pass -- and the synchronous path is
+then run with `seshat-reader--multipage-last-range' bound to nil so that it
+really redoes the range instead of returning early on the unchanged one (the
+asynchronous step already recorded it).
+
+The pending timestamp is re-armed from whatever the forced pass left queued:
+the prefetch of the synchronous path still queues its page, and that page has
+its own full timeout window.
+
+The range the synchronous pass synchronised is returned."
+  (seshat-reader--multipage-clear-async-state)
+  (prog1 (let ((seshat-reader--multipage-last-range nil))
+           (seshat-reader--multipage-sync-blocking window))
+    (seshat-reader--multipage-note-pending-since)))
+
 
 (defun seshat-reader--multipage--show-page (page)
   "Put the window start and point on the row of PAGE and return its position.
@@ -2008,13 +3119,17 @@ buffer position of the row is returned."
         pos))))
 
 (defun seshat-reader--multipage-page-pixel-height (page)
-  "Return the pixel height of the row of PAGE, or 0 when it has no image.
+  "Return the pixel height of the row of PAGE, or 0 when it is unknown.
 
-PAGE is a 1-based page number.  A placeholder row (a page whose render failed)
-has no spec and therefore no height, which the scroll code treats as an empty
-page rather than dividing by an unknown."
-  (let ((spec (seshat-reader--multipage-page-spec page)))
-    (or (and spec (image-property spec :height)) 0)))
+PAGE is a 1-based page number.  The height comes from
+`seshat-reader--multipage-page-display-size', so a rendered page answers with
+the `:height' of its spec and a page whose pixels are still to be delivered
+answers with the measured height of the same page -- the two numbers are
+equal, which is what keeps the scroll extent stable while a page is filled in.
+0 means the size is unknown (a failed render of a page that was never
+measured); the scroll code treats that as an empty page rather than dividing
+by an unknown."
+  (or (cdr-safe (seshat-reader--multipage-page-display-size page)) 0))
 
 (defun seshat-reader--default-line-pixels (&optional window)
   "Return the pixel height of a normal text line in WINDOW.

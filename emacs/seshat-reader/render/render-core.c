@@ -2861,6 +2861,187 @@ emacs_page_image_spec(emacs_env *env, ptrdiff_t nargs, emacs_value *args,
 	return spec;
 }
 
+/**
+ * emacs_page_size - Report one page's display size without rendering it.
+ *
+ * The pixel-free counterpart of `emacs_page_image_spec'.  It answers the
+ * single question a two-phase multi-page layout asks before anything is
+ * rasterized — how many logical pixels does a page occupy at this scale
+ * and rotation — and it answers it in exactly the units a rendered spec
+ * reports in `:width'/`:height', so a placeholder row can take the
+ * image's place without the page height (and with it the scroll extent)
+ * moving when the pixels arrive later.
+ *
+ * The arithmetic is the render path's, step for step:
+ *
+ *   ctm     = fz_transform_page(page bbox, resolution, rotate)
+ *   device  = round(transform(page bbox, ctm))     [== pixmap size]
+ *   logical = (int)(device / frame_scale)
+ *
+ * with `resolution = fz_clamp(scale * 72, MINRES, MAXRES)' and
+ * `frame_scale' clamped to 1.0 exactly as `render_page_to_buffer' clamps
+ * it — both are load bearing for the equality above.
+ *
+ * ZERO SIDE EFFECTS, by construction.  It deliberately does NOT go
+ * through `acquire_doc_page' / `load_page_dl': that path couples
+ * `fz_bound_page' with `fz_new_display_list_from_page' inside one fz_try,
+ * so using it would build (and cache) a display list — the expensive half
+ * of a render — for every page merely probed for its height.  Here the
+ * page is loaded, bounded and dropped within the call, and nothing is
+ * written back: no DocPage, no display list, no pixmap, no decoration
+ * snapshot, and not even `current_page_number'.
+ *
+ * The MuPDF work runs on a cloned context, for the same reason
+ * `load_page_dl' and `render_page_to_buffer' do: `fz_load_page' parses
+ * untrusted page objects and can throw (a corrupt or encrypted document),
+ * and such a throw must not leave the document's own context with a
+ * pending error or a half-built object.  A clone shares the document's
+ * lock set, so this stays safe alongside any other reader of the same
+ * document, and `fz_drop_context' releases it on every exit path.
+ *
+ * PAGE is 1-based and validated by `resolve_page_arg'; SCALE goes through
+ * `extract_float_coerced' and must be finite; ROTATE, when given, must be
+ * 0, 90, 180 or 270.  Every refusal — including a document that is being
+ * reloaded — is a silent nil, exactly as in `emacs_page_image_spec'.
+ *
+ * @param env    Emacs module environment.
+ * @param nargs  Number of Elisp args (2 or 3).
+ * @param args   Elisp arguments: page, scale, optional rotate.
+ * @param data   Additional data (unused).
+ * Return:       A two-element list (WIDTH HEIGHT) in logical pixels, or nil.
+ */
+
+emacs_value
+emacs_page_size(emacs_env *env, ptrdiff_t nargs, emacs_value *args, void *data)
+{
+	(void)data;
+
+	DocState *doc_state = get_doc_state_ptr(env);
+
+	/* Same guards as `emacs_page_image_spec': the reload flag is the only
+	 * thing standing between us and a freed document, and a document with
+	 * no pages cannot answer a page question. */
+	if (!doc_state || doc_state->is_reloading)
+		return EMACS_NIL;
+
+	if (doc_state->pagecount <= 0)
+		return EMACS_NIL;
+
+	int page = 0;
+
+	if (!resolve_page_arg(env, args[0], doc_state->pagecount, &page))
+		return EMACS_NIL;
+
+	float scale = 0.0f;
+
+	if (!extract_float_coerced(env, args[1], &scale) || !isfinite(scale))
+		return EMACS_NIL;
+
+	int rotate = 0;
+
+	if (nargs >= 3)
+		{
+			float rotate_f = 0.0f;
+
+			if (!extract_float_coerced(env, args[2], &rotate_f))
+				return EMACS_NIL;
+
+			if (!(rotate_f == 0.0f || rotate_f == 90.0f
+			      || rotate_f == 180.0f || rotate_f == 270.0f))
+				return EMACS_NIL;
+
+			rotate = (int)rotate_f;
+		}
+
+	/* Identical resolution policy to the render path: SCALE is a multiple
+	 * of 72 dpi, clamped into MINRES..MAXRES. */
+	double resolution = fz_clamp((double)scale * 72.0, MINRES, MAXRES);
+
+	/* Identical clamping to `render_page_to_buffer': a non-positive or
+	 * tiny `frame_scale' would blow the logical size up past int range. */
+	float frame_scale = doc_state->frame_scale;
+
+	if (!(frame_scale > 0.01f))
+		frame_scale = 1.0f;
+
+	fz_context *ctx = fz_clone_context(doc_state->ctx);
+
+	if (!ctx)
+		return EMACS_NIL;
+
+	/* volatile for the same reason as in `load_page_dl': fz_try is
+	 * setjmp/longjmp based, so anything assigned inside it and read after
+	 * the block (or dropped in fz_always) must not live only in a register
+	 * that longjmp restores.  `bbox' is read after the block, but every read
+	 * is short-circuited by `ok', which is only set on the success path.
+	 * `bbox' itself is volatile too: -Wclobbered flags any non-volatile
+	 * object written between setjmp and longjmp, and the copy below is the
+	 * single place where it is read back into a calm local. */
+	fz_page *volatile loaded_page = NULL;
+	volatile fz_rect bbox = { 0, 0, 0, 0 };
+	volatile bool ok = false;
+
+	fz_try(ctx)
+		{
+			loaded_page = fz_load_page(ctx, doc_state->doc, page);
+			bbox = fz_bound_page(ctx, loaded_page);
+			ok = true;
+		}
+	fz_always(ctx)
+		{
+			if (loaded_page)
+				fz_drop_page(ctx, loaded_page);
+		}
+	fz_catch(ctx)
+		{
+			ok = false;
+		}
+
+	fz_drop_context(ctx);
+
+	if (!ok)
+		return EMACS_NIL;
+
+	/* Local copy so the value cannot be aliased to a clobbered register
+	 * slot, and so the geometry helpers get a calm, non-volatile input. */
+	fz_rect page_bbox = bbox;
+
+	if (!fz_is_valid_rect(page_bbox))
+		return EMACS_NIL;
+
+	/* Pure arithmetic from here on — no MuPDF objects, so nothing to drop
+	 * and nothing that can throw.  This is the same two steps
+	 * `fz_new_pixmap_from_display_list' performs internally to size its
+	 * pixmap (a page's display list is created with `fz_bound_page' as its
+	 * mediabox, which is why bounding the page and bounding its display
+	 * list agree). */
+	fz_matrix ctm = fz_transform_page(page_bbox, (float)resolution, rotate);
+	fz_irect device = fz_round_rect(fz_transform_rect(page_bbox, ctm));
+
+	int device_w = device.x1 - device.x0;
+	int device_h = device.y1 - device.y0;
+
+	/* A degenerate box (whole-page clip, or a throwaway MediaBox) has no
+	 * meaningful size; report it as "unknown" rather than as 0 x 0. */
+	if (device_w <= 0 || device_h <= 0)
+		return EMACS_NIL;
+
+	/* `(int)(int / float)' — integer division by a float, truncated, is
+	 * exactly what `render_page_to_buffer' does to the pixmap dimensions. */
+	int logical_w = (int)(device_w / frame_scale);
+	int logical_h = (int)(device_h / frame_scale);
+
+	if (logical_w <= 0 || logical_h <= 0)
+		return EMACS_NIL;
+
+	/* A plain two-element list (not a dotted pair), so the caller can use
+	 * `nth' 0/1 or `destructuring-bind' interchangeably. */
+	emacs_value dims[2] = { env->make_integer(env, logical_w),
+				env->make_integer(env, logical_h) };
+
+	return env->funcall(env, env->intern(env, "list"), 2, dims);
+}
+
 // Entrypoint for the dynamic module
 int
 emacs_module_init(struct emacs_runtime *runtime)
@@ -2992,6 +3173,25 @@ emacs_module_init(struct emacs_runtime *runtime)
 			     "is being reloaded all return nil silently. The "
 			     "current page, the window state, the page cache "
 			     "and every overlay are left unchanged.");
+
+	register_module_func(env, emacs_page_size,
+			     "seshat-reader-dyn--page-size", 2, 3,
+			     "Returns the display size of PAGE (1-based) at "
+			     "SCALE, a multiple of 72 dpi clamped to MINRES/72 "
+			     ".. MAXRES/72, as a two-element list (WIDTH "
+			     "HEIGHT) in logical pixels — the very units "
+			     "`seshat-reader-dyn--page-image-spec' reports in "
+			     "the spec's :width and :height, so a placeholder "
+			     "can take an image's place without the page "
+			     "height changing. Optional ROTATE must be 0, 90, "
+			     "180 or 270 and defaults to 0. Nothing is "
+			     "rasterized: no display list is built, no pixmap "
+			     "is allocated and no page cache entry is touched, "
+			     "which keeps this a microsecond-scale query. An "
+			     "out-of-range or non-integral PAGE, a non-numeric "
+			     "or non-finite SCALE, any other ROTATE value and "
+			     "a document that is being reloaded all return nil "
+			     "silently.");
 
 	// Register buffer-local variables.
 	permanent_buffer_local_var(env, "seshat-reader-current-doc-pagecount");

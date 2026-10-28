@@ -103,7 +103,7 @@
 - **版本**：`EMACS_MAJOR_VERSION` 为 **32**，环境结构体 `emacs_env_32`；32 相对 31 为**尾部追加成员**，ABI 向后兼容，故 `module-load` 无需改调用约定。
 - **为什么必须升级**：旧 31 版头文件**没有 `canvas_data` 成员**，无法读写 canvas 的像素缓冲——canvas 后端在编译期就过不了。
 - **备份**：原 31 版副本在 `/tmp/canvas-baseline/emacs-module.h.31.bak`（临时目录，**不入库**）。
-- **复核**：升级后逐个对照 `nm -D seshat-render-core.so` 的导出入口（T1 阶段 15 个；T7 删除 `--window-close` 后为 14 个）。
+- **复核**：升级后逐个对照 `nm -D seshat-render-core.so` 的导出入口（T1 阶段 15 个；T7 删除 `--window-close` 后为 14 个；2026-10-29 新增 `--page-size` 后为 **15 个**）。
 
 ### 本地改动摘要（迁移相关）
 
@@ -118,3 +118,11 @@
 | `render/*.d` | `-MMD -MP` 生成的依赖文件（`.c` 与头文件的依赖清单），`make clean` 会一并删除。**注意**：`.gitignore` 目前**未**覆盖 `*.d`，因此 `git status` 会把它们显示为未跟踪文件（建议补一条 `*.d`，属独立小改动）。 |
 
 **未升级的部分**：`render/` 下其余源码文件名、C 内部函数名（如 `get_reader_current_state`）、上游版权头一律保持原样（对 elisp 不可见，改名无收益）。
+
+### 新增模块入口 `seshat-reader-dyn--page-size`（2026-10-29，P2-B T1）
+
+- **入口数 14 → 15**（`emacs -Q --batch` 逐个 `fboundp` 实测；`nm -D` 导出符号同步增加 `emacs_page_size`）。
+- **签名**：`(seshat-reader-dyn--page-size PAGE SCALE &optional ROTATE)`，arity **2..3**；`PAGE` **1-based**（与 `--page-image-spec` / `--add-*` 同基数），`SCALE` 按 `fz_clamp(scale*72, MINRES, MAXRES)` 夹紧，`ROTATE` 仅接受 0/90/180/270。
+- **返回**：`(W H)` **两元素真列表**（`list` 构造，非 dotted pair），单位是**逻辑像素**——与 `--page-image-spec` 返回的 spec 的 `:width`/`:height` 同口径（36 组样本逐值相等，差 0）。
+- **零副作用**：走独立的轻量路径 `fz_load_page → fz_bound_page → fz_drop_page`（克隆 ctx + `fz_try`/`fz_always` 保证所有退出路径 drop），**不**调用 `acquire_doc_page` / `load_page_dl`，因此**不建 display list、不分配 pixmap、不写 `DocPage` 缓存、不动 `DocState`**（含 `current_page_number`）。实测 220 次调用中位 **0.0045–0.0103 ms**（4.5–10.3 µs），100 次调用后进程 RSS 增量 **0 kB**。
+- **失败语义**：非法/越界/非整数 `PAGE`、非数字/非有限 `SCALE`、异常 `ROTATE`、`is_reloading`、无文档——一律**静默 nil**（与 `--page-image-spec` 一致）。注意 `SCALE = 0` / 负数**不返回 nil**：它们与渲染路径一样被 `MINRES`（18 dpi）夹紧，返回该夹紧值下的尺寸（两入口逐值一致）。

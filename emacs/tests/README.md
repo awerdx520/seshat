@@ -76,15 +76,20 @@ make -C emacs/tests check-criteria
   `-L` 就会 load 失败、整文件 0 用例（也是假绿）。`Makefile` 里只把**存在**的目录
   加进 `-L`，换机器 / 未装某个包时不报错。
 
-## 当前基线（P1 批次 8 / T9 固化）
+## 当前基线（P1 批次 8 / T9 固化；P2-B T2 于 2026-10-29 更新）
 
 | 项 | 值 |
 |---|---|
-| 测试文件数 | **31** |
-| 用例总数 | **1213** |
+| 测试文件数 | **38** |
+| 用例总数 | **1345** |
 | unexpected / skipped | **0 / 0** |
-| `make -C emacs/seshat-reader clean all` | **EXIT 0**，`Warning` **24** 行（零新增基线） |
+| `make -C emacs/seshat-reader clean all` | **EXIT 0**，`Warning` **20** 行（零新增基线） |
 | 生产代码 checkdoc | **0** 诊断（`make all` 自带 checkdoc 步骤无输出） |
+
+P2-B T2 新增的 `seshat-reader-multipage-page-size-test.el`（12 例）只桩两个原生
+入口（`seshat-reader-dyn--page-size` / `seshat-reader-dyn--page-image-spec`），不用
+真实 PDF、不依赖已构建的 `.so`，因此在任何 `-Q --batch` 环境都可复现（不产生
+`skipped`）。
 
 基线变化时请同时更新本表，并在 `CHANGELOG` / 计划文件里记一句。
 

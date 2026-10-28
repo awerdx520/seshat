@@ -343,7 +343,11 @@
   "`--multipage-sync' 在区间不变时不再调用渲染入口。"
   (with-temp-buffer
     (seshat-reader-multipage-test--with-window-buffer
-      (let* ((seshat-reader-current-doc-pagecount 5)
+      ;; 本用例断言的是「区间内逐页同步渲染」的旧语义（T6 之前的唯一路径），
+      ;; 故关掉异步分派，走态 A —— 异步态的同名契约由
+      ;; `seshat-reader-multipage-async-render-test.el' 与 T6 的态 B 用例覆盖。
+      (let* ((seshat-reader-render-async nil)
+             (seshat-reader-current-doc-pagecount 5)
              (calls 0))
         (cl-letf (((symbol-function 'seshat-reader--page-spec)
                    (lambda (&rest _args)
@@ -371,6 +375,9 @@
   (with-temp-buffer
     (seshat-reader-multipage-test--with-window-buffer
       (let ((seshat-reader-current-doc-pagecount 20)
+            ;; 本用例断言「区间外的页行被回收 + 区间内页**都已渲染**」的同步语义
+            ;; （T6 之前的唯一路径），故显式走态 A；异步态下页行会先以占位态建立。
+            (seshat-reader-render-async nil)
             (seshat-reader--multipage-preload 1))
         (seshat-reader-multipage-test--insert-pages '(1 2 3 4 5 6 7))
         (cl-letf (((symbol-function 'seshat-reader--page-spec)
@@ -1735,6 +1742,24 @@ request returns a WIDTH x HEIGHT page scaled like the real renderer."
               (seshat-reader-multipage-test--fake-renderer ,counter ,width ,height)))
      ,@body))
 
+(defmacro seshat-reader-multipage-test--with-silent-timers (&rest body)
+  "Run BODY with the asynchronous render timers stubbed out.
+
+Since T5 `seshat-reader--multipage-prefetch' queues a page and asks
+`seshat-reader--schedule-async-render' to arm the idle and the periodic timer.
+Arming real ones inside a batch test would leave a repeating timer behind for
+the rest of the file, so every timer function is replaced by a no-op here; what
+the timers are armed with, and what drives the queue, is asserted by
+`seshat-reader-multipage-async-render-test.el'."
+  (declare (indent 0) (debug t))
+  `(cl-letf (((symbol-function 'run-with-idle-timer)
+              (lambda (&rest _args) 'fake-idle-timer))
+             ((symbol-function 'run-at-time)
+              (lambda (&rest _args) 'fake-render-timer))
+             ((symbol-function 'cancel-timer)
+              (lambda (&rest _args) nil)))
+     ,@body))
+
 (defun seshat-reader-multipage-test--scale-fixture (pages width height)
   "Geometry buffer of PAGES WIDTH x HEIGHT pages, ready for the scale commands.
 
@@ -2362,50 +2387,65 @@ rendered once, and the row shows the very same spec object after the way back
       (kill-buffer buffer))))
 
 (ert-deftest seshat-reader-multipage-test--geometry-prefetch-warms-next-page-in-direction ()
-  "The prefetch warms the page beyond the set in the scrolling direction.
+  "The prefetch queues the page beyond the set in the scrolling direction.
 
 Downwards that is the page after the last resident one, upwards the page before
-the first; the page is only cached, so the reader finds a bitmap ready when it
-scrolls one page further."
+the first.  Since T5 nothing is rendered on the scrolling path: the page is
+queued and the asynchronous pass -- driven by hand here -- puts the bitmap in
+the cache, so the reader finds it ready when it scrolls one page further."
   (let* ((fixture (seshat-reader-multipage-test--geometry-buffer '(2 3 4)))
          (buffer (car fixture))
          (counter (list 0)))
     (unwind-protect
         (with-current-buffer buffer
           (seshat-reader-multipage-test--with-fake-renderer counter 600 800
-            (setq-local seshat-reader--multipage-scroll-direction 1)
-            (seshat-reader--multipage-prefetch (selected-window))
-            (should (seshat-reader--multipage-spec-cached-p 5))
-            (should-not (seshat-reader--multipage-spec-cached-p 1))
-            ;; 清空后反向预取
-            (seshat-reader--page-spec-clear-cache)
-            (setq-local seshat-reader--multipage-scroll-direction -1)
-            (seshat-reader--multipage-prefetch (selected-window))
-            (should (seshat-reader--multipage-spec-cached-p 1))
-            (should-not (seshat-reader--multipage-spec-cached-p 5))))
+            (seshat-reader-multipage-test--with-silent-timers
+              (setq-local seshat-reader--multipage-scroll-direction 1)
+              (seshat-reader--multipage-prefetch (selected-window))
+              ;; 登记但未渲染：滚动这一步零像素成本。
+              (should (equal '(5) seshat-reader--multipage-pending-renders))
+              (should (= 0 (car counter)))
+              (seshat-reader--async-render-tick buffer)
+              (should (seshat-reader--multipage-spec-cached-p 5))
+              (should-not (seshat-reader--multipage-spec-cached-p 1))
+              ;; 清空后反向预取
+              (seshat-reader--page-spec-clear-cache)
+              (setq-local seshat-reader--multipage-scroll-direction -1)
+              (seshat-reader--multipage-prefetch (selected-window))
+              (should (equal '(1) seshat-reader--multipage-pending-renders))
+              (seshat-reader--async-render-tick buffer)
+              (should (seshat-reader--multipage-spec-cached-p 1))
+              (should-not (seshat-reader--multipage-spec-cached-p 5)))))
       (kill-buffer buffer))))
 
 (ert-deftest seshat-reader-multipage-test--geometry-prefetch-does-not-insert-rows ()
-  "Prefetching warms the cache without adding a page row.
+  "Prefetching queues the page without adding a page row.
 
 The resident rows stay exactly what the viewport asked for: an extra row would
-enlarge the layout (and the scroll range) for a page the reader has not reached."
+enlarge the layout (and the scroll range) for a page the reader has not reached.
+The row count also stays put after the asynchronous pass ran, because a queued
+page without a row is only cached."
   (let* ((fixture (seshat-reader-multipage-test--geometry-buffer '(2 3 4)))
          (buffer (car fixture))
          (counter (list 0)))
     (unwind-protect
         (with-current-buffer buffer
           (seshat-reader-multipage-test--with-fake-renderer counter 600 800
-            (let ((rows (length seshat-reader--pages)))
-              (setq-local seshat-reader--multipage-scroll-direction 1)
-              (seshat-reader--multipage-prefetch (selected-window))
-              (should (= rows (length seshat-reader--pages)))
-              (should (seshat-reader--multipage-spec-cached-p 5))
-              (should-not (assq 5 seshat-reader--pages)))))
+            (seshat-reader-multipage-test--with-silent-timers
+              (let ((rows (length seshat-reader--pages)))
+                (setq-local seshat-reader--multipage-scroll-direction 1)
+                (seshat-reader--multipage-prefetch (selected-window))
+                (should (= rows (length seshat-reader--pages)))
+                (should (equal '(5) seshat-reader--multipage-pending-renders))
+                (should-not (assq 5 seshat-reader--pages))
+                (seshat-reader--async-render-tick buffer)
+                (should (= rows (length seshat-reader--pages)))
+                (should (seshat-reader--multipage-spec-cached-p 5))
+                (should-not (assq 5 seshat-reader--pages))))))
       (kill-buffer buffer))))
 
 (ert-deftest seshat-reader-multipage-test--geometry-prefetch-skips-when-cached ()
-  "A page that is already cached is not rendered again by the prefetch.
+  "A page that is already cached is not queued by the prefetch.
 
 The prefetch exists to save a render, so it has to be free when there is nothing
 to warm: any cached entry of the page counts, whatever scale or rotation it was
@@ -2416,13 +2456,15 @@ rendered at."
     (unwind-protect
         (with-current-buffer buffer
           (seshat-reader-multipage-test--with-fake-renderer counter 600 800
-            (setq-local seshat-reader--multipage-scroll-direction 1)
-            ;; 先用不同 scale 把第 5 页放进缓存
-            (seshat-reader--page-spec 5 1.0)
-            (let ((after-warm (car counter)))
-              (seshat-reader--multipage-prefetch (selected-window))
-              (should (= after-warm (car counter)))
-              (should (seshat-reader--multipage-spec-cached-p 5)))))
+            (seshat-reader-multipage-test--with-silent-timers
+              (setq-local seshat-reader--multipage-scroll-direction 1)
+              ;; 先用不同 scale 把第 5 页放进缓存
+              (seshat-reader--page-spec 5 1.0)
+              (let ((after-warm (car counter)))
+                (seshat-reader--multipage-prefetch (selected-window))
+                (should (= after-warm (car counter)))
+                (should-not seshat-reader--multipage-pending-renders)
+                (should (seshat-reader--multipage-spec-cached-p 5))))))
       (kill-buffer buffer))))
 
 (ert-deftest seshat-reader-multipage-test--geometry-cache-bounded-while-scrolling ()
@@ -2443,14 +2485,15 @@ single page turn -- that is the virtualisation budget of decision D4."
             (seshat-reader-multipage-test--with-window-buffer buffer
               (with-current-buffer buffer
                 (seshat-reader-multipage-test--with-fake-renderer counter 600 800
-                  (seshat-reader-multipage-test--with-single-page-viewport
-                    (let ((limit (seshat-reader--multipage-cache-limit))
-                          (max-rows (+ (* 2 seshat-reader--multipage-preload) 1)))
-                      (dotimes (i 30)
-                        (seshat-reader--multipage-goto (1+ i))
-                        (should (<= (length seshat-reader--page-spec-cache) limit))
-                        (should (<= (length seshat-reader--pages) max-rows))
-                        (should (<= (car counter) (* 30 3)))))))))))
+                  (seshat-reader-multipage-test--with-silent-timers
+                    (seshat-reader-multipage-test--with-single-page-viewport
+                      (let ((limit (seshat-reader--multipage-cache-limit))
+                            (max-rows (+ (* 2 seshat-reader--multipage-preload) 1)))
+                        (dotimes (i 30)
+                          (seshat-reader--multipage-goto (1+ i))
+                          (should (<= (length seshat-reader--page-spec-cache) limit))
+                          (should (<= (length seshat-reader--pages) max-rows))
+                          (should (<= (car counter) (* 30 3))))))))))))
       (kill-buffer buffer))))
 
 (ert-deftest seshat-reader-multipage-test--geometry-sequential-scan-gets-cache-hits ()
@@ -2735,6 +2778,10 @@ T7 的验收是「不崩」：跨页选区的 `user-error' 属 T8，本批只要
     (unwind-protect
         (seshat-reader-multipage-test--with-window-buffer buffer
           (with-current-buffer buffer
+            ;; 自愈路径断言「sync 依视口范围重新渲染并插回页行」——这是态 A 的
+            ;; 语义，故关掉异步分派（异步下页行会先以占位态插回，像素后才到）。
+            ;; 用 buffer-local 置 nil：本 buffer 用完即 kill，不会泄漏到别的用例。
+            (setq-local seshat-reader-render-async nil)
             (cl-letf (((symbol-function 'seshat-reader-dyn--page-image-spec)
                        (lambda (page scale &optional _rotate)
                          (list 'image :type 'canvas :data nil

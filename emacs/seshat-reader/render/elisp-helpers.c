@@ -198,7 +198,13 @@ data2elisp_canvas(emacs_env *env, int data_w, int data_h, int logical_w,
 
 	/* `:data' 不传 → 缓冲惰性分配（Lisp 侧零常驻）；`:id' 一律省略
 	 * （实测传非符号会静默产出假 spec）。 */
-	emacs_value create_args[11]
+	/* `:scale' 必须显式给 1：缺省时 Emacs 把 spec 的 `:scale' 当作
+	 * `default'，再按 `image-scaling-factor'（默认 `auto'，即
+	 * frame-char-width/10）放大显示 —— 实测声明 612x792 的页在屏幕上占
+	 * 735x951，而布局层 `--multipage-page-pixel-height' 读的是声明
+	 * `:height'，页高因此系统性少算约 20%（滚动范围偏小、页底不可达）。
+	 * 给 1 后显示尺寸 == 声明尺寸，位图也不再被上采样。 */
+	emacs_value create_args[13]
 	    = { EMACS_NIL,
 		env->intern(env, "canvas"),
 		EMACS_T,
@@ -209,9 +215,11 @@ data2elisp_canvas(emacs_env *env, int data_w, int data_h, int logical_w,
 		env->intern(env, ":width"),
 		env->make_integer(env, logical_w),
 		env->intern(env, ":height"),
-		env->make_integer(env, logical_h) };
+		env->make_integer(env, logical_h),
+		env->intern(env, ":scale"),
+		env->make_integer(env, 1) };
 
-	emacs_value img = env->funcall(env, env->intern(env, "create-image"), 11,
+	emacs_value img = env->funcall(env, env->intern(env, "create-image"), 13,
 				       create_args);
 
 	/* 双自检之一：`create-image' 失败时会返回非 image（或已经 signal）。 */
