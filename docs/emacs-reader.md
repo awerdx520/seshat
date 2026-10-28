@@ -300,7 +300,7 @@ ETAF 渲染层是可选外部依赖：`Makefile` 先探测 `~/Workspace/emacs-ta
 
 - 页区间由 `seshat-reader-select--posn-page-extent` / `--selection-page-rects` 用 `seshat-reader--multipage-page-at-pos` 求出（首末点落页间分隔区时归**上一页**，与 P1 的页号派生同一口径，不做「更近页」判定）；文本按阅读顺序拼接、页间插**一个**换行，几何逐页裁剪后存进 `seshat-reader-select-last` 的新字段 `:page-rects`（元素 `(PAGE X0 Y0 X1 Y1)`），`:rect` / `:rects` 仍是**起点页**的几何（旧消费方零改动）。
 - 每页的页面坐标由该页**自身**的 `seshat-reader-select--page-space-size`（native × frame-scale）算出，它对 native 做 `seshat-reader-select--unrotate-size` 换回**未旋转**页面尺寸——**交换宽高只发生在这类出口为页面坐标的函数里**，`--display-scale` 取的是 spec ÷ native 的同向比值、不交换。跨页矩形的垂直高度**不做比例校准**（2026-10-28）：换算口径统一到逐页实际显示 scale 后，旧实现里「起点页 `extent / native`」的标定比例恒为 1，校准整段删除。
-- 写入 `location` 时按「是否跨页」分流：单页（含同页多矩形）仍是 `page:<n>;rect:…`，**与改造前逐字节一致**；跨页写 `pages:<a>-<b>;rect@<p>:…`（段按阅读顺序，见 `docs/api.md` §4.5.3）。批注列表与 ETAF 卡片的页码列显示 `a-b`，`RET` 跳**首页**。
+- 写入 `location` 时按「是否跨页」分流：单页（含同页多矩形）仍是 `page:<n>;rect:…`，**与改造前逐字节一致**；跨页写 `pages:<a>-<b>;rect@<p>:…`（段按阅读顺序，见 keystone 仓 `docs/api.md` §4.5.3）。批注列表与 ETAF 卡片的页码列显示 `a-b`，`RET` 跳**首页**。
 - 实例（页 1 两段 + 页 2 一段）：`pages:1-2;rect@1:50.00,100.00,545.50,140.00;rect@1:50.00,142.00,300.00,152.00;rect@2:50.00,80.00,545.50,120.00`。
 - 上限与降级：跨页形态按「页数 + 段数」计，超过写入端 500 段上限时降级为**只保留首页矩形**并 `display-warning`，批注正文同时截断到首页（避免「正文含第二页、高亮只在第一页」）。
 - **残余限制**（都记在 §12）：① 跨页选区的 `seshat:` 引用链接降级为起点页锚 `page:<a>` 并提示；② 跨页 explain / 翻译的**上下文**只覆盖起点页（翻译对象本身仍是全文）；③ 选区确认时的**高亮闪现**只落在起点页；④ Android 端不渲染 `pages:` 形态的批注。
@@ -407,7 +407,7 @@ Emacs 端**只显示**手写（无笔事件、无压感，输入永远在 Androi
 
 - **结果缓存（仅本会话内存）**：翻译与解释的结果按键 `(KIND PRESET LANGS REQUEST-TEXT)` 存在 `seshat-reader-translate--cache` 里——同一段内容、同一预设与语言对**再次打开不再请求**，直接按模板重绘面板并回显「使用缓存结果」；解释路径的 `REQUEST-TEXT` 是装配好的「上下文 + 原文 + 指令」串，因此**上下文不同即视为不同条目**（同一句原文在不同页、邻近文字不同，各存一份）。要跳过缓存重新生成按 `C-u`（`C-c C-t` / `C-c C-e` 的 `C-u` 前缀既读目标语言也强制重算）；想整体丢弃用 `M-x seshat-reader-translate-clear-cache`。缓存**不落盘**、重启 Emacs 即清空；posframe 承载下的流式结果不写缓存（面板路径恒为非流式，写入点在 `seshat-reader-translate--record-result` 的成功分支）。
 
-- **解释带同页上下文**：`C-c C-e` 送模型的是「结构化指令 + 同页邻近上下文（上下各 `seshat-reader-translate-context-lines` 行，上限 `seshat-reader-translate-context-max-chars` 字）+ 选区原文（上限 `seshat-reader-translate-explain-max-chars` 字）」，不再只是孤立片段；指令模板可用 `seshat-reader-translate-explain-prompt` 自定义（设 `nil` 退回「纯选区 + 预设引擎自带 prompt」的旧行为），关掉上下文用 `(setq seshat-reader-translate-context-enabled nil)`。**注意隐私**：默认会把同页邻近正文一并送出（见 [`llm.md`](llm.md)「隐私提示」）。
+- **解释带同页上下文**：`C-c C-e` 送模型的是「结构化指令 + 同页邻近上下文（上下各 `seshat-reader-translate-context-lines` 行，上限 `seshat-reader-translate-context-max-chars` 字）+ 选区原文（上限 `seshat-reader-translate-explain-max-chars` 字）」，不再只是孤立片段；指令模板可用 `seshat-reader-translate-explain-prompt` 自定义（设 `nil` 退回「纯选区 + 预设引擎自带 prompt」的旧行为），关掉上下文用 `(setq seshat-reader-translate-context-enabled nil)`。**注意隐私**：默认会把同页邻近正文一并送出（见 keystone 仓 `docs/llm.md`「隐私提示」）。
 - 依赖 go-translate：`seshat-reader-translate-preset`（默认 `reader`）与 `seshat-reader-translate-explain-preset`（默认 `reader-explain`）按名从 `seshat-reader-translate-presets` → `gt-preset-translators` 依次取用（seshat 自有表优先，故这两个预设不必进 gt 全局表）；预设通常定义在**用户配置侧**，缺失时翻译回退内置 youdao/google，解释需显式配置端点。gt 的中转 buffer `" *Seshat gt*"` 由包隐藏，用户无需改 `display-buffer-alist`。
 - 呈现方式由 `seshat-reader-translate-render`（默认 `sidebar`）决定：`sidebar` 写进面板内的**只读 Markdown 文本 buffer**（`gfm-view-mode` → `markdown-view-mode` → `text-mode` 降级链，原生折行/滚动/复制/isearch 可用，**不经 ETAF**）；`pop`（posframe 弹出、失焦消失）；`pin`（posframe 常驻）。取 `sidebar` 但 `seshat-reader-sidebar-enabled` 为 `nil` 时退回 `pop` 式 posframe。
 - 正文按模板渲染：翻译用 `seshat-reader-translate-template`（默认 `"%l\n\n%q\n\n---\n\n%t\n"`），解释用 `seshat-reader-translate-explain-template`（默认 `"%q\n\n---\n\n%t\n"`）。占位符 `%k` 标题、`%l` 语言对、`%q` 原文引用块、`%t` 正文；模板非法时回退纯正文并 `message` 警告；设 `nil` 表示不套模板。
@@ -537,7 +537,7 @@ P1 起阅读器不再「一次只显示一页 + 翻页」，而是把整本排�
 - **`uid:<前 8 位>…` 什么时候出现**：只在**已有的 uid 形态链接**查不到本地路径时（尚未下载、换了机器、或两套根配置事后不一致），链接描述与 `:export` 才回落为 `uid:<前 8 位>…`（如 `uid:01J8ZKQ2…`，uid 长度不大于 8 时原样输出 `uid:<uid>`）——它是「这一步查不到本地路径」的可辨识标识，**不是 bug，也绝不会是空串**；`:follow` 对 uid 形态会先按需下载（软依赖 `seshat-library`），故描述里的回落标识不妨碍打开。
 - `location` 与批注的 `location` **同源同构**，不新增解析器；doc-id 形态的 `<tag>:<相对路径>` 与批注 `document_id` 同源。
 - **`doc-id` 不得包含 `#` 或 `%`**：含这两个字符时生成链接直接 `user-error` 并提示重命名文件（不做百分号转义）。uid 形态不受此限（uid 字符集不含这两个字符）。
-- **`uid:` 是客户端协议前缀，不是根 tag**：服务端 `registry.Service.Resolve`（`internal/registry/service.go`）的解析优先级为四段——空 key 报错 → 裸 uid（26 位 Crockford Base32）→ **`uid:` 前缀 + 合法 uid** → `tag:path` / 默认根纯路径；`uid:` 之后不是合法 uid 时**回落** `tag:path`（因此根 tag 名为 `uid` 的配置仍然可用）。两个 uid 形态（裸 uid 与 `uid:<uid>`）都会被 `registry.RefreshRefs` 收录为引用边，`GET /api/refs` 不因改用前缀形态而缺边。客户端侧 `:follow` 由本端自己解析，不受影响。
+- **`uid:` 是客户端协议前缀，不是根 tag**：服务端 `registry.Service.Resolve`（keystone 仓 `internal/registry/service.go`）的解析优先级为四段——空 key 报错 → 裸 uid（26 位 Crockford Base32）→ **`uid:` 前缀 + 合法 uid** → `tag:path` / 默认根纯路径；`uid:` 之后不是合法 uid 时**回落** `tag:path`（因此根 tag 名为 `uid` 的配置仍然可用）。两个 uid 形态（裸 uid 与 `uid:<uid>`）都会被 `registry.RefreshRefs` 收录为引用边，`GET /api/refs` 不因改用前缀形态而缺边。客户端侧 `:follow` 由本端自己解析，不受影响。
 
 | 入口 | 键位 / 命令 | 行为 |
 |---|---|---|
@@ -827,7 +827,7 @@ uid 形态本身**不可读**，可读性由 org 链接描述承担（`[[seshat:
 
 **失败降级**：某个根的清单请求失败只 `display-warning` 并让该根**没有行**（不返回半份清单——半份清单配上「已下载 / 未下载」会误导用户去取一本其实已在远端的书），其余根照常汇总；一根拉不动不会让整个书架打不开。
 
-**取书事务**（`seshat-library-fetch`，六步固定顺序，任一步失败即中止）：uid → `(root . path)`（本地状态优先，缺失时问服务端）→ 本地根目录 → **越界校验**（`seshat-sync--local-path`，服务端下发的路径不可信）→ 整份下载（原子落位）→ 登记 `(root, path)` 与 base-blob（`ondemand` 根 blob **恒空串**）→ 落盘状态。网络失败 `display-warning` + 返回 nil；「根未配置目录 / 路径越界 / 服务端未登记该 uid」三种是 `user-error`。实现要点见 [`sync-protocol.md`](sync-protocol.md) 的「Emacs 客户端按需取书实现要点（M8-C）」。
+**取书事务**（`seshat-library-fetch`，六步固定顺序，任一步失败即中止）：uid → `(root . path)`（本地状态优先，缺失时问服务端）→ 本地根目录 → **越界校验**（`seshat-sync--local-path`，服务端下发的路径不可信）→ 整份下载（原子落位）→ 登记 `(root, path)` 与 base-blob（`ondemand` 根 blob **恒空串**）→ 落盘状态。网络失败 `display-warning` + 返回 nil；「根未配置目录 / 路径越界 / 服务端未登记该 uid」三种是 `user-error`。服务端侧的同步协议细节见 keystone 仓 `docs/sync-protocol.md` 的「Emacs 客户端按需取书实现要点（M8-C）」。
 
 **安全底线：根归属校验——只有 `ondemand` 根的书才能操作**：取书（`RET` / `u`）与删除本地副本（`d`）都先校验 uid 所属根在本地配置里的 mode 为 `ondemand`（`seshat-library--ondemand-root-p`），否则 `user-error`，**不碰磁盘、不发请求**。防的是「清单来源不可信」：`seshat-sync--local-path` 只保证「不越出根目录」，**不保证「这个 uid 该由这个根处理」**——服务端若在书库清单里塞一个 `mirror` 根 uid，用户按 `d` 会删掉未提交的笔记、按 `u` 会覆盖它。清单收集环节同步加固：`seshat-library--collect` **校验响应 `:root` 与请求 tag 一致**（不一致则丢弃该行并 `display-warning`），不再把响应的 `:root` 覆盖成请求 tag——「根」列同时是操作目标（`RET` / `u` / `d` 都按 uid 定位），显示值与实际归属分叉等于允许一行显示在 `books` 下而实际指向 `notes`。同一环节还用 `[0-9A-HJKMNP-TV-Z]{26}` 过滤形态不合法的 uid（uid 会被拼进 `GET /api/resources/%s`，不校验等于给同源 URL 注入留门）。
 

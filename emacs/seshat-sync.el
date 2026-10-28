@@ -314,7 +314,7 @@ nil（调用方据此跳过该项）。整个初始化过程**只调本函数一
 
 (defvar seshat-sync--read-only-roots nil
   "本次同步中被判定为只读（服务端 403 `root_read_only'）的根 tag 列表.
-只读根指 `ondemand' 根：任何写操作都会被拒（见 `docs/sync-protocol.md'），
+只读根指 `ondemand' 根：任何写操作都会被拒（见 keystone 仓 `docs/sync-protocol.md'），
 因此**不重试**、也不重复告警。由 `seshat-sync--mark-root-read-only' 写入，
 `seshat-sync--read-only-root-p' 读取；每次同步入口应用
 `seshat-sync--reset-read-only-roots' 清空（服务端配置可能在两次同步之间变化）。")
@@ -380,7 +380,7 @@ SINCE 为本次请求用的值，ITEMS 为本次返回的资源列表。
 
 - 本页最后一项的 mtime 与 SINCE 相同（同秒，且该秒内的记录多于一页）：用
   `since = mtime' 会反复取到同一批记录，只能 `(1+ mtime)'。**代价是该秒内剩余
-  的记录被跳过**，这是 `docs/api.md' §1.5 记录在案的已知行为，由 changes 追平
+  的记录被跳过**，这是 keystone 仓 `docs/api.md' §1.5 记录在案的已知行为，由 changes 追平
   （T1c）补齐；本函数**不做**任何「补救」尝试（补救只会重新引入死循环）。
 - ITEMS 为空但 `:has-more' 为真（异常响应）：没有 mtime 可用，只能
   `(1+ since)'，保证游标严格前进。
@@ -930,7 +930,7 @@ EVENT 是 `seshat-rest-changes' 解出的事件 plist（`:seq' `:uid' `:op' `:ro
 ;; push 只遍历 `seshat-state-dirty-uids'（H3：不做全量扫描），逐 uid 做**条件
 ;; 写**——无 `:base-blob' 时发 `If-None-Match: *'（仅创建），有 `:base-blob'
 ;; 时发 `If-Match: \"<blob>\"'（条件覆盖）。两条条件头不能并存：服务端两者都
-;; 校验，任一不成立即 412（`docs/api.md' §8.2）。
+;; 校验，任一不成立即 412（keystone 仓 `docs/api.md' §8.2）。
 ;;
 ;; 本节的**不变量**（改动时必须保持）：
 ;;
@@ -1458,7 +1458,7 @@ TAGS 为本次扫描成功的 mirror 根 tag 列表（`ondemand' 根不参与）
 代价是同尺寸同 mtime 的两个不同文件会被误判为 rename，由计划 C 用 blob 精化）：
 
 - **必须同根**：`move-resource' 的目标路径是「相对同一个根」的
-  （`docs/api.md' §15），跨根的「改名」只能表达成删 + 建，不能上报 move；
+  （keystone 仓 `docs/api.md' §15），跨根的「改名」只能表达成删 + 建，不能上报 move；
 - 状态基线缺 `:size' / `:mtime'（刚建索引、从未推送过）时**不配对**：显式要求
   两者都是数字，否则 `nil' 与畸形值会让不相干的条目互配（`nil' 与 `nil' 相等，
   一旦某天新增项也带 nil 就会误配）。"
@@ -1484,7 +1484,7 @@ ITEM 为 `(:uid :root :path :size :mtime)'，TARGET 为同根下的新相对路�
   remap 本身既不清 dirty 也不置 dirty）；
 - `conflict' — 409（`:conflict' 为 `state-conflict'）：**不重试**——服务端的
   `UNIQUE(root, path)' 可能被墓碑占着，而**物理移动可能已经完成**
-  （`docs/api.md' §15 的已知限制），重试只会再得一个 409。此时**不 remap**：
+  （keystone 仓 `docs/api.md' §15 的已知限制），重试只会再得一个 409。此时**不 remap**：
   本地状态与服务端真实状态此刻不一致，贸然改本地会让下一轮把文件推到错误位置；
   只 warning 建议先 rescan；
 - `skipped` — 403（`:read-only-root'）：整根标只读（与 T1a / T1b / T2 共用同一

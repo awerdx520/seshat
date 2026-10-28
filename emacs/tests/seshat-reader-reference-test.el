@@ -763,7 +763,7 @@ buffer 启用 `org-mode'，`point' 置 `point-min'，便于用 `search-forward' 
 (ert-deftest seshat-reader-reference-test--parse-link-uid-excluded-letters-falls-back ()
   "`uid:' 后是含 I / L / O / U 的 26 位串时回落 doc-id 形态.
 uid 的权威字符集是 Crockford Base32 `[0-9A-HJKMNP-TV-Z]'（排除 I/L/O/U），
-不是 `[0-9A-Z]'（见服务端 `internal/registry/uid.go:29'）。"
+不是 `[0-9A-Z]'（见 keystone 仓 `internal/registry/uid.go:29'）。"
   (dolist (uid '("01J8ZKQ2ABCDEFGHIJKLMNOPQR"   ; 含 I / L / O
                  "01J8ZKQ2ABCDEFGHJKMNPQRSTU"))  ; 含 U
     (should (= 26 (length uid)))

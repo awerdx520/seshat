@@ -101,7 +101,7 @@
                  \"updated_at\": \"2026-10-18T11:00:00Z\",
                  \"deleted_at\": \"\"}],
     \"has_more\": true}"
-  "`GET /api/resources' 的成功响应体样例（字段与 docs/api.md §5.1 一致）。")
+  "`GET /api/resources' 的成功响应体样例（字段与 keystone 仓 docs/api.md §5.1 一致）。")
 
 (defconst seshat-rest-test--change-json
   "{\"changes\": [{\"seq\": 1042,
@@ -115,7 +115,7 @@
                   \"changed_at\": \"2026-10-18T11:00:00Z\"}],
     \"next_cursor\": 1042,
     \"has_more\": false}"
-  "`GET /api/changes' 的成功响应体样例（字段与 docs/api.md §9 一致）。")
+  "`GET /api/changes' 的成功响应体样例（字段与 keystone 仓 docs/api.md §9 一致）。")
 
 ;;; seshat-rest-roots
 

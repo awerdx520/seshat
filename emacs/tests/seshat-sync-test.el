@@ -1423,7 +1423,7 @@ NAME 用服务端写法（如 \"If-Match\"），比较时大小写不敏感。"
 
 (ert-deftest seshat-sync-test-push-new-file-uses-if-none-match ()
   "无 `:base-blob' 时只发 `If-None-Match: *'（仅创建），不发 `If-Match'。
-两个条件头并存会让服务端**恒回 412**（docs/api.md §8.2）。"
+两个条件头并存会让服务端**恒回 412**（keystone 仓 docs/api.md §8.2）。"
   (seshat-sync-test--with-state
     (seshat-state-set-roots (list (list "notes" seshat-sync-test--dir "mirror")))
     (seshat-sync-test--write-local "a.org" "本地内容\n")

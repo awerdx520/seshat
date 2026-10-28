@@ -46,7 +46,7 @@
 ;;
 ;; uid 形态的判别靠字符集白名单而不是「有没有 `uid:' 前缀」：`uid:' 之后到
 ;; 第一个 `#' 之前的部分必须是 26 位 Crockford Base32
-;; （`[0-9A-HJKMNP-TV-Z]'，排除 I/L/O/U；服务端 `internal/registry/uid.go:29'）
+;; （`[0-9A-HJKMNP-TV-Z]'，排除 I/L/O/U；keystone 仓 `internal/registry/uid.go:29'）
 ;; 才判 uid 形态，否则回落 doc-id 形态——这样把根标签取名为 `uid' 仍是合法的。
 ;;
 ;; 转义不变量：`document_id' **不得包含 `#' 与 `%'**。本模块禁用任何百分号
@@ -153,7 +153,7 @@ visiting buffer 时无从得知「当前 headline」与光标，一并回退为
 (defconst seshat-reader-reference--uid-format-regexp
   "\\`[0-9A-HJKMNP-TV-Z]\\{26\\}\\'"
   "服务端 uid 的权威形态：26 位 Crockford Base32，排除 I / L / O / U.
-字符集逐字取自服务端 `internal/registry/uid.go:29' 的
+字符集逐字取自 keystone 仓 `internal/registry/uid.go:29' 的
 `^[0-9A-HJKMNP-TV-Z]{26}$'（依据见 `docs/adr/0003-uid-identity-model.md:18'）；
 `seshat-rest.el' 里既有的 `[0-9A-Z]' 写法是不精确的，一律以服务端代码为准。
 本常量只做**形态校验**（解析判别与构造前置条件），不提供生成能力。

@@ -8,7 +8,7 @@ import org.junit.Test
 /**
  * [formatRfc3339Millis] / [parseRfc3339Millis] 的纯 JVM 单测。
  *
- * 核心约束：**输出必须只到秒、不含小数秒**。服务端 `internal/storage/state.go` 用
+ * 核心约束：**输出必须只到秒、不含小数秒**。keystone 仓 `internal/storage/state.go` 用
  * `time.RFC3339` 布局严格解析 `updated_at`，带小数秒会被判 `invalid_argument`（HTTP 400），
  * 因此这里对格式做逐字符级别的硬断言，而不只是「能被解析」的宽松断言。
  */

@@ -1,5 +1,7 @@
 # 架构设计
 
+> **服务端架构已迁出**：服务端（REST/WebDAV/存储/身份登记/路径安全/模块装配）的架构说明见 keystone 仓 `docs/architecture.md`。本文件只描述客户端（Emacs + Android）架构。
+
 ## 概述
 
 个人笔记同步系统是单用户、云 VPS 自托管的个人知识中枢，三端协作 + LLM 增值：
@@ -19,108 +21,7 @@
 7. 对外 WebDAV：可读写 + 范围受限（笔记目录 + 文件类型白名单）+ 每次写自动 commit
 8. LLM 后端：混合（云端 API + 本地处理节点），本地节点为纯推理节点、结果明文回传，无 E2EE（ADR-002）
 
-## 模块划分（服务端）
-
-| 模块 | 职责 |
-|---|---|
-| `cmd/server` | 入口：装配配置、日志、存储、git 版本库、索引、认证与路由（装配失败即退出） |
-| `internal/config` | 配置加载（config.yaml + 环境变量覆盖），含 `webdav.roots` 归一化与校验 |
-| `internal/auth` | 单用户认证（主令牌 + 可选节点令牌） |
-| `internal/storage` | SQLite(SQLCipher) + 文件系统 + git 版本库；M7 新增身份三表（见下） |
-| `internal/logging` | 结构化日志与稳定错误码（`logging.Code`） |
-| `internal/webdav` | WebDAV 服务：内部 `/dav/` 与对外 `/public/` 双出口，写后 commit + FTS 索引 + **registry 钩子** |
-| `internal/api` | REST API：状态、资源登记、路径解析、根映射、文件读写、变更流、引用、维护重扫等端点类别（M7 新增后七类） |
-| `internal/index` | 全文索引 FTS5（仅覆盖笔记根） |
-| `internal/llm` | LLM 接入层（云端 + 本地处理节点） |
-| `internal/registry` | **M7 新增**：文件身份与增量同步地基——uid 生成/校验、事件应用（`resources` + `changes` 同事务）、引用解析（`refs`）、文件系统 → 登记表的 bootstrap / rescan |
-| `internal/pathguard` | **A 批新增**：「仓库内相对路径」安全规则的唯一实现（`CleanRel` / `IsDotName` / `HasDotSegment` + `Options`），五个入口改为薄包装；只依赖标准库 |
-
-**`internal/storage` 的三张新表**（v6 单条迁移建档；v7 只重建状态表，不动这三张）：
-
-| 表 | 键 | 职责 |
-|---|---|---|
-| `resources` | `uid` 主键 + `UNIQUE(root, path)` | 服务端权威文件身份登记：uid 跨改名稳定，`path` 是可变属性，删除写墓碑（`deleted_at`）不物理删行 |
-| `changes` | `seq INTEGER PRIMARY KEY AUTOINCREMENT` | 全局单调变更日志（`create`/`update`/`rename`/`delete`），客户端游标的唯一基准，无 TTL |
-| `refs` | `(source_uid, source_location, target_uid, target_location)` | 引用图：`seshat:` 链接解析结果的落地，支持「我引用了谁 / 谁引用了我」双向查询 |
-
-`internal/webdav` 的 **registry 钩子**（`registryAfterWrite`）包在 commit 钩子外层、FTS 索引钩子内层，仅 2xx 写响应生效：把「文件已落盘」的事实登记为身份与事件，与 REST 写路径共用同一个 `registry.Apply`，因此两个出口写入同一文件得到同一个 uid。
-
-`internal/api` 的新端点类别（细节见 [`docs/api.md`](api.md)）：资源登记（`/api/resources`、`/api/resources/{uid}`）、路径解析（`/api/resolve`）、根映射（`/api/roots`）、文件读写（`/api/files/{path...}`、`/api/resources/{uid}/move`）、变更流（`/api/changes`）、引用（`/api/refs`）与维护（`/api/resources/rescan`）。
-
-## 路径安全：`internal/pathguard` 单一真源
-
-**背景（A 批，2026-10-26）**：同一套「仓库内相对路径」不变量（拒 NUL、拒 `..` 段、拒 `.git`
-段与点段、`path.Clean` 折叠）此前有**五份**实现，分散在五个包里，靠注释「两处必须同步修改」
-维系：
-
-| 入口 | 位置 | 历史形态 |
-|---|---|---|
-| REST 文件端点 | `internal/api/files.go` 的 `cleanRelPath` | TrimSpace + 自己的判定 + `logging` 错误码包装 |
-| 登记表键规范化 | `internal/registry/service.go` 的 `normalizeResourcePath` | 同上 |
-| WebDAV 出口策略 | `internal/webdav/policy.go` 的 `hasDotSegment` | `path.Clean` **折叠** `..`，只判点段 |
-| bootstrap 逐项判定 | `internal/registry/bootstrap.go` 的 `isDotName` | 单段名字判定 |
-| 版本层路径解析 | `internal/gitver/version.go` 的 `resolve` / `resolveAny` | 折叠 `..`，并额外拒「指向仓库根」 |
-
-**现状**：规则本体唯一——`pathguard.CleanRel(rel, Options)`（另有 `IsDotName` 与
-`HasDotSegment` 两个便捷判定）。五个入口都是**薄包装**：保留原函数名与签名（调用点与测试
-大量按这些名字构造），只负责「TrimSpace（部分入口）+ 把 pathguard 的哨兵错误包成本入口既有的
-错误码与中文文案」。**对外错误码与中文文案零变化**——`docs/api.md` 与 `docs/errors.md` 的
-契约未动。
-
-`Options` 的三个开关**零值即最严格**（拒空、拒 `..` 段、拒点段），且**只能放宽、不能收紧**：
-
-| 开关 | 放宽的语义 | 谁需要它 |
-|---|---|---|
-| `AllowEmpty` | 规范化结果为空时返回 `""` 而非报错 | WebDAV 挂载根本身、`gitver` 的仓库根 |
-| `AllowParentSegments` | `..` 段**折叠**而不是拒绝（`a/../b` → `b`） | WebDAV 出口、`gitver`（与历史 `path.Clean` 语义逐字等价） |
-| `AllowDotSegments` | 允许 `.git` 与以 `.` 开头的段 | `gitver`（版本表达式可含点名字） |
-
-两处「折叠 `..` 而非拒绝」是**显式传参**的例外，不靠零值兜底：`HasDotSegment` 内部传
-`AllowParentSegments: true`（否则 `a/../b` 会被拒，是 WebDAV 出口的行为变更），`gitver` 的
-`resolve` 传三个开关全开。它们与历史实现**逐字节等价**——抽取时用 12 个输入（`a/../b`、
-`../x`、`a/b/..`、`.git/x`、`A.GIT/x`、`.hidden`、含 NUL、纯空白、`//a.org`、`/a.org`、
-`a/./b`、`a//b`）逐条比对改动前后输出，无一差异；`HasDotSegment` 改传 `AllowDotSegments:
-true` 后 13 个输入 0 差异（见 `openspec/decisions.md` 2026-10-26 条）。
-
-**不变量**：**新增任何路径入口都必须调用 `pathguard`**，不得自写 `path.Clean("/"+…)` 或
-自己拼点段判定。判断「这个入口算不算路径入口」的判据是「入参是否来自客户端或文件名」——
-新增 HTTP 端点、新的 WebDAV 包装层、新的版本查询入口都算。测试侧对应 `internal/pathguard`
-的表驱动拒绝矩阵，它是不变量的唯一可机械检查形态。
-
-**已知未收敛（技术债，非本批范围）**：下面三处仍是**纯折叠**（`path.Clean` 去前导斜杠，不判
-点段、不判 `..`），尚未改为调用 pathguard：
-
-| 位置 | 现状 |
-|---|---|
-| `internal/gitver/merge.go` 的 `cleanTreePath` | git tree 内条目名规范化，只折叠 |
-| `internal/webdav/symlink.go` 的 `cleanRel` | 软链守卫里的请求路径规范化，只折叠 |
-| `internal/webdav/versioned.go` 的 `blobPath` | 版本化包装层的 blob 路径拼接，只折叠 |
-
-三者的入参都先经过各自出口的 pathguard 判定或来自 git tree（非客户端直传），因此当前不构成
-绕过；但仍记在 `openspec/tech-debt.md`，作为「路径规则单一真源」这条技术债的残余。
-
-## 身份与增量同步（M7）
-
-M7 把「按路径 / 内容哈希识别文件」换成「服务端权威 **uid** 识别文件」，把「客户端全量遍历比对」换成「**全局游标**拉增量」。本节只列要点，完整契约见 [`docs/sync-protocol.md`](sync-protocol.md)，设计依据见 [ADR-003](adr/0003-uid-identity-model.md)（uid 身份模型）与 [ADR-004](adr/0004-incremental-change-log.md)（变更日志与游标）。
-
-1. **uid 是身份，路径是属性**：uid 由服务端生成（16 字节随机 → 26 位 Crockford Base32），改名/移动只改 `resources.path`；删除写墓碑（`deleted_at`）不物理删行，同一路径重建时复用原 uid。
-2. **三张表承载三件事**：`resources`（身份登记）、`changes`（变更日志）、`refs`（引用图）；状态表 `reading_progress`/`annotations` 在 v7 起直接以 uid 为键。
-3. **单一全局游标**：`changes.seq` 跨全部根共用一个单调递增序列，客户端只持久化一个整数 `cursor`；`changed_at` 不是游标。
-4. **多根**：首根 `mirror`（笔记根，WebDAV 全量镜像 + FTS + git，可写），其余 `ondemand`（书库根，只经 REST 按需读，写请求 → `403 root_read_only`）。
-5. **写路径顺序固定**：落盘 → commit → registry → refs。登记是**派生状态**且失败只记日志（不改变已发出的响应），缺口由 `POST /api/resources/rescan` 兜底修复。
-6. **状态 API 只接受 uid**：形态非法 → `400 invalid_uid`；形态合法但未登记/已墓碑 → `404 unknown_uid`（破坏性变更，见 `docs/api.md` §14）。
-
-服务端内部写入顺序（WebDAV 与 REST 共用）：
-
-| # | 步骤 | 实现位置 |
-|---|---|---|
-| 1 | 落盘 + commit（同一持锁临界区） | `gitver.WriteAndCommit` / `RenameAndCommit` / `RemoveAndCommit` |
-| 2 | 登记身份与变更事件（单事务 upsert `resources` + append `changes`） | `registry.Apply` |
-| 3 | `.org` 写成功后**整份替换**该源的引用 | `registry.RefreshRefs` / `ClearRefs` |
-
-其它既有的同步通道不变：文件（org / 附件 / 电子书）走 WebDAV 或 REST 文件端点、ETag 乐观锁；状态（阅读进度 / 批注）走 REST、后写覆盖 + 时间戳冲突检测；附件（二进制）按内容寻址存储（SHA256）且「附件清单」纳入 git。
-
-### 客户端侧批注同步约定（离线优先）
+## 客户端侧批注同步约定（离线优先）
 
 Emacs 阅读器（`seshat-reader`）的批注同步在客户端侧叠加一层**离线队列**，用于吸收服务端不可用时的创建/删除操作。约定如下：
 
@@ -169,7 +70,7 @@ M8-C 在 M8-A/M8-B 之上新增**一层**：`emacs/seshat-library.el`（项目�
 
 | 层 | 文件 | 职责 |
 |---|---|---|
-| 数据层 | `emacs/seshat-library.el`（`seshat-library--roots` / `--remote-entries` / `--local-state` / `seshat-library-fetch`） | 读远端 `ondemand` 根清单（`:since-mtime` 翻页）、判本地三态、按需取书（六步事务，见 [`docs/sync-protocol.md`](sync-protocol.md)「Emacs 客户端按需取书实现要点（M8-C）」） |
+| 数据层 | `emacs/seshat-library.el`（`seshat-library--roots` / `--remote-entries` / `--local-state` / `seshat-library-fetch`） | 读远端 `ondemand` 根清单（`:since-mtime` 翻页）、判本地三态、按需取书（六步事务，见 [`docs/emacs-reader.md`](emacs-reader.md)「书架：按需取书」） |
 | UI 层 | 同一文件的 `seshat-library-mode`（`tabulated-list-mode` 派生）+ `seshat-library` / `-open-at-point` / `-refresh-at-point` / `-delete-local-at-point` | 书架 buffer `*Seshat Library*`：四列（书名 / 根 / 大小 / 状态）、`RET` / `u` / `d` / `g` / `q` 五键 |
 
 **依赖方向（单向，无环）**：
@@ -211,11 +112,11 @@ M8-C 在 M8-A/M8-B 之上新增**一层**：`emacs/seshat-library.el`（项目�
 
 **与批注 `location` 的同构关系**：批注的 `location` 是**页锚 + 可选几何尾段**——形如 `page:<n>;rect:<x0>,<y0>,<x1>,<y1>`（页锚 `page:<n>` 1-based、唯一导航真值；`rect:` 段是可选几何、页面坐标、只供渲染），链接片段**直接复用同一字符串**（引用锚复用，不新增解析器）。批注侧唯一的构造点是 `seshat-reader-annotation--anchor`（2026-10-25 由 `--location` 改名，语义收窄为「页锚 + 可选几何尾段」；守 `location` 长度上限的 defconst `seshat-reader-annotation--location-max-length` 保留原名，它守的是 API 字段）。批注列表的行携带该字符串（文本属性），故「批注 → 引用」取值不触网；`page:` 段直接传给 `seshat-reader-goto-page`，`rect:` 段在 M11 只做数据保留，自 M12 起在 Emacs 客户端渲染为页面半透明高亮，`ink:` 段自 2026-10-25 起同样渲染为页面手写笔迹（见「Emacs 阅读器：展示层与渲染层（M12）」节与「搜索与 ink 渲染流程」节）。
 
-**双形态（M7 起）**：`<target>` 可以是 **uid**（服务端权威身份，如 `seshat:01J8ZK4Q7M2X9VYB3TR6NDW5PC#page:3`）或 **doc-id 文本**（`tag:path` 或纯 path，人可读、可手写）。服务端解析优先级为 **uid → `tag:path` → 纯 path（默认根）**（`registry.Resolve`）：uid 形态跨改名稳定，doc-id 形态在改名后失效，需重新构造。含 `#`/`%` 的非法 target 仍按上述规则拒绝。
+**双形态（M7 起）**：`<target>` 可以是 **uid**（服务端权威身份，如 `seshat:01J8ZK4Q7M2X9VYB3TR6NDW5PC#page:3`）或 **doc-id 文本**（`tag:path` 或纯 path，人可读、可手写）。**客户端视角**：uid 形态跨改名稳定，doc-id 形态在文档改名后失效、需重新构造，故客户端产出链接时优先 uid。服务端侧的解析优先级（uid → `tag:path` → 纯 path）与解析实现见 keystone 仓 `docs/architecture.md`。含 `#`/`%` 的非法 target 仍按上述规则拒绝。
 
-**客户端新增的 `uid:` 前缀（M8-C）**：Emacs 端产出的 uid 形态写作 `seshat:uid:<uid>[#<location>]`——多一个 `uid:` 前缀，既让「根 tag 恰好叫 `uid`」的 doc-id 不被误判（判别靠 `uid:` 之后是否匹配 26 位 Crockford Base32），也让链接形态在文本上一眼可辨。**服务端 `registry.Resolve` 已识别两种 uid 形态**（M8-C T8）：裸 uid（`IsUID`）与客户端产出的显式前缀 `uid:<uid>`（`uid:` 之后须为合法 26 位 Crockford Base32）；`uid:` 之后不合法时**回落** `tag:path`，因此根 tag 名为 `uid` 的配置仍可用。因此 `registry.RefreshRefs` 对两种 uid 形态都能建立引用边，`GET /api/refs` 与客户端产出的链接形态一致。
+**客户端新增的 `uid:` 前缀（M8-C）**：Emacs 端产出的 uid 形态写作 `seshat:uid:<uid>[#<location>]`——多一个 `uid:` 前缀，既让「根 tag 恰好叫 `uid`」的 doc-id 不被误判（判别靠 `uid:` 之后是否匹配 26 位 Crockford Base32），也让链接形态在文本上一眼可辨。服务端对 `uid:<uid>` 显式前缀的识别与「`uid:` 之后不合法时回落 `tag:path`」的规则见 keystone 仓 `docs/architecture.md`；客户端只需保证前缀形态合法，`GET /api/refs` 的返回与客户端产出的链接形态一致。
 
-**refs 表由写路径维护**：`.org` 写入成功后，服务端解析全文 `seshat:` 链接并用 `registry.RefreshRefs` **整份替换**该源的全部引用（先删后插、单事务）；文件被删除或从 `.org` 改成其它扩展名时清空（`ClearRefs`）。目标解析不到只跳过该条（链接可以指向尚未同步的文档），故 `refs` 是**尽力而为**的派生数据，解析失败不阻塞写响应。查询走 `GET /api/refs?uid=&direction=in|out`。
+**refs 表的维护在服务端**：`.org` 写入成功后，服务端解析全文 `seshat:` 链接并整份替换该源的引用（`RefreshRefs` / `ClearRefs`），细节见 keystone 仓 `docs/architecture.md`。客户端只需正确产出链接形态；查询走 `GET /api/refs?uid=&direction=in|out`（响应结构见 keystone 仓 `docs/api.md`，错误码见 [`docs/SERVER-CONTRACT.md`](SERVER-CONTRACT.md)）。
 
 **Emacs 侧的双值分工**：`seshat-reader-annotation--uid`（路径 → `GET /api/resolve` → uid，`file-truename` 内存缓存）只用于状态 API；`seshat-reader-annotation--doc-id`（文件 → `tag:path`）曾只用于显示与链接文本。二者分别落在列表 buffer 的 `seshat-reader-annotation-list-uid` 与 `seshat-reader-annotation-list-document-id`。**M8-C 起链接身份也走 uid**：`seshat-reader-reference.el` 不再是「零改动」的旁观者，新增单一身份入口 `seshat-reader-reference--identity`（按 `seshat-reader-annotation-roots` 得 `(tag . 相对路径)` → 零网络 `seshat-state-uid-for-path` 查 uid），产出链接与链接描述时优先 uid 形态、查不到回落 doc-id 形态（见「书架与按需取书（M8-C）」节与 [`docs/emacs-reader.md`](emacs-reader.md) §8）。
 
@@ -400,5 +301,4 @@ M12 把 M11 的「单个底部面板」升级为「左目录 / 右信息 / 中�
 ## 数据流
 
 - 桌面端/Android 经 WebDAV 同步文件，经 REST 同步阅读进度/批注
-- 服务端 WebDAV 写操作后自动 git commit（记录来源），ETag 用工作区内容即时 blob hash
-- 敏感/需本地模型任务经任务队列路由到本地处理节点，结果明文回传服务端
+- **服务端侧**的数据流（WebDAV 写后自动 git commit、ETag 用工作区内容即时 blob hash、敏感/本地模型任务经任务队列路由到本地处理节点）见 keystone 仓 `docs/architecture.md`

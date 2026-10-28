@@ -7,7 +7,7 @@ package com.seshat.app.reader
  * UI 侧只负责「读 store → 映射成 [AnnotationItem] → 调 [AnnotationGrouping.group] → 渲染」。
  *
  * 设计要点：
- * - **一笔一条**：`kind=ink` 的批注在服务端是一笔一条（见 `docs/api.md §4.5.1`），
+ * - **一笔一条**：`kind=ink` 的批注在服务端是一笔一条（见 keystone 仓 `docs/api.md §4.5.1`），
  *   若逐条渲染会淹没文本批注，故默认**折叠成一条汇总行**（带 `count`）。
  * - **分组顺序固定**（便签 → 高亮 → 手写 → 其它），与输入顺序无关，便于 UI 与测试稳定断言。
  * - **不丢数据**：未知 `kind` 的条目归入「其它」组，但每行仍保留原始 `kind` 与原始 `id`，

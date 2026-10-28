@@ -7,7 +7,7 @@ import kotlinx.serialization.json.Json
 /**
  * PDF 设备本地批注。
  *
- * 字段与服务端批注模型（docs/api.md §4）对齐，便于后续 M3.4 REST 同步：
+ * 字段与服务端批注模型（keystone 仓 docs/api.md §4）对齐，便于后续 M3.4 REST 同步：
  * - [documentId] ↔ `document_id`
  * - [location]   ↔ `location`（PDF 侧取 `page:<n>`，1-based）
  * - [text]       ↔ `text`

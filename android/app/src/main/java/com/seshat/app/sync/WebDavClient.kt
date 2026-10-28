@@ -24,7 +24,7 @@ class WebDavException(val statusCode: Int, message: String) : IOException(messag
 
 /**
  * WebDAV 客户端：PROPFIND / GET / PUT / DELETE，使用 Basic 认证
- * （凭据为 `base64(user:token)`，与服务端 `internal/auth` 一致）。
+ * （凭据为 `base64(user:token)`，与 keystone 仓 `internal/auth` 一致）。
  *
  * `client` 可注入（单测传入 MockWebServer 指向的 OkHttpClient）。
  */

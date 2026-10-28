@@ -195,7 +195,7 @@ class ApiException(val statusCode: Int, val code: String?, message: String) : IO
 /**
  * REST 状态同步客户端：阅读进度与批注 CRUD + M7 只读状态端点，`Authorization: Bearer <token>`，JSON 编解码。
  *
- * 端点严格对齐服务端 `internal/api`（M7 起状态标识统一为资源 uid，旧称 document_id）：
+ * 端点严格对齐 keystone 仓 `internal/api`（M7 起状态标识统一为资源 uid，旧称 document_id）：
  * - `GET  /api/progress/{uid}`（支持 If-Modified-Since，返回 null 表示 304）
  * - `PUT  /api/progress/{uid}`
  * - `POST /api/annotations`（201）

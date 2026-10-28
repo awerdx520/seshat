@@ -72,7 +72,7 @@ class SyncManagerTest {
          * 模拟服务端**进度**的 409 冲突检测：请求的 `updatedAt` **不晚于**库内 `updated_at` →
          * 抛 `ApiException(409)`。
          *
-         * 比真实服务端更严格：服务端是 `existing > incoming` 才冲突（`internal/storage/state.go`
+         * 比真实服务端更严格：服务端是 `existing > incoming` 才冲突（keystone 仓 `internal/storage/state.go`
          * 的 `assertNotStale`），此处把「相等」也算冲突，让「本地毫秒较新但上行时间戳被截断到秒、
          * 与服务端同秒」这一防御分支（`SyncManager` 的「本地较新 → 带新时间戳重发」）可被测试覆盖。
          * 默认关闭：既有进度用例不关心冲突，保持原行为。

@@ -26,7 +26,7 @@
 ;; 颜色解析辅助 `seshat-reader-annotation--ink-color-from-hex'——都是**纯
 ;; 函数级**行为：不加载动态模块、不打开文档、不发请求、不写文件。
 ;;
-;; 契约（`docs/api.md' §4.5.1）：
+;; 契约（keystone 仓 `docs/api.md' §4.5.1）：
 ;;
 ;;   page:<n>;ink:<color>,<widthPt>,<x0>,<y0>,<x1>,<y1>,...
 ;;

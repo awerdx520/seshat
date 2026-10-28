@@ -877,7 +877,7 @@ internal fun parseRfc3339Millis(value: String?): Long {
  * 后者会让服务端以为本地时间戳极旧而误判 409）。
  *
  * ## 为什么必须截断到秒
- * 服务端（`internal/storage/state.go`）声明的是 `const timestampLayout = time.RFC3339`，
+ * 服务端（keystone 仓 `internal/storage/state.go`）声明的是 `const timestampLayout = time.RFC3339`，
  * Go 的 [time.Parse] 按该布局**严格**匹配：`time.RFC3339` 不含小数秒，因此
  * `2026-10-18T07:30:00.123Z` 会被判 `invalid_argument`，接口返回 400。
  * 而本地 `updatedAt` 取自 `System.currentTimeMillis()`，毫秒几乎从不为 0——

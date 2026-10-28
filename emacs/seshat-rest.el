@@ -31,7 +31,7 @@
 ;;
 ;;   (seshat-rest-resolve-uid "notes" "book/chapter-1.org")
 ;;
-;; 端点、字段与错误码约定见项目 `docs/api.md'。注意文件身份是服务端权威的
+;; 端点、字段与错误码约定见 keystone 仓 `docs/api.md'。注意文件身份是服务端权威的
 ;; uid（26 位 Crockford Base32），进度/批注端点一律以 uid 为键；旧的路径式
 ;; 文档标识已被废弃。服务端把 uid 当作 URL 路径中的单个路径段，不含斜杠；
 ;; 本模块统一用 `url-hexify-string' 对标识做 URL 编码后再拼接路径。
@@ -566,7 +566,7 @@ SINCE-SEQ**，游标不倒退，因此重试安全）。`:has-more' 为 Elisp �
 
 (defun seshat-rest--etag-value (value)
   "把条件头的取值 VALUE 规范成可放进请求头的字符串；VALUE 为 nil 时返回 nil。
-服务端要求强 ETag 带双引号（`If-Match: \"<blob>\"'，见 `docs/api.md' §8.2），
+服务端要求强 ETag 带双引号（`If-Match: \"<blob>\"'，见 keystone 仓 `docs/api.md' §8.2），
 故按下列规则处理：
 
 - nil → nil，调用方据此**整个省略**该请求头（绝不发空值头）；
@@ -742,7 +742,7 @@ PATH 为根内逻辑相对路径；ROOT 为根 tag——只有 `mirror' 根可�
 根写入返回 403（应回退为只读展示，不要重试）；CONTENT 为字符串（多字节按
 UTF-8 编码，unibyte 原样发送）。
 
-条件写（乐观锁，`docs/api.md' §8.2）：
+条件写（乐观锁，keystone 仓 `docs/api.md' §8.2）：
 - IF-MATCH 非 nil → 发 `If-Match: \"<blob>\"'，仅当远端内容匹配才写入；
 - IF-NONE-MATCH 非 nil → 发 `If-None-Match'；传 \"*\" 表示「仅允许创建」；
 - 两者为 nil → 无条件写（不存在则创建、存在则覆盖）；
@@ -812,7 +812,7 @@ TO 为目标相对路径（相对**同一个根**，不允许 `..` 逃逸、不�
 :not-found :error …)'：`:from' 为移动前路径，`:to' 为移动后路径。
 
 **409 的语义需要特别处理**：`:conflict' 为 `state-conflict'，此时服务端可能是
-「目标路径被其它 uid（含**墓碑**）占用」——而 docs/api.md §15 已知限制指出这种
+「目标路径被其它 uid（含**墓碑**）占用」——而 keystone 仓 docs/api.md §15 已知限制指出这种
 情况下**物理移动可能已经完成**（墓碑占着 `UNIQUE(root,path)'）。因此调用方
 **不应立即重试**本次移动（重试只会再得一个 409），应先 `POST /api/resources/rescan'
 或按 `:from' / `:to' 拉清单核对真实状态，再决定后续动作。
@@ -842,7 +842,7 @@ BLOB 为可选的版本标识（服务端叫 `hash'，即 git commit / blob 引�
   为 nil；
 - BLOB 非 nil → 取**该版本的内容**：返回 `:content' 为该版本的文件内容，`:head'
   为 nil。
-注意线缆参数名是 `hash'（`docs/api.md' §12.2 / `internal/api/server.go' 的
+注意线缆参数名是 `hash'（keystone 仓 `docs/api.md' §12.2，实现见 keystone 仓 `internal/api/server.go' 的
 `Query().Get(\"hash\")'），本函数的形参沿用计划里的 `BLOB' 命名但发送时映射为
 `hash='；不要把 `blob=' 发出去——服务端会忽略它并退化成「取历史」。
 

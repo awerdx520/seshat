@@ -7,7 +7,7 @@ import java.util.Locale
  *
  * 背景（M10.3 / T6）：[PdfInkStore] 仍是手写笔迹的**渲染唯一真相**，本模块只产出「同步镜像」——
  * 把一笔本地笔迹翻译成一条服务端批注的 `location`（`page:<n>;ink:<color>,<widthPt>,<x0>,<y0>,...`，
- * 见 `docs/api.md §4.5.1`），镜像本身不参与绘制。
+ * 见 keystone 仓 `docs/api.md §4.5.1`），镜像本身不参与绘制。
  *
  * ## 单位换算（三处，缺一处都会跨端错位）
  * 1. **页号**：本地 `PdfInkPage.page` / `PdfPageAdapter` 的 position 是 **0-based**，而 location 的
@@ -21,18 +21,18 @@ import java.util.Locale
  * ## 页尺寸口径（`pageWidthPt` 的来源）
  * `PdfRenderer.Page.width/height` 是页面在 **72 dpi（= PDF point，1:1）** 下的尺寸，与渲染位图尺寸
  * 无关——适配器把位图缩放到 `renderWidth` 像素只是显示缩放，归一化坐标已消除该缩放。因此直接取
- * `Page.width/height` 即 pt，无需再乘任何 DPI 系数（见 `docs/api.md §4.5.1` 的换算公式）。
+ * `Page.width/height` 即 pt，无需再乘任何 DPI 系数（见 keystone 仓 `docs/api.md §4.5.1` 的换算公式）。
  *
  * ## 颜色格式
  * `InkStroke.color` 是 ARGB `Int` → 编码为 `#AARRGGBB`（大写八位十六进制，如 `#FFE53935`），
- * 与 `docs/api.md §4.5.1` 的约定一致，也与 [LocationCodec] 的 `sanitize`（只剔除 `,` `;` `@`
+ * 与 keystone 仓 `docs/api.md §4.5.1` 的约定一致，也与 [LocationCodec] 的 `sanitize`（只剔除 `,` `;` `@`
  * 与空白）兼容——`#` 与十六进制字符都能原样穿过，[LocationCodec.parse] 能取回同串。
  * **不用 `#RRGGBB`**：会丢掉 alpha，而马克笔/荧光笔（[InkStyle.MARKER] / [InkStyle.HIGHLIGHTER]）
  * 的半透明是其视觉本体，丢 alpha 后跨端还原会变成实心粗线。
  */
 internal object InkAnnotationMapper {
 
-    /** 手写批注的 `kind` 取值（服务端 `kind` 只约定不校验，见 `docs/api.md §4`）。 */
+    /** 手写批注的 `kind` 取值（服务端 `kind` 只约定不校验，见 keystone 仓 `docs/api.md §4`）。 */
     const val KIND_INK = "ink"
 
     /** ink 批注的 `text` 恒为空串（备注正文对一笔手写无意义，服务端已按 kind 放宽校验）。 */

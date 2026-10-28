@@ -1,121 +1,10 @@
 # 配置说明
 
-seshat 服务的配置由三部分组成，优先级从低到高：
-
-1. 内置默认值
-2. `config.yaml`（可选，文件不存在时全部使用默认值）
-3. 环境变量（仅敏感项）
-
-服务通过 `config.Load(path)` 加载配置。敏感值（数据库密钥、API 令牌、LLM API key）禁止写入配置文件或任何落盘文件，只能通过环境变量注入。
-
-## 配置项一览
-
-| 配置项 | YAML 键 | 环境变量 | 默认值 | 敏感 |
-|---|---|---|---|---|
-| 监听地址 | `server.addr` | — | `":8080"` | 否 |
-| 读超时 | `server.read_timeout` | — | `30s` | 否 |
-| 写超时 | `server.write_timeout` | — | `30s` | 否 |
-| SQLite 路径 | `db.path` | — | `"./data/seshat.db"` | 否 |
-| 笔记根目录 | `webdav.root` | — | `"./data/seshat"` | 否 |
-| 公开出口目录 | `webdav.public` | — | `"./data/seshat/public"` | 否 |
-| 对外出口只读 | `webdav.public_read_only` | — | `false` | 否 |
-| 对外出口写扩展名白名单 | `webdav.public_allow_exts` | — | 空（不限制） | 否 |
-| 多根映射 | `webdav.roots` | — | 空（归一为单根 `notes`） | 否 |
-| 数据库密钥 | 不可配置（不落盘） | `SESHAT_DB_KEY` | 空 | **是** |
-| API 访问令牌 | 不可配置（不落盘） | `SESHAT_AUTH_TOKEN` | 空 | **是** |
-| LLM API key | 不可配置（不落盘） | `SESHAT_LLM_API_KEY` | 空 | **是** |
-| LLM 节点令牌 | 不可配置（不落盘） | `SESHAT_NODE_TOKEN` | 空 | **是** |
-| 本地 LLM 节点 URL | `llm.local_node_url` | — | 空 | 否 |
-
-说明：
-
-- `read_timeout` / `write_timeout` 使用 Go `time.ParseDuration` 支持的字符串格式（如 `30s`、`1m30s`）。
-- `server.addr` 等非敏感项当前仅由配置文件控制；敏感项的 YAML 键被忽略，只能通过环境变量提供。
-- `webdav.public_read_only` 只作用于对外公开出口（内部同步通道不受影响）。置为 `true` 后对外出口的全部写操作（PUT/MKCOL/DELETE/MOVE/COPY 等）被拒绝，读操作（GET/PROPFIND/HEAD 等）不受影响。
-- `webdav.public_allow_exts` 是允许对外出口写入的文件扩展名白名单（如 `[".org", ".md", ".pdf", ".epub"]`），仅在写文件时校验，读操作不受限制；置空表示不限制扩展名。扩展名比较忽略大小写，前导点可省略。
-- 两项同时配置时只读优先：只要 `public_read_only` 为 `true`，任何写操作都被拒绝。
-- `SESHAT_NODE_TOKEN` 是本地 LLM 处理节点专用令牌（对应 `Config.LLM.NodeToken`），仅保护节点端点（注册 / 轮询 / 回传，最小权限）。未配置时节点端点回退接受主令牌 `SESHAT_AUTH_TOKEN`（向后兼容既有单令牌部署）；配置后主令牌不能访问节点端点、节点令牌也不能访问普通端点，二者经 `auth.NodeMiddleware` 相互隔离。
-
-## 多根映射（`webdav.roots`）
-
-服务端可同时管理多个文档根：**首个为笔记根**（`mirror`：WebDAV 全量镜像 + FTS 索引 + git 版本化），**其余为书库根**（`ondemand`：不挂 WebDAV、不进 FTS，只经 REST 按需读取）。
-
-未配置 `webdav.roots` 时行为与历史版本完全一致——只有一个 `notes` 根，路径取 `webdav.root`。
-
-```yaml
-webdav:
-  root: "./data/seshat"        # 向后兼容：等价 roots[0].path
-  roots:
-    - { tag: notes,  path: "./data/seshat" }
-    - { tag: ebooks, path: "./data/ebooks", mode: ondemand }
-```
-
-### 字段
-
-| 字段 | 必填 | 说明 |
-|---|---|---|
-| `tag` | 是 | 根标签，作为资源登记与服务端引用（`tag:relpath`）中的根标识。必须**非空**、**唯一**、**不含 `:`**（`:` 是 `tag:path` 语法的分隔符） |
-| `path` | 条件必填 | 物理根目录（相对服务进程工作目录）。仅**首根**可留空——留空时回落 `webdav.root`；其余根必须显式配置 |
-| `mode` | 否 | 根模式，取 `mirror` 或 `ondemand`；留空按位置推导（见下） |
-
-### `mode` 语义
-
-| 模式 | 位置约束 | WebDAV | FTS 索引 | git 版本化 | 写入口 |
-|---|---|---|---|---|---|
-| `mirror`（笔记根） | 至多一个，且**必须是首根** | `/dav/` 全量镜像 | 索引 `.org` | 版本化 | WebDAV + REST |
-| `ondemand`（书库根） | 只能在第二根起 | 不挂载 | 不索引 | 不管 | 仅 REST 按需读取（写操作被拒绝） |
-
-「mirror 至多一个且必须首根」的理由：FTS 索引与 WebDAV 出口**只挂载首根**，多个 mirror 会让「哪个根对外可写」变得不可判定，故在配置层直接拒绝。
-
-### 归一化与校验
-
-`Load()` 末尾调用 `Config.Validate()`，把配置归一化后**写回** `Config.WebDAV.Roots`（后续代码只读归一形态）：
-
-1. `roots` 为空 → 归一为 `[{ tag: notes, path: webdav.root, mode: mirror }]`（单根向后兼容）；
-2. `mode` 留空 → 首根推导为 `mirror`，其余为 `ondemand`；
-3. **首根** `path` 留空 → 回落 `webdav.root`（其余根的 `path` 不回落）；
-4. 校验：`tag` 非空、唯一、不含 `:`；`path` 非空；`mode` ∈ {`mirror`, `ondemand`}；`mirror` 根至多一个且必须是首根；
-5. 归一化幂等——对已归一的结果再次 `Validate()` 不改变内容。
-
-任一校验失败即 `Load()` 返回错误，**服务带着非法根配置无法启动**（错误信息含 `webdav.roots[N]` 下标与 tag，便于定位）。
-
-显式写出的 `mode` 原样保留、不被位置规则改写：单根配 `mode: ondemand` 是合法的（零个 mirror 根被允许，此时没有镜像根可挂 FTS/WebDAV，挂载策略由调用方决定）。
-
-### 与 `webdav.root` 的兼容关系
-
-- `webdav.root` 仍有效，语义等价于 `roots[0].path`；配置了 `roots` 时它们**互不覆盖**（`roots` 显式值优先）。
-- 只配 `webdav.root`（不配 `roots`）→ 单根 `notes`，路径为该值，行为与升级前一致。
-- 只配 `roots`（保留默认 `webdav.root`）→ 完全以 `roots` 为准；`webdav.root` 仅在 `roots[0].path` 留空时作为回落值。
-
-### 目录与仓库约束（启动期）
-
-上面 4 条归一化规则之外，以下 4 条事实决定「配置能起来」与「写操作会不会失败」：
-
-1. **只有笔记根与公开出口会被自动创建**：启动时 `os.MkdirAll` 只作用于 `roots[0].path`（笔记根）与 `webdav.public`；`roots[1..]`（`ondemand` 书库根）**不会自动创建**。书库根目录不存在时，启动期的 bootstrap 扫描该根失败 → 服务**以非零码退出**（日志 `seshat 服务退出` 携带 `读取根目录失败` 与该根的物理路径），不会把缺失目录静默当成空根继续服务。部署时需自行创建好 `ondemand` 根目录。
-2. **mirror 根的 `path` 必须与 git 仓库根一致**：服务端以首根路径初始化版本库，而 git 写方法接受「仓库内相对路径」。配置漂移（两处指向不同目录）时 `/api/files` 的写端点直接返回 `500 internal`（错误信息只带根 tag，不回物理路径），宁可报错也不静默写到错误位置。
-3. **`webdav.public` 应是笔记根的子目录**：公开出口相对笔记根的偏移 `offset` 由 `filepath.Rel(笔记根, public)` **自动计算**（如 `public`），用于把对外请求路径换算成仓库内路径（ETag blob hash 与 FTS key 都按仓库内路径计算）。若配置在笔记根**之外**，启动时只告警（`公开出口不在笔记根目录内…`）不阻止启动：此时对外写入不在 git 工作区内，**写后不产生 commit**，ETag 也退化为 mtime 启发式。
-4. **`mode` 的归一化口径**：`mode` 留空时按位置推导——**首根默认 `mirror`，其余默认 `ondemand`**；显式写出的 `mode` 原样保留（单根配 `ondemand` 合法）。`mirror` 根**至多一个且必须位于首根**，违反即启动失败（FTS 索引与 WebDAV 出口只挂载首根，多个 mirror 会让「哪个根对外可写」不可判定）。
-
-## 敏感值处理
-
-敏感项对应的结构体字段标记为 `yaml:"-"`，因此：
-
-- 无法通过 `config.yaml` 或任何配置文件提供；
-- 即使配置文件中出现同名键（如 `db.key`），也会被忽略；
-- 序列化（`yaml.Marshal`）时不会输出敏感值。
-
-敏感值只能由部署环境通过环境变量注入：
-
-```bash
-export SESHAT_DB_KEY=...        # → Config.DB.Key
-export SESHAT_AUTH_TOKEN=...    # → Config.Auth.Token
-export SESHAT_LLM_API_KEY=...   # → Config.LLM.CloudAPIKey
-export SESHAT_NODE_TOKEN=...    # → Config.LLM.NodeToken
-```
+> **服务端配置已迁出**：`config.yaml` 与 `KEYSTONE_*` 环境变量见 keystone 仓 `docs/configuration.md`。本文件只描述客户端（Emacs + Android）配置。
 
 ## Emacs 客户端配置（批注侧车）
 
-> 本节为**客户端侧**配置（`notes/emacs/`），与服务端 `config.yaml` / 环境变量无关，不影响服务端行为。
+> 本节为**客户端侧**配置（`notes/emacs/`），与服务端部署配置无关，不影响服务端行为。
 
 Emacs 端通过 `seshat-reader-annotation` 采集 PDF 页面选区并同步为服务端批注（侧车，不写回 PDF）。相关变量：
 
@@ -477,7 +366,3 @@ done
 ```
 
 > 阅读模式（`seshat-reading-mode`）不引入新的用户配置项：库根由 `seshat-sync-roots` 决定，状态由 `seshat-state-file` 承载。详见 `docs/emacs-reader.md` 的「阅读模式」节。
-
-## 相关文件
-
-- 示例配置：[`config.example.yaml`](../config.example.yaml)

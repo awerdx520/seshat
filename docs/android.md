@@ -41,7 +41,7 @@
 | 8 | 关于 | 无存储 | 静态（版本号 + 配置状态） |
 | 9 | 笔记外部目录（SAF 目录树，只读） | `notes_external_dir`（只存 URI 字符串） | 下次扫描笔记（选择/清除立即落盘，无需点保存；持久读权限由设置页 `takePersistableUriPermission` 持有，清除时先释放权限再清偏好） |
 
-- 存储**分两层**：机密与同步配置走 `SecurePrefs`（EncryptedSharedPreferences，见 `docs/security.md` §7）；
+- 存储**分两层**：机密与同步配置走 `SecurePrefs`（EncryptedSharedPreferences，见 keystone 仓 `docs/security.md` §7）；
   远程目录 / 主题 / 字号 / 翻页模式 / 笔记外部目录走 `settings/AppPreferences`（普通 `seshat_app_prefs.xml`，不加密、参与系统备份）。
   因此**加密存储不可用时，主题与阅读偏好仍可用**。
 - 服务端地址**仅接受 https**；带 userinfo（`https://real.com@evil.com`）、查询参数或锚点的地址会被拒绝，长度上限 2048。
@@ -390,7 +390,7 @@ M7 把服务端的文档身份从「客户端自定字符串」改成「服务�
 - **当前后果**：M7 起状态 API（`/api/progress/{uid}`、`/api/annotations?uid=`、`POST /api/annotations`）只接受 uid。Android 现版本若把 `documentId` 当 uid 发送，epub 的 32 位十六进制**必然**得到 `400 invalid_uid`（不满足 26 位形态）；即便将来派生出形态合法的 id，未在服务端登记仍是 `404 unknown_uid`。批量同步时需按此码停止本轮、不要无脑重试。
 - **后续改造**：数据源接入与 M10 Reader 将改为「路径 → `GET /api/resolve?root=&path=` → uid」，把 `(root, path) → uid` 的映射缓存在 `seshat_app_prefs`（普通偏好，不加密、可重建），仅缓存服务端返回的 uid，不在客户端生成。
 - **无需迁移**：服务端与客户端均尚未部署，本地旧 `documentId` 名下的进度/批注可直接**清空**（删除对应 prefs 键即可），不需要做 id 迁移或双写过渡期。
-- 契约细节见 [`docs/api.md`](api.md) §6（路径解析）与 [`docs/sync-protocol.md`](sync-protocol.md) §2（身份模型）。
+- 契约细节见 [`SERVER-CONTRACT.md`](SERVER-CONTRACT.md)：HTTP 端点与错误码在 keystone 仓 `docs/api.md` §6（路径解析），增量同步协议在 keystone 仓 `docs/sync-protocol.md` §2（身份模型）。
 
 ## 12. 与 M7 服务端对接（M9.2 A 批）
 

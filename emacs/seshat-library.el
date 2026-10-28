@@ -70,7 +70,7 @@
 
 (defconst seshat-library--uid-regexp "\\`[0-9A-HJKMNP-TV-Z]\\{26\\}\\'"
   "服务端 uid 的权威形态：26 位 Crockford Base32（排除 I / L / O / U）.
-字符集取自服务端 `internal/registry/uid.go' 的 `^[0-9A-HJKMNP-TV-Z]{26}$'。
+字符集取自 keystone 仓 `internal/registry/uid.go' 的 `^[0-9A-HJKMNP-TV-Z]{26}$'。
 匹配时必须绑 `case-fold-search' 为 nil（见 `seshat-library--uid-valid-p'）。")
 
 (defgroup seshat-library nil

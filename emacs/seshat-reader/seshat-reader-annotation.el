@@ -64,13 +64,13 @@
 ;; 缩放与旋转，四个坐标各保留两位小数。
 ;;
 ;; 手写笔迹另用一条 location 形态 "page:<n>;ink:<color>,<widthPt>,<x0>,<y0>,…"
-;; （一笔一条批注，见 `docs/api.md' §4.5.1）：解析入口是
+;; （一笔一条批注，见 keystone 仓 `docs/api.md' §4.5.1）：解析入口是
 ;; `seshat-reader-annotation--ink-strokes-from-location'，它把串解析成
 ;; ((PAGE R G B ALPHA WIDTH POINTS TRUNCATED) …) 形式的 stroke 结构，**本
 ;; 模块不投喂也不渲染**——把 stroke 送进装饰表的渲染入口由后续任务（T5）
 ;; 消费本函数结果后实现。
 ;;
-;; 服务端契约（端点、字段与错误码）见项目 `docs/api.md'。
+;; 服务端契约（端点、字段与错误码）见 keystone 仓 `docs/api.md'。
 ;;
 ;; 交互入口（键位加在 `seshat-reader-mode-map'）：
 ;;
@@ -1186,7 +1186,7 @@ LOCATION 来自不可信的服务端响应，故解析**有界**，与
 四个字节依次是 alpha、红、绿、蓝（**alpha 在最高位**），每个分量除以 255
 归一化到 0..1：alpha 满值 \"FF\" 为 1.0、半透明 \"80\" 约 0.502。只接受
 **恰好 8 位**十六进制的形态；\"#RGB\"、\"#RRGGBB\"、缺 \"#\" 的前缀以及
-含非十六进制字符的串一律返回 nil——`docs/api.md' §4.5.1 只定义了
+含非十六进制字符的串一律返回 nil——keystone 仓 `docs/api.md' §4.5.1 只定义了
 `#AARRGGBB'，其它位宽的 alpha 归属无从判断，猜错会把整笔颜色（含透明度）
 画错，故宁可不画。"
   (when (and (stringp color)
@@ -1243,7 +1243,7 @@ y），TRUNCATED 为 t 表示点数超过
   "从 LOCATION 解析出全部可渲染的手写笔迹，返回 stroke 列表.
 LOCATION 的约定形态是
 \"page:<n>;ink:<color>,<widthPt>,<x0>,<y0>,<x1>,<y1>,…\"（一笔一条批注，
-见 `docs/api.md' §4.5.1）：页码 `<n>' 为 **1-based** 十进制整数，颜色为
+见 keystone 仓 `docs/api.md' §4.5.1）：页码 `<n>' 为 **1-based** 十进制整数，颜色为
 `#AARRGGBB'，线宽与点列都是**页面 pt 坐标**（与 `rect:' 段同口径、原点
 左上、y 向下）。按 \";\" 切段后**只**处理以 \"ink:\" 开头的段，出现多个
 \"ink:\" 段时逐个解析，返回顺序与 LOCATION 中一致；`rect:' 段由
@@ -1720,7 +1720,7 @@ nil 时同样回落到缓存（`seshat-reader-annotation--cached-annotation-stro
 `--add-highlight'，细条走 9 参 `--add-decoration'）；笔迹走 7 参
 `--add-stroke'（页号与 `--add-highlight' 同为 **1-based**，C 侧统一做
 0-based 换算，Lisp 侧不做 ±1；投喂层也不做 y 翻转——两端口径同为原点左上、
-y 向下，见 `docs/api.md' §4.5.1）。
+y 向下，见 keystone 仓 `docs/api.md' §4.5.1）。
 
 笔迹排在最后：额外装饰来源（搜索命中）与笔迹互不遮挡顺序敏感度低，但笔迹是
 用户手写，画在矩形装饰之上更符合「手写覆盖高亮」的直觉。
