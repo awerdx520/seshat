@@ -30,7 +30,6 @@ void
 reset_doc_state(DocState *state)
 {
 	// We need to preserve these across resets
-	int current_active_jobs = state->active_jobs;
 	bool current_is_reloading = state->is_reloading;
 
 	*state = (DocState){
@@ -41,6 +40,11 @@ reset_doc_state(DocState *state)
 		.path = NULL,
 		.pagecount = 0,
 		.frame_scale = 1,
+		/* Explicitly listed rather than relying on implicit zero
+		 * initialisation of the omitted members: a load that never
+		 * reaches the `current_page_number' assignment must still
+		 * start from page 0. */
+		.current_page_number = 0,
 		.outline = NULL,
 		/* No dark-mode field to clear: the invert flag and the
 		 * tint colours are process-wide state (render-theme.c),
@@ -54,8 +58,7 @@ reset_doc_state(DocState *state)
 		.decorations = NULL,
 		.decoration_count = 0,
 		.decoration_cap = 0,
-		.decorations_dirty = false,
-		.active_jobs = current_active_jobs,
+
 		.is_reloading = current_is_reloading
 	};
 }
@@ -174,9 +177,8 @@ free_doc_pages(DocState *state)
 {
     if (!state || !state->doc_pages) return;
 
-    /* Called from `free_doc_state' once the render threads are idle and
-     * no EmacsWinState is left, so no slot can still reference these
-     * pages and no mutex can be held. */
+    /* Called from `free_doc_state' after the document was closed, so no
+     * slot can still reference these pages and no mutex can be held. */
     for (int i = 0; i < state->pagecount; ++i) {
         DocPage *dp = &state->doc_pages[i];
         pthread_mutex_destroy(&dp->mutex);
@@ -206,8 +208,8 @@ release_doc_page(DocState *doc_state, DocPage *dp)
 		atomic_store(&dp->refcount, 0);
 }
 
-/* A DocPage is being acquried (by a CachedPage) for rendering
-   so we increase its refcount and if it isn't ready, we parse it */
+/* A DocPage is being acquired (by a page render) so we increase its
+   refcount and if it isn't ready, we parse it */
 
 DocPage *
 acquire_doc_page(DocState *doc_state, int page_num)
@@ -234,70 +236,6 @@ acquire_doc_page(DocState *doc_state, int page_num)
 	return dp;
 }
 
-/**
- * Free all ready pages in the document's cache window.
- */
-
-void
-free_cache_window(EmacsWinState *win_state)
-{
-	if (!win_state)
-		return;
-
-	DocState *doc_state = win_state->doc_state;
-
-	for (int i = 0; i < MAX_CACHE_SIZE; ++i)
-		{
-			CachedPage *cp = win_state->cache_window[i];
-			if (!cp)
-				continue;
-
-			int old_page_num = -1;
-
-			pthread_mutex_lock(&cp->mutex);
-			old_page_num = cp->page_num;
-			cp->page_num = -1;
-			cp->status = PAGE_STATUS_EMPTY;
-
-			free(cp->img_data);
-			cp->img_data = NULL;
-			cp->img_size = 0;
-			cp->imgw = 0;
-			cp->imgh = 0;
-			pthread_mutex_unlock(&cp->mutex);
-
-			/*
-			 * Release this slot's reference to the shared DocPage.
-			 * If this was the last window holding this page, the display
-			 * list will be dropped automatically by release_doc_page().
-			 */
-			if (doc_state && doc_state->doc_pages &&
-			    old_page_num >= 0 && old_page_num < doc_state->pagecount)
-				{
-					DocPage *dp = &doc_state->doc_pages[old_page_num];
-
-					int prev = atomic_fetch_sub(&dp->refcount, 1);
-					if (prev == 1)
-						{
-							drop_doc_page_display_list(doc_state, dp);
-						}
-					else if (prev <= 0)
-						{
-							atomic_store(&dp->refcount, 0);
-						}
-				}
-
-			/* Destroy the slot's synchronization primitives and free it */
-			pthread_mutex_destroy(&cp->mutex);
-			pthread_cond_destroy(&cp->cond);
-			free(cp);
-
-			win_state->cache_window[i] = NULL;
-		}
-
-	win_state->current_cached_page = NULL;
-}
-
 void
 free_doc_state(DocState *state)
 {
@@ -312,10 +250,9 @@ free_doc_state(DocState *state)
 	 * a time and bails out on failure — so a partially built array is
 	 * torn down correctly too.
 	 *
-	 * Callers must have quiesced the render threads and freed every
-	 * EmacsWinState first (`wait_for_doc_jobs' + `free_cache_window');
-	 * all three call sites do exactly that.  Without it the pages would
-	 * still be referenced by CachedPage slots. */
+	 * No render thread and no window state exists any more, so the
+	 * per-page array is the only holder of these pages and dropping it
+	 * here is safe. */
 	free_doc_pages(state);
 
 	// Drop MuPDF objects
@@ -358,77 +295,3 @@ free_doc_state(DocState *state)
 }
 
 // Cache window slot helpers
-
-/**
- * Clear only the rasterize data from a slot (CachedPage), keeping
- * its DocPage reference. Used when the slot already points to the
- * correct page (e.g. during zoom/rotate).
- */
-
-void
-clear_cp(CachedPage *cp)
-{
-	if (!cp) return;
-	pthread_mutex_lock(&cp->mutex);
-	cp->status = PAGE_STATUS_EMPTY;
-	free(cp->img_data);
-	cp->img_data = NULL;
-	cp->img_size = 0;
-	cp->imgw = 0;
-	cp->imgh = 0;
-	pthread_mutex_unlock(&cp->mutex);
-}
-/**
- * Clear a slot (CachedPage) completely and release its reference to the shared DocPage.
- * Used when a slot is evicted from the cache window or reassigned to a new page.
- */
-
-void
-clear_cp_and_release(DocState *doc_state, CachedPage *cp)
-{
-    if (!cp) return;
-    int old_page_num = -1;
-
-    pthread_mutex_lock(&cp->mutex);
-    old_page_num = cp->page_num;
-    cp->page_num = -1;
-    cp->status = PAGE_STATUS_EMPTY;
-    free(cp->img_data);
-    cp->img_data = NULL;
-    cp->img_size = 0;
-    cp->imgw = 0;
-    cp->imgh = 0;
-    pthread_mutex_unlock(&cp->mutex);
-
-    if (doc_state && doc_state->doc_pages &&
-        old_page_num >= 0 && old_page_num < doc_state->pagecount)
-    {
-        release_doc_page(doc_state, &doc_state->doc_pages[old_page_num]);
-    }
-}
-
-void
-mark_cp_error(CachedPage *cp)
-{
-	if (!cp)
-		return;
-	pthread_mutex_lock(&cp->mutex);
-	cp->status = PAGE_STATUS_ERROR;
-	pthread_cond_signal(&cp->cond);
-	pthread_mutex_unlock(&cp->mutex);
-}
-
-void
-mark_cp_error_if_rendering(CachedPage *cp)
-{
-	if (!cp)
-		return;
-
-	pthread_mutex_lock(&cp->mutex);
-	if (cp->status == PAGE_STATUS_RENDERING)
-		{
-			cp->status = PAGE_STATUS_ERROR;
-			pthread_cond_signal(&cp->cond);
-		}
-	pthread_mutex_unlock(&cp->mutex);
-}

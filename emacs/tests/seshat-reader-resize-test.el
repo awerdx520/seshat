@@ -5,7 +5,7 @@
 ;; Author: Seshat contributors
 ;; Keywords: lisp, tests, tools
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "29.1"))
+;; Package-Requires: ((emacs "32.0"))
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -94,8 +94,8 @@
 ;; 模块加载需要它）。
 ;;
 ;; 纪律：**不触网、不碰真实文档、不触 GUI**。动态模块函数
-;; （`seshat-reader-dyn--scale-page' / `seshat-reader-dyn--close-doc'）与窗口
-;; 访问函数一律用 `cl-letf' 桩替；窗口对象取 batch 帧上的真实窗口，因此
+;; （`seshat-reader-dyn--page-image-spec' / `seshat-reader-dyn--close-doc'）与
+;; 窗口访问函数一律用 `cl-letf' 桩替；窗口对象取 batch 帧上的真实窗口，因此
 ;; `with-selected-window' / `split-window' 无需额外桩；页面 overlay 用
 ;; `make-overlay' 在临时 buffer 内构造，不依赖真实渲染。
 ;;
@@ -132,15 +132,22 @@ document through the dynamic module.  Only `major-mode' matters for the
   "Create a page image spec that is WIDTH x HEIGHT pixels.
 
 WIDTH and HEIGHT default to 200 and 100.  The spec has the shape the dynamic
-module produces, `(image :type … :width … :height …)', so `image-property'
-reads and writes it and `seshat-reader--apply-display-scale' can rewrite its
-display size in place.  It is a plain list on purpose: no image has to be
-decodable, and `image-flush' failing without a window-system frame is
-already handled by the caller (`ignore-errors')."
-  (list 'image :type 'pbm :data "x"
-        :width (or width 200)
-        :height (or height 100)
-        :scale 1))
+module produces for the canvas backend, `(image :type canvas :data nil
+:data-width … :data-height … :width … :height …)', so `image-property' reads
+and writes it and `seshat-reader--apply-display-scale' can rewrite its display
+size in place.  `:data' is nil because canvas pixels live in the image cache,
+not in a Lisp string; the device size (`:data-width'/`:data-height') and the
+logical size (`:width'/`:height') are equal here.  It is a plain list on
+purpose: no image has to be decodable, and `image-flush' failing without a
+window-system frame is already handled by the caller (`ignore-errors')."
+  (let ((w (or width 200))
+        (h (or height 100)))
+    (list 'image :type 'canvas :data nil
+          :data-width w
+          :data-height h
+          :width w
+          :height h
+          :scale 1)))
 
 ;; P1 T7 删除：per-window 页 overlay 与单页缩放助手（`--set-page-overlay'、
 ;; `--set-page-spec'）随 overlay 机制一起退役；几何一律由
@@ -248,7 +255,9 @@ without decoding anything."
     (lambda (_page scale _rotate)
       (setcar counter (1+ (car counter)))
       (setcar (cdr counter) (cons scale (cadr counter)))
-      (list 'image :type 'pbm :data "x"
+      (list 'image :type 'canvas :data nil
+            :data-width (max 1 (round (* w scale)))
+            :data-height (max 1 (round (* h scale)))
             :width (max 1 (round (* w scale)))
             :height (max 1 (round (* h scale)))))))
 

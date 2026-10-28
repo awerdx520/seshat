@@ -6,7 +6,7 @@
 ;; Author: Divya Ranjan Pattanaik <divya@subvertising.org>
 ;; Keywords: lisp, files, tools
 ;; Version: 0.3.2
-;; Package-Requires: ((emacs "29.1"))
+;; Package-Requires: ((emacs "32.0"))
 ;; URL: https://codeberg.org/divyaranjan/emacs-reader
 
 ;; This program is free software; you can redistribute it and/or modify
@@ -904,10 +904,14 @@ and the buffer-local `seshat-reader--recent-scale-fallback' are updated
 together with the specs, so that \"spec size / scale = native size\" keeps
 holding for the bookmarks and the selection code that read the scale.
 
-No `image-flush' is issued here: rewriting the spec in place is enough for
-the new geometry to take effect, and flushing on every size change would
-make redisplay re-decode the whole page bitmap each time, which is what
-makes dragging a window divider stall."
+Nothing is flushed here, and there is nothing to flush: a canvas spec has no
+flush semantics.  The `:data-width'/`:data-height' properties and the pixels
+of the canvas buffer are written exactly once, by the renderer that fills the
+buffer, while `:width' and `:height' are the pair that may be `setf'ed at any
+time.  Rewriting that pair alone is enough for the new geometry to take
+effect, so a size change costs one relayout instead of a re-render of the
+whole page bitmap -- which is what keeps dragging a window divider from
+stalling."
   (let ((window (if (window-live-p window) window (selected-window)))
         (changed nil))
     (when (and (numberp scale) (> scale 0))
@@ -937,9 +941,9 @@ WINDOW must be a valid window and defaults to the selected one."
 ;; a small spec cache on top of it.
 ;;
 ;; The entry point is synchronous and blocks the Emacs main thread for about
-;; as long as one page of `seshat-reader-dyn--refresh-highlights', so P0 only
-;; exposes it for explicit measurement (and for P1 to build on).  Nothing in
-;; the display, redisplay or scrolling paths may call it.
+;; as long as one page rasterization takes, so it is only exposed for explicit
+;; measurement.  Nothing in the display, redisplay or scrolling paths may call
+;; it directly: the multi-page layout renders through the wrapper below.
 
 ;; 前置声明：这两个变量属于多页布局一节（定义在下方），但缓存上限与清缓存函数
 ;; 先用到它们（`defvar' 不设值，不覆盖后面的 `defvar-local' 默认值），先声明让
@@ -966,10 +970,12 @@ silently bounded by `seshat-reader--multipage-effective-preload'.")
 (defvar seshat-reader--page-spec-cache-limit 8
   "Hard ceiling for `seshat-reader--page-spec-cache', and a knob to lower it.
 
-Each entry pins a copy of the page bitmap on the Lisp heap (the `:data'
-string of the spec) while the native module keeps its own copy in the
-`CachedPage' and in the MuPDF image cache, so one entry costs roughly two
-bitmaps.
+Each entry holds one rendered page, and its pixels live only in the canvas
+buffer that Emacs owns (`:data-width' x `:data-height' x 4 bytes); the Lisp
+side holds no copy of the bitmap, since the canvas backend stores it as an
+opaque object instead of the `:data' string the pbm backend used, and the
+native `CachedPage' cache is gone (removed in the 2026-10-28 canvas
+migration).  One cache entry therefore costs exactly one canvas buffer.
 
 The effective size is the smallest of this value,
 `seshat-reader--multipage-cache-limit' (derived from the resident set) and 16
@@ -1200,12 +1206,16 @@ suits a dark theme."
 (defcustom seshat-reader-multipage-memory-warning-mb 75
   "Warn when the resident page bitmaps exceed this many megabytes.
 
-The estimate counts the `:data' string of every cached page spec and doubles
-it, because each spec pins a copy on the Lisp heap while the native module
-keeps its own copy of the bitmap.  With the default preload the cache holds at
-most 6 specs, i.e. roughly 75 MB at 150 dpi; a document whose pages are much
-larger, or a configuration that raises the preload, can cross that line and the
-message says so once per buffer instead of on every scroll.
+The estimate sums `:data-width' x `:data-height' x 4 bytes, i.e. one ARGB32
+pixel per device pixel of the canvas buffer that Emacs owns; it does not
+double the figure, because the pixels exist only in that buffer (no Lisp-side
+copy of the bitmap is pinned any more).  Specs without `:data-width' /
+`:data-height' fall back to `:width' x `:height' x 4, which counts logical
+pixels and so under-estimates on a frame whose scale factor is not 1.0.  With
+the default preload the cache holds at most 6 specs, i.e. roughly 75 MB at
+150 dpi; a document whose pages are much larger, or a configuration that
+raises the preload, can cross that line and the message says so once per
+buffer instead of on every scroll.
 
 Set it to nil to disable the warning."
   :group 'seshat-reader
@@ -1448,8 +1458,10 @@ because `:align-to' references the spec object itself."
              (new-width (max 1 (round (* (car native) target))))
              (new-height (max 1 (round (* (cdr native) target)))))
         (unless (and (equal width new-width) (equal height new-height))
-          ;; 不做 image-flush：拖动分割线时每帧 flush 会强制重解码整页位图
-          ;; （实测卡 1–2s）；旧缓存由 C 侧下次重渲染替换 spec 时清掉。
+          ;; canvas spec 没有 flush 语义：`:data-width'/`:data-height' 与缓冲
+          ;; 内容只允许渲染函数写一次（那里才第一次分配并填像素），可随时 setf
+          ;; 的只有 `:width'/`:height' 这一对。改尺寸因此只是重排，不会重渲染
+          ;; 整页位图（旧 pbm 后端拖动分割线时每帧 flush，实测卡 1–2s）。
           (setf (image-property spec :width) new-width)
           (setf (image-property spec :height) new-height)
           t)))))
@@ -1738,10 +1750,11 @@ page first: no row is inserted or removed and no scale is touched.
 Why a re-render and not a repaint: since P1 the decorations (annotation
 rectangles, the selection flash, search hits and ink strokes) are **baked into
 the page bitmap while it is rendered**, so the C side table alone no longer
-changes what is on screen.  Feeding the table and calling the old
-`seshat-reader-dyn--refresh-highlights' repainted a single-page overlay that
-does not exist any more; the cached spec has to be dropped and the page drawn
-again instead.  See `VENDORED.md', decoration layer.
+changes what is on screen.  Feeding the table used to be followed by a call to
+a window-level repaint entry point; that entry point repainted a single-page
+overlay which does not exist any more and was retired together with the overlay
+backend, so the cached spec has to be dropped and the page drawn again instead.
+See `VENDORED.md', decoration layer.
 
 Each page is rendered inside `ignore-errors': a decoration refresh is optional
 feedback and must never break the command that triggered it (a page that fails
@@ -1855,21 +1868,32 @@ and a failed render simply does not populate the cache."
 (defun seshat-reader--multipage-resident-spec-megabytes ()
   "Estimate the memory the cached page specs hold, in megabytes.
 
-The estimate sums the `:data' string length of every cached spec and doubles
-it: the Lisp heap keeps one copy of the bitmap while the native module keeps its
-own in the `CachedPage' and in the MuPDF cache.  Pages without a `:data' string
-\(a placeholder row, or a stub in a test) are skipped.  nil is returned when
-nothing measurable is cached."
+The pixels of a spec live in the canvas buffer that Emacs owns and holds on
+the Lisp side only as an opaque object: there is no string copy of the bitmap
+in the Lisp heap any more (the old pbm backend kept one in the `:data'
+property).  The estimate therefore sums `:data-width' x `:data-height' x 4
+bytes per cached spec, i.e. one ARGB32 pixel per device pixel.
+
+Specs that carry no `:data-width'/`:data-height' fall back to
+`:width' x `:height' x 4: that counts the logical size and implicitly assumes
+a device pixel ratio of 1, so it under-estimates on a scaled frame.  The
+fallback exists for specs the canvas renderer never produced (a placeholder
+row, or a stub in a test); a spec with neither pair is skipped.  nil is
+returned when nothing measurable is cached."
   (let ((bytes 0)
         (seen 0))
     (dolist (entry seshat-reader--page-spec-cache)
       (let* ((spec (cdr entry))
-             (data (and spec (image-property spec :data))))
-        (when (stringp data)
-          (setq bytes (+ bytes (length data)))
+             (dw (and spec (image-property spec :data-width)))
+             (dh (and spec (image-property spec :data-height))))
+        (unless (and (integerp dw) (integerp dh) (> dw 0) (> dh 0))
+          (setq dw (and spec (image-property spec :width))
+                dh (and spec (image-property spec :height))))
+        (when (and (integerp dw) (integerp dh) (> dw 0) (> dh 0))
+          (setq bytes (+ bytes (* dw dh 4)))
           (setq seen (1+ seen)))))
     (when (> seen 0)
-      (/ (* 2.0 bytes) (* 1024.0 1024.0)))))
+      (/ (float bytes) (* 1024.0 1024.0)))))
 
 (defun seshat-reader--multipage-check-memory (&optional _window)
   "Report once per buffer when the resident page bitmaps exceed the budget.
@@ -2407,36 +2431,6 @@ row is placed according to the current geometry."
         (setq number (1+ number))))
     (seshat-reader--multipage-goto target)
     (seshat-reader--center-page)))
-
-(defun seshat-reader--multipage-c-overlay ()
-  "Return the single-page overlay the native module attached to the buffer.
-
-The overlay spans the whole buffer and carries a `win-state' property, which
-is how it is recognised here: the `win-state' overlay property is the handle
-of the native `EmacsWinState', and only this overlay has one.  Looking the
-overlay up by property instead of by window parameter keeps the display code
-free of the per-window state the multi-page layout does not use any more,
-and it works for any window showing the buffer.  nil is returned when there
-is no such overlay."
-  (let (found)
-    (dolist (overlay (overlays-in (point-min) (point-max)) found)
-      (when (and (not found) (overlay-get overlay 'win-state))
-        (setq found overlay)))))
-
-(defun seshat-reader--multipage-drop-c-overlay (window)
-  "Remove the single-page overlay the native module attached to the buffer.
-
-That overlay spans the whole buffer and carries the image of one page in its
-`display' property, so it would cover the multi-page layout and has to go
-once the page rows take over.  It is closed through
-`seshat-reader-dyn--window-close' rather than `delete-overlay' because the
-native module owns an `EmacsWinState' behind it and only that entry point
-releases it.  The window parameter of WINDOW is cleared either way, so that
-no stale overlay handle survives the reload."
-  (let ((overlay (seshat-reader--multipage-c-overlay)))
-    (when (overlayp overlay)
-      (ignore-errors (seshat-reader-dyn--window-close overlay)))
-    (set-window-parameter window 'overlay nil)))
 
 (defun seshat-reader--multipage-rotate-by (delta)
   "Rotate every page of the buffer by DELTA degrees.
@@ -3352,21 +3346,16 @@ Load the PAGE if provided.
 
 PAGE is a 0-based page index, which is what the native loader expects, and
 defaults to the first page.  The document is loaded through
-`seshat-reader-dyn--load-doc', which also attaches a whole-buffer overlay
-displaying a single page; that overlay is closed again, because the pages are
-displayed by the rows of the multi-page layout instead.  The buffer is then
-emptied, the rows around PAGE are rendered and the window is left showing
-PAGE."
+`seshat-reader-dyn--load-doc', which only builds the native document state;
+the pages are displayed by the rows of the multi-page layout.  The buffer is
+then emptied, the rows around PAGE are rendered and the window is left
+showing PAGE."
   (interactive)
   (if-let* ((file (buffer-file-name (current-buffer))))
       (when (file-exists-p file)
 	(let* ((p (if (numberp page) (max 0 page) 0))
 	       (window (selected-window)))
 	  (seshat-reader-dyn--load-doc file p)
-	  ;; C 在建完 DocState 后总会挂一个覆盖全文、带单页图片的 overlay；它带着
-	  ;; display 属性，会盖住整页布局。必须经 `--window-close' 释放（它同时
-	  ;; 释放 C 侧的 EmacsWinState），直接 `delete-overlay' 会漏掉那份状态。
-	  (seshat-reader--multipage-drop-c-overlay window)
 	  ;; 页行由本函数重建，旧的页行/标记全部作废。
 	  (let ((inhibit-read-only t))
 	    (erase-buffer))

@@ -1,5 +1,7 @@
 *.elc
 *.o
+# -MMD 生成的依赖文件（render/*.d）
+*.d
 *.so
 *.bak
 *.dylib

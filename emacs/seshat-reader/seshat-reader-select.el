@@ -5,7 +5,7 @@
 ;; Author: Seshat contributors
 ;; Keywords: lisp, files, tools
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "29.1"))
+;; Package-Requires: ((emacs "32.0"))
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -544,7 +544,7 @@ feedback and must never break text extraction."
       ;; P1：装饰在渲染时**烘进位图**，C 侧那张表本身不再改变画面，故投喂完
       ;; 之后要「清 spec 缓存 + 重渲染驻留页」（见
       ;; `seshat-reader--multipage-refresh-decorations'），不再是刷新单页
-      ;; overlay 的 `--refresh-highlights'。
+      ;; overlay 的 `--refresh-highlights'（该入口已于 2026-10-28 删除）。
       (seshat-reader--multipage-refresh-decorations)))))
 
 (defun seshat-reader-select--clear-flash (buffer)

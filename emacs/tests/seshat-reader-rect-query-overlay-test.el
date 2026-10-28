@@ -5,7 +5,7 @@
 ;; Author: Seshat contributors
 ;; Keywords: lisp, tests, tools
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "29.1"))
+;; Package-Requires: ((emacs "32.0"))
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -113,21 +113,15 @@
     seshat-reader-rect-query-overlay-test--buffer))
 
 (defmacro seshat-reader-rect-query-overlay-test--with-doc (&rest body)
-  "在活的 reader buffer 里执行 BODY，并隔离 `image-flush'。
+  "在活的 reader buffer 里执行 BODY。
 
-`image-flush' 绑成 `ignore'（batch 下连续渲染必需，见 page-spec 套件注释），
-退出时无条件恢复原函数。"
+canvas 后端的 spec 没有 flush 语义，夹具不再需要隔离 `image-flush'。"
   (declare (indent 0) (debug t))
   `(progn
      (skip-unless (file-exists-p seshat-reader-rect-query-overlay-test--pdf))
      (skip-unless (seshat-reader-rect-query-overlay-test--module-available-p))
-     (let ((original-image-flush (symbol-function 'image-flush)))
-       (unwind-protect
-           (progn
-             (fset 'image-flush #'ignore)
-             (with-current-buffer (seshat-reader-rect-query-overlay-test--open-doc)
-               ,@body))
-         (fset 'image-flush original-image-flush)))))
+     (with-current-buffer (seshat-reader-rect-query-overlay-test--open-doc)
+       ,@body)))
 
 (defun seshat-reader-rect-query-overlay-test--foreign-overlay ()
   "在当前 buffer 之外造一个 overlay，并返回它。

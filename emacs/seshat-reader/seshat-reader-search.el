@@ -5,7 +5,7 @@
 ;; Author: Seshat contributors
 ;; Keywords: docs, hypermedia, tools
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "29.1"))
+;; Package-Requires: ((emacs "32.0"))
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -90,7 +90,9 @@
 ;; 那条「clear → 批注 → 闪现 → 扩展」路径，不存在第二套共存逻辑。
 ;;
 ;; 批注模块**未加载**时（只 require 了 `seshat-reader'）搜索仍可用：降级为
-;; 自己 `--clear-highlights' → `--add-decoration' → `--refresh-highlights'。
+;; 自己 `--clear-highlights' → `--add-decoration' → 清 spec 缓存 + 重渲染驻留页
+;; （`seshat-reader--multipage-refresh-decorations'；单页 overlay 刷新入口
+;; `--refresh-highlights' 已于 2026-10-28 随 canvas 迁移删除）。
 ;;
 ;; 状态
 ;; ====
@@ -525,8 +527,8 @@ module may not be loaded at all, hence the `fboundp' guards and
         (seshat-reader-dyn--clear-highlights)
         (dolist (decoration (seshat-reader-search--active-decorations))
           (seshat-reader-search--feed-decoration decoration))
-        ;; P1：装饰烘在渲染出来的位图里，最后一步是重渲染驻留页（而不是刷新
-        ;; 单页 overlay 的 `--refresh-highlights'）。
+        ;; P1：装饰烘在渲染出来的位图里，最后一步是重渲染驻留页（单页 overlay
+        ;; 刷新入口 `--refresh-highlights' 已于 2026-10-28 随 canvas 迁移删。）
         (seshat-reader--multipage-refresh-decorations))))))
 
 ;;;; 会话：显示与提示

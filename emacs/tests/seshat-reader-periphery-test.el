@@ -60,7 +60,9 @@ behind.  Returns the buffer."
                   seshat-reader--recent-scale-fallback 1.0)
       (use-local-map seshat-reader-mode-map)
       (dolist (page (or pages '(1 2 3)))
-        (let ((spec (list 'image :type 'pbm :data "x"
+        (let ((spec (list 'image :type 'canvas :data nil
+                          :data-width (or width 600)
+                          :data-height (or height 800)
                           :width (or width 600) :height (or height 800))))
           (seshat-reader--multipage-insert-page page spec)
           (seshat-reader--multipage-record-native page spec 1.0))))
@@ -95,7 +97,7 @@ behind.  Returns the buffer."
   "Return a fake position list for WINDOW at buffer POINT.
 XY is the image pixel offset (`posn-object-x-y'), (10 . 20) by default."
   (list window 5 point (cons 0 0) 100
-        (list 'image :type 'pbm :data "x")
+        (list 'image :type 'canvas :data nil)
         (cons 0 0)
         (or xy (cons 10 20))))
 
@@ -555,10 +557,9 @@ goto frame, where this order was impossible."
             (cl-letf (((symbol-function 'seshat-reader-dyn--page-image-spec)
                        (lambda (page scale &optional _rotate)
                          (setq renders (1+ renders))
-                         (list 'image :type 'pbm :data "x"
-                               :width 600 :height 800 :page page :scale scale)))
-                      ((symbol-function 'seshat-reader-dyn--refresh-highlights)
-                       (lambda (&rest _) (error "Must not be called"))))
+                         (list 'image :type 'canvas :data nil
+                               :data-width 600 :data-height 800
+                               :width 600 :height 800 :page page :scale scale))))
               (should (= 3 (seshat-reader--multipage-refresh-decorations window)))
               (should (= 3 renders))
               ;; 过期条目被清掉：第 1 页只留下新的（scale 1.0）那条

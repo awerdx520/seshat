@@ -58,9 +58,26 @@ endif
 
 # Compiler and base flags
 CC := gcc
-CFLAGS += -Wall -Wextra -fPIC
+# -O2 不可省：渲染热路径（逐像素 BGRA 扩展、色彩空间转换）在 -O0 下慢 2~2.5 倍。
+# 只加 -O2，不加 -march=native（产物需在其它机器可用）。
+# -Wclobbered（-O2 才启用）在 fz_try/fz_always 的跨块局部变量上会告警：MuPDF 的
+# fz_try 基于 setjmp/longjmp，跨块变量必须显式声明 volatile，因此这里不抑制任何
+# 告警，而是按 MuPDF 惯例在源码中声明 volatile。
+CFLAGS += -O2 -Wall -Wextra -fPIC -MMD -MP
 LDFLAGS :=
 EMACS = emacs --batch -Q --eval '(setq enable-dir-local-variables nil)' -L . -L ..
+
+# --- Emacs 版本门禁 ---
+# 本项目已迁移为单后端 canvas（见 openspec/completed/2026-10-28-reader-canvas-backend-migration.md），
+# 只走 Emacs 32 的原生 canvas 能力，没有 31 及更早版本的降级路径；低于 32 一律在解析期
+# 直接失败，避免「用旧 Emacs 编出一份看似成功、实际跑不起来的模块」。
+# 取 `EMACS' 的第一个词作为可执行文件（用户可 `make EMACS=/path/to/emacs' 覆盖），
+# 这样后面追加的 `-L' 参数不会被误喂给 --eval。
+EMACS_BIN   := $(firstword $(EMACS))
+EMACS_MAJOR := $(shell $(EMACS_BIN) --batch -Q --eval '(princ emacs-major-version)' 2>/dev/null)
+ifneq ($(shell test "$(EMACS_MAJOR)" -ge 32 2>/dev/null && echo yes),yes)
+  $(error Emacs 32 or newer is required for the canvas backend (found major=$(EMACS_MAJOR)))
+endif
 
 # --- 可选外部依赖：ETAF（面板 ETAF 渲染层）---
 # ETAF 不 vendored 进本仓库（见 openspec/completed/2026-10-17-m11.9-etaf-render.md），
@@ -172,4 +189,9 @@ checkdoc: $(EL_SRCS)
 clean:
 	rm -f seshat-reader-autoloads.el
 	rm -f $(ELC)
-	rm -f $(OBJS) $(LIB_NAME)
+	rm -f $(OBJS) $(OBJS:.o=.d) $(LIB_NAME)
+
+# gcc -MMD -MP 在编译每个 .c 的同时生成同名 .d，记录该 .c 依赖的全部头文件。
+# 没有这行的话头文件变更不会触发重编（改了 render/*.h 会静默复用旧 .o）。
+# `-include'（连字符）保证首次构建、.d 尚未生成时不会报错。
+-include $(OBJS:.o=.d)

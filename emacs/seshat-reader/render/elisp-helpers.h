@@ -38,55 +38,29 @@ register_module_func(emacs_env *env,
 						emacs_value *args, void *data),
 		     char *symbol, int min_args, int max_args, char *docstring);
 emacs_value
-data2elisp_image(emacs_env *env, int width, int height, char *img_data, size_t img_size);
+data2elisp_canvas(emacs_env *env, int data_w, int data_h, int logical_w,
+		  int logical_h, const unsigned char *bgra, size_t bgra_size);
 
 DocState *
 init_doc_state_ptr(emacs_env *env);
 DocState *
 get_doc_state_ptr(emacs_env *env);
 bool
-get_reader_current_state(emacs_env *env, DocState **doc_state_out,
-			 EmacsWinState **win_state_out, emacs_value *overlay_out);
+get_reader_current_state(emacs_env *env, DocState **doc_state_out);
 void
 clear_doc_state_ptr(emacs_env *env);
-EmacsWinState *
-init_win_state_ptr(emacs_env *env, DocState *doc_state, emacs_value window);
-EmacsWinState *
-get_win_state_ptr(emacs_env *env, emacs_value overlay);
-void
-reset_win_state(EmacsWinState *win_state);
 void
 set_current_page_number(emacs_env *env, int page);
 void
 set_current_render_status(emacs_env *env);
 void
 set_current_pagecount(emacs_env *env, DocState *state);
-emacs_value
-init_overlay(emacs_env *env, emacs_value window);
-bool
-check_current_overlay(emacs_env *env, emacs_value overlay);
-emacs_value
-get_current_doc_overlay(emacs_env *env);
 float
 get_frame_scale_factor(emacs_env *env);
 void
 emacs_message(emacs_env *env, char *str);
 void
 permanent_buffer_local_var(emacs_env *env, char *symbol);
-void
-display_img_to_overlay(emacs_env *env, int width, int height, char *img_data,
-		       size_t img_size, emacs_value buffer_overlay);
 emacs_value
 outline2plist(emacs_env *env, DocState *state, fz_outline *node);
-void
-nullify_window_cache(EmacsWinState *win_state);
-void
-clear_overlay_and_win_state(emacs_env *env, emacs_value overlay);
-void
-clear_all_overlays(emacs_env *env);
-bool
-display_cached_page(emacs_env *env, CachedPage *cp, emacs_value overlay);
-emacs_value
-render_and_display_page(emacs_env *env, DocState *doc_state, EmacsWinState *win_state,
-			emacs_value overlay, int page_number);
 #endif

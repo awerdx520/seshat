@@ -5,7 +5,7 @@
 ;; Author: Seshat contributors
 ;; Keywords: lisp, tests, tools
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "29.1"))
+;; Package-Requires: ((emacs "32.0"))
 
 ;; This program is free software: you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -74,7 +74,8 @@ buffer is returned."
       (use-local-map seshat-reader-mode-map)
       (dolist (page pages)
         (let* ((size (or (cdr (assq page sizes)) (cons 600 800)))
-               (spec (list 'image :type 'pbm :data "x"
+               (spec (list 'image :type 'canvas :data nil
+                           :data-width (car size) :data-height (cdr size)
                            :width (car size) :height (cdr size))))
           (seshat-reader--multipage-insert-page page spec)
           (seshat-reader--multipage-record-native page spec 1.0))))
@@ -100,7 +101,7 @@ buffer is returned."
   "Return a fake position list at buffer position POINT.
 XY is the image pixel offset, i.e. what `posn-object-x-y' answers."
   (list seshat-reader-select-cross-page-test--window 5 point (cons 0 0) 100
-        (list 'image :type 'pbm :data "x")
+        (list 'image :type 'canvas :data nil)
         (cons 0 0)
         xy))
 
@@ -611,7 +612,8 @@ frame scale / page scale）这一页的真实高度是 3200 / 2.0 = 1600，而
       '(1 2 3) '((1 . (600 . 800)) (2 . (600 . 3200)) (3 . (600 . 800)))
     ;; 夹具按 scale 1.0 记了 600x3200，这里改记为 scale 4.0 → native 600x800。
     (seshat-reader--multipage-record-native
-     2 (list 'image :type 'pbm :data "x" :width 600 :height 3200) 4.0)
+     2 (list 'image :type 'canvas :data nil
+             :data-width 600 :data-height 3200 :width 600 :height 3200) 4.0)
     (cl-letf (((symbol-function 'seshat-reader-select--page-scale)
                (lambda (_window) 2.0))
               ((symbol-function 'posn-object-width-height)

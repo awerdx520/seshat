@@ -19,7 +19,6 @@
 #include "render-theme.h"
 #include "elisp-helpers.h"
 #include "render-core.h"
-#include "render-threads.h"
 
 /* Dark mode is a user preference, not a property of the open document:
  * reloading a file, or opening a second one, must keep the chosen colours.

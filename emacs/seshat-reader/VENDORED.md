@@ -90,3 +90,31 @@
 - `Makefile` — 构建脚本（`make all` 生成 `seshat-render-core.so`、`seshat-reader-autoloads.el` 与 `.elc`）。可选依赖 ETAF 的位置按两级探测：`$(HOME)/Workspace/emacs-taf`（可用 `make ETAF_ROOT=…` 覆盖）→ straight.el 的 `build-*` 目录（本机 ETAF 只有这种形态）；都找不到时 `seshat-reader-etaf.el` 不参与编译
 - `COPYING`、`README.org`、`NEWS`、`CONTRIBUTORS`、`.clang-format` — 上游许可与元数据
 - `.gitignore` — 排除构建产物
+
+## 2026-10-28 · canvas 后端迁移（vendored 头文件升级 + legacy 路径退役）
+
+> 本节登记「PBM/PNM → canvas」后端迁移涉及 vendored 内容的部分。上文「按文件的本地改动清单」中凡提到
+> `render/render-threads.c` / `.h`、PNM 编码、`CachedPage`、`init_overlay`、`--refresh-highlights` 的描述，
+> 自本节起**属历史记录**（对应文件/入口已于 2026-10-28 删除）。
+
+### vendored `render/emacs-module.h`：31 → 32
+
+- **来源**：发行版随 Emacs 32.0.50 提供的 `/usr/include/emacs-module.h`（整文件替换，非手改拼装）。
+- **版本**：`EMACS_MAJOR_VERSION` 为 **32**，环境结构体 `emacs_env_32`；32 相对 31 为**尾部追加成员**，ABI 向后兼容，故 `module-load` 无需改调用约定。
+- **为什么必须升级**：旧 31 版头文件**没有 `canvas_data` 成员**，无法读写 canvas 的像素缓冲——canvas 后端在编译期就过不了。
+- **备份**：原 31 版副本在 `/tmp/canvas-baseline/emacs-module.h.31.bak`（临时目录，**不入库**）。
+- **复核**：升级后逐个对照 `nm -D seshat-render-core.so` 的导出入口（T1 阶段 15 个；T7 删除 `--window-close` 后为 14 个）。
+
+### 本地改动摘要（迁移相关）
+
+| 文件 | 改动 |
+|---|---|
+| `render/render-core.c` | ① 像素路线改 `fz_new_pixmap_from_display_list(…, fz_device_bgr(ctx), 0)`——`alpha=0` 表示不分配 A 通道（3 分量 BGR），MuPDF 把页面直接合成到不透明黑底 ⇒ 无预乘/反预乘问题；② `render_page_to_buffer` 改为导出 BGRA：按 `fz_pixmap_stride` 取源行，每像素一次 32 位写 `0xFF000000 | R<<16 | G<<8 | B`（**A 恒填 255**）到紧凑中间缓冲；`data2elisp_canvas` 再按行 `memcpy` 进 canvas 缓冲（两者行宽同为 `data_w*4`）；③ 新增 `data2elisp_canvas`（`create-image nil 'canvas t` + `:data-width`/`:data-height`/`:width`/`:height`，**`:data` 为 nil**、省略 `:id`，逐行 memcpy 进 `canvas_data` 后 `canvas-refresh`，`imagep` + 非 NULL 双自检失败即返回 nil）；④ 删除 PNM 编码段、`data2elisp_image`、11 个 legacy 入口（`--redisplay-doc` / `--next-page` / `--prev-page` / `--first-page` / `--last-page` / `--goto-page` / `--scale-page` / `--rotate-page` / `--window-create` / `--window-close` / `--refresh-highlights`）与 overlay/win-state 相关中间层；⑤ **20 处跨 `fz_try` 块变量加 `volatile`**（`loaded_page`/`success`/`pixmap`/`local_bgra`/`render_ok`/`dev`/`path`/`page`/`stext`/`buf`/`out`/`ok`/`quads`/`lines` 等，依据 MuPDF `fz_var` 的「异常后仍需使用的局部变量必须保活」要求，消除 `-O2` 下 `longjmp` 丢寄存器值隐患）；⑥ 渲染完成标志 `set_current_render_status` 移到 `--page-image-spec` 的成功路径（`--load-doc` 不再置位）。 |
+| `render/render-threads.c` / `.h` | **整文件删除**：worker 线程池、`submit_render_job`、`DrawThreadArgs`、`CachedPage` 生命周期全部退役。`render/` 净删 **1714** 行（其中含 header 31→32 的 +201 行；全仓 21 文件合计 **+786/−2423**）。 |
+| `render/elisp-helpers.c` / `.h` | 删除 overlay / win-state 的 elisp 互操作（`init_overlay` / `init_win_state_ptr` / `display_img_to_overlay` / `image-flush` 调用）；`--load-doc` 只建 `DocState`。 |
+| `render/mupdf-helpers.c` / `.h` | `free_doc_state` 不再处理 overlay / win-state；`get_reader_current_state` 只持 `DocState`（`--page-text` 的 0 参路径经 funcall `seshat-reader-current-doc-pagenumber` 取页号，含 DocState 兜底）。 |
+| `Makefile` | `CFLAGS` 加 `-O2 -MMD -MP` 与 `-include $(OBJS:.o=.d)`（补头文件依赖，消除「换了头文件却复用旧 `.o`」）；新增解析期门禁：`emacs-major-version` < 32 直接 `$(error Emacs 32 or newer is required for the canvas backend …)`。 |
+| `seshat-reader.el` | canvas 语义：`:data-width` / `:data-height` **只由渲染函数写一次**（任何 setf 都会重建并清零缓冲），只有 `:width` / `:height` 可随时改写；驻留内存估算改 `data-width × data-height × 4`；删除 `--multipage-drop-c-overlay` 与 `--refresh-highlights` 能力探测。 |
+| `render/*.d` | `-MMD -MP` 生成的依赖文件（`.c` 与头文件的依赖清单），`make clean` 会一并删除。**注意**：`.gitignore` 目前**未**覆盖 `*.d`，因此 `git status` 会把它们显示为未跟踪文件（建议补一条 `*.d`，属独立小改动）。 |
+
+**未升级的部分**：`render/` 下其余源码文件名、C 内部函数名（如 `get_reader_current_state`）、上游版权头一律保持原样（对 elisp 不可见，改名无收益）。

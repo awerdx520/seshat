@@ -5,7 +5,7 @@
 ;; Author: Seshat contributors
 ;; Keywords: lisp, files, tools
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "29.1"))
+;; Package-Requires: ((emacs "32.0"))
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -1352,15 +1352,14 @@ rect 数）。")
     count))
 
 (defun seshat-reader-annotation--highlight-module-available-p ()
-  "判断动态模块提供的五个入口是否都已可用.
-`--clear-highlights' / `--add-highlight' / `--refresh-highlights' 三者
-任一缺失即模块未加载；`--add-decoration' 缺失则表示加载的是**装饰表之前**
-的旧版模块（画不了 underline / strikeout 细条，也画不了自定义配色）；
-`--add-stroke' 缺失表示模块早于笔迹（ink）入口（画不了手写轨迹）。五种缺失
-都让投喂必然不完整，调用方据此提前跳过并提示一次。"
+  "判断动态模块提供的四个入口是否都已可用.
+`--clear-highlights' / `--add-highlight' 任一缺失即模块未加载；
+`--add-decoration' 缺失则表示加载的是**装饰表之前**的旧版模块（画不了
+underline / strikeout 细条，也画不了自定义配色）；`--add-stroke' 缺失表示
+模块早于笔迹（ink）入口（画不了手写轨迹）。四种缺失都让投喂必然不完整，
+调用方据此提前跳过并提示一次。"
   (and (fboundp 'seshat-reader-dyn--clear-highlights)
        (fboundp 'seshat-reader-dyn--add-highlight)
-       (fboundp 'seshat-reader-dyn--refresh-highlights)
        (fboundp 'seshat-reader-dyn--add-decoration)
        (fboundp 'seshat-reader-dyn--add-stroke)
        t))
@@ -1727,8 +1726,9 @@ y 向下，见 `docs/api.md' §4.5.1）。
 用户手写，画在矩形装饰之上更符合「手写覆盖高亮」的直觉。
 
 **两种失败分开归因**：模块不可用（`--clear-highlights' / `--add-highlight' /
-`--refresh-highlights' / `--add-decoration' / `--add-stroke' 五入口任一缺
-`fboundp'）经 `seshat-reader-annotation--warn-highlight-unavailable' 提示一次
+`--add-decoration' / `--add-stroke' 四入口任一缺 `fboundp'；单页 overlay 刷新
+入口 `--refresh-highlights' 已于 2026-10-28 随 canvas 迁移删除，不再探测）经
+`seshat-reader-annotation--warn-highlight-unavailable' 提示一次
 （会话内不重复）；而**单条投喂失败**（页号越界、坐标非法、C 侧拒绝该条目）
 只静默累计条数，仅在 `seshat-reader-annotation--feed-failure-report' 非 nil
 时 `message' 一次总数——它通常是上游数据问题，且每次重绘都会复现。两种情况

@@ -3,7 +3,7 @@
 单用户、云 VPS 自托管的个人知识中枢，三端协作 + LLM 增值。
 
 ## 三端
-- **桌面端**：Emacs（org-mode）+ 同步插件，复用 org-mode
+- **桌面端**：Emacs（**32.0+**，阅读器渲染后端使用 Emacs 32 的 canvas 图像对象）+ 同步插件，复用 org-mode
 - **Android 端**：Kotlin 单 App 双模块（① 电子书阅读/批注 ② org GTD）
 - **服务端**：Go（WebDAV + REST + git 版本化 + 静态加密 + FTS5 + LLM 增值）
 

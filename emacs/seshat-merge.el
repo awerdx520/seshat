@@ -4,7 +4,7 @@
 
 ;; Author: Thomas
 ;; Keywords: tools, comm, notes
-;; Package-Requires: ((emacs "27.1"))
+;; Package-Requires: ((emacs "32.0"))
 
 ;; 本文件不属于 GNU Emacs。
 

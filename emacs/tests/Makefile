@@ -30,7 +30,31 @@ EMACS      ?= emacs
 TESTS_DIR  := $(CURDIR)
 EMACS_ROOT := $(abspath $(CURDIR)/..)
 READER_DIR := $(abspath $(CURDIR)/../seshat-reader)
-BUILD_ROOT := $(HOME)/thomas-emacs/.local/straight/build-31.1
+# straight 的 build 目录名带 Emacs 完整版本（本机为 build-32.0.50），硬编码会在换
+# Emacs 版本后指向不存在的目录 —— 那些 `-L' 全部落空、整文件 load 失败、0 用例，
+# 正是文件头判据要消灭的「假绿」。故按当前 Emacs 的 major.minor 推导；推导不出
+# 唯一目录时直接 $(error)，绝不静默降级成空 `-L'。
+# 命令行传 BUILD_ROOT=<dir> 时以命令行为准（ifndef 不覆盖）。
+STRAIGHT_ROOT     ?= $(HOME)/thomas-emacs/.local/straight
+EMACS_MAJOR_MINOR := $(shell $(EMACS) --batch -Q --eval \
+  '(princ (format "%s.%s" emacs-major-version emacs-minor-version))' 2>/dev/null)
+ifndef BUILD_ROOT
+  BUILD_ROOT_EXACT := $(wildcard $(STRAIGHT_ROOT)/build-$(EMACS_MAJOR_MINOR))
+  ifneq ($(BUILD_ROOT_EXACT),)
+    BUILD_ROOT := $(BUILD_ROOT_EXACT)
+  else
+    # major.minor 拼不出目录名（版本带补丁位，如 32.0.50）→ 取同前缀的 build 目录，
+    # 必须唯一。`*/' 保证只匹配目录，不会匹配 build-32.0.50-cache.el 这类文件。
+    BUILD_ROOT_MATCHES := $(patsubst %/,%,$(wildcard $(STRAIGHT_ROOT)/build-$(EMACS_MAJOR_MINOR)*/))
+    ifeq ($(words $(BUILD_ROOT_MATCHES)),1)
+      BUILD_ROOT := $(BUILD_ROOT_MATCHES)
+    else ifeq ($(BUILD_ROOT_MATCHES),)
+      $(error 找不到与 Emacs $(EMACS_MAJOR_MINOR) 匹配的 straight build 目录（$(STRAIGHT_ROOT)/build-$(EMACS_MAJOR_MINOR)*）；请先让 straight 安装依赖，或显式传 BUILD_ROOT=<dir>)
+    else
+      $(error 与 Emacs $(EMACS_MAJOR_MINOR) 匹配的 straight build 目录不唯一：$(BUILD_ROOT_MATCHES)；请显式传 BUILD_ROOT=<dir>)
+    endif
+  endif
+endif
 LOG_DIR    := /tmp/seshat-reader-ert
 JUDGE      := sh $(TESTS_DIR)/ert-judge.sh
 

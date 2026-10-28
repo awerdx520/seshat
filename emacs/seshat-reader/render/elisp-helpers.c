@@ -18,9 +18,11 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 #include "elisp-helpers.h"
-#include "render-threads.h"
 #include "emacs-module.h"
 #include "render-core.h"
+
+#include <stdio.h>
+#include <string.h>
 
 /* Upper bound on one outline title, in bytes.  MuPDF reads the title
  * straight out of the PDF and nothing upstream validates it, so a
@@ -135,45 +137,138 @@ register_module_func(emacs_env *env,
 }
 
 /**
- * data2elisp_image - Create an Elisp image object from raw image data
-
- * One needs to be extremely about handling the image data, and make sure it
- * later gets dropped and freed accordingly.
+ * data2elisp_canvas - Create an Elisp `canvas' image spec and fill it.
  *
- * Returns: The Elisp image object, which will be a specific plist, and can be
- * rendered in Emacs with `insert-image' or other means.
-
+ * 历史实现把像素塞进 Lisp 字符串（多一份常驻副本）；现在改成让 Emacs
+ * 自己的 canvas 缓冲持有像素——spec 里没有
+ * `:data'，像素在 C 侧直接写进 canvas，再 `canvas-refresh'。
+ *
+ * 尺寸双轨制（务必区分）：
+ *   - `:data-width' / `:data-height' = 设备像素（= MuPDF pixmap 尺寸），
+ *     决定 canvas 缓冲大小，只在建 spec 时设一次，之后任何路径都不得改写
+ *     （改写会让 Emacs 重建缓冲并清零 → 残影/花屏）。
+ *   - `:width' / `:height' = 逻辑像素（= pixmap ÷ frame_scale），供显示层
+ *     缩放，可在 Elisp 侧随时 `setf'。
+ *
+ * BGRA 是 canvas 的原生格式（ARGB32，小端字节序 B,G,R,A），无需重排；
+ * 传入的 BGRA 必须已是逐行紧凑布局（行宽 data_w*4），源数据的 stride
+ * 已在渲染侧消化。
+ *
+ * @param env        Emacs module environment.
+ * @param data_w     Canvas width in device pixels.
+ * @param data_h     Canvas height in device pixels.
+ * @param logical_w  Logical width in unscaled pixels (`:width`).
+ * @param logical_h  Logical height in unscaled pixels (`:height`).
+ * @param bgra       Tightly packed BGRA block of data_w*data_h pixels.
+ * @param bgra_size  Size of BGRA in bytes.
+ * Return:           The canvas image spec, or nil (never a fake spec).
  */
 
 emacs_value
-data2elisp_image(emacs_env *env, int width, int height, char *img_data,
-		 size_t img_size)
+data2elisp_canvas(emacs_env *env, int data_w, int data_h, int logical_w,
+		  int logical_h, const unsigned char *bgra, size_t bgra_size)
 {
-	if (!img_data || img_size == 0 || width <= 0 || height <= 0)
+	if (!bgra || data_w <= 0 || data_h <= 0 || logical_w <= 0
+	    || logical_h <= 0)
 		return EMACS_NIL;
 
-	emacs_value image_width
-	    = env->make_integer(env, width);
-	emacs_value image_height
-	    = env->make_integer(env, height);
-	emacs_value img_data_string
-	    = env->make_unibyte_string(env, img_data, img_size);
-	emacs_value image_args[9]
-	    = { img_data_string,
-		env->intern(env, "pbm"),
-		env->intern(env, "t"),
+	size_t need = (size_t)data_w * (size_t)data_h * 4u;
+
+	if (bgra_size < need)
+		{
+			fprintf(stderr,
+				"seshat: BGRA block too small (%zu < %zu bytes)\n",
+				bgra_size, need);
+			return EMACS_NIL;
+		}
+
+	/* 只有 Emacs ≥ 32 的环境才带 `canvas_data' 槽位；这里先按 env->size
+	 * 探一下，避免在旧运行时上读越界（T8 会再加硬门禁）。 */
+	size_t canvas_slot_end = offsetof(emacs_env, canvas_data)
+				 + sizeof(env->canvas_data);
+
+	if ((size_t)env->size < canvas_slot_end)
+		{
+			fprintf(stderr,
+				"seshat: Emacs module environment too old for "
+				"canvas (size %zu < %zu)\n",
+				(size_t)env->size, canvas_slot_end);
+			return EMACS_NIL;
+		}
+
+	/* `:data' 不传 → 缓冲惰性分配（Lisp 侧零常驻）；`:id' 一律省略
+	 * （实测传非符号会静默产出假 spec）。 */
+	emacs_value create_args[11]
+	    = { EMACS_NIL,
+		env->intern(env, "canvas"),
+		EMACS_T,
+		env->intern(env, ":data-width"),
+		env->make_integer(env, data_w),
+		env->intern(env, ":data-height"),
+		env->make_integer(env, data_h),
 		env->intern(env, ":width"),
-		image_width,
+		env->make_integer(env, logical_w),
 		env->intern(env, ":height"),
-		image_height,
-		env->intern(env,
-			    ":scale"), // Never really used, only a placeholder
-		env->make_integer(env, 1) };
+		env->make_integer(env, logical_h) };
 
-	emacs_value image_data = env->funcall(
-	    env, env->intern(env, "create-image"), 9, image_args);
+	emacs_value img = env->funcall(env, env->intern(env, "create-image"), 11,
+				       create_args);
 
-	return image_data;
+	/* 双自检之一：`create-image' 失败时会返回非 image（或已经 signal）。 */
+	emacs_value imagep
+	    = env->funcall(env, env->intern(env, "imagep"), 1, &img);
+
+	if (!env->eq(env, imagep, EMACS_T))
+		{
+			fprintf(stderr,
+				"seshat: create-image returned a non-image for "
+				"the canvas spec\n");
+			/* `create-image' 失败时通常已经挂了 pending
+			 * non-local exit（signal）。带着它做后续调用
+			 * （`env->intern' / `funcall'）是 UB，故返回前清掉。 */
+			if (env->non_local_exit_check(env)
+			    != emacs_funcall_exit_return)
+				env->non_local_exit_clear(env);
+
+			return EMACS_NIL;
+		}
+
+	/* `canvas_data' 每次必须重取：改写 `:data-width'/`:data-height' 会
+	 * 重建并清零缓冲，旧指针随即悬空。用完即弃，不跨调用缓存。 */
+	uint32_t *canvas = env->canvas_data(env, img);
+
+	/* 双自检之二：缓冲必须可写。任一自检失败都不得静默返回假 spec。 */
+	if (!canvas)
+		{
+			fprintf(stderr,
+				"seshat: canvas_data returned NULL "
+				"(canvas buffer unavailable)\n");
+			/* 同上一处自检：失败前清掉 pending non-local exit，
+			 * 否则后续 `env->intern' 在待处理异常下是 UB。 */
+			if (env->non_local_exit_check(env)
+			    != emacs_funcall_exit_return)
+				env->non_local_exit_clear(env);
+
+			return EMACS_NIL;
+		}
+
+	/* 逐行拷贝。canvas 缓冲按 Emacs 文档是 row major、尺寸
+	 * width*height、格式 ARGB32，行宽即 data_w*4（紧凑）。源块同样紧凑，
+	 * 因此只需要逐行 memcpy，不做任何像素重排。 */
+	for (int y = 0; y < data_h; ++y)
+		{
+			size_t row_off = (size_t)y * (size_t)data_w * 4u;
+
+			memcpy((unsigned char *)canvas + row_off, bgra + row_off,
+			       (size_t)data_w * 4u);
+		}
+
+	/* 刷新：第二参 nil 表示不重新加载 `:data'（像素已由模块直写）。
+	 * 不得与 `reload-data' 混用，否则会用空/旧 :data 覆盖缓冲。 */
+	emacs_value refresh_args[2] = { img, EMACS_NIL };
+	env->funcall(env, env->intern(env, "canvas-refresh"), 2, refresh_args);
+
+	return img;
 }
 
 /**
@@ -188,7 +283,7 @@ DocState *
 init_doc_state_ptr(emacs_env *env)
 {
 	DocState *state = malloc(sizeof(DocState));
-	state->active_jobs = 0;
+
 	state->is_reloading = false;
 
 	// Create a user pointer and expose it to Emacs in a buffer-local
@@ -228,103 +323,6 @@ clear_doc_state_ptr(emacs_env *env)
 	emacs_value sym = env->intern(env, "seshat-reader-current-doc-state-ptr");
 	env->funcall(env, env->intern(env, "set"), 2,
 		     (emacs_value[]){ sym, EMACS_NIL });
-}
-
-EmacsWinState *
-init_win_state_ptr(emacs_env *env, DocState *doc_state, emacs_value window)
-{
-	/* Use calloc to ensure the struct starts zeroed */
-	EmacsWinState *win_state = calloc(1, sizeof(EmacsWinState));
-	if (!win_state)
-		return NULL;
-
-	reset_win_state(win_state);
-	win_state->doc_state = doc_state;
-
-	/* Allocate the window's CachedPage array */
-	for (int i = 0; i < MAX_CACHE_SIZE; ++i)
-		{
-			CachedPage *cp = malloc(sizeof(CachedPage));
-			if (!cp)
-				{
-					/* Cleanup on allocation failure */
-					for (int j = 0; j < i; ++j)
-						{
-							pthread_mutex_destroy(&win_state->cache_window[j]->mutex);
-							pthread_cond_destroy(&win_state->cache_window[j]->cond);
-							free(win_state->cache_window[j]);
-						}
-					free(win_state);
-					return NULL;
-				}
-
-			cp->page_num = -1;
-			cp->img_data = NULL;
-			cp->img_size = 0;
-			cp->imgw = 0;
-			cp->imgh = 0;
-			cp->status = PAGE_STATUS_EMPTY;
-
-			pthread_mutex_init(&cp->mutex, NULL);
-			pthread_cond_init(&cp->cond, NULL);
-
-			win_state->cache_window[i] = cp;
-		}
-
-	win_state->current_cached_page = win_state->cache_window[0];
-
-	/* Create a user pointer */
-	emacs_value win_state_usr_ptr = env->make_user_ptr(env, NULL, win_state);
-
-	/* Get the overlay window parameter */
-	emacs_value overlay = env->funcall(
-					   env, env->intern(env, "window-parameter"), 2,
-					   (emacs_value[]){ window, env->intern(env, "overlay") });
-
-	/* Set the overlay property for the EmacsWinState user pointer */
-	env->funcall(env, env->intern(env, "overlay-put"), 3,
-		     (emacs_value[]){ overlay, env->intern(env, "win-state"),
-				      win_state_usr_ptr });
-	return win_state;
-}
-
-EmacsWinState *
-get_win_state_ptr(emacs_env *env, emacs_value overlay)
-{
-	if (env->eq(env, overlay, EMACS_NIL))
-	{
-		emacs_message(env,
-			      "Selected window doesn't have a valid overlay.");
-		return NULL;
-	}
-
-	emacs_value ptr = env->funcall(
-	    env, env->intern(env, "overlay-get"), 2,
-	    (emacs_value[]){ overlay, env->intern(env, "win-state") });
-
-	if (env->eq(env, ptr, EMACS_NIL))
-	{
-		emacs_message(
-		    env,
-		    "Selected window doesn't have a pointer to EmacsWinState.");
-		return NULL;
-	}
-
-	EmacsWinState *win_state = env->get_user_ptr(env, ptr);
-	return win_state;
-}
-
-void
-reset_win_state(EmacsWinState *win_state)
-{
-    if (!win_state) return;
-
-    win_state->resolution = 72.0;
-    win_state->rotate = 0;
-    win_state->current_page_number = 0;
-    win_state->current_window_index = 0;
-    win_state->active_jobs = 0;
-    win_state->closing = false;
 }
 
 void
@@ -378,101 +376,6 @@ set_current_pagecount(emacs_env *env, DocState *state)
 }
 
 /**
- * init_overlay - Create and register an overlay covering the whole buffer.
- * @env:    The Emacs environment pointer.
- *
- * Makes an overlay spanning the entire buffer for the given window . Stores the
- * overlay object in the the window parameter.
- */
-
-emacs_value
-init_overlay(emacs_env *env, emacs_value window)
-{
-	emacs_value start
-	    = env->funcall(env, env->intern(env, "point-min"), 0, NULL);
-	emacs_value end
-	    = env->funcall(env, env->intern(env, "point-max"), 0, NULL);
-
-	// Check if there is an existing overlay for the window and deletes it
-	emacs_value existing_overlay = env->funcall(
-	    env, env->intern(env, "window-parameter"), 2,
-	    (emacs_value[]){ window, env->intern(env, "overlay") });
-
-	if (!env->eq(env, existing_overlay, EMACS_NIL))
-		env->funcall(env, env->intern(env, "seshat-reader-dyn--window-close"),
-			     1, &existing_overlay);
-
-	emacs_value overlay
-	    = env->funcall(env, env->intern(env, "make-overlay"), 2,
-			   (emacs_value[]){ start, end });
-	env->funcall(
-	    env, env->intern(env, "overlay-put"), 3,
-	    (emacs_value[]){ overlay, env->intern(env, "window"), window });
-	env->funcall(
-	    env, env->intern(env, "set-window-parameter"), 3,
-	    (emacs_value[]){ window, env->intern(env, "overlay"), overlay });
-
-	return overlay;
-}
-
-/*
- * Check whether the overlay is in the correct
- * buffer or not
- */
-bool
-check_current_overlay(emacs_env *env, emacs_value overlay)
-{
-	/* `emacs_value' is an opaque handle, not a pointer we may compare with
-	 * `==': the module API only guarantees `env->eq' knows about Emacs'
-	 * (possibly non-unique) representation of nil.  Comparing handles
-	 * directly silently failed once nil was actually reached here (the
-	 * reader's multi-page layout no longer puts an overlay on every
-	 * window), and the guard let `overlay-buffer(nil)' through — a crash
-	 * instead of the intended `false'. */
-	if (env->eq(env, overlay, EMACS_NIL))
-		return false;
-
-	emacs_value overlay_buffer = env->funcall(
-	    env, env->intern(env, "overlay-buffer"), 1, &overlay);
-	emacs_value current_buffer
-	    = env->funcall(env, env->intern(env, "current-buffer"), 0, NULL);
-
-	return env->eq(env, overlay_buffer, current_buffer);
-}
-
-/**
- * get_current_doc_overlay - Retrieve the stored overlay object for the
- * document as a window parameter.
- * @env:    The Emacs environment pointer.
- *
- * Return: The Elisp overlay object, or an unbound value if not set.
- */
-
-emacs_value
-get_current_doc_overlay(emacs_env *env)
-{
-	emacs_value curr_win = EMACS_CURR_WIN;
-	emacs_value current_overlay = env->funcall(
-	    env, env->intern(env, "window-parameter"), 2,
-	    (emacs_value[]){ curr_win, env->intern(env, "overlay") });
-
-	// Check if overlay is valid for current buffer.  `env->eq' (not `!='
-	// on the raw handle): see the note in `check_current_overlay'.
-	if (!env->eq(env, current_overlay, EMACS_NIL)
-	    && !check_current_overlay(env, current_overlay))
-	{
-		// Stale overlay, clear it
-		env->funcall(env, env->intern(env, "set-window-parameter"), 3,
-			     (emacs_value[]){ curr_win,
-					      env->intern(env, "overlay"),
-					      EMACS_NIL });
-		return EMACS_NIL;
-	}
-
-	return current_overlay;
-}
-
-/**
  * emacs_message - Print a message in Emacs with the given string
  * @env:    The Emacs environment pointer.
  * @str:    Null-terminated C string containing the message.
@@ -505,37 +408,6 @@ permanent_buffer_local_var(emacs_env *env, char *symbol)
 		     (emacs_value[]){ el_symbol,
 				      env->intern(env, "permanent-local"),
 				      EMACS_T });
-}
-
-/**
- * Display image data in an Emacs overlay.
- *
- * Converts raw image data into an Emacs image spec and sets it as the
- * `display` property of the given overlay. Flushes the existing image
- * from Emacs' image cache after displaying.
- */
-
-void
-display_img_to_overlay(emacs_env *env, int width, int height, char *img_data,
-                       size_t img_size, emacs_value buffer_overlay)
-{
-	if (!img_data || img_size == 0 || width <= 0 || height <= 0)
-		return;
-
-	// Fetch the old image spec before we overwrite it
-	emacs_value old_img = env->funcall(env, env->intern(env, "overlay-get"), 2,
-					   (emacs_value[]){ buffer_overlay, env->intern(env, "display") });
-
-	// 2. Create and apply the new image spec
-	emacs_value elisp_img = data2elisp_image(env, width, height, img_data, img_size);
-	emacs_value overlay_put_args[3] = { buffer_overlay, env->intern(env, "display"), elisp_img };
-	env->funcall(env, env->intern(env, "overlay-put"), 3, overlay_put_args);
-
-	// 3. Flush the old image from Emacs' image cache
-	if (!env->eq(env, old_img, EMACS_NIL))
-		{
-			env->funcall(env, env->intern(env, "image-flush"), 1, &old_img);
-		}
 }
 
 /**
@@ -674,15 +546,12 @@ get_frame_scale_factor(emacs_env *env)
 	return env->extract_float(env, factor);
 }
 
-/* Fetch the current DocState, EmacsWinState and overlay */
-/* To be used when operating on the current state, e.g. */
-/* changing pages, zooming, etc. Return false if invalid.*/
+/* Fetch the current DocState.  To be used when operating on the current */
+/* state, e.g. reading the text of a page or querying its rectangles. */
+/* Return false if invalid. */
 
 bool
-get_reader_current_state(emacs_env *env,
-			 DocState **doc_state_out,
-			 EmacsWinState **win_state_out,
-			 emacs_value *overlay_out)
+get_reader_current_state(emacs_env *env, DocState **doc_state_out)
 {
 	DocState *doc_state = get_doc_state_ptr(env);
 
@@ -691,189 +560,13 @@ get_reader_current_state(emacs_env *env,
 			emacs_message(env, "No valid DocState user pointer found.");
 			return false;
 		}
-	emacs_value overlay = get_current_doc_overlay(env);
-	if (!check_current_overlay(env, overlay))
-		{
-			emacs_message(env, "Invalid overlay state: reinitializing");
-			return false;
-		}
 
-	EmacsWinState *win_state = get_win_state_ptr(env, overlay);
-
-	if (!win_state || win_state->closing)
+	/* Bail out during reload to avoid use-after-free. */
+	if (doc_state->is_reloading)
 		return false;
+
 	if (doc_state_out)
 		*doc_state_out = doc_state;
-	if (win_state_out)
-		*win_state_out = win_state;
-	if (overlay_out)
-		*overlay_out = overlay;
 
 	return true;
-}
-
-/* Free all the CachedPages of an Emacs window's
- cache window. We only nullify them so that new data
-can be rendered into those slots, we retain the links to
-DocPages. */
-
-void
-nullify_window_cache(EmacsWinState *win_state)
-{
-	if (!win_state)
-		return;
-
-	for (int i = 0; i < MAX_CACHE_SIZE; ++i)
-		{
-			CachedPage *cp = win_state->cache_window[i];
-			if (!cp)
-				continue;
-			clear_cp(cp);
-		}
-}
-
-/* Delete the overlay and the EmacsWinState associated  */
-
-void
-clear_overlay_and_win_state(emacs_env *env, emacs_value overlay)
-{
-	if (env->eq(env, overlay, EMACS_NIL))
-		return;
-
-	emacs_value overlayp =
-		env->funcall(env, env->intern(env, "overlayp"), 1, &overlay);
-
-	if (!env->eq(env, overlayp, EMACS_T))
-		return;
-
-	emacs_value win_state_sym = env->intern(env, "win-state");
-	emacs_value get_args[2] = { overlay, win_state_sym };
-	emacs_value ws_val =
-		env->funcall(env, env->intern(env, "overlay-get"), 2, get_args);
-
-	if (env->eq(env, ws_val, EMACS_NIL))
-		return;
-
-	// Clear the property first to prevent double close
-	emacs_value clear_args[3] = { overlay, win_state_sym, EMACS_NIL };
-	env->funcall(env, env->intern(env, "overlay-put"), 3, clear_args);
-	EmacsWinState *win_state = env->get_user_ptr(env, ws_val);
-
-	if (win_state)
-		{
-			win_state->closing = true;
-			wait_for_win_jobs(win_state);
-			free_cache_window(win_state);
-			free(win_state);
-		}
-
-	// Clear the window's overlay parameter if it points to this overlay
-	emacs_value window_sym = env->intern(env, "window");
-	emacs_value overlay_window_args[2] = { overlay, window_sym };
-	emacs_value win =
-		env->funcall(env, env->intern(env, "overlay-get"), 2,
-			     overlay_window_args);
-
-	if (!env->eq(env, win, EMACS_NIL))
-		{
-			emacs_value window_overlay_args[2] = { win, env->intern(env, "overlay") };
-			emacs_value window_overlay =
-				env->funcall(env, env->intern(env, "window-parameter"), 2,
-					     window_overlay_args);
-
-			if (env->eq(env, window_overlay, overlay))
-				{
-					emacs_value set_args[3] = { win, env->intern(env, "overlay"), EMACS_NIL };
-					env->funcall(env, env->intern(env, "set-window-parameter"), 3,
-						     set_args);
-				}
-		}
-	env->funcall(env, env->intern(env, "delete-overlay"), 1, &overlay);
-}
-
-/* Safely clear all overlays and their associated EmacsWinStates  */
-
-void
-clear_all_overlays(emacs_env *env)
-{
-	emacs_value start =
-		env->funcall(env, env->intern(env, "point-min"), 0, NULL);
-	emacs_value end =
-		env->funcall(env, env->intern(env, "point-max"), 0, NULL);
-
-	emacs_value overlays_in_args[2] = { start, end };
-	emacs_value overlays =
-		env->funcall(env, env->intern(env, "overlays-in"), 2,
-			     overlays_in_args);
-
-	while (!env->eq(env, overlays, EMACS_NIL))
-		{
-			emacs_value ov =
-				env->funcall(env, env->intern(env, "car"), 1, &overlays);
-			clear_overlay_and_win_state(env, ov);
-			overlays =
-				env->funcall(env, env->intern(env, "cdr"), 1, &overlays);
-		}
-}
-
-/* Take an already rasterized CachedPage and display it in Emacs */
-
-bool
-display_cached_page(emacs_env *env, CachedPage *cp, emacs_value overlay)
-{
-	char *img_data;
-	if (!cp)
-		return false;
-
-	// Get data of the page without race conditions
-	pthread_mutex_lock(&cp->mutex);
-	if (cp->status != PAGE_STATUS_READY || !cp->img_data)
-		{
-			pthread_mutex_unlock(&cp->mutex);
-			return false;
-		}
-	int width    = cp->imgw;
-	int height   = cp->imgh;
-	img_data = cp->img_data;
-	size_t img_size = cp->img_size;
-	pthread_mutex_unlock(&cp->mutex);
-
-	display_img_to_overlay(env, width, height, img_data, img_size, overlay);
-	return true;
-}
-
-/* Properly render the page, build the cache window arond it, and once rendered display it */
-
-emacs_value
-render_and_display_page(emacs_env *env, DocState *doc_state,
-			EmacsWinState *win_state,
-			emacs_value overlay,
-			int page_number)
-{
-	if (page_number < 0 || page_number >= doc_state->pagecount)
-		{
-			emacs_message(env, "Provided page number is out of bounds!");
-			return EMACS_NIL;
-		}
-
-	wait_for_win_jobs(win_state);
-	build_cache_window(doc_state, win_state, page_number);
-
-	CachedPage *cp = win_state->current_cached_page;
-
-	if (!wait_for_cached_page(cp))
-		{
-			emacs_message(env, "Failed to render the page.");
-			return EMACS_NIL;
-		}
-
-	if (!display_cached_page(env, cp, overlay))
-		{
-			emacs_message(env, "Failed to display the rendered page.");
-			return EMACS_NIL;
-		}
-
-	set_current_page_number(env, win_state->current_page_number);
-	set_current_render_status(env);
-	return EMACS_T;
 }

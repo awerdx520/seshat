@@ -5,7 +5,7 @@
 ;; Author: Seshat contributors
 ;; Keywords: lisp, tests, tools
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "29.1"))
+;; Package-Requires: ((emacs "32.0"))
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -45,13 +45,13 @@
 ;;     -l ert -l emacs/tests/seshat-reader-page-spec-test.el \
 ;;     -f ert-run-tests-batch-and-exit
 ;;
-;; 两个 batch 独有的坑：
-;;  1. batch 下**第二次**往 overlay 写 display 时 C 侧 `image-flush' 会抛
-;;     `Window system frame should be used'；本套件连续渲染多页，故夹具内把
-;;     `image-flush' 绑成 `ignore'（只影响图像缓存，不影响 PNM 字节），
-;;     并在 `unwind-protect' 里恢复原函数。
-;;  2. PDF 打开一次贵（477 页 + 首页渲染），故整个会话复用同一个 reader
-;;     buffer；文档被关闭（`seshat-reader-current-doc-state-ptr' 为 nil）时才重开。
+;; 一个 batch 独有的坑：PDF 打开一次贵（477 页 + 首页渲染），故整个会话复用
+;; 同一个 reader buffer；文档被关闭（`seshat-reader-current-doc-state-ptr' 为
+;; nil）时才重开。
+;;
+;; 旧单页 overlay 后端需要在夹具里把 `image-flush' 绑成 `ignore'（batch 下第二
+;; 次写 display 会抛 `Window system frame should be used'）；canvas 后端的 spec
+;; 不经过那条淘汰路径，该护栏已删除。
 ;;
 ;; 缺 PDF 或 `.so' 不可用时用例 `skip-unless' 跳过，不会让整个文件报错。
 
@@ -115,22 +115,16 @@
     seshat-reader-page-spec-test--buffer))
 
 (defmacro seshat-reader-page-spec-test--with-doc (&rest body)
-  "在活的 reader buffer 里执行 BODY，并隔离 `image-flush' 与规范缓存。
+  "在活的 reader buffer 里执行 BODY，并隔离规范缓存。
 
-BODY 执行前缓存被清空，因此各用例互不影响；`image-flush' 被绑成 `ignore'
-（batch 下连续渲染必需），退出时无条件恢复原函数。"
+BODY 执行前缓存被清空，因此各用例互不影响。"
   (declare (indent 0) (debug t))
   `(progn
      (skip-unless (file-exists-p seshat-reader-page-spec-test--pdf))
      (skip-unless (seshat-reader-page-spec-test--module-available-p))
-     (let ((original-image-flush (symbol-function 'image-flush)))
-       (unwind-protect
-           (progn
-             (fset 'image-flush #'ignore)
-             (with-current-buffer (seshat-reader-page-spec-test--open-doc)
-               (seshat-reader--page-spec-clear-cache)
-               ,@body))
-         (fset 'image-flush original-image-flush)))))
+     (with-current-buffer (seshat-reader-page-spec-test--open-doc)
+       (seshat-reader--page-spec-clear-cache)
+       ,@body)))
 
 (defmacro seshat-reader-page-spec-test--with-c-counter (counter &rest body)
   "在 BODY 内统计原生入口被调用的次数，结果放在 COUNTER。"
@@ -156,7 +150,7 @@ BODY 执行前缓存被清空，因此各用例互不影响；`image-flush' 被�
 ;;; 参数语义
 
 (ert-deftest seshat-reader-page-spec-test--returns-image-spec ()
-  "正常页返回 image spec，且宽高为正整数。"
+  "正常页返回 canvas image spec，宽高与设备尺寸为正整数，且无 :data 副本。"
   (seshat-reader-page-spec-test--with-doc
     (let* ((spec (seshat-reader--page-spec 1 1.0))
            (width (image-property spec :width))
@@ -166,8 +160,58 @@ BODY 执行前缓存被清空，因此各用例互不影响；`image-flush' 被�
       (should (> width 0))
       (should (integerp height))
       (should (> height 0))
-      ;; PNM 字节已复制进 Lisp 字符串，spec 必须能取回 :data。
-      (should (stringp (image-property spec :data))))))
+      ;; canvas 后端：像素写进 Emacs 持有的 canvas 缓冲，Lisp 侧不再有字符串
+      ;; 副本，因此 :data 必须是 nil，尺寸改由 :data-width/:data-height 表达。
+      (should (eq (image-property spec :type) 'canvas))
+      (should-not (image-property spec :data))
+      (let ((data-width (image-property spec :data-width))
+            (data-height (image-property spec :data-height)))
+        (should (integerp data-width))
+        (should (integerp data-height))
+        (should (> data-width 0))
+        (should (> data-height 0))
+        ;; 设备像素 ≥ 逻辑像素：frame_scale=1 时两者相等，但本机不保证，
+        ;; 故只断言「不小于」，不写死相等。
+        (should (>= data-width width))
+        (should (>= data-height height)))
+      ;; canvas 缓冲可写路径存在（Emacs 32 的 `canvas-refresh' 把模块写入的
+      ;; 像素提交给显示）；不在此真写，避免 batch 下触发重绘。
+      (should (fboundp 'canvas-refresh)))))
+
+(ert-deftest seshat-reader-page-spec-test--canvas-buffer-fill-regression ()
+  "两次同参数渲染都产出可用的 canvas spec，刷新后后端类型不变。
+
+回归目标：canvas 后端把像素**直写**进 Emacs 持有的缓冲，一旦模块漏写，
+spec 形状仍然完全正常（尺寸对、类型对），只有画面全黑——形状断言抓不到。
+
+batch 里没有 Lisp 侧的像素访问器（spec 的 `:data' 恒为 nil，`canvas_data'
+只对模块可见），因此**无法在此断言缓冲内容**。这里覆盖所有可观测项：设备尺寸
+为正整数、清缓存后第二次渲染仍是 image spec 且是新对象、`canvas-refresh' 之后
+`:type' 仍为 canvas。缓冲是否真被填充由 `/tmp/canvas-baseline' 的 dump 模块
+逐字节回归覆盖（见 `openspec/tech-debt.md' 的 batch 断言缺口条目）。"
+  (seshat-reader-page-spec-test--with-doc
+    (let* ((first (seshat-reader--page-spec 1 1.0))
+           (second (progn (seshat-reader--page-spec-clear-cache)
+                          (seshat-reader--page-spec 1 1.0))))
+      (should (imagep first))
+      (should (imagep second))
+      ;; 缓存已清，第二次必须走原生入口并产出新 spec；对象相同说明缓存
+      ;; 清理失效，那样这条用例就没有覆盖「重新渲染」。
+      (should-not (eq first second))
+      (dolist (spec (list first second))
+        (should (eq (image-property spec :type) 'canvas))
+        (should-not (image-property spec :data))
+        (should (> (or (image-property spec :data-width) 0) 0))
+        (should (> (or (image-property spec :data-height) 0) 0))
+        (should (> (or (image-property spec :width) 0) 0))
+        (should (> (or (image-property spec :height) 0) 0)))
+      ;; `canvas-refresh' 在 batch（无窗口系统）下不保证可用：调用失败就不断言，
+      ;; 成功则要求 spec 仍是同一个 canvas 后端。
+      (when (and (fboundp 'canvas-refresh)
+                 (condition-case nil (progn (canvas-refresh second nil) t)
+                   (error nil)))
+        (should (eq (image-property second :type) 'canvas))
+        (should (imagep second))))))
 
 (ert-deftest seshat-reader-page-spec-test--invalid-page-numbers-return-nil ()
   "页号 0 / 负数 / 越界一律返回 nil，且不写缓存。"

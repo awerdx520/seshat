@@ -4,7 +4,7 @@
 
 ;; Author: Thomas
 ;; Keywords: data, notes, tools
-;; Package-Requires: ((emacs "27.1"))
+;; Package-Requires: ((emacs "32.0"))
 
 ;;; Commentary:
 

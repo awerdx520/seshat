@@ -5,7 +5,7 @@
 ;; Author: seshat project
 ;; Version: 0.1.0
 ;; Keywords: tools, comm
-;; Package-Requires: ((emacs "27.1"))
+;; Package-Requires: ((emacs "32.0"))
 
 ;; 本文件不属于 GNU Emacs。
 

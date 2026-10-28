@@ -24,21 +24,8 @@
 
 #define MINRES 18
 #define MAXRES 850
-#define MAX_CACHE_SIZE 11
-#define MAX_CACHE_WINDOW_SIZE (MAX_CACHE_SIZE / 2)
 
 extern pthread_mutex_t g_mupdf_mutex[FZ_LOCK_MAX];
-
-/* Represents what's the current status of the page */
-/* in the entire rasterization and display process */
-
-typedef enum
-{
-	PAGE_STATUS_EMPTY,
-	PAGE_STATUS_RENDERING,
-	PAGE_STATUS_READY,
-	PAGE_STATUS_ERROR
-} PageStatus;
 
 /*************************************************************/
 /* Representation of the document's page from MuPDF	     */
@@ -124,11 +111,11 @@ typedef struct
 } Decoration;
 
 /************************************************************************/
-/* The primary representation of the entire document. DocState holds    */
-/* DocPages and each EmacsWinState links to some DocState. It shall     */
-/* have the important MuPDF objects such as fz_context and fz_document, */
-/* and for this reason, to follow MuPDF's multi-threading rules,        */
-/* it must always be used by one thread at any given time.	        */
+/* The primary representation of the entire document.  DocState holds     */
+/* the DocPages and the MuPDF context of one open document.  It shall     */
+/* have the important MuPDF objects such as fz_context and fz_document,   */
+/* and for this reason, to follow MuPDF's multi-threading rules, it must  */
+/* always be used by one thread at any given time.                        */
 /************************************************************************/
 
 typedef struct
@@ -144,65 +131,21 @@ typedef struct
 	fz_outline *outline;
 	float frame_scale; // Emacs' frame-scale-factor
 
-	/* Document-level decoration table (rects and strokes).  Owned by
-	 * whichever thread runs the module functions (Emacs' main thread);
-	 * the render threads never read it, they get a per-page snapshot
-	 * copied into DrawThreadArgs instead. */
+	/* Page the document was loaded at.  The module keeps no window state,
+	 * so this is the only page number it remembers: `--page-text' falls
+	 * back to it when the caller omits PAGE and Elisp cannot report the
+	 * page on screen. */
+	int current_page_number;
+
+	/* Document-level decoration table (rects and strokes).  Owned by the
+	 * Emacs main thread; the worker threads never read it, they get a
+	 * per-page snapshot copied into their job argument instead. */
 	Decoration *decorations;
 	int decoration_count;
 	int decoration_cap;
 
-	/* Set by the mutating module functions, cleared by the refresh one.
-	 * Only touched from the Emacs main thread. */
-	bool decorations_dirty;
-
-	atomic_int active_jobs;
 	bool is_reloading;
 } DocState;
-
-/**************************************************************/
-/* This represents rasterized image of a page that has been   */
-/* produced via load_page_dl and draw_page_thread. This image */
-/* has specific properties such as its page number, its pixel */
-/* dimensions, its render status, etc.                        */
-/* The image is to be owned by an EmacsWinState, i.e., an     */
-/* Emacs Window.					      */
-/**************************************************************/
-
-typedef struct
-{
-	int page_num;
-	int imgw, imgh;
-	char *img_data;
-	size_t img_size;
-	PageStatus status;
-	pthread_mutex_t mutex;
-	pthread_cond_t cond;
-} CachedPage;
-
-/**********************************************************************/
-/* Representation of the document's specific state in a given Emacs   */
-/* Window. All window-specific operations, such as zooming, rotating, */
-/* etc. must be done using this. For each window we keep a separate   */
-/* cache_window and, of course, a distinct CachedPage to display.     */
-/**********************************************************************/
-
-typedef struct
-{
-	DocState *doc_state;
-
-	float resolution;
-	int rotate;
-
-	int current_page_number;
-	int current_window_index;
-
-	CachedPage *cache_window[MAX_CACHE_SIZE];
-	CachedPage *current_cached_page;
-
-	atomic_int active_jobs;
-	bool closing;
-} EmacsWinState;
 
 /* Frees the `pts' of COUNT decorations, then the array itself.  Shared by
  * render-core.c (DocState table) and mupdf-helpers.c (free_doc_state), so
@@ -213,43 +156,10 @@ free_decoration_table(Decoration *deco, int count);
 
 int
 load_page_dl(DocState *state, DocPage *dp);
-void *
-draw_page_thread(void *arg);
-void
-build_cache_window(DocState *doc_state, EmacsWinState *win_state, int n);
-void
-slide_cache_window_forward(DocState *state, EmacsWinState *win_state);
-void
-slide_cache_window_backward(DocState *state, EmacsWinState *win_state);
 
 // Emacs module functions
 emacs_value
 emacs_load_doc(emacs_env *env, ptrdiff_t nargs, emacs_value *args, void *data);
-emacs_value
-emacs_doc_window_create(emacs_env *env, ptrdiff_t nargs, emacs_value *args,
-			void *data);
-emacs_value
-emacs_doc_window_close(emacs_env *env, ptrdiff_t nargs, emacs_value *args,
-		       void *data);
-emacs_value
-emacs_next_page(emacs_env *env, ptrdiff_t nargs, emacs_value *args, void *data);
-emacs_value
-emacs_prev_page(emacs_env *env, ptrdiff_t nargs, emacs_value *args, void *data);
-emacs_value
-emacs_first_page(emacs_env *env, ptrdiff_t nargs, emacs_value *args,
-		 void *data);
-emacs_value
-emacs_last_page(emacs_env *env, ptrdiff_t nargs, emacs_value *args, void *data);
-emacs_value
-emacs_goto_page(emacs_env *env, ptrdiff_t nargs, emacs_value *args, void *data);
-emacs_value
-emacs_doc_scale_page(emacs_env *env, ptrdiff_t nargs, emacs_value *args,
-		     void *data);
-emacs_value
-emacs_doc_rotate(emacs_env *env, ptrdiff_t nargs, emacs_value *args,
-		     void *data);
-emacs_value
-emacs_redisplay_doc(emacs_env *env, ptrdiff_t nargs, emacs_value *args, void *data);
 
 emacs_value
 emacs_page_text(emacs_env *env, ptrdiff_t nargs, emacs_value *args, void *data);
@@ -278,10 +188,6 @@ emacs_add_stroke(emacs_env *env, ptrdiff_t nargs, emacs_value *args, void *data)
 emacs_value
 emacs_clear_highlights(emacs_env *env, ptrdiff_t nargs, emacs_value *args,
 		       void *data);
-
-emacs_value
-emacs_refresh_highlights(emacs_env *env, ptrdiff_t nargs, emacs_value *args,
-			 void *data);
 
 emacs_value
 emacs_page_image_spec(emacs_env *env, ptrdiff_t nargs, emacs_value *args,

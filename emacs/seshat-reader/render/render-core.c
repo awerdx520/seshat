@@ -23,7 +23,6 @@
 #include <math.h>
 #include "mupdf-helpers.h"
 #include "render-theme.h"
-#include "render-threads.h"
 
 int plugin_is_GPL_compatible;
 
@@ -185,25 +184,6 @@ free_decoration_table(Decoration *deco, int count)
 }
 
 /**
- * Free a render job's argument block together with the per-page
- * decoration snapshot it owns.  Every exit path of `draw_page_thread'
- * must release both through this helper.
- *
- * The snapshot owns its own copies of every stroke's point array (see
- * submit_render_job), so freeing it here cannot touch the DocState table.
- */
-
-static void
-free_draw_thread_args(DrawThreadArgs *args)
-{
-	if (!args)
-		return;
-
-	free_decoration_table(args->deco, args->deco_count);
-	free(args);
-}
-
-/**
  * Load and cache the display list for a page.
  *
  * If the page is empty, sets its status to rendering, loads the page,
@@ -236,8 +216,13 @@ load_page_dl(DocState *state, DocPage *dp)
 			return EXIT_FAILURE;
 		}
 
-	fz_page *loaded_page = NULL;
-	bool success = false;
+	/* volatile：见 MuPDF context.h 的说明——fz_try 基于 setjmp/longjmp，
+	 * 在 fz_try 内赋值、在 fz_always/fz_catch（或块之后）读取的局部变量必须
+	 * 声明为 volatile，否则 longjmp 恢复寄存器后读到的是调用 setjmp 时的旧值
+	 * （未定义值）。`loaded_page' 在 fz_try 内赋值、在 fz_always 内 drop，
+	 * 若不加 volatile，-O2 下可能 drop 到 NULL（泄漏）或旧值（重复释放）。 */
+	fz_page *volatile loaded_page = NULL;
+	volatile bool success = false;
 
 	fz_try(ctx)
 		{
@@ -265,21 +250,20 @@ load_page_dl(DocState *state, DocPage *dp)
 }
 
 /**
- * render_page_to_buffer - Rasterize one page and encode it as PNM bytes.
+ * render_page_to_buffer - Rasterize one page and export it as BGRA bytes.
  *
  * This is the rendering core that used to live inline in
  * `draw_page_thread'.  It was extracted unchanged so that a second,
  * purely additive entry point (`emacs_page_image_spec') can reuse it
  * without duplicating the painter: the ordering below — rasterize,
  * optional pixel transform (tint, or luminance invert + gamma),
- * decoration wash, PNM encode — is load bearing and must not be
+ * decoration wash, BGRA export — is load bearing and must not be
  * rearranged.
  *
- * Every render parameter is an argument, so the caller decides them:
- * nothing here reads `EmacsWinState'.  The document-level state that is
- * deliberately still read from DOC_STATE is `frame_scale', exactly as the
- * worker used to read it, because it is a property of the frame rather
- * than of a window.  Dark mode is deliberately *not* document state:
+ * Every render parameter is an argument, so the caller decides them.
+ * The document-level state that is deliberately still read from DOC_STATE is
+ * `frame_scale', because it is a property of the frame rather than of a
+ * page.  Dark mode is deliberately *not* document state:
  * whether it is on and which colours it uses come from the process-wide
  * preference exposed by render-theme.c (`theme_dark_enabled' /
  * `theme_tint_set' / `theme_tint_colors'), so reloading a document or
@@ -298,24 +282,29 @@ load_page_dl(DocState *state, DocPage *dp)
  * @param rotate     Rotation in degrees, 0 / 90 / 180 / 270.
  * @param deco       Decoration snapshot to paint over the page, may be NULL.
  * @param deco_count Number of entries in DECO.
- * @param out_w      Receives the image width in unscaled pixels.
- * @param out_h      Receives the image height in unscaled pixels.
- * @param out_data   Receives a malloc'ed PNM byte block owned by the caller.
- * @param out_size   Receives the size of OUT_DATA in bytes.
- * Return:           true on success; false leaves every OUT_* zeroed/NULL.
+ * @param out_w        Receives the image width in logical (unscaled) pixels.
+ * @param out_h        Receives the image height in logical (unscaled) pixels.
+ * @param out_data_w   Receives the pixmap width in device pixels.
+ * @param out_data_h   Receives the pixmap height in device pixels.
+ * @param out_data     Receives a malloc'ed BGRA byte block owned by the caller.
+ * @param out_size     Receives the size of OUT_DATA in bytes (data_w*data_h*4).
+ * Return:             true on success; false leaves every OUT_* zeroed/NULL.
  */
 
 static bool
 render_page_to_buffer(DocState *doc_state, DocPage *dp, float resolution,
 		      int rotate, Decoration *deco, int deco_count, int *out_w,
-		      int *out_h, unsigned char **out_data, size_t *out_size)
+		      int *out_h, int *out_data_w, int *out_data_h,
+		      unsigned char **out_data, size_t *out_size)
 {
 	if (!doc_state || !dp || !dp->display_list || !out_w || !out_h
-	    || !out_data || !out_size)
+	    || !out_data_w || !out_data_h || !out_data || !out_size)
 		return false;
 
 	*out_w = 0;
 	*out_h = 0;
+	*out_data_w = 0;
+	*out_data_h = 0;
 	*out_data = NULL;
 	*out_size = 0;
 
@@ -325,25 +314,43 @@ render_page_to_buffer(DocState *doc_state, DocPage *dp, float resolution,
 		return false;
 
 	fz_matrix ctm = fz_transform_page(dp->bbox, resolution, rotate);
-	fz_pixmap *pixmap = NULL;
-	fz_buffer *buf = NULL;
-	fz_output *out = NULL;
+	/* volatile：`pixmap' 在 fz_try 内赋值、在 fz_always 内 drop，
+	 * `local_bgra' 在 fz_try 内赋值、在块之后（含失败清理路径）被 free，
+	 * 两者都跨 setjmp/longjmp 边界，故必须 volatile（同 MuPDF context.h
+	 * 对 fz_var 的说明）。局部整型尺寸只在块后做守卫判断，且失败路径由
+	 * render_ok 短路，不参与指针释放，故保持非 volatile。 */
+	fz_pixmap *volatile pixmap = NULL;
 	int local_imgw = 0;
 	int local_imgh = 0;
+	int local_data_w = 0;
+	int local_data_h = 0;
+	unsigned char *volatile local_bgra = NULL;
+	size_t local_size = 0;
 
-	bool render_ok = false;
+	volatile bool render_ok = false;
 	float frame_scale = doc_state->frame_scale;
 	/* Read the process-wide dark-mode preference once, so the two
 	 * branches below can never disagree about whether it is on. */
 	bool dark_on = theme_dark_enabled();
 
-	if (frame_scale <= 0.0f)
+	/* `frame_scale' 是逻辑像素的除数，必须夹在合理区间：非正值按 1.0
+	 * 处理，极小的正值（< 0.01）同理——否则 `width / frame_scale'
+	 * 会放大到 int 溢出，逻辑尺寸变成无意义的巨大值。 */
+	if (!(frame_scale > 0.01f))
 		frame_scale = 1.0f;
 
 	fz_try(ctx)
 		{
+			/* colorspace 用 fz_device_bgr：canvas 缓冲是 ARGB32
+			 * （小端字节序 B,G,R,A），BGR 设备产出的通道序天然
+			 * 吻合，导出时零重排。
+			 *
+			 * alpha 保持 0（不分配 A 通道）：MuPDF 会把页面直接
+			 * 合成到不透明背景上，初始像素为 0（黑），与旧 PNM
+			 * 路径的语义完全一致。若改成 alpha=1 则得到预乘
+			 * alpha 像素、且 MuPDF 无反预乘 API，颜色会偏。 */
 			pixmap = fz_new_pixmap_from_display_list(ctx, dp->display_list,
-								 ctm, fz_device_rgb(ctx), 0);
+								 ctm, fz_device_bgr(ctx), 0);
 
 			/* Dark mode has exactly two pixel transforms.
 			 * Without a tint it is the historical full-range
@@ -396,8 +403,15 @@ render_page_to_buffer(DocState *doc_state, DocPage *dp, float resolution,
 			 * uniform alpha instead of stacking up. */
 			if (deco_count > 0)
 				{
-					fz_device *dev = NULL;
-					fz_path *path = NULL;
+					/* volatile：`dev' 与 `path' 都在
+					 * fz_try 内赋值、在 fz_always 内
+					 * drop（path 还会在循环里反复重建），
+					 * 跨 setjmp/longjmp 边界，必须
+					 * volatile，否则 -O2 下 longjmp
+					 * 后读到调用 setjmp 时的旧值
+					 * （-Wclobbered 报的正是这两条）。 */
+					fz_device *volatile dev = NULL;
+					fz_path *volatile path = NULL;
 
 					/* One flag per decoration: a rect is
 					 * emitted by exactly one style group,
@@ -651,165 +665,115 @@ render_page_to_buffer(DocState *doc_state, DocPage *dp, float resolution,
 						}
 				}
 
+			/* 尺寸双轨制：逻辑像素（÷ frame_scale）供 Elisp 的
+			 * :width/:height 做显示层缩放；设备像素（pixmap
+			 * 尺寸）供 canvas 的 :data-width/:data-height 定缓冲
+			 * 尺寸。两者不可互换——把逻辑像素写进 data-* 会让
+			 * Emacs 重建缓冲并清零（残影/花屏）。 */
 			local_imgh = (int)(fz_pixmap_height(ctx, pixmap) / frame_scale);
 			local_imgw = (int)(fz_pixmap_width(ctx, pixmap) / frame_scale);
-			buf = fz_new_buffer(ctx, 1024);
-			out = fz_new_output_with_buffer(ctx, buf);
-			fz_write_pixmap_as_pnm(ctx, out, pixmap);
+			local_data_h = (int)fz_pixmap_height(ctx, pixmap);
+			local_data_w = (int)fz_pixmap_width(ctx, pixmap);
+
+			/* 导出成 canvas 的 ARGB32 缓冲格式（小端字节序
+			 * B,G,R,A）。MuPDF 侧 alpha=0 故只有 3 分量，这里
+			 * 补 A=255（不透明）。
+			 *
+			 * 源行必须按 fz_pixmap_stride 推进，不能假设紧凑布局
+			 * （stride 可能因行对齐大于 w*3）；目标行宽固定为
+			 * w*4，与 canvas 缓冲的隐式行宽一致。 */
+			int ncomp = fz_pixmap_components(ctx, pixmap);
+
+			if (ncomp != 3)
+				{
+					fz_warn(ctx,
+						"unexpected pixmap components %d "
+						"(expected 3: BGR without alpha)",
+						ncomp);
+					fz_throw(ctx, FZ_ERROR_ARGUMENT,
+						 "pixmap is not 3-component BGR");
+				}
+
+			if (local_data_w <= 0 || local_data_h <= 0)
+				fz_throw(ctx, FZ_ERROR_ARGUMENT,
+					 "pixmap has zero size");
+
+			unsigned char *samples = fz_pixmap_samples(ctx, pixmap);
+			int stride = fz_pixmap_stride(ctx, pixmap);
+			size_t out_bytes = (size_t)local_data_w
+					   * (size_t)local_data_h * 4u;
+
+			if (!samples || stride < local_data_w * 3)
+				fz_throw(ctx, FZ_ERROR_ARGUMENT,
+					 "pixmap samples/stride unusable");
+
+			local_bgra = malloc(out_bytes);
+
+			if (!local_bgra)
+				fz_throw(ctx, FZ_ERROR_LIMIT,
+					 "out of memory for the BGRA export");
+
+			for (int y = 0; y < local_data_h; ++y)
+				{
+					const unsigned char *src
+						= samples + (size_t)y
+								    * (size_t)stride;
+					unsigned char *dst
+						= local_bgra
+						  + (size_t)y
+							    * (size_t)local_data_w
+						    * 4u;
+
+					for (int x = 0; x < local_data_w; ++x)
+						{
+							/* 单次 32 位写（memcpy 会被
+							 * 编译成一条 store）：小端
+							 * ARGB32 = 字节 B,G,R,A。 */
+							uint32_t px
+								= 0xFF000000u
+								  | ((uint32_t)src[2]
+								     << 16) /* R */
+								  | ((uint32_t)src[1]
+								     << 8) /* G */
+								  | (uint32_t)src[0]; /* B */
+
+							memcpy(dst, &px, 4);
+							src += 3;
+							dst += 4;
+						}
+				}
+
+			local_size = out_bytes;
 			render_ok = true;
 		}
 	fz_always(ctx)
 		{
 			if (pixmap)
 				fz_drop_pixmap(ctx, pixmap);
-
-			if (out)
-				{
-					fz_close_output(ctx, out);
-					fz_drop_output(ctx, out);
-				}
 		}
 	fz_catch(ctx)
 		{
 			render_ok = false;
 		}
 
-	if (!render_ok || !buf || local_imgw <= 0 || local_imgh <= 0)
+	if (!render_ok || !local_bgra || local_size == 0 || local_imgw <= 0
+	    || local_imgh <= 0)
 		{
-			if (buf)
-				fz_drop_buffer(ctx, buf);
-
+			free(local_bgra);
 			fz_drop_context(ctx);
 			return false;
 		}
 
-	size_t local_img_size = buf->len;
-	char *local_img_data = malloc(local_img_size);
-
-	if (!local_img_data)
-		{
-			fz_drop_buffer(ctx, buf);
-			fz_drop_context(ctx);
-			return false;
-		}
-
-	memcpy(local_img_data, buf->data, local_img_size);
-	fz_drop_buffer(ctx, buf);
 	fz_drop_context(ctx);
 
 	*out_w = local_imgw;
 	*out_h = local_imgh;
-	*out_data = (unsigned char *)local_img_data;
-	*out_size = local_img_size;
+	*out_data_w = local_data_w;
+	*out_data_h = local_data_h;
+	*out_data = local_bgra;
+	*out_size = local_size;
 
 	return true;
-}
-
-/**
- * Thread function to render a page and encode it as a PNM image.
- *
- * Uses the page's display list to generate a pixmap, applies the dark-mode
- * pixel transform to it (tinted between the two process-wide colours, or
- * inverted and gamma-corrected when no tint is set), then encodes it to
- * PNM and stores it in `cp->img_data'. Updates image dimensions and
- * status, and signals completion via a condition variable.
- *
- * @param arg  Pointer to DrawThreadArgs (contains DocState and CachedPage).
- * Return:     NULL (result is stored in CachedPage).
- */
-
-void *
-draw_page_thread(void *arg)
-{
-	DrawThreadArgs *args = (DrawThreadArgs *)arg;
-	if (!args)
-		return NULL;
-
-	DocState *doc_state = args->doc_state;
-	EmacsWinState *win_state = args->win_state;
-	CachedPage *cp = args->cp;
-	DocPage *dp = args->dp;
-
-	if (!doc_state || !win_state || !cp || !dp)
-		{
-			free_draw_thread_args(args);
-			return NULL;
-		}
-
-	 /* If the document is being reloaded/closed, or the window is closing, */
-	 /* abort this job safely. */
-	if (doc_state->is_reloading || win_state->closing)
-		{
-			mark_cp_error_if_rendering(cp);
-			release_doc_page(doc_state, dp);
-
-			atomic_fetch_sub(&doc_state->active_jobs, 1);
-			atomic_fetch_sub(&win_state->active_jobs, 1);
-
-			free_draw_thread_args(args);
-			return NULL;
-		}
-
-	// If the page isn't ready then parse/load it
-	if (!dp->ready)
-		load_page_dl(doc_state, dp);
-	if (!dp->ready || !dp->display_list)
-		{
-			mark_cp_error_if_rendering(cp);
-			release_doc_page(doc_state, dp);
-			atomic_fetch_sub(&doc_state->active_jobs, 1);
-			atomic_fetch_sub(&win_state->active_jobs, 1);
-			free_draw_thread_args(args);
-			return NULL;
-		}
-
-	/* The rasterization itself (rasterize -> pixel transform, tint or
-	 * invert/gamma -> decoration wash -> PNM encode) lives in
-	 * `render_page_to_buffer' so that the page-image-spec entry point
-	 * can share it.  The ordering inside is identical to what this
-	 * function used to do inline. */
-	int local_imgw = 0;
-	int local_imgh = 0;
-	unsigned char *local_img_data = NULL;
-	size_t local_img_size = 0;
-
-	if (!render_page_to_buffer(doc_state, dp, win_state->resolution,
-				   win_state->rotate, args->deco,
-				   args->deco_count, &local_imgw, &local_imgh,
-				   &local_img_data, &local_img_size))
-		{
-			mark_cp_error_if_rendering(cp);
-			release_doc_page(doc_state, dp);
-			atomic_fetch_sub(&doc_state->active_jobs, 1);
-			atomic_fetch_sub(&win_state->active_jobs, 1);
-			free_draw_thread_args(args);
-			return NULL;
-		}
-
-	/* If the slot was invalidated while we were rendering, its status will */
-	/* no longer be PAGE_STATUS_RENDERING. In that case, discard the result. */
-
-	pthread_mutex_lock(&cp->mutex);
-	if (cp->status == PAGE_STATUS_RENDERING)
-		{
-			free(cp->img_data);
-			cp->img_data = (char *)local_img_data;
-			cp->img_size = local_img_size;
-			cp->imgw = local_imgw;
-			cp->imgh = local_imgh;
-			cp->status = PAGE_STATUS_READY;
-			pthread_cond_signal(&cp->cond);
-		}
-	else
-		free(local_img_data);
-	pthread_mutex_unlock(&cp->mutex);
-
-	release_doc_page(doc_state, dp);
-	atomic_fetch_sub(&doc_state->active_jobs, 1);
-	atomic_fetch_sub(&win_state->active_jobs, 1);
-
-	free_draw_thread_args(args);
-	return NULL;
 }
 
 /**
@@ -824,168 +788,33 @@ draw_page_thread(void *arg)
  */
 
 /**
- * Build a sliding cache window around the given page.
+ * Reset `seshat-reader-current-doc-render-status' to nil in the current
+ * buffer.
  *
- * This function assumes that there are no active render jobs for this
- * window. Callers should call wait_for_win_jobs() first.
+ * The variable is permanent buffer-local (see `permanent_buffer_local_var')
+ * and means "a page image has been handed to Lisp for this document".  It
+ * must therefore drop back to nil whenever the document it describes goes
+ * away — on a successful `--close-doc' and on every `--load-doc' failure
+ * path — otherwise a stale t survives the failed load and the reader skips
+ * the initial render (`seshat-reader-mode' only renders when the variable is
+ * unset).
+ *
+ * Writes the same symbol through the same `set' mechanism as
+ * `set_current_render_status' (elisp-helpers.c), which is `t'-only; the
+ * reset lives here because adding a parameter there would change a shared
+ * header instead of this file.
+ *
+ * @param env  The Emacs environment pointer.
  */
 
-void
-build_cache_window(DocState *doc_state, EmacsWinState *win_state, int n)
+static void
+reset_current_render_status(emacs_env *env)
 {
-	if (!doc_state || !win_state)
-		return;
-	if (!doc_state->doc_pages || doc_state->pagecount <= 0)
-		return;
+	emacs_value render_status_var
+	    = env->intern(env, "seshat-reader-current-doc-render-status");
 
-	int pagecount = doc_state->pagecount;
-	if (n < 0)
-		n = 0;
-	if (n >= pagecount)
-		n = pagecount - 1;
-
-	int start, end;
-	if (n < MAX_CACHE_WINDOW_SIZE)
-		{
-			start = 0;
-			end = n + MAX_CACHE_WINDOW_SIZE;
-			if (end >= pagecount)
-				end = pagecount - 1;
-		}
-	else if (n > (pagecount - 1) - MAX_CACHE_WINDOW_SIZE)
-		{
-			end = pagecount - 1;
-			start = n - MAX_CACHE_WINDOW_SIZE;
-			if (start < 0)
-				start = 0;
-		}
-	else
-		{
-			start = n - MAX_CACHE_WINDOW_SIZE;
-			end = n + MAX_CACHE_WINDOW_SIZE;
-		}
-
-	win_state->current_page_number = n;
-	win_state->current_window_index = n - start;
-
-	for (int i = 0; i < MAX_CACHE_SIZE; ++i)
-		{
-			int idx = start + i;
-			CachedPage *cp = win_state->cache_window[i];
-			if (!cp)
-				continue;
-
-			if (idx < pagecount && idx <= end)
-				{
-					/* Check if we can reuse the existing CachedPage */
-					pthread_mutex_lock(&cp->mutex);
-					int old_page_num = cp->page_num;
-					bool reusable = (old_page_num == idx &&
-							 cp->status == PAGE_STATUS_READY &&
-							 cp->img_data != NULL);
-					pthread_mutex_unlock(&cp->mutex);
-
-					if (reusable)
-						continue;
-
-					if (old_page_num == idx)
-						{
-							/* Clear the slot, but keep DocPage reference. */
-							clear_cp(cp);
-							DocPage *dp = &doc_state->doc_pages[idx];
-							if (!dp->ready)
-								load_page_dl(doc_state, dp);
-							if (!dp->ready)
-								{
-									mark_cp_error(cp);
-									continue;
-								}
-
-							if (!submit_render_job(doc_state, win_state, cp, dp))
-								mark_cp_error(cp);
-						}
-					else
-						{
-							/* Now we acquire a new DocPage and release the last one. */
-							clear_cp_and_release(doc_state, cp);
-							DocPage *dp = acquire_doc_page(doc_state, idx);
-							if (!dp)
-								{
-									mark_cp_error(cp);
-									continue;
-								}
-
-							pthread_mutex_lock(&cp->mutex);
-							cp->page_num = idx;
-							pthread_mutex_unlock(&cp->mutex);
-
-							if (!submit_render_job(doc_state, win_state, cp, dp))
-								mark_cp_error(cp);
-						}
-				}
-			else
-				{
-					/* Outside new window. Clear and release. */
-					clear_cp_and_release(doc_state, cp);
-				}
-		}
-
-	win_state->current_cached_page =
-		win_state->cache_window[win_state->current_window_index];
-}
-
-/**
- * Slide the cache window forward by one page.
- *
- * Advances to the next page, shifts the cache window if within bounds,
- * reuses or frees cached pages, and spawns rendering jobs as needed.
- * Falls back to full rebuild if near document edges. Waits until the
- * new current page is ready.
- *
- * @param state  Pointer to the current DocState.
- * Return:       true if sliding succeeded, false if at end of document.
- */
-
-void
-slide_cache_window_forward(DocState *doc_state, EmacsWinState *win_state)
-{
-    if (!doc_state || !win_state)
-        return;
-
-    if (doc_state->pagecount <= 0)
-        return;
-
-    wait_for_win_jobs(win_state);
-    int n = win_state->current_page_number + 1;
-    if (n < doc_state->pagecount)
-        build_cache_window(doc_state, win_state, n);
-}
-
-/**
- * Slide the cache window backward by one page.
- *
- * Moves to the previous page, shifts the cache window if within bounds,
- * frees or reuses cached pages, and triggers rendering if needed.
- * Falls back to a full rebuild near document start. Waits until the
- * new current page is ready.
- *
- * @param state  Pointer to the current DocState.
- * Return:       true if sliding succeeded, false if at start of document.
- */
-
-void
-slide_cache_window_backward(DocState *doc_state, EmacsWinState *win_state)
-{
-    if (!doc_state || !win_state)
-        return;
-
-    if (doc_state->pagecount <= 0)
-        return;
-
-    wait_for_win_jobs(win_state);
-    int n = win_state->current_page_number - 1;
-    if (n >= 0)
-        build_cache_window(doc_state, win_state, n);
+	env->funcall(env, env->intern(env, "set"), 2,
+		     (emacs_value[]){ render_status_var, EMACS_NIL });
 }
 
 /**
@@ -1021,26 +850,11 @@ emacs_load_doc(emacs_env *env, ptrdiff_t nargs, emacs_value *args, void *data)
     {
         old_state->is_reloading = true;
 
-        clear_all_overlays(env);
-
         clear_doc_state_ptr(env);
-        wait_for_doc_jobs(old_state);
         free_doc_state(old_state);
     }
 
-    emacs_value curr_win = EMACS_CURR_WIN;
-    emacs_value current_doc_overlay = EMACS_NIL;
-
     DocState *doc_state = NULL;
-    EmacsWinState *win_state = NULL;
-
-    current_doc_overlay = init_overlay(env, curr_win);
-
-    if (env->eq(env, current_doc_overlay, EMACS_NIL))
-    {
-        emacs_message(env, "Failed to create seshat-reader overlay.");
-        return EMACS_NIL;
-    }
 
     doc_state = init_doc_state_ptr(env);
 
@@ -1051,14 +865,6 @@ emacs_load_doc(emacs_env *env, ptrdiff_t nargs, emacs_value *args, void *data)
     }
 
     reset_doc_state(doc_state);
-
-    win_state = init_win_state_ptr(env, doc_state, curr_win);
-
-    if (!win_state)
-    {
-        emacs_message(env, "Window state couldn't be initialized.");
-        goto cleanup;
-    }
 
     if (!elisp_2_c_str(env, args[0], &doc_state->path, &str_length))
     {
@@ -1090,7 +896,9 @@ emacs_load_doc(emacs_env *env, ptrdiff_t nargs, emacs_value *args, void *data)
 
     doc_state->frame_scale = get_frame_scale_factor(env);
 
-    if (doc_state->frame_scale <= 0.0f)
+    /* 与 `render_page_to_buffer' 同一口径：极小正值同样视为 1.0，
+     * 免得逻辑像素（device / frame_scale）溢出。 */
+    if (!(doc_state->frame_scale > 0.01f))
         doc_state->frame_scale = 1.0f;
 
     /*
@@ -1132,129 +940,31 @@ emacs_load_doc(emacs_env *env, ptrdiff_t nargs, emacs_value *args, void *data)
     if (start_page >= doc_state->pagecount)
         start_page = doc_state->pagecount - 1;
 
-    win_state->current_page_number = start_page;
-
-    build_cache_window(doc_state, win_state, start_page);
+    /* 只记录起始页：多页布局经 `--page-image-spec' 逐页取图，C 侧不再持有
+     * 任何窗口状态，也不在加载时把任何页面渲染到 overlay。 */
+    doc_state->current_page_number = start_page;
 
     set_current_pagecount(env, doc_state);
-    set_current_page_number(env, win_state->current_page_number);
-
-    CachedPage *cp = win_state->current_cached_page;
-
-    if (!wait_for_cached_page(cp))
-    {
-        emacs_message(env, "Failed to render the current page.");
-        goto cleanup;
-    }
-
-    if (!display_cached_page(env, cp, current_doc_overlay))
-    {
-        emacs_message(env, "Failed to display the rendered page.");
-        goto cleanup;
-    }
-
-    set_current_render_status(env);
+    set_current_page_number(env, start_page);
+    /* 加载本身不再渲染任何页面，故这里**不**置渲染状态：状态只表示
+     * “已经出过一页图像”，由 `--page-image-spec' 成功返回时置位。
+     * buffer-local 变量已 permanent 化，默认即 nil（未渲染）。 */
 
     return EMACS_T;
 
 cleanup:
-    if (!env->eq(env, current_doc_overlay, EMACS_NIL))
-    {
-        if (win_state)
-        {
-            clear_overlay_and_win_state(env, current_doc_overlay);
-        }
-        else
-        {
-            emacs_value clear_window_args[3] = {
-                curr_win,
-                env->intern(env, "overlay"),
-                EMACS_NIL
-            };
-
-            env->funcall(env,
-                         env->intern(env, "set-window-parameter"),
-                         3,
-                         clear_window_args);
-
-            env->funcall(env,
-                         env->intern(env, "delete-overlay"),
-                         1,
-                         &current_doc_overlay);
-        }
-    }
-    else if (win_state)
-    {
-        win_state->closing = true;
-        wait_for_win_jobs(win_state);
-        free_cache_window(win_state);
-        free(win_state);
-    }
-
     if (doc_state)
     {
-        wait_for_doc_jobs(doc_state);
         free_doc_state(doc_state);
     }
 
     clear_doc_state_ptr(env);
 
+    /* 加载失败后不能把上一份文档留下的渲染状态带下去：状态为 t 时
+     * `seshat-reader-mode' 会跳过首次渲染，画面将永远空白。 */
+    reset_current_render_status(env);
+
     return EMACS_NIL;
-}
-
-/**
- * Redisplay the current document page in Emacs.
- *
- * Resets visual state (no rotation/inversion), re-renders the current
- * cached page in a background thread, waits for completion, and updates
- * the image in the associated Emacs overlay.
- *
- * @param env    Emacs module environment.
- * @param nargs  Argument count (unused).
- * @param args   Argument values (unused).
- * @param data   Additional data (unused).
- * Return:       EMACS_T on success, EMACS_NIL if state is not available.
- */
-
-emacs_value
-emacs_redisplay_doc(emacs_env *env, ptrdiff_t nargs, emacs_value *args,
-                    void *data)
-{
-	(void)nargs;
-	(void)args;
-	(void)data;
-
-	DocState *doc_state = NULL;
-	EmacsWinState *win_state = NULL;
-	emacs_value overlay = EMACS_NIL;
-
-	if (!get_reader_current_state(env, &doc_state, &win_state, &overlay))
-		return EMACS_NIL;
-
-	if (doc_state->pagecount <= 0)
-		return EMACS_NIL;
-
-	wait_for_win_jobs(win_state);
-	nullify_window_cache(win_state);
-	build_cache_window(doc_state,
-			   win_state,
-			   win_state->current_page_number);
-
-	CachedPage *cp = win_state->current_cached_page;
-
-	if (!wait_for_cached_page(cp))
-		{
-			emacs_message(env, "Failed to render the page.");
-			return EMACS_NIL;
-		}
-	if (!display_cached_page(env, cp, overlay))
-		{
-			emacs_message(env, "Failed to display the rendered page.");
-			return EMACS_NIL;
-		}
-
-	set_current_render_status(env);
-	return EMACS_T;
 }
 
 /**
@@ -1282,405 +992,59 @@ emacs_close_doc(emacs_env *env, ptrdiff_t nargs, emacs_value *args,
 	if (!state)
 		{
 			emacs_message(env, "No valid DocState user pointer found.");
+			/* 文档已经不在了，渲染状态也必须随之归零，否则
+			 * 残留的 t 会让下一次 `seshat-reader-mode' 跳过渲染。 */
+			reset_current_render_status(env);
 			return EMACS_NIL;
 		}
 
 	state->is_reloading = true;
 
-	clear_all_overlays(env);
-
 	clear_doc_state_ptr(env);
 
-	wait_for_doc_jobs(state);
 	free_doc_state(state);
 
-	return EMACS_T;
-}
-
-/**
- * emacs_next_page - Move to and display the next page in the overlay.
- * @env:   The Emacs environment pointer.
- * @nargs: (ignored).
- * @args:  (ignored).
- * @data:  (ignored).
- *
- * Return: Elisp `t` on completion, `nil` otherwise.
- */
-
-emacs_value
-emacs_next_page(emacs_env *env, ptrdiff_t nargs, emacs_value *args,
-                void *data)
-{
-    (void)nargs;
-    (void)args;
-    (void)data;
-
-    DocState *doc_state = NULL;
-    EmacsWinState *win_state = NULL;
-    emacs_value overlay = EMACS_NIL;
-
-    if (!get_reader_current_state(env, &doc_state, &win_state, &overlay))
-        return EMACS_NIL;
-
-    if (win_state->current_page_number >= doc_state->pagecount - 1)
-    {
-        emacs_message(env, "Already last page!");
-        return EMACS_NIL;
-    }
-
-    return render_and_display_page(env, doc_state, win_state, overlay, win_state->current_page_number + 1);
-}
-
-/**
- * emacs_prev_page - Move to and display the previous page in the overlay.
- * @env:   The Emacs environment pointer.
- * @nargs: (ignored).
- * @args:  (ignored).
- * @data:  (ignored).
- *
- * Return: Elisp `t` if page moved, `nil` if already at first page (and warn).
- */
-
-emacs_value
-emacs_prev_page(emacs_env *env, ptrdiff_t nargs, emacs_value *args,
-                void *data)
-{
-	(void)nargs;
-	(void)args;
-	(void)data;
-
-	DocState *doc_state = NULL;
-	EmacsWinState *win_state = NULL;
-	emacs_value overlay = EMACS_NIL;
-
-	if (!get_reader_current_state(env, &doc_state, &win_state, &overlay))
-		return EMACS_NIL;
-
-	if (win_state->current_page_number <= 0)
-		{
-			emacs_message(env, "Already first page!");
-			return EMACS_NIL;
-		}
-
-	return render_and_display_page(env,
-			 doc_state,
-			 win_state,
-			 overlay,
-			 win_state->current_page_number - 1);
-}
-
-/**
- * emacs_first_page - Jump to and display the first page of the document.
- * @env:   The Emacs environment pointer.
- * @nargs: (ignored).
- * @args:  (ignored).
- * @data:  (ignored).
- *
- * Return: Elisp `t` on success, `nil` if already at the first page (and warn).
- */
-
-emacs_value
-emacs_first_page(emacs_env *env, ptrdiff_t nargs, emacs_value *args,
-                 void *data)
-{
-	(void)nargs;
-	(void)args;
-	(void)data;
-
-	DocState *doc_state = NULL;
-	EmacsWinState *win_state = NULL;
-	emacs_value overlay = EMACS_NIL;
-
-	if (!get_reader_current_state(env, &doc_state, &win_state, &overlay))
-		return EMACS_NIL;
-
-	if (win_state->current_page_number == 0)
-		{
-			emacs_message(env, "Already first page!");
-			return EMACS_NIL;
-		}
-
-	return render_and_display_page(env, doc_state, win_state, overlay, 0);
-}
-
-/**
- * emacs_last_page - Jump to and display the last page of the document.
- * @env:   The Emacs environment pointer.
- * @nargs: (ignored).
- * @args:  (ignored).
- * @data:  (ignored).
- *
- * Return: Elisp `t` on success, `nil` if already at the last page (and warn).
- */
-
-emacs_value
-emacs_last_page(emacs_env *env, ptrdiff_t nargs, emacs_value *args,
-                void *data)
-{
-    (void)nargs;
-    (void)args;
-    (void)data;
-
-    DocState *doc_state = NULL;
-    EmacsWinState *win_state = NULL;
-    emacs_value overlay = EMACS_NIL;
-
-    if (!get_reader_current_state(env, &doc_state, &win_state, &overlay))
-        return EMACS_NIL;
-
-    if (win_state->current_page_number >= doc_state->pagecount - 1)
-    {
-        emacs_message(env, "Already the last page!");
-        return EMACS_NIL;
-    }
-
-    return render_and_display_page(env,
-                     doc_state,
-                     win_state,
-                     overlay,
-                     doc_state->pagecount - 1);
-}
-
-/**
- * emacs_goto_page - Jump to a specific page number and display it.
- * @env:   The Emacs environment pointer.
- * @nargs: Number of Elisp args (should be 1).
- * @args:  Array of Elisp argument values; args[0] is desired page index.
- * @data:  (ignored).
- *
- * Return: Elisp `t` on success or out-of-bounds (always `t`), otherwise emits a
- * bounds warning.
- */
-
-emacs_value
-emacs_goto_page(emacs_env *env, ptrdiff_t nargs, emacs_value *args,
-                void *data)
-{
-	(void)nargs;
-	(void)data;
-
-	int page_number = env->extract_integer(env, args[0]);
-
-	DocState *doc_state = NULL;
-	EmacsWinState *win_state = NULL;
-	emacs_value overlay = EMACS_NIL;
-
-	if (!get_reader_current_state(env, &doc_state, &win_state, &overlay))
-		return EMACS_NIL;
-
-	return render_and_display_page(env, doc_state, win_state, overlay, page_number);
-}
-
-/**
- * emacs_doc_change_page_size - Scale the displayed image to a new size.
- * @env:   The Emacs environment pointer.
- * @nargs: Number of Elisp args (should be 1).
- * @args:  Array of Elisp argument values; args[0] is the float scale factor.
- * @data:  (ignored).
- *
- * Return: Elisp float of new clamped scale on completion, `nil` otherwise.
- */
-
-emacs_value
-emacs_doc_scale_page(emacs_env *env, ptrdiff_t nargs, emacs_value *args,
-		     void *data)
-{
-	(void)nargs;
-	(void)data;
-	DocState *doc_state = NULL;
-	EmacsWinState *win_state = NULL;
-	emacs_value overlay = EMACS_NIL;
-	if (!get_reader_current_state(env, &doc_state, &win_state, &overlay))
-		return EMACS_NIL;
-	if (doc_state->pagecount <= 0)
-		return EMACS_NIL;
-	float scale_factor = env->extract_float(env, args[0]);
-	double new_res = fz_clamp(scale_factor * 72.0, MINRES, MAXRES);
-
-	// Calculate the clamped scale factor to return to Elisp
-	double scale_clamped = new_res / 72.0;
-
-	wait_for_win_jobs(win_state);
-	if (win_state->resolution != new_res)
-		{
-			win_state->resolution = new_res;
-			nullify_window_cache(win_state);
-		}
-	build_cache_window(doc_state,
-			   win_state,
-			   win_state->current_page_number);
-	CachedPage *cp = win_state->current_cached_page;
-	if (!wait_for_cached_page(cp))
-		{
-			emacs_message(env, "Failed to render the page.");
-			return EMACS_NIL;
-		}
-	if (!display_cached_page(env, cp, overlay))
-		{
-			emacs_message(env, "Failed to display the rendered page.");
-			return EMACS_NIL;
-		}
-	set_current_render_status(env);
-
-	return env->make_float(env, scale_clamped);
-}
-
-/**
- * emacs_doc_rotate - rotate the displayed image by rotation angle.
- * @env:   The Emacs environment pointer.
- * @nargs: Number of Elisp args (should be 1).
- * @args:  Array of Elisp argument values, args[0] is the angle (in degrees).
- * @data:  (ignored).
- *
- * Return: Elisp `t` on completion, `nil` otherwise.
- */
-
-emacs_value
-emacs_doc_rotate(emacs_env *env, ptrdiff_t nargs, emacs_value *args,
-                     void *data)
-{
-	(void)nargs;
-	(void)data;
-
-	DocState *doc_state = NULL;
-	EmacsWinState *win_state = NULL;
-	emacs_value overlay = EMACS_NIL;
-
-	if (!get_reader_current_state(env, &doc_state, &win_state, &overlay))
-		return EMACS_NIL;
-	if (doc_state->pagecount <= 0)
-		return EMACS_NIL;
-
-	int rotation_deg = env->extract_integer(env, args[0]);
-	wait_for_win_jobs(win_state);
-
-	int new_rotate = (win_state->rotate + rotation_deg) % 360;
-	if (new_rotate < 0)
-		new_rotate += 360;
-
-	if (win_state->rotate != new_rotate)
-	{
-		win_state->rotate = new_rotate;
-		nullify_window_cache(win_state);
-	}
-
-	build_cache_window(doc_state, win_state, win_state->current_page_number);
-	CachedPage *cp = win_state->current_cached_page;
-
-	if (!wait_for_cached_page(cp))
-		{
-			emacs_message(env, "Failed to render the page.");
-			return EMACS_NIL;
-		}
-
-	if (!display_cached_page(env, cp, overlay))
-		{
-			emacs_message(env, "Failed to display the rendered page.");
-			return EMACS_NIL;
-		}
-
-	set_current_render_status(env);
-	return EMACS_T;
-}
-
-emacs_value
-emacs_doc_window_create(emacs_env *env, ptrdiff_t nargs, emacs_value *args,
-                        void *data)
-{
-	(void)nargs;
-	(void)data;
-
-	emacs_value win = args[0];
-	DocState *doc_state = get_doc_state_ptr(env);
-
-	if (!doc_state)
-		{
-			emacs_message(env, "No valid DocState user pointer found.");
-			return EMACS_NIL;
-		}
-
-	emacs_value overlay = init_overlay(env, win);
-	if (env->eq(env, overlay, EMACS_NIL))
-		{
-			emacs_message(env, "Failed to create seshat-reader overlay.");
-			return EMACS_NIL;
-		}
-
-	EmacsWinState *win_state = init_win_state_ptr(env, doc_state, win);
-	if (!win_state)
-		{
-			emacs_message(env, "Window state couldn't be initialized.");
-			emacs_value clear_window_args[3] = {
-				win,
-				env->intern(env, "overlay"),
-				EMACS_NIL
-			};
-			env->funcall(env, env->intern(env, "set-window-parameter"), 3,
-				     clear_window_args);
-
-			env->funcall(env, env->intern(env, "delete-overlay"), 1,
-				     &overlay);
-			return EMACS_NIL;
-		}
+	/* 位图随文档一起释放，故「已经出过一页图像」不再成立。 */
+	reset_current_render_status(env);
 
 	return EMACS_T;
 }
 
-emacs_value
-emacs_doc_window_close(emacs_env *env, ptrdiff_t nargs, emacs_value *args,
-                       void *data)
+/**
+ * current_page_from_elisp - Resolve the page to use when PAGE is omitted.
+ *
+ * The C side keeps no window state any more, so the current page is asked
+ * from Elisp: `seshat-reader-current-doc-pagenumber' reports the 1-based
+ * number of the page at the top of the window.  Its value is converted to
+ * the 0-based index the module speaks.  When that function is not
+ * available (a bare `emacs -Q --batch' loading the module, or a buffer
+ * that holds no page row yet) the page recorded by `--load-doc' is used.
+ *
+ * @param env    Emacs module environment.
+ * @param state  The current DocState, for the fallback page.
+ * Return:       A 0-based page index.
+ */
+
+static int
+current_page_from_elisp(emacs_env *env, DocState *state)
 {
-	(void)nargs;
-	(void)data;
+	emacs_value sym = env->intern(env, "seshat-reader-current-doc-pagenumber");
+	emacs_value bound = env->funcall(env, env->intern(env, "fboundp"), 1, &sym);
 
-	emacs_value overlay = args[0];
-
-	clear_overlay_and_win_state(env, overlay);
-
-	/* If `clear_overlay_and_win_state' did not delete the overlay because */
-	/* the win-state property was already missing, delete it here as a */
-	/* fallback. */
-	emacs_value overlayp =
-		env->funcall(env, env->intern(env, "overlayp"), 1, &overlay);
-
-	if (env->eq(env, overlayp, EMACS_T))
+	if (!env->eq(env, bound, EMACS_NIL))
 		{
-			emacs_value window_sym = env->intern(env, "window");
-			emacs_value overlay_window_args[2] = {
-				overlay,
-				window_sym
-			};
-			emacs_value win =
-				env->funcall(env, env->intern(env, "overlay-get"), 2,
-					     overlay_window_args);
-			if (!env->eq(env, win, EMACS_NIL))
+			emacs_value value = env->funcall(env, sym, 0, NULL);
+
+			if (env->eq(env, env->funcall(env, env->intern(env, "integerp"),
+						      1, &value), EMACS_T))
 				{
-					emacs_value window_overlay_args[2] = {
-						win,
-						env->intern(env, "overlay")
-					};
-					emacs_value window_overlay =
-						env->funcall(env, env->intern(env, "window-parameter"), 2,
-							     window_overlay_args);
+					int page = (int)env->extract_integer(env, value) - 1;
 
-					if (env->eq(env, window_overlay, overlay))
-						{
-							emacs_value set_args[3] = {
-								win,
-								env->intern(env, "overlay"),
-								EMACS_NIL
-							};
-
-							env->funcall(env, env->intern(env, "set-window-parameter"), 3,
-								     set_args);
-						}
+					return page < 0 ? 0 : page;
 				}
-
-			env->funcall(env, env->intern(env, "delete-overlay"), 1,
-				     &overlay);
 		}
 
-	return EMACS_T;
+	return state ? state->current_page_number : 0;
 }
 
 /**
@@ -1706,18 +1070,13 @@ emacs_page_text(emacs_env *env, ptrdiff_t nargs, emacs_value *args, void *data)
 	(void)data;
 
 	DocState *doc_state = NULL;
-	EmacsWinState *win_state = NULL;
-	emacs_value overlay = EMACS_NIL;
 
-	if (!get_reader_current_state(env, &doc_state, &win_state, &overlay))
+	if (!get_reader_current_state(env, &doc_state))
 		return EMACS_NIL;
 
-	/* Bail out during reload/close windows to avoid use-after-free. */
-	if (doc_state->is_reloading || win_state->closing)
-		return EMACS_NIL;
-
-	int page_number = (nargs >= 1) ? (int)env->extract_integer(env, args[0])
-		: win_state->current_page_number;
+	int page_number = (nargs >= 1)
+		? (int)env->extract_integer(env, args[0])
+		: current_page_from_elisp(env, doc_state);
 
 	if (page_number < 0 || page_number >= doc_state->pagecount)
 		{
@@ -1731,11 +1090,11 @@ emacs_page_text(emacs_env *env, ptrdiff_t nargs, emacs_value *args, void *data)
 	if (!ctx)
 		return EMACS_NIL;
 
-	fz_page *page = NULL;
-	fz_stext_page *stext = NULL;
-	fz_buffer *buf = NULL;
-	fz_output *out = NULL;
-	bool ok = false;
+	fz_page *volatile page = NULL;
+	fz_stext_page *volatile stext = NULL;
+	fz_buffer *volatile buf = NULL;
+	fz_output *volatile out = NULL;
+	volatile bool ok = false;
 
 	fz_try(ctx)
 		{
@@ -1838,13 +1197,16 @@ stext_query_in_rect(emacs_env *env, DocState *doc_state, int page_number,
 	if (!ctx)
 		return EMACS_NIL;
 
-	fz_page *page = NULL;
-	fz_stext_page *stext = NULL;
-	fz_buffer *buf = NULL;
+	/* volatile：与上面各函数同理，fz_try 内赋值、fz_always / 块之后
+	 * 使用的局部变量跨 setjmp/longjmp 边界，必须 volatile
+	 * （`quads' 在 fz_try 内被 realloc、在失败路径上被 free）。 */
+	fz_page *volatile page = NULL;
+	fz_stext_page *volatile stext = NULL;
+	fz_buffer *volatile buf = NULL;
 
 	/* Collected quads: plain malloc, so a failure truncates the result
 	 * instead of throwing.  Freed on every path below. */
-	fz_quad *quads = NULL;
+	fz_quad *volatile quads = NULL;
 	int quad_count = 0;
 	int quad_cap = 0;
 
@@ -2055,9 +1417,9 @@ prepare_rect_query(emacs_env *env, emacs_value *args, DocState **doc_state_out,
 	if (!doc_state)
 		return false;
 
-	/* Bail out during reload to avoid use-after-free.  The window-close
-	 * branch that used to be checked here belonged to the overlay's
-	 * `EmacsWinState'; without a window there is nothing left to consult. */
+	/* Bail out during reload to avoid use-after-free.  The module holds no
+	 * window state, so the document's own reload flag is the only guard
+	 * needed here. */
 	if (doc_state->is_reloading)
 		return false;
 
@@ -2143,12 +1505,14 @@ stext_lines_in_rect(emacs_env *env, DocState *doc_state, int page_number,
 	if (!ctx)
 		return EMACS_NIL;
 
-	fz_page *page = NULL;
-	fz_stext_page *stext = NULL;
+	/* volatile：同 stext_query_in_rect——fz_try 内赋值、fz_always /
+	 * 块之后使用的局部变量跨 setjmp/longjmp 边界，必须 volatile。 */
+	fz_page *volatile page = NULL;
+	fz_stext_page *volatile stext = NULL;
 
 	/* Collected line unions: plain malloc, so a failure truncates the
 	 * result instead of throwing.  Freed on every path below. */
-	fz_rect *lines = NULL;
+	fz_rect *volatile lines = NULL;
 	int line_count = 0;
 	int line_cap = 0;
 
@@ -2567,14 +1931,8 @@ emacs_search_page(emacs_env *env, ptrdiff_t nargs, emacs_value *args, void *data
 	(void)data;
 
 	DocState *doc_state = NULL;
-	EmacsWinState *win_state = NULL;
-	emacs_value overlay = EMACS_NIL;
 
-	if (!get_reader_current_state(env, &doc_state, &win_state, &overlay))
-		return EMACS_NIL;
-
-	/* Bail out during reload/close windows to avoid use-after-free. */
-	if (doc_state->is_reloading || win_state->closing)
+	if (!get_reader_current_state(env, &doc_state))
 		return EMACS_NIL;
 
 	/* PAGE is 1-based here, exactly like the three decoration entry
@@ -2626,7 +1984,10 @@ emacs_search_page(emacs_env *env, ptrdiff_t nargs, emacs_value *args, void *data
 			return EMACS_NIL;
 		}
 
-	fz_page *page = NULL;
+	/* volatile：`page' 在 fz_try 内赋值、在 fz_always 内 drop，跨
+	 * setjmp/longjmp 边界，必须 volatile。`quads' / `marks' 在
+	 * fz_try 之前就已赋值，longjmp 不会改变它们的值，故保持非 volatile。 */
+	fz_page *volatile page = NULL;
 
 	/* Fixed-size plain malloc blocks, not fz_malloc: an allocation
 	 * failure must not turn into an fz_throw.  MuPDF never writes more
@@ -2913,8 +2274,8 @@ clamp_style_component(float v, float fallback)
  * hence the decrement below.  Out-of-range pages and unusable rectangles
  * are ignored silently — a stale or half-parsed annotation must not abort
  * a bulk feed.  Storing a rectangle only marks the document dirty: the
- * bitmap is not re-rendered here, the caller is expected to batch its
- * updates and then call `seshat-reader-dyn--refresh-highlights'.
+ * bitmap is not re-rendered here, the caller batches its updates and
+ * `seshat-reader-dyn--page-image-spec' then paints them.
  *
  * @param env    Emacs module environment.
  * @param nargs  Number of Elisp args (5).
@@ -2973,7 +2334,6 @@ emacs_add_highlight(emacs_env *env, ptrdiff_t nargs, emacs_value *args,
 	d->alpha = DECORATION_DEFAULT_ALPHA;
 
 	doc_state->decoration_count += 1;
-	doc_state->decorations_dirty = true;
 
 	return EMACS_T;
 }
@@ -3048,7 +2408,6 @@ emacs_add_decoration(emacs_env *env, ptrdiff_t nargs, emacs_value *args,
 	d->alpha = clamp_style_component(alpha, DECORATION_DEFAULT_ALPHA);
 
 	doc_state->decoration_count += 1;
-	doc_state->decorations_dirty = true;
 
 	return EMACS_T;
 }
@@ -3251,7 +2610,6 @@ emacs_add_stroke(emacs_env *env, ptrdiff_t nargs, emacs_value *args, void *data)
 	d->pt_count = pt_count;
 
 	doc_state->decoration_count += 1;
-	doc_state->decorations_dirty = true;
 
 	return EMACS_T;
 }
@@ -3261,7 +2619,7 @@ emacs_add_stroke(emacs_env *env, ptrdiff_t nargs, emacs_value *args, void *data)
  *
  * Frees the table and marks the document dirty; like
  * `seshat-reader-dyn--add-highlight' it does not re-render anything, the
- * caller triggers that through `seshat-reader-dyn--refresh-highlights'.
+ * next `seshat-reader-dyn--page-image-spec' call paints without them.
  *
  * @param env    Emacs module environment.
  * @param nargs  Number of Elisp args (ignored).
@@ -3287,76 +2645,6 @@ emacs_clear_highlights(emacs_env *env, ptrdiff_t nargs, emacs_value *args,
 	doc_state->decorations = NULL;
 	doc_state->decoration_count = 0;
 	doc_state->decoration_cap = 0;
-	doc_state->decorations_dirty = true;
-
-	return EMACS_T;
-}
-
-/**
- * emacs_refresh_highlights - Re-render the page with the current
- * highlights.
- *
- * Adding or clearing highlights deliberately does not repaint: those
- * functions receive one rectangle at a time and can be called in bulk,
- * while every repaint re-rasterizes the whole ±5 page cache window.  The
- * caller therefore batches its mutations and asks for a single refresh.
- *
- * The sequence mirrors `emacs_redisplay_doc' step by step — wait for this
- * window's in-flight render jobs, nullify the cache window, rebuild it
- * around the current page and display the result — which is known to be
- * safe to invoke from Elisp: it runs on the Emacs main thread and never
- * runs concurrently with a render job of the same window.
- *
- * @param env    Emacs module environment.
- * @param nargs  Number of Elisp args (ignored).
- * @param args   Elisp arguments (ignored).
- * @param data   Additional data (unused).
- * Return:       Elisp `t' on success, `nil' on failure.
- */
-
-emacs_value
-emacs_refresh_highlights(emacs_env *env, ptrdiff_t nargs, emacs_value *args,
-			 void *data)
-{
-	(void)nargs;
-	(void)args;
-	(void)data;
-
-	DocState *doc_state = NULL;
-	EmacsWinState *win_state = NULL;
-	emacs_value overlay = EMACS_NIL;
-
-	if (!get_reader_current_state(env, &doc_state, &win_state, &overlay))
-		return EMACS_NIL;
-
-	if (doc_state->pagecount <= 0)
-		return EMACS_NIL;
-
-	/* Nothing changed since the last refresh: skip the re-render. */
-	if (!doc_state->decorations_dirty)
-		return EMACS_T;
-
-	wait_for_win_jobs(win_state);
-	nullify_window_cache(win_state);
-	build_cache_window(doc_state, win_state,
-			   win_state->current_page_number);
-
-	CachedPage *cp = win_state->current_cached_page;
-
-	if (!wait_for_cached_page(cp))
-		{
-			emacs_message(env, "Failed to render the page.");
-			return EMACS_NIL;
-		}
-
-	if (!display_cached_page(env, cp, overlay))
-		{
-			emacs_message(env, "Failed to display the rendered page.");
-			return EMACS_NIL;
-		}
-
-	doc_state->decorations_dirty = false;
-	set_current_render_status(env);
 
 	return EMACS_T;
 }
@@ -3457,10 +2745,10 @@ snapshot_page_decorations(DocState *doc_state, int page_num, int *out_count)
  *
  * The read-only counterpart of the display path: it rasterizes PAGE at an
  * explicit SCALE and hands the result back as the very spec
- * `create-image' builds for the page overlay, so the caller can put the
- * image anywhere it likes.  It exists so that a multi-page view can ask
- * for a page without going through a window: nothing here reads or writes
- * `EmacsWinState', a window parameter, a cache slot or an overlay.
+ * `create-image' builds for a page row, so the caller can put the image
+ * anywhere it likes.  It exists so that a multi-page view can ask for a
+ * page without going through a window: nothing here reads or writes a
+ * window parameter, a cache slot or an overlay.
  *
  * PAGE is 1-based, like every other page-addressed entry point, and is
  * validated by `resolve_page_arg'.  SCALE is a multiple of 72 dpi and is
@@ -3474,8 +2762,7 @@ snapshot_page_decorations(DocState *doc_state, int page_num, int *out_count)
  * The page's decorations are painted onto the bitmap (from a deep-copied
  * snapshot) so that the result matches what the screen shows.
  *
- * Rendering is synchronous on the Emacs main thread, with the same cost
- * as one page of `seshat-reader-dyn--refresh-highlights'; it must not be
+ * Rendering is synchronous on the Emacs main thread; it must not be
  * called from a scrolling or redisplay path.
  *
  * @param env    Emacs module environment.
@@ -3493,9 +2780,8 @@ emacs_page_image_spec(emacs_env *env, ptrdiff_t nargs, emacs_value *args,
 
 	DocState *doc_state = get_doc_state_ptr(env);
 
-	/* No window state is involved, so `closing' (an EmacsWinState field)
-	 * has no meaning here; only the document's own reload flag guards
-	 * against freeing the tables under us. */
+	/* The module holds no window state, so only the document's own reload
+	 * flag guards against freeing the tables under us. */
 	if (!doc_state || doc_state->is_reloading)
 		return EMACS_NIL;
 
@@ -3543,12 +2829,14 @@ emacs_page_image_spec(emacs_env *env, ptrdiff_t nargs, emacs_value *args,
 
 	int width = 0;
 	int height = 0;
+	int data_w = 0;
+	int data_h = 0;
 	unsigned char *img_data = NULL;
 	size_t img_size = 0;
 
 	bool ok = render_page_to_buffer(doc_state, dp, (float)resolution, rotate,
 					deco, deco_count, &width, &height,
-					&img_data, &img_size);
+					&data_w, &data_h, &img_data, &img_size);
 
 	/* This entry point owns both: the worker path frees the snapshot
 	 * through `free_draw_thread_args', which does not exist here. */
@@ -3558,12 +2846,17 @@ emacs_page_image_spec(emacs_env *env, ptrdiff_t nargs, emacs_value *args,
 	if (!ok || !img_data)
 		return EMACS_NIL;
 
-	/* `data2elisp_image' copies the bytes into an Emacs string, so the C
-	 * block can go away as soon as the spec exists. */
-	emacs_value spec
-		= data2elisp_image(env, width, height, (char *)img_data, img_size);
+	/* `data2elisp_canvas' 把 BGRA 字节按行写进 canvas 自己的缓冲，
+	 * 返回的 spec 不持有 img_data，故 C 块在用完后即可释放。 */
+	emacs_value spec = data2elisp_canvas(env, data_w, data_h, width, height,
+					     img_data, img_size);
 
 	free(img_data);
+
+	/* 只有真的产出了 canvas spec 才算“这一页渲染完成”：状态在此置位，
+	 * 任何 nil 返回路径（参数非法 / 加载中 / 渲染失败）都不会动它。 */
+	if (env->is_not_nil(env, spec))
+		set_current_render_status(env);
 
 	return spec;
 }
@@ -3591,38 +2884,10 @@ emacs_module_init(struct emacs_runtime *runtime)
 			     "seshat-reader-dyn--load-doc", 1, 2,
 			     "Loads a DOC to be rendered in Emacs.");
 
-	register_module_func(env, emacs_redisplay_doc,
-			     "seshat-reader-dyn--redisplay-doc", 0, 0,
-			     "Redisplays the document at the current page and scale.");
-
 	register_module_func(env, emacs_close_doc,
 			     "seshat-reader-dyn--close-doc", 0, 0,
 			     "Frees the DocState in memory and all other "
 			     "artifacts related to the current document.");
-
-	register_module_func(env, emacs_next_page,
-			     "seshat-reader-dyn--next-page", 0, 0,
-			     "Loads and renders the next page of the document.");
-
-	register_module_func(env, emacs_prev_page,
-			     "seshat-reader-dyn--prev-page", 0, 0,
-			     "Loads and renders the previous page of the document.");
-
-	register_module_func(env, emacs_first_page,
-			     "seshat-reader-dyn--first-page", 0, 0,
-			     "Loads and renders the first page of the document.");
-
-	register_module_func(env, emacs_last_page,
-			     "seshat-reader-dyn--last-page", 0, 0,
-			     "Loads and renders the last page of the document.");
-
-	register_module_func(env, emacs_goto_page,
-			     "seshat-reader-dyn--goto-page", 1, 1,
-			     "Loads and renders the N page number.");
-
-	register_module_func(env, emacs_doc_scale_page,
-			     "seshat-reader-dyn--scale-page", 1, 1,
-			     "Scales the current page of the document by a given FACTOR.");
 
 	register_module_func(env, emacs_doc_invert,
 			     "seshat-reader-dyn--doc-invert", 1, 1,
@@ -3644,18 +2909,6 @@ emacs_module_init(struct emacs_runtime *runtime)
 			     "process-wide state changes here, so the "
 			     "caller has to redraw the visible pages "
 			     "afterwards.");
-
-	register_module_func(env, emacs_doc_rotate,
-			     "seshat-reader-dyn--rotate-page", 1, 1,
-			     "Rotates the page by the given DEGREE.");
-
-	register_module_func(env, emacs_doc_window_create,
-			     "seshat-reader-dyn--window-create", 1, 1,
-			     "Initializes window parameters for EmacsWinState.");
-
-	register_module_func(env, emacs_doc_window_close,
-			     "seshat-reader-dyn--window-close", 1, 1,
-			     "Frees EmacsWinState.");
 
 	register_module_func(env, emacs_page_text,
 			     "seshat-reader-dyn--page-text", 0, 1,
@@ -3700,38 +2953,31 @@ emacs_module_init(struct emacs_runtime *runtime)
 	register_module_func(env, emacs_add_highlight,
 			     "seshat-reader-dyn--add-highlight", 5, 5,
 			     "Adds a highlight rectangle (X0 Y0 X1 Y1) on "
-			     "PAGE (1-based), in page coordinates. Call "
-			     "seshat-reader-dyn--refresh-highlights to make "
-			     "it visible.");
+			     "PAGE (1-based), in page coordinates. The next "
+			     "`seshat-reader-dyn--page-image-spec' paints it.");
 
 	register_module_func(env, emacs_add_decoration,
 			     "seshat-reader-dyn--add-decoration", 9, 9,
 			     "Adds a rectangle (X0 Y0 X1 Y1) on PAGE "
 			     "(1-based) in page coordinates, painted in "
-			     "colour (R G B, each 0..1) at ALPHA (0..1). "
-			     "Call seshat-reader-dyn--refresh-highlights "
-			     "to make it visible.");
+			     "colour (R G B, each 0..1) at ALPHA (0..1). The "
+			     "next `seshat-reader-dyn--page-image-spec' paints "
+			     "it.");
 
 	register_module_func(env, emacs_add_stroke,
 			     "seshat-reader-dyn--add-stroke", 7, 7,
 			     "Adds a freehand polyline on PAGE (1-based): "
 			     "colour (R G B, each 0..1), ALPHA (0..1), "
 			     "WIDTH in page points, and POINTS as a flat "
-			     "list (X0 Y0 X1 Y1 ...) in page coordinates. "
-			     "Call seshat-reader-dyn--refresh-highlights "
-			     "to make it visible.");
+			     "list (X0 Y0 X1 Y1 ...) in page coordinates. The "
+			     "next `seshat-reader-dyn--page-image-spec' paints "
+			     "it.");
 
 	register_module_func(env, emacs_clear_highlights,
 			     "seshat-reader-dyn--clear-highlights", 0, 0,
 			     "Removes every highlight of the current document. "
-			     "Call seshat-reader-dyn--refresh-highlights to "
-			     "repaint.");
-
-	register_module_func(env, emacs_refresh_highlights,
-			     "seshat-reader-dyn--refresh-highlights", 0, 0,
-			     "Re-renders the cache window of the current "
-			     "window so that pending highlight changes become "
-			     "visible.");
+			     "The next `seshat-reader-dyn--page-image-spec' "
+			     "paints the page without them.");
 
 	register_module_func(env, emacs_page_image_spec,
 			     "seshat-reader-dyn--page-image-spec", 2, 3,
@@ -3757,11 +3003,6 @@ emacs_module_init(struct emacs_runtime *runtime)
 	// Provide the current dynamic module as a feature to Emacs
 	provide(env, "seshat-render-core");
 
-	// Initialize the global thread pool
-	threadpool_init(&g_thread_pool);
-
-	fprintf(stderr, "seshat-reader: %d threads have been initialized.\n",
-		MAX_POOL_SIZE);
 	fprintf(stderr,
 		"seshat-reader: dynamic module has been loaded successfully.\n");
 	return 0;

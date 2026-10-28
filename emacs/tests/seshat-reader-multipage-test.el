@@ -5,7 +5,7 @@
 ;; Author: Seshat contributors
 ;; Keywords: lisp, tests, tools
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "29.1"))
+;; Package-Requires: ((emacs "32.0"))
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -430,7 +430,9 @@ leave behind: `contain' fit mode and base scale 1.0.  The buffer is returned as
       (setq-local seshat-reader--multipage-base-scale 1.0
                   seshat-reader--multipage-fit-mode 'contain)
       (dolist (page (or pages '(1 2 3)))
-        (let ((spec (list 'image :type 'pbm :data "x"
+        (let ((spec (list 'image :type 'canvas :data nil
+                          :data-width (or width 600)
+                          :data-height (or height 800)
                           :width (or width 600) :height (or height 800))))
           (push (cons page spec) specs)
           (seshat-reader--multipage-insert-page page spec)
@@ -472,7 +474,9 @@ scale, like the real renderer."
         (h (or height 800)))
     (lambda (_page scale _rotate)
       (setcar counter (1+ (car counter)))
-      (list 'image :type 'pbm :data "x"
+      (list 'image :type 'canvas :data nil
+            :data-width (max 1 (round (* w scale)))
+            :data-height (max 1 (round (* h scale)))
             :width (max 1 (round (* w scale)))
             :height (max 1 (round (* h scale)))))))
 
@@ -546,7 +550,8 @@ follows the new size without rebuilding any row."
           (seshat-reader-multipage-test--with-window-buffer buffer
             (with-current-buffer buffer
               ;; 第 2 页换成比窗口宽得多的页
-              (let ((wide (list 'image :type 'pbm :data "x"
+              (let ((wide (list 'image :type 'canvas :data nil
+                                :data-width 1200 :data-height 800
                                 :width 1200 :height 800)))
                 (seshat-reader--multipage-insert-page 2 wide)
                 (seshat-reader--multipage-record-native 2 wide 1.0))
@@ -584,7 +589,8 @@ width fit of a page that is wider than the window at scale 1.0 (the crop)."
               (should (< (abs (- (seshat-reader--multipage-target-scale 1 window)
                                  (/ 1000.0 600)))
                          1e-9))
-              (let ((wide (list 'image :type 'pbm :data "x"
+              (let ((wide (list 'image :type 'canvas :data nil
+                                :data-width 2000 :data-height 800
                                 :width 2000 :height 800)))
                 (seshat-reader--multipage-insert-page 2 wide)
                 (seshat-reader--multipage-record-native 2 wide 1.0))
@@ -841,7 +847,8 @@ comes back at a different rotation."
         (seshat-reader-multipage-test--window-pixels 1000 800
           (seshat-reader-multipage-test--with-window-buffer buffer
             (with-current-buffer buffer
-              (let ((tall (list 'image :type 'pbm :data "x"
+              (let ((tall (list 'image :type 'canvas :data nil
+                                :data-width 800 :data-height 600
                                 :width 800 :height 600)))
                 (seshat-reader--multipage-insert-page 2 tall)
                 (seshat-reader--multipage-record-native 2 tall 1.0))
@@ -2338,7 +2345,9 @@ rendered once, and the row shows the very same spec object after the way back
                 (cl-letf (((symbol-function 'seshat-reader-dyn--page-image-spec)
                            (lambda (page scale _rotate)
                              (push page renders)
-                             (list 'image :type 'pbm :data "x"
+                             (list 'image :type 'canvas :data nil
+                                   :data-width (max 1 (round (* 600 scale)))
+                                   :data-height (max 1 (round (* 800 scale)))
                                    :width (max 1 (round (* 600 scale)))
                                    :height (max 1 (round (* 800 scale)))))))
                   (seshat-reader-multipage-test--with-single-page-viewport
@@ -2476,19 +2485,21 @@ back one page costs nothing at all."
 (ert-deftest seshat-reader-multipage-test--geometry-memory-warning-fires-once ()
   "The memory budget is reported once per buffer, not on every scroll.
 
-Six 100 KB bitmaps count as roughly 1.1 MB (the estimate doubles the `:data'
-length for the native copy), which crosses a 0.5 MB budget; the message is
+Six 600x800 canvases count as roughly 11 MB (the estimate takes one ARGB32
+pixel per `:data-width' x `:data-height' pixel), which crosses a 0.5 MB budget;
+the message is
 recorded in a buffer-local flag, so a second check stays silent -- and the flag
 is cleared when the document is reloaded with the cache."
   (let* ((fixture (seshat-reader-multipage-test--geometry-buffer '(1 2 3 4 5 6)))
          (buffer (car fixture))
-         (messages 0)
-         (big-data (make-string 100000 ?x)))
+         (messages 0))
     (unwind-protect
         (with-current-buffer buffer
           (cl-letf (((symbol-function 'seshat-reader-dyn--page-image-spec)
                      (lambda (_page scale _rotate)
-                       (list 'image :type 'pbm :data big-data
+                       (list 'image :type 'canvas :data nil
+                             :data-width (max 1 (round (* 600 scale)))
+                             :data-height (max 1 (round (* 800 scale)))
                              :width (max 1 (round (* 600 scale)))
                              :height (max 1 (round (* 800 scale))))))
                     ((symbol-function 'message)
@@ -2571,7 +2582,7 @@ P1 起该访问器返回 image spec（`overlayp' 为 nil、`car-safe' 是 `image
             (set-window-parameter window 'scale 2.0)
             (cl-letf (((symbol-function 'posn-window) (lambda (_posn) window))
                       ((symbol-function 'posn-object)
-                       (lambda (_posn) (list 'image :type 'pbm :data "x")))
+                       (lambda (_posn) (list 'image :type 'canvas :data nil)))
                       ((symbol-function 'posn-object-x-y)
                        (lambda (_posn) '(200 . 400)))
                       ((symbol-function 'frame-scale-factor)
@@ -2600,7 +2611,7 @@ T7 的验收是「不崩」：跨页选区的 `user-error' 属 T8，本批只要
                         ((symbol-function 'posn-object)
                          (lambda (posn)
                            (when (eq (car-safe posn) 'image-pos)
-                             (list 'image :type 'pbm :data "x"))))
+                             (list 'image :type 'canvas :data nil))))
                         ((symbol-function 'posn-object-x-y)
                          (lambda (_posn) '(10 . 20)))
                         ((symbol-function 'frame-scale-factor)
@@ -2718,7 +2729,8 @@ T7 的验收是「不崩」：跨页选区的 `user-error' 属 T8，本批只要
           (with-current-buffer buffer
             (cl-letf (((symbol-function 'seshat-reader-dyn--page-image-spec)
                        (lambda (page scale &optional _rotate)
-                         (list 'image :type 'pbm :data "x"
+                         (list 'image :type 'canvas :data nil
+                               :data-width 600 :data-height 800
                                :width 600 :height 800
                                :page page :scale scale)))
                       ((symbol-function 'seshat-reader--multipage-prefetch)
@@ -2775,13 +2787,12 @@ T7 的验收是「不崩」：跨页选区的 `user-error' 属 T8，本批只要
             (cl-letf (((symbol-function 'file-exists-p) (lambda (&rest _) t))
                       ((symbol-function 'seshat-reader-dyn--load-doc)
                        (lambda (&rest _) nil))
-                      ((symbol-function 'seshat-reader--multipage-drop-c-overlay)
-                       (lambda (&rest _) nil))
                       ((symbol-function 'seshat-reader--multipage-goto)
                        (lambda (&rest _) nil))
                       ((symbol-function 'seshat-reader-dyn--page-image-spec)
                        (lambda (page scale &optional _rotate)
-                         (list 'image :type 'pbm :data "x"
+                         (list 'image :type 'canvas :data nil
+                               :data-width 600 :data-height 800
                                :width 600 :height 800
                                :page page :scale scale))))
               ;; 第一次渲染：3 页文档（页表与缓存都记到第 3 页）
