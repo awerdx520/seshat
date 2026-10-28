@@ -150,7 +150,7 @@ accessor the selection uses is stubbed:
                      ((symbol-function 'frame-scale-factor)
                       (lambda (&optional _frame) 1.0))
                      ((symbol-function 'seshat-reader-select--page-scale)
-                      (lambda (_window) 1.0))
+                      (lambda (_window &optional _page) 1.0))
                      ((symbol-function 'seshat-reader-dyn--text-in-rect)
                       (lambda (page x0 y0 x1 y1)
                         (push (list 'text page x0 y0 x1 y1)
@@ -572,12 +572,14 @@ rotate=90 时 native 尺寸记的是旋转后的位图（800x600），裁剪要�
 (ert-deftest seshat-reader-select-cross-page-test--page-extent-nil-fallback ()
   "A page whose size cannot be measured falls back instead of erroring.
 `posn-object-width-height' 在批处理帧里返回 nil；此时既不能报错，也不能把
-nil 当高度用——页自身尺寸取不到就退回起点的 extent，再退回常量兜底。
+nil 当高度用——量不到起点 extent 的页仍用**该页自己的 native 高**裁剪，连行都
+没有的页再退常量兜底。末页仍以拖拽点为下边界。
 
-审查修复 F1 之后首页也退到 `height'：起点 extent 量不到就没有换算比例，而
-`--page-space-size' 的绝对值与拖拽坐标口径不同（渲染 scale ≠ page scale 时
-会偏短），故一概不采信（原来首页拿到 800.0，现在拿到常量 1.0e7——过长无害，
-模块只报页内真有的字）。末页仍以拖拽点为下边界。"
+A+ 修复（显示口径）之后首页拿到 800.0（它自己的 native 高）而不是常量：
+`--posn-page-extent'（图像像素 × frame scale / 显示 scale）与
+`--page-space-size'（native × frame scale）现在是同一个口径，比例恒 1，
+不存在「渲染 scale ≠ page scale 时 own 会偏短」的顾虑。第 2 页没有行 →
+仍退 `--page-extent-fallback'（过长无害，模块只报页内真有的字）。"
   (seshat-reader-select-cross-page-test--with-reader '(1)
     (cl-letf (((symbol-function 'posn-object-width-height)
                (lambda (_posn) nil)))
@@ -586,9 +588,8 @@ nil 当高度用——页自身尺寸取不到就退回起点的 extent，再退
                    (cons 10 500))))
         (should-not (seshat-reader-select--posn-page-extent
                      posn (selected-window)))
-        ;; 第 1 页有行（native 800）但比例不可用 → 常量；第 2、3 页没有行
-        ;; → 同样是常量。
-        (should (equal '((1 10.0 500.0 20.0 1.0e7)
+        ;; 第 1 页有行（native 高 800）→ 用 800；第 2、3 页没有行 → 常量。
+        (should (equal '((1 10.0 500.0 20.0 800.0)
                          (2 10.0 0.0 20.0 1.0e7)
                          (3 10.0 0.0 20.0 300.0))
                        (seshat-reader-select--selection-page-rects
@@ -596,26 +597,24 @@ nil 当高度用——页自身尺寸取不到就退回起点的 extent，再退
                         (selected-window))))))))
 
 (ert-deftest seshat-reader-select-cross-page-test--page-rects-uncalibrated-own-not-short ()
-  "An unmeasurable start page never lets a raw native height clip a page.
-起点页 extent 量不到（批处理帧、无 redisplay 信息）时 `--selection-page-rects'
-拿不到换算比例；此时若直接采信 `--page-space-size' 的绝对值（= native ×
-frame scale），在渲染 scale ≠ page scale 的页上会偏**短**，矩形切在页内 →
-丢字。修法（审查修复 F1）：比例不可用时统一回退到起点页高度（再退常量
-`--page-extent-fallback'），宁可过长（模块只报页内真有的字，过长无害）不可
-过短。
+  "A page is clipped to its own native height without any calibration ratio.
+起点页 extent 量不到（批处理帧、无 redisplay 信息）时，`--selection-page-rects'
+仍按每页自己的 native 高裁剪——「用起点页量出来的比例校准口径」这一步已随 A+
+修复（显示口径）删除：拖拽坐标的分母是**显示 scale**，与 own（native × frame
+scale）同为页面坐标 pt，两者可以直接比较。
 
-构造：第 2 页的位图按 scale 4.0 渲染（bitmap 600x3200 → native 600x800），
-page scale 是 2.0，frame scale 是 1.0。于是按拖拽坐标口径（图像像素 ×
-frame scale / page scale）这一页的真实高度是 3200 / 2.0 = 1600，而
-`--page-space-size' 给的 own 只有 native 的 800——采信它就会丢掉下半页。"
+构造：第 2 页的位图按 scale 4.0 渲染（bitmap 600x3200 → native 150x800），
+page scale 桩 2.0。这一页就是 800 pt 高，采信 own 既精确又不偏短；旧实现因为
+怕口径不同而退常量 1e7，旧口径下更极端的做法（own × 比例）会给出 1600 ——
+两者都不该回来。"
   (seshat-reader-select-cross-page-test--with-reader-sizes
       '(1 2 3) '((1 . (600 . 800)) (2 . (600 . 3200)) (3 . (600 . 800)))
-    ;; 夹具按 scale 1.0 记了 600x3200，这里改记为 scale 4.0 → native 600x800。
+    ;; 夹具按 scale 1.0 记了 600x3200，这里改记为 scale 4.0 → native 150x800。
     (seshat-reader--multipage-record-native
      2 (list 'image :type 'canvas :data nil
              :data-width 600 :data-height 3200 :width 600 :height 3200) 4.0)
     (cl-letf (((symbol-function 'seshat-reader-select--page-scale)
-               (lambda (_window) 2.0))
+               (lambda (_window &optional _page) 2.0))
               ((symbol-function 'posn-object-width-height)
                (lambda (_posn) nil)))
       (let* ((window (selected-window))
@@ -625,18 +624,19 @@ frame scale / page scale）这一页的真实高度是 3200 / 2.0 = 1600，而
              (rects (seshat-reader-select--selection-page-rects
                      (cons 10.0 500.0) 1 (cons 20.0 300.0) 3 start window))
              (middle (cdr (assoc 2 rects))))
-        ;; 前提：起点页尺寸量不到 → 换算比例不可用。
+        ;; 前提：起点页尺寸量不到（无 redisplay 信息）。
         (should-not (seshat-reader-select--posn-page-extent start window))
-        ;; 中间页的页高（RECT 的第 4 个元素，即 Y1）不是 own 的绝对值 800。
-        (should-not (equal 800.0 (nth 3 middle)))
-        ;; 也不短于「拖拽点到页底」的真实距离 1600（短了就会丢字）。
-        (should (>= (nth 3 middle) 1600.0))
-        ;; 具体值：比例不可用 → 退常量兜底（越过页底，模块只报页内真有的字）。
-        (should (equal seshat-reader-select--page-extent-fallback
-                       (nth 3 middle)))
-        ;; 首页同样退兜底、末页仍以拖拽点为下边界。
-        (should (equal '((1 10.0 500.0 20.0 1.0e7)
-                         (2 10.0 0.0 20.0 1.0e7)
+        ;; own 就是页面坐标口径：600x3200 的位图按 scale 4.0 渲染 = 150x800。
+        (should (equal (cons 150.0 800.0)
+                       (seshat-reader-select--page-space-size 2 window)))
+        ;; 中间页按自己的整页高裁剪：精确 800，不是常量兜底也不是旧的 1600。
+        (should (equal 800.0 (nth 3 middle)))
+        (should-not (equal seshat-reader-select--page-extent-fallback
+                           (nth 3 middle)))
+        (should-not (equal 1600.0 (nth 3 middle)))
+        ;; 首页同样是自己的 native 高，末页仍以拖拽点为下边界。
+        (should (equal '((1 10.0 500.0 20.0 800.0)
+                         (2 10.0 0.0 20.0 800.0)
                          (3 10.0 0.0 20.0 300.0))
                        rects))))))
 
@@ -683,5 +683,236 @@ frame scale / page scale）这一页的真实高度是 3200 / 2.0 = 1600，而
         ;; 坐标口径为 (PAGE X0 Y0 X1 Y1)，逐页取文仍按阅读顺序。
         (should (equal "b\nc" (seshat-reader-select-extract start end)))
         (should (equal "b\nc" (plist-get seshat-reader-select-last :text)))))))
+
+;;;; 4. 显示口径（A+ 修复）：`--display-scale' 是换算的分母
+
+;; 真机故障：窗口 resize 后 `--multipage-base-scale'（文档打开那一刻 fit 出来的
+;; 基准值，1.0）与实际显示宽度（逐页 `--multipage-target-scale'，0.25）分叉，
+;; 于是 `frame_scale / base_scale' 把整页宽的拖拽换算成页面坐标 0..153（页宽
+;; 612）——每行只剩左侧 1/4 的字。修法：分母改成「显示即真相」的
+;; `--display-scale' = 该页 spec 的 `:width' / 该页 native 宽——两者**同向**（都已按
+;; 当前 rotate 渲染），直接相除，不交换宽高；交换只属于出口为未旋转页面坐标的
+;; `--page-space-size' / `--posn-page-extent'。
+;;
+;; 本节夹具的页尺寸是**真实的两套值**：native（612x792 之类，页面坐标的原点与
+;; 单位）与显示尺寸（native × 0.25，行里那幅图的实际像素大小）。既有夹具把两者
+;; 记成同一份、再桩掉 `--page-scale'，本节故意反过来：不桩 `--page-scale'，
+;; 让真实的 `--display-scale' 回答。
+
+(defvar seshat-reader-select-cross-page-test--displayed nil
+  "Alist PAGE -> (W . H) of the sizes the fake rows currently display.
+Filled by `--set-displayed-size'; `posn-object-width-height' answers from it,
+which is what a real redisplayed row reports after a zoom.")
+
+(defun seshat-reader-select-cross-page-test--set-displayed-size (page size)
+  "Rewrite the displayed size of PAGE to SIZE, as one zoom step would.
+Only `:width' and `:height' of the page spec are rewritten — exactly what
+`seshat-reader--multipage-resize-spec' does — so the row keeps displaying a
+page whose rendered size is no longer its native size, which is the state a
+window resize leaves behind.  The size is recorded in
+`--displayed' so the stubbed `posn-object-width-height' can answer it."
+  (let ((spec (seshat-reader--multipage-page-spec page)))
+    (when spec
+      (setf (image-property spec :width) (car size))
+      (setf (image-property spec :height) (cdr size))
+      (setf (alist-get page seshat-reader-select-cross-page-test--displayed)
+            size)
+      spec)))
+
+(defmacro seshat-reader-select-cross-page-test--with-display-reader
+    (native-sizes &rest body)
+  "Run BODY in a reader buffer whose rows are NATIVE-SIZES at scale 1.0.
+NATIVE-SIZES is a PAGE -> (W . H) alist of the **native** page sizes; BODY
+rewrites the *displayed* size of a page with `--set-displayed-size'.
+
+Unlike `--with-reader-sizes' the page scale is **not** stubbed: the real
+`seshat-reader-select--page-scale' answers, which reaches
+`seshat-reader-select--display-scale' and therefore the spec the row really
+displays — the point of this suite.  For the same reason the buffer is
+displayed in the selected window, because `--display-scale' reads the page
+table of `(window-buffer WINDOW)' and not of the current buffer.
+
+`posn-object-width-height' answers the displayed size of the page under the
+position (nil when that page has no spec), `frame-scale-factor' answers 1.0
+and `message' is silenced.  Every accessor is stubbed on the source of
+`seshat-reader-select', reloaded for the same inlining reason as the other
+fixtures."
+  (declare (indent 1) (debug t))
+  `(let* ((buffer (seshat-reader-select-cross-page-test--reader-buffer
+                   (mapcar #'car ,native-sizes) ,native-sizes))
+          (window (selected-window))
+          (original (window-buffer window))
+          (seshat-reader-select-cross-page-test--calls nil)
+          (seshat-reader-select-cross-page-test--displayed nil)
+          (seshat-reader-select-cross-page-test--window window)
+          (seshat-reader-select-last nil))
+     (unwind-protect
+         (progn
+           (set-window-buffer window buffer)
+           (with-current-buffer buffer
+             (seshat-reader-select-cross-page-test--load-source)
+             (cl-letf (((symbol-function 'posn-window)
+                        (lambda (_posn) window))
+                       ((symbol-function 'posn-point)
+                        (lambda (posn) (nth 2 posn)))
+                       ((symbol-function 'posn-object)
+                        (lambda (posn) (nth 5 posn)))
+                       ((symbol-function 'posn-object-x-y)
+                        (lambda (posn) (nth 7 posn)))
+                       ((symbol-function 'posn-object-width-height)
+                        (lambda (posn)
+                          (cdr (assq (or (seshat-reader--multipage-page-at-pos
+                                          (nth 2 posn))
+                                         1)
+                                     seshat-reader-select-cross-page-test--displayed))))
+                       ((symbol-function 'frame-scale-factor)
+                        (lambda (&optional _frame) 1.0))
+                       ((symbol-function 'seshat-reader-dyn--text-in-rect)
+                        (lambda (page x0 y0 x1 y1)
+                          (push (list 'text page x0 y0 x1 y1)
+                                seshat-reader-select-cross-page-test--calls)
+                          (format "page-%d" (1+ page))))
+                       ((symbol-function 'seshat-reader-select--rects-in-rect)
+                        (lambda (page x0 y0 x1 y1)
+                          (push (list 'rects page x0 y0 x1 y1)
+                                seshat-reader-select-cross-page-test--calls)
+                          (list (list (float (1+ page)) 5.0 15.0 25.0))))
+                       ((symbol-function 'seshat-reader-select--flash-selection)
+                        (lambda (&rest _) t))
+                       ((symbol-function 'message) (lambda (&rest _) nil)))
+               ,@body)))
+       (set-window-buffer window original)
+       (kill-buffer buffer))))
+
+(ert-deftest seshat-reader-select-cross-page-test--posn->page-divides-by-displayed-scale ()
+  "`posn->page' divides by the scale the page is **displayed** at, not by base.
+native 612x792 的页按 0.25 显示（行里的图 153x198），页面坐标仍是 native 口径：
+图像像素 (153, 198) 就是页的右边界与下边界 → (612.0 . 792.0)。
+
+旧口径（分母取 `--multipage-base-scale' = 打开时的基准 1.0）只答 (153.0 . 198.0)，
+即页宽 / 页高的 1/4 —— 真机上「整页宽拖选只取回左侧 1/4 的字」就是这个数。"
+  (seshat-reader-select-cross-page-test--with-display-reader
+      '((1 . (612 . 792)))
+    (seshat-reader-select-cross-page-test--set-displayed-size 1 (cons 153 198))
+    (let* ((window (selected-window))
+           (posn (seshat-reader-select-cross-page-test--fake-posn
+                  (seshat-reader-select-cross-page-test--row-start 1)
+                  (cons 153 198)))
+           (page (seshat-reader-select-posn->page posn window)))
+      ;; 换算：frame scale 1.0 / display scale 0.25 → 像素 ×4。
+      (should (= 612.0 (car page)))
+      (should (= 792.0 (cdr page)))
+      (should-not (= 153.0 (car page)))
+      ;; 分母本身就是显示口径（spec :width 153 / native 宽 612）。
+      (should (= 0.25 (seshat-reader-select--display-scale 1 window)))
+      ;; 显示尺寸与 native 相同的页仍然答 1.0（口径一致时不能变）。
+      (seshat-reader-select-cross-page-test--set-displayed-size 1 (cons 612 792))
+      (should (= 1.0 (seshat-reader-select--display-scale 1 window))))))
+
+(ert-deftest seshat-reader-select-cross-page-test--cross-page-rects-use-displayed-scale ()
+  "Cross-page rectangles clip to the **native** height of each page.
+两页 native 612x792 / 612x1000，按 0.25 显示成 153x198 / 153x250。拖拽从第 1 页
+左上角 (0, 49.5)px 到第 2 页右下 (153, 62.5)px，页面坐标因此是 (0, 198) 与
+(612, 250)：横跨整页宽，纵跨两页边界。
+
+矩形口径全部统一后（页面坐标 pt），第 1 页的 y1 必须是它**自己的整页高** 792，
+而不是旧 ratio 校准路径给出的 198（页高的 1/4，会切掉 3/4 的字）。"
+  (seshat-reader-select-cross-page-test--with-display-reader
+      '((1 . (612 . 792)) (2 . (612 . 1000)))
+    (seshat-reader-select-cross-page-test--set-displayed-size 1 (cons 153 198))
+    (seshat-reader-select-cross-page-test--set-displayed-size 2 (cons 153 250))
+    (let* ((window (selected-window))
+           (start (seshat-reader-select-cross-page-test--fake-posn
+                   (seshat-reader-select-cross-page-test--row-start 1)
+                   (cons 0 49.5)))
+           (end (seshat-reader-select-cross-page-test--fake-posn
+                 (seshat-reader-select-cross-page-test--row-start 2)
+                 (cons 153 62.5)))
+           (start-page (seshat-reader-select-posn->page start window))
+           (end-page (seshat-reader-select-posn->page end window)))
+      ;; 两个端点都落在页面坐标里（像素 ×4）。
+      (should (equal (cons 0.0 198.0) start-page))
+      (should (equal (cons 612.0 250.0) end-page))
+      (let ((rects (seshat-reader-select--selection-page-rects
+                    start-page
+                    (seshat-reader-select-posn-page start window)
+                    end-page
+                    (seshat-reader-select-posn-page end window)
+                    start window)))
+        (should (equal '((1 0.0 198.0 612.0 792.0)
+                         (2 0.0 0.0 612.0 250.0))
+                       rects))
+        ;; 第 1 页 y1 = 自己的 native 高（792），不是旧 ratio 路径的 198。
+        (should (= 792.0 (nth 3 (cdr (assoc 1 rects)))))
+        (should-not (= 198.0 (nth 3 (cdr (assoc 1 rects)))))
+        ;; 第 2 页 y0 从页顶开始，y1 是拖拽终点换算值（页高 1000 不被截）。
+        (should (= 0.0 (nth 1 (cdr (assoc 2 rects)))))
+        (should (= 250.0 (nth 3 (cdr (assoc 2 rects)))))))))
+
+(ert-deftest seshat-reader-select-cross-page-test--display-scale-is-measured-on-same-orientation ()
+  "`--display-scale' 只在**同向**尺寸之间取比值，旋转页不交换宽高。
+生产里 native 与 spec 出自同一张已旋转的位图：`--multipage-record-native' 用
+`spec :width / render scale' 记录，而 spec 就是 rotate 之后渲染的位图。故 612x792
+的页在 rotate 90 下 native 记成 792x612、行里显示 198x153 ⇒ 显示 scale 仍是 0.25。
+
+若对 native 再做一次 `--unrotate-size'（把 792x612 换回 612x792），分母变成 612，
+答 198/612 ≈ 0.3235——页面坐标被压掉 23%，旋转页整行丢字，且**不 resize 也复现**。"
+  (seshat-reader-select-cross-page-test--with-display-reader
+      '((1 . (792 . 612)))
+    (let ((window (selected-window)))
+      ;; rotate 90：native 与 spec 同为「横放」方向，直接相除。
+      (setq-local seshat-reader--multipage-rotate 90)
+      (seshat-reader-select-cross-page-test--set-displayed-size 1 (cons 198 153))
+      (should (= 0.25 (seshat-reader-select--display-scale 1 window)))
+      ;; 交换过的错误答案 198/612 必须被排除（不是碰巧等于 0.25）。
+      (should-not (< (abs (- (/ 198.0 612.0)
+                             (seshat-reader-select--display-scale
+                              1 window)))
+                    1e-9))
+      ;; 270° 与 90° 同型：位图同样横放，答案同样是 0.25。
+      (setq-local seshat-reader--multipage-rotate 270)
+      (should (= 0.25 (seshat-reader-select--display-scale 1 window))))))
+
+(ert-deftest seshat-reader-select-cross-page-test--display-scale-nil-when-spec-sizes-unusable ()
+  "spec 尺寸不可用时 `--display-scale' 答 nil，`--page-scale' 退回文档 scale。
+行里那幅图可能还没有可用尺寸（`:width' / `:height' 缺失，或为 0 / 负数）：此时
+比值无从谈起，`--display-scale' 必须答 nil（不是 0、也不是负值），
+`--page-scale' 则退回 `seshat-reader-current-doc-scale-value'（这里桩成 0.5，
+证明走的是回落分支而不是碰巧算出同一个数）。"
+  (seshat-reader-select-cross-page-test--with-display-reader
+      '((1 . (612 . 792)))
+    (let* ((window (selected-window))
+           (spec (seshat-reader--multipage-page-spec 1)))
+      (should spec)
+      ;; ① 尺寸缺失。
+      (setf (image-property spec :width) nil)
+      (setf (image-property spec :height) nil)
+      (should-not (seshat-reader-select--display-scale 1 window))
+      ;; ② 非正（0 / 负数）。
+      (setf (image-property spec :width) 0)
+      (setf (image-property spec :height) -198)
+      (should-not (seshat-reader-select--display-scale 1 window))
+      ;; 回落：桩住文档 scale，`--page-scale' 必须用它。
+      (cl-letf (((symbol-function 'seshat-reader-current-doc-scale-value)
+                 (lambda (&optional _window) 0.5)))
+        (should (= 0.5 (seshat-reader-select--page-scale window 1)))
+        ;; 页号未知（nil）同样走回落。
+        (should (= 0.5 (seshat-reader-select--page-scale window)))))))
+
+(ert-deftest seshat-reader-select-cross-page-test--page-scale-falls-back-when-undisplayable ()
+  "`--page-scale' degrades to the document scale when no page is given.
+`--display-scale' 需要页号与页 spec：页号未知（nil）或该页没有行时答 nil，
+`--page-scale' 必须退到 `seshat-reader-current-doc-scale-value'（这里是夹具的
+基准 1.0），而不是报错或返回 nil 让整个换算失败。"
+  (seshat-reader-select-cross-page-test--with-display-reader
+      '((1 . (612 . 792)))
+    (seshat-reader-select-cross-page-test--set-displayed-size 1 (cons 153 198))
+    (let ((window (selected-window)))
+      (should-not (seshat-reader-select--display-scale nil window))
+      (should-not (seshat-reader-select--display-scale 9 window))
+      (should (= 0.25 (seshat-reader-select--page-scale window 1)))
+      ;; 无页号 / 无行 → 退回文档 scale（1.0）。
+      (should (= 1.0 (seshat-reader-select--page-scale window)))
+      (should (= 1.0 (seshat-reader-select--page-scale window 9))))))
 
 ;;; seshat-reader-select-cross-page-test.el ends here

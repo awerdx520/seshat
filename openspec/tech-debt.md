@@ -965,7 +965,7 @@
 ## 旋转页的 rect 采不准导致高亮可能错位（M12，2026-10-22）——已解决（P2-A，2026-10-27：`seshat-reader-select-posn->page` 出口按 `seshat-reader--multipage-rotate` 逆变换回未旋转页面空间）
 - 现状（解决前）：`seshat-reader-select.el` 的选区取文**明确不支持旋转页**（`docs/api.md` §4.5 曾把「不支持已旋转页面」写进 `location` 约定）。M12 的高亮按 `rect` 在 C 层按页面 `ctm` 绘制——`ctm` 含 `rotate`/缩放，而 `rect` 本身是「未旋转页面坐标」，两者对同一个 `rect` 的解释在旋转页上不一致。
 - 影响（解决前）：旋转页上的批注高亮位置可能偏移（数据本身已错，渲染忠实反映了错的数据）；不旋转的页无此问题。
-- 建议（已采纳 ② 的 elisp 侧版本）：不新增 C 接口——`seshat-reader--multipage-rotate` 自 P1 起在 Lisp 侧可读（`defvar-local`，取值 ∈ {0,90,180,270}），坐标公式（0/90/180/270，90/270 交换宽高）经 C 侧 `fz_transform_page` 源码、同版本 MuPDF 实现与四象限灰度 PDF 像素实测三方核对；逆变换只在 `select-posn->page` 一处施加，避免多处换算叠加。残余项见本文件「`--page-space-size` 的 frame-scale 标定待真机」条。
+- 建议（已采纳 ② 的 elisp 侧版本）：不新增 C 接口——`seshat-reader--multipage-rotate` 自 P1 起在 Lisp 侧可读（`defvar-local`，取值 ∈ {0,90,180,270}），坐标公式（0/90/180/270，90/270 交换宽高）经 C 侧 `fz_transform_page` 源码、同版本 MuPDF 实现与四象限灰度 PDF 像素实测三方核对；逆变换只在 `select-posn->page` 一处施加，避免多处换算叠加。残余项见本文件「`--page-space-size` 的 frame-scale 标定待真机」条（2026-10-28 已解决，仅剩 frame scale ≠ 1 的真机验收）。
 
 ## 高亮刷新与 strip 缓存的多窗口局限（M12，2026-10-22）
 - 现状：① `--refresh-highlights` 只重建**当前窗口**的 ±5 页缓存（`wait_for_win_jobs` → `nullify_window_cache` → `build_cache_window` → `display_cached_page`，均以当前 `EmacsWinState` 为作用域），同文档的其它窗口在各自下次 redisplay 前仍显示旧位图；② 跨页 strip 用的上一页 image spec 缓存 `seshat-reader--page-image-specs` 是 **buffer 级** `defvar-local`（上限 5 条），而记录时页号取「当前选中窗口」显示的页——多窗口显示同一文档的不同页时，strip 取到的「上一页」可能与自身窗口的上一页不符。
@@ -1775,12 +1775,14 @@
 - 建议：需要时改 `LocationCodec.parsePage`——先按 `pages:` 前缀分派，解析 `a-b` 跨度与逐段 `rect@<page>:`，返回新的 `Parsed.PageRects`（多页矩形）；注意 `Parsed` 是封闭 union（`Unknown` / `Page` / `PageRect` / `Chapter` / `Ink`），新增分支要同时覆盖 `PdfReaderActivity` 与 EPUB 侧的所有 `when` 分支，并补单测（现有 Android 测试对多段 `rect:` 已断言「落 Unknown」，改语义会打红，属预期）。按 2026-10-27 用户确认，本轮（批次 A）**不改 Android**。
 - 来源：`docs/api.md` §4.5.3 的兼容表；`LocationCodec.kt:97`、`:107-119`。
 
-## `--page-space-size` 的 frame-scale 标定待真机（P2-A，2026-10-27）
+## `--page-space-size` 的 frame-scale 标定待真机（P2-A，2026-10-27）——已解决（2026-10-28）
 
-- 现状：`seshat-reader-select--page-space-size` 对「页面坐标单位」的假设是 `native × frame-scale`（与 `posn->page` 的 `image_px × frame_scale / page_scale` 对齐，`native` = 已旋转位图尺寸 ÷ 渲染 scale）。为不把单位误差带进几何，`--selection-page-rects` **不直接采信绝对值**，而用**起点页**的 `extent / native` 实测比例做标定（起点页结论与批次 1 逐值一致，其余页按同比例缩放），标定不可用时才退回绝对值。
-- 影响：真机上 `frame_scale ≠ 1` 或 `page_scale ≠ 渲染 scale` 时，中间页的 `y1`（非末页取该页自身高度）可能偏一个比例因子——表现为跨页高亮在第二页上下略有偏移。默认缩放下比例因子为 1，无影响。
-- 建议：T9 真机验收第 ⑤ 项（旋转页 + 跨页组合）时先在 `*Messages*` 里比对「标定比例」与 1 的差距；若发现偏移，优先查这里（而非旋转公式——旋转公式已由像素实测三方核对）。根治方式是让 C 侧把每页的 `page.width/height`（未旋转 pt 尺寸）批量暴露给 elisp，彻底去掉像素→pt 的换算假设。
-- 来源：`openspec/completed/2026-10-27-reader-multipage-p2a-cross-page-selection.md` 批次 2「偏差 ②（单位口径靠标定）」。
+- 现状（修复前）：`seshat-reader-select--page-space-size` 对「页面坐标单位」的假设是 `native × frame-scale`（与 `posn->page` 的 `image_px × frame_scale / page_scale` 对齐，`native` = 已旋转位图尺寸 ÷ 渲染 scale）。为不把单位误差带进几何，`--selection-page-rects` **不直接采信绝对值**，而用**起点页**的 `extent / native` 实测比例做标定（起点页结论与批次 1 逐值一致，其余页按同比例缩放），标定不可用时才退回绝对值。
+- 影响（修复前）：真机上 `frame_scale ≠ 1` 或 `page_scale ≠ 渲染 scale` 时，中间页的 `y1`（非末页取该页自身高度）可能偏一个比例因子——表现为跨页高亮在第二页上下略有偏移。默认缩放下比例因子为 1，无影响。
+- 处置：**比例标定整段删除**。上面那条公式里的 `page_scale` 被明确为**该页实际显示 scale**——新增纯函数 `seshat-reader-select--display-scale`（该页 spec `:width` ÷ 该页 native 宽；两者同向，spec 与 native 都是按当前 rotate 渲染的位图口径，直接相除、不交换宽高，交换只属于出口为未旋转页面坐标的 `--page-space-size` / `--posn-page-extent` 经 `--unrotate-size` 的那一侧），`posn->page` / `--posn-page-extent` 均按 posn 所在页取分母；`--selection-page-rects` 改为每页直接用自身 `--page-space-size`，不再做「起点页 `extent / native`」标定——分母口径统一后该比例恒为 1，标定已无意义。
+- 残余：**`frame_scale ≠ 1` 的端到端真机验收仍未做**，本条降级为 L3 待办（见 `docs/emacs-reader.md` §12 第 1 条 2026-10-28 补充）。单位假设 `native × frame-scale` 本身未改，根治方式（C 侧批量暴露每页未旋转 pt 尺寸）未实施。
+- 回归：`seshat-reader-select-cross-page-test--posn->page-divides-by-displayed-scale` / `--cross-page-rects-use-displayed-scale` / `--display-scale-is-measured-on-same-orientation` / `--display-scale-nil-when-spec-sizes-unusable` / `--page-scale-falls-back-when-undisplayable`。
+- 来源：`openspec/completed/2026-10-27-reader-multipage-p2a-cross-page-selection.md` 批次 2「偏差 ②（单位口径靠标定）」；`CHANGELOG.md`「修复 → 矩形选区取文被截断（换算分母用错 scale）」；落点 `emacs/seshat-reader/seshat-reader-select.el` 的 `seshat-reader-select--display-scale`（`:790`）、`--page-scale`（`:833`）、`--selection-page-rects`（`:1109`）。
 
 ## 矩形查询必须在阅读 buffer 内调用（`prepare_rect_query` 只看 buffer-local 文档指针，P2-A，2026-10-27）
 

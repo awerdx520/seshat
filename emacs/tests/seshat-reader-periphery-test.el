@@ -659,6 +659,14 @@ goto frame, where this order was impossible."
             (setq seshat-reader--multipage-base-scale 2.0)
             (set-window-parameter window-a 'scale 2.0)
             (set-window-parameter window-b 'scale 1.0)
+            ;; A+ 修复起换算的分母是**显示 scale**：真实缩放会重写每页 spec
+            ;; （`seshat-reader--apply-display-scale'），夹具不动 spec 就等于
+            ;; 「放大到 2 倍但画面仍是原尺寸」，现实里不存在这种状态。
+            (dolist (page '(1 2))
+              (let ((spec (seshat-reader--multipage-page-spec page)))
+                (when spec
+                  (setf (image-property spec :width) 1200)
+                  (setf (image-property spec :height) 1600))))
             (seshat-reader-periphery-test--with-posn-stubs window-b
               (let ((posn (seshat-reader-periphery-test--fake-posn
                            window-b 1 (cons 200 400))))

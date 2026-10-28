@@ -292,11 +292,14 @@ ETAF 渲染层是可选外部依赖：`Makefile` 先探测 `~/Workspace/emacs-ta
 
 闪现不受 `seshat-reader-annotation-highlight-enabled` 约束（它是框选反馈，不是批注）。**旋转页上的选区已支持（2026-10-27）**：`seshat-reader-select-posn->page` 在出口按 `seshat-reader--multipage-rotate` 做逆变换（0 / 90 / 180 / 270，90 / 270 交换宽高），把屏幕坐标换回**未旋转页面空间**，因此写入 `location` 的 `rect` 与 C 侧渲染的 `ctm` 用的是同一套变换。页尺寸量不到时（如批处理 / 无 redisplay）`posn->page` 明确返回 `nil` 并提示，而不是把旋转后坐标当页面坐标交出去。跨页拖选同样已支持，见下节。
 
+**坐标换算的分母是「该页实际显示 scale」，不是文档基准 scale（2026-10-28 修复）**：`seshat-reader-select-posn->page` / `--posn-page-extent` 用的因子是 `seshat-reader-select--display-scale`——该页 image spec 的 `:width` ÷ 该页 native 宽。spec 与 native **同向**（spec 是按当前 rotate 渲染的位图，native 是同一张位图 ÷ 渲染 scale），故直接相除、**不**交换宽高；交换只属于出口为未旋转页面坐标的 `--page-space-size` / `--posn-page-extent`，它们才调 `--unrotate-size`。这个因子**不是**文档打开时算出的 `seshat-reader--multipage-base-scale`。窗口 resize（含开合目录面板、拖分割线）只重写每页 spec 的 `:width` 而基准值不动，两者一旦分叉，用基准值做分母会把整页宽的拖选压成页面坐标的 1/N——实测基准 `1.0` / 实际 `0.25` 时整页宽拖选只覆盖页宽 25%，表现就是「每行只剩左侧一截」。按 `0` / `W` / `H` 会重算基准值，故缺陷会「按一下缩放键就自愈」，容易被误判成偶发。取不到 spec 时 `--display-scale` 回落基准 scale（批处理 / spec 未就绪的既有降级路径）。真机对照可在 `seshat-reader-select-describe-posn` 的输出里同时看 `page-scale` 与 `display-scale`。
+
 ### 跨页选区（2026-10-27）
 
 多页连续布局下一次拖拽可以横跨两页或多页——不再 `user-error`，而是**逐页**取文与取几何：
 
 - 页区间由 `seshat-reader-select--posn-page-extent` / `--selection-page-rects` 用 `seshat-reader--multipage-page-at-pos` 求出（首末点落页间分隔区时归**上一页**，与 P1 的页号派生同一口径，不做「更近页」判定）；文本按阅读顺序拼接、页间插**一个**换行，几何逐页裁剪后存进 `seshat-reader-select-last` 的新字段 `:page-rects`（元素 `(PAGE X0 Y0 X1 Y1)`），`:rect` / `:rects` 仍是**起点页**的几何（旧消费方零改动）。
+- 每页的页面坐标由该页**自身**的 `seshat-reader-select--page-space-size`（native × frame-scale）算出，它对 native 做 `seshat-reader-select--unrotate-size` 换回**未旋转**页面尺寸——**交换宽高只发生在这类出口为页面坐标的函数里**，`--display-scale` 取的是 spec ÷ native 的同向比值、不交换。跨页矩形的垂直高度**不做比例校准**（2026-10-28）：换算口径统一到逐页实际显示 scale 后，旧实现里「起点页 `extent / native`」的标定比例恒为 1，校准整段删除。
 - 写入 `location` 时按「是否跨页」分流：单页（含同页多矩形）仍是 `page:<n>;rect:…`，**与改造前逐字节一致**；跨页写 `pages:<a>-<b>;rect@<p>:…`（段按阅读顺序，见 `docs/api.md` §4.5.3）。批注列表与 ETAF 卡片的页码列显示 `a-b`，`RET` 跳**首页**。
 - 实例（页 1 两段 + 页 2 一段）：`pages:1-2;rect@1:50.00,100.00,545.50,140.00;rect@1:50.00,142.00,300.00,152.00;rect@2:50.00,80.00,545.50,120.00`。
 - 上限与降级：跨页形态按「页数 + 段数」计，超过写入端 500 段上限时降级为**只保留首页矩形**并 `display-warning`，批注正文同时截断到首页（避免「正文含第二页、高亮只在第一页」）。
@@ -940,7 +943,7 @@ evil 是 globalized minor mode，会在 mode body 之后重新启用自己，所
 
 以下条目全部出自 [`../openspec/tech-debt.md`](../openspec/tech-debt.md)，如实列出，未做美化。
 
-1. **旋转页的选区坐标已修正，但仍需真机复核**：2026-10-27 起 `seshat-reader-select-posn->page` 在出口按 `seshat-reader--multipage-rotate` 做逆变换（0 / 90 / 180 / 270，90 / 270 交换宽高），写出的 `rect` 落在**未旋转页面空间**，与 C 侧含 `rotate` 的 `ctm` 一致。残余两项：① 页空间与 `posn` 像素的单位换算靠 `posn-object-width-height` + frame scale 标定，frame scale ≠ 1 的组合未在真机长时间验证；② Android 采集的 `ink:` / `rect:` 在旋转页上仍是旧行为（导出副本至今跳过 `/Rotate ≠ 0` 的页）。真机验收见计划 T9 第 ④⑤ 项。
+1. **旋转页的选区坐标已修正，但仍需真机复核**：2026-10-27 起 `seshat-reader-select-posn->page` 在出口按 `seshat-reader--multipage-rotate` 做逆变换（0 / 90 / 180 / 270，90 / 270 交换宽高），写出的 `rect` 落在**未旋转页面空间**，与 C 侧含 `rotate` 的 `ctm` 一致。残余两项：① 页空间与 `posn` 像素的单位换算靠 `posn-object-width-height` + frame scale 标定，frame scale ≠ 1 的组合未在真机长时间验证（**2026-10-28 补充**：换算的**分母**已改为逐页实际显示 scale（`seshat-reader-select--display-scale`），基准 scale 与显示 scale 的分叉不再影响取文——「resize 后不按缩放键则整页宽拖选被压窄」已修；但 `frame scale ≠ 1` 下的端到端真机验证仍属本条待办，未因该修复关闭）；② Android 采集的 `ink:` / `rect:` 在旋转页上仍是旧行为（导出副本至今跳过 `/Rotate ≠ 0` 的页）。真机验收见计划 T9 第 ④⑤ 项。
 2. **ink 笔迹只做了数值级坐标对照，未做真机肉眼确认**：ink 与 `rect:` 同为页面 pt、原点左上、y 向下，实测同一形状的差异行中心 `80.0` vs `80.0`，因此实现**不做 y 翻转**；但「同一形状在 Android 与 Emacs 上看起来一致」仍需真机对照（见 tech-debt）。另外单笔超过 1024 点会被截断为前 1024 点（不丢整笔），超长笔迹在页面上显示不完整。
 3. **颜色与 alpha 可配但只在 Lisp 侧**：颜色/透明度/细条粗细是 defcustom（见 §10），改配色后走 9 参 `--add-decoration`；C 侧编译期常量仅作默认值，不读用户配置。
 4. **装饰刷新只覆盖驻留页、多窗口不共享页码**：批注 / 搜索 / 选区的装饰是在渲染时烘进位图的，故刷新 = 清 spec 缓存 + 重渲染**当前 buffer 的驻留页**（视口 ± `seshat-reader--multipage-preload`）；不在驻留集里的页要等再次进入视口才更新。同一文档在多个窗口各自有独立滚动位置（P1 的设计选择）。

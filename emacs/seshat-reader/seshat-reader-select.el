@@ -654,14 +654,6 @@ or non-positive result falls back to 1.0."
         (float scale)
       1.0)))
 
-(defun seshat-reader-select--page-scale (window)
-  "Return the page scale of WINDOW, or nil when it is unusable.
-The scale is taken from `seshat-reader-current-doc-scale-value', which is
-window-local in `seshat-reader-mode'; the window argument is mandatory
-there and is passed through."
-  (let ((scale (ignore-errors (seshat-reader-current-doc-scale-value window))))
-    (and (numberp scale) (> scale 0) (float scale))))
-
 (defun seshat-reader-select--page-rotate (&optional window)
   "Return the rotation of the page shown in WINDOW, in degrees.
 The value is one of 0, 90, 180 and 270.  Since P1 the pages are buffer rows
@@ -750,6 +742,131 @@ in."
          (y1 (cdr b)))
     (list (min x0 x1) (min y0 y1) (max x0 x1) (max y0 y1))))
 
+;;; 显示口径（A+ 修复）
+
+;; 页面坐标的单位是 native（页的点），而鼠标报的是**显示像素**，两者之间只差
+;; 一个系数：显示 scale。它曾经取自 `--multipage-base-scale'（文档打开那一刻
+;; fit 出来的基准值），但窗口 resize 只重写每页 spec 的 `:width'/`:height'
+;; （`seshat-reader--apply-display-scale'），基准值不动，于是 resize 之后两者
+;; 分叉（实测 base 1.0 / 实际显示 0.25）：换算把整页宽的拖拽压成页面坐标
+;; 0..153（页宽 612），每行只剩左侧 1/4 的字。下面的函数一律按「显示即真相」
+;; 测量——行里那幅图多大，分母就是多少。
+
+(defun seshat-reader-select--page-spec (page window)
+  "Return the image spec PAGE displays in the buffer of WINDOW, or nil.
+PAGE is a 1-based page number and WINDOW a window that may show a buffer with
+page rows.  The spec is read from the buffer-local `seshat-reader--pages' of
+**that** buffer, following the layout used there: an entry is
+\(PAGE MARKER . SPEC), so the spec is its `cddr'.
+
+nil means WINDOW shows no buffer with page rows, or that PAGE has no row in
+it.  Reading the page table of the window's buffer instead of the current one
+is what keeps the measurement right when the drag runs while another buffer
+is current."
+  (when (and (integerp page) (windowp window))
+    (let ((buffer (window-buffer window)))
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer
+          (and (boundp 'seshat-reader--pages)
+               (cddr (assq page seshat-reader--pages))))))))
+
+(defun seshat-reader-select--page-native-size (page window)
+  "Return the unscaled native size of PAGE in the buffer of WINDOW, or nil.
+PAGE is a 1-based page number and WINDOW a window that may show a buffer with
+page rows.  The size is `seshat-reader--multipage-native-size' read **in that
+buffer**, because the table behind it is buffer-local; it is the size of the
+page at scale 1.0, i.e. the unit the coordinates of
+`seshat-reader-select-posn->page' are expressed in.
+
+nil means PAGE has no row yet, has not been rendered, or the vendored reader
+does not expose the native size."
+  (when (and (integerp page) (windowp window))
+    (let ((buffer (window-buffer window)))
+      (when (and (buffer-live-p buffer)
+                 (fboundp 'seshat-reader--multipage-native-size))
+        (with-current-buffer buffer
+          (ignore-errors (seshat-reader--multipage-native-size page)))))))
+
+(defun seshat-reader-select--display-scale (page window)
+  "Return the scale PAGE is displayed at in WINDOW, or nil.
+PAGE is a 1-based page number and WINDOW the window showing it.  The value is
+the ratio of the size the page row actually displays to the native size of
+the page:
+
+    display scale = spec `:width' / native width
+
+so it is 0.25 for a 612 pt wide page whose row holds a 153 px wide bitmap —
+the scale a fully zoomed out page is fitted at, and the divisor
+`seshat-reader-select-posn->page' needs to turn image pixels back into page
+coordinates.  It is **not** `seshat-reader--multipage-base-scale': that value
+is the scale the document was fitted at when it was opened, and a resize
+rewrites the page specs without touching it, which is exactly how the two
+drift apart.
+
+A quarter turn does **not** swap the sides here.  Both quantities are taken in
+the rotated orientation and are therefore divided as they are: the spec is the
+bitmap the row displays, rendered with `seshat-reader--multipage-rotate'
+applied, and the native size is that same bitmap divided by its render scale
+\(`seshat-reader--multipage-record-native'), so the two always face the same
+way and their ratio is the scale and nothing else.  Swapping one side would
+inflate the answer by width/height (612x792 gives 1.294x, i.e. page
+coordinates compressed by 23%, which loses the right part of every line on a
+rotated page).  Only the functions whose answer is in page coordinates
+\(`seshat-reader-select--page-space-size', `--posn-page-extent') exchange the
+sides through `seshat-reader-select--unrotate-size', because the module takes
+rectangles in unrotated page space.
+
+When the width of the spec is unusable the height is used instead, and nil is
+returned when neither is usable, when PAGE has no row or no native size, or
+when the resulting scale would not be positive."
+  (let ((spec (seshat-reader-select--page-spec page window))
+        (native (seshat-reader-select--page-native-size page window)))
+    (when (and spec
+               (consp native)
+               (numberp (car native)) (> (car native) 0)
+               (numberp (cdr native)) (> (cdr native) 0))
+      (let* ((width (image-property spec :width))
+             (height (image-property spec :height))
+             (scale (cond
+                     ((and (numberp width) (> width 0))
+                      (/ (float width) (float (car native))))
+                     ((and (numberp height) (> height 0))
+                      (/ (float height) (float (cdr native)))))))
+        (and scale (> scale 0) scale)))))
+
+(defun seshat-reader-select--page-scale (window &optional page)
+  "Return the page scale of WINDOW, or nil when it is unusable.
+The scale is the one the page is **displayed** at, so it is asked of
+`seshat-reader-select--display-scale' first, which measures PAGE against the
+image spec its row really shows.
+
+PAGE defaults to nil, meaning \"the page is unknown\": the measurement is
+skipped and the document scale answers instead, which is what this function
+always returned before the display scale was measured.  The document scale
+comes from `seshat-reader-current-doc-scale-value' and is only a fallback,
+because it is the scale the document was fitted at **when it was opened**
+\(`seshat-reader--multipage-base-scale'): a resize rewrites the size of every
+page row without touching that base value, so after a resize the base scale
+and the displayed size disagree, and dividing by the base one shrinks the
+page coordinates to a fraction of the page (measured 2026-10-28: a full width
+drag came back as page x 0..153 on a page 612 pt wide, so only the left
+quarter of every line was selected).
+
+A nil or non-positive answer from either source is reported as nil.
+
+Note that the two sources do not read the same buffer: the fallback answers
+from `seshat-reader-current-doc-scale-value', i.e. from the base scale of the
+**current** buffer, while the display scale reads the page table of the buffer
+WINDOW displays.  The drag path runs with the reader buffer current, so the
+two agree there; a caller running in another buffer (a test, a batch job)
+should make the window's buffer the one it means, or pass PAGE to stay on the
+measured path."
+  (let ((scale (or (ignore-errors
+                     (seshat-reader-select--display-scale page window))
+                   (ignore-errors
+                     (seshat-reader-current-doc-scale-value window)))))
+    (and (numberp scale) (> scale 0) (float scale))))
+
 (defun seshat-reader-select-posn-page (posn &optional window)
   "Return the 1-based page number POSN points into, or nil.
 
@@ -789,7 +906,11 @@ The coordinates are computed as
 where the image pixel offset comes from `posn-object-x-y' (which
 already accounts for window scrolling and page centering), the
 frame scale from `frame-scale-factor' and the page scale from
-`seshat-reader-current-doc-scale-value'.  The result is meant to be passed,
+`seshat-reader-select--display-scale', i.e. from the size the page row really
+displays over the native size of the page — the scale of the document as it
+is **on screen now**, not the one it was fitted at when it was opened.  The
+page whose scale is measured is the one POSN landed on, as answered by
+`seshat-reader-select-posn-page'.  The result is meant to be passed,
 over the rectangle formed by two such positions, to
 `seshat-reader-dyn--text-in-rect'.
 
@@ -819,7 +940,8 @@ drag across a page boundary is a real case, not an edge case)."
       nil)
      (t
       (let ((xy (posn-object-x-y posn))
-            (scale (seshat-reader-select--page-scale window)))
+            (scale (seshat-reader-select--page-scale
+                    window (seshat-reader-select-posn-page posn window))))
         (cond
          ((not (consp xy))
           (message "Seshat Reader select: no image pixel offset at position.")
@@ -956,7 +1078,8 @@ nil (a batch frame carries no redisplay information)."
   (when (and (windowp window)
              (eq (car-safe (posn-object posn)) 'image))
     (let ((size (ignore-errors (posn-object-width-height posn)))
-          (scale (seshat-reader-select--page-scale window)))
+          (scale (seshat-reader-select--page-scale
+                  window (seshat-reader-select-posn-page posn window))))
       (when (and (consp size)
                  (numberp (car size))
                  (numberp (cdr size))
@@ -1020,20 +1143,19 @@ The bottom edge of a page is that page's **own** height, because the pages of
 one document do not have to be equally tall — a cover page next to body pages
 is the common case, and clipping every page with the height of the page the
 drag started on would cut text away on a taller page.  The own height is read
-from the native size of the page's row (`seshat-reader-select--page-space-size')
-and **calibrated** by the ratio measured on the start page: that ratio is the
-only link between the unit of `--posn-page-extent' (image pixels times frame
-scale over page scale) and the unit of `--page-space-size' (native pixels times
-frame scale), and the two agree only when the page was rendered at the page
-scale.  The height therefore comes from three paths, in this order:
+from the native size of the page's row, i.e. from
+`seshat-reader-select--page-space-size', the same unrotated page size the two
+drag positions are expressed in, so it is used **as it is**: every quantity
+here is now the same unit (page coordinates, i.e. native size times the frame
+scale), because `seshat-reader-select-posn->page' divides by the **displayed**
+page scale.
+The ratio this function used to calibrate the two units with is therefore
+identically 1 and is gone.  The height still comes from two fallbacks, in
+this order:
 
-  1. the page's own size scaled by the start page ratio, when both the start
-     page extent and that own size are measurable;
-  2. the height measured on the start page (`--posn-page-extent'), when the
-     ratio cannot be measured — the own size is **never** used raw in that
-     case: the two units differ by the ratio of render scale to page scale, so
-     an uncalibrated own size can be too short and cut text away;
-  3. `seshat-reader-select--page-extent-fallback' when that is unknown too.
+  1. the page's own size, when its row has been rendered;
+  2. the height measured on the start page (`--posn-page-extent'), then
+     `seshat-reader-select--page-extent-fallback', when it has not.
 
 Erring long is deliberate and harmless (the native module only reports text
 the page really holds), while a short rectangle loses text, so every fallback
@@ -1059,31 +1181,18 @@ page space as the rectangles."
              (start-on-first (and start-number (= first start-number)))
              (first-y (if start-on-first (cdr start-page) (cdr end-page)))
              (last-y (if start-on-first (cdr end-page) (cdr start-page)))
-             ;; 每页有自己的高度（批次 2）：`--posn-page-extent' 只量到起点页，
-             ;; 而封面与正文的页高经常不同，用同一个高度裁剪会让中间页的矩形
-             ;; 越界或不足（越界无害，模块只报页内真有的字；不足会丢字）。
-             ;; 比例把 native 尺寸换算到 `--posn-page-extent' 的口径——两者的
-             ;; 单位约定不同（前者是 scale 1.0 的页尺寸，后者是已过 frame
-             ;; scale / page scale 的坐标），用起点页做基准即可让起点页的结论
-             ;; 与只用 extent 时逐值相同，其余页按同一比例缩放。
-             ;; 比例量不到（起点 extent 为 nil）时**不采信 own 的绝对值**：
-             ;; 渲染 scale 与 page scale 不等时那个值会偏短，按 `height' 兜底
-             ;; （宁可过长：模块只报页内真有的字，过长无副作用）。
-             (ratio (let ((own (seshat-reader-select--page-space-size
-                                (if start-on-first first last) window)))
-                      (when (and extent own
-                                 (> (car own) 0)
-                                 (> (cdr own) 0))
-                        (cons (/ (float (car extent)) (car own))
-                              (/ (float (cdr extent)) (cdr own))))))
+             ;; 每页有自己的高度：`--posn-page-extent' 只量到起点页，而封面与
+             ;; 正文的页高经常不同，用同一个高度裁剪会让中间页的矩形越界或不足
+             ;; （越界无害，模块只报页内真有的字；不足会丢字）。口径统一后
+             ;; `--page-space-size' 的绝对值就是页面坐标（native × frame
+             ;; scale），不再需要比例校准；量不到（页没有行 / 尚未渲染）才
+             ;; 退回起点页量到的高度，再退常量。
              rects)
         (cl-labels ((page-height (page)
                       "Height of PAGE in page coordinates, or the fallback."
-                      (let ((own (seshat-reader-select--page-space-size
-                                  page window)))
-                        (cond
-                         ((and own ratio) (* (cdr own) (cdr ratio)))
-                         (t height)))))
+                      (or (cdr (seshat-reader-select--page-space-size
+                                page window))
+                          height)))
           (cl-loop for page from first to last
                    do (push (cons page
                                   (list x0
@@ -1282,15 +1391,24 @@ to page coordinates and its text is reported by
   "Report the raw and converted coordinates of the mouse EVENT.
 This is a calibration helper for `seshat-reader-select-posn->page':
 it prints the image pixel offset returned by `posn-object-x-y', the
-page coordinates computed from it and the scale factors involved."
+page coordinates computed from it and the scale factors involved.
+`display-scale' is the scale measured on the displayed page row — the divisor
+the conversion uses — while `page-scale' is what the conversion was handed in
+total (it falls back to the document scale when the page cannot be measured);
+comparing the two is how a drift between the base scale and the displayed one
+is spotted on a live frame."
   (interactive "e")
   (let* ((posn (event-start event))
          (window (posn-window posn))
+         (number (and (windowp window)
+                      (seshat-reader-select-posn-page posn window)))
          (page (seshat-reader-select-posn->page posn window)))
-    (message "Seshat Reader select: pixel=%S page=%S page-scale=%S frame-scale=%S"
+    (message "Seshat Reader select: pixel=%S page=%S page-scale=%S display-scale=%S frame-scale=%S"
              (posn-object-x-y posn)
              page
-             (and (windowp window) (seshat-reader-select--page-scale window))
+             (and (windowp window) (seshat-reader-select--page-scale window number))
+             (and (windowp window)
+                  (seshat-reader-select--display-scale number window))
              (and (windowp window)
                   (seshat-reader-select--frame-scale (window-frame window))))))
 

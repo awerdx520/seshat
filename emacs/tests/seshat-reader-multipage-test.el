@@ -2580,6 +2580,14 @@ P1 起该访问器返回 image spec（`overlayp' 为 nil、`car-safe' 是 `image
             ;; 缩放真值是 buffer 级的（M3）：窗口参数只是镜像，必须一起写
             (setq seshat-reader--multipage-base-scale 2.0)
             (set-window-parameter window 'scale 2.0)
+            ;; A+ 修复起页面坐标换算的分母是**显示 scale**（行里那幅图的实际
+            ;; 尺寸 ÷ native），因为窗口 resize 只重写 spec 而 base scale 不动。
+            ;; 真实缩放同样会把每页 spec 重写为 native × 2.0
+            ;; （`seshat-reader--apply-display-scale'），夹具必须一起缩放，
+            ;; 否则「base 2.0 + 显示 1.0」是现实里不存在的状态。
+            (dolist (entry (cdr fixture))
+              (setf (image-property (cdr entry) :width) 1200)
+              (setf (image-property (cdr entry) :height) 1600))
             (cl-letf (((symbol-function 'posn-window) (lambda (_posn) window))
                       ((symbol-function 'posn-object)
                        (lambda (_posn) (list 'image :type 'canvas :data nil)))
