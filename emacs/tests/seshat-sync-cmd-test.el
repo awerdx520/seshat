@@ -46,6 +46,7 @@
 (require 'ert)
 (require 'cl-lib)
 (require 'seshat-state)
+(require 'seshat-log)
 (require 'seshat-sync-cmd)
 
 ;;; 测试辅助
@@ -144,7 +145,7 @@ BODY 期间 `seshat-state-file' 指向临时根目录里的 \"sync-state.eld\"�
                   (push 'push seshat-sync-cmd-test--calls)
                   (seshat-sync-cmd-test--push-stats)))
                ((symbol-function 'seshat-sync-status)
-                (lambda ()
+                (lambda (&optional _quiet)
                   (push 'status seshat-sync-cmd-test--calls)
                   0)))
        ,@body)))
@@ -159,38 +160,41 @@ BODY 期间 `seshat-state-file' 指向临时根目录里的 \"sync-state.eld\"�
   "`seshat-sync-now' 的编排严格是 pull → 改名检测 → push → 状态。
 顺序不可调换：rename 产生的 dirty 与 uid 路径变更必须先落 state，push 才能
 按新路径推送。"
-  (seshat-sync-cmd-test--with-engine-stubs
-    (seshat-sync-now)
-    (should (equal (seshat-sync-cmd-test--call-order)
-                   '(pull detect-renames push status)))))
+  (seshat-sync-cmd-test--with-env
+    (seshat-sync-cmd-test--with-engine-stubs
+      (seshat-sync-now)
+      (should (equal (seshat-sync-cmd-test--call-order)
+                     '(pull detect-renames push status))))))
 
 (ert-deftest seshat-sync-cmd-test-now-pull-error-does-not-abort ()
   "pull 抛错时后续三步仍被调用（既有的单步异常隔离语义保持）。"
-  (seshat-sync-cmd-test--with-engine-stubs
-    (cl-letf (((symbol-function 'seshat-sync-pull)
-               (lambda ()
-                 (push 'pull seshat-sync-cmd-test--calls)
-                 (error "传输层不可用"))))
-      (let ((result (seshat-sync-now)))
-        (should (equal (seshat-sync-cmd-test--call-order)
-                       '(pull detect-renames push status)))
-        (should (eq (nth 0 result) 'error))
-        (should (equal (plist-get (nth 1 result) :renamed) 1))
-        (should (equal (plist-get (nth 2 result) :pushed) 2))))))
+  (seshat-sync-cmd-test--with-env
+    (seshat-sync-cmd-test--with-engine-stubs
+      (cl-letf (((symbol-function 'seshat-sync-pull)
+                 (lambda ()
+                   (push 'pull seshat-sync-cmd-test--calls)
+                   (error "传输层不可用"))))
+        (let ((result (seshat-sync-now)))
+          (should (equal (seshat-sync-cmd-test--call-order)
+                         '(pull detect-renames push status)))
+          (should (eq (nth 0 result) 'error))
+          (should (equal (plist-get (nth 1 result) :renamed) 1))
+          (should (equal (plist-get (nth 2 result) :pushed) 2)))))))
 
 (ert-deftest seshat-sync-cmd-test-now-status-error-keeps-sync-result ()
   "status 抛错只影响进度展示：此时 push 已完成，其统计原样返回。"
-  (seshat-sync-cmd-test--with-engine-stubs
-    (cl-letf (((symbol-function 'seshat-sync-status)
-               (lambda ()
-                 (push 'status seshat-sync-cmd-test--calls)
-                 (error "进度服务不可用"))))
-      (let ((result (seshat-sync-now)))
-        ;; push 在 status 之前完成：调用记录里 push 必须已出现且早于 status。
-        (should (equal (seshat-sync-cmd-test--call-order)
-                       '(pull detect-renames push status)))
-        (should (equal (plist-get (nth 2 result) :pushed) 2))
-        (should (eq (nth 3 result) 'error))))))
+  (seshat-sync-cmd-test--with-env
+    (seshat-sync-cmd-test--with-engine-stubs
+      (cl-letf (((symbol-function 'seshat-sync-status)
+                 (lambda (&optional _quiet)
+                   (push 'status seshat-sync-cmd-test--calls)
+                   (error "进度服务不可用"))))
+        (let ((result (seshat-sync-now)))
+          ;; push 在 status 之前完成：调用记录里 push 必须已出现且早于 status。
+          (should (equal (seshat-sync-cmd-test--call-order)
+                         '(pull detect-renames push status)))
+          (should (equal (plist-get (nth 2 result) :pushed) 2))
+          (should (eq (nth 3 result) 'error)))))))
 
 ;;; 兼容入口
 
@@ -270,6 +274,13 @@ BODY 期间 `seshat-state-file' 指向临时根目录里的 \"sync-state.eld\"�
        ,@body)
      (nreverse collected)))
 
+(defun seshat-sync-cmd-test--log-text ()
+  "返回 `*Seshat Log*' 的当前全部文本（buffer 不存在时返回空串）.
+静默化断言用它：QUIET 路径下 echo area 必须安静，但日志 buffer 必须有记录。"
+  (or (when-let* ((buffer (get-buffer seshat-log--buffer-name)))
+        (with-current-buffer buffer (buffer-string)))
+      ""))
+
 ;;; 未配置根映射：不空转、不误导（T4d 缺口 1）
 
 (ert-deftest seshat-sync-cmd-test-report-pull-unconfigured-message ()
@@ -285,34 +296,38 @@ BODY 期间 `seshat-state-file' 指向临时根目录里的 \"sync-state.eld\"�
   "pull 返回 `:configured nil' 时 `seshat-sync-now' 只调 pull，返回 `(unconfigured)'。
 改名检测 / 推送 / 状态同步都跳过：根映射为空时它们只能在空集上空转，状态同步
 也没有可用 uid；此时再打印「同步完成」摘要会误导用户。"
-  (seshat-sync-cmd-test--with-engine-stubs
-    (cl-letf (((symbol-function 'seshat-sync-pull)
-               (lambda ()
-                 (push 'pull seshat-sync-cmd-test--calls)
-                 (seshat-sync-cmd-test--unconfigured-pull-stats))))
-      (let (result messages)
-        (setq messages
-              (seshat-sync-cmd-test--collect-messages
-                (setq result (seshat-sync-now))))
-        (should (equal result '(unconfigured)))
-        (should (equal (seshat-sync-cmd-test--call-order) '(pull)))
-        (should (cl-some (lambda (m) (string-match-p "跳过" m)) messages))
-        (should-not (cl-some (lambda (m) (string-match-p "同步完成" m)) messages))))))
+  (seshat-sync-cmd-test--with-env
+    (seshat-sync-cmd-test--with-engine-stubs
+      (cl-letf (((symbol-function 'seshat-sync-pull)
+                 (lambda ()
+                   (push 'pull seshat-sync-cmd-test--calls)
+                   (seshat-sync-cmd-test--unconfigured-pull-stats))))
+        (let (result messages)
+          (setq messages
+                (seshat-sync-cmd-test--collect-messages
+                  (setq result (seshat-sync-now))))
+          (should (equal result '(unconfigured)))
+          (should (equal (seshat-sync-cmd-test--call-order) '(pull)))
+          (should (cl-some (lambda (m) (string-match-p "跳过" m)) messages))
+          (should-not (cl-some (lambda (m) (string-match-p "同步完成" m))
+                               messages)))))))
 
 (ert-deftest seshat-sync-cmd-test-now-configured-keeps-orchestration ()
   "正常配置（`:configured t'）下编排仍是 pull → 改名检测 → push → 状态（回归）。
 本轮改动只在 `:configured' 为 nil 时短路，配置正常时行为必须完全不变。"
-  (seshat-sync-cmd-test--with-engine-stubs
-    (let (result messages)
-      (setq messages (seshat-sync-cmd-test--collect-messages
-                       (setq result (seshat-sync-now))))
-      (should (equal (seshat-sync-cmd-test--call-order)
-                     '(pull detect-renames push status)))
-      (should (= 4 (length result)))
-      (should (equal (plist-get (nth 0 result) :configured) t))
-      (should (equal (plist-get (nth 2 result) :pushed) 2))
-      (should (cl-some (lambda (m) (string-match-p "拉取完成" m)) messages))
-      (should (cl-some (lambda (m) (string-match-p "同步完成" m)) messages)))))
+  (seshat-sync-cmd-test--with-env
+    (seshat-sync-cmd-test--with-engine-stubs
+      (let (result messages)
+        (setq messages (seshat-sync-cmd-test--collect-messages
+                         (setq result (seshat-sync-now))))
+        (should (equal (seshat-sync-cmd-test--call-order)
+                       '(pull detect-renames push status)))
+        (should (= 4 (length result)))
+        (should (equal (plist-get (nth 0 result) :configured) t))
+        (should (equal (plist-get (nth 2 result) :pushed) 2))
+        (should (cl-some (lambda (m) (string-match-p "拉取完成" m)) messages))
+        (should (cl-some (lambda (m) (string-match-p "同步完成" m))
+                         messages))))))
 
 ;;; 改配置后重建根映射（T4d 缺口 2）
 
@@ -365,6 +380,122 @@ BODY 期间 `seshat-state-file' 指向临时根目录里的 \"sync-state.eld\"�
   (should (commandp 'seshat-sync-reset-roots))
   (should (equal (func-arity 'seshat-sync-reset-roots) '(0 . 0)))
   (should (interactive-form 'seshat-sync-reset-roots)))
+
+;;; 静默化：自动路径只写日志、交互路径保留 echo（T7）
+
+(ert-deftest seshat-sync-cmd-test-report-pull-quiet-logs-not-echo ()
+  "`--report-pull' 传 QUIET 非 nil：不 message，改写入 `*Seshat Log*'。"
+  (seshat-log-clear)
+  (let ((messages (seshat-sync-cmd-test--collect-messages
+                    (seshat-sync-cmd--report-pull
+                     (seshat-sync-cmd-test--pull-stats) t))))
+    (should-not messages))
+  (should (string-match-p "拉取完成" (seshat-sync-cmd-test--log-text))))
+
+(ert-deftest seshat-sync-cmd-test-now-quiet-writes-log-not-echo ()
+  "`seshat-sync-now' 传 QUIET 非 nil：`message' 一次都不调，日志有完整记录。
+定时器路径就靠它保证「不刷 echo area」。"
+  (seshat-sync-cmd-test--with-env
+    (seshat-log-clear)
+    (seshat-sync-cmd-test--with-engine-stubs
+      (let ((messages (seshat-sync-cmd-test--collect-messages
+                        (seshat-sync-now t))))
+        (should-not messages)))
+    (let ((text (seshat-sync-cmd-test--log-text)))
+      (should (string-match-p "开始同步" text))
+      (should (string-match-p "同步完成" text)))))
+
+(ert-deftest seshat-sync-cmd-test-now-interactive-ignores-quiet ()
+  "交互调用时即使显式传 QUIET 也照常 message：用户主动操作必须有反馈。
+`called-interactively-p' 为真时 QUIET 被强制复位为 nil，防止外部误传把
+用户自己的操作反馈吞掉。"
+  (seshat-sync-cmd-test--with-env
+    (seshat-sync-cmd-test--with-engine-stubs
+      (let ((messages
+             (cl-letf (((symbol-function 'called-interactively-p)
+                        (lambda (&optional _kind) t)))
+               (seshat-sync-cmd-test--collect-messages
+                 (seshat-sync-now t)))))
+        (should (cl-some (lambda (m) (string-match-p "同步完成" m)) messages))))))
+
+(ert-deftest seshat-sync-cmd-test-enable-timer-callback-is-quiet ()
+  "`seshat-sync-enable-timer' 交给定时器的是「带 QUIET 的回调」。
+桩 `run-at-time' 取出回调后直接调用：不得产生任何 echo 输出，日志必须有记录。"
+  (seshat-sync-cmd-test--with-env
+    (let* ((seshat-sync-cmd--timer nil)
+           (captured nil))
+      (cl-letf (((symbol-function 'run-at-time)
+                 (lambda (&rest args) (setq captured args) 'fake-timer)))
+        (seshat-sync-enable-timer))
+      (should (equal (nth 0 captured) seshat-sync-interval))
+      (should (equal (nth 1 captured) seshat-sync-interval))
+      (should (functionp (nth 2 captured)))
+      ;; 回调不是 `seshat-sync-now' 本体（本体不带 QUIET），而是包了一层的闭包
+      (should-not (eq (nth 2 captured) #'seshat-sync-now))
+      (seshat-log-clear)
+      (seshat-sync-cmd-test--with-engine-stubs
+        (let ((messages (seshat-sync-cmd-test--collect-messages
+                          (funcall (nth 2 captured)))))
+          (should-not messages)))
+      (should (string-match-p "同步完成" (seshat-sync-cmd-test--log-text))))))
+
+;;; `:runtime' 落盘（成功 / 失败两条路径都要写）
+
+(ert-deftest seshat-sync-cmd-test-record-runtime-success-persisted ()
+  "全成功一轮同步后，`:runtime' 落盘为 `success'（重新加载状态库后仍可读）。
+`seshat-status' 的「上次同步」完全依赖这条记录，因此必须真落盘而不是只改内存。"
+  (seshat-sync-cmd-test--with-env
+    (seshat-sync-cmd-test--with-engine-stubs
+      (should (= 4 (length (seshat-sync-now t)))))
+    (setq seshat-state--state nil)       ; 丢弃内存态，强制从磁盘重读
+    (let ((runtime (seshat-state-runtime)))
+      (should (eq (plist-get runtime :last-sync-result) 'success))
+      (should (numberp (plist-get runtime :last-sync-at)))
+      (should-not (plist-get runtime :last-sync-error)))))
+
+(ert-deftest seshat-sync-cmd-test-record-runtime-failed-on-pull-error ()
+  "拉取抛错：`:runtime' 落盘为 `failed' 且带错误摘要（失败路径同样要写）。"
+  (seshat-sync-cmd-test--with-env
+    (seshat-sync-cmd-test--with-engine-stubs
+      (cl-letf (((symbol-function 'seshat-sync-pull)
+                 (lambda ()
+                   (push 'pull seshat-sync-cmd-test--calls)
+                   (error "传输层不可用"))))
+        (seshat-sync-now t)))
+    (setq seshat-state--state nil)
+    (let ((runtime (seshat-state-runtime)))
+      (should (eq (plist-get runtime :last-sync-result) 'failed))
+      (should (string-match-p "传输层不可用"
+                              (plist-get runtime :last-sync-error))))))
+
+(ert-deftest seshat-sync-cmd-test-record-runtime-failed-when-unconfigured ()
+  "未配置根映射短路时也写 `:runtime'（`failed' + 未配置摘要）。
+否则启动汇总会一直显示「尚未同步」，用户看不出「配了但没生效」。"
+  (seshat-sync-cmd-test--with-env
+    (seshat-sync-cmd-test--with-engine-stubs
+      (cl-letf (((symbol-function 'seshat-sync-pull)
+                 (lambda ()
+                   (push 'pull seshat-sync-cmd-test--calls)
+                   (seshat-sync-cmd-test--unconfigured-pull-stats))))
+        (should (equal (seshat-sync-now t) '(unconfigured)))))
+    (setq seshat-state--state nil)
+    (let ((runtime (seshat-state-runtime)))
+      (should (eq (plist-get runtime :last-sync-result) 'failed))
+      (should (string-match-p "未配置" (plist-get runtime :last-sync-error))))))
+
+(ert-deftest seshat-sync-cmd-test-record-runtime-save-error-keeps-result ()
+  "`:runtime' 落盘失败只记日志，不影响 `seshat-sync-now' 的返回值。
+「记录同步结论失败」绝不能反过来把一次成功的同步变成失败。"
+  (seshat-sync-cmd-test--with-env
+    (seshat-log-clear)
+    (seshat-sync-cmd-test--with-engine-stubs
+      (cl-letf (((symbol-function 'seshat-state-save)
+                 (lambda () (error "磁盘只读"))))
+        (let ((result (seshat-sync-now t)))
+          (should (= 4 (length result)))
+          (should (equal (plist-get (nth 2 result) :pushed) 2)))))
+    (should (string-match-p "记录同步运行状态失败"
+                            (seshat-sync-cmd-test--log-text)))))
 
 (provide 'seshat-sync-cmd-test)
 ;;; seshat-sync-cmd-test.el ends here

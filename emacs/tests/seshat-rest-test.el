@@ -651,13 +651,44 @@ JSON 的 false 必须转成 nil（`json-parse-string' 读出的是符号 `:false
           (should (equal (plist-get result :size) 7))
           (should (file-exists-p target))
           (should (equal (seshat-rest-test--read-text target) "payload")))))
-    ;; Content-Length 缺失时跳过检查（绝不因为「不知道大小」就拒写）
+    ;; Content-Length 缺失时**不再**跳过检查（旧行为，安全缺口）：
+    ;; chunked / 无该头时先落盘、再按实际文件大小兜底，超限即删文件并报超限。
     (let ((target (expand-file-name "nolength.epub" dir)))
       (seshat-rest-test--with (list :status 200 :headers nil :body "payload")
         (let ((result (seshat-rest-download-file "nolength.epub" target
                                                 :max-bytes 1)))
+          (should (eq (plist-get result :too-large) t))
+          (should (equal (plist-get result :size) 7))
+          (should-not (file-exists-p target)))))))
+
+(ert-deftest seshat-rest-download-file-too-large-by-actual-size ()
+  "无 `Content-Length' 且 body 超大 → 落盘后兜底判定为超限，目标文件**被删除**。
+修复 2 的核心断言：`Content-Length' 缺失时（chunked 分段响应是常态）第一道闸
+整个失效，若不按实际文件大小兜底就会一直写到磁盘满。"
+  (seshat-rest-test--with-temp-dir dir
+    (let ((target (expand-file-name "chunked.epub" dir))
+          (big (make-string 4096 ?x)))
+      (seshat-rest-test--with (list :status 200 :headers nil :body big)
+        (let ((result (seshat-rest-download-file "chunked.epub" target
+                                                :max-bytes 1024)))
+          (should (eq (plist-get result :too-large) t))
+          (should (equal (plist-get result :status) 200))
+          ;; `:size' 回落到实际写入的字节数（头里没有这个信息）
+          (should (equal (plist-get result :size) 4096))
+          (should-not (file-exists-p target))
+          ;; 也不留临时文件（`seshat-download-' 前缀）
+          (should (equal (directory-files dir nil "\\`seshat-download-") nil)))))))
+
+(ert-deftest seshat-rest-download-file-missing-content-length-within-limit ()
+  "无 `Content-Length' 但 body 在上限内 → 照常落盘（兜底只删超限的，不是一律拒写）。"
+  (seshat-rest-test--with-temp-dir dir
+    (let ((target (expand-file-name "chunked-ok.epub" dir)))
+      (seshat-rest-test--with (list :status 200 :headers nil :body "payload")
+        (let ((result (seshat-rest-download-file "chunked-ok.epub" target
+                                                :max-bytes 1024)))
           (should-not (plist-get result :too-large))
-          (should (file-exists-p target)))))))
+          (should (file-exists-p target))
+          (should (equal (seshat-rest-test--read-text target) "payload")))))))
 
 (ert-deftest seshat-rest-download-file-too-large-accepts-float-max-bytes ()
   "`:max-bytes' 传浮点时上限**照旧生效**（判据用 `numberp' 而不是 `integerp'）。

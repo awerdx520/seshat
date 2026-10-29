@@ -322,23 +322,29 @@ RESPONSE 是桩返回的 `(STATUS . BODY)'。用途：断言「零请求」以�
         (should (eq (plist-get identity :state) 'unregistered))))))
 
 (ert-deftest seshat-reading-test-resolve-error-degrades-to-external ()
-  "`--resolve' 内部抛错 → 降级为 `external'，不向外抛错，警告只发一次."
+  "`--resolve' 内部抛错 → 降级为 `external'，不向外抛错，警告只记一次.
+静默化后降级警告走 `seshat-log' 的 warn 级（自动路径不刷 echo area），
+「每个进程只记一次」的去重语义不变。"
   (seshat-reading-test--with-env
     (let* ((file (seshat-reading-test--touch seshat-reading-test--dir
                                              "any.pdf"))
-           (result (seshat-reading-test--warnings
-                    (lambda ()
-                      (cl-letf (((symbol-function 'seshat-state-roots)
-                                 (lambda ()
-                                   (error "状态文件不可读"))))
-                        (list (seshat-reading--resolve file)
-                              (seshat-reading--resolve file))))))
-           (identities (car result))
-           (warnings (cdr result)))
+           (logged nil)
+           (identities
+            (cl-letf (((symbol-function 'seshat-state-roots)
+                       (lambda ()
+                         (error "状态文件不可读")))
+                      ((symbol-function 'seshat-log)
+                       (lambda (level format-string &rest args)
+                         (push (cons level (apply #'format format-string args))
+                               logged))))
+              (list (seshat-reading--resolve file)
+                    (seshat-reading--resolve file)))))
       (should (= 2 (length identities)))
       (dolist (identity identities)
         (should (eq (plist-get identity :state) 'external)))
-      (should (= 1 (length warnings))))))
+      (should (= 1 (length logged)))
+      (should (eq (caar logged) 'warn))
+      (should (string-match-p "解析库身份失败" (cdar logged))))))
 
 ;;; T2：mode-line 标识
 
@@ -1251,6 +1257,89 @@ buffer，`(buffer-live-p (current-buffer))' 恒为真，旧守卫因此完全失
                                     (current-buffer)))
       ;; 页码元素照样装上（与 doom-modeline 是否加载无关）
       (should (member seshat-reader--page-mode-line mode-line-misc-info))))))
+
+;;; 静默化（T7）：自动路径走日志、显式命令保留 message
+
+(defun seshat-reading-test--log-text ()
+  "返回 `*Seshat Log*' 的当前全部文本（buffer 不存在时返回空串）。"
+  (or (when-let* ((buffer (get-buffer seshat-log--buffer-name)))
+        (with-current-buffer buffer (buffer-string)))
+      ""))
+
+(ert-deftest seshat-reading-test-resolve-error-logs-not-echo ()
+  "自动路径（打开文档时的身份解析）异常：只写 `*Seshat Log*'，不刷 echo area。
+`seshat-reading--warn-once' 在 mode 体里被调用（自动路径），逐条 message
+只会打断用户输入；身份降级仍按 `external' 处理，不抛错。"
+  (seshat-reading-test--with-env
+    (seshat-log-clear)
+    (let ((messages nil)
+          (warnings nil))
+      (cl-letf (((symbol-function 'seshat-reading--state-broken-p)
+                 (lambda () (error "状态库读取失败")))
+                ((symbol-function 'message)
+                 (lambda (format-string &rest args)
+                   (push (apply #'format format-string args) messages)))
+                ((symbol-function 'display-warning)
+                 (lambda (&rest args) (push args warnings))))
+        (let ((identity (seshat-reading--resolve "/tmp/does-not-exist.pdf")))
+          (should (eq (plist-get identity :state) 'external))
+          (should (null (plist-get identity :uid)))))
+      (should-not messages)
+      (should-not warnings))
+    (should (string-match-p "解析库身份失败"
+                            (seshat-reading-test--log-text)))))
+
+(ert-deftest seshat-reading-test-warn-once-logs-only-once ()
+  "降级警告每个 Emacs 进程只记一次（去重标记 `seshat-reading--warned'）。"
+  (seshat-reading-test--with-env
+    (let ((count 0))
+      (cl-letf (((symbol-function 'seshat-log)
+                 (lambda (&rest _args) (cl-incf count))))
+        (seshat-reading--warn-once "boom %s" 1)
+        (seshat-reading--warn-once "boom %s" 2))
+      (should (= count 1)))))
+
+(ert-deftest seshat-reading-test-refresh-library-still-messages ()
+  "显式命令 `seshat-reading-refresh' 仍 message：用户主动操作必须有反馈。
+静默化只针对自动路径，交互命令的 echo 输出不在改造范围内。"
+  (seshat-reading-test--with-env
+    (seshat-reading-test--register-root)
+    (let ((file (seshat-reading-test--touch seshat-reading-test--root
+                                            "book.pdf")))
+      (seshat-state-set "UID-LIB" (list :root "lib" :path "book.pdf"))
+      (with-temp-buffer
+        (setq buffer-file-name file)
+        (setq major-mode 'seshat-reading-mode)
+        (seshat-reading--apply-identity)
+        (let ((messages nil))
+          (seshat-reading-test--with-request-stub (cons 500 "{}")
+            (cl-letf (((symbol-function 'message)
+                       (lambda (format-string &rest args)
+                         (push (apply #'format format-string args) messages))))
+              (seshat-reading-refresh))
+            ;; `library' 状态零请求
+            (should (= seshat-reading-test--calls 0)))
+          (should (seq-some (lambda (msg) (string-match-p "库内文档" msg))
+                            messages)))))))
+
+(ert-deftest seshat-reading-test-library-add-still-messages ()
+  "显式命令 `seshat-library-add' 成功后仍 message「已入库」。"
+  (seshat-reading-test--with-env
+    (seshat-reading-test--register-root)
+    (let ((source (seshat-reading-test--touch seshat-reading-test--dir
+                                              "outside.pdf")))
+      (seshat-reading-test--with-upload-stub
+          (list (list :status 201 :uid "UID-MSG" :etag "ETAG-1" :rev 1))
+        (seshat-reading-test--with-reading-buffer source
+          (seshat-reading-test--with-y-or-n t
+            (let ((messages nil))
+              (cl-letf (((symbol-function 'message)
+                         (lambda (format-string &rest args)
+                           (push (apply #'format format-string args)
+                                 messages))))
+                (seshat-library-add source "lib" "book.pdf"))
+              (should (seq-some (lambda (msg) (string-match-p "已入库" msg))
+                                messages)))))))))
 
 (provide 'seshat-reading-test)
 ;;; seshat-reading-test.el ends here

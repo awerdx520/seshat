@@ -263,6 +263,37 @@ UUID 与条目的 `:uuid' 用 `string=' 精确比较。找到并移除（含写�
 队列文件不存在时返回 0。"
   (length (seshat-reader-annotation-queue--read)))
 
+;;; 输出通道（软依赖项目层日志）
+
+;; 本文件位于 `emacs/seshat-reader/'（vendored 包），**不得** `require'
+;; `seshat-log'：vendored 包必须能脱离项目层单独加载。因此日志走软依赖——
+;; 项目层在场就写 `*Seshat Log*'，缺席时降级为 `message'（只降级 warn 级，
+;; info 级在无日志层时无意义，静默丢弃）。
+
+(defvar seshat-reader-annotation-queue--quiet nil
+  "非 nil 表示当前处于自动（非交互）路径，提示应改走日志层.
+由 `seshat-reader-annotation-queue-sync' 按 `called-interactively-p' 绑定，
+`seshat-reader-annotation-queue--timer-sync' 直接绑 t：定时器回调不是交互
+调用，逐条 message 只会刷 echo area。")
+
+(defun seshat-reader-annotation-queue--log (level format-string &rest args)
+  "把一条 LEVEL 级日志交给项目层 `seshat-log'（软依赖）；缺失时降级为 `message'.
+`seshat-log' 的签名是 `(LEVEL FORMAT-STRING &rest ARGS)'，故这里用
+`apply' 转发 ARGS。降级时只对 `warn' 级 `message'——`info' 级在没有日志层
+的场景（脱离项目层单独使用本包）没有可见价值，静默丢弃即可。"
+  (if (fboundp 'seshat-log)
+      (apply 'seshat-log level format-string args)
+    (when (eq level 'warn)
+      (apply #'message format-string args))))
+
+(defun seshat-reader-annotation-queue--say (level format-string &rest args)
+  "按 `seshat-reader-annotation-queue--quiet' 选择输出通道并写一条 LEVEL 级提示.
+非 nil → `seshat-reader-annotation-queue--log'（静默，只进日志）；
+nil → `message'（用户显式操作时的原有反馈）。"
+  (if seshat-reader-annotation-queue--quiet
+      (apply #'seshat-reader-annotation-queue--log level format-string args)
+    (apply #'message format-string args)))
+
 ;;; 同步到服务端
 
 (defun seshat-reader-annotation-queue--sync-create (entry)
@@ -341,8 +372,10 @@ ENTRY 为队列中的 delete 操作 plist（含 `:id'）。删除按服务端批
                    (= status 404)))
           'ok)
          ((eql status 400)
-          (message "Seshat Reader annotation queue: 删除条目 id=%s 被服务端拒绝（HTTP 400），已从队列丢弃。"
-                   (plist-get entry :id))
+          (seshat-reader-annotation-queue--say
+           'warn
+           "Seshat Reader annotation queue: 删除条目 id=%s 被服务端拒绝（HTTP 400），已从队列丢弃。"
+           (plist-get entry :id))
           'ok)
          (t 'stop)))
     (error 'stop)))
@@ -373,8 +406,15 @@ UID 非 nil 时只同步该文档（服务端权威身份，**不是** doc-id）
 并移除的条目数，剩余数由 `seshat-reader-annotation-queue-count' 现算（含
 并发新入队的条目）。
 
-队列文件损坏等需要用户干预的问题不在此吞掉，会照常 `error' 抛出。"
-  (let ((entries (seshat-reader-annotation-queue-entries uid))
+队列文件损坏等需要用户干预的问题不在此吞掉，会照常 `error' 抛出。
+
+**输出通道**：交互调用（`called-interactively-p' 为真）时逐条 `message'
+汇报；非交互调用（定时器、`seshat-reader-annotation-queue--timer-sync'、
+其它程序的调用）静默——提示改走 `seshat-reader-annotation-queue--say'，
+项目层在场时只写 `*Seshat Log*'。"
+  (let ((seshat-reader-annotation-queue--quiet
+         (not (called-interactively-p 'interactive)))
+        (entries (seshat-reader-annotation-queue-entries uid))
         (synced 0)
         (skipped-legacy nil)
         (stopped nil))
@@ -393,19 +433,25 @@ UID 非 nil 时只同步该文档（服务端权威身份，**不是** doc-id）
           ;; 旧条目：保留在队列里，本轮不再重试；提示只发一次。
           (unless skipped-legacy
             (setq skipped-legacy t)
-            (message "Seshat Reader annotation queue: 旧队列条目缺少 uid，已跳过。")))
+            (seshat-reader-annotation-queue--say
+             'warn "Seshat Reader annotation queue: 旧队列条目缺少 uid，已跳过。")))
          (t
           (setq stopped t)))))
     (let ((remaining (seshat-reader-annotation-queue-count)))
       (cond
        ((and (zerop synced) (zerop remaining))
-        (message "Seshat Reader annotation queue: 批注队列同步：队列为空。"))
+        (seshat-reader-annotation-queue--say
+         'info "Seshat Reader annotation queue: 批注队列同步：队列为空。"))
        (stopped
-        (message "Seshat Reader annotation queue: 批注队列同步：已同步 %d 条，服务暂不可达，已保留 %d 条待下次同步。"
-                 synced remaining))
+        (seshat-reader-annotation-queue--say
+         'warn
+         "Seshat Reader annotation queue: 批注队列同步：已同步 %d 条，服务暂不可达，已保留 %d 条待下次同步。"
+         synced remaining))
        (t
-        (message "Seshat Reader annotation queue: 批注队列同步：已同步 %d 条，剩余 %d 条。"
-                 synced remaining)))
+        (seshat-reader-annotation-queue--say
+         'info
+         "Seshat Reader annotation queue: 批注队列同步：已同步 %d 条，剩余 %d 条。"
+         synced remaining)))
       (cons synced remaining))))
 
 ;;; 自动同步定时器
@@ -427,22 +473,29 @@ UID 非 nil 时只同步该文档（服务端权威身份，**不是** doc-id）
 
 仅当 `seshat-reader-annotation-queue-auto-sync' 非 nil 且队列非空时，调用
 `seshat-reader-annotation-queue-sync' 同步全部条目。本函数**永不抛错**：
-读取队列或同步过程中的任何错误都在此捕获，只 `message' 一行说明；因为
-定时器回调抛出的错误会打断后续周期，导致自动同步停摆。"
+读取队列或同步过程中的任何错误都在此捕获，只写一行提示；因为定时器回调抛出的
+错误会打断后续周期，导致自动同步停摆。
+
+提示走 `seshat-reader-annotation-queue--say' 且 `--quiet' 绑为 t（定时器
+回调不是交互调用）：项目层在场时只写 `*Seshat Log*'，不刷 echo area。"
   (when seshat-reader-annotation-queue-auto-sync
-    (condition-case nil
-        (when (> (seshat-reader-annotation-queue-count) 0)
-          (seshat-reader-annotation-queue-sync))
-      (error
-       (message "Seshat Reader annotation queue: 定时自动同步失败（本轮跳过，稍后重试）。")))))
+    (let ((seshat-reader-annotation-queue--quiet t))
+      (condition-case nil
+          (when (> (seshat-reader-annotation-queue-count) 0)
+            (seshat-reader-annotation-queue-sync))
+        (error
+         (seshat-reader-annotation-queue--say
+          'warn
+          "Seshat Reader annotation queue: 定时自动同步失败（本轮跳过，稍后重试）。"))))))
 
 (defun seshat-reader-annotation-queue-enable-timer ()
   "启用离线队列的自动同步定时器（幂等）.
 
 若 `seshat-reader-annotation-queue-auto-sync' 为 nil，则不创建任何定时器，
-只 `message' 一行说明并返回 nil。否则先取消已有的定时器（`--initial-timer'
-与 `--timer' **两个都跟踪**，故重复调用不会堆积定时器），再注册两个
-`run-with-timer' 定时器：首次同步延迟
+只写一行说明并返回 nil（交互调用时 `message'，模块加载等自动路径下改走
+`seshat-reader-annotation-queue--say'，不刷 echo area）。否则先取消已有的
+定时器（`--initial-timer' 与 `--timer' **两个都跟踪**，故重复调用不会堆积
+定时器），再注册两个 `run-with-timer' 定时器：首次同步延迟
 `seshat-reader-annotation-queue-initial-delay' 秒后触发一次，其返回值存入
 `seshat-reader-annotation-queue--initial-timer'；周期同步的延迟与间隔均取
 `seshat-reader-annotation-queue-sync-interval'，其返回值存入
@@ -460,7 +513,11 @@ UID 非 nil 时只同步该文档（服务端权威身份，**不是** doc-id）
               (run-with-timer seshat-reader-annotation-queue-sync-interval
                               seshat-reader-annotation-queue-sync-interval
                               #'seshat-reader-annotation-queue--timer-sync)))
-    (message "Seshat Reader annotation queue: 自动同步已关闭（-auto-sync 为 nil），未启用定时器。")
+    (let ((seshat-reader-annotation-queue--quiet
+           (not (called-interactively-p 'interactive))))
+      (seshat-reader-annotation-queue--say
+       'info
+       "Seshat Reader annotation queue: 自动同步已关闭（-auto-sync 为 nil），未启用定时器。"))
     nil))
 
 (defun seshat-reader-annotation-queue-disable-timer ()

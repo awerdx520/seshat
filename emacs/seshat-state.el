@@ -19,10 +19,16 @@
 ;; - `:paths'：`(ROOT . PATH)' → uid 的**派生索引**，可由 `:uids' 重建；
 ;;   持久化只是为避免每次同步都做一次 O(n) 重建，`seshat-state-load' 会校验
 ;;   它与 `:uids' 的一致性。
+;; - `:runtime'：**上次运行记录**，形状为
+;;   `(:last-sync-at UNIX秒 :last-sync-result success|failed|nil
+;;   :last-sync-error 字符串或 nil)'；nil 表示尚无记录（旧文件即如此）。
+;;   启动汇总据此报告「上次同步时间/结果」，无需探测网络。该键是**可选**
+;;   新增键，不构成格式版本升级（`:version' 仍为 1）；字段级校验留给写方，
+;;   本模块只保证「是 plist 或 nil」。
 ;;
 ;; 数据形状（顶层 plist，`prin1' 序列化）：
 ;;
-;;   (:version 1 :cursor 0 :roots (...) :uids (...) :paths (...))
+;;   (:version 1 :cursor 0 :roots (...) :uids (...) :paths (...) :runtime ...)
 ;;
 ;; 三条组合语义（改动本模块时必须保持）：
 ;;
@@ -79,12 +85,13 @@
 
 (defun seshat-state--empty ()
   "返回空状态 plist.
-形状为 `(:version 1 :cursor 0 :roots nil :uids nil :paths nil)'。"
+形状为 `(:version 1 :cursor 0 :roots nil :uids nil :paths nil :runtime nil)'。"
   (list :version seshat-state-version
         :cursor 0
         :roots nil
         :uids nil
-        :paths nil))
+        :paths nil
+        :runtime nil))
 
 (defun seshat-state--empty-entry ()
   "返回字段齐备的空条目 plist（八个字段全为 nil）。"
@@ -162,12 +169,18 @@ nil。ENTRY 为 nil 时得到字段齐备的空条目。"
 其余取 nil）；`:cursor' 非非负整数时置 0；`:uids' 中键不是字符串或值不是
 plist 的元素丢弃，其余条目逐字段归一化；`:roots' 中非三元的元素丢弃；
 `:paths' **原样保留**——它与 `:uids' 的一致性由
-`seshat-state--rebuild-paths' 在 `seshat-state-load' 时校验。"
+`seshat-state--rebuild-paths' 在 `seshat-state-load' 时校验；`:runtime'
+不是 plist（首元素非 keyword，含 nil、字符串、数字）时置 nil，合法 plist
+**原样保留**（不做字段级清洗，字段增删由写方负责）。
+
+新增键一律**追加**在末尾且缺省为 nil，因此旧文件（无 `:runtime'）加载后
+只是取到 nil，不会被判为损坏，`:version' 也不因此升级。"
   (if (not (keywordp (car-safe state)))
       (seshat-state--empty)
     (let ((cursor (plist-get state :cursor))
           (raw-uids (plist-get state :uids))
           (raw-paths (plist-get state :paths))
+          (raw-runtime (plist-get state :runtime))
           (uids nil))
       (dolist (cell (and (listp raw-uids) raw-uids))
         (when (and (consp cell) (stringp (car cell)) (listp (cdr cell)))
@@ -176,13 +189,19 @@ plist 的元素丢弃，其余条目逐字段归一化；`:roots' 中非三元�
             :cursor (if (and (integerp cursor) (>= cursor 0)) cursor 0)
             :roots (seshat-state--normalize-roots (plist-get state :roots))
             :uids (nreverse uids)
-            :paths (and (listp raw-paths) raw-paths)))))
+            :paths (and (listp raw-paths) raw-paths)
+            :runtime (and (keywordp (car-safe raw-runtime)) raw-runtime)))))
 
 (defun seshat-state--rebuild-paths (state)
   "返回把 STATE 的 `:paths' 依 `:uids' 重建后的新状态（纯函数）.
 只为 `:path' 非 nil、且**无** `:orphan'、**无** `:deleted-at' 的条目建索引
 （墓碑不占本地路径，孤儿没有本地路径）；同一 `(ROOT . PATH)' 出现多次时保留
-`:uids' 中靠前的条目。索引顺序与 `:uids' 顺序一致，便于与磁盘内容逐项比较。"
+`:uids' 中靠前的条目。索引顺序与 `:uids' 顺序一致，便于与磁盘内容逐项比较。
+
+**活性判据一律走 `seshat-state--entry-active-p'**，不在本函数内联那三个条件：
+「活条目」的定义只允许有一处实现，否则改动判据时会出现「索引、反查、书架清单
+各说一套」的漂移。本函数定义在 `seshat-state--entry-active-p' 之前，Elisp 在
+运行时解析函数名，因此前置引用没有问题（同文件内的定义顺序不影响调用）。"
   (let ((state (seshat-state--normalize state))
         (seen (make-hash-table :test #'equal))
         (paths nil))
@@ -191,9 +210,7 @@ plist 的元素丢弃，其余条目逐字段归一化；`:roots' 中非三元�
              (entry (cdr cell))
              (root (plist-get entry :root))
              (path (plist-get entry :path)))
-        (when (and path
-                   (not (plist-get entry :orphan))
-                   (not (plist-get entry :deleted-at)))
+        (when (seshat-state--entry-active-p entry)
           (let ((key (cons root path)))
             (unless (gethash key seen)
               (puthash key uid seen)
@@ -403,6 +420,42 @@ UID 未登记时以空条目为起点（不 `error'：调用方常先记 base-bl
     (setq seshat-state--state (seshat-state--put-entry state uid new))
     new))
 
+;;; 条目活性与公开枚举（离线书架用）
+
+(defun seshat-state--entry-active-p (entry)
+  "判断条目 ENTRY 是否占有一个**有效的本地位置**.
+判据三条同时成立：`:path' 非 nil、**无** `:orphan'、**无** `:deleted-at'。
+这是「活条目」的唯一定义，`seshat-state-path-for-uid'、
+`seshat-state--rebuild-paths' 与 `seshat-state-entries' 三处必须口径一致；
+改动任一处时须同步其余两处（否则索引、反查与书架清单会各说一套）。"
+  (and (plist-get entry :path)
+       (not (plist-get entry :orphan))
+       (not (plist-get entry :deleted-at))))
+
+(defun seshat-state-entries (&optional include-inactive)
+  "返回状态库中全部 `(UID . ENTRY)' 的列表，顺序与 `:uids' 完全一致.
+
+INCLUDE-INACTIVE 为 nil（默认）时只返回**活条目**——即 `:path' 非 nil 且无
+`:orphan' 且无 `:deleted-at'（判据见 `seshat-state--entry-active-p'，与
+`seshat-state-path-for-uid' / `seshat-state--rebuild-paths' 同口径）；非 nil
+时返回 `:uids' 中的全部条目（含墓碑与孤儿）。过滤走
+`seshat-state--uids-where'，因此过滤口径只有一处实现。
+
+返回的 ENTRY 是状态库内部条目 plist 的**引用**（不做深拷贝，也不重排顺序，
+省掉书架刷新时对数千条目的复制开销）：**调用方不得就地修改返回的 plist**，
+需要改条目请走 `seshat-state-set' / `seshat-state-remap' 等写入接口。
+
+本函数零网络、零磁盘 IO（首次调用会惰性 `seshat-state-load'），供离线书架
+在不探测服务端的前提下取清单。"
+  (let ((table (make-hash-table :test #'equal)))
+    (dolist (cell (plist-get (seshat-state--ensure) :uids))
+      (puthash (car cell) (cdr cell) table))
+    (mapcar (lambda (uid) (cons uid (gethash uid table)))
+            (seshat-state--uids-where
+             (if include-inactive
+                 (lambda (_entry) t)
+               #'seshat-state--entry-active-p)))))
+
 ;;; 复合键（root . path）双向查找
 
 (defun seshat-state-uid-for-path (root path)
@@ -415,13 +468,10 @@ UID 未登记时以空条目为起点（不 `error'：调用方常先记 base-bl
 (defun seshat-state-path-for-uid (uid)
   "返回 UID 当前占用的 `(ROOT . PATH)'；无有效路径时返回 nil.
 「无有效路径」指：UID 未登记、`:path' 为 nil、条目带 `:orphan'、条目带
-`:deleted-at'（与 `:paths' 索引口径一致，保证与 `seshat-state-uid-for-path'
-互为反函数）。"
+`:deleted-at'（判据见 `seshat-state--entry-active-p'，与 `:paths' 索引口径
+一致，保证与 `seshat-state-uid-for-path' 互为反函数）。"
   (let ((entry (seshat-state-get uid)))
-    (when (and entry
-               (plist-get entry :path)
-               (not (plist-get entry :orphan))
-               (not (plist-get entry :deleted-at)))
+    (when (seshat-state--entry-active-p entry)
       (cons (plist-get entry :root) (plist-get entry :path)))))
 
 (defun seshat-state-remap (uid root new-path)
@@ -473,6 +523,33 @@ UID 未登记时以空条目为起点（不 `error'：调用方常先记 base-bl
     (error "Seshat state: 游标必须是非负整数：%S" seq))
   (setq seshat-state--state (seshat-state--put (seshat-state--ensure) :cursor seq))
   seq)
+
+;;; 上次运行记录（:runtime）
+
+(defun seshat-state-runtime ()
+  "返回「上次运行」记录 plist；从未记录（含旧文件无 `:runtime' 键）时返回 nil.
+
+结构约定：`(:last-sync-at UNIX秒 :last-sync-result success|failed|nil
+:last-sync-error 字符串或 nil)'。字段可缺省，读方须用 `plist-get' 逐个取值，
+**不要**假设字段全集（将来会加字段）。启动汇总据此报告上次同步时间与结果，
+因此无需在启动时探测网络。"
+  (plist-get (seshat-state--ensure) :runtime))
+
+(defun seshat-state-set-runtime (plist)
+  "写入「上次运行」记录 PLIST，返回归一化后的记录值.
+
+PLIST 的约定结构见 `seshat-state-runtime'。本函数**不**逐字段校验（字段名与
+取值由写方负责，将来会加字段），只校验整体形状：必须是 plist（首元素为
+keyword）或 nil；nil 表示清空记录。不是 plist（字符串、数字、首元素非
+keyword 的列表、向量等）时 `error'——这是编程错误，不是用户输入。
+
+只改内存状态，**不落盘**：调用方负责在合适的时机调 `seshat-state-save'
+（例如同步收尾一次写入，避免每次同步都多一次原子写）。"
+  (unless (or (null plist) (keywordp (car-safe plist)))
+    (error "Seshat state: 运行记录必须是 plist 或 nil：%S" plist))
+  (setq seshat-state--state
+        (seshat-state--put (seshat-state--ensure) :runtime plist))
+  (seshat-state-runtime))
 
 ;;; 根映射
 

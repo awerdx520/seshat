@@ -107,6 +107,8 @@ M0–M6 已完成并归档，见 `openspec/completed/personal-notes-system.md`�
 | M8.5 | **已完成（2026-10-26）**：`seshat:` org-link follow（uid → 本地路径），新增 `seshat:uid:<uid>` 形态并全部插入路径统一 | 低 |
 | M8.6 | **已完成（2026-10-26，L3 人工清单待验）**：透明性验证：denote/dired/org-agenda 行为零变化（9 例白名单式反向断言） | 高（零侵入约束） |
 
+**计划 D（离线优先书架，已完成并归档，2026-10-29）**，见 `openspec/completed/2026-10-29-emacs-offline-library.md`（T1–T4 / T5a / T5b / T6–T9 共 **10** 项全 `[x]`）：书架清单主源由远端 REST 改为**本地状态库**（`seshat-state-entries` 读 `:uids` 索引，零网络 ⇒ **断网可用**），远端清单降级为 `g` 显式刷新并落盘 `library-cache.eld`；UI 由 `tabulated-list` 改为**自建 buffer**（行内封面 + 显式分页 30 条/页 + 15 键位 + 批量删 + dired 定位，**不使用 ETAF**）；新增 4 个顶层模块 `seshat-log`（分级日志 + 静默 + `*Seshat Log*`）/ `seshat-reads`（本地阅读进度侧车）/ `seshat-covers`（封面三级回退 + 磁盘缓存）/ `seshat-status`（启动一次汇总 + `*Seshat Status*`）；自动路径全部静默进日志、启动一次性提醒，同步收尾写状态库 `:runtime`。L1 全绿（`check-parens` + 字节编译 0 warning）；L2 `make -C emacs/tests ert` → **FILES=47 TOTAL=1568 UNEXPECTED=0**（基线 42 文件 / 1403 例）；**L3 待人工**（断网真机：离线列书 / 封面回退 / `RET` 打开 / 进度显示 / `d`·`x` 删本地 / 翻页 / 启动提醒 / `*Seshat Log*` 无 echo 刷屏）。
+
 ### M9 Android 客户端重构
 
 | 子项 | 内容 |

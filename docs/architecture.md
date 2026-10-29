@@ -70,8 +70,8 @@ M8-C 在 M8-A/M8-B 之上新增**一层**：`emacs/seshat-library.el`（项目�
 
 | 层 | 文件 | 职责 |
 |---|---|---|
-| 数据层 | `emacs/seshat-library.el`（`seshat-library--roots` / `--remote-entries` / `--local-state` / `seshat-library-fetch`） | 读远端 `ondemand` 根清单（`:since-mtime` 翻页）、判本地三态、按需取书（六步事务，见 [`docs/emacs-reader.md`](emacs-reader.md)「书架：按需取书」） |
-| UI 层 | 同一文件的 `seshat-library-mode`（`tabulated-list-mode` 派生）+ `seshat-library` / `-open-at-point` / `-refresh-at-point` / `-delete-local-at-point` | 书架 buffer `*Seshat Library*`：四列（书名 / 根 / 大小 / 状态）、`RET` / `u` / `d` / `g` / `q` 五键 |
+| 数据层 | `emacs/seshat-library.el`（`seshat-library--entries-local` / `--entries-cached` / `--entries-merge` / `--state-for` / `seshat-library-fetch`） | **本地状态库为主源 + 远端缓存增强**：`seshat-state-entries` 枚举书目（零网络）、`library-cache.eld` 补远端清单、D1 策略合并（以状态库为准，缓存独有项以 `unregistered` 出现）、按需取书（六步事务，见 [`docs/emacs-reader.md`](emacs-reader.md)「书架（离线优先）」） |
+| UI 层 | 同一文件的 `seshat-library-mode`（**自建 `special-mode` buffer + 显式分页**）+ `seshat-library` / `-open-at-point` / `-refresh-at-point` / `-refresh-remote` / `-delete-local-at-point` / `-delete-marked` / `-toggle-mark` / `-dired-at-point` / `-next-page` / `-previous-page` / `-first-page` / `-last-page` / `-filter-keyword` / `-filter-state` / `-sort-cycle` | 书架 buffer `*Seshat Library*`：一条目一行 = 行首标记 + 行内封面 image（固定像素高）+ 书名 · 根 · 大小 · 进度 · 待同步 · 状态；只渲染当前页（`seshat-library-page-size`，默认 30）；**15 键位**（`RET` / `u` / `d` / `x` / `m` / `D` / `n` / `p` / `M-<` / `M->` / `g` / `/` / `F` / `s` / `q`） |
 
 **依赖方向（单向，无环）**：
 
@@ -87,11 +87,53 @@ M8-C 在 M8-A/M8-B 之上新增**一层**：`emacs/seshat-library.el`（项目�
 
 **三条不变量**：
 
-1. **`d`（删本地副本）零网络**：只用 buffer-local 缓存的清单重算状态列（`seshat-library--redisplay`），不走 `tabulated-list-revert`（那条路挂着「重拉远端清单」）。远端文件一律保留。
+1. **`d`（删本地副本）零网络**：只用 buffer-local 缓存的清单重算状态列并重绘该行（`seshat-library--refresh-item-state` / `seshat-library--redraw-line`），不走「重拉远端清单」那条路。远端文件一律保留。
 2. **所有落盘路径都过 `seshat-sync--local-path`**：服务端下发的相对路径不可信（拒绝 `..`、绝对路径、盘符、`~`、符号链接逃逸），取书与删本地副本共用这一处校验，不自行拼路径字符串。
 3. **`ondemand` 根绝不写远端**：`seshat-library` 只发 `GET`；服务端对书库根的写入本就 `403 root_read_only`，客户端不制造撞墙的机会。
 
 **为什么书架读的是状态库而不是配置变量**：`seshat-library--roots` 从 `seshat-state-roots`（状态库里的根映射）筛 `MODE` 为 `ondemand` 的根——与同步引擎同源，避免「书架认一套根、同步认另一套」。代价是**首次使用前必须先跑过一次同步**（`M-x seshat-sync-now` 把 `seshat-sync-roots` 写入状态库），改配置后需 `M-x seshat-sync-reset-roots`。
+
+## 书架离线层（2026-10-29）
+
+2026-10-29 一轮把书架从「打开即拉远端清单」改为**离线优先**：主源换成本地状态库，远端降级为可选增强 + 落盘缓存，UI 从列式表格（内置表格库）改为自建 `special-mode` buffer + 显式分页。动机与备选方案见 [`docs/adr/0006-offline-first-library.md`](adr/0006-offline-first-library.md)。
+
+**分层与职责**：
+
+| 模块 | 职责 | 依赖 |
+|---|---|---|
+| `emacs/seshat-log.el` | 分级日志（`seshat-log`）+ `*Seshat Log*` ring（`seshat-log-max-lines` 默认 2000 行，超出从头部裁剪）+ 静默层（`seshat-log-quiet`：自动路径不写 echo，`error` 级例外） | 零依赖 |
+| `emacs/seshat-state.el` | 状态库：uid → `(root . path)` 登记、根映射、墓碑 / 孤儿、`seshat-state-entries`（只含活条目） | 基础设施层 |
+| `emacs/seshat-reads.el` | 阅读进度侧车 `reads.eld`（`seshat-reads-get` / `-record` / `-percent`），落盘去抖 `seshat-reads-debounce` | 纯本地文件系统 |
+| `emacs/seshat-covers.el` | 封面三级回退（EPUB `unzip` → PDF `mutool` → 占位）+ 缓存目录 + 负缓存 + idle 串行队列 | 纯本地文件系统（**禁止 require `seshat-rest`**） |
+| `emacs/seshat-library.el` | 书架数据层 + UI：三层取数、D1 合并、过滤 / 排序 / 分页（纯函数）、封面驻留管理、15 键位 | `state` / `reads` / `covers` / `log` / `rest` / `sync`；软依赖 `seshat-reading`、`seshat-reader-annotation-queue` |
+| `emacs/seshat-status.el` | 启动后一次汇总（`seshat-status-startup-notify` / `-startup-delay`）+ 详情 buffer `*Seshat Status*` | `state` / `reads` / queue / `log`；**禁止 require `seshat-rest`**（可达性只读状态库 `:runtime`，启动不探测网络） |
+
+**依赖方向（与实现一致，单向无环）**：
+
+| 依赖 | 内容 |
+|---|---|
+| 所有模块 → `seshat-log` | 日志是叶子，谁都可以 require 它 |
+| `seshat-library` → `seshat-state` / `seshat-reads` / `seshat-covers` / `seshat-log` / `seshat-rest` / `seshat-sync` | 数据层拿本地事实 + 取书；封面与进度是纯本地只读依赖 |
+| `seshat-status` → `seshat-state` / `seshat-reads` / `seshat-reader-annotation-queue` / `seshat-log` | 汇总只读本地事实，**不** require `seshat-rest` |
+| `seshat-library` ⇢ `seshat-reading` / `seshat-reader-annotation-queue` | **软依赖**（`require … nil t` + `fboundp`）：缺失时 `RET` 退化为 `find-file`、「待同步」段省略 |
+| `seshat-reader/**` ⇢ `seshat-library` | 仍**禁止反向 require**（vendored 包），取书一律 `fboundp` + `declare-function` |
+
+**三条机械不变量**（都可在 ERT 里判定，不靠人工约定）：
+
+| 不变量 | 断言内容 | 守护点 |
+|---|---|---|
+| **I-OOM** | 任一时刻驻留（已构造、未 flush）的 image 个数 ≤ `seshat-library-page-size`；对**非当前页**条目的封面文件 / 文档解析次数为 0 | 唯一构造点 `seshat-library--make-cover-image` + 驻留表 `seshat-library--resident`（buffer-local）+ `--render` 只插当前页、插入前释放离开页 |
+| **I-NONET** | 打开 / 翻页 / 过滤 / 排序 / 删本地 / 批量删 / 标记 / `D` / 启动汇总 / 进度侧车只读路径 / 封面只读路径 / 日志：**零网络** | 三层网络入口全部桩成 `error`（见下） |
+| **I-READONLY** | `ondemand` 根**不发写请求**；所有落盘路径过 `seshat-sync--local-path` | 根归属门 `seshat-library--ondemand-root-p` + 取书事务的越界校验；服务端侧本就 `403 root_read_only` |
+
+**网络三层（为什么必须三层全钉）**：清单请求走的是 `seshat-rest-list-resources`，它**直连** `seshat-transport-request`（要拿响应头做 `:since-mtime` 翻页），**不经**薄包装 `seshat-rest--request`。因此只桩薄包装会漏掉真正的清单路径。`seshat-offline-invariant-test.el` 把 `seshat-rest--request` / `seshat-transport-request` / `url-retrieve-synchronously` **三层都绑成抛错函数**，再跑书架全链路；另有一个自检用例证明「`g` 在同样的桩下必须失败」——否则那些 I-NONET 用例可能只是「根本没走到网络」的假绿。
+
+**反假绿设计（重点，为什么这么切）**：
+
+- `seshat-library--make-cover-image` 是**唯一** image 构造点，且函数体**不含** `display-graphic-p`——`create-image` 在 `emacs --batch` 下是安全的，构造与「能否显示」是两件事。有专门用例按函数体文本断言这一点（`seshat-library-make-cover-image-has-no-display-graphic-p`）。
+- `seshat-library--insert-cover` 是**唯一**显示检查点，且 `display-graphic-p` 判断**在构造之前**。顺序不能反：若先构造再判断「不显示」，看不见的 image 会白占驻留预算（I-OOM 的「驻留 ≤ 一页」随之失去意义）；若把判断挪进 `--make-cover-image`，测试桩 `display-graphic-p` 为 `t` 之后**正断言 P 依然成立**——自检失效。
+- 正断言 **P**：桩 `display-graphic-p` 为 `t` 后断言「`--make-cover-image` 实际构造次数 > 0 **且** == 当前页『有封面可用』的条目数」，再叠加三条守恒式（构造 + 复用 == 需要封面的条目数、释放数 == 离开页驻留数、驻留数 ≤ 页大小）与三个场景（首屏 / 翻页 / 重渲染）。**去桩后 P 必须失败**（`i-oom-selfcheck-no-graphic-stub` 用例专门断言批处理下构造次数为 0）。
+- 桩的边界：桩 `seshat-library--make-cover-image` 与 `image-flush`，**不桩** `create-image`（它是被测对象的下游）；去重逻辑在 `seshat-library--register-cover` 里，故另有用例让真 `--make-cover-image` 跑起来测去重。
 
 ## `seshat:` 引用协议（M11.4）
 

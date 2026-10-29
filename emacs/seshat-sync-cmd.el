@@ -33,6 +33,15 @@
 ;;           M-x seshat-sync-disable-timer 停用。定时器对象记录在
 ;;           `seshat-sync-cmd--timer' 中，重复启用不会创建多个定时器。
 ;;
+;; **输出通道（静默化）**：用户显式 `M-x seshat-sync-now' 时逐条 `message'
+;; 汇报进度；定时器调用时传 QUIET 非 nil，所有提示改走 `seshat-log'
+;; （只进 `*Seshat Log*'，不刷 echo area）。两栖判定由 `seshat-sync-now' 自己
+;; 完成：`called-interactively-p' 为真时强制 QUIET 为 nil，用户主动操作永远
+;; 有反馈。每轮同步的结论（成功 / 失败 + 错误摘要）由
+;; `seshat-sync-cmd--record-runtime' 写入状态库 `:runtime'，供
+;; `seshat-status' 在启动后一次性汇总——自动路径的「不刷屏」与「故障可见」
+;; 靠这两条互补实现。
+;;
 ;; 使用前需先配置 `seshat-sync-server-url'、`seshat-sync-username'、
 ;; `seshat-sync-token'、`seshat-sync-local-dir'、`seshat-sync-remote-dir'
 ;; （见 seshat-sync.el），以及 `seshat-rest-base-url'、`seshat-rest-token'
@@ -43,6 +52,7 @@
 (require 'seshat-sync)
 (require 'seshat-rest)
 (require 'seshat-conflict)
+(require 'seshat-log)
 (require 'subr-x)
 (require 'url-util)
 
@@ -102,41 +112,79 @@ REL 为已按百分号解码的相对路径。返回规范化后的相对路径�
 ;;
 ;; 引擎层（`seshat-sync'）返回统计 plist 且不发 message，汇报统一在本层做，
 ;; 沿用 M8 之前「每步一行 message + 末行摘要」的观感。
+;;
+;; 静默化：所有汇报都带可选参数 QUIET。QUIET 非 nil 时改走 `seshat-log'
+;; （只进 `*Seshat Log*'），供定时器等自动路径使用；nil 时保持原有 message
+;; 行为，供用户显式命令使用。
 
-(defun seshat-sync-cmd--report-pull (stats)
+(defun seshat-sync-cmd--say (quiet level format-string &rest args)
+  "按 QUIET 选择输出通道：非 nil 走 `seshat-log'，否则 `message'.
+LEVEL 是 `seshat-log' 的级别（`debug' / `info' / `warn' / `error'）。
+自动路径传 QUIET 非 nil，避免刷 echo area；交互路径传 nil，保持原观感。"
+  (if quiet
+      (apply #'seshat-log level format-string args)
+    (apply #'message format-string args)))
+
+(defun seshat-sync-cmd--report-pull (stats &optional quiet)
   "汇报拉取统计 STATS（`seshat-sync-pull' 的返回值）并原样返回。
-首同步与增量共用一行格式，只切换前缀。
+首同步与增量共用一行格式，只切换前缀。QUIET 非 nil 时改走 `seshat-log'。
 
 `:configured' 为 nil 表示根映射不可用（未配置 `seshat-sync-roots' 或其中没有
 有效项），此时 `seshat-sync-pull' 直接返回、什么都没拉——汇报成「拉取完成
 （0 批 / 0 个事件）」会误导用户，故改报未配置并给出配置提示。"
   (if (null (plist-get stats :configured))
-      (message "seshat-sync: 未配置 `seshat-sync-roots'，本次跳过同步（请先配置根映射）")
+      (seshat-sync-cmd--say
+       quiet 'warn
+       "seshat-sync: 未配置 `seshat-sync-roots'，本次跳过同步（请先配置根映射）")
     (let* ((changes (plist-get stats :changes))
            (batches (or (plist-get changes :batches) 0))
            (events (or (plist-get changes :events) 0)))
-      (message "seshat-sync: %s完成（%d 批 / %d 个事件）"
-               (if (plist-get stats :first-sync) "首同步" "拉取")
-               batches events)))
+      (seshat-sync-cmd--say quiet 'info
+                            "seshat-sync: %s完成（%d 批 / %d 个事件）"
+                            (if (plist-get stats :first-sync) "首同步" "拉取")
+                            batches events)))
   stats)
 
-(defun seshat-sync-cmd--report-renames (stats)
-  "汇报改名 / 本地改动检测统计 STATS（`seshat-sync-detect-renames' 的返回值）."
-  (message "seshat-sync: 改名检测完成（标脏 %d，改名 %d，冲突 %d，失败 %d）"
-           (or (plist-get stats :dirty-marked) 0)
-           (or (plist-get stats :renamed) 0)
-           (or (plist-get stats :conflict) 0)
-           (or (plist-get stats :failed) 0))
+(defun seshat-sync-cmd--report-renames (stats &optional quiet)
+  "汇报改名 / 本地改动检测统计 STATS（`seshat-sync-detect-renames' 的返回值）.
+QUIET 非 nil 时改走 `seshat-log'。"
+  (seshat-sync-cmd--say quiet 'info
+                        "seshat-sync: 改名检测完成（标脏 %d，改名 %d，冲突 %d，失败 %d）"
+                        (or (plist-get stats :dirty-marked) 0)
+                        (or (plist-get stats :renamed) 0)
+                        (or (plist-get stats :conflict) 0)
+                        (or (plist-get stats :failed) 0))
   stats)
 
-(defun seshat-sync-cmd--report-push (stats)
-  "汇报推送统计 STATS（`seshat-sync-push' 的返回值）."
-  (message "seshat-sync: 推送完成（成功 %d，冲突 %d，跳过 %d，失败 %d）"
-           (or (plist-get stats :pushed) 0)
-           (or (plist-get stats :conflicted) 0)
-           (or (plist-get stats :skipped) 0)
-           (or (plist-get stats :failed) 0))
+(defun seshat-sync-cmd--report-push (stats &optional quiet)
+  "汇报推送统计 STATS（`seshat-sync-push' 的返回值）.
+QUIET 非 nil 时改走 `seshat-log'。"
+  (seshat-sync-cmd--say quiet 'info
+                        "seshat-sync: 推送完成（成功 %d，冲突 %d，跳过 %d，失败 %d）"
+                        (or (plist-get stats :pushed) 0)
+                        (or (plist-get stats :conflicted) 0)
+                        (or (plist-get stats :skipped) 0)
+                        (or (plist-get stats :failed) 0))
   stats)
+
+(defun seshat-sync-cmd--record-runtime (result &optional error)
+  "把本次同步结论 RESULT（`success' / `failed'）与 ERROR 摘要写入状态库并落盘.
+写的是 `:runtime' 的 `(:last-sync-at (float-time) :last-sync-result RESULT
+:last-sync-error ERROR)'，供 `seshat-status' 在启动后一次性汇总「上次同步」
+（零网络）。
+
+**绝不抛错**：写状态或落盘失败只 `seshat-log' 记一条 warn 并返回 nil——
+「记录同步结论失败」不能反过来影响同步结果本身。恒返回 nil。"
+  (condition-case err
+      (progn
+        (seshat-state-set-runtime
+         (list :last-sync-at (float-time)
+               :last-sync-result result
+               :last-sync-error error))
+        (seshat-state-save))
+    (error
+     (seshat-log 'warn "记录同步运行状态失败：%s" (error-message-string err))))
+  nil)
 
 (defun seshat-sync-cmd--outcome (value keys)
   "把一步的结果 VALUE 渲染成摘要用的短字符串。
@@ -210,7 +258,7 @@ rename，再做条件写推送。M8 起走 REST 增量引擎；旧的 WebDAV 全
   (seshat-sync-cmd--report-renames (seshat-sync-detect-renames))
   (seshat-sync-cmd--report-push (seshat-sync-push)))
 
-(defun seshat-sync-status ()
+(defun seshat-sync-status (&optional quiet)
   "同步阅读进度状态（MVP：仅拉取，暂不自动推送批注）。
 遍历本地笔记目录下的 .org 文件，按状态库登记的 uid（服务端权威文档标识，
 经 `seshat-sync-cmd--uid-for-file' 用根 tag + 根内相对路径解析）调用
@@ -218,7 +266,10 @@ rename，再做条件写推送。M8 起走 REST 增量引擎；旧的 WebDAV 全
 
 未登记的文件（本地新文件，尚未经 `seshat-sync-now' 建立 uid）跳过并提示；
 `seshat-sync-status' 曾在 M8 之前把相对路径当 uid 传（既有 bug，已修）。返回
-有进度的文档数。"
+有进度的文档数。
+
+QUIET 非 nil 时所有提示改走 `seshat-log'（`seshat-sync-now' 在定时器路径下
+就以此方式调用它，避免逐个文件刷 echo area）。"
   (interactive)
   (let* ((local-dir (file-name-as-directory
                      (expand-file-name seshat-sync-local-dir)))
@@ -231,8 +282,9 @@ rename，再做条件写推送。M8 起走 REST 增量引擎；旧的 WebDAV 全
         (let ((uid (seshat-sync-cmd--uid-for-file file)))
           (cond
            ((null uid)
-            (message "seshat-sync: %s 未登记，先运行 `seshat-sync-now'"
-                     (file-relative-name file local-dir)))
+            (seshat-sync-cmd--say
+             quiet 'info "seshat-sync: %s 未登记，先运行 `seshat-sync-now'"
+             (file-relative-name file local-dir)))
            (t
             (let ((progress (seshat-rest-get-progress uid)))
               (when progress
@@ -242,12 +294,13 @@ rename，再做条件写推送。M8 起走 REST 增量引擎；旧的 WebDAV 全
                         (format "%s（%s）@ %s"
                                 uid (file-relative-name file local-dir)
                                 (or (cdr (assq 'position progress)) "?")))))))))))
-    (message "seshat-sync: 阅读进度同步（拉取）完成，%d/%d 个文档有进度%s"
-             found total
-             (if sample (format "，示例：%s" sample) ""))
+    (seshat-sync-cmd--say
+     quiet 'info "seshat-sync: 阅读进度同步（拉取）完成，%d/%d 个文档有进度%s"
+     found total
+     (if sample (format "，示例：%s" sample) ""))
     found))
 
-(defun seshat-sync-now ()
+(defun seshat-sync-now (&optional quiet)
   "立即执行一次完整同步：拉取 → 改名检测 → 推送 → 状态。
 依次调用 `seshat-sync-pull'、`seshat-sync-detect-renames'、`seshat-sync-push'
 与 `seshat-sync-status'（M8 起走 REST 增量引擎）。**顺序不可调换**：rename 产生
@@ -260,47 +313,77 @@ rename，再做条件写推送。M8 起走 REST 增量引擎；旧的 WebDAV 全
 \(拉取 改名 推送 状态) 列表，各元素为该步的统计（plist 或计数）或符号
 `error'（该步失败）。
 
+QUIET 非 nil 时所有提示改走 `seshat-log'（只进 `*Seshat Log*'），供定时器
+等自动路径使用；`called-interactively-p' 为真时**强制**按非 QUIET 处理，
+防止外部误传 QUIET 吞掉用户主动操作的反馈。
+
+**运行结论落盘**：无论成功、某步失败还是未配置根映射，收尾都经
+`seshat-sync-cmd--record-runtime' 把 `success' / `failed' 与错误摘要写进
+状态库 `:runtime'（`seshat-status' 启动汇总的数据来源）。落盘失败只记日志，
+不影响返回值。
+
 **未配置根映射时短路**：`seshat-sync-pull' 的返回里 `:configured' 为 nil 表示
 状态库没有根映射（未配置 `seshat-sync-roots'，或其中的项全部无效）。此时拉取
 什么都没做，改名检测与推送也只能在空集上空转、状态同步无 uid 可用——本函数
 仅提示一条说明便返回 `(unconfigured)'，不再调用后三步，也不打印「同步完成」
 摘要（那会让用户误以为同步已成功跑过一轮）。"
   (interactive)
-  (message "seshat-sync: 开始同步…")
-  (let ((pull (condition-case err
-                  (seshat-sync-cmd--report-pull (seshat-sync-pull))
-                (error
-                 (message "seshat-sync: 拉取失败：%s" (error-message-string err))
-                 'error))))
+  (setq quiet (and quiet (not (called-interactively-p 'interactive))))
+  (seshat-sync-cmd--say quiet 'info "seshat-sync: 开始同步…")
+  (let* ((errors nil)
+         (pull (condition-case err
+                   (seshat-sync-cmd--report-pull (seshat-sync-pull) quiet)
+                 (error
+                  (let ((text (error-message-string err)))
+                    (push (format "拉取失败：%s" text) errors)
+                    (seshat-sync-cmd--say quiet 'warn
+                                          "seshat-sync: 拉取失败：%s" text))
+                  'error))))
     (if (and (consp pull) (null (plist-get pull :configured)))
         (progn
-          (message (concat "seshat-sync: 本次同步跳过（未配置 `seshat-sync-roots'，"
-                           "请先配置根映射；配置后运行 M-x seshat-sync-reset-roots "
-                           "或再运行一次本命令）"))
+          (seshat-sync-cmd--say
+           quiet 'warn
+           (concat "seshat-sync: 本次同步跳过（未配置 `seshat-sync-roots'，"
+                   "请先配置根映射；配置后运行 M-x seshat-sync-reset-roots "
+                   "或再运行一次本命令）"))
+          (seshat-sync-cmd--record-runtime
+           'failed "未配置 `seshat-sync-roots'，本次同步跳过")
           (list 'unconfigured))
       (let ((renames (condition-case err
                          (seshat-sync-cmd--report-renames
-                          (seshat-sync-detect-renames))
+                          (seshat-sync-detect-renames) quiet)
                        (error
-                        (message "seshat-sync: 改名检测失败：%s"
-                                 (error-message-string err))
+                        (let ((text (error-message-string err)))
+                          (push (format "改名检测失败：%s" text) errors)
+                          (seshat-sync-cmd--say quiet 'warn
+                                                "seshat-sync: 改名检测失败：%s" text))
                         'error)))
             (push (condition-case err
-                      (seshat-sync-cmd--report-push (seshat-sync-push))
+                      (seshat-sync-cmd--report-push (seshat-sync-push) quiet)
                     (error
-                     (message "seshat-sync: 推送失败：%s" (error-message-string err))
+                     (let ((text (error-message-string err)))
+                       (push (format "推送失败：%s" text) errors)
+                       (seshat-sync-cmd--say quiet 'warn
+                                             "seshat-sync: 推送失败：%s" text))
                      'error)))
             (status (condition-case err
-                        (seshat-sync-status)
+                        (seshat-sync-status quiet)
                       (error
-                       (message "seshat-sync: 状态同步失败：%s"
-                                (error-message-string err))
+                       (let ((text (error-message-string err)))
+                         (push (format "状态同步失败：%s" text) errors)
+                         (seshat-sync-cmd--say quiet 'warn
+                                               "seshat-sync: 状态同步失败：%s" text))
                        'error))))
-        (message "seshat-sync: 同步完成（拉取 %s，改名 %s，推送 %s，状态 %s）"
-                 (seshat-sync-cmd--outcome pull '(:changes :events))
-                 (seshat-sync-cmd--outcome renames '(:renamed))
-                 (seshat-sync-cmd--outcome push '(:pushed))
-                 (seshat-sync-cmd--outcome status nil))
+        (seshat-sync-cmd--say
+         quiet (if errors 'warn 'info)
+         "seshat-sync: 同步完成（拉取 %s，改名 %s，推送 %s，状态 %s）"
+         (seshat-sync-cmd--outcome pull '(:changes :events))
+         (seshat-sync-cmd--outcome renames '(:renamed))
+         (seshat-sync-cmd--outcome push '(:pushed))
+         (seshat-sync-cmd--outcome status nil))
+        (seshat-sync-cmd--record-runtime
+         (if errors 'failed 'success)
+         (when errors (string-join (nreverse errors) "；")))
         (list pull renames push status)))))
 
 (defun seshat-sync-reset-roots ()
@@ -336,14 +419,16 @@ rename，再做条件写推送。M8 起走 REST 增量引擎；旧的 WebDAV 全
 
 (defun seshat-sync-enable-timer ()
   "启用周期性同步定时器。
-每隔 `seshat-sync-interval' 秒调用一次 `seshat-sync-now'；定时器对象记录在
-`seshat-sync-cmd--timer'。幂等：已存在运行中的定时器时不重复创建，仅提示。
+每隔 `seshat-sync-interval' 秒调用一次 `seshat-sync-now'（**带 QUIET 非 nil**：
+定时同步属自动路径，提示只进 `*Seshat Log*'，不刷 echo area）；定时器对象记录
+在 `seshat-sync-cmd--timer'。幂等：已存在运行中的定时器时不重复创建，仅提示。
 返回该定时器对象。"
   (interactive)
   (if (timerp seshat-sync-cmd--timer)
       (message "seshat-sync: 定时同步已启用（每 %s 秒）" seshat-sync-interval)
     (setq seshat-sync-cmd--timer
-          (run-at-time seshat-sync-interval seshat-sync-interval #'seshat-sync-now))
+          (run-at-time seshat-sync-interval seshat-sync-interval
+                       (lambda () (seshat-sync-now t))))
     (message "seshat-sync: 已启用定时同步，每 %s 秒执行一次" seshat-sync-interval))
   seshat-sync-cmd--timer)
 

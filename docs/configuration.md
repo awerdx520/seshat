@@ -78,6 +78,63 @@ Emacs 端通过 `seshat-reader-annotation` 采集 PDF 页面选区并同步为�
 
 同理，`seshat:` 链接的 uid 形态也不需要新配置：能否产出 uid 形态由「两套根配置能否映射到同一路径」决定（见下节），不引入开关。
 
+### 书架离线层（2026-10-29）
+
+> 本轮把书架改为**离线优先**（清单主源 = 本地状态库），新增 5 个模块与 **16 个 defcustom**。上一节的两个下载边界变量（`seshat-library-download-timeout` / `seshat-library-max-download-bytes`）仍然有效、含义不变。
+
+**日志（`emacs/seshat-log.el`）**：
+
+| 变量 | 默认值 | 类型 | 说明 |
+|---|---|---|---|
+| `seshat-log-level` | `info` | `(choice (const debug) (const info) (const warn) (const error))` | 写入 `*Seshat Log*` 的最低级别（权重 `debug` 0 / `info` 1 / `warn` 2 / `error` 3）；未知级别按 `info` 处理 |
+| `seshat-log-quiet` | `t` | `boolean` | 非 nil 时日志只进 `*Seshat Log*`、不写 echo area（`error` 级例外仍 `message`）；设 `nil` 恢复全部 echo 输出（前缀 `Seshat: `），用于排障 |
+| `seshat-log-max-lines` | `2000` | `integer` | `*Seshat Log*` 保留的最大行数；超出后从 buffer **头部**裁剪，最新行一定保留 |
+
+**阅读进度侧车（`emacs/seshat-reads.el`）**：
+
+| 变量 | 默认值 | 类型 | 说明 |
+|---|---|---|---|
+| `seshat-reads-file` | `~/.local/share/seshat/reads.eld` | `file` | 进度侧车路径；与同目录 `sync-state.eld` / `annotation-queue.eld` 同一惯例，由 `seshat-reads-save` 以「同目录临时文件 + `rename-file`」原子替换写入 |
+| `seshat-reads-debounce` | `2` | `number` | `seshat-reads-record` 的落盘去抖秒数（翻页会连续触发记录）；`0` 表示不延迟（仍经定时器，语义一致） |
+
+**封面（`emacs/seshat-covers.el`）**：
+
+| 变量 | 默认值 | 类型 | 说明 |
+|---|---|---|---|
+| `seshat-covers-dir` | `~/.cache/seshat/covers/` | `directory` | 封面缓存目录；**惰性创建**（只有真正写图片或负缓存时才 `make-directory`，只读路径不建目录） |
+| `seshat-covers-timeout` | `3` | `integer` | 单次外部命令（`unzip` / `mutool`）的超时秒数；超时即 `delete-process` 并按失败降级——一个挂住的 `unzip` 不能无限期占住主线程。**默认 3 秒（不是 10）**：封面是装饰，不值得为它冻结主线程——队列在 idle 定时器里**同步**跑，一页 30 本 × 10 秒 = 最坏 5 分钟无响应；3 秒足够任何正常的 `unzip -p` / `mutool draw -r 24` 跑完（低分辨率栅格化一本普通 PDF 在百毫秒量级），超时的那本按失败降级即可 |
+| `seshat-covers-max-bytes` | `(* 4 1024 1024)`（4 MiB） | `(choice (const nil) integer)` | 源图字节数上限；超限**不落盘**、按失败降级（写负缓存）；`nil` 表不限，`0` 等价「所有封面都走占位」 |
+| `seshat-covers-queue-delay` | `0.2` | `number` | 串行队列两本封面之间的空闲间隔秒数（idle 定时器，每次只处理 1 本，不抢用户输入） |
+
+**书架（`emacs/seshat-library.el`，本轮新增 5 个）**：
+
+| 变量 | 默认值 | 类型 | 说明 |
+|---|---|---|---|
+| `seshat-library-max-entries` | `200000` | `(choice (const nil) integer)` | 远端清单刷新的总条数硬上限；超出即截断并记一条 warn（**不抛错**，书架照常可用、只是这次少列一些书）。这是 **DoS 护栏**而非性能调优：分页上限 500 × 每页 2000 最多 100 万条，防恶意 / 异常服务端返回海量条目把 `g`（刷新）拖到长时间无响应；`nil` 表不限（不推荐） |
+| `seshat-library-cache-file` | `~/.local/share/seshat/library-cache.eld` | `file` | 远端清单缓存；**只缓存**远端清单（uid / 根 / 路径 / 大小 / mtime），**不缓存**本地三态（三态每次按磁盘事实重算）。原子写入，写失败不抛错；删掉即回到「只用状态库」的降级形态 |
+| `seshat-library-page-size` | `30` | `integer` | 每页书目条数；非正整数按 `1` 处理（不让「除以 0」把整张表打不开）。**同时是 I-OOM 的驻留上限**：驻留 image 数 ≤ 本值 |
+| `seshat-library-cover-height` | `48` | `integer` | 行内封面的显示高度（像素），只影响 `create-image` 的 `:height` 缩放；改大改小**不改变**「同时驻留几个 image」 |
+| `seshat-library-cover-width` | `36` | `integer` | 封面区占用的**像素**宽度，用于把占位文本折算成列数（夹在 `[2, 8]` 列之间）；只影响列对齐，不影响 I-OOM |
+
+**启动汇总（`emacs/seshat-status.el`）**：
+
+| 变量 | 默认值 | 类型 | 说明 |
+|---|---|---|---|
+| `seshat-status-startup-notify` | `t` | `boolean` | 非 nil 时 Emacs 启动后**一次**在 echo area 汇总 Seshat 状态（书库本数与已下载数、待同步笔记 / 批注、上次同步时间与结果、状态库是否损坏）；`nil` 完全不提醒（仍可随时 `M-x seshat-status`） |
+| `seshat-status-startup-delay` | `2` | `number` | 启动汇总的延迟秒数；不在 `emacs-startup-hook` 里同步计算，避免拖慢启动、也避免与启动期其他 `message` 抢 echo area |
+
+**回退路径**（把某个新行为关掉而不改代码）：
+
+| 想关掉 | 做法 |
+|---|---|
+| 远端缓存（回到「只用状态库」） | 删 `~/.local/share/seshat/library-cache.eld` |
+| 静默化（回到 echo 全量输出） | `(setq seshat-log-quiet nil)` |
+| 封面（全部走书名首字占位） | `(setq seshat-covers-max-bytes 0)` |
+| 启动汇总 | `(setq seshat-status-startup-notify nil)` |
+| 分页（近似一屏到底） | 调大 `seshat-library-page-size`（**代价**：I-OOM 的驻留上限随之放宽） |
+
+**封面队列熔断（内部常量，不可配）**：连续失败 **5** 次（`seshat-covers--failure-threshold`）即暂停封面队列 **60** 秒（`seshat-covers--cooldown-seconds`），成功一次即清零——两者都是 `defconst` 而非 defcustom，**没有配置入口**（改它们等于改代码）。它兜的是「环境整体不可用」：缺 `unzip` / `mutool`、或源文件全部损坏时，不会让队列逐本空跑一遍超时。熔断与冷却只在 `*Seshat Log*` 记一条 warn（不写 echo area）。
+
 ### 阅读器翻译 / 解释（go-translate 预设）
 
 > 与批注侧车同属**客户端侧**配置（由 `seshat-reader-translate` 模块读取），与服务端无关。

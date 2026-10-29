@@ -42,6 +42,9 @@
 (require 'ert)
 (require 'cl-lib)
 (require 'seshat-reader-annotation-queue)
+;; 项目层的日志层：本文件在**测试层**加载它，用于断言「软依赖命中时只写日志」。
+;; vendored 模块自身**不得** require 它（`--no-hard-require-of-seshat-log' 锁定）。
+(require 'seshat-log)
 
 (defconst seshat-reader-annotation-queue-test--temp-root
   (file-name-as-directory (if (file-directory-p "/tmp") "/tmp"
@@ -49,6 +52,12 @@
   "测试临时目录的根：优先系统 /tmp.
 `temporary-file-directory' 会跟随 `TMPDIR'，而本机 `TMPDIR' 可能被设为
 仓库根（ECA 客户端所为），那时 `make-temp-file' 会把测试目录建进工作树。")
+
+(defconst seshat-reader-annotation-queue-test--vendored-dir
+  (expand-file-name "../seshat-reader/"
+                    (file-name-directory (or load-file-name buffer-file-name)))
+  "vendored 包源码目录（`emacs/seshat-reader/'）的绝对路径.
+在文件顶层求值：`load-file-name' 只在加载期有值，ERT 用例体内它是 nil。")
 
 ;; 模块加载时会依 `-auto-sync' 自动启用定时器，这里立即关闭。
 (seshat-reader-annotation-queue-disable-timer)
@@ -111,6 +120,12 @@ FN 接收一个 document-id 参数并作为拉取结果返回。"
                         seshat-reader-annotation-queue-test--messages))))
        ,@body-forms)
      (nreverse seshat-reader-annotation-queue-test--messages)))
+
+(defun seshat-reader-annotation-queue-test--log-text ()
+  "返回 `*Seshat Log*' 的当前全部文本（buffer 不存在时返回空串）."
+  (or (when-let* ((buffer (get-buffer seshat-log--buffer-name)))
+        (with-current-buffer buffer (buffer-string)))
+      ""))
 
 (defmacro seshat-reader-annotation-queue-test--with-temp-queue (var &rest body-forms)
   "把队列文件指向临时路径并求值 BODY-FORMS，把该路径绑定到 VAR.
@@ -382,7 +397,9 @@ FN 接收一个 document-id 参数并作为拉取结果返回。"
 ;;; B2. 旧队列条目（无 `:uid'）
 
 (ert-deftest seshat-reader-annotation-queue-test--sync-skips-legacy-entry-without-uid ()
-  "缺 `:uid' 的旧 create 条目被跳过（不移除）且只提示一次，后续条目照常同步."
+  "缺 `:uid' 的旧 create 条目被跳过（不移除）且只提示一次，后续条目照常同步.
+非交互调用（本用例即如此）时提示走 `seshat-log'：echo area 保持安静，
+`*Seshat Log*' 里有且只有一条「旧队列条目缺少 uid」。"
   (seshat-reader-annotation-queue-test--with-temp-queue queue-file
     (seshat-reader-annotation-queue-enqueue
      (list :action 'create :document-id "notes:legacy.pdf"
@@ -394,6 +411,7 @@ FN 接收一个 document-id 参数并作为拉取结果返回。"
      (seshat-reader-annotation-queue-test--create-entry
       seshat-reader-annotation-queue-test--uid
       "page:3;rect:0.00,0.00,1.00,1.00" "新条目"))
+    (seshat-log-clear)
     (let ((result nil)
           (messages nil)
           (requests nil))
@@ -411,11 +429,14 @@ FN 接收一个 document-id 参数并作为拉取结果返回。"
       (should (string-match-p
                (regexp-quote seshat-reader-annotation-queue-test--uid)
                (nth 2 (car requests))))
-      ;; 提示只发一次（而不是每条旧条目各一次）
-      (should (= 1 (length (cl-remove-if-not
-                            (lambda (msg)
-                              (string-match-p "旧队列条目缺少 uid" msg))
-                            messages)))))))
+      ;; echo area 安静
+      (should-not messages)
+      ;; 提示只记一次（而不是每条旧条目各一次）
+      (let ((text (seshat-reader-annotation-queue-test--log-text)))
+        (with-temp-buffer
+          (insert text)
+          (goto-char (point-min))
+          (should (= 1 (how-many "旧队列条目缺少 uid"))))))))
 
 ;;; C. 接入点（`seshat-reader-annotation'）
 
@@ -677,12 +698,14 @@ FN 接收一个 document-id 参数并作为拉取结果返回。"
     (should-not seshat-reader-annotation-queue--timer)))
 
 (ert-deftest seshat-reader-annotation-queue-test--timer-sync-swallows-error-and-skips-empty ()
-  "`--timer-sync'：`-sync' 抛 error 时不冒泡；队列为空时不调用 `-sync'."
-  ;; 队列非空且 -sync 抛 error：错误被吞掉并 message 一行
+  "`--timer-sync'：`-sync' 抛 error 时不冒泡；队列为空时不调用 `-sync'；
+且定时路径**不刷 echo area**（失败提示只进 `*Seshat Log*'）。"
+  ;; 队列非空且 -sync 抛 error：错误被吞掉并记一条日志
   (seshat-reader-annotation-queue-test--with-temp-queue queue-file
     (seshat-reader-annotation-queue-enqueue
      (seshat-reader-annotation-queue-test--create-entry
       "lib:b.pdf" seshat-reader-annotation-queue-test--loc1 "x"))
+    (seshat-log-clear)
     (let ((messages nil)
           (signalled nil))
       (cl-letf (((symbol-function 'seshat-reader-annotation-queue-sync)
@@ -694,8 +717,9 @@ FN 接收一个 document-id 参数并作为拉取结果返回。"
             (seshat-reader-annotation-queue--timer-sync)
           (error (setq signalled t))))
       (should-not signalled)
-      (should messages)
-      (should (string-match-p "定时自动同步失败" (car messages)))))
+      (should-not messages)
+      (should (string-match-p "定时自动同步失败"
+                              (seshat-reader-annotation-queue-test--log-text)))))
   ;; 队列为空：不调用 -sync
   (seshat-reader-annotation-queue-test--with-temp-queue queue-file
     (let ((sync-called nil))
@@ -703,6 +727,60 @@ FN 接收一个 document-id 参数并作为拉取结果返回。"
                  (lambda (&rest _) (setq sync-called t))))
         (seshat-reader-annotation-queue--timer-sync))
       (should-not sync-called))))
+
+;;; E. 静默化与 vendored 边界（T7）
+
+(ert-deftest seshat-reader-annotation-queue-test--timer-sync-degrades-without-log-layer ()
+  "项目层日志缺席时（软依赖缺失）定时路径降级为 `message'，且绝不抛错.
+vendored 包必须能脱离项目层加载，因此 `--log' 用 `fboundp' 软探测；
+缺失时 warn 级降级为 `message'（错误仍可见），info 级静默丢弃。"
+  (seshat-reader-annotation-queue-test--with-temp-queue queue-file
+    (seshat-reader-annotation-queue-enqueue
+     (seshat-reader-annotation-queue-test--create-entry
+      "lib:c.pdf" seshat-reader-annotation-queue-test--loc1 "y"))
+    (let ((messages nil)
+          (signalled nil))
+      (cl-letf (((symbol-function 'seshat-log) nil)
+                ((symbol-function 'seshat-reader-annotation-queue-sync)
+                 (lambda (&rest _) (error "Boom")))
+                ((symbol-function 'message)
+                 (lambda (fmt &rest args)
+                   (push (apply #'format fmt args) messages))))
+        (condition-case nil
+            (seshat-reader-annotation-queue--timer-sync)
+          (error (setq signalled t))))
+      (should-not signalled)
+      ;; 软依赖缺失 → 降级路径：warn 级仍然可见
+      (should (cl-some (lambda (m) (string-match-p "定时自动同步失败" m))
+                       messages)))))
+
+(ert-deftest seshat-reader-annotation-queue-test--sync-interactive-keeps-messages ()
+  "交互调用 `-sync' 时仍 `message'（用户主动操作必须有反馈）。
+静默化只针对自动路径：`called-interactively-p' 为真时走原来的 message。"
+  (seshat-reader-annotation-queue-test--with-temp-queue queue-file
+    (let ((messages nil))
+      (cl-letf (((symbol-function 'called-interactively-p)
+                 (lambda (&optional _kind) t)))
+        (setq messages
+              (seshat-reader-annotation-queue-test--capture-messages
+                (seshat-reader-annotation-queue-sync))))
+      (should (cl-some (lambda (m) (string-match-p "队列为空" m)) messages)))))
+
+(ert-deftest seshat-reader-annotation-queue-test--no-hard-require-of-seshat-log ()
+  "vendored 目录（`emacs/seshat-reader/'）的 .el 源文件里**不得**出现
+`(require 'seshat-log)'：vendored 包必须能脱离项目层单独加载。
+这是软依赖约束的静态不变量，靠 grep 源码锁定（运行时 `fboundp' 探测无法
+阻止有人图省事加一条硬 require）。"
+  (let* ((vendored seshat-reader-annotation-queue-test--vendored-dir)
+         (offenders nil))
+    (should (file-directory-p vendored))
+    (dolist (file (directory-files vendored t "\\.el\\'"))
+      (with-temp-buffer
+        (insert-file-contents file)
+        (goto-char (point-min))
+        (while (re-search-forward "require 'seshat-log" nil t)
+          (push (file-name-nondirectory file) offenders))))
+    (should-not offenders)))
 
 (provide 'seshat-reader-annotation-queue-test)
 ;;; seshat-reader-annotation-queue-test.el ends here

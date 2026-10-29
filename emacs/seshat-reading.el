@@ -23,11 +23,15 @@
 ;;; Commentary:
 
 ;; `seshat-reading-mode' 是 `seshat-reader-mode' 的派生 major mode：渲染、
-;; 翻页、目录、缩放 100% 继承自 reader，本模块只叠加两件事：
+;; 翻页、目录、缩放 100% 继承自 reader，本模块只叠加三件事：
 ;;
 ;; 1. 库身份解析（`seshat-reading--resolve'）——只读本地同步状态文件，
 ;;    **零网络**，四态 `library' / `unregistered' / `external' / `broken'；
-;; 2. mode-line 标识（" [库]" / " [未入库]" / " [库外]" / " [状态异常]"）。
+;; 2. mode-line 标识（" [库]" / " [未入库]" / " [库外]" / " [状态异常]"）；
+;; 3. 阅读进度侧车写入（`seshat-reads'，**零网络**）：页号变化时记进度，
+;;    关 buffer 时立即落盘。写入点收口在 buffer-local 的
+;;    `post-command-hook'（页号比对去抖）与 `kill-buffer-hook' 上，见
+;;    `seshat-reading--install-progress-tracking'。
 ;;
 ;; 加载本文件后会把 `auto-mode-alist' 中指向 `seshat-reader-mode' 的项**就地**
 ;; 改成 `seshat-reading-mode'（遍历替换 cdr，不重拼正则），因此 reader 支持的
@@ -49,6 +53,9 @@
 (require 'seshat-reader)
 (require 'seshat-state)
 (require 'seshat-rest)
+;; 阅读进度侧车：纯本地文件（零网络）。`seshat-log' 供写入路径的降级告警使用。
+(require 'seshat-reads)
+(require 'seshat-log)
 
 (defgroup seshat-reading nil
   "Seshat 阅读模式：库身份与显式入库。"
@@ -62,8 +69,9 @@
 
 (defvar seshat-reading--warned nil
   "`seshat-reading--resolve' 是否已经发过降级警告.
-用于把「解析异常」的 `display-warning' 限制为每个 Emacs 进程一次，避免每
-打开一个文件就刷一条同样的警告。")
+用于把「解析异常」的警告限制为每个 Emacs 进程一次，避免每打开一个文件就
+刷一条同样的日志。警告经 `seshat-log' 的 `warn' 级写入 `*Seshat Log*'，
+不占 echo area（打开文档属自动路径）。")
 
 (defconst seshat-reading--mode-line-entry
   '(:eval (seshat-reading--mode-line-text))
@@ -115,12 +123,15 @@ reader 模块（`seshat-reader-annotation' / `-reference' / `-translate'）对
 
 (defun seshat-reading--warn-once (format-string &rest args)
   "发出一次 `seshat-reading' 级别的警告，之后不再重复.
-FORMAT-STRING 与 ARGS 交给 `format'；去重标记见 `seshat-reading--warned'。"
+FORMAT-STRING 与 ARGS 交给 `format'；去重标记见 `seshat-reading--warned'。
+
+走 `seshat-log' 的 `warn' 级（只进 `*Seshat Log*'，不刷 echo area）：本函数
+的唯一调用点是 `seshat-reading--resolve'——它在**打开文档**时（自动路径）执行，
+用户没在等结果，逐条 message 只会打断输入。故障可见性由 mode-line 的
+\" [库外]\" 标识与 `seshat-status' 的启动汇总承担。"
   (unless seshat-reading--warned
     (setq seshat-reading--warned t)
-    (display-warning 'seshat-reading
-                     (apply #'format format-string args)
-                     :warning)))
+    (seshat-log 'warn "%s" (apply #'format format-string args))))
 
 (defun seshat-reading--root-for-file (file)
   "返回 FILE 所属库根的 `(TAG . REL)'；不在任何根下时返回 nil.
@@ -169,8 +180,9 @@ FILE 先经 `expand-file-name' 与 `file-truename' 归一；根目录取自
 4. `unregistered'——在根下但状态库没有该路径的 uid（含 `:root' 与 `:rel'，
    供 `seshat-reading-refresh' 显式向服务端确认）。
 
-任何异常都降级为 `external' 并 `display-warning' 一次（标记见
-`seshat-reading--warned'）——「打开文件」绝不因状态异常而失败。"
+任何异常都降级为 `external' 并记一条 `seshat-log' warn（标记见
+`seshat-reading--warned'）——「打开文件」绝不因状态异常而失败，也绝不因此
+刷 echo area（本函数在 mode 体里执行，属自动路径）。"
   (condition-case err
       (if (seshat-reading--state-broken-p)
           (list :state 'broken :uid nil :root nil :rel nil)
@@ -548,6 +560,78 @@ hash，而 `If-Match' 比对的是**内容 blob hash**——用提交 hash 做�
                    file tag rel* uid)
           (list :uid uid :root tag :rel rel* :target target))))))
 
+;;; 阅读进度侧车（零网络）
+
+;; 换页入口清单（A6 前置验证结论，实测 `emacs/seshat-reader/'）：
+;;
+;;   命令层：`seshat-reader-next-page' / `-previous-page' / `-first-page' /
+;;   `-last-page' / `-goto-page'，以及目录（`seshat-reader-outline'）、引用
+;;   （`-reference'）、搜索结果（`-search'）、ETAF 面板（`-etaf'）、bookmark /
+;;   saveplace 恢复（`-bookmark-jump'）——**全部**最终调用
+;;   `seshat-reader--multipage-goto'；
+;;   视口层：`seshat-reader-scroll-*' 命令、鼠标滚轮、拖拽滚动条、
+;;   `set-window-start' ——不经过任何翻页函数，只改 `window-start'。
+;;
+;; 因此**不**逐条给翻页命令加 advice（脆弱且必漏视口层），改用 buffer-local
+;; 的 `post-command-hook' + 页号比对去抖：任何改变视口顶页的动作（无论是命令
+;; 还是滚动）都会在下一条命令后被发现。代价是每条命令一次
+;; `seshat-reader-current-doc-pagenumber' 调用（读 `window-start' 落在哪个页行，
+;; 一次 marker 比较；reader 自己的 `post-command-hook' 同步页行本来就是同一量级
+;; 的开销），且页号不变时不做任何写入。
+
+(defvar-local seshat-reading--last-noted-page nil
+  "本 buffer 最近一次写入侧车的页号.
+用于 `post-command-hook' 去抖：页号未变化时不做任何记录（滚动半页、连续同页
+命令都不写）。buffer-local——每个 buffer 的视口各自独立。")
+
+(defun seshat-reading--note-progress ()
+  "页号变化时把阅读进度写入本地侧车（零网络、绝不抛错）.
+只在 `seshat-reading-mode' 的 buffer 内生效；uid 取
+`seshat-reading--identity' 的 `:uid'（只有 `library' 状态有值），库外 / 未入库
+文档静默跳过。真正写内存与去抖落盘由 `seshat-reads--note-current-page' 完成
+（页号与总页数的取值口径、缺值时的静默跳过都在那里）。
+
+本函数是 `post-command-hook' 的入口，任何异常都吞掉并 `seshat-log' 记 warn：
+「记进度」不得破坏阅读。"
+  (condition-case err
+      (when (derived-mode-p 'seshat-reading-mode)
+        (let ((uid (plist-get seshat-reading--identity :uid))
+              (page (seshat-reads--buffer-page)))
+          (when (and (stringp uid)
+                     (not (string-empty-p uid))
+                     (integerp page)
+                     (not (eql page seshat-reading--last-noted-page)))
+            (setq seshat-reading--last-noted-page page)
+            (seshat-reads--note-current-page uid page))))
+    (error
+     (seshat-log 'warn "记录阅读进度失败：%s" (error-message-string err)))))
+
+(defun seshat-reading--save-progress ()
+  "把挂起的阅读进度立即落盘（`kill-buffer-hook' 用，避免丢最后一次）.
+只在**确有未落盘记录**时写盘（`seshat-reads--pending'）：去抖定时器还没到点就
+关 buffer 时靠它兜住；没有记录时不产生任何 IO（也不会因为「打开又关掉一个
+库外文档」去创建进度文件）。异常同样吞掉并记 warn。"
+  (condition-case err
+      (when (and (derived-mode-p 'seshat-reading-mode)
+                 seshat-reads--pending)
+        (seshat-reads-save))
+    (error
+     (seshat-log 'warn "落盘阅读进度失败：%s" (error-message-string err)))))
+
+(defun seshat-reading--install-progress-tracking ()
+  "在本 buffer 装上阅读进度的两个写入点（幂等）.
+
+- `post-command-hook' → `seshat-reading--note-progress'：页号变化时记录。追加到
+  末尾（DEPTH 传 t），不与 reader 自己的 `post-command-hook' 条目抢顺序；先
+  remove 再 add，重复进 mode 不累积副本。
+- `kill-buffer-hook' → `seshat-reading--save-progress'：立即落盘。
+
+两个 hook 都是 buffer-local，因此只在 `seshat-reading-mode' 的 buffer 内生效。"
+  (remove-hook 'post-command-hook #'seshat-reading--note-progress t)
+  (add-hook 'post-command-hook #'seshat-reading--note-progress t t)
+  (remove-hook 'kill-buffer-hook #'seshat-reading--save-progress t)
+  (add-hook 'kill-buffer-hook #'seshat-reading--save-progress nil t))
+
 ;;; 模式定义
 
 (define-derived-mode seshat-reading-mode seshat-reader-mode "Seshat Reading"
@@ -555,8 +639,9 @@ hash，而 `If-Match' 比对的是**内容 blob hash**——用提交 hash 做�
 
 渲染、翻页、目录与缩放全部继承 `seshat-reader-mode'（不复制任何渲染代码，
 不直接调用动态模块）；本 mode 只叠加库身份解析（**零网络**）、mode-line
-标识，以及供批注静音路径使用的 buffer-local 标记
-`seshat-reading--quiet-fallback'。
+标识、阅读进度侧车写入（**零网络**，见
+`seshat-reading--install-progress-tracking'），以及供批注静音路径使用的
+buffer-local 标记 `seshat-reading--quiet-fallback'。
 
 mode 体不做任何 I/O 循环与网络请求：首次 `seshat-state-load' 是唯一一次
 磁盘读（通常几十毫秒），此后都是内存查表。
@@ -575,7 +660,10 @@ Keybindings:
   ;; 的 reader buffer 才有 render-status。
   (when (bound-and-true-p seshat-reader-current-doc-render-status)
     (setq-local seshat-reading--quiet-fallback t)
-    (seshat-reading--apply-identity)))
+    (seshat-reading--apply-identity)
+    ;; 进度写入点只在渲染成功的 buffer 上装：`--apply-identity' 已填好 uid
+    ;; （库外 / 未入库时为 nil，写入路径会静默跳过）。
+    (seshat-reading--install-progress-tracking)))
 
 ;;;###autoload
 (defun seshat-reading-open (file)

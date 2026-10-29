@@ -1023,6 +1023,36 @@ refit 按当前窗口尺寸做一次几何适配 + 重渲染，一次到位。
 
 **来源**：`openspec/completed/2026-10-28-reader-canvas-backend-migration.md`（T0–T8 执行记录）+ `openspec/completed/2026-10-28-reader-canvas-s0-spike.md`（可行性实测）。
 
+## 2026-10-29 · 书架清单主源从远端切到本地状态库（离线优先）
+
+**决策**：Emacs 书架的清单主源由远端 REST 清单改为**本地状态库**（`seshat-state-entries`，读 `:uids` 索引，零网络）；远端清单降级为**可选增强**并落盘缓存 `~/.local/share/seshat/library-cache.eld`（仅显式 `g` 刷新时原子写）。本地事实（是否已下载）由 `file-exists-p` + `file-attributes` 判定。合并策略：以状态库为准，缓存项仅在 uid 不在状态库时以「未登记」状态出现。远端刷新失败静默进日志，书架永不因网络失败而空表；状态库与缓存都为空（从未同步过）时书架**显式提示** `M-x seshat-sync-now`，不显示空表假装书库是空的。
+
+**理由**：① 「断网即空表」是数据源选错——本地状态库本就持有 uid 全集，「有哪些书」不该依赖网络；② 远端清单的剩余价值（服务端全集里本地未登记的项、远端 size）正是「增强」的定义，可缓存、可缺失、失败不影响主功能；③ 若把缓存当主源，书架内容会随网络状态与缓存新旧漂移，而状态库是**权威的本地事实**。
+
+**代价**：① 首次使用前必须先成功同步过一次（否则书架只有提示）；② 状态库损坏时书架与启动汇总都必须降级为「提示 + 空表」，需显式区分「损坏」与「从未同步」两种空态；③ 远端全集信息（本地未登记项）在未刷新前不可见。**回退**：删 `library-cache.eld` 即回到「只用状态库」。
+
+（来源计划：[openspec/completed/2026-10-29-emacs-offline-library.md](completed/2026-10-29-emacs-offline-library.md) 的 D1 与 T2 / T5；ADR：[docs/adr/0006-offline-first-library.md](../docs/adr/0006-offline-first-library.md)）
+
+## 2026-10-29 · 书架 UI 自建 buffer + 显式分页，禁用 ETAF 与 tabulated-list 行内图（OOM 有界）
+
+**决策**：书架视图**重写为自建 buffer**（`special-mode` 派生），每条目一行 = 行内封面 image（`display` 文本属性 + 固定像素高）+ 书名 + 根 + 大小 + 进度 + 待同步 + 状态徽章；`seshat-library-page-size`（默认 30）控制每页条目数，`n`/`p` 翻页、`M-<`/`M->` 首末页、`g` 重算并回第一页。**只为当前页条目创建 image**，翻页 / `q` 时对离开页调 `image-flush`；**不变量 I-OOM**：任一时刻驻留 image 数 ≤ `page-size`，对非当前页条目的封面文件/文档解析次数为 0。非图形环境（`display-graphic-p` 为 nil，含 ERT 批处理）一律跳过 image，用书名首字占位。
+
+**理由**：① `tabulated-list-mode` 的列宽按字符计、行高按字符行计，行内 image 会撑破列对齐，且每次重排重建整表，与「只为当前页创建 image」的节流目标冲突；② ETAF 在测试期常 OOM（用户实测结论），其内部缓存与重绘策略无法表达「驻留 image ≤ 一页」这一硬上限；③ 自建 buffer 把「行 = 一条目、行内一个 image」写成结构，再用分页把同时存在的 image 数钉死——这是唯一不依赖 GC 时机就能保证的内存上限；④ 排序/过滤/翻页因自建而必须自写，但它们同时变成**可测纯函数**（隐性收益）。
+
+**代价**：① 排序 / 过滤 / 翻页 / 标记全部自维护，代码量与回归面比 `tabulated-list` 大；② 分页牺牲连续滚动观感（`page-size` 调大可近似「一屏到底」，但 I-OOM 上限随之放宽）；③ 行高与封面尺寸需按像素自行控制，非图形环境必须有守卫否则 ERT 批处理失败。**验证**：I-OOM 与 I-NONET 两条机械不变量在 ERT 内判定（`create-image` 计数 / `seshat-rest--request` 绑成抛错）。
+
+（来源计划：[openspec/completed/2026-10-29-emacs-offline-library.md](completed/2026-10-29-emacs-offline-library.md) 的 D2 / D3 与 T4 / T5 / T8；ADR：[docs/adr/0006-offline-first-library.md](../docs/adr/0006-offline-first-library.md)）
+
+## 2026-10-29 · 日志收口：自动路径静默进 `*Seshat Log*`，启动时一次汇总提醒
+
+**决策**：新增 `emacs/seshat-log.el`（`seshat-log-level` 默认 `info` / `seshat-log-quiet` 默认 `t` / ring 上限 2000 行的 `*Seshat Log*` / `seshat-show-log` / `seshat-log-clear`），把 `seshat-sync.el`、`seshat-sync-cmd.el`、`seshat-library.el`、`seshat-reading.el`、`seshat-reader-annotation-queue.el` 的**自动路径**（定时器、书架渲染、阅读器打开、批注队列同步）全部改走 `seshat-log`；**显式交互命令**（`M-x seshat-sync-now`、`u`、`d`、`x`）保留单行 echo 反馈。新增 `emacs/seshat-status.el`：在 `emacs-startup-hook` 延迟 `seshat-status-startup-delay`（默认 2s）做**一次**汇总（书库 N 本 / 本地已下载 M、待同步笔记 X / 批注 Y、上次同步时间与结果、状态库是否损坏、从未同步提示），服务端可达性用状态库新增的 `:runtime` 键（上次运行结论），**不在启动时探测网络**。
+
+**理由**：① 项目层 el 文件已有约 **210 处**用户可见输出点（2026-10-29 实测：`(message` 155 + `(display-warning` 55），其中 `seshat-sync.el` 一个文件 103 行含 message/warning，且由两个后台定时器持续触发——echo area 长期刷屏，真正重要的信息被冲掉；② 用户不反对信息存在，反对的是**自动路径**刷屏，因此「自动路径写日志 + 启动汇总一次 + 显式命令保留回显」三条同时成立；③ 启动探测网络会让「启动变慢/卡住」成为新投诉面，用上次运行结论表达「上次同步失败了」已足够。
+
+**代价**：① 静默化后「不看日志就不知道出过问题」成为新默认，必须靠启动汇总与 `M-x seshat-status` 兜住；② 既有大量断言 `message` 的测试（`seshat-library-test.el` / `seshat-sync-cmd-test.el`）必须同批改断言——这是预期改动而非回归；③ `:runtime` 让状态库格式多一个键，旧文件需在 `seshat-state--normalize` 补 nil 兼容。**回退**：`seshat-log-quiet` 设 nil 即恢复 echo 输出。
+
+（来源计划：[openspec/completed/2026-10-29-emacs-offline-library.md](completed/2026-10-29-emacs-offline-library.md) 的 D6 / D7 与 T1 / T2 / T6 / T7；ADR：[docs/adr/0006-offline-first-library.md](../docs/adr/0006-offline-first-library.md)）
+
 ## 2026-10-29 · 阅读器两阶段异步渲染：不做 worker 线程池（P2-B D1）
 
 **决策**：像素渲染的异步化**不**重建后台线程/线程池，改为「同步查页尺寸 + idle/周期 timer 补像素」两阶段。同步路径只调 C 入口 `--page-size`（`fz_load_page → fz_bound_page → fz_drop_page`，实测中位 4.5–10.3 µs），像素仍由主线程在 timer 回调里渲染（每轮 ≤ `render-idle-batch` 页）。
@@ -1072,3 +1102,24 @@ refit 按当前窗口尺寸做一次几何适配 + 重渲染，一次到位。
 **代价**：① 用户侧「双窗口」体验在 follow-up 落地前仍不达标（已知缺陷，写入 `docs/emacs-reader.md` §7 与 `openspec/tech-debt.md`）；② 两条线索（队列级已修 / 布局级待修）需要文档同时交代，否则后人会把「已修 D8」误当成「双窗口已可用」。
 
 （来源计划：[openspec/completed/2026-10-28-reader-multipage-p2b-async-render.md](completed/2026-10-28-reader-multipage-p2b-async-render.md) 的「T9 真机主观验收」与「T9 D8 清空路径修复」；follow-up：[openspec/active/2026-10-29-reader-multiwindow-independent-scroll.md](active/2026-10-29-reader-multiwindow-independent-scroll.md)）
+
+## 2026-10-29 · I-OOM 反假绿：显示判断必须在构造之前
+
+**决策**：`seshat-library--insert-cover` 里 `display-graphic-p` 的判断**先于** `seshat-library--make-cover-image` 调用——非图形环境**根本不构造** image（不是「构造了但不显示」）。
+
+**理由**：计划原文（D2）要求「先构造、再判断是否显示」，理由是「构造不受 `display-graphic-p` 约束，构造计数才可测」。但那样写出来 I-OOM 的反假绿自检**形同虚设**：把测试里的 `display-graphic-p` 桩去掉（回到批处理真实值 `nil`）后，构造次数仍等于「页内可用封面数」，**正断言 P 不会失败**——而 P 失败正是「断言非空」的唯一证明。把判断提前后语义变成「看不见就不构造」，去桩 ⇒ 构造 0 次 ⇒ P 必然失败，自检才有判别力（实测：去桩后 `(should (> created 0)) :form (> 0 0) :value nil`）。
+
+**代价**：非图形环境完全不做构造，失去了「构造但不显示」这一中间态（也因此少了一条「构造路径在批处理下也可执行」的间接覆盖）；但这正是想要的结果——看不见的 image 不该占驻留预算。相应地，I-OOM 的三条守恒式（上界 / 收支 / 无泄漏）必须在**桩 `display-graphic-p` 为 `t`** 的前提下才跑得动，桩与去桩两个版本都固化成了用例（`seshat-library-i-oom-scenario-a/b/c` 与 `seshat-library-i-oom-positive-assertion-fails-without-graphic-stub`）。
+
+（来源计划：[openspec/completed/2026-10-29-emacs-offline-library.md](completed/2026-10-29-emacs-offline-library.md) 的 D2 与 T8「OOM 有界断言（去假绿）」）
+
+## 2026-10-29 · 启动汇总零副作用：只查 `featurep`，不主动 require 批注队列
+
+**决策**：`seshat-status--pending-annotations` **只在** `(featurep 'seshat-reader-annotation-queue)` 为真时读取队列计数，否则返回 `nil`（汇总行显示「不可用」）。启动汇总**不 require** 该模块，也不 require 任何其它非必需模块。
+
+**理由**：`seshat-reader-annotation-queue.el` 顶层在 `seshat-reader-annotation-auto-sync` 非 `nil` 时会**立即注册 300 秒周期定时器**。启动汇总若为了拿一个数字去 `require` 它，等于**顺带启用了批注自动同步**——启动路径改变了运行态，属于隐蔽副作用：用户没开过阅读器却开始有后台同步在跑，且日志里会出现没人预期来源的条目。启动汇总的契约是「只读快照、零副作用、零网络」，任何「为了取数而加载模块」的写法都破坏这条契约。
+
+**代价**：会话中从未加载过队列模块时，启动汇总的批注数显示「不可用」而非 `0`——比「显示 0」信息量低，但诚实（`0` 会被误读成「确实没有待同步批注」）。同理，`seshat-status` 对 `seshat-state` / `seshat-reads` 也走「已加载才查、未加载不催」的口径；确需完整数据时由用户显式打开 `*Seshat Status*`（交互命令，可接受加载成本）。
+
+（来源计划：[openspec/completed/2026-10-29-emacs-offline-library.md](completed/2026-10-29-emacs-offline-library.md) 的 D7 与 T6）
+

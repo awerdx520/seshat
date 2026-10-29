@@ -351,6 +351,43 @@ WARNINGS 是消息字符串列表（调用顺序），用于断言「确实发�
       (should (equal (plist-get rebuilt :paths)
                      (list (cons (cons "notes" "b.org") "uid-b")))))))
 
+;;; 活性判据唯一实现（`--rebuild-paths' 复用 `--entry-active-p'）
+
+(ert-deftest seshat-state-test-rebuild-paths-agrees-with-entry-active-p ()
+  "`--rebuild-paths' 与 `--entry-active-p' 对四种条目给出一致判定.
+四种条目：活（有路径）/ 墓碑（`:deleted-at'）/ 孤儿（`:orphan'）/ 无路径。
+这是「活性定义只有一处实现」的机械保证——把内联三条件换成调用
+`seshat-state--entry-active-p' 之后，两者不可能再各自漂移。"
+  (seshat-state-test--with-temp-state
+    (let* ((cases (list (cons "live" (list :root "books" :path "a.pdf"))
+                        (cons "tomb" (list :root "books" :path "b.pdf"
+                                           :deleted-at 1700000000))
+                        (cons "orphan" (list :root "books" :path "c.pdf"
+                                             :orphan t))
+                        (cons "nopath" (list :root "books"))))
+           (indexed-uids nil))
+      (dolist (cell cases)
+        (seshat-state-set (car cell) (cdr cell)))
+      (let ((paths (plist-get (seshat-state--rebuild-paths seshat-state--state)
+                              :paths)))
+        (setq indexed-uids (mapcar #'cdr paths))
+        (dolist (cell cases)
+          (let* ((uid (car cell))
+                 (entry (seshat-state-get uid))
+                 (active (seshat-state--entry-active-p entry)))
+            ;; 两处口径必须一致：活 ↔ 建索引
+            (should (eq (and active t) (and (member uid indexed-uids) t)))
+            ;; 逐个条目复核判据本身（防「两边都错得一样」）
+            (pcase uid
+              ("live" (should active))
+              (_ (should-not active))))))
+      ;; 正断言：四种里恰好 1 个活条目、1 个索引项（否则上面的「一致」是空断言）
+      (should (equal (list "live") indexed-uids))
+      (should (= 1 (length (cl-remove-if-not #'seshat-state--entry-active-p
+                                             (mapcar (lambda (cell)
+                                                       (seshat-state-get (car cell)))
+                                                     cases))))))))
+
 ;;; 游标
 
 (ert-deftest seshat-state-test-cursor-read-write ()
@@ -679,6 +716,180 @@ WARNINGS 是消息字符串列表（调用顺序），用于断言「确实发�
     (should (= 0 seshat-state--batch-depth))
     (should-not (seshat-state-batch))
     (should (= 0 seshat-state--batch-depth))))
+
+;;; 公开枚举（seshat-state-entries）
+
+(ert-deftest seshat-state-test-entries-order-matches-uids ()
+  "`seshat-state-entries' 返回 `(uid . entry)'，顺序与 `:uids' 完全一致（不重排）。"
+  (seshat-state-test--with-temp-state
+    (seshat-state-set "uid-c" (list :root "notes" :path "c.org"))
+    (seshat-state-set "uid-a" (list :root "notes" :path "a.org"))
+    (seshat-state-set "uid-b" (list :root "work" :path "b.org"))
+    (should (equal (mapcar #'car (seshat-state-entries))
+                   '("uid-c" "uid-a" "uid-b")))
+    ;; 与状态库内部顺序逐项相同（没有重排、没有丢项）
+    (should (equal (mapcar #'car (seshat-state-entries))
+                   (mapcar #'car (plist-get seshat-state--state :uids))))
+    ;; 条目就是状态库里的条目（引用，不深拷贝）
+    (should (equal (cdr (assoc "uid-a" (seshat-state-entries)))
+                   (seshat-state-get "uid-a")))
+    (should (= 3 (length (seshat-state-entries t))))))
+
+(ert-deftest seshat-state-test-entries-excludes-tombstones ()
+  "默认过滤墓碑：`:deleted-at' 非 nil 的条目不出现；include-inactive 时出现。"
+  (seshat-state-test--with-temp-state
+    (seshat-state-set "uid-live" (list :root "notes" :path "live.org"))
+    (seshat-state-set "uid-dead" (list :root "notes" :path "dead.org"))
+    (seshat-state-mark-deleted "uid-dead")
+    (should (equal (mapcar #'car (seshat-state-entries)) '("uid-live")))
+    (should (equal (mapcar #'car (seshat-state-entries t))
+                   '("uid-live" "uid-dead")))
+    (should (numberp (plist-get (cdr (assoc "uid-dead" (seshat-state-entries t)))
+                                :deleted-at)))))
+
+(ert-deftest seshat-state-test-entries-excludes-orphans ()
+  "默认过滤孤儿：带 `:orphan' 的条目不出现；include-inactive 时出现。"
+  (seshat-state-test--with-temp-state
+    (seshat-state-set "uid-b" (list :root "notes" :path "p.org"))
+    (seshat-state-set "uid-a" (list :root "notes" :path "old.org"))
+    ;; remap 冲突：uid-b 被挤出 → :path 置 nil + :orphan t
+    (seshat-state-remap "uid-a" "notes" "p.org")
+    (should (eq t (plist-get (seshat-state-get "uid-b") :orphan)))
+    (should (equal (mapcar #'car (seshat-state-entries)) '("uid-a")))
+    (should (equal (mapcar #'car (seshat-state-entries t)) '("uid-b" "uid-a")))))
+
+(ert-deftest seshat-state-test-entries-excludes-pathless ()
+  "默认过滤 `:path' 为 nil 的条目（如只记了 base-blob 的条目）。"
+  (seshat-state-test--with-temp-state
+    (seshat-state-set-base-blob "uid-blob" "sha1:1" 10 1761234567)
+    (seshat-state-set "uid-live" (list :root "notes" :path "live.org"))
+    (should-not (plist-get (seshat-state-get "uid-blob") :path))
+    (should (equal (mapcar #'car (seshat-state-entries)) '("uid-live")))
+    (should (equal (mapcar #'car (seshat-state-entries t))
+                   '("uid-blob" "uid-live")))))
+
+(ert-deftest seshat-state-test-entries-include-inactive-returns-all ()
+  "include-inactive 非 nil 时墓碑 / 孤儿 / 无路径三类都出现，且顺序仍是 `:uids' 顺序。"
+  (seshat-state-test--with-temp-state
+    (seshat-state-set "uid-live" (list :root "notes" :path "live.org"))
+    (seshat-state-set "uid-dead" (list :root "notes" :path "dead.org"))
+    (seshat-state-mark-deleted "uid-dead")
+    (seshat-state-set "uid-orphan" (list :root "notes" :path "orphan.org"))
+    (seshat-state-set "uid-taker" (list :root "notes" :path "taken.org"))
+    (seshat-state-remap "uid-taker" "notes" "orphan.org")  ; 挤掉 uid-orphan
+    (seshat-state-set-base-blob "uid-blob" "sha1:b" 1 2)   ; 无 :path
+    (should (equal (mapcar #'car (seshat-state-entries))
+                   '("uid-live" "uid-taker")))
+    (should (equal (mapcar #'car (seshat-state-entries t))
+                   '("uid-live" "uid-dead" "uid-orphan" "uid-taker" "uid-blob")))
+    (should (equal (mapcar #'car (seshat-state-entries t))
+                   (mapcar #'car (plist-get seshat-state--state :uids))))))
+
+(ert-deftest seshat-state-test-entries-empty-state-is-nil ()
+  "空状态库（无任何条目）返回 nil 而不是报错。"
+  (seshat-state-test--with-temp-state
+    (should-not (seshat-state-entries))
+    (should-not (seshat-state-entries t))
+    (should-not (file-exists-p seshat-state-file))))
+
+;;; 上次运行记录（:runtime）
+
+(ert-deftest seshat-state-test-runtime-old-file-is-nil ()
+  "旧文件（无 `:runtime' 键）加载后 runtime 为 nil，且**不**判为损坏、不告警。"
+  (seshat-state-test--with-temp-state
+    (seshat-state-test--write-state-file
+     (list :version 1 :cursor 5 :roots nil
+           :uids (list (cons "uid-a" (list :root "notes" :path "a.org")))
+           :paths (list (cons (cons "notes" "a.org") "uid-a"))))
+    (let* ((captured (seshat-state-test--warnings #'seshat-state-load)))
+      (should-not (cdr captured))                     ; 无告警
+      (should-not seshat-state--load-was-corrupt)
+      (should-not (seshat-state-runtime))
+      (should (= 5 (seshat-state-cursor)))
+      (should (equal (seshat-state-uid-for-path "notes" "a.org") "uid-a"))
+      ;; 文件既没被改名，也没被当成坏文件备份
+      (should (file-exists-p seshat-state-file))
+      (should-not (file-exists-p (concat seshat-state-file ".bak"))))))
+
+(ert-deftest seshat-state-test-runtime-save-load-roundtrip ()
+  "set-runtime → save → 丢弃内存状态 → load 后记录往返一致（成功与失败两条路径）。"
+  (seshat-state-test--with-temp-state
+    (should-not (seshat-state-runtime))
+    (let ((success (list :last-sync-at 1761234567
+                         :last-sync-result 'success
+                         :last-sync-error nil)))
+      (should (equal (seshat-state-set-runtime success) success))
+      (should (equal (seshat-state-runtime) success))
+      (seshat-state-save)
+      (setq seshat-state--state nil)          ; 强制重新从磁盘读
+      (seshat-state-load)
+      (should (equal (seshat-state-runtime) success))
+      (should (= 1761234567 (plist-get (seshat-state-runtime) :last-sync-at))))
+    (let ((failed (list :last-sync-at 1761234600
+                        :last-sync-result 'failed
+                        :last-sync-error "HTTP 500")))
+      (should (equal (seshat-state-set-runtime failed) failed))
+      (seshat-state-save)
+      (setq seshat-state--state nil)
+      (seshat-state-load)
+      (should (equal (seshat-state-runtime) failed))
+      (should (equal (plist-get (seshat-state-runtime) :last-sync-error)
+                     "HTTP 500")))))
+
+(ert-deftest seshat-state-test-set-runtime-rejects-non-plist ()
+  "非法入参（字符串 / 数字 / 非 keyword 开头的 list）→ error；nil 清空记录。"
+  (seshat-state-test--with-temp-state
+    (should-error (seshat-state-set-runtime "garbage"))
+    (should-error (seshat-state-set-runtime 42))
+    (should-error (seshat-state-set-runtime '("not-a-keyword" 1)))
+    (should-error (seshat-state-set-runtime (vector :a 1)))
+    ;; 合法形状不报错：字段名不做校验（将来会加字段）
+    (should (equal (seshat-state-set-runtime (list :future-field 1))
+                   (list :future-field 1)))
+    ;; 抛错不改变既有记录
+    (let ((runtime (list :last-sync-at 1 :last-sync-result 'success)))
+      (seshat-state-set-runtime runtime)
+      (should-error (seshat-state-set-runtime "garbage"))
+      (should (equal (seshat-state-runtime) runtime)))
+    ;; nil 表示清空
+    (should-not (seshat-state-set-runtime nil))
+    (should-not (seshat-state-runtime))))
+
+(ert-deftest seshat-state-test-normalize-runtime-tolerance ()
+  "`--normalize' 的 `:runtime' 归一化：非 plist 置 nil，合法 plist 原样保留。"
+  (should-not (plist-get (seshat-state--normalize (list :runtime "garbage"))
+                         :runtime))
+  (should-not (plist-get (seshat-state--normalize (list :runtime 42)) :runtime))
+  (should-not (plist-get (seshat-state--normalize (list :runtime '("k" 1)))
+                         :runtime))
+  (should-not (plist-get (seshat-state--normalize (list :runtime (vector :a 1)))
+                         :runtime))
+  ;; 合法 plist 原样保留（不清洗字段、不丢未知字段）
+  (let ((runtime (list :last-sync-at 5 :future-field 'x)))
+    (should (equal (plist-get (seshat-state--normalize (list :runtime runtime))
+                              :runtime)
+                   runtime)))
+  ;; 缺键时补 nil（向后兼容）：键存在但值为 nil
+  (should (plist-member (seshat-state--normalize (list :version 1)) :runtime))
+  (should-not (plist-get (seshat-state--normalize (list :version 1)) :runtime)))
+
+(ert-deftest seshat-state-test-version-unchanged-by-runtime ()
+  "新增 `:runtime' 不构成格式版本升级：常量与落盘 `:version' 都仍为 1。"
+  (seshat-state-test--with-temp-state
+    (should (= seshat-state-version 1))
+    (should (= (plist-get (seshat-state--ensure) :version) 1))
+    (seshat-state-set-runtime (list :last-sync-at 1 :last-sync-result 'success))
+    (should (= (plist-get (seshat-state--ensure) :version) 1))
+    (seshat-state-save)
+    (should (= (plist-get (seshat-state--ensure) :version) 1))
+    (let ((contents (seshat-state-test--file-contents seshat-state-file)))
+      (should (= (plist-get (car (read-from-string contents)) :version) 1))
+      (should (equal (plist-get (car (read-from-string contents)) :runtime)
+                     '(:last-sync-at 1 :last-sync-result success))))
+    (setq seshat-state--state nil)
+    (seshat-state-load)
+    (should (= (plist-get (seshat-state--ensure) :version) 1))
+    (should (= seshat-state-version 1))))
 
 (provide 'seshat-state-test)
 

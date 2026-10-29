@@ -680,10 +680,18 @@ PATH 为根内逻辑相对路径（可含 `/`，逐段编码后保留分隔符�
 
 TIMEOUT 为单次请求的超时秒数（透传给 `seshat-transport-request' 的 `:timeout'，
 两个后端各自的口径见传输层；nil 表示不限）。MAX-BYTES 为允许的最大字节数（nil
-表示不限）：**落盘之前**先看响应的 `Content-Length'，数字且大于 MAX-BYTES 时
-**不写盘**、返回 `:too-large t'（并在结果里带 `:size'）——先写满磁盘再报「文件
-太大」毫无意义。`Content-Length' 取不到（无该头 / 非数字，如分段响应）时
-**跳过**检查，绝不因「不知道大小」就拒写。
+表示不限），**两道闸**：
+
+1. **落盘前**看响应的 `Content-Length'，数字且大于 MAX-BYTES 时**不写盘**、
+   返回 `:too-large t'（并在结果里带 `:size'）——先写满磁盘再报「文件太大」
+   毫无意义。
+2. **落盘后**再按**实际文件大小**兜底：`Content-Length' 取不到（无该头、非数字、
+   chunked 编码的分段响应）时第 1 道闸整个失效，若不再兜底就是「一直写到磁盘
+   满」。因此写完后 `file-attribute-size' 超限即**删掉刚写的文件**并返回
+   `:too-large t'`（`:size' 用实际字节数），绝不留下半成品。
+
+第 2 道闸是必要的而不是冗余：服务端可以不发 `Content-Length'（`Transfer-
+Encoding: chunked` 时这是常态），此时「不知道大小」不等于「可以随便写」。
 
 **落盘语义**：
 - 先把响应体（原始字节）写入 TARGET 同目录的临时文件，再 `rename-file' 替换
@@ -698,10 +706,11 @@ TIMEOUT 为单次请求的超时秒数（透传给 `seshat-transport-request' �
 :not-found :read-only-root :range-not-satisfiable :error …)'：`:status' 为整数
 状态码（传输失败为 nil），`:etag' / `:content-type' 取自响应头——`:etag' **带双
 引号**（服务端原样），可直接作为下次 `seshat-rest-upload-file' 的 IF-MATCH
-使用。`:size' 为 `Content-Length' 的整数值（取不到时没有该字段）。
-304 → `:not-modified-p t'；416 → `:range-not-satisfiable t'（响应体是纯文本，
-不解析 JSON）；403 → `:read-only-root t'；404 → `:not-found t'；超限 →
-`:too-large t'。任何状态都不抛错。"
+使用。`:size' 为 `Content-Length' 的整数值；取不到时若走了「落盘后兜底」这条
+路（见上），改用**实际写入的字节数**。304 → `:not-modified-p t'`；416 →
+`:range-not-satisfiable t'（响应体是纯文本，不解析 JSON）；403 →
+`:read-only-root t'；404 → `:not-found t'`；超限 → `:too-large t'`（两道闸任一
+命中）。任何状态都不抛错。"
   (let* ((response (seshat-transport-request
                     "GET"
                     (seshat-rest--file-url path root)
@@ -723,7 +732,18 @@ TIMEOUT 为单次请求的超时秒数（透传给 `seshat-transport-request' �
                          (integerp size)
                          (> size max-bytes))))
     (when (and success (not too-large))
-      (seshat-rest--write-binary-file target (or (plist-get response :body) "")))
+      (let ((written (seshat-rest--write-binary-file
+                      target (or (plist-get response :body) ""))))
+        ;; 第二道闸：按**实际文件大小**兜底。`Content-Length' 缺失 / 非数字
+        ;; （chunked 分段响应是常态）时上面那道闸整个失效，不兜底就会一直写到
+        ;; 磁盘满。超限即删掉刚写的文件——半个大文件既没用又占空间。
+        (when (numberp max-bytes)
+          (let* ((attrs (and (stringp written) (file-attributes written)))
+                 (actual (or (and attrs (file-attribute-size attrs)) 0)))
+            (when (> actual max-bytes)
+              (ignore-errors (delete-file written))
+              (setq too-large t
+                    size actual))))))
     (seshat-rest--result
      base
      (append (list :etag (and success (seshat-transport-header headers "ETag"))
@@ -842,8 +862,9 @@ BLOB 为可选的版本标识（服务端叫 `hash'，即 git commit / blob 引�
   为 nil；
 - BLOB 非 nil → 取**该版本的内容**：返回 `:content' 为该版本的文件内容，`:head'
   为 nil。
-注意线缆参数名是 `hash'（keystone 仓 `docs/api.md' §12.2，实现见 keystone 仓 `internal/api/server.go' 的
-`Query().Get(\"hash\")'），本函数的形参沿用计划里的 `BLOB' 命名但发送时映射为
+注意线缆参数名是 `hash'（keystone 仓 `docs/api.md' §12.2，实现见 keystone 仓
+`internal/api/server.go' 的 `Query().Get(\"hash\")'），本函数的形参沿用计划里的
+`BLOB' 命名但发送时映射为
 `hash='；不要把 `blob=' 发出去——服务端会忽略它并退化成「取历史」。
 
 成功（200）返回 plist `(:status 200 :head :content :not-found :error …)'；

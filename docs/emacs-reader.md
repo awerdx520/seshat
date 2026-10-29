@@ -803,18 +803,26 @@ uid 形态本身**不可读**，可读性由 org 链接描述承担（`[[seshat:
 
 > 服务端侧的 REST 地址与令牌（`seshat-rest-base-url` / `seshat-rest-token`）见 [`configuration.md`](configuration.md) 的「Emacs 客户端配置（批注侧车）」节；令牌只从环境变量 `SESHAT_AUTH_TOKEN` 读取，禁止写入配置文件。
 
-## 书架：按需取书
+## 书架（离线优先）
 
-`M-x seshat-library` 打开 `*Seshat Library*`（major mode `seshat-library-mode`，派生自 `tabulated-list-mode`，只读），列出 `ondemand` 根（书库）的**远端清单**与本地状态，`RET` 即可把书取到本地并打开——不必离开 Emacs 去别处拷文件。`C-u M-x seshat-library` 可从现有 `ondemand` 根的 tag 里选一个过滤（tag 原样 `equal` 比较，不做归一）。
+`M-x seshat-library` 打开 `*Seshat Library*`（major mode `seshat-library-mode`，派生自 `special-mode` 的**自建 buffer**，只读）。它列的是**本地已知书目**：主源是本地状态库（`seshat-state-entries` → `seshat-library--entries-local`，零网络、零子进程），增强源是上次远端刷新落盘的缓存 `~/.local/share/seshat/library-cache.eld`（`seshat-library--entries-cached`）。**打开书架不发任何请求**——断网、服务端不可达时书架照样有内容，不会「看起来书库空了」。`RET` 把书取到本地并打开；`C-u M-x seshat-library` 可从现有 `ondemand` 根的 tag 里选一个过滤（tag 原样 `equal` 比较，不做归一）。
 
-**表格四列**（宽度与排序由 `tabulated-list-mode` 承担，四列都可点表头排序）：
+**三层取数**：`local`（状态库，唯一主源）→ `cache`（`library-cache.eld`，只存远端清单的 uid / 根 / 路径 / 大小 / mtime，**不存**本地三态）→ `remote`（只在按 `g` 时拉取）。合并策略由纯函数 `seshat-library--entries-merge` 承担：同一 uid 以状态库为准（它的 `:state` / `:size` 来自当前磁盘事实，比缓存新鲜）；缓存独有项以 `未登记` 出现、**不丢弃**（这些书远端确实存在，只是本地状态库还没登记）；顺序先状态库、后缓存独有项。
+
+**首次使用**：必须先跑过一次 `M-x seshat-sync-now`——根映射由首次同步写入状态库，书架只读 `seshat-state-roots` 里 `MODE` 为 `ondemand` 的根。状态库与缓存都为空时，书架显式提示「书架为空：请先运行 M-x seshat-sync-now 建立索引」，**不假装书库是空的**。
+
+**每行一条目**，格式为 `<标记> <封面区 N 列> <正文>`；正文用 ` · ` 连接以下六段（空段直接省略，避免出现连续分隔符）：
 
 | 列 | 取值 |
 |---|---|
 | 书名 | 远端路径的 `file-name-nondirectory`（同名书靠「根」列区分；路径缺失时退化显示 uid） |
-| 根 | 该条目所属的根 tag（多根汇总时按请求 tag 显式覆盖，来源唯一） |
-| 大小 | 服务端 `size` 按 1024 进制格式化（`B` / `KiB` / `MiB` / `GiB` / `TiB`，保留一位小数）；大小未知显示 `-`（**与 0 区分**：0 会被读成空文件，`-` 只表示不知道） |
+| 根 | 该条目所属的根 tag（清单收集时校验响应 `:root` 与请求 tag 一致，来源唯一） |
+| 大小 | 按 1024 进制格式化（`B` / `KiB` / `MiB` / `GiB` / `TiB`，保留一位小数）；大小未知显示 `-`（**与 0 区分**：0 会被读成空文件，`-` 只表示不知道） |
+| 进度 | 来自本地侧车 `reads.eld`（`seshat-reads-get`，零网络）：能算出百分比显示 `42%`，只有页码显示 `p.12`（**总页数未知**时的退化形态），两者都没有显示 `-`（不拿 `0%` 冒充「没有进度」） |
+| 待同步 | 该书的待同步批注条数，显示为 `⟳2`；为 0 或**查不到**都不显示。查不到 = 批注队列模块（`seshat-reader-annotation-queue`）未加载，此时该段直接省略（**不是**「0 条」——`nil` 是「查不了」，0 是「查过、确实没有」） |
 | 状态 | 本地三态，见下 |
+
+行首标记：`*` 表示已 `m` 标记，空格表示未标记。`header-line` 显示「第 P/T 页 · 共 N 本（本地 M）· 排序 KEY↑/↓ · 过滤 …· 标记 N」；「本地 M」是 `:source` 为 `local` 的条数，它与「共 N 本」的差额就是只存在于缓存里的 `未登记` 条目。
 
 **状态三态**（`seshat-library--local-state`）：
 
@@ -826,28 +834,42 @@ uid 形态本身**不可读**，可读性由 org 链接描述承担（`[[seshat:
 
 `未登记` 的行照样能 `RET`：取书事务在本地查不到 `(root . path)` 时会向服务端要一次元数据（`GET /api/resources/{uid}`）再落盘。
 
-**键位**（`seshat-library-mode-map`，父表 `tabulated-list-mode-map`，故 `n` / `p` / `S` 等浏览与排序键照旧可用）：
+**键位**（`seshat-library-mode-map`，父表 `special-mode-map`；15 个键，全部由本 mode 自己实现——没有 `tabulated-list` 的浏览 / 排序键可继承）：
 
 | 键位 | 命令 | 作用 |
 |---|---|---|
 | `RET` | `seshat-library-open-at-point` | 取书并打开（本地已有副本则直接打开，**零网络**）；先经 `seshat-reading-open` 打开阅读，`seshat-reading` 不在时退化为 `find-file` |
 | `u` | `seshat-library-refresh-at-point` | **强制重新下载**当前行的本地副本（以 `force` 非 nil 调 `seshat-library-fetch`，即使本地已有副本也重下） |
 | `d` | `seshat-library-delete-local-at-point` | **只删本地副本**（绝不删远端，也不改状态库：删完该行自然退回「未下载」，下次 `RET` 重新取书） |
-| `g` | `tabulated-list-revert` | 重拉远端清单（`M-x revert-buffer` 同一条路） |
-| `q` | `quit-window` | 关闭书架窗口 |
+| `x` | `seshat-library-delete-marked` | 批量删所有标记行的本地副本（逐条走 `d` 的同一路径，远端一律保留） |
+| `m` | `seshat-library-toggle-mark` | 标记 / 取消标记当前行（行首标记 `*`） |
+| `D` | `seshat-library-dired-at-point` | 在 `dired` 里打开该书所在目录（本地无副本时提示，不触网） |
+| `n` | `seshat-library-next-page` | 下一页 |
+| `p` | `seshat-library-previous-page` | 上一页 |
+| `M-<` | `seshat-library-first-page` | 首页 |
+| `M->` | `seshat-library-last-page` | 末页 |
+| `g` | `seshat-library-refresh-remote` | 重拉远端清单并**落盘缓存**（唯一的清单刷新入口，也是唯一会写缓存的键） |
+| `/` | `seshat-library-filter-keyword` | 关键词过滤（大小写不敏感，匹配书名 / 路径 / 根三处） |
+| `F` | `seshat-library-filter-state` | 状态过滤循环：`all` → 已下载 → 未下载 → 未登记 → `all` |
+| `s` | `seshat-library-sort-cycle` | 排序循环：`name` / `root` / `size` / `percent` / `mtime` 各走一遍升序、再各走一遍降序（同键再按一次即反向） |
+| `q` | `quit-window` | 关闭书架窗口（`kill-buffer-hook` 释放全部驻留 image、清空封面队列） |
 
-**零网络不变量**：`d` 与 `u` 走零网络的内部重画路径 `seshat-library--redisplay`（按 buffer-local 缓存的清单重算状态列并重画），**不触发 `GET /api/resources`**；只有 `RET`（本地缺副本时）与 `g` 会触网。原因：「重拉清单」挂在 `tabulated-list-revert-hook` 上（`revert-buffer-function` 指向 `tabulated-list-revert`，故 `g` 与 `M-x revert-buffer` 都会重拉），`d` / `u` 若也走 `tabulated-list-revert` 就会顺带发一次清单请求——那既浪费往返，也违反「`d` 绝不发远端请求」的契约（`emacs/tests/seshat-library-test.el` 有断言守护）。
+**分页**：每页 `seshat-library-page-size`（默认 `30`）条，`n` / `p` / `M-<` / `M->` 翻页，`header-line` 常显「第 P/T 页」。**只渲染当前页**——`seshat-library--render` 只插入当前页的条目，渲染前先把「已驻留但不在新页上」的 uid 交给 `seshat-library--release-leaving-covers` 做 `image-flush`。翻页 / 过滤 / 排序 / 刷新 / 空结果全部走这一条释放路径，因此**同时驻留的 image ≤ 一页**（I-OOM，见 [`architecture.md`](architecture.md)「书架离线层（2026-10-29）」）。分页代价是牺牲连续滚动：条目多时需要多次 `n`，但这是「万级书库不卡主线程」与「image 驻留数有硬上限」的交换条件。
+
+**封面三级回退**：EPUB 用 `unzip` 取内嵌封面 → PDF 用 `mutool` 栅格化首页 → 都不可用时插书名首字占位（`[书]` 形）。缓存目录 `~/.cache/seshat/covers/`（`seshat-covers-dir`）；失败项写**负缓存** `<uid>.none`（空文件，存在即表示「已尝试且确定性失败」），因此失败**不重试**——装好 `unzip` / `mutool` 后必须 `M-x seshat-covers-clear-cache` 才会重新尝试。封面生成一律走 `seshat-covers-queue` 的 idle 串行队列（`seshat-covers-queue-delay` 秒间隔、每次 1 本、单次子进程受 `seshat-covers-timeout` 约束），**绝不在渲染路径上同步生成**——一页 30 本足以把书架冻住几秒。构造与显示的分工见下条。
+
+**I-NONET（离线不变量）**：打开 / 翻页 / 过滤 / 排序 / 删本地（`d` / `x`）/ 标记 / `D` **全部零网络**；只有 `g`（`seshat-library-refresh-remote`）与 `RET`（本地缺副本时）会触网。守护方式是把**三层**网络入口同时钉死——薄包装 `seshat-rest--request`、传输层 `seshat-transport-request`、`url.el`：清单请求走的是 `seshat-rest-list-resources`，它**直连** `seshat-transport-request`（要拿响应头做 `:since-mtime` 翻页），不经 `seshat-rest--request`，只钉薄包装会漏。断言在 `emacs/tests/seshat-offline-invariant-test.el`。
 
 **前提配置**：
 
 - `seshat-sync-roots` 中每个 `ondemand` 根**必须配 `DIR`**，否则该根在书架里只给一次 `message` 提示（「根 X 未配置本地目录，无法取书」）、**不列出条目**（无法定位落点，服务端路径拼不出本地绝对路径）。根配了却缺目录是配置问题而非故障，故提示而非警告。
 - 书架读的是**状态库里的根映射**（`seshat-state-roots`），不是 `seshat-sync-roots` 本身：根映射由首次同步写入（`MODE` 为 `nil` 时由服务端 `/api/roots` 补齐）。因此**先跑过一次同步**（`M-x seshat-sync-now`）才有根可用；改配置后需 `M-x seshat-sync-reset-roots` 才生效（见 [`configuration.md`](configuration.md) 的「同步根映射（M8-B）」节）。
 - 只列 `MODE` 为 `ondemand` 的根；`mirror`（笔记）根不进书架。
-- **加载**：`seshat-library` 带 `;;;###autoload` 标记，`emacs/` 在 `load-path` 上并生成过 autoloads 时可直接 `M-x seshat-library`；否则显式 `(require 'seshat-library)`。它依赖 `seshat-rest` / `seshat-state` / `seshat-sync` 与 `tabulated-list`（内置），并可选依赖 `seshat-reading`（`RET` 打开文档用）与 evil（关 magic state 用）。
+- **加载**：`seshat-library` 带 `;;;###autoload` 标记，`emacs/` 在 `load-path` 上并生成过 autoloads 时可直接 `M-x seshat-library`；否则显式 `(require 'seshat-library)`。它依赖 `seshat-state` / `seshat-reads` / `seshat-covers` / `seshat-log` / `seshat-rest` / `seshat-sync`，并可选依赖 `seshat-reading`（`RET` 打开文档用）、`seshat-reader-annotation-queue`（「待同步」列）与 evil（关 magic state 用）。
 
-**已知成本**：打开书架会**一次拉全根清单**——`GET /api/resources` 只有 `limit` + `has_more`（无 offset 分页），客户端用 `:since-mtime` 翻页到 `:has_more` 为 nil，每页 2000 条。超大书库首次打开会**阻塞主线程**等待（同步循环），且不做增量清单缓存。同一秒内记录多于一页时游标只能前进一秒，该秒剩余记录被跳过，此时提示一次「清单可能不完整（同秒记录超页）」，不重试、不补救。
+**远端刷新成本**（只影响 `g`，不影响打开书架）：`g` 会**一次拉全根清单**——`GET /api/resources` 只有 `limit` + `has_more`（无 offset 分页），客户端用 `:since-mtime` 翻页到 `:has_more` 为 nil，每页 2000 条、单根上限 2000 × 500 页。超大书库刷新会**阻塞主线程**等待（同步循环）。同一秒内记录多于一页时游标只能前进一秒，该秒剩余记录被跳过，此时提示一次「清单可能不完整（同秒记录超页）」，不重试、不补救。
 
-**失败降级**：某个根的清单请求失败只 `display-warning` 并让该根**没有行**（不返回半份清单——半份清单配上「已下载 / 未下载」会误导用户去取一本其实已在远端的书），其余根照常汇总；一根拉不动不会让整个书架打不开。
+**失败降级**：`g` 时某个根的清单请求失败只 `seshat-log` 记一条 warn；**全部根都空时不写缓存**（不拿半份 / 空清单覆盖上一份可用缓存，否则书架会「越刷新越少」），直接退回「状态库 + 上一份缓存」的离线合并结果，界面照常可用。一根拉不动不会让整个书架打不开。
 
 **取书事务**（`seshat-library-fetch`，六步固定顺序，任一步失败即中止）：uid → `(root . path)`（本地状态优先，缺失时问服务端）→ 本地根目录 → **越界校验**（`seshat-sync--local-path`，服务端下发的路径不可信）→ 整份下载（原子落位）→ 登记 `(root, path)` 与 base-blob（`ondemand` 根 blob **恒空串**）→ 落盘状态。网络失败 `display-warning` + 返回 nil；「根未配置目录 / 路径越界 / 服务端未登记该 uid」三种是 `user-error`。服务端侧的同步协议细节见 keystone 仓 `docs/sync-protocol.md` 的「Emacs 客户端按需取书实现要点（M8-C）」。
 
@@ -867,6 +889,23 @@ uid 形态本身**不可读**，可读性由 org 链接描述承担（`[[seshat:
 
 **与 `seshat-library-add` 的区别**：`seshat-library-add`（`M-x`，在 `seshat-reading` 里）是**反方向**动作——把库外文档**复制上传**进 `mirror` 根（`ondemand` 根不作为入库目标，其写入返回 403）；而书架是「从 `ondemand` 根**取下来**」，两者方向相反、不共用代码。
 
+**离线不可用清单**（断网 / 服务端不可达时，书架里哪些动作会失败——写明以免被当成 bug）：
+
+| 动作 | 离线时表现 | 原因 |
+|---|---|---|
+| 打开书架 / 翻页 / 过滤 / 排序 / 标记 | 正常 | 只读状态库与缓存，零网络（I-NONET） |
+| `d` / `x`（删本地副本）/ `m` / `D` | 正常 | 纯本地文件操作 |
+| `RET`（本地已有副本） | 正常 | 零网络直接打开 |
+| `RET`（本地缺副本） | 失败：`display-warning` + 返回 nil | 取书事务需要下载 |
+| `u`（强制重下） | 失败：同上 | 同上 |
+| `g`（刷新远端清单） | 静默降级：warn 进 `*Seshat Log*`，书架沿用状态库 + 上一份缓存 | 不写缓存、不清空书架 |
+| 入库上传（`seshat-library-add`） | 失败 | 写请求 |
+| `seshat-reading-refresh`（阅读器内刷新） | 失败 | 拉远端元数据 |
+| 批注列表拉取 | 失败 / 空表 | 逐书拉批注需要往返 |
+| 翻译 / 解释 | 失败 | 走外部 LLM 引擎 |
+| 封面生成 | 正常（首次需本地文件） | `unzip` / `mutool` 是本地子进程，不触网 |
+| 阅读进度 / 待同步数 | 正常 | 读 `reads.eld` 与本地批注队列 |
+
 ## 透明性边界
 
 「装上 seshat 之后 Emacs 仍像没装一样」不是口号，而是一组**可机械验证的断言**（`emacs/tests/seshat-transparency-test.el`，9 例）。断言方式是**加载后白名单式反向断言**：在模块**已加载**的前提下断言「不该出现的东西不出现」，刻意不用「加载前 / 加载后」差分（共享 ERT 单进程里 `require` 幂等 → 差分恒空 → 断言恒真，是假绿；`seshat-reading--take-over-auto-mode-alist` 是就地改写，第二次执行零效果，同样测不出东西）。
@@ -879,7 +918,6 @@ uid 形态本身**不可读**，可读性由 org 链接描述承担（`[[seshat:
 | 4 | **被 advice 的函数名集合** ⊆ 白名单 `{save-place-to-alist, pcase--mutually-exclusive-p}` | 悄悄改第三方函数行为 |
 | 5 | 实际按 `.org` 自动定 mode 的 buffer，其 `major-mode` 不是 seshat 系 | 第 1 项只断言 alist 事实，本项断言**实际行为**（`find-file-hook` / advice 等旁路） |
 | 6 | `seshat-library-mode` 未在 `auto-mode-alist` 注册任何条目（并再从 `default-value` 侧复核一次） | 书架按扩展名抢走用户的同名文件 |
-
 另有 3 例**反向自我验证**：把假侵入塞进临时上下文（动态绑定的 `auto-mode-alist`、假 hook 值、临时 `advice-add 'ignore`），断言探测器确实会报警——「怎么写都通过」的断言等于没测。
 
 **白名单纪律**：`save-place-to-alist` 是 vendored reader 包（`seshat-reader-saveplace.el`）的既有 advice，`pcase--mutually-exclusive-p` 是 stock Emacs `cl-macs.el` 在 `cl-lib` 加载时自带的 advice（与 seshat 无关，不纳入会因无关原因永久失败）。**新增任何 advice 都必须先更新白名单**——白名单的变更本身即侵入评审点：断言失败时先问「为什么要 advice 第三方函数」，而不是直接加白名单。
@@ -887,7 +925,7 @@ uid 形态本身**不可读**，可读性由 org 链接描述承担（`[[seshat:
 **已知边界**（写明，避免被当作 bug）：
 
 - **hook 内部的 lambda 查不到**：断言只按 symbol 名筛 hook 元素，若有人把 seshat 调用包在匿名 lambda 里挂进全局 hook，断言看不见。
-- **keymap 断言只覆盖 `dired-mode-map`**：不覆盖 `global-map` / `tabulated-list-mode-map`（也不跟随 `keymap-parent` 的父链）——故意如此：按命令反查按键的查询函数会连带搜索父 keymap 链与 `global-map`，无法限定「只查自身」。
+- **keymap 断言只覆盖 `dired-mode-map`**：不覆盖 `global-map` / `seshat-library-mode-map`（也不跟随 `keymap-parent` 的父链）——故意如此：按命令反查按键的查询函数会连带搜索父 keymap 链与 `global-map`，无法限定「只查自身」。
 - **advice 断言按「被 advice 的函数名」建集合**：因此匿名 lambda advice 同样被覆盖（它体现在「某个函数名进入集合」这一事实上），但断言不识别 advice 函数的来源，也不检查 advice 的**内容**——白名单是对「动了哪个函数」的把关，不是对「怎么动」的把关。
 
 **人工验证清单**（自动化断言覆盖不到的行为，需人工确认与未装 seshat 时一致）：
@@ -1080,7 +1118,7 @@ GTROOT=$(dirname "$(find "$HOME" -maxdepth 6 -type d \
 echo "$GTROOT"
 ```
 
-现有套件（**32** 个文件，逐文件实测合计 **1240** 例，0 unexpected / 0 skipped）：`seshat-conflict-test.el`（10 例）、`seshat-library-test.el`（**54 例**，M8-C T1/T2 新增 38 例——数据层 21 + 书架 buffer 17；Phase 4 安全加固再 +16 例——根归属门、清单根一致与 uid 形态过滤、`u` 覆盖确认、下载 `:timeout` / `:max-bytes` 透传与 `:too-large`、分页上限）、`seshat-merge-test.el`（13 例）、`seshat-reader-annotation-decoration-test.el`（21 例）、`seshat-reader-annotation-ink-test.el`（24 例）、`seshat-reader-annotation-queue-test.el`（27 例）、`seshat-reader-annotation-test.el`（**58 例**）、`seshat-reader-annotation-v8-test.el`（14 例）、`seshat-reader-etaf-test.el`（19 例）、`seshat-reader-evil-keymap-test.el`（10 例）、`seshat-reader-hl-line-test.el`（**6 例**，新建：全局化重新开启时的时序竞争、hook 末尾注册的结构契约、重开 buffer 后再次关闭、派生自 `seshat-reader-mode` 的阅读模式同样干净、`special-mode` / `fundamental-mode` 两个不误伤）、`seshat-reader-multipage-test.el`（90 例）、`seshat-reader-outline-test.el`（29 例）、`seshat-reader-page-spec-test.el`（**13 例**，P0 新增：真实 `.so` + 真实 PDF 下的参数语义、scale 夹紧、rotate 方向互换、缓存命中与上限淘汰、零副作用守门）、`seshat-reader-periphery-test.el`（**18 例**）、`seshat-reader-reference-test.el`（**95 例**，基线 50；M8-C 带入 +19 例 uid 形态解析与构造、+17 例全部插入路径与导出回落、+9 例 follow 按需下载链与 doc-id 回归）、`seshat-reader-resize-test.el`（49 例）、`seshat-reader-search-test.el`（**49 例**）、`seshat-reader-select-flash-test.el`（11 例）、`seshat-reader-select-merge-test.el`（18 例）、`seshat-reader-select-scope-test.el`（7 例）、`seshat-reader-select-report-test.el`（**7 例**，M12 T8a 新增：框选回显只报行列数、`seshat-reader-select-message-limit` 已删除）、`seshat-reader-sidebar-test.el`（**143 例**）、`seshat-reader-theme-test.el`（**19 例**，新建：5 档预设与自定义 cons 的下发颜色、`graphite` 走 `-1 -1` 哨兵、关灯不下发 tint、未知/非法预设回落旧路径）、`seshat-reader-translate-test.el`（**159 例**）、`seshat-reading-test.el`（**49 例**）、`seshat-rest-test.el`（**58 例**，安全加固 +3 例——`:max-bytes` 按 `Content-Length` 超限不写盘、`:timeout` 透传）、`seshat-state-test.el`（36 例）、`seshat-sync-cmd-test.el`（14 例）、`seshat-sync-test.el`（77 例）、`seshat-transparency-test.el`（**9 例**，M8-C T5 新增：六项白名单式反向断言 + 3 例反向自我验证）、`seshat-transport-test.el`（**34 例**，安全加固 +1 例——url 后端真正传递 `:timeout`）。**前置**：`seshat-render-core.so` 已构建，否则加载 `seshat-reader` 会触发交互式构建询问并阻塞 batch 运行。
+现有套件（**47** 个文件，逐文件实测合计 **1568** 例，0 unexpected / 0 skipped；下表中个别文件例数为**其新增轮次**的实测值，全仓合计以 **1568** 为准）：`seshat-conflict-test.el`（10 例）、`seshat-covers-test.el`（**23 例**，离线书架新增：路径派生、缓存命中不发子进程、负缓存不重试、`unzip` 缺失降级 `mutool`、`mutool` 缺失降级占位、源图超限跳过并写负缓存、子进程失败不抛错；外部命令与 `executable-find` 全部 `cl-letf` 桩掉，不依赖本机安装）、`seshat-library-test.el`（**107 例**，离线书架批次按新结构**整体重写**：数据层（本地枚举 / 缓存合并 / 过滤 / 排序 / 分页边界）、视图层（15 键位逐个 `keymap-lookup` 断言、行属性反查 uid、翻页释放离开页 image、`d` / `x` 只删 ondemand 根、`D` dired 定位）、I-OOM 三场景的正断言 P + 守恒式 ①②③ 与去桩反假绿自检）、`seshat-log-test.el`（**12 例**，离线书架新增：quiet 时不进 echo area 但进 buffer、级别过滤、行数上限裁剪、buffer 未创建时可调用、`seshat-show-log` 幂等复用）、`seshat-merge-test.el`（13 例）、`seshat-offline-invariant-test.el`（**13 例**，离线书架新增：跨模块不变量——I-NONET 十个场景把 `seshat-rest--request` 绑成 `(error "网络调用")` 后跑打开书架 / 翻页 / 过滤 / 排序 / 删本地 / 批量删 / 启动汇总 / 打开已下载书，I-OOM 跨模块复核，两条反向自检证明桩有效）、`seshat-reader-annotation-decoration-test.el`（21 例）、`seshat-reader-annotation-ink-test.el`（24 例）、`seshat-reader-annotation-queue-test.el`（**30 例**）、`seshat-reader-annotation-test.el`（**58 例**）、`seshat-reader-annotation-v8-test.el`（14 例）、`seshat-reader-etaf-test.el`（19 例）、`seshat-reader-evil-keymap-test.el`（10 例）、`seshat-reader-hl-line-test.el`（**6 例**，新建：全局化重新开启时的时序竞争、hook 末尾注册的结构契约、重开 buffer 后再次关闭、派生自 `seshat-reader-mode` 的阅读模式同样干净、`special-mode` / `fundamental-mode` 两个不误伤）、`seshat-reader-multipage-test.el`（90 例）、`seshat-reader-outline-test.el`（29 例）、`seshat-reader-page-spec-test.el`（**13 例**，P0 新增：真实 `.so` + 真实 PDF 下的参数语义、scale 夹紧、rotate 方向互换、缓存命中与上限淘汰、零副作用守门）、`seshat-reader-periphery-test.el`（**18 例**）、`seshat-reader-reference-test.el`（**95 例**，基线 50；M8-C 带入 +19 例 uid 形态解析与构造、+17 例全部插入路径与导出回落、+9 例 follow 按需下载链与 doc-id 回归）、`seshat-reader-resize-test.el`（49 例）、`seshat-reader-search-test.el`（**49 例**）、`seshat-reader-select-flash-test.el`（11 例）、`seshat-reader-select-merge-test.el`（18 例）、`seshat-reader-select-scope-test.el`（7 例）、`seshat-reader-select-report-test.el`（**7 例**，M12 T8a 新增：框选回显只报行列数、`seshat-reader-select-message-limit` 已删除）、`seshat-reader-sidebar-test.el`（**143 例**）、`seshat-reader-theme-test.el`（**19 例**，新建：5 档预设与自定义 cons 的下发颜色、`graphite` 走 `-1 -1` 哨兵、关灯不下发 tint、未知/非法预设回落旧路径）、`seshat-reader-translate-test.el`（**159 例**）、`seshat-reading-test.el`（**53 例**）、`seshat-reads-test.el`（**17 例**，离线书架新增：进度侧车记录 / 读回、百分比边界（`total` 为 `nil` / `0` / `page > total`）、原子写不残留临时文件、坏文件降级为空、重复记录幂等）、`seshat-rest-test.el`（**58 例**，安全加固 +3 例——`:max-bytes` 按 `Content-Length` 超限不写盘、`:timeout` 透传）、`seshat-state-test.el`（**47 例**，离线书架批次新增 `seshat-state-entries` 枚举顺序 / 墓碑孤儿过滤 / `:runtime` 往返与旧文件补 `nil`）、`seshat-status-test.el`（**14 例**，离线书架新增：summary 各分支——从未同步 / 状态库损坏 / 正常 / 待同步非零；notify 关闭时不 message；延迟钩子不阻塞启动；零网络）、`seshat-sync-cmd-test.el`（**22 例**）、`seshat-sync-test.el`（77 例）、`seshat-transparency-test.el`（**9 例**，M8-C T5 新增：六项白名单式反向断言 + 3 例反向自我验证）、`seshat-transport-test.el`（**34 例**，安全加固 +1 例——url 后端真正传递 `:timeout`）。**前置**：`seshat-render-core.so` 已构建，否则加载 `seshat-reader` 会触发交互式构建询问并阻塞 batch 运行。
 
 用例数是**实测值**，统计命令（每个文件单独跑、抓 `Ran N tests` 求和；与全仓脚本同一套 `-L`）：
 
@@ -1107,7 +1145,7 @@ total=0; for f in emacs/tests/*-test.el; do \
 
 其余 24 个文件只用仓库内两个 `-L` 即可跑全；上表的 skip / 失败都是**缺 `-L` 造成的假绿/假红**，跑全仓时 12 个 straight 目录必须齐备。
 
-**必须逐文件运行**：一次 `emacs --batch` 加载全部测试文件时，`seshat-reader-annotation-test.el` 与 `seshat-reader-annotation-queue-test.el` 各有 3 个列表渲染用例会失败——同时加载 `etaf` 测试后 `etaf-ui` 变为可用，批注列表改走 EBOX/ETAF 渲染，而那两个用例断言的是纯文本（如 `"没有批注"`）。这是**既有基线特性、不是回归**：全仓用例总数按逐文件求和计（当前 **32** 个文件合计 **1240** 例，0 unexpected / 0 skipped；本轮读取器 P0 带入 `seshat-reader-page-spec-test.el` **13** 例（`seshat-render-core.so` 真实渲染，不是桩）；M8-C 一轮带入：新增 `seshat-library-test.el` **38** 例与 `seshat-transparency-test.el` **9** 例，`seshat-reader-reference-test.el` 69 → **95** 例；Phase 4 安全加固再带入 **20** 例——library 38 → **54**、rest 55 → **58**、transport 33 → **34**；更早一轮「面板键改用 evil `'local` state keymap」带入 sidebar 套件 137 → 140（**当前实测 139**，以上表列值为准）：删除 1 例 `--panel-evil-keys-four-keymaps`（按 map 对象断言，与新方案互斥）、新增 4 例「`'normal`+`'local` 且落在面板 buffer 内 / 四个 kind 的键→命令集合 / buffer 已 kill 时空操作 / 显示漏斗与 `pop-to-buffer` 回退分支都传 (BUFFER KIND)」；上一轮「面板保持 evil normal state + `n` / `p` 翻页补绑 + 搜索翻页高亮侧栏当前页」带入 search 套件 38 → **48**、sidebar 套件 134 → **137**；上一轮「搜索命中在阅读与结果侧栏之间双向同步」带入 search 套件 30 → **38**；再上一轮「追问中转 buffer 隐藏 + 面板内 evil emacs state + 翻译/解释 toggle 语境对应」带入 translate 套件 138 → **143**、sidebar 套件 132 → **134**；再上一轮「重开按最近显示顺序 + 搜索侧栏补 `C-c w`」带入 sidebar 套件 126 → **132**；再上一轮「M-o 面板键位 / 重开位置 / evil 下 ? 补绑」带入 sidebar 套件 120 → **126**；再上一轮「搜索侧栏纳入面板机制」带入 sidebar 套件 117 → **120**；本轮「面板正文宽度跟随窗口 + valign」带入 translate 套件 143 → **159** 例（+16）、sidebar 套件 139 → 143 例（+4，resize 出口显式刷新正文宽度的兜底））。跑全仓脚本见下（`for` 循环逐文件执行，任一文件非零退出即整体失败）：
+**必须逐文件运行**：一次 `emacs --batch` 加载全部测试文件时，`seshat-reader-annotation-test.el` 与 `seshat-reader-annotation-queue-test.el` 各有 3 个列表渲染用例会失败——同时加载 `etaf` 测试后 `etaf-ui` 变为可用，批注列表改走 EBOX/ETAF 渲染，而那两个用例断言的是纯文本（如 `"没有批注"`）。这是**既有基线特性、不是回归**：全仓用例总数按逐文件求和计（当前 **47** 个文件合计 **1568** 例，0 unexpected / 0 skipped；本轮读取器 P0 带入 `seshat-reader-page-spec-test.el` **13** 例（`seshat-render-core.so` 真实渲染，不是桩）；M8-C 一轮带入：新增 `seshat-library-test.el` **38** 例与 `seshat-transparency-test.el` **9** 例，`seshat-reader-reference-test.el` 69 → **95** 例；Phase 4 安全加固再带入 **20** 例——library 38 → **54**、rest 55 → **58**、transport 33 → **34**；更早一轮「面板键改用 evil `'local` state keymap」带入 sidebar 套件 137 → 140（**当前实测 139**，以上表列值为准）：删除 1 例 `--panel-evil-keys-four-keymaps`（按 map 对象断言，与新方案互斥）、新增 4 例「`'normal`+`'local` 且落在面板 buffer 内 / 四个 kind 的键→命令集合 / buffer 已 kill 时空操作 / 显示漏斗与 `pop-to-buffer` 回退分支都传 (BUFFER KIND)」；上一轮「面板保持 evil normal state + `n` / `p` 翻页补绑 + 搜索翻页高亮侧栏当前页」带入 search 套件 38 → **48**、sidebar 套件 134 → **137**；上一轮「搜索命中在阅读与结果侧栏之间双向同步」带入 search 套件 30 → **38**；再上一轮「追问中转 buffer 隐藏 + 面板内 evil emacs state + 翻译/解释 toggle 语境对应」带入 translate 套件 138 → **143**、sidebar 套件 132 → **134**；再上一轮「重开按最近显示顺序 + 搜索侧栏补 `C-c w`」带入 sidebar 套件 126 → **132**；再上一轮「M-o 面板键位 / 重开位置 / evil 下 ? 补绑」带入 sidebar 套件 120 → **126**；再上一轮「搜索侧栏纳入面板机制」带入 sidebar 套件 117 → **120**；本轮「面板正文宽度跟随窗口 + valign」带入 translate 套件 143 → **159** 例（+16）、sidebar 套件 139 → 143 例（+4，resize 出口显式刷新正文宽度的兜底））。跑全仓脚本见下（`for` 循环逐文件执行，任一文件非零退出即整体失败）：
 
 ```bash
 cd /home/thomas/Workspace/seshat && rm -f emacs/seshat-reader/*.elc && \
