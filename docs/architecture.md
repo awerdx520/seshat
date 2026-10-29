@@ -269,12 +269,42 @@ M12 把 M11 的「单个底部面板」升级为「左目录 / 右信息 / 中�
 
 单页 overlay 模型已退役并**彻底删除**（2026-10-28）：elisp 侧**没有任何** `(window-parameter … 'overlay)` 读取点；C 侧原有 `--window-close`（释放 `EmacsWinState`）与 `--refresh-highlights`（兼容入口）两个残留入口也随 legacy 渲染路径一并移除，装饰刷新只走 elisp 的 spec 缓存失效 + 重渲染。
 
-- **buffer 结构**：**每页一行**。行 = 引导空格（`display` 取 `(space :align-to (+ center (-0.5 . SPEC)))`，让页面在窗口里居中且随 redisplay 求值）+ 图像空格（`display` 取页面 image spec）+ 换行。每个页行之后依次是 `seshat-reader-page-gap-lines`（默认 `0`）个整行空行 + **分隔区 3 行**（上空行 / 横贯窗口的线 / 下空行）——线是 `(space :align-to (- right 0))` 的 stretch space 配 `seshat-reader-page-separator-face` 的 `:background`，三段高度由 face `:height` 相对 `frame-char-height` 缩放，总和 = `seshat-reader-page-separator-height`（默认 `0.5`）行像素（名义值；face `:height` 阶梯取整会让实际渲染比名义多 ±1–2px，见 `docs/emacs-reader.md` §7 与 §12）。分隔区像素由 `seshat-reader--multipage-separator-segments`（返回 `(TOP LINE BOTTOM)`）**单一产出**，滚动几何（`--multipage-page-span` / `--multipage-page-max-offset`）与行构造共用它，避免口径分叉。页表 `seshat-reader--pages` 是升序 alist，元素 `(PAGE MARKER . SPEC)`，marker 指向**行首**（插入/删除页行时自动跟随，故页号永远由 marker 反查而不是由行号推算）。
+- **buffer 结构**：**每页一行**。行 = 引导空格（`display` 取 `(space :align-to (+ center (-0.5 . SPEC)))`，让页面在窗口里居中且随 redisplay 求值）+ 图像空格（`display` 取页面 image spec）+ 换行。每个页行之后依次是 `seshat-reader-page-gap-lines`（默认 `0`）个整行空行 + **分隔区 3 行**（上空行 / 横贯窗口的线 / 下空行）——线是 `(space :align-to (- right 0))` 的 stretch space 配 `seshat-reader-page-separator-face` 的 `:background`，三段高度由 face `:height` 相对 `frame-char-height` 缩放，总和 = `seshat-reader-page-separator-height`（默认 `0.5`）行像素（**名义值**；其中横贯窗口的那条**规则行**是 stretch space，行高恒为一个 `frame-char-height`、不吃 face 的相对高度，故实际高度比名义多 `frame-char-height − thickness`——char-h 20 → +18 px/页，见 `docs/emacs-reader.md` §7 与 §12）。分隔区像素由 `seshat-reader--multipage-separator-segments`（返回 `(TOP LINE BOTTOM)`）**单一产出**，滚动几何（`--multipage-page-span` / `--multipage-page-max-offset`）与行构造共用它，避免口径分叉；**`--multipage-page-gap-pixels` 返回的是实测值**（gap 行 + 名义分隔区 + `--multipage-separator-extra-pixels` 补偿），span 与跨页累减距离因此与真实布局一致（P2-B T9 修复，修复前每页少算一个字符行高、5 页累计 90 px）。页表 `seshat-reader--pages` 是升序 alist，元素 `(PAGE MARKER . SPEC)`，marker 指向**行首**（插入/删除页行时自动跟随，故页号永远由 marker 反查而不是由行号推算）。
 - **可见集与虚拟化**：驻留集 = 视口顶页 − `seshat-reader--multipage-preload` .. 视口底页 + 同值（默认 `2`）；越界页 recycle（删行 + 释放 spec），相邻一页保留 spec 缓存。spec 缓存 `seshat-reader--page-spec-cache` 上限 = `min 16 (2K+2)`（K = preload，下限 4），**视口外优先淘汰**；`--multipage-prefetch` 按滚动方向预热**一页**（只暖缓存、不插行）。内存：`--multipage-check-memory` 按 `data-width × data-height × 4` 估算（canvas 缓冲的 ARGB32 像素，缺 `data-*` 时退回 `:width × :height × 4`，缩放 frame 下为低估），超 `seshat-reader-multipage-memory-warning-mb`（默认 75）时每 buffer `message` 一次。
 - **页号派生**：`seshat-reader-current-doc-pagenumber` = **视口顶页**（`window-start` 经 `--multipage-page-at-pos` 反查页行），不再读窗口参数 `page`；`goto-page`（及 `n` / `p` / `M-<` / `M->` / 搜索跳转 / 引用跳转）= 把目标页行设为 `window-start` 并把 `window-vscroll` 归零，故整页跳转恒停在页首。
 - **滚动原语**：一页一行、行高 = 整页位图高，因此**内置行滚动等于翻页**。滚动由 `seshat-reader--multipage-scroll` 实现：「页内用 `window-vscroll` 的像素偏移，跨页时改 `set-window-start` 到相邻页行，余量成为新页的偏移」；步长 = `seshat-reader-scroll-step-pixels`（绝对像素，优先）或 `scroll-step-ratio`（默认 `0.15`）× `(window-body-height WIN t)`，再退回一行（`frame-char-height`）。首尾由「页内偏移夹到 `[0, 高−1]`」自然截止，每轮必前进一页，占位页（spec 为 nil）不会死循环。
 - **几何**：`base-scale` 由**打开文档那一页**的 native 尺寸锚定（`seshat-reader--multipage-reference-native`，reload / rotate 时清空），保证 `W` / `H` / `0` 的基准稳定。每页 target 由分模式表给出：`contain` = `min(base, 该页 width-fit)`、`width` = 该页 width-fit、`height` = 该页 height-fit（**不裁剪**，可横向滚动）、`manual` = base；`contain` / `width` 下任一可见页宽度 ≤ 窗口宽。refit 闸门 `seshat-reader--refit-scale-tolerance`（`0.005`）：已渲染 scale 与目标 scale 差小于该值即视为「已清晰」，避免反复重渲染。
 - **装饰刷新**：装饰（批注 rect、选区闪现、搜索命中、ink 笔迹）在**渲染时烘进位图**，所以「刷新高亮」= 清掉目标页的 spec 缓存并把**全部驻留页**重渲染一次（`seshat-reader--multipage-refresh-decorations`），不再走 C 侧 overlay 重绘入口。代价是每次刷新 O(驻留页) 次重渲染（实测 0.7–11 ms/页）。
+
+## 阅读器两阶段异步渲染（P2-B，2026-10-29）
+
+**动机**：P1 的 `--multipage-sync` 在 range 变化时**逐页同步渲染**，像素渲染因此留在滚动同步路径上——批次 0 的 S1 实测单页 `--page-spec` p95 最高 **49 ms**（扫描书 p50 19 ms，矢量 letter 页 8–10 ms 尖峰），滚动一屏 2 页即几十毫秒的主线程阻塞。**但布局真正需要的只有页高**，它来自页面 bounds（MediaBox/CropBox × scale × rotate），与栅格化无关 ⇒「异步」不必等于「后台线程」，可拆成「尺寸先行（同步、微秒级）+ 像素后补（idle/周期 timer）」。
+
+**为什么不做 worker 线程池**（决策 D1 的取舍）：`render-threads.c/.h`、`CachedPage`、`EmacsWinState` 已在 canvas 后端迁移中**整族删除**；`DocState` 有单线程纪律（`render/render-core.h`），装饰表由主线程拥有，`canvas_data` 指针不可跨调用缓存。重建线程池 = 重建调度器 + 快照 + 生命周期，规模远超本项，且收益被「页高与像素可解耦」这条结构性事实直接绕开。
+
+**两阶段的拆分依据**：
+
+| 阶段 | 入口 | 代价 | 产物 |
+|---|---|---|---|
+| 尺寸先行（同步） | `seshat-reader--page-size` → C 入口 `seshat-reader-dyn--page-size`（`fz_load_page → fz_bound_page → fz_drop_page`） | 中位 4.5–10.3 µs/次 | `(W H)` 显示像素 → 占位行 `(space :width (W) :height (H))`（**括号形式**：裸数字会被当作字体尺寸倍数） |
+| 像素后补（异步） | `seshat-reader--async-render-tick`（每轮 ≤ `seshat-reader-render-idle-batch` 页） | 0.7–11 ms/页 | 真 spec，写回同一页行（只改 `display` 文本属性、**不动 marker**） |
+
+因此「已定尺寸未渲染」成为第三种状态（`spec = nil` 仍是「未渲染」的唯一表达，尺寸另存 buffer-local 平行 alist `seshat-reader--multipage-page-sizes`，不改 `seshat-reader--pages` 的 `(MARKER . SPEC)` 结构）。**占位态与已渲染态页高逐像素相等**（独立 GUI 实测 4/4 组差 0 px），这是 P1 不变量①在异步路径下的延续：页高不变 ⇒ 滚动范围不变 ⇒ `window-vscroll` 不被 redisplay 回滚、不会跳变。
+
+**代际作废（决策 D4）**：`seshat-reader--multipage-render-generation` 是 buffer-local 整数，**只在全量失效入口 `--page-spec-clear-cache` 自增**——它同时清空尺寸缓存与渲染失败计数表，是 rotate / 关闭 / reload / redisplay-all 四类作废时机的汇合点。缓存写入、尺寸缓存写入与 tick 回调都比对代际，不匹配即丢弃（不写缓存、不补位）。**单页入口 `--multipage-forget-specs` 明确不自增**：它被 `--multipage-recycle-page`（滚动回收远页）调用，若在此自增，则「每回收一页就作废全部在途 pending」，持续快速滚动时 idle 补位被系统性作废、退化为超时强制同步，直接吃掉本计划的全部收益。这条写进了代码注释防回归，并有 ERT 回归守卫（「单页 forget 不改变代际、不丢弃在途 pending」）。
+
+**队列是 buffer 级并集，强制同步是窗口级操作（决策 D8）**：`seshat-reader--multipage-pending-renders` 的语义是「所有显示该 buffer 的窗口请求的并集」。因此两个出口必须都按并集口径：
+
+| 出口 | 修前 | 修后 |
+|---|---|---|
+| 态 B 的裁剪（`--multipage-prune-pending` 实参） | 调用窗口的可见页（交集）⇒ 两窗口互相删掉对方的队项 | `--multipage-all-visible-pages`（`frame-list` → `window-list FRAME` → 过滤显示本 buffer 的窗口 → 各窗口 range 展开后取并集） |
+| 态 C 的超时清空（`--multipage-force-sync`） | `--multipage-clear-async-state` **整队清空** ⇒ 其它窗口的占位页失去唯一驱动源、永远补不上像素 | `--multipage-clear-synced-pending`：只把本窗口这一轮同步渲染的页（取 `--multipage-sync-blocking` 的返回值，即同步前的 range）出队；幸存队项保留 + 重启计时起点 + 重排两个 timer；队空才整清（`--multipage-reset-async-state`，态 A 仍用它） |
+
+**三层兜底（决策 D5）**：① 视口内同步（point 页 + 沿 `--multipage-scroll-direction` 相邻的一页）；② 超时强制同步（`seshat-reader-render-async-timeout`，唯一不依赖 timer 的保险）；③ `run-at-time` 周期推进——**idle timer 只作首轮启动**，因为 daemon Emacs 的一个 idle 窗口只 fire 一次（批次 0 的 G3b 实测 ticks=1，`nil REPEAT` 也不行），不能当自续驱动。
+
+**与 canvas 后端的关系**：`--page-size` 走独立的轻量路径（`fz_load_page → fz_bound_page → fz_drop_page`），**不建 display list、不分配像素、不写 `DocPage` 缓存、不动 `DocState`**（含 `current_page_number`），实测 100 次调用后进程 RSS 增量 0 kB；它返回的 `(W H)` 与 `--page-image-spec` 的 `:width`/`:height` **同口径**（`:scale 1` 后的显示尺寸，36 组样本逐值相等），因此占位行与真实 image 的显示尺寸天然一致。像素后补仍走 `--page-image-spec` → canvas 缓冲（每页 ≈1.9 MB），本项**不改内存模型**：异步只改变「何时渲染」，驻留集与缓存上限一概不动（扩大驻留集会直接撞 75 MB 告警线）。
+
+**与 `--scale 1` 修复的关系**：canvas spec 缺 `:scale` 会让 Emacs 按 `image-scaling-factor` 放大 1.2×，而 `--multipage-page-pixel-height` 读声明值 ⇒ 页高系统性少算约 20%（单页最多 365 px）。该缺陷由本计划的批次 0 S2 真机测量暴露并同批修掉；不修则「占位页高 == 真实 image 行高」这条不变量在 canvas 后端下根本不成立，两阶段渲染会引入跳变。
 
 ## 搜索与 ink 渲染流程（2026-10-25）
 

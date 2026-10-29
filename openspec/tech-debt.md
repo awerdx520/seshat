@@ -1639,7 +1639,7 @@
   2. **`--refresh-highlights` 只重建当前窗口 ±5 页**：多页布局下视口可跨更多页，装饰（批注 / 框选闪现 / 搜索命中 / ink）刷新范围必须按视口实际页数重算，否则刚滚入视口的页会显示旧装饰。
   3. **hscroll 是窗口级**：整页横向滚动会让整栏（含相邻页）一起移动，宽页（如 A0 图纸）在多页布局下会把邻页推出视野。需改为按页对齐或按页单独横向偏移。
   4. **多窗口「各看不同页」的能力将丢失**：路线 3 的决策是「页号由视口顶页派生」，不再用 window 参数 `page` 作真相来源；同一文档在两个窗口停在不同位置后，依赖 `page` 参数同步的功能（书签恢复、`--centered-p`、侧栏跳转回写）都要改成按窗口各自派生。
-  5. **整页位图内存与驻留策略（P2-5）——部分缓解（2026-10-28 canvas 后端）**：**已消除** ① Lisp 堆上的 PNM 字符串副本（旧口径 72 dpi 1.42 MB/页、150 dpi 6.16 MB/页）；② C 侧 `CachedPage.img_data`（`CachedPage` 已随 legacy 渲染路径删除）。**仍存在** ① Emacs image cache 内的 canvas 缓冲（每页 `w*h*4`，612×792 ≈ **1.9 MB**，比旧 ≈3.4 MB 降 **43%**）；② 渲染期临时内存——MuPDF pixmap（3 分量 + alpha）与 BGRA 中间缓冲，渲染函数返回前释放、不进缓存。**旧结论已被推翻**：「一张位图在内存里至少两份」不再成立，现状是「Emacs 侧一份常驻 + 渲染期最多两份临时」。**口径更新**：驻留估算改 `data-width × data-height × 4`（不再读 `:data` 长度）；上限仍由 `seshat-reader--page-spec-cache-limit`（8）与多页驻留集（视口 ± `seshat-reader--multipage-preload`）共同约束。**未做**：pin 引用而非复制（已无复制对象）、异步渲染与 idle 预取（P2-1 待办）。
+  5. **整页位图内存与驻留策略（P2-5）——部分缓解（2026-10-28 canvas 后端）**：**已消除** ① Lisp 堆上的 PNM 字符串副本（旧口径 72 dpi 1.42 MB/页、150 dpi 6.16 MB/页）；② C 侧 `CachedPage.img_data`（`CachedPage` 已随 legacy 渲染路径删除）。**仍存在** ① Emacs image cache 内的 canvas 缓冲（每页 `w*h*4`，612×792 ≈ **1.9 MB**，比旧 ≈3.4 MB 降 **43%**）；② 渲染期临时内存——MuPDF pixmap（3 分量 + alpha）与 BGRA 中间缓冲，渲染函数返回前释放、不进缓存。**旧结论已被推翻**：「一张位图在内存里至少两份」不再成立，现状是「Emacs 侧一份常驻 + 渲染期最多两份临时」。**口径更新**：驻留估算改 `data-width × data-height × 4`（不再读 `:data` 长度）；上限仍由 `seshat-reader--page-spec-cache-limit`（8）与多页驻留集（视口 ± `seshat-reader--multipage-preload`）共同约束。**未做**：pin 引用而非复制（已无复制对象）。**已解决（2026-10-29）**：异步渲染与 idle 预取由 P2-B 交付（`openspec/completed/2026-10-28-reader-multipage-p2b-async-render.md`），本项内存模型未变——异步只改「何时渲染」，驻留集与缓存上限未动。
   6. **`snapshot_page_decorations` 与 `submit_render_job` 渲染路径重复未合并**：P0 新增的静态 `snapshot_page_decorations`（`render/render-core.c`）与 `render/render-threads.c` 的 `submit_render_job` 内联的装饰快照逻辑**语义等价但是两份代码**（deep copy 规则、`pts` 逐条拷贝、失败降级策略），任一处修改都会让「屏幕上的位图」与「`--page-spec` 返回的位图」装饰不一致。合并时必须保证 `free_draw_thread_args` 仍是 worker 路径的唯一释放漏斗。
   7. **batch 下第二次渲染撞 `image-flush`**：`emacs --batch` 里连续多次渲染/写 overlay `display` 时 C 侧 `image-flush` 抛 `Window system frame should be used`，因此 P0 的 ERT 夹具必须 `(fset 'image-flush #'ignore)`。**GUI 侧未验证**是否有图像库警告或缓存行为差异——若 GUI 下 `image-flush` 被反复调用（例如每页替换 spec），可能有性能影响，需在 P1 的 GUI 冒烟里观察。
 - 影响：①②③ 是布局**正确性**前置（不处理会画错位置 / 显示旧装饰 / 邻页被推出视野）；④ 是**能力回退**（用户当前依赖的多窗口各看不同页会消失）；⑤ 是**内存上限**，处理不当会让打开大文档直接吃满内存；⑥⑦ 是**一致性与可测试性**债，短期不致命但会让「两条渲染路径取到不同位图」这类 bug 极难定位。
@@ -1670,7 +1670,7 @@
 - **跨页选区未实现**：首期 `user-error`（决策 D7）；需「按阅读顺序拼接两页文本 + 跨页矩形集合（带页号）」。——**已解决（P2-A，2026-10-27）**：页区间由 `--posn-page-extent` / `--selection-page-rects` 求出、逐页调 C 侧单页接口取文取几何，文本按阅读顺序拼接（页间一个换行），几何存 `:page-rects`（`(PAGE X0 Y0 X1 Y1)`），location 写 `pages:<a>-<b>;rect@<p>:…`（单页仍写旧形态、逐字节不变）。落点：`openspec/completed/2026-10-27-reader-multipage-p2a-cross-page-selection.md`（批次 1–3）+ `docs/api.md` §4.5.3 + `openspec/decisions.md` 2026-10-27「跨页选区的 location 形态与引用链接降级」；残余降级见本文件「跨页选区的四类残余降级」条。
 - **横向滚动整栏平移**：`height` 模式与手动放大下，宽页横向滚动会让整栏（含邻页）一起移动（窗口级 hscroll）。
 - **宽页按宽裁剪的取舍**：基准页取「打开文档那一页」，异常宽页被缩到刚好不溢窗；若改用「全文档最大页」需新增 C 侧批量查页尺寸接口。
-- **异步渲染未做**：P1 全同步（0.7–11 ms/页），滚动到新页会阻塞；P2 再做异步 + idle 预取。
+- **异步渲染未做**：P1 全同步（0.7–11 ms/页），滚动到新页会阻塞；P2 再做异步 + idle 预取。——**已解决（P2-B，2026-10-29）**：两阶段渲染落地（同步只查页尺寸 4.5–10.3 µs、像素由 idle 首轮 + `run-at-time` 周期 timer 补上），三层兜底 + 运行时回滚开关 `seshat-reader-render-async`。落点：`openspec/completed/2026-10-28-reader-multipage-p2b-async-render.md`；用户视角见 `docs/emacs-reader.md` §7「两阶段异步渲染」；剩余缺口（`fit-width` 单页成本、连按缩放无去抖、双窗口独立滚动等）见本文件「阅读器两阶段异步渲染（P2-B）遗留（2026-10-29）」。
 - **C 侧单页 overlay 机制仅剩兼容外壳**：`init_overlay` / `init_win_state_ptr` / `get_win_state_ptr` / `--refresh-highlights` / `--window-close` 仍存在但 elisp 侧除 `--window-close`（释放 EmacsWinState）外已无调用；`elisp-helpers.c:279-287` 的 `overlay-put` 无 nil 守卫（`overlayp, nil` 的潜在来源）。——**已解决（P2-A 真机修复，2026-10-27）**：`overlayp nil` 不再有任何真实路径可达——① `check_current_overlay` / `get_current_doc_overlay` 的 nil 判定由 `emacs_value` 指针相等改为 `env->eq`（句柄相等不可靠，nil 真到达时原写法漏判，把 nil 喂进 `overlay-buffer` 即崩溃）；② `prepare_rect_query`（三个 rect 入口的唯一前半段）不再走 `get_reader_current_state`，改为只读 buffer-local 的 `seshat-reader-current-doc-state-ptr`（`get_doc_state_ptr`），overlay / `EmacsWinState` 与 `win_state->closing` 检查一并退出该路径。剩余外壳（`init_overlay` 等）**保留**：`--window-close` 仍需释放 `EmacsWinState`，且旧翻页/显示族 C 函数仍按自己的路径调用 `get_reader_current_state`；`elisp-helpers.c` 的 `overlay-put` 处未加 nil 守卫（无 elisp 调用者，加守卫等于给死代码加分支）。回归：`emacs/tests/seshat-reader-rect-query-overlay-test.el` 6 例（真实 `.so` + 真实 PDF，窗口 overlay 置 nil / 置外来 overlay / 置本 buffer 普通 overlay 三态对比），旧构建下 5/6 失败并复现 `(wrong-type-argument overlayp nil)`。
 - **`posn-*` 访问器在字节编译后被内联**：测试若要桩替必须加载同源 `.el`（已在 `emacs/tests/README.md` 记录）。
 
@@ -1734,13 +1734,13 @@
 - 建议：下次阅读宽页文档时顺手验证；若不恢复，另开小计划（可能同样需要「落帧后再设 hscroll」的次序）。
 - 已验证（2026-10-27，用户真机）：用户确认书签跳回后位置正确（含横向位置），宽页 `hscroll` 在书签恢复时被保留，本条可关闭。
 
-## 阅读器页间分隔区的渲染高度与名义像素有 ±1–2px 偏差（2026-10-27）
+## 阅读器页间分隔区的渲染高度与名义像素的偏差（2026-10-27；2026-10-29 修正为「约 1 个字符行高/页」并已修 span 计算，保留记录）
 
-- 现状：分隔区三行的高度用 face `:height` 的相对倍率表达（`目标像素 / frame-char-height`），而 face 行高是**阶梯函数**——名义 12px（5/2/5）在真实字体 frame 上渲染为 5/3/5 = **13px**。1px 同样不可达（face 与 1px 图像的渲染下限都约 2px），故 `seshat-reader-page-separator-thickness` 默认取 `2` 而不是 `1`。
-- 影响：滚动几何（`seshat-reader--multipage-page-span` / `--multipage-page-max-offset` / 跨页滚动）使用**名义值**（`seshat-reader--multipage-separator-pixels`），与实渲染最多差 ±1–2px，因此页底理论上存在 ≤2px 的不可达残量。不影响体验，也不构成滚动死区（几何口径仍然单一，行构造与滚动共用 `--multipage-separator-segments`）。
-- 建议：**不得在 ERT 里对 ±1px 做严格断言**——像素断言只允许断言「三段（TOP + LINE + BOTTOM）之和 == 名义分隔区像素」这类结构量；真机观感的粗细差异靠调 `seshat-reader-page-separator-height` / `-thickness` 吸收。若将来要求逐像素一致，只能改走「自绘一条 image 条」，需重估窗口宽自适应与 refit 路径（本轮已否决）。
+- 现状（**2026-10-29 实测修正**）：本条目原记「偏差 ±1–2px」，**实测口径错了**。真实偏差是**约 1 个字符行高/页**：分隔区的规则行是 `(space :align-to (- right 0))` 的 **stretch space**，行高恒为一个 `frame-char-height`、**不吃 face 的 `:height` 相对高度**（上/下空白行是普通文本行，`:height 0.2` 精确生效、实测 4 px 无误差）。因此实际高度恒为「`frame-char-height` + 上下留白」，比名义多 `frame-char-height − thickness`——char-h 20 → **+18 px/页**，char-h 25/35/17 → +25/+33/+15；关掉 `seshat-reader-page-separator` 后偏差归零（0/0，对照组实测）。
+- 影响（**已缓解/已修**）：`--multipage-page-span` 是 `--multipage-scroll` 跨页累减距离的唯一依据，修前每跨一页少走一个字符行高、**5 页累计 90 px**（跨页落点累积偏移）。2026-10-29 起 `--multipage-page-gap-pixels` 返回**实测值**（gap 行 + 名义分隔区 + 新增纯函数 `seshat-reader--multipage-separator-extra-pixels` 的补偿），span / `--multipage-page-max-offset` / 跨页累减距离全部按实际布局；独立 GUI 实测 span vs 实测 row→row **0 px**、全文范围 vs Σspan **0 px**、页高三态 0 px。**视觉未变**（分隔行构造与 face 逐字未改，页间距仍是原来那个高度）。
+- 建议（**保留记录，勿重复排查**）：① 不要再把本条目当成「±1px 观感问题」重新立项——偏差的量级与来源已确证，且已被 span 修复吸收；② 依赖「名义分隔区高度」的新消费方必须改用 `--multipage-separator-pixels`（名义）而不是 `--multipage-page-gap-pixels`（实测）；③ 残余：`--multipage-page-span` 仍未透传 window（多 frame 且字体不同时取 `selected-window` 的 `frame-char-height`），见本文件「滚动侧 span 未透传窗口」条——那是 ±1–2 px 级残余，与本条的 +18 px 不是同一件事。
 
-（来源计划：`openspec/completed/2026-10-27-reader-page-separator.md` 的「T0 实测结论」与 T1–T3 实测偏差段。）
+（来源计划：`openspec/completed/2026-10-27-reader-page-separator.md` 的「T0 实测结论」与 T1–T3 实测偏差段；修正依据：`openspec/completed/2026-10-28-reader-multipage-p2b-async-render.md` 的「T9 分隔区 span 修复（2026-10-29）」）
 
 ## 阅读器分隔区选项改动需重排才生效（2026-10-27）
 
@@ -1844,4 +1844,52 @@
 - 影响的缺口：单测层面抓不到「渲染成功但像素没写进去」这类回归（历史上 T2/T3 阶段是靠 `/tmp/canvas-baseline` 的临时 dump 模块 + 与 PNM 基线逐字节比对发现的）。目前该覆盖只存在于一次性回归脚本里，脚本不在仓库内（`dumpmod.c` 刻意不进仓库，因为要用未导出的 `canvas_data`）。
 - 建议：若要把它变成常规回归，需要一条**仓库内**的像素出口，二选一——① 给模块加一个仅在测试构建启用的入口（如 `--debug-canvas-hash`，返回缓冲的 FNV/sha 摘要，不返回整块像素，避免把几 MB 塞进 elisp）；② 让测试在临时目录编译一个小 dump 模块（与 `dumpmod.c` 同构）。①更可控，代价是多一个半公开 API，需在 docstring 里标明「仅测试/诊断用，不保证语义稳定」。本轮不做，因为改动会扩张模块入口面（当前 14 个入口刚在 canvas 迁移中收敛）。
 - 来源：`emacs/tests/seshat-reader-page-spec-test.el`（`--canvas-buffer-fill-regression` 的 docstring）、`render/elisp-helpers.c` 的 `data2elisp_canvas`；代码审查 minor 7。
+
+## 阅读器两阶段异步渲染（P2-B）遗留（2026-10-29）
+
+> 来源：`openspec/completed/2026-10-28-reader-multipage-p2b-async-render.md`（T9 真机验收 ①–⑤ 通过、⑥ 双窗口不通过；D8 的两处出口已修）。本节的条目**都不是**本项引入的回归，而是本项暴露或未覆盖的缺口。
+
+### 1. 双窗口独立滚动不成立（P1 L3-⑪ 违反，主缺口）
+
+- **现象**（用户 2026-10-29 真机回报）：同一文档开两个窗口，滚 A 时 B 跟着动、**且位置看起来「随机」**；B 的页还会变成**背景色**（占位态无像素）且不再恢复。
+- **证据**（T9 客观测量量化）：两窗口视口相隔 11 页时，B 的 `window-start` 从 p12 **塌到 p6**，2 条 `--multipage-sync` 只恢复到 p7，需 1 次显式 `goto-page` 才回位。P2-B 修掉的 D8 违规只解释「不恢复」这一半（态 C 整队清空丢掉另一窗口的 pending），**位置塌陷与「随机」感**属布局模型。
+- **根因**（已定位，带行号）：① `seshat-reader--pages` 是**单 buffer** 的驻留行表（`seshat-reader.el:462`）；② 回收循环遍历整个 buffer、只保留**本窗口**区间（`:3100-3104`，同步路径 `:2971-2976`）；③ `delete-region` 回收后 B 的 `window-start` 随之前移（`:2004`）；④ `--ensure-window-layout` 对**非当前窗口**显式 `set-window-start` 并钉到最小驻留页（`:3727-3734`）；⑤ `--multipage-last-range` 是 **buffer 一份**（`:2139` / `:3040` / `:3079`）⇒ 「区间未变即早退」的判据在多窗口下永远错、结果依赖命令顺序 ⇒ 「随机」感；⑥ 居中/贴左决策按**单窗口**宽度写入 buffer 全局文本属性（`:1771` / `:2217`）⇒ 横向症状。（行号为 2026-10-29 实测，`seshat-reader.el` 后续改动会漂移，按函数名 grep 定位。）
+- **影响**：P1 L3-⑪（「双窗口各自滚动正常」）**不成立**；用户实际只能单窗口阅读，或接受另一窗口被拖走。
+- **建议方向**：另立 P1 follow-up 计划 `openspec/active/2026-10-29-reader-multiwindow-independent-scroll.md`（草案，含 A/B/C 三方案与影响面）。**不要**在修其它问题时顺手改这一段——涉及驻留集语义、内存上限与 T9 的全部几何断言。
+
+### 2. `--multipage-async-overdue-p` 用单一 buffer 时间戳（多窗口粗粒度近似）
+
+- **现象**：超时判据 `--multipage-async-pending-since` 是 **buffer-local 单值**，而队列是「所有窗口的并集」⇒ A 窗口把队列撑久后，B 窗口的下一条命令也会被判「超时」并强制同步。
+- **证据**：`seshat-reader.el` 的 `--multipage-async-overdue-p`（`(> (- (float-time) since) timeout)`）+ `--multipage-note-pending-since` 的「队非空且无时间戳才补」语义；T9 D8 批次已把「幸存队项重启计时」做进 `--multipage-clear-synced-pending`，但**起点仍是单值**。
+- **影响**：多窗口下强制同步的触发频率高于必要（**性能退化，不会渲染错**）；单窗口无影响。
+- **建议方向**：队项级时间戳（`(PAGE . SINCE)`）或按窗口分别记账；若采用前者，`--multipage-pending-remove` / `--multipage-prune-pending` 的队项结构要一并改（当前队项是页号整数），回归面比看起来大。**先做 §1 再谈本项**——两者都动队列结构。
+
+### 3. 并集队列在「窗口长期不可见」时可能长期非空
+
+- **现象**：若某个显示本 buffer 的窗口长期不可见（被 bury 到不可见 frame、或被其它窗口完全遮挡），它的页仍在并集口径里 ⇒ `--multipage-prune-pending` 不会裁掉它 ⇒ 队列长期非空。
+- **证据**：T9 D8 修复批次的「发现但未处理的风险」段（计划内明写「本批按任务书要求不自行加新机制」）；`--multipage-all-visible-pages` 只看「哪些窗口显示本 buffer」与它们的 `--multipage-visible-range`，不看窗口/frame 可见性。
+- **影响**：每条命令都可能因「超时」走强制同步（**性能退化，不会渲染错**）；单窗口、窗口都可见时无影响。
+- **建议方向**：二选一——① 并集口径纳入窗口/frame 可见性（`window-visible-p` + `frame-visible-p`）；② 给队项加登记时间戳、按龄淘汰（与 §2 的队项结构改动可合并）。
+
+### 4. `fit-width` 单页渲染成本高 + 连按缩放无去抖
+
+- **现象**（用户 2026-10-29 真机回报）：`fit-width` 模式卡顿较长（虽已比改造前好）；连按 `+` / `-` 缩放卡顿明显。
+- **证据**：T9 主观项 ②（fit-width 卡顿）与 ④（连按缩放卡顿）；缩放路径每次 `clear-cache` + 同步渲染 point 页与相邻页，无 debounce；单页渲染成本随显示面积增长（canvas 后端实测 0.589 → 1.22 ms 只是 scale 1.0 的口径）。
+- **影响**：观感问题，不影响正确性；`render-idle-batch` 默认 `2` 是「大页场景单轮 ~100 ms」的取舍点，用户可自行降到 `1`。
+- **建议方向**：① 缩放加去抖（参照既有 `--schedule-refit` 的 `--drag-threshold` 范式：连续缩放只保留最后一次，中间帧只做显示层缩放、不重渲染）；② 或给 `fit-width` 单独降 batch。两者都要真机验「缩放后首屏清晰度」不变。
+
+### 5. 跨 frame 双窗口场景无真机覆盖
+
+- **现象**：`--multipage-all-visible-pages` 已改为遍历 `frame-list`（代码审查 ① major 的修复），但只有 **batch 桩用例**（`--all-visible-pages-walks-every-frame`，桩 `frame-list` / `frame-live-p` / `window-list`）证明它遍历每个 frame，**没有真机**两 frame 场景的验收。
+- **证据**：该用例的变异测试（改回无参 `window-list` ⇒ 用例转红）证明断言非空，但 batch 无真实 redisplay 与真实多 frame；T9 真机项 ⑥ 只覆盖同 frame 双窗口。
+- **影响**：跨 frame 时并集口径的正确性只有代码与单测支撑；若 `frame-list` 在某路径上返回非预期（如 minibuffer-only frame、已死 frame 竞态），队项可能被误裁 ⇒ 另一 frame 的占位页不恢复。
+- **建议方向**：GUI 两 frame 真机验收一次（开第二 frame 显示同一 buffer，两 frame 各滚不同页，观察两边的占位页都能补上像素）；后续若做 §1，本项应与 §1 一并验。
+
+### 6. `seshat-reader-sidebar.el:489` 的 `--windows` 与已修 major 同类（docstring 称「全体」实际只答选中 frame）
+
+- **现象**：`seshat-reader-sidebar--windows` 的 docstring 写「返回本包当前的**全体**信息面板窗口」，实现是 `(dolist (win (window-list nil 'nomini)) …)`——无参 `window-list` **只答选中 frame** 的窗口（`seshat-reader-sidebar.el:489`）。
+- **证据**：与 P2-B 代码审查 ① major 完全同类（`--multipage-all-visible-pages` 修前也这么写，docstring 却称「walks every frame」）；该 major 的修法是 `frame-list` → `frame-live-p` 过滤 → `window-list FRAME`。
+- **影响**：面板窗口在另一个 frame 时，`--windows` 看不到它 ⇒ 依赖它的路径（`--window-for-kind` 判「同 kind 是否已显示」、`seshat-reader-sidebar-toggle-width` 取「最近的」面板、kind 全关）在跨 frame 时会误判：可能重复开面板，或 `C-c w` 找不到面板只提示。**不涉及阅读器渲染正确性**。
+- **建议方向**：把实现改成与 `--multipage-all-visible-pages` 同构（`frame-list` → `frame-live-p` → `window-list FRAME`，保持 docstring 的「全体」语义），并补一条桩用例（桩 `frame-list` / `window-list` 按 frame 作答、断言无参调用零次）。**同一轮里检查其它 docstring 写「全体」但实现用无参 `window-list` 的函数**——这类不一致会反复被写出来。
+
 

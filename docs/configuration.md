@@ -207,6 +207,23 @@ Emacs 端通过 `seshat-reader-annotation` 采集 PDF 页面选区并同步为�
 - **`C-c C-h`**：批注高亮的手动刷新入口（清掉目标页 spec 缓存并重渲染驻留页；C 侧 `--refresh-highlights` 入口已在 2026-10-28 canvas 迁移中删除）；自动刷新发生在打开文档与批注列表增删之后。
 - **`o`**：收起/展开左侧目录面板（目录不再 `pop-to-buffer` 抢窗口，改由承载层按 `seshat-reader-outline-sidebar-position` 显示）。只开合目录的命令 `seshat-reader-sidebar-toggle-outline` 不再绑键（与 `o` 功能重复），仍可 `M-x` 调用。
 
+### 阅读器两阶段渲染（P2-B，2026-10-29）
+
+> 客户端侧配置（由 `seshat-reader` 读取），与服务端无关。默认行为**已变更**：滚动进入新页时先只查页尺寸、把页行按最终高度立起来（占位态），像素由 idle / 周期 timer 补上；页高与滚动范围不变、不会跳变。设 `seshat-reader-render-async` 为 `nil` 即完全回到改造前的「逐页同步渲染」。用户视角说明见 [`docs/emacs-reader.md`](emacs-reader.md) §7「两阶段异步渲染」。
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `seshat-reader-render-async` | `t` | **两阶段渲染开关**。非 nil（默认）时，滚动一步只**同步渲染** point 所在页 + 沿 `seshat-reader--multipage-scroll-direction` 相邻的一页，其余可见页登记进 pending 队列、由 idle / 周期 timer 补像素；`nil` 时完全走旧路径——可见范围逐页同步渲染、队列与两个 timer 一并丢弃，结果布局**逐字节等价**（同页同 spec 写到同一行），只差「什么时候渲染」。该开关在**每一步滚动**都重新读取，改完下一条命令即生效（无需重启/重载）。**它只覆盖 elisp 路径**：C 侧改动（如 `--page-size` 入口、`:scale 1` 修复）必须 `make clean all` 重编 `.so` 并**重启 Emacs** 才生效——动态模块不可卸载 |
+| `seshat-reader-render-async-timeout` | `1.0` | pending 队列存活超过该秒数即触发**超时兜底**：下一次 `post-command-hook` 里的 `--multipage-sync` 把**本窗口**可见范围强制同步渲染，并只把这次覆盖到的页出队；幸存队项（其它窗口登记的页 + 同步预取刚登记的一页）**保留**，同时重启计时起点并重排两个 timer，使它们各自拿到完整的超时窗；只有出队后队列为空才整清（队列 + 两个 timer + 时间戳）。队列是 buffer 级并集、强制同步是窗口级操作，故强制同步**永不整队清空**（D8）。计时起点 = 队列首次变为非空的时刻，或**上一次留下队项的强制同步**时刻。**边界**：`0` 或负数 ⇒ 判据 `(> 已存活秒数 超时值)` 恒成立（存活秒数非负且时钟持续推进）⇒ 队列一非空，**下一条命令**就强制同步，等价于「几乎总是同步渲染」；非数字 ⇒ `numberp` 守卫使 `--multipage-async-overdue-p` 恒返回 nil（永不超时，只剩 idle/周期 timer 两条保险）。该值在**检查截止期时**读取，`setq` 立即生效 |
+| `seshat-reader-render-idle-delay` | `0.05` | **周期推进间隔**（秒）——**不是**「idle 延迟」。同一个数承担两件事：① 首次推进的 **idle timer 延迟**（该 timer 用 `nil REPEAT` 武装）；② 之后推进队列的 **`run-at-time` 周期 timer 周期**。为什么必须两条：daemon Emacs 里 `run-with-idle-timer` 的一个 idle 窗口**只 fire 一次**（批次 0 的 G3b 实测 ticks=1，无新输入不 re-arm），不能当自续驱动，故 idle 只负责「首轮启动」、周期 timer 负责「持续推进」。`0.05` = 每秒 20 轮，远高于每轮渲染 `render-idle-batch` 页所需（每页几毫秒）。**不建议设为 0**：周期 timer 会几乎无间隔地连续触发，等于占满主线程推进队列 |
+| `seshat-reader-render-idle-batch` | `2` | **每轮最多渲染的页数**（单轮成本上限，不是总量上限）。一轮渲染完即返回，剩下的交给周期 timer 的下一拍。存在这个上限的原因是渲染跑在 **Emacs 主线程**：一次渲染整队会让事件循环挨一整块长阻塞，读者感受到的正是异步想消除的那种卡顿。扫描书单页 p95 ≈ 49 ms ⇒ `2` 页时单轮可达 ~100 ms（约一条命令的延迟）；大页 / 扫描书场景建议降到 `1`。`nil` 或非正数按 `1` 处理（`(max 1 (or … 1))`） |
+
+说明：
+
+- **三层兜底**（从快到慢）：① 视口内同步——point 页与滚动方向相邻页永远同步渲染，任何情况下「正在看的页」不会是空白；② 超时强制同步——队列超过 `render-async-timeout` 未排空则下一条命令走同步（唯一不依赖 timer 的保险）；③ 周期推进——idle 首轮 + `run-at-time` 自续（timer 可能因 Emacs 忙而漏拍）。
+- **失败 3 次落占位并放弃**：同一页连续渲染失败 3 次后永久移出 pending（不再尝试），页停在占位态；该页**重新进入可见范围**时计数清零重试，代际变化（缩放 / 切暗色 / 重载 / 关文档）时整表清空。
+- **观测方式**：这四个选项都是普通 defcustom，`M-x customize-option` 逐个可见（`:group 'seshat-reader`）；不设 `:set` 回调，`setq` / customize 本身不触发重排或重绘（与本包既有版式类选项一致）。
+
 ### 阅读器暗色模式配色（2026-10-27）
 
 > 客户端侧配置（由 `seshat-reader` 读取，经原生模块的进程级状态生效），与服务端无关。暗色开关仍是 `M-x seshat-reader-dark-mode`，本节的选项只决定**暗色下页面被映射成哪两色**。

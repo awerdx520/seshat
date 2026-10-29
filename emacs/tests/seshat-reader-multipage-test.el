@@ -3184,16 +3184,24 @@ T7 的验收是「不崩」：跨页选区的 `user-error' 属 T8，本批只要
         (kill-buffer (car buffer))))))
 
 (ert-deftest seshat-reader-multipage-test--separator-adds-to-the-gap-lines ()
-  "Gap lines and the separator stack instead of replacing each other."
+  "Gap lines and the separator stack instead of replacing each other.
+
+2 条 gap 行（2 × 10px）+ 分隔区名义 5px + 规则行多占的 8px：规则行是
+stretch space，行高恒为一个字符行高（10px），名义厚度只有 2px，差额由
+\\(`seshat-reader--multipage-separator-extra-pixels') 补进滚动口径。"
   (seshat-reader-multipage-test--with-line-height 10
     (let* ((seshat-reader-page-separator t)
            (seshat-reader-page-gap-lines 2)
            (buffer (seshat-reader-multipage-test--geometry-buffer '(1 2) 400 500)))
       (unwind-protect
           (with-current-buffer (car buffer)
-            ;; 2 条 gap 行（2 × 10px）+ 分隔区 5px
-            (should (= 25 (seshat-reader--multipage-page-gap-pixels)))
-            (should (= 525 (seshat-reader--multipage-page-span 1)))
+            ;; 分隔区名义高度（三段之和）仍是 5px
+            (should (= 5 (seshat-reader--multipage-separator-pixels)))
+            ;; 规则行的实测溢出 = 行高 10 − 厚度 2
+            (should (= 8 (seshat-reader--multipage-separator-extra-pixels)))
+            ;; 2 条 gap 行（2 × 10px）+ 分隔区 5px + 溢出 8px
+            (should (= 33 (seshat-reader--multipage-page-gap-pixels)))
+            (should (= 533 (seshat-reader--multipage-page-span 1)))
             ;; 附加行数 = gap-lines + 3
             (should (= (+ 2 3)
                        (seshat-reader-multipage-test--lines-between 1 2)))
@@ -3229,10 +3237,11 @@ T7 的验收是「不崩」：跨页选区的 `user-error' 属 T8，本批只要
       (should-not (seshat-reader--multipage-separator-rows)))))
 
 (ert-deftest seshat-reader-multipage-test--separator-on-cross-page-geometry ()
-  "With the default separator the span is page + 5px and a cross lands 45px in.
+  "With the default separator the span is page + 13px and a cross lands 37px in.
 
-分隔区打开时 span 必须含它 5px：500 → 505，非末页的 clamp 因此是 504。跨页一次
-（450 + 100 = 550）余量是 45px 而不是 50px，落点仍是第 3 页页行 —— 像素口径与
+分隔区打开时 span 必须含它**实际**占的高度：名义 5px 加上规则行多出的 8px
+（行高 10 − 厚度 2）= 13px，500 → 513；非末页的 clamp 因此是 512。跨页一次
+（450 + 100 = 550）余量是 37px 而不是 50px，落点仍是第 3 页页行 —— 像素口径与
 buffer 里真实存在的分隔行由同一个行高支撑，两者不再分叉。"
   (seshat-reader-multipage-test--with-line-height 10
     (let ((buffer (seshat-reader-multipage-test--scroll-fixture '(1 2 3))))
@@ -3240,24 +3249,131 @@ buffer 里真实存在的分隔行由同一个行高支撑，两者不再分叉�
           (seshat-reader-multipage-test--window-pixels 1000 800
             (seshat-reader-multipage-test--with-window-buffer buffer
               (with-current-buffer buffer
-                (should (= 505 (seshat-reader--multipage-page-span 1)))
-                (should (= 504 (seshat-reader--multipage-page-max-offset 1)))
+                (should (= 513 (seshat-reader--multipage-page-span 1)))
+                (should (= 512 (seshat-reader--multipage-page-max-offset 1)))
                 ;; 末页仍由窗口高约束：500 − 800 → 0
                 (should (= 0 (seshat-reader--multipage-page-max-offset 3)))
                 (setq seshat-reader-multipage-test--scroll-start
                       (seshat-reader-multipage-test--row-position 1)
                       seshat-reader-multipage-test--scroll-offset 450)
                 (seshat-reader-multipage-test--with-scroll-stubs
-                  (should (= 45 (seshat-reader--multipage-scroll 100)))
-                  (should (= 45 seshat-reader-multipage-test--scroll-offset))
+                  (should (= 37 (seshat-reader--multipage-scroll 100)))
+                  (should (= 37 seshat-reader-multipage-test--scroll-offset))
                   ;; 最后一次写入窗口的像素偏移就是跨页后的余量
-                  (should (= 45 (car seshat-reader-multipage-test--scroll-vscrolls)))
+                  (should (= 37 (car seshat-reader-multipage-test--scroll-vscrolls)))
                   (should (equal (list (seshat-reader-multipage-test--row-position 2))
                                  seshat-reader-multipage-test--scroll-starts))
                   ;; point 落到视口里可见的下一行（第 3 页）
                   (should (= (seshat-reader-multipage-test--row-position 3)
                              (point)))))))
         (kill-buffer buffer)))))
+
+;;;; T9：分隔区实测高度补偿（规则行是 stretch space，恒占一个字符行高）
+
+;; 分隔区的三段几何里，只有规则行不受 face `:height' 影响：它是
+;; `(space :align-to (- right 0))' 拉伸空格，行高恒等于 `frame-char-height'，
+;; 于是实际高度比名义高度多出「字符行高 − 厚度」。滚动算术必须把这部分算进去
+;; （`--multipage-page-gap-pixels' 是唯一入口，span / max-offset 都由它派生），
+;; 否则每翻一页少走一个字符行高，跨页落点逐页累积偏移。
+;;
+;; 视觉不改：`--multipage-separator-row' / segments 的三段分配 / face 全部不动，
+;; 只让像素口径反映真实布局（用户已拍板）。
+
+(ert-deftest seshat-reader-multipage-test--span-includes-separator-actual-height ()
+  "The span covers the separator as drawn, not as nominal.
+
+规则行行高恒等于 `frame-char-height'（stretch space 不吃 face 的相对高度），
+上/下留白行是普通文本行、`:height' 精确生效。10px 行高 + 2px 厚度下，名义 5px
+的分隔区实际多占 8px；span 必须含这 8px，否则每页少算一个字符行高。（真机实测：
+20px 行高 + 默认 0.5 行 = 名义 10px、实测 28px，偏差恰为 18px。）"
+  (seshat-reader-multipage-test--with-line-height 10
+    (let* ((seshat-reader-page-separator t)
+           (seshat-reader-page-separator-height 0.5)
+           (seshat-reader-page-separator-thickness 2)
+           (seshat-reader-page-gap-lines 2)
+           (buffer (seshat-reader-multipage-test--geometry-buffer '(1 2) 400 500)))
+      (unwind-protect
+          (with-current-buffer (car buffer)
+            (let* ((nominal-gap (+ (* 2 10) 5))
+                   (actual-gap (seshat-reader--multipage-page-gap-pixels))
+                   (span (seshat-reader--multipage-page-span 1)))
+              (should (= 8 (seshat-reader--multipage-separator-extra-pixels)))
+              (should (= 25 nominal-gap))
+              ;; 差值恰为「字符行高 − 厚度」
+              (should (= 8 (- actual-gap nominal-gap)))
+              (should (= 533 span))
+              (should (= (+ 500 nominal-gap 8) span))
+              ;; 不是恒等式：span 确实比「名义合计」多 8px
+              (should-not (= span (+ 500 nominal-gap)))
+              ;; 同时 max-offset 也跟着 span 走（跨页阈值与 clamp 同一数字）
+              (should (= (1- span)
+                         (seshat-reader--multipage-page-max-offset 1)))))
+        (kill-buffer (car buffer))))))
+
+(ert-deftest seshat-reader-multipage-test--span-unaffected-when-separator-off ()
+  "With the separator off the span keeps the old numbers, pixel for pixel.
+
+关闭分隔区时没有规则行，补偿必须为 0：span = 页高 + gap 行，与修复前逐值一致
+（不因为修复给关掉分隔区的用户多算像素）。"
+  (seshat-reader-multipage-test--with-line-height 10
+    (dotimes (lines 3)
+      (let* ((seshat-reader-page-separator nil)
+             (seshat-reader-page-gap-lines lines)
+             (buffer (seshat-reader-multipage-test--geometry-buffer '(1 2) 400 500)))
+        (unwind-protect
+            (with-current-buffer (car buffer)
+              (should (= 0 (seshat-reader--multipage-separator-extra-pixels)))
+              (should (= (* lines 10)
+                         (seshat-reader--multipage-page-gap-pixels)))
+              (should (= (+ 500 (* lines 10))
+                         (seshat-reader--multipage-page-span 1))))
+          (kill-buffer (car buffer)))))))
+
+(ert-deftest seshat-reader-multipage-test--span-extra-pixels-clamps ()
+  "The compensation degrades to 0 instead of signalling on odd geometry.
+
+四种退化都不能把错误带进滚动算术：① 厚度远大于名义总高（clamp 后线 = 总高，规则
+行**仍然存在**，补偿 = 行高 − 总高）；② 厚度非数字（`--multipage-separator-segments'
+按 0 读 ⇒ 没有规则行 ⇒ 0）；③ 总高为 0（segments 为 nil ⇒ 0）；④ 行高读不到
+（返回 nil 或抛错 ⇒ 0）。厚度/总高的读取口径只有 `--multipage-separator-segments'
+一处，本函数不复制 clamp。"
+  (seshat-reader-multipage-test--with-line-height 10
+    ;; ① 厚度 40 > 总高 5：线被夹到 5，上下留白退化为 0，规则行仍在
+    (let ((seshat-reader-page-separator t)
+          (seshat-reader-page-separator-height 0.5)
+          (seshat-reader-page-separator-thickness 40))
+      (should (equal '(0 5 0) (seshat-reader--multipage-separator-segments)))
+      (should (= 5 (seshat-reader--multipage-separator-extra-pixels)))
+      (should (= 10 (seshat-reader--multipage-page-gap-pixels))))
+    ;; ② 厚度非数字：按 0 读，没有规则行，补偿 0
+    (let ((seshat-reader-page-separator t)
+          (seshat-reader-page-separator-height 0.5)
+          (seshat-reader-page-separator-thickness 'unknown))
+      (should (equal '(2 0 3) (seshat-reader--multipage-separator-segments)))
+      (should (= 0 (seshat-reader--multipage-separator-extra-pixels)))
+      (should (= 5 (seshat-reader--multipage-page-gap-pixels))))
+    ;; ③ 总高为 0 / 开关关闭：segments 为 nil，补偿 0
+    (let ((seshat-reader-page-separator t)
+          (seshat-reader-page-separator-height 0))
+      (should-not (seshat-reader--multipage-separator-segments))
+      (should (= 0 (seshat-reader--multipage-separator-extra-pixels))))
+    (let ((seshat-reader-page-separator nil))
+      (should (= 0 (seshat-reader--multipage-separator-extra-pixels))))
+    ;; ④ 行高读不到：先取好 segments（它自己也需要行高），再桩掉行高只验容错
+    (let* ((seshat-reader-page-separator t)
+           (seshat-reader-page-separator-height 0.5)
+           (segments (seshat-reader--multipage-separator-segments)))
+      (should (equal '(1 2 2) segments))
+      (cl-letf (((symbol-function 'seshat-reader--multipage-separator-segments)
+                 (lambda (&optional _window) segments))
+                ((symbol-function 'seshat-reader--default-line-pixels)
+                 (lambda (&optional _window) nil)))
+        (should (= 0 (seshat-reader--multipage-separator-extra-pixels))))
+      (cl-letf (((symbol-function 'seshat-reader--multipage-separator-segments)
+                 (lambda (&optional _window) segments))
+                ((symbol-function 'seshat-reader--default-line-pixels)
+                 (lambda (&optional _window) (error "frame without a font"))))
+        (should (= 0 (seshat-reader--multipage-separator-extra-pixels)))))))
 
 (ert-deftest seshat-reader-multipage-test--separator-uses-display-window-frame ()
   "`--multipage-insert-page' builds the separator rows for the display window.

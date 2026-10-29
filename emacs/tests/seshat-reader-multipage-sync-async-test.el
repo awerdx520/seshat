@@ -39,6 +39,9 @@
 ;;   4) 态 B 失败清零：失败 2 次的页重新可见后计数归 0，允许重试；
 ;;   5) 态 C 超时：pending 存活超过 `seshat-reader-render-async-timeout' ⇒ 本轮
 ;;      走同步路径、队列清空、两个 timer 被取消；
+;;   5b) 态 C 保队（T9，D8 的第二个出口）：强制同步只把**本窗口范围**的页出队，
+;;      其它窗口登记的队项仍在，两个 timer 仍然有效、计时起点重置；队列只剩本
+;;      窗口的页时仍然全清；态 A 的整队清空语义不变；
 ;;   6) 开关切换：t → nil → t 反复切换不残留 timer / pending；
 ;;   7) timer 不泄漏：三个 timer 函数全部桩住，nil 态下 buffer-local 变量为 nil；
 ;;   8) 全量回归（41 文件 1383 例）由 `make -C emacs/tests ert' 覆盖。
@@ -78,12 +81,39 @@
 
 `seshat-reader--multipage-visible-range' widens it by
 `seshat-reader--multipage-preload', so the observable range is
-\(FIRST - preload . LAST + preload) clipped to the document page count.")
+\(FIRST - preload . LAST + preload) clipped to the document page count.
+
+It is the fallback for every window that has no entry of its own in
+`seshat-reader-sync-async-test--viewports', i.e. the single-window case.")
+
+(defvar seshat-reader-sync-async-test--viewports nil
+  "Per-window viewports for the stubbed `window-start'/`window-end'.
+
+Each element is (WINDOW . (FIRST-PAGE . LAST-PAGE)); nil -- the default --
+makes every window answer from `seshat-reader-sync-async-test--viewport', so
+the tests written before the table existed see exactly what they saw then.
+
+It exists for the two-window tests of decision D8: in batch a whole page row is
+one text line, so the real `window-end' would give both windows on the same
+buffer the same range and a test could not tell a window-level answer from a
+buffer-level one.  Same shape as the table of
+`seshat-reader-multipage-async-render-test--viewports' (T8), kept local to this
+file because every ERT file is loaded in its own Emacs process.")
 
 (defun seshat-reader-sync-async-test--row-start (page)
   "Return the buffer position of the page row of PAGE, or nil."
   (when-let* ((entry (assq page seshat-reader--pages)))
     (marker-position (cadr entry))))
+
+(defun seshat-reader-sync-async-test--viewport-for (window)
+  "Return the (FIRST . LAST) viewport the stubs report for WINDOW.
+
+WINDOW's own entry in `seshat-reader-sync-async-test--viewports' wins; a
+window without one falls back to
+`seshat-reader-sync-async-test--viewport', which is the behaviour every
+single-window test relies on."
+  (or (cdr (assq window seshat-reader-sync-async-test--viewports))
+      seshat-reader-sync-async-test--viewport))
 
 (defun seshat-reader-sync-async-test--fake-spec (page)
   "Return a fake canvas spec of PAGE, 600x800 pixels."
@@ -108,8 +138,10 @@ batch:
   the real numbers would clip every page; 1000x800 is what a normal GUI frame
   reports;
 - `window-start'/`window-end' -- derived from
-  `seshat-reader-sync-async-test--viewport', because in batch a whole page row
-  is one text line and the real `window-end' would swallow the whole buffer;
+  `seshat-reader-sync-async-test--viewport' (or from
+  `seshat-reader-sync-async-test--viewports' for a window that has an entry
+  there), because in batch a whole page row is one text line and the real
+  `window-end' would swallow the whole buffer;
 - `seshat-reader-dyn--page-size' -- answers the page bounds at the requested
   scale (600x800 at scale 1.0), which is what the native entry point does
   without rendering.  Stubbing the symbol also makes `fboundp' true, so
@@ -141,13 +173,15 @@ batch:
                        ((symbol-function 'window-body-height)
                         (lambda (&optional _window _pixels-p) 800))
                        ((symbol-function 'window-start)
-                        (lambda (&optional _window)
+                        (lambda (&optional window)
                           (seshat-reader-sync-async-test--row-start
-                           (car seshat-reader-sync-async-test--viewport))))
+                           (car (seshat-reader-sync-async-test--viewport-for
+                                 (or window (selected-window)))))))
                        ((symbol-function 'window-end)
-                        (lambda (&optional _window _update)
+                        (lambda (&optional window _update)
                           (seshat-reader-sync-async-test--row-start
-                           (cdr seshat-reader-sync-async-test--viewport))))
+                           (cdr (seshat-reader-sync-async-test--viewport-for
+                                 (or window (selected-window)))))))
                        ((symbol-function 'seshat-reader-dyn--page-size)
                         (lambda (_page scale &optional _rotate)
                           (list (round (* 600 (or scale 1.0)))
@@ -595,6 +629,286 @@ contain 模式下目标 scale = min(base, 宽向 fit)。页宽 1200、窗口 100
           (seshat-reader--multipage-sync (selected-window)))
         (should (= 667 (seshat-reader--multipage-page-pixel-height 1)))
         (should (= 1000 (seshat-reader--multipage-max-page-width)))))))
+
+;;; T8：态 A 与基线路径的完整几何等价（不变量③的完整形态）
+
+(defun seshat-reader-sync-async-test--geometry ()
+  "Return the layout geometry of the current buffer as a plist.
+
+Four views of the same layout, all of them things a user can see move:
+
+- `:lines' -- the buffer extent, i.e. how many lines the layout produced;
+- `:markers' -- (PAGE . POSITION) for every page row, in page order;
+- `:specs' -- (PAGE WIDTH HEIGHT) from each row's spec, nil dimensions for a
+  page that has none;
+- `:max-width' -- the horizontal scroll bound (`--multipage-max-page-width');
+- `:heights' -- (PAGE . PIXEL-HEIGHT), the vertical extent of every row.
+
+Comparing two of these is what \"byte for byte equivalent\" means at the
+observable level: same rows, same positions, same sizes."
+  (list :lines (count-lines (point-min) (point-max))
+        :markers (mapcar (lambda (entry)
+                           (cons (car entry) (marker-position (cadr entry))))
+                         seshat-reader--pages)
+        :specs (mapcar (lambda (entry)
+                         (let ((spec (cddr entry)))
+                           (list (car entry)
+                                 (and spec (image-property spec :width))
+                                 (and spec (image-property spec :height)))))
+                       seshat-reader--pages)
+        :max-width (seshat-reader--multipage-max-page-width)
+        :heights (mapcar (lambda (entry)
+                           (cons (car entry)
+                                 (seshat-reader--multipage-page-pixel-height
+                                  (car entry))))
+                         seshat-reader--pages)))
+
+(ert-deftest seshat-reader-sync-async-test--state-a-matches-baseline-geometry ()
+  "State A leaves a layout indistinguishable from the blocking baseline.
+
+`--state-a-equals-blocking' 只比了**渲染页序**（谁在什么时候被渲染）；这里是
+不变量③的完整形态：两个独立构造的等价缓冲区，一个走态 A（`--multipage-sync'
++ 开关 nil）、一个直接调 `--multipage-sync-blocking'，跑完之后的**布局**必须逐
+项相同 —— 行数、每页 marker 位置、每页 spec 的 `:width'/`:height'、水平上限、
+每页像素高。
+
+为什么页序相同还不够：态 A 是多绕了一层（清异步状态 → 调 blocking → 再清一次），
+这一层若顺手碰了布局（比如额外插了预取行、把 spec resize 了一次），页序完全可
+以一模一样而屏幕上的滚动范围已经变了。"
+  (let ((async-geometry nil)
+        (blocking-geometry nil))
+    (seshat-reader-sync-async-test--with-buffer '(1 2 3 4 5)
+      (setq seshat-reader-sync-async-test--viewport '(2 . 4)
+            seshat-reader-current-doc-pagecount 7)
+      (seshat-reader-sync-async-test--with-timer-stubs _i _p _c
+        (goto-char (seshat-reader-sync-async-test--row-start 3))
+        (seshat-reader-sync-async-test--with-renderer _calls
+          (let ((seshat-reader-render-async nil))
+            (should (equal '(1 . 5) (seshat-reader--multipage-sync
+                                     (selected-window))))
+            (setq async-geometry (seshat-reader-sync-async-test--geometry))))))
+    (seshat-reader-sync-async-test--with-buffer '(1 2 3 4 5)
+      (setq seshat-reader-sync-async-test--viewport '(2 . 4)
+            seshat-reader-current-doc-pagecount 7)
+      (seshat-reader-sync-async-test--with-timer-stubs _i2 _p2 _c2
+        (goto-char (seshat-reader-sync-async-test--row-start 3))
+        (seshat-reader-sync-async-test--with-renderer _calls2
+          (let ((seshat-reader-render-async nil))
+            (should (equal '(1 . 5)
+                           (seshat-reader--multipage-sync-blocking
+                            (selected-window))))
+            (setq blocking-geometry (seshat-reader-sync-async-test--geometry))))))
+    ;; 两份快照都拿到了（否则下面的 equal 会在 nil 之间相等，成为假绿）。
+    (should blocking-geometry)
+    (should async-geometry)
+    ;; 逐项断言，失败时能直接看出是哪一项漂了。
+    (should (= (plist-get blocking-geometry :lines)
+               (plist-get async-geometry :lines)))
+    (should (equal (plist-get blocking-geometry :markers)
+                   (plist-get async-geometry :markers)))
+    (should (equal (plist-get blocking-geometry :specs)
+                   (plist-get async-geometry :specs)))
+    (should (equal (plist-get blocking-geometry :max-width)
+                   (plist-get async-geometry :max-width)))
+    (should (equal (plist-get blocking-geometry :heights)
+                   (plist-get async-geometry :heights)))
+    ;; 整份快照也相等（防止将来往快照里加字段却忘了断言）。
+    (should (equal blocking-geometry async-geometry))))
+
+;;; T6 的超时兜底会重新武装 pending 计时（态 C 的第二轮窗口）
+
+(ert-deftest seshat-reader-sync-async-test--state-c-rearms-pending-since ()
+  "The forced synchronous pass re-arms the pending timestamp and both timers.
+
+超时兜底（态 C）清空队列后，同步路径的预取**仍会登记一页**（开关为 t 时）。那一
+页必须拿到属于它自己的完整超时窗口：`--multipage-async-pending-since' 要重置成
+强制同步那一刻的时间（不是保留旧值，也不是留 nil），两个 timer 要重新排上。否则
+新登记的那页要么立刻被判超时（每轮命令都全量同步，异步彻底失效），要么永远没有
+计时起点（超时兜底对它失效）。
+
+时钟桩 1000.0 → 1001.5 → 1001.6 → 1002.6 四个点：态 B 登记、超时强制同步
+\(1.5 s > 1.0 s）、新窗口尚未到期（0.1 s）、从重置点算满 1.0 s 后再次到期。
+用独立 buffer 夹具、pagecount 7（预取页 6 因此存在且不在可见范围内），不改动
+`--state-c-timeout-forces-sync' 依赖的 pagecount = 5。
+"
+  (seshat-reader-sync-async-test--with-buffer '(1 2 3 4 5)
+    (setq seshat-reader-sync-async-test--viewport '(2 . 4)
+          seshat-reader-current-doc-pagecount 7)
+    (let ((now 1000.0))
+      (cl-letf (((symbol-function 'float-time) (lambda (&optional _time) now)))
+        (seshat-reader-sync-async-test--with-timer-stubs idle periodic cancelled
+          (goto-char (seshat-reader-sync-async-test--row-start 3))
+          (let ((seshat-reader-render-async-timeout 1.0))
+            (seshat-reader-sync-async-test--with-renderer _calls
+              ;; 态 B：1、2、5 登记，预取页 6 也登记 ⇒ 计时起点 = 1000.0
+              (should (equal '(1 . 5)
+                             (seshat-reader--multipage-sync (selected-window))))
+              (should (equal '(1 2 5 6)
+                             seshat-reader--multipage-pending-renders))
+              (should (= 1000.0 seshat-reader--multipage-async-pending-since))
+              (should (>= (length idle) 1))
+              (should (= (length idle) (length periodic)))
+              (let ((idle-before (length idle))
+                    (periodic-before (length periodic)))
+                ;; 时钟推到 1.5 s：超时 ⇒ 强制同步
+                (setq now 1001.5)
+                (should (seshat-reader--multipage-async-overdue-p))
+                (should (equal '(1 . 5)
+                               (seshat-reader--multipage-sync
+                                (selected-window))))
+                ;; 预取页仍登记，计时起点换成强制同步那一刻（不是旧值 1000.0）
+                (should (equal '(6) seshat-reader--multipage-pending-renders))
+                (should (= 1001.5 seshat-reader--multipage-async-pending-since))
+                (should-not (= 1000.0
+                               seshat-reader--multipage-async-pending-since))
+                ;; 两个 timer 重新排上（旧的已被强制同步取消）
+                (should seshat-reader--multipage-async-idle-timer)
+                (should seshat-reader--multipage-async-render-timer)
+                (should (> (length idle) idle-before))
+                (should (> (length periodic) periodic-before))
+                (should (>= (length cancelled) 2)))
+              ;; 新窗口刚起步：0.1 s 后当然还没到期
+              (setq now 1001.6)
+              (should-not (seshat-reader--multipage-async-overdue-p))
+              (should (= 1001.5 seshat-reader--multipage-async-pending-since))
+              ;; 从重置点算满 1.0 s ⇒ 再次到期（窗口是完整的，不是残值）
+              (setq now 1002.6)
+              (should (seshat-reader--multipage-async-overdue-p)))))))))
+
+;;; T9：态 C 的清空路径（D8 的第二个出口）
+
+(ert-deftest seshat-reader-sync-async-test--state-c-keeps-other-windows-pending ()
+  "The forced synchronous pass drops its own range only, not another window's pages.
+
+决策 D8 说队列是 **buffer 级并集**（每个显示本 buffer 的窗口各贡献一份），而态 C
+（超时兜底）是 **窗口级** 操作：它只同步渲染调用窗口的可见范围。修前它调
+`--multipage-clear-async-state' 整队清空，于是另一个窗口登记的页失去唯一的驱动
+源 —— 它的占位页永远不会补上像素（用户真机实测：双窗口时另一窗口「跟背景色一
+样」且不再恢复）。本用例是那个缺陷的机械形式。
+
+夹具：文档 8 页、preload 1；窗口 A 视口 (4 . 5) ⇒ 范围 (3 . 6)；窗口 B 视口
+\(5 . 6) ⇒ 范围 (4 . 7)。队列里先放三页：8（B 的范围之内、A 的范围之外，且不是
+A 的预取页 7 —— 否则修前也会被预取重新登记，用例就分不出对错）、3 与 5（A 自己
+的可见页，模拟「另一窗口登记过的同一页」）。时钟推过 timeout ⇒ A 这一轮走态 C。
+
+期望：3/4/5/6 同步渲染并**全部出队**；8 仍在队列；A 的预取页 7 照旧入队（预取页
+是本轮**新增**的，不属于「已渲染」）；两个 timer 仍有效；计时起点重置到强制同步
+那一刻（1001.5，不是旧的 1000.0），否则存活队项会立刻再次超时、每轮命令都全量
+同步。"
+  (seshat-reader-sync-async-test--with-buffer (number-sequence 1 8)
+    (setq seshat-reader-current-doc-pagecount 8)
+    (let* ((win-a (selected-window))
+           (win-b (split-window win-a)))
+      (unwind-protect
+          (let ((seshat-reader-sync-async-test--viewports
+                 (list (cons win-a '(4 . 5))
+                       (cons win-b '(5 . 6))))
+                (now 1000.0))
+            (cl-letf (((symbol-function 'float-time)
+                       (lambda (&optional _time) now)))
+              (seshat-reader-sync-async-test--with-timer-stubs
+                  idle periodic _cancelled
+                (let ((seshat-reader-render-async-timeout 1.0))
+                  (goto-char (seshat-reader-sync-async-test--row-start 5))
+                  (should (seshat-reader--multipage-pending-add 8))
+                  (should (seshat-reader--multipage-pending-add 3))
+                  (should (seshat-reader--multipage-pending-add 5))
+                  (should (= 1000.0
+                             seshat-reader--multipage-async-pending-since))
+                  (setq now 1001.5)
+                  (should (seshat-reader--multipage-async-overdue-p))
+                  (seshat-reader-sync-async-test--with-renderer calls
+                    (should (equal '(3 . 6)
+                                   (seshat-reader--multipage-sync win-a)))
+                    ;; 整个范围同步渲染（3、5 虽在队列里，像素现在已到位）
+                    (should (equal '(3 4 5 6) calls)))
+                  ;; 另一窗口的队项仍在（修前被整队清空丢掉）
+                  (should (memq 8 seshat-reader--multipage-pending-renders))
+                  ;; 本窗口已同步渲染的页全部出队
+                  (dolist (page '(3 4 5 6))
+                    (should-not (memq page
+                                      seshat-reader--multipage-pending-renders)))
+                  ;; 队列 = B 的 8 + 本轮同步预取的 7（预取页不是「已渲染」）
+                  (should (equal '(8 7)
+                                 seshat-reader--multipage-pending-renders))
+                  ;; 队列非空 ⇒ 两个 timer 继续有效，计时起点重置
+                  (should seshat-reader--multipage-async-idle-timer)
+                  (should seshat-reader--multipage-async-render-timer)
+                  (should (= 1001.5
+                             seshat-reader--multipage-async-pending-since))
+                  (should (>= (length idle) 1))
+                  (should (= (length idle) (length periodic)))))))
+        (delete-window win-b)))))
+
+(ert-deftest seshat-reader-sync-async-test--state-c-clears-queue-when-empty ()
+  "An empty queue after the forced pass still takes the whole asynchronous state.
+
+态 C 的「全清」只该发生在**出队之后队列为空**时：那时没有东西可驱动，队列、
+两个 timer 与时间戳一起走。这条是防回归 —— 保队不能变成「队列永不清空」。
+
+夹具：文档 6 页、视口 (4 . 5) ⇒ 范围 (3 . 6)；预取页按 pagecount 裁剪回 6，而 6
+已在驻留集里 ⇒ 预取不登记任何页。队列里只有本窗口的 3、5，出队后为空。"
+  (seshat-reader-sync-async-test--with-buffer '(1 2 3 4 5 6)
+    (setq seshat-reader-sync-async-test--viewport '(4 . 5)
+          seshat-reader-current-doc-pagecount 6)
+    (let ((now 1000.0))
+      (cl-letf (((symbol-function 'float-time)
+                 (lambda (&optional _time) now)))
+        (seshat-reader-sync-async-test--with-timer-stubs
+            _idle _periodic cancelled
+          (let ((seshat-reader-render-async-timeout 1.0))
+            (should (seshat-reader--multipage-pending-add 3))
+            (should (seshat-reader--multipage-pending-add 5))
+            ;; 先真的把两个 timer 排上（否则「取消」断言是空转：没有 timer 可取消）
+            (should (equal '(3 5)
+                           (seshat-reader--schedule-async-render
+                            (current-buffer))))
+            (should seshat-reader--multipage-async-idle-timer)
+            (should seshat-reader--multipage-async-render-timer)
+            (setq now 1001.5)
+            (should (seshat-reader--multipage-async-overdue-p))
+            (should (equal '(3 . 6)
+                           (seshat-reader--multipage-sync (selected-window))))
+            (should-not seshat-reader--multipage-pending-renders)
+            (should-not seshat-reader--multipage-pending-generation)
+            (should-not seshat-reader--multipage-async-pending-since)
+            (should-not seshat-reader--multipage-async-idle-timer)
+            (should-not seshat-reader--multipage-async-render-timer)
+            (should (>= (length cancelled) 2))))))))
+
+(ert-deftest seshat-reader-sync-async-test--state-a-still-clears-everything ()
+  "State A keeps wiping the whole queue, including another window's pages.
+
+态 A（`seshat-reader-render-async' = nil）不用队列：所有可见页由
+`--multipage-sync-blocking' 同步渲染，所以整队清空仍然是对的 —— 本批只改态 C 的
+清空路径，不许把态 A 一起改成「按范围出队」（那样每次切开关都会留下一队没人驱动
+的队项）。
+
+夹具与 `--state-c-keeps-other-windows-pending' 相同：窗口 B 的页 7 与窗口 A 的
+页 3 都在队列里，走一轮态 A 之后队列必须整体为空。"
+  (seshat-reader-sync-async-test--with-buffer (number-sequence 1 8)
+    (setq seshat-reader-current-doc-pagecount 8)
+    (let* ((win-a (selected-window))
+           (win-b (split-window win-a)))
+      (unwind-protect
+          (let ((seshat-reader-sync-async-test--viewports
+                 (list (cons win-a '(4 . 5))
+                       (cons win-b '(5 . 6)))))
+            (seshat-reader-sync-async-test--with-timer-stubs
+                _idle _periodic _cancelled
+              (goto-char (seshat-reader-sync-async-test--row-start 5))
+              (should (seshat-reader--multipage-pending-add 7))
+              (should (seshat-reader--multipage-pending-add 3))
+              (should seshat-reader--multipage-async-pending-since)
+              (let ((seshat-reader-render-async nil))
+                (should (equal '(3 . 6)
+                               (seshat-reader--multipage-sync win-a))))
+              (should-not seshat-reader--multipage-pending-renders)
+              (should-not seshat-reader--multipage-pending-generation)
+              (should-not seshat-reader--multipage-async-pending-since)
+              (should-not seshat-reader--multipage-async-idle-timer)
+              (should-not seshat-reader--multipage-async-render-timer)))
+        (delete-window win-b)))))
 
 (provide 'seshat-reader-multipage-sync-async-test)
 

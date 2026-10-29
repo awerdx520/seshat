@@ -1,12 +1,13 @@
 # 阅读器多页布局 P2-B：两阶段渲染（尺寸先行 + idle 补位）
 
 ## 当前状态
-- 阶段：Phase 3（Implement）· **T6 完成（含态 A 等价性修复）**（T6：`--multipage-sync` 三态分流——**态 A**（`seshat-reader-render-async` = nil）原函数体整体搬进 `--multipage-sync-blocking` 后原样转调（逐字节等价；2026-10-29 补修：`--multipage-prefetch` 加同步分支后，态 A 恢复「同步预取一页」，与改造前逐页等价，见「T6 执行记录 · 与计划/任务书的偏差」第 4 条）；**态 B**（默认）point 所在页 + 沿 `--multipage-scroll-direction` 相邻的一页同步 `--page-spec` 渲染，其余可见页「`--page-size` 先定尺寸 → 占位行 → 登记 pending → 排两个 timer」；**态 C** pending 存活超过 `seshat-reader-render-async-timeout`（默认 1.0 s）⇒ 清队 + cancel 两个 timer + 强制走 blocking（区间早退被 `last-range` 临时绑定 nil 绕开）；`--multipage-prune-pending` 与 `--multipage-reset-render-failure` 正式接入 sync；新增 2 个 defcustom（`--render-async` t / `--render-async-timeout` 1.0）。L1 `make -C emacs/seshat-reader clean all` EXIT 0 / C 0 error 0 warning / elisp `Warning` 20（= 基线，零新增）/ checkdoc 0 / `check-parens` 通过；L2 `make -C emacs/tests ert` **42 文件 1396 例**、0 unexpected / 0 skipped、`check-criteria` PASS（新增 13 例，其中 2 例是 2026-10-29 态 A 等价性修复的回归断言；3 个既有用例显式绑定 `render-async` = nil 以保留其「区间内逐页同步渲染」的断言）。T5 记录：（异步渲染调度器：pending 队列 `--multipage-pending-renders` + 队列代际 `--multipage-pending-generation`；`--schedule-async-render` 先 cancel 两个 timer 再挂 **idle 首轮（REPEAT 必须 nil）** + **`run-at-time` 周期推进**；`--async-render-tick` 七步（live 守卫 → 空队收尾 → 防重入 → 代际校验 → 每轮 ≤ `seshat-reader-render-idle-batch` 页 → 成功补位/失败计数 → 队空 cancel）；失败 3 次永久移出 pending，两处清零（全量失效 + `--multipage-reset-render-failure` 供 T6）；`--multipage-prefetch` 改为登记 + 排程，滚动路径零像素成本；`--multipage-prune-pending` 供 T6；新增 2 个 defcustom（`--render-idle-delay` 0.05 / `--render-idle-batch` 2）。L1 `make -C emacs/seshat-reader clean all` EXIT 0 / C 0 error 0 warning / elisp `Warning` 20（= 基线，零新增）/ checkdoc 0 / `check-parens` 3 文件通过；L2 `make -C emacs/tests ert` 41 文件 1383 例、0 unexpected / 0 skipped、`check-criteria` PASS），下一步 T6（sync 改造：视口内同步 + 其余登记 pending + 超时兜底 + 开关）。T4 记录：代际作废（buffer-local `--multipage-render-generation` 在**唯一**入口 `--page-spec-clear-cache` 自增（`--multipage-forget-specs` 明确不自增，理由写进代码注释防回归）；同入口清空尺寸缓存与失败计数表；新增纯判定 `--multipage-generation-current-p`，两个 remember 函数加 `&optional GENERATION`；L2 当时 40 文件 1370 例）。T3 记录：占位行与布局稳定性（第三态「已定尺寸、未渲染」落地；页高 / 最大页宽 / 居中判定 / 行构造四处口径统一到 `--multipage-page-display-size`；补位只改文本属性、marker 零位移；L2 当时 39 文件 1359 例）。T2 记录：elisp 页尺寸层落地（`--page-size` + buffer-local `--multipage-page-sizes`，L2 当时 38 文件 1345 例）
+- 阶段：**已完成（2026-10-29）** · 归档路径：`openspec/completed/2026-10-28-reader-multipage-p2b-async-render.md` · T1–T10 全部完成（T0 批次 0 的 spike 与 Gate 判定在开工前完成，见「## 验证记录」）。**交付摘要**：两阶段异步渲染（尺寸先行 `--page-size` + 像素后补 idle/周期 timer）+ 4 个 defcustom + 三层兜底 + 运行时回滚开关（`seshat-reader-render-async` = nil）；同批修掉 `:scale 1` canvas 缺陷（页高少算 20%、单页最多 365 px）、页间分隔区 span 少算一个字符行高（5 页累计 90 px，修后实测 0 px）、D8 的两个出口（裁剪按交集 / 态 C 整队清空）。**真机主观验收 ①–⑤ 通过、⑥ 双窗口各自滚动不通过** ⇒ 根因 = P1 布局模型（单 buffer 行驻留集 + 窗口共享 buffer-local 布局状态），已转 `openspec/active/2026-10-29-reader-multiwindow-independent-scroll.md`；本批交付其中「D8 清空路径」半（已修 + 3 例 ERT + 变异测试）。逐批细节（T1 的 C 入口、T2 的尺寸层、T3 的占位行、T4 的代际、T5 的调度器、T6 的三态分流、T8 的 D8 裁剪口径、T9 的 span 修复与 D8 清空路径、代码审查的 4 项）各自见「## 验证记录」下对应小节，此处不复述。
 - 审查：plan-reviewer 2026-10-28 有条件通过（0 blocking / 3 major / 7 minor）；本次修订落地 M1（G1 降级依赖闭环）、M2（L2 基线口径）、M3（T2 收敛为平行 alist + 消费方零改动验收；本轮复审已把口径修正为「读 `(cddr entry)` 的 4 处」）、6 项 minor（F5/F8 行号、T1 实现约束、不变量④ 断言、C 侧回滚、README 必改）；第二轮复审 2026-10-28：M2/M6 闭环、M1 闭环、新发现 N1（代际自增点必须挂在全量失效入口 `--page-spec-clear-cache` 而非单页的 `--multipage-forget-specs`，否则滚动回收会误作废全部 pending）已修订，另修 4 处 minor（T5/T8 的 G1 override 提示、T2 消费方归类、失败计数重置语义、T1 行号 195→196）
 - 已确认：方案 ✅（用户 2026-10-28 确认）、计划 ✅（用户 2026-10-28 确认，经 plan-reviewer 两轮审查）、Gate 处置 ✅（G1 未触发 / G2 未触发 / G3b 周期 timer，2026-10-29 实测）
 - 前置：P1 已归档（`openspec/completed/2026-10-26-reader-multipage-p1-layout.md`）、P2-A 已归档（`openspec/completed/2026-10-27-reader-multipage-p2a-cross-page-selection.md`）、canvas 后端迁移已提交（`3265652` 代码 + `7e76d15` 文档）
-- **L2 基线（已实测，本批唯一口径）**：`make -C emacs/tests ert` = **ERT 37 文件 / 1333 例**、0 unexpected / 0 skipped（2026-10-29 `.so` 重建后的回归实跑；此前「1328」的疑义作废，不再按它判「零新增」）
-- 下一步：~~T1（C 侧 `--page-size` 入口）~~ **已完成** → ~~T2（elisp 页尺寸层，依赖新入口）~~ **已完成** → ~~T3（占位行与布局稳定性）~~ **已完成** → ~~T4（代际作废，无依赖，可与 T5 并行）~~ **已完成** → ~~T5（调度器：idle 首轮 + `run-at-time` 周期推进）~~ **已完成** → ~~T6（sync 改造：视口内同步 + 其余登记 pending + 超时兜底 + 开关）~~ **已完成（含态 A 等价性修复，2026-10-29）** → **T8（测试补齐与等价性）→ T9（重启 Emacs 做真机 L3）** → T7（仅文档同步与 customize 验证，见 T7 条目）→ T10
+- **L2 最终口径（2026-10-29 归档时）**：**本计划自身口径 = 42 文件 / 1409 → 42 文件 / 1410 例（+1 例）**，0 unexpected / 0 skipped。算术依据（逐批记录逐项相加）：T5 41 / 1383 → T6 42 / 1396（+13）→ T8 42 / 1403（+7）→ T9 span 42 / 1406（+3）→ T9 D8 清空路径 42 / 1409（+3）→ 代码审查批 42 / **1410**（+1，`seshat-reader-multipage-async-render-test.el` 18 → 19）；T7 / T10 是纯文档批，**零新增用例**。**实跑数字含同一工作区的并发会话**：代码审查批实跑 **43 文件 / 1433 例**（= 1410 + 并发会话的 `seshat-log-test` 12 例 + `seshat-state-test` 新增 11 例；FILES 42 + 1 = 43）；T10 文档批实跑 **45 文件 / 1473 例**（再 + 并发会话的 `seshat-covers-test` 23 例 + `seshat-reads-test` 17 例；FILES 43 + 2 = 45），其中 `seshat-covers-test-invalid-uid-creates-nothing` 报 `(void-variable calls)`——属并发会话未完成的新用例（未跟踪文件），与本计划无关，故本轮实跑为 45 / 1473 / **1 unexpected（来自并发会话）**。**判定「零新增」必须用本计划口径（42 / 1410），不得用实跑总数。**
+- **口径已确认（2026-10-29，harspower）**：本计划自身口径 = **42 文件 / 1410 例**（42/1409 + 代码审查批 1 例）。此前任务书给出的「+11 → 42/1420」系把并发会话 `seshat-state-test.el` 的新增 11 例误记到本计划，**已作废，不得引用**。各批执行记录里的实跑数字保留原值（它们是实测值，含并发会话）。
+- 下一步：**无（本计划已归档）**。T1–T10 全部完成；真机 ①–⑤ 通过、⑥ 双窗口项转 P1 follow-up（`openspec/active/2026-10-29-reader-multiwindow-independent-scroll.md`，草案 / 候选池，待用户圈定方案 A/B/C）。后续动作：① 用户在重启后的主实例上按同口径复核 ①–⑤（本批只改 elisp、C 侧仅新增零副作用入口，重启即生效）；② 需要回滚时 `(setq seshat-reader-render-async nil)`（运行时、无需重启），C 侧回滚须回退源码 + `make clean all` + 重启；③ 遗留缺口见 `openspec/tech-debt.md`「阅读器两阶段异步渲染（P2-B）遗留（2026-10-29）」6 条。
 
 ## 目标
 
@@ -96,10 +97,13 @@
 - [x] **T4 代际作废**：`seshat-reader--multipage-render-generation`（buffer-local 整数），**在 `--page-spec-clear-cache` 内自增**（**不是** `--multipage-forget-specs`，理由见 D4：单页 forget 被 `--multipage-recycle-page` 调用，在此自增会让滚动回收误作废全部 pending）；`--page-spec-remember`、尺寸缓存写入与 idle 回调入口都比对代际，不匹配则丢弃（回调不写缓存、不写尺寸、不补位）。该入口同时清空 `--multipage-page-sizes` 与 `--multipage-render-failures`。验收：① ERT 断言「先登记 pending → 走 `--page-spec-clear-cache` 清缓存 → 触发 idle 回调 ⇒ 缓存无新条目、行仍是占位」；② ERT 断言「单页 `--multipage-forget-specs`（模拟 recycle）**不改变**代际、不丢弃在途 pending」——这条是防过度作废的回归守卫。（依赖：无，可与 T1 并行）
 - [x] **T5 idle 调度器（替换同步预取）**：`--schedule-async-render`（复用 `--schedule-refit` 的「cancel + 单 timer + buffer 入参」范式）；pending 集合按代际与可见范围整理，每轮最多渲染 `seshat-reader-render-idle-batch`（默认 2）页；渲染后补位；**队列推进由 `run-at-time` 周期 timer 自续**（间隔 = `seshat-reader-render-idle-delay`），直到 pending 空或代际变化；**不得依赖 `run-with-idle-timer` 重复 fire**（G3b 实测：一个 idle 窗口只 fire 一次）；`--multipage-prefetch` 改为向 pending 登记（不再同步取 spec）。验收：ERT（桩 `run-with-idle-timer` 捕获回调手动执行）覆盖「登记→补位→pending 清空」「代际变化后不补位」「每轮上限生效」；④ ERT 断言「idle 回调只被消费一次、后续推进来自周期 timer」（桩住两种 timer 分别计数）。（依赖：T3、T4；**G1 触发时依赖改为仅 T4**）
 - [x] **T6 `--multipage-sync` 改造**：视口内「point 所在页 + 滚动方向第一页」同步渲染（保持现状手感），其余可见页登记 pending；超时兜底（`--render-async-timeout`，默认 1.0 s，G3 触发则 0.2 s 并加 `run-at-time` 兜底）；`seshat-reader-render-async` 为 nil 时走旧路径（逐页同步 + 同步预取）。验收：ERT 覆盖三态（默认异步 / 超时强制同步 / 开关关闭等价旧行为）；真机 L3。（依赖：T5、T7）**执行记录见「## 验证记录 · T6 执行记录（2026-10-29）」**；「视口内」定稿为「point 页 + 沿 `--multipage-scroll-direction` 相邻的一页」（不是「视口两端都同步」），理由与取舍写在同一节。
-- [ ] **T7 四个 defcustom 的文档同步 + customize 验证**（**本批不新增任何变量**）：4 个变量已在 T5（`seshat-reader-render-idle-delay` 0.05 / `seshat-reader-render-idle-batch` 2）与 T6（`seshat-reader-render-async` t / `seshat-reader-render-async-timeout` 1.0）落地，T7 **只做**：① `docs/configuration.md` 同步这 4 个变量（语义、默认值、nil/0 的边界）；② `README.md`/`Readme.org` 说明默认行为由「全同步」变为「先空白后清晰」并给出回滚口径；③ `M-x customize-option` 逐个可见（`:type`/`:group` 已就位）；④ 编译 warning 不新增。**注意：不得重复定义**这 4 个 defcustom——重复 `defcustom` 会让 `customize` 里出现两份条目、`defcustom` 的 `:set` 语义失效（历史教训见 T5 记录的偏差第 4 条）。**4 个 defcustom 数量不变，仅语义澄清**（`--render-idle-delay` 由「idle 延迟」改义为「周期推进间隔」）。（依赖：无）
-- [ ] **T8 测试补齐与等价性**：新增/改造用例覆盖 D1–D8；特别包含「`seshat-reader-render-async=nil` 时与旧路径行为等价（同一 PDF 同一页的 spec 几何一致、marker 一致）」与「双窗口 pending 并集」。验收：`make -C emacs/tests ert` 0 unexpected 0 skipped；`check-criteria` PASS。（依赖：T6；**G1 触发时依赖改为 T5**）
-- [ ] **T9 L1/L2 全量 + 真机 L3**：L1 `make -C emacs/seshat-reader clean all`（EXIT 0、C 0/0、elisp warning ≤ 20、checkdoc 0）；L2 全量 ERT + `check-criteria`；L3 真机：① 连续快速滚动无卡顿（且 B8 主观对比批次前后）；② 大页首次进入「先空白后瞬清」可接受；③ 缩放/切暗色期间不出现旧代际像素；④ daemon + `emacsclient -c` 真实空闲后 pending 清空；⑤ 双窗口各自滚动正常；⑥ 页高与滚动几何一致：`:scale 1` 修复后，多页布局的页高/滚动范围与真实显示高度一致（修复前单页最多少算 365 px），主实例重启后同口径复验一次。**C 模块重编译后必须重启 Emacs**。（依赖：T8）
-- [ ] **T10 文档沉淀与归档**：按「## 文档清单」逐项更新；计划移入 `openspec/completed/`；`openspec/tech-debt.md` 勾销 P2-1（异步渲染未做）；roadmap 更新 P2 池状态（P2-1 完成、P2-7 因 `--page-size` 落地只剩判定）。（依赖：T9）
+- [x] **T7 四个 defcustom 的文档同步 + customize 验证**（**本批不新增任何变量**）：4 个变量已在 T5（`seshat-reader-render-idle-delay` 0.05 / `seshat-reader-render-idle-batch` 2）与 T6（`seshat-reader-render-async` t / `seshat-reader-render-async-timeout` 1.0）落地，T7 **只做**：① `docs/configuration.md` 同步这 4 个变量（语义、默认值、nil/0 的边界）；② `README.md`/`Readme.org` 说明默认行为由「全同步」变为「先空白后清晰」并给出回滚口径；③ `M-x customize-option` 逐个可见（`:type`/`:group` 已就位）；④ 编译 warning 不新增。**注意：不得重复定义**这 4 个 defcustom——重复 `defcustom` 会让 `customize` 里出现两份条目、`defcustom` 的 `:set` 语义失效（历史教训见 T5 记录的偏差第 4 条）。**4 个 defcustom 数量不变，仅语义澄清**（`--render-idle-delay` 由「idle 延迟」改义为「周期推进间隔」）。（依赖：无）**已执行（2026-10-29）**：`docs/configuration.md` 新增「阅读器两阶段渲染（P2-B，2026-10-29）」节（4 变量表 + 三层兜底说明 + `render-async-timeout` 的 `0`/负数/非数字边界如实写：`0`/负数 ⇒ 判据恒成立、几乎总是同步；非数字 ⇒ `numberp` 守卫使永不超时）；`README.md` 新增「阅读器渲染：默认两阶段异步」节（行为变更 + 回滚口径 + 4 变量简表），`Readme.org` 加对应小节；customize 可见性用 `emacs -Q --batch` 实测——4 个变量 `custom-variable-p` 全 `t`、`custom-type` 分别为 `boolean`/`number`/`number`/`integer`、全部在 `seshat-reader` 自定义组内；**零重复 `defcustom`**（未改 `seshat-reader.el`）。
+- [x] **T8 测试补齐与等价性**：新增/改造用例覆盖 D1–D8；特别包含「`seshat-reader-render-async=nil` 时与旧路径行为等价（同一 PDF 同一页的 spec 几何一致、marker 一致）」与「双窗口 pending 并集」。验收：`make -C emacs/tests ert` 0 unexpected 0 skipped；`check-criteria` PASS。（依赖：T6；**G1 触发时依赖改为 T5**）**执行记录见「## 验证记录 · T8 执行记录（2026-10-29）」**——本批同时修掉 D8 的实现缺陷（裁剪口径由交集改为并集）。
+- [x] **T9 L1/L2 全量 + 真机 L3**：L1 `make -C emacs/seshat-reader clean all`（EXIT 0、C 0/0、elisp warning ≤ 20、checkdoc 0）；L2 全量 ERT + `check-criteria`；L3 真机：① 连续快速滚动无卡顿（且 B8 主观对比批次前后）；② 大页首次进入「先空白后瞬清」可接受；③ 缩放/切暗色期间不出现旧代际像素；④ daemon + `emacsclient -c` 真实空闲后 pending 清空；⑤ 双窗口各自滚动正常；⑥ 页高与滚动几何一致：`:scale 1` 修复后，多页布局的页高/滚动范围与真实显示高度一致（修复前单页最多少算 365 px），主实例重启后同口径复验一次。**C 模块重编译后必须重启 Emacs**。（依赖：T8） **已执行（2026-10-29）**：①–⑤ 通过（用户真机回报）；⑥ 页高/滚动几何由独立 GUI 进程三方口径实测差 0 px（含分隔区 span 修复后），**双窗口各自滚动不通过** ⇒ 根因 P1 布局模型，转 `openspec/active/2026-10-29-reader-multiwindow-independent-scroll.md`（详见「## 验证记录 · T9 客观测量 / T9 真机主观验收」）。
+  - **⑥ 转 P1 follow-up（2026-10-29 用户回报后判定）**：双窗口主观项**不通过**（另一窗口变背景色；滚 A 时 B 跟着动且随机）。根因不在本批的异步机制，而在 **P1 布局模型**（单 buffer 行驻留集 + 窗口共享 buffer-local 布局状态），本批的 D8 违规（态 C 整队清空丢掉另一窗口的 pending）只是**放大**了它 —— 该半已在本批修掉（见「### T9 D8 清空路径修复（2026-10-29）」）；「双窗口各自滚动 / 行驻留集按窗口」另立 P1 follow-up 计划。故本项 checkbox 在 D8 修复批次仍不勾，但⑥的归属与处置已闭环（**T10 归档时按 ①–⑤ 通过而勾选**，⑥ 的验收归属见本节第 3 条）。
+  - **①–⑤ 已由用户 2026-10-29 回报通过**（重启正常、fit-height 正常 / fit-width 卡顿较长但比改造前变好、进入新页正常无跳变、缩放后清晰但连按缩放卡顿明显、切暗色正常），明细见「### T9 真机主观验收（用户 2026-10-29 回报）」；其中②④的「卡顿」属 `render-idle-batch` 默认值取舍（T6 记录末段的待确认建议），不在本批修改范围。
+  - **归档时的勾选结论（T10，2026-10-29）**：本项**勾选**——主观 L3 的 ①–⑤ 已通过（用户真机回报），**⑥ 双窗口项转 P1 follow-up**（见 `openspec/active/2026-10-29-reader-multiwindow-independent-scroll.md`），①–⑤ 通过；本批交付的「D8 清空路径」半已修复并有 3 例 ERT + 变异测试守护；L1/L2 全量与 `check-criteria` 均在本批实跑通过（数字见「## 当前状态」）。勾选**不等于**「⑥ 通过」——⑥ 的验收归属见 follow-up 计划。
+- [x] **T10 文档沉淀与归档**：按「## 文档清单」逐项更新；计划移入 `openspec/completed/`；`openspec/tech-debt.md` 勾销 P2-1（异步渲染未做）；roadmap 更新 P2 池状态（P2-1 完成、P2-7 因 `--page-size` 落地只剩判定）。（依赖：T9）**已执行（2026-10-29）**：`docs/architecture.md` 新增「阅读器两阶段异步渲染（P2-B，2026-10-29）」节（动机 / 拆分依据 / 代际作废 / D8 两出口 / 三层兜底 / 与 canvas 后端关系 / 与 `:scale 1` 修复的关系）；`docs/emacs-reader.md` §7 新增「两阶段异步渲染」小节（用户视角：过渡、降级条件、失败恢复）+ 修正多窗口与分隔区两条旧结论；`docs/configuration.md` 新增 4 变量节；`README.md` / `Readme.org` 说明默认行为变更与回滚口径；`emacs/seshat-reader/VENDORED.md` 的 `--page-size` 条目（入口数 14 → 15）**T1 已写**，本批复核无需改；`CHANGELOG.md` 新增 1 条（新增）+ 2 条（修复）；`openspec/decisions.md` 追加 5 条（2026-10-29）；`openspec/tech-debt.md` 勾销 P2-1、修正分隔区 ±1–2px 条目、新增「两阶段异步渲染（P2-B）遗留」6 条；`openspec/roadmap.md` 更新 P2 池状态；本计划移入 `openspec/completed/`；新建 follow-up 草案 `openspec/active/2026-10-29-reader-multiwindow-independent-scroll.md`。
 
 ## 文档清单
 
@@ -780,3 +784,367 @@
 **待用户确认的建议（本批未改默认值）**
 
 - S1（批次 0 实测）扫描书单页 **p95 49 ms**、p50 19 ms ⇒ `seshat-reader-render-idle-batch` = 2 时**单轮 tick 最长约 100 ms**，这是一次命令可感的停顿（虽然它发生在 idle/周期 timer 里，不与按键同帧）。T5 的建议是「按页面积动态取 1/2」（letter 页 2 页、扫描书/大页 1 页）。**本批不动默认值**，留到 T9 真机做主观判定：若连续滚动仍有可感顿挫，再把 batch 的默认值改 1 或改成面积自适应。请在 T9 前给出取舍。
+
+### T8 执行记录（2026-10-29）
+
+**一句话**：本批补 7 例之外，**先修掉 D8 的实现缺陷**——pending 队列的裁剪口径原本是「调用窗口的可见页」（交集），而 `--multipage-pending-renders` 的 docstring 声明的是「所有显示该 buffer 的窗口请求的并集」；两个窗口滚到不同位置时会互相删掉对方刚登记的页。修法只动裁剪实参，渲染 / 回收 / 失败清零三个循环仍只看本窗口的范围。
+
+**D8 缺陷（修前）**
+
+| 项 | 位置 / 事实 |
+|---|---|
+| 声明 | `seshat-reader.el` 的 `seshat-reader--multipage-pending-renders` docstring：「holds the union of what every window showing the buffer asked for (decision D8)」 |
+| 实现 | `--multipage-sync-async` 里唯一裁剪点（原 `seshat-reader.el:3040`）实参是 `pages` = `(number-sequence (car range) (cdr range))`，即**调用窗口**的可见范围 ⇒ 实际口径是「队列 ∩ 该窗口范围」 |
+| 后果 | 窗口 A 登记了 3、6 号页，窗口 B 的下一轮 pass 在 B 的范围（4..7）上裁剪 ⇒ 3 被剪掉，A 的空白页要等到它自己下一轮 pass 才重登记（且若 A 与 B 交替滚动，每次都互相清空）。计划 D8 与风险表「双窗口 pending 争用」判的是并集语义 |
+| 为什么此前没被发现 | 现有用例全是单窗口；`--state-b-prunes-to-visible-range` 只验证「滚过去的页要被裁掉」，单窗口下交集与并集等价 |
+
+**修法（最终形态）**
+
+| 项 | 内容 |
+|---|---|
+| 新函数 | `seshat-reader--multipage-all-visible-pages (&optional window)`，紧跟在 `seshat-reader--multipage-visible-range` 之后（布局层）。对每个窗口取 `--multipage-visible-range`（视口 ± preload）展开成页号，**取并集**（升序、去重，`delete-dups` + `sort`）；窗口集合 = `(window-list)` 里 `(eq (window-buffer w) (current-buffer))` 的那些，再把 `WINDOW` 参数显式并入（`window` 为 nil 时就是选中窗口，`window-list` 已覆盖，仍按任务书显式并入）；某窗口 range 为 nil 时跳过；全部为空时返回 nil。用 `window-list` 而非 `get-buffer-window-list`（前者在 batch/daemon 下行为更可预测，且过滤条件与布局其余部分同一条） |
+| 调用点 diff | `--multipage-sync-async` 内**一行**：`(seshat-reader--multipage-prune-pending pages)` → `(seshat-reader--multipage-prune-pending (seshat-reader--multipage-all-visible-pages window))`，上方加 4 行注释说明「队列是共享的、布局不是」 |
+| 未改的部分（如何确认） | 渲染循环 `(dolist (page pages) (if (memq page sync-pages) …))`、回收循环 `(dolist (entry (copy-sequence seshat-reader--pages)) … (< page first) (> page last) …)`、失败清零循环 `(dolist (page pages) …)` **三处实参仍是本窗口的 `pages`**。机械证据：`git diff` 里 `seshat-reader--multipage-sync-async` 的改动只有 docstring 段 + prune 那一行 + 注释；`grep -n "multipage-all-visible-pages" seshat-reader.el` 只有定义、prune 调用点与 docstring 三处命中 |
+| `--multipage-prune-pending` 的 nil 语义 | 原实现「PAGES 为 nil ⇒ 队列被清空」。并集在「无窗口报出范围」时正好是 nil，此时清队会丢掉仍有效的工作 ⇒ 改为 **nil 时不动队列直接返回**。docstring 重写，明确「实参是并集而不是调用窗口的范围」以及「渲染/回收仍按窗口」。这条改动**要求更新一个既有用例**（见下） |
+| 为什么改在 prune 侧而不是调用侧 | 任务书要求「nil 时应直接返回、不清队」；在 prune 侧收口后，任何将来新增的调用点都不会踩到「nil 把队清空」这个坑，代价只是 `--prune-pending-keeps-visible` 的一条断言需要按新语义改写（见偏差 1） |
+
+**新增 7 例**
+
+| # | 用例 | 断言要点 | 结果 |
+|---|---|---|---|
+| 1 | `seshat-reader-sync-async-test--state-a-matches-baseline-geometry` | 两个独立构造的等价缓冲区（态 A vs 直接调 `--multipage-sync-blocking`，两边 `render-async` = nil）：行数、每页 marker 位置序列、每页 spec 的 `:width`/`:height`、`--multipage-max-page-width`、逐页 `--multipage-page-pixel-height` **五项逐一相等**，最后整份快照也 equal（防止将来往快照加字段忘了断言） | 通过 |
+| 2 | `seshat-reader-multipage-async-test--pending-union-across-two-windows` | `split-window` 造两窗口（A 视口 (4 . 5) ⇒ 范围 3..6；B 视口 (5 . 6) ⇒ 范围 4..7；并集 3..7），方向向前（-1，两轮预取都不把并集外的页补回来）：先 A 后 B —— A 的队项 3 不在 B 的范围里，仍留在队列；再 A 单独跑一轮 —— B 的队项 7 不在 A 的范围里，仍留在队列。断言队列精确为 `(3 6 2)` → `(3 7)` → `(3 7 2)` | 通过（**变异测试**：把 prune 实参改回 `pages` 后本用例失败，实测 `(3 7)` vs `(7 3)`） |
+| 3 | `seshat-reader-multipage-async-test--queued-pages-stay-out-of-spec-cache` | `render-idle-batch` = 1、登记 3 页、跑一轮 tick：缓存恰 1 条且是刚渲染的第 1 页，另两页 `--multipage-spec-cached-p` = nil 且仍在队列（D7 的「部分排空」角度） | 通过 |
+| 4 | `seshat-reader-multipage-async-test--tick-fill-moves-no-marker` | 两页占位（尺寸桩使页高已是 800）→ tick 补位：**全部页 marker 位置逐条不变、`buffer-substring-no-properties` 全文逐字节不变**、目标行 `display` 变成真 spec（`eq` 同一对象）、另一页仍是 `space` 占位、页高仍是 800（覆盖 tick 内 `resize-spec` + `set-page-centered` 之后的路径） | 通过 |
+| 5 | `seshat-reader-multipage-async-test--generation-move-during-render-is-not-a-failure` | 渲染桩内部先 `--page-spec-clear-cache` 再返回 nil ⇒ 代际 +1、`--multipage-render-failure-count` 仍 0、`--multipage-render-failed-p` = nil、`--multipage-render-failures` 整表为空、队列与代际已清、无补位、无缓存、两个 timer 被取消（对应 `seshat-reader.el` 的 `invalidated` 分支，修前零覆盖） | 通过 |
+| 6 | `seshat-reader-sync-async-test--state-c-rearms-pending-since` | `float-time` 桩 1000.0 → 1001.5 → 1001.6 → 1002.6，pagecount 7（独立 buffer 夹具，不动 `--state-c-timeout-forces-sync` 的 pagecount = 5）：态 B 起点 1000.0 → 超时强制同步后预取页 6 仍入队、`--multipage-async-pending-since` 重置为 **1001.5**（≠ 1000.0）、两个 timer 重新排上 → 1001.6 未到期 → 1002.6 再次到期（窗口是完整的，不是残值） | 通过 |
+| 7 | `seshat-reader-multipage-async-test--custom-defaults` | `seshat-reader-render-async` = t、`seshat-reader-render-async-timeout` = 1.0（补 `--batch-default-is-two` 未覆盖的两个 T6 defcustom） | 通过 |
+
+**夹具扩展（步骤 2）**
+
+- `seshat-reader-multipage-async-test--with-body` 新增两个桩：`window-start` / `window-end`。默认行为**不变**：它们只在 `seshat-reader-multipage-async-test--viewports`（alist `WINDOW . (FIRST-PAGE . LAST-PAGE)`，默认 nil）里有该窗口时改答该页行首，否则转调进夹具前捕获的真实函数。这样既有 18 个用例零改动（除下面偏差 1 那一条断言）仍然通过。
+- 另加 `--row-start` 辅助函数（页号 → 行首位置），供视口桩与新用例共用。
+- 为什么必须按窗口查表：batch 下 `window-end` 不可信（一整页行只是一行文本），两个窗口会算出同一个范围，用例 2 就会在「交集实现」上也通过（假绿）。
+
+**L1（实测）**
+
+- `make -C emacs/seshat-reader clean all` → **EXIT 0**；C **0 error / 0 warning**；elisp 字节编译 `Warning:` **20**（= 基线 20，零新增）；`checkdoc` **0 诊断**；`check-parens` 3 个改动文件全部通过（shell 与 `verify` 隔离实例各一次）。
+- 改动后曾用 `make -C emacs/seshat-reader all`（增量）复核过一次：EXIT 0 / 0 error / 该文件 17 条既有 warning（清空构建的总数 20 含其它文件）。
+
+**L2（实测）**
+
+- `make -C emacs/tests ert` → **FILES=42 / TOTAL=1403 / UNEXPECTED=0**，EXIT 0；`make -C emacs/tests check-criteria` → **PASS**（四条判据行全部按预期，含 `Ran 0 tests` 的假绿拦截）。基线 42 文件 / 1396 例 ⇒ **+7 例**，无新增文件。两个改动文件的单文件跑数：async-render-test 13 → **18**，sync-async-test 13 → **15**。
+- 旧 `.elc` 陷阱复发一次（第一次跑新用例时 `--multipage-all-visible-pages` 报 `void-function`：加载的是上一次构建的 `seshat-reader.elc`）⇒ 改 `.el` 后必须先 `make -C emacs/seshat-reader all` 再跑 ERT；已按此顺序重跑并留证。
+
+**elisp-mcp 三实例流程（实测痕迹）**
+
+| 步骤 | 结果 |
+|---|---|
+| `elisp_mcp_set_task(verify)` | `{"status":"ok","task":"verify",...}` |
+| `elisp_mcp_instance(verify, start)` | `{"status":"started",...}` |
+| `elisp_mcp_instance_status(verify)` #1 | `socket-exists:false, alive:false` |
+| `elisp_mcp_instance_status(verify)` #2 | `socket-exists:true, alive:true`（约 11 s 就绪，**未出现历史上那种启动卡死**） |
+| 实例内 `elisp_check_parens` × 3 文件 | 全部 `{"status":"ok"}` |
+| 实例内 flymake（trigger + get，`seshat-reader.el` 与 async 测试文件） | `未收集到诊断（未启用 Flymake 或后端未产生诊断）` —— 该实例没有启用 flymake 后端，**故本批没有 flymake 数值**；语法与定义层的把关由 `make all`（字节编译 + checkdoc）与 `check-parens` 承担 |
+| 实例内 `elisp_eval_expression` + `load-file` | 被 MCP 黑名单拦下（`禁止调用危险符号: load-file`）⇒ 「外部改盘后在实例内重载文件」这条路走不通，未强行绕过 |
+| 收尾 | `set_task(auto)` → `instance(verify, stop)` → `instance_status` 确认 `task:"auto"`、`alive:false`、`socket-exists:false`、`task-ttl-seconds:"auto（无 task 文件）"` |
+
+**与计划的偏差（诚实记录）**
+
+1. **改了一个既有用例的断言**：`seshat-reader-multipage-async-test--prune-pending-keeps-visible` 原来断言「`--prune-pending` 传 nil ⇒ 队列被清空」，与新语义（nil = 没有窗口报出范围 ⇒ 队列原样保留）冲突。改为断言 nil 不动队列 + 用一个**不含任何队项的集合** `'(9)` 验证「真的全裁掉时队列与代际都清空」，即原断言的语义（队列能被裁空）仍然被覆盖。这是任务书步骤 1 要求的语义变更的直接后果，不是顺手改断言；其余既有用例零改动。
+2. **`--multipage-prune-pending` 的语义改在函数内部**（任务书列了「剪在调用点」与「改 prune」两条路，选择后者），理由见修法表最后一行。
+3. **用例 2 的视口与方向是推算出来的**：为了让「A 的队项落在 B 范围之外」与「B 的队项落在 A 范围之外」两件事都能同时观察到，需要两窗口范围部分重叠（重叠是必然的：`--multipage-sync-async` 会回收本窗口范围外的行，两个相距很远的窗口在单 buffer 里本来就不可能同时驻留——这是既有设计性质，不在本批范围），且**滚动方向取 -1**（方向 +1 时 A 的预取页恰好是 B 的预载页，会在下一轮被重新登记，从而掩盖裁剪差异）。
+4. **未做**：没有为「回收 + 双窗口」的组合做用例（两窗口相距较远时行会被互相回收，属既有设计限制，需 T9 真机观察，见下）；没有 flymake 数值（实例无后端）；没有提交 git（按任务书）。
+5. **做得比计划多的**：对用例 2 做了一次**变异测试**（把 prune 实参改回 `pages`、重编译、重跑），实测该用例失败（`(3 7)` vs `(7 3)`），证明它不是「怎么改都绿」的空断言；随后已恢复源码并重新 `make all`（md5 回到 `daa2b119…`）。
+6. **页码/行号漂移**：`seshat-reader.el` 因新增函数而整体后移约 45 行，计划其它小节里引用的行号（如 `3040`）已不再准确；本记录只按修前事实标注「原 `seshat-reader.el:3040`」。后续若要行号，请以 grep 函数名定位。
+
+**改后 md5 / 安全点**
+
+| 文件 | 改前 | 改后 |
+|---|---|---|
+| `emacs/seshat-reader/seshat-reader.el` | `15625c82b4768cb3b55f708520347569` | `daa2b119d486dd174567509ec736eaf6` |
+| `emacs/tests/seshat-reader-multipage-async-render-test.el` | `5f0f0a7a11dcd8028670c27c97511fd6` | `086a30046be98bd5af5bc442048f091b` |
+| `emacs/tests/seshat-reader-multipage-sync-async-test.el` | `5cd2fdbe619b38d14e26a2e86eeae062` | `f89dae6cc60e44aea78cbf964699f764` |
+
+安全点 = 起点 `HEAD` = `d240b5616bfea3db42d7230904b5879d5fe27239`（工作区在开工时干净，故未 `git stash create`；回滚口径即 `git checkout -- <三个文件>`）。未提交、未 push。
+
+### T9 客观测量（2026-10-29）
+
+**口径**：独立 GUI 进程（`emacs -Q -l /tmp/t9-*.el`，pgtk frame 130×60、`(frame-char-height)` = 20、`(display-graphic-p)` = t），临时可见 frame + `(redisplay t)` + `window-text-pixel-size` 显式放开 X/Y 上限（`100000`）；**不碰主实例、不重启主实例**。样本：`Ghostscript.pdf`（矢量 477 页，`base-scale` 0.35）+ 真实扫描书（见「样本替换」），五页驻留。
+
+| 项 | 方法 | 结果 |
+|---|---|---|
+| **M1 页高与滚动几何一致（三态）** | 同一页分别取「已渲染 / 占位（走生产路径 `--multipage-placeholder-row`）/ 恢复渲染」三态的行像素高 + `--multipage-page-pixel-height` | 三态**逐值相等，差 0 px**；`:scale 1` 修复后页高与真实 image 行高一致 |
+| **M2 空闲后 pending 清空** | 态 B（异步默认）渲染 + 真实空闲（无输入） | pending 队列在 **≈2.5 s** 内清空，无残留占位页 |
+| **M3 不抖动** | 连续采样 row→row 距离与页行高 | 无抖动（无 ±1 px 漂移） |
+| **M4-a D8 真机生效** | 双窗口各自视口滚不同页 | 两窗口的 pending 队项互不删除（并集语义在真机成立，与 T8 的 ERT 变异测试同结论） |
+| **M4-b 塌陷量化** | 两窗口视口相距较远时行被互相回收 | 已量化记录：属既有设计限制（单 buffer 行驻留集），不在本项范围，留给 T9 主观项观察 |
+| **主实例是否已载入本批 `.so`** | 主实例启动时刻 **10:13:17** < `seshat-render-core.so` 构建时刻 **11:48:22** | **未重启** ⇒ 上述 M1–M4 只能由独立进程代表；**主观 L3-①/②/③/⑤/⑥ 必须在用户重启主实例后做** |
+| **样本替换（诚实记录）** | 上一批用的 `/home/thomas/Workspace/seshat/《新赤脚医生手册》 .pdf` 已不在仓库（`file-exists-p` = nil） | 本批改用 `/home/thomas/Workspace/Tongji-University-Linear-algebra/线性代数 同济第六版【高清OCR可检索版本】.pdf`（真实扫描书 182 页）+ `Ghostscript.pdf`；`base-scale` 与三分段实测法与上一批**完全一致**，故「修复前 → 修复后」的数字可比 |
+
+### T9 分隔区 span 修复（2026-10-29）
+
+**缺陷（修前）**
+
+| 项 | 位置 / 事实 |
+|---|---|
+| 现象 | `--multipage-page-gap-pixels` 报 10 px（默认 `page-separator-height` 0.5 / `thickness` 2 / char-h 20），实测页间实际高度 **28 px** |
+| 偏差规律 | 恒为 `frame-char-height − thickness`（char-h 20/25/35/17 → +18/+25/+33/+15）；`seshat-reader-page-separator` 关掉后偏差归零（0/0） |
+| 根因 | 分隔区**规则行**的 `display` 属性是 `(space :align-to (- right 0))`（`--multipage-separator-row`，修前行 1654），**没有 `:height` 语义**：stretch space 行高恒为一个字体行高，row 里烘焙的 face `:height` 比例对它无效；上/下**空白行**是普通文本行，`:height 0.2` 精确生效（4 px 精确） |
+| 影响面 | `--multipage-page-span`（= 页行高 + gap，修前行 3277）是 `--multipage-scroll` 跨页累减距离的**唯一**依据（`seshat-reader.el:3512-3526`）⇒ 每页少算一个字符行高，**跨页落点累积偏移**（5 页 = 90 px @ char-h 20） |
+
+**落点判定（为什么加在 `--multipage-page-gap-pixels` 里）**
+
+| 判据 | 结论 |
+|---|---|
+| `--multipage-page-gap-pixels` 的语义 | docstring 原文是「the pixel height of **everything that follows** a page row」——即**实际**像素高度，不是名义值；它撒谎了才是缺陷本身 |
+| 它的消费方清单（`grep` 全仓） | 代码消费方**只有** `--multipage-page-span` 一处（其余是 docstring 提及 `seshat-reader.el:1939` 与测试断言）；`--multipage-separator-segments` / `--multipage-separator-rows`（真正**生成**分隔行的路径）用的是**名义** `--multipage-separator-pixels`，**不经过** gap-pixels |
+| 是否存在依赖名义值的消费方 | 无 ⇒ 补偿放在 gap-pixels 里，span / `--multipage-page-max-offset` / 跨页累减距离**全部自动受益**，且「实际高度」只有一处定义（单一事实来源） |
+| 未动的部分（不变量） | `--multipage-separator-row` / `--multipage-separator-rows` / `--multipage-separator-pixels` / `--multipage-separator-segments` 的三段分配 / face / `:height` **逐字未改** ⇒ 视觉不变（页间距仍是 28 px，没有变窄成 10 px） |
+
+**补偿函数（新增纯函数，可单测）**
+
+`seshat-reader--multipage-separator-extra-pixels (&optional window)`，紧跟在 `--multipage-separator-segments` 之后：
+
+- 取值：`(max 0 (- (seshat-reader--default-line-pixels) LINE))`，`LINE` = `--multipage-separator-segments` 的第二段（`nth 1`）。**厚度不复制读取逻辑**：`min THICKNESS TOTAL` 的 clamp 与「非数字按 0」都只在 segments 里实现一次，本函数只读结果 ⇒ 几何与补偿不会分叉。
+- 边界：`separator` 关闭 / 总高 ≤ 0 / `thickness` 非数字或 ≤ 0（此时 `LINE` = 0，没有规则行）⇒ **0**；`frame-char-height` 读不到（`--default-line-pixels` 返回 nil 或抛错）⇒ **0**（`ignore-errors` + `numberp` 双保险，不把错误带进滚动算术）。
+- docstring 写清了三件事（防回归）：① 为什么规则行恒为 `frame-char-height`（stretch space 不吃 face 相对高度）；② 补偿量 = `frame-char-height − thickness`，并附真机实测（10 名义 / 28 实际 / 18 偏差，25/35/17 → +25/+33/+15）；③ 为什么**不能**靠 face 的 `:height` 修、也不能缩短规则行（那是观感变更，已被用户排除）——布局是定点，算术跟随布局。
+- `--multipage-page-gap-pixels` 改为三段相加（gap 行 + 名义分隔区 + 补偿），docstring 明确「answers with what the layout **measures**, not with what the customisation nominally asks for」；`--multipage-page-span` 的 docstring 补一句「gap 是实测值，含分隔区溢出，少算会让每次跨页少走一个字符行高」。
+
+**回归用例（`emacs/tests/seshat-reader-multipage-test.el`，T13 小节，沿用 `--with-line-height` 同一套桩，未新造第二套）**
+
+| # | 用例 | 断言要点 | 结果 |
+|---|---|---|---|
+| 1 | `--span-includes-separator-actual-height` | char-h 10 / thickness 2 / gap-lines 2：`extra` = 8、名义合计 25、实际 gap = 33（差恰为 8）、span = 533、`max-offset` = span−1，并**显式断言 `span ≠ 页高 + 名义合计`**（证明补偿生效，不是恒等式） | 通过 |
+| 2 | `--span-unaffected-when-separator-off` | `page-separator` = nil，`gap-lines` 取 0/1/2：`extra` = 0、gap = `lines × 10`、span = 500 + gap（与补偿前逐值一致） | 通过 |
+| 3 | `--span-extra-pixels-clamps` | ① thickness 40 > total 5 ⇒ segments `(0 5 0)`、extra = 5（规则行仍在）；② thickness 非数字 ⇒ segments `(2 0 3)`、extra = 0；③ total = 0 与 separator 关闭 ⇒ 0；④ 行高返回 nil / 抛错 ⇒ 0 且不抛错 | 通过 |
+
+**同时按新语义更新 2 个既有用例**（补偿的直接后果，不是顺手改断言）：
+`--separator-adds-to-the-gap-lines`（gap 25 → 33、span 525 → 533，并补 `separator-pixels` = 5 与 `extra` = 8 两条分项断言）、`--separator-on-cross-page-geometry`（span 505 → 513、max-offset 504 → 512、跨页余量 45 → 37、vscroll 断言 45 → 37，落点仍是第 3 页）。
+
+**L1**：`make -C emacs/seshat-reader clean all` → **EXIT 0**；C **0 error / 0 warning**；elisp `Warning:` **20**（= 基线 20，零新增；中途曾因新 docstring 两个超 80 字符行与一个行首 `(` 报 21 与 checkdoc 1 条，均已修正）；`checkdoc` **0 诊断**；`check-parens`（`seshat-reader.el` + `seshat-reader-multipage-test.el`，verify 隔离实例）双双 `{"status":"ok"}`。
+
+**L2**：`make -C emacs/tests ert` → **FILES=42 / TOTAL=1406 / UNEXPECTED=0**，EXIT 0；`make -C emacs/tests check-criteria` → **PASS**（四条判据行按预期，含 `Ran 0 tests` 假绿拦截）。基线 42 文件 / 1403 例 ⇒ **+3 例**，无新增文件；`seshat-reader-multipage-test.el` 单文件 100 → **103** 例、103 results as expected / 0 unexpected。
+
+**独立 GUI 重测（修复后，口径与上一批完全一致）**
+
+环境：`emacs -Q -l /tmp/t9b-measure.el`，GNU Emacs 32.0.50（pgtk）、`(frame-char-height)` = 20、`scale-factor` = 1.0、frame 130×60（body 1170×1160）、`base-scale` 0.35、五页驻留（`--multipage-render-page` 1..5）；`window-text-pixel-size` 显式放开 X/Y 上限；进程自行 `kill-emacs 0`，`timeout 240`。
+
+| 指标 | 样本 | 修复前 | 修复后 |
+|---|---|---|---|
+| `--multipage-page-span` vs 实测 row→row | 矢量 letter（4 组） | +18 px/页 | **0 / 0 / 0 / 0** |
+| 同上 | 真实扫描书（4 组） | +18 px/页 | **0 / 0 / 0 / 0** |
+| 全文滚动范围 vs Σspan（5 页） | 矢量 letter | +90 px | **0**（Σspan 1525 = `window-text-pixel-size` 全文 1525） |
+| 同上 | 真实扫描书 | +90 px | **0**（Σspan 1281 = 全文 1281） |
+| 页高三态（渲染 / 占位 / 恢复） | 两样本各 1 页 | 0 px | **0 px**（277 / 277 / 277；243 / 243 / 243） |
+| separator 关闭对照组 | 两样本 | 0 px | **0 px**（gap = 0、segments = nil、4 组 span 全等于实测） |
+
+修复后 `gap-px` = **28**（名义 10 + 补偿 18），`segments` = `(4 2 4)`；关闭分隔区后 `gap-px` = 0、`extra` = 0。（`full-text-px` 与 `Σ(butlast spans) + 末页页高` 相差 28 px 属正常：末页之后也有分隔区，`Σspan` 全量口径才是主口径。）
+
+**与任务书的两处偏差（诚实记录）**
+
+1. **任务书的边界假设与实现不符**：任务书要求「`thickness ≥ total`（segments 为 nil）⇒ 补偿 0」。实测 `thickness ≥ total` 时 segments **不是 nil**，而是 `(0 TOTAL 0)`——规则行仍然渲染，实际高度仍是 `frame-char-height`，故补偿应为 `frame-char-height − TOTAL`（用例 3 ① 断言 5 而非 0）；若照抄任务书会给这类配置**少算** `TOTAL` 像素。反向的「`thickness` 非数字」任务书判断正确（`LINE` = 0 ⇒ 0）。实现按实际语义、用例按实际语义断言。
+2. **首版实现返回 nil 而非 0**：`when` 无 else 分支使 extra 在「无分隔区」时返回 nil，`(+ … nil)` 直接抛 `wrong-type-argument`，第一轮单文件 ERT 13 例失败（多数是分隔区关闭的既有几何用例）。改为显式 `if` 返回 0 后全部转绿——已写进边界表与 docstring。
+
+**改前 / 改后 md5 与安全点**
+
+| 文件 | 改前 | 改后 |
+|---|---|---|
+| `emacs/seshat-reader/seshat-reader.el` | `daa2b119d486dd174567509ec736eaf6` | `a9db484476304a2774a66e6d3d1f2a2c` |
+| `emacs/tests/seshat-reader-multipage-test.el` | `0b76cf2715e252d306d932f9b1c1bc5e` | `4aece9c27cd836878396c2dfa9166811` |
+| `openspec/completed/2026-10-28-reader-multipage-p2b-async-render.md` | `bfdec3eb91c59e3743126be8e56c0b64` | `626aaf3a0e77b2069c1ffaefe6974df5`（追加本节后的最终值；本行在写入前计算，故不含自身回填） |
+
+安全点 = `git stash create` → `cc4bb4ca9345bc02a8f21c2938b0a65728a843e1`（起点 `HEAD` = `d240b5616bfea3db42d7230904b5879d5fe27239`；工作区带 T8 的 4 项未提交改动，未 commit、未 stash 掉）。未提交、未 push。
+
+**T9 checkbox 保持未勾**：主观 L3-①（连续快速滚动无卡顿 + B8 主观对比）、②（大页「先空白后瞬清」可接受）、③（缩放/切暗色不出旧代际像素）、⑤ 双窗口主观部分、⑥ 主实例重启后同口径复验，全部**必须在用户重启主实例后**才能观察（主实例启动 10:13:17 < `.so` 11:48:22）。
+
+### T9 真机主观验收（用户 2026-10-29 回报）
+
+**口径**：用户在**重启主实例之后**（故 `seshat-render-core.so` 与 elisp 改动均已载入）按「真实阅读」逐项主观判定，不用测量脚本。逐项原文结论：
+
+| # | 主观项 | 结论 | 备注 |
+|---|---|---|---|
+| ① | 重启后阅读器正常 | **通过** | 无残留状态、无报错 |
+| ② | fit-height 正常 / fit-width 的卡顿 | **通过（附注）** | fit-height 正常；fit-width 卡顿较长，但**比改造前变好** |
+| ③ | 进入新页（跨页滚动） | **通过** | 正常、无跳变（P1 不变量①在异步路径下成立） |
+| ④ | 缩放（`+`/`-`/`0`） | **通过（附注）** | 缩放后清晰；**连按缩放卡顿明显** |
+| ⑤ | 切暗色 | **通过** | 无旧代际像素残留 |
+| ⑥ | **双窗口各自滚动** | **不通过** | 另一窗口变成**背景色**（占位页无像素且不再恢复）；滚窗口 A 时 **B 跟着动，且位置随机** |
+
+**⑥ 的根因归属（两项叠加，不是单一原因）**
+
+| 层 | 事实 | 归属 |
+|---|---|---|
+| 布局模型（主因） | 单个 buffer 只有一份行驻留集与一份 buffer-local 布局状态；两个窗口视口不同 ⇒ 任一窗口的 `--multipage-sync` 都会回收「不在**本窗口**范围内」的行、并按本窗口重排 | **P1 布局模型缺陷**（与 P2-B 的异步机制无关）：窗口级视口 vs buffer 级布局的错配 |
+| 本批 D8 违规（放大项） | 态 C（超时兜底）**整队清空** `--multipage-pending-renders`，而它只同步渲染**调用窗口**的可见范围 ⇒ 另一窗口登记的队项被丢掉，那些占位页失去唯一驱动源、**永远补不上像素**（= 用户看到的「跟背景色一样」且不恢复） | **D8 的第二个出口**，本批修掉（见下节） |
+
+**处置**：① 本批修 D8 清空路径（只把本窗口已同步的页出队）；②「双窗口独立滚动 / 行驻留集按窗口 / 布局状态按窗口」属布局模型重构，**另立 P1 follow-up 计划**（T9 第⑥项转出，故 T9 checkbox 不勾）；③ ②④ 的「卡顿」属 `seshat-reader-render-idle-batch` 默认值（2）的取舍，见「T6 执行记录」末段的待用户确认建议，不在本批范围。
+
+### T9 D8 清空路径修复（2026-10-29）
+
+**一句话**：D8 说队列是 **buffer 级并集**，而态 C（超时兜底）是 **窗口级** 操作；修前它把整队清空，于是另一个窗口登记的队项被丢掉、那窗口的占位页永远没有驱动源。本批把它改成「只把本窗口这一轮同步渲染的页出队，其它窗口的队项保留，并给存活的队项重排两个 timer + 重启计时起点」；态 A 的整队清空语义不变。
+
+**缺陷（修前）**
+
+| 项 | 位置 / 事实 |
+|---|---|
+| 声明 | `seshat-reader--multipage-pending-renders` 的 docstring：「holds the union of what every window showing the buffer asked for (decision D8)」 |
+| 第一个出口（T8 已修） | 裁剪口径按调用窗口的交集 —— `--multipage-prune-pending` 的实参（T8 改为 `--multipage-all-visible-pages`） |
+| **第二个出口（本批）** | `--multipage-clear-async-state`（修前 `seshat-reader.el:2563`）调 `--multipage-pending-clear`（修前 `2571`）**整队清空** + `--cancel-async-render-timers` + 时间戳 nil |
+| 调用点 | 态 C `--multipage-force-sync`（修前 `3122`，清空在 `3139`）；态 A `--multipage-sync`（修前 `3025` / `3030`） |
+| 后果 | 态 C 只同步调用窗口的范围，却清掉其它窗口登记的队项 ⇒ 那些窗口的占位页**永远补不上像素**（用户真机 ⑥：双窗口时另一窗口「跟背景色一样」且不再恢复） |
+| 为什么 T8 没覆盖 | 态 C 的清空路径**不经过** `--multipage-prune-pending`（后者只在态 B 调用），T8 的并集改造只覆盖了裁剪这一个出口 |
+
+**顺序设计（先同步，再按同步前的 range 出队）**
+
+| 判据 | 结论 |
+|---|---|
+| range 必须在**同步前**取 | `--multipage-sync-blocking` 会回收范围外的行、给范围内缺行的页建占位行 ⇒ 同步后布局已变，`--multipage-visible-range` 可能给出**不同**区间（同步后再取会把「已渲染」的集合算错） |
+| 预取页为什么不该被出队 | blocking 末尾的 `--multipage-prefetch` 在开关为 t 时走**队列分支**：它把「驻留集外沿 ±1」的页登记进队列（本批新增的队项）。这页是**预取**、不是「已渲染」，若把它算进「本窗口已渲染」的出队集合，刚排上的预取页会当场被删掉 ⇒ 态 B/态 C 的预取收益归零 |
+| 机械保证（预取页 ∉ 出队集合） | 预取页 = 驻留集外沿 ±1；blocking 结束时驻留集**恰等于**它的 range（范围内的行全在、范围外的行已回收）⇒ 预取页 = `first-1` 或 `last+1`，天然落在 `[first, last]` 之外 |
+| 出队集合的实现取法 | 直接取 `--multipage-sync-blocking` 的**返回值**：它在函数入口（任何行被回收/插入之前）算一次 range 并原样返回 ⇒ 它就是「同步前的 range」。比另行调用 `--multipage-visible-range` 多两个正确性收益：① blocking 早退（range 为 nil / 重入守卫 / 窗口 buffer 不符）时返回 nil ⇒ **不出队**（否则会删掉根本没渲染的页）；② 返回的正是**实际被同步渲染**的区间，「已渲染」语义天然对齐 |
+| 出队用什么 | 既有 `--multipage-pending-remove` 逐页出队（它自己处理「队空 ⇒ generation 与时间戳置 nil」），不新写清队逻辑 |
+| 队非空时 | `(setq --multipage-async-pending-since (float-time))` + `--schedule-async-render`：**必须**重启计时起点 —— 否则存活队项继承「刚刚超时那一段」的年龄，下一条命令立刻再次判超时 ⇒ 每条命令都全量同步（异步路径被兜底网关死） |
+| 队空时 | `--multipage-reset-async-state`（全清：队列 + 两个 timer + 时间戳），与修前态 C 的收尾一致 |
+
+**改动点（`emacs/seshat-reader/seshat-reader.el`）**
+
+| 位置（修后行号） | 改动 |
+|---|---|
+| `2565` | `--multipage-clear-async-state` **改名** `--multipage-reset-async-state`，语义收窄为「态 A 的全清」；docstring 写明「态 C 不得使用它：强制同步是窗口级操作、队列是 buffer 级资源（D8）」并指向新函数 |
+| `2586` | **新增** `--multipage-clear-synced-pending (range)`：按 range 逐页 `--multipage-pending-remove` → 队非空则重置时间戳 + `--schedule-async-render`（两个 timer 重排）→ 队空则 `--multipage-reset-async-state`；返回剩余队列。docstring 写清「为什么态 A 全清 / 态 C 只出本窗口 / 并集队列下强制同步是窗口级操作、队列是 buffer 级资源」 |
+| `3184`（`--multipage-force-sync`） | 改为 `let*` 绑 `last-range` = nil 拿 blocking 返回值 → `--multipage-clear-synced-pending`（调用在 `3213`）→ 返回该 range；删掉原 `prog1` 里的 `--multipage-note-pending-since`（计时起点改由新函数按队空/非空显式处理） |
+| `3087` / `3092`（态 A） | 两处调用改名 `--multipage-reset-async-state`，**语义与顺序不变**（先清再 blocking、跑完再清一次兜底） |
+| docstring 同步 | `--multipage-sync` 的态 C 描述（「整队清空」→「只出本窗口的页，其余保留并重排 timer」）；`--multipage-note-pending-since` 的调用方清单（删掉「forced synchronous pass」，指向新函数）；`--multipage-async-pending-since` 的 defvar 说明（新增「forced pass 在队项存活时重启它」） |
+| **未改** | 4 个 defcustom 默认值；`--multipage-sync-blocking` 函数体（一行未动，`while (<= page last)` / `--multipage-recycle-page` / `--multipage-prefetch win` 三处仍在 `3027`/`3033`/`3035`）；`render/*`；`--multipage-async-overdue-p` 的判定模型（单一 buffer 时间戳的粗粒度近似照旧） |
+
+**新增 3 例（`emacs/tests/seshat-reader-multipage-sync-async-test.el`，15 → 18 例）**
+
+| # | 用例 | 断言要点 | 结果 |
+|---|---|---|---|
+| 1 | `--state-c-keeps-other-windows-pending` | 双窗口 A 视口 (4 . 5) ⇒ 范围 (3 . 6)、B 视口 (5 . 6) ⇒ 范围 (4 . 7)；队列预置 8（**B 的、A 范围外、且不是 A 的预取页 7**）、3、5；时钟 1000.0 → 1001.5 超时 ⇒ A 走态 C。断言：渲染页序 `(3 4 5 6)`；**8 仍在队列**；3/4/5/6 **全部出队**；队列 = `(8 7)`（7 = 本轮同步预取新增）；两个 timer 非 nil；时间戳 = 1001.5（重置，不是旧的 1000.0）。**变异测试**：把 `--multipage-force-sync` 改回「blocking 前整队清空」⇒ 本用例失败（同轮其余 3 个 state-c 用例仍绿），随后已恢复源码并重编译 | 通过 |
+| 2 | `--state-c-clears-queue-when-empty` | pagecount 6（预取页被裁剪回驻留集内 ⇒ 不登记）、范围 (3 . 6)、队列只有本窗口的 3/5，且先真的排一次 timer；态 C 之后：队列空、generation nil、时间戳 nil、两个 timer 变量 nil、`cancel-timer` 被调 ≥ 2 次（**防回归**：保队不能变成「队列永不清空」） | 通过 |
+| 3 | `--state-a-still-clears-everything` | 双窗口同夹具、队列 7（B 的范围 4..7 内）+ 3（A 的）、`render-async` = nil ⇒ 态 A 走一轮后**队列整体清空**、时间戳 nil、两个 timer 变量 nil（**态 A 语义不变**，不许被顺手改成「按范围出队」） | 通过 |
+
+**夹具改动（1 处扩展，未新造第二套）**：`seshat-reader-sync-async-test--viewports`（alist `WINDOW . (FIRST . LAST)`）+ `--viewport-for`；stub 查不到该窗口时**回落**到既有的 `--viewport` ⇒ 既有 15 例零改动。形态与 T8 的 `seshat-reader-multipage-async-test--viewports` 一致，但不跨文件 `require`（`emacs/tests/Makefile` 每个文件各起一个 Emacs 进程，跨文件 require 会把另一个文件的用例算进本文件的 `Ran N tests`）。
+
+**L1 / L2（实测）**
+
+- L1 `make -C emacs/seshat-reader clean all` → **EXIT 0**；C **0 error / 0 warning**；elisp 字节编译 `Warning:` **20**（= 基线 20，**零新增**；新增/改写的 docstring 无超 80 列告警）；`checkdoc` **0 诊断**；`check-parens` 2 个改动 `.el` 在 `verify` 隔离实例内双双 `{"status":"ok"}`。
+- L2 `make -C emacs/tests ert` → **FILES=42 / TOTAL=1409 / UNEXPECTED=0**，EXIT 0；`make -C emacs/tests check-criteria` → **PASS**。基线 42 / 1406 ⇒ **+3 例**，无新增文件；`seshat-reader-multipage-sync-async-test.el` 单文件 15 → **18** 例。
+- 旧 `.elc` 陷阱：改 `.el` 后必须先 `make -C emacs/seshat-reader all` 再跑 ERT（本批按此顺序，未复发）。
+
+**elisp-mcp 三实例流程（实测痕迹）**
+
+| 步骤 | 结果 |
+|---|---|
+| `elisp_mcp_set_task(verify)` | `{"status":"ok","task":"verify",...}` |
+| `elisp_mcp_instance(verify, start)` | `{"status":"started",...}` |
+| `elisp_mcp_instance_status(verify)` | `socket-exists:true, alive:true`（首个轮询即就绪） |
+| 实例内 `elisp_check_parens` × 2 文件 | 均 `{"status":"ok"}` |
+| 收尾 | `set_task(auto)` → `instance(verify, stop)` → `instance_status` 确认 `task:"auto"`、`alive:false`、`socket-exists:false`、`task-ttl-seconds:"auto（无 task 文件）"` |
+
+**与任务书的偏差（诚实记录）**
+
+1. **出队集合取 `--multipage-sync-blocking` 的返回值，而不是另行调用 `--multipage-visible-range window`**（任务书写「态 C 的 range 必须取同步前的 `--multipage-visible-range window`」）。两者在正常路径下是**同一区间**（blocking 在入口算一次并原样返回）；用返回值额外覆盖两种情况：blocking 早退 ⇒ 返回 nil ⇒ 不出队；以及「返回的就是实际渲染的区间」。语义仍是「同步前的 range」，理由写进了两个函数的 docstring。
+2. **态 C 不再调 `--multipage-note-pending-since`**：该函数的语义是「队空清 nil / 队非空且无时间戳才补」，而态 C 需要的是**无条件重启**（存活队项必须拿到完整的新窗口）。改为在 `--multipage-clear-synced-pending` 里按队空/非空显式处理，`note-pending-since` 只剩态 B 一个调用点（其 docstring 已同步）。
+3. **`--multipage-clear-async-state` 改名 `--multipage-reset-async-state`**（任务书给了「拆两个函数或加参数」两条路，选前者）：`reset` = 全部三件状态一起走，`clear-synced-pending` = 窗口级出队 + 按需保留。仓库内该函数无测试直接引用（`grep` 空），改名零影响。
+4. **渲染失败的页仍在出队集合里**（`--multipage-render-page` 返回 nil ⇒ 落占位行，但页已在本窗口范围内）—— 与态 B「同步渲染完立刻出队」同口径，属既有语义：这类页要等它下次重新进入可见范围才重试。本批不改。
+5. **未做**：未动 `render-idle-batch` 默认值（②④的卡顿取舍留用户）；未做「双窗口独立滚动」（P1 follow-up）；未 commit / 未 push；未动 CHANGELOG / docs（T7 / T10 的活）。
+
+**发现但未处理的风险（留 follow-up）**：若某个显示本 buffer 的窗口长期不可见（被 bury 到不可见 frame、或被其它窗口完全遮挡），它的页仍会留在并集口径里 ⇒ `--multipage-prune-pending` 不会裁掉它，队列可能长期非空 ⇒ 每条命令都可能因「超时」走强制同步（**性能退化，不会渲染错**）。建议 follow-up 二选一：① 并集口径纳入窗口/ frame 可见性（`window-visible-p` + `frame-visible-p`）；② 给队项加登记时间戳、按龄淘汰。本批按任务书要求**不自行加新机制**。
+
+**改前 / 改后 md5 与安全点**
+
+| 文件 | 改前 | 改后 |
+|---|---|---|
+| `emacs/seshat-reader/seshat-reader.el` | `a9db484476304a2774a66e6d3d1f2a2c` | `bbb9dedcf4b265f94eaabe2398b30487`（含一次 docstring 重复行修正；`b24e7a8550c7f7b46fa7741ce11f679b` 是修正前的中间值） |
+| `emacs/tests/seshat-reader-multipage-sync-async-test.el` | `f89dae6cc60e44aea78cbf964699f764` | `54505853d3b529da991a9f4332cfd46f` |
+| `openspec/completed/2026-10-28-reader-multipage-p2b-async-render.md` | `5ccb4999df9c2280f3a6025a34ecb6ad` | 追加本节后的值（本行在写入前计算，故不含自身回填） |
+
+安全点 = 起点 `HEAD` = `d240b5616bfea3db42d7230904b5879d5fe27239`（工作区带 T8/T9 的未提交改动，**未 commit、未 stash**）；回滚口径 = `git checkout -- <两个 .el>`（本批未触发回滚）。
+
+### 代码审查与修复（2026-10-29）
+
+**一句话**：code-reviewer 对 P2-B 提了 3 项 + 1 个 nit，本批全部处置 —— ①（major）`--multipage-all-visible-pages` 用无参 `(window-list)` ⇒ 只遍历选中 frame，D8 的**跨 frame** 缺口；②（minor）`render-async-timeout` 的 docstring 还停在 T9 之前的语义；③（minor）`--multipage-clear-synced-pending` 的 nil RANGE docstring 与代码不一致；④（nit）`--multipage-force-sync` 的 `let*` 遮蔽缺注释。**只改 1 个实现文件 + 1 个测试文件 + 本计划**；可观察行为零变化（①补全并集口径、②③是注释与早退口径、④纯注释）。
+
+**① major — 跨 frame 缺口（`--multipage-all-visible-pages`）**
+
+| 项 | 内容 |
+|---|---|
+| 修前 | 窗口集合 = `(delq nil (cons WINDOW (mapcar … (window-list))))` —— `(window-list)` **无参**只答**选中 frame** 的窗口，docstring 却写「walks every frame」（错的），并以此解释「为什么显式并入 WINDOW」 |
+| 后果 | 同一 buffer 显示在**另一个 frame** 时，那个 frame 的窗口不进并集 ⇒ `--multipage-prune-pending` 把它的队项裁掉 ⇒ 它的占位页永远没有驱动源（T9 用户 ⑥ 的「另一窗口跟背景色一样」在跨 frame 场景重现） |
+| 修法 | `(frame-list)` → 每个 frame 用 `(frame-live-p)` 过滤（对已死 frame 调 `window-list` 会 signal）→ `(window-list FRAME)` → 只留 `(windowp W)` 且 `(eq (window-buffer W) (current-buffer))` 的窗口；再把 WINDOW 参数显式并入（`windowp` + `window-live-p` 双检查，nil / 已死窗口跳过） |
+| 保留的既有语义 | range 为 nil 的窗口跳过、结果 `delete-dups` + 升序、全空返回 nil —— 三条逐条不变 |
+| minibuffer-only frame | `window-list` 对它返回 nil（minibuffer 窗口默认不计入），自然跳过，不需要特判 |
+| docstring | 重写为「`frame-list` → `window-list FRAME` → 过滤」，并**显式写明为什么不能用无参 `(window-list)`**（只答选中 frame ⇒ 另一 frame 的队项被裁 ⇒ 占位页永久空白），防后人改回 |
+
+**① 的桩用例（做了，纯函数级）**
+
+`seshat-reader-multipage-async-test--all-visible-pages-walks-every-frame`（`emacs/tests/seshat-reader-multipage-async-render-test.el`，18 → 19 例）：
+
+- 桩的对象是 `frame-list` / `frame-live-p` / `window-list` 三个函数；**窗口是真的**（`split-window` 造），`window-buffer` 也走真函数 ⇒「显示本 buffer」这条过滤不是桩，桩不掩盖它。
+- `frame-list` 答 `(frame-a frame-dead frame-b)`；`window-list` **按 frame** 答窗口，且**无参调用只答 frame-a 的窗口** —— 那正是旧实现会拿到的结果，所以这是**差分**用例而不是恒真断言。
+- 四条断言：并集 `(2 3 4 5 6 7 8)`（frame-b 的窗口贡献 6/7/8）、`frame-b` 进过 `window-list`、`frame-dead` 没进过（被 `frame-live-p` 挡在调用之前）、**一次无参调用都没有**。
+- **变异测试**（证明非空断言）：把 `(window-list frame)` 改回 `(window-list)`、增量重编译、单文件跑该用例 ⇒ **FAILED**，实测 `(equal (2 3 4 5 6 7 8) (2 3 4 5))`；随后从备份恢复源码（md5 回到 `e2abda85…`）并重编译，19 例全绿。
+
+**② minor — `seshat-reader-render-async-timeout` 的 docstring（与 T9 后的实现逐句对齐）**
+
+- 「renders the visible range of **its own window** synchronously and drops exactly the pages that pass covered from the queue」—— 不再是「renders the whole visible range … empties the queue」。
+- 「What survives … is kept, gets the pending clock restarted and both timers re-armed, so it owns a full timeout window of its own」，并写明不重启的后果（幸存队项仍显超时 ⇒ 下一条命令再次强制同步 ⇒ 兜底网关死异步路径）。
+- 「Only a queue that is empty after the drop takes the whole asynchronous state with it (queue, both timers and the timestamp)」。
+- 新增一段：「队列是 buffer 级、强制同步是窗口级（D8）⇒ 强制同步永不整队清空」。
+- 计时起点措辞改为「measured from the moment it first became non-empty, **or from the last forced pass that left entries behind**」（态 C 对幸存队项无条件重启）。
+
+**③ minor — `--multipage-clear-synced-pending` 的 nil RANGE：选「nil 时提前返回、队列原样」**
+
+- 实现：「出队 + 时间戳/timer 处置」整体收进 `(when (consp range) …)`，函数末尾照旧返回队列；nil 时**不重置时间戳、不重排 timer、不动队列**。
+- 理由：① 与 docstring 原本的声明一致（「queue is left exactly as it is」），改代码比改文档风险低；② 语义最干净 —— nil 表示「这一轮什么都没渲染」，没有可丢的页，给一个什么都没做的 pass 重排 timer 只会掩盖「队列排不空」这个信号；③ 无实害 —— 唯一调用方 `--multipage-force-sync` 的 `synced` 来自 `--multipage-sync-blocking`，而 `--multipage-sync` 在派发态 C **之前**已 `(null range) ⇒ nil` 早退，故态 C 的 range 恒非 nil（理论上 blocking 因重入守卫返回 nil 时也只是「不重启计时」，不会渲染错）。
+- docstring 同步补一句：nil 时「returns at once: the queue, the pending clock and both timers are left exactly as they are」。
+
+**④ nit — `--multipage-force-sync` 的 `let*` 遮蔽：选「加注释」而非「先 setq nil」**
+
+- 选注释，理由：`let*` 绑定**可证明零行为变化**；改成「先 setq nil 再调用」会让 blocking 内部的 `setq --multipage-last-range RANGE` 落到 buffer-local 上并**持久化**，于是强制同步之后的 `--multipage-sync` 会因「区间未变」早退 —— 这是可观察的行为变化（任务书要求「不要改变可观察行为」）。
+- 注释内容：绑定只作用于本次调用（目的是让 blocking 绕过「区间未变即早退」）；blocking 内部的 `setq` 写的是 let 绑定、退出即丢弃，**不打算持久化**；并写明改成 setq 的后果，防后人「顺手修正」。
+
+**L1（实测）**
+
+- `make -C emacs/seshat-reader clean all` → **EXIT 0**；C **0 error / 0 warning**（`grep -E "warning:|error:"` 无命中）；elisp 字节编译 `Warning:` **20**（= 基线 20，零新增；新增 docstring 无超 80 列告警）；`checkdoc` **0 诊断**；`check-parens` 2 个改动 `.el` 在 `verify` 隔离实例内双双 `{"status":"ok"}`。
+- 恢复源码后的增量 `make all`：EXIT 0、该文件 17 条既有 warning（清空构建的 20 含其它文件）。
+
+**L2（实测）**
+
+- `make -C emacs/tests ert` → **FILES=43 / TOTAL=1433 / UNEXPECTED=0**，EXIT 0；`make -C emacs/tests check-criteria` → **PASS**（四条判据行按预期，含 `Ran 0 tests` 假绿拦截）。
+- 数字构成（**并发会话**在同一工作区写文件，必须逐项交代）：T9 基线 42 / 1409 **+ 本批 1 例**（async-render-test 18 → **19**）= 42 / 1410；实跑 43 / 1433 的差额 = 并发会话新增的 `emacs/tests/seshat-log-test.el`（12 例，`??` 未跟踪）+ `seshat-state-test.el` 新增 11 例（`git diff` 数 `+.*(ert-deftest` = 11）⇒ 1410 + 12 + 11 = 1433，FILES 42 + 1 = 43，逐项对得上。
+- 本批相关文件的单文件数：`seshat-reader-multipage-async-render-test.el` **19 / 19**、`seshat-reader-multipage-sync-async-test.el` **18 / 18**（均 0 unexpected）。
+
+**elisp-mcp 三实例流程（实测痕迹）**
+
+| 步骤 | 结果 |
+|---|---|
+| `elisp_mcp_set_task(verify)` | `{"status":"ok","task":"verify","ttl":"30 分钟后自动回落到 auto"}` |
+| `elisp_mcp_instance(verify, start)` | `{"status":"started","daemon":"elisp-test",...}` |
+| `elisp_mcp_instance_status(verify)` | `socket-exists:true, alive:true, task:"verify", task-ttl-seconds:1788` |
+| 实例内 `elisp_check_parens` × 2 文件 | 均 `{"status":"ok"}` |
+| 收尾 | `set_task(auto)` → `instance(verify, stop)` → `instance_status` 确认 `task:"auto"`、`alive:false`、`socket-exists:false` |
+
+（flymake 与实例内 `load-file` 的既有结论同 T8：该实例无 flymake 后端、`load-file` 被 MCP 黑名单拦，本批不重复尝试；语法与定义层由 `make all`（字节编译 + checkdoc）+ `check-parens` 承担。）
+
+**与任务书的偏差 / 未做项（诚实记录）**
+
+1. **① 的桩用例做了**（任务书给了「低成本能造就做」的裁量）：三个函数桩 + 真窗口，「差分性」由「无参调用只答 frame-a」这条桩行为保证，并用变异测试证明它不是空断言。
+2. **③ 选了「nil 提前返回」**（任务书推荐项），理由见上；未改任何调用点。
+3. **④ 选了「加注释」**（任务书两选项之一），理由是 setq 方案会改变 `last-range` 的可观察状态。
+4. **未做**：跨 frame 的真机验收（需 GUI 两个 frame + 主实例重启，属 T9 主观项）；`get-buffer-window-list` 与 `frame-list` 两条路的性能对比（无测量需求）；未 commit / 未 push。
+5. **未碰并发会话的文件**：`openspec/decisions.md`、`docs/adr/0006-offline-first-library.md`、`openspec/active/2026-10-29-emacs-offline-library.md`、`emacs/seshat-log.el`、`emacs/tests/seshat-log-test.el`、`emacs/seshat-reads.el`、`emacs/tests/seshat-reads-test.el`、`emacs/seshat-state.el`、`emacs/tests/seshat-state-test.el`、`emacs/seshat-reading.el` 一律未读改；本记录只在本计划文件内追加。
+
+**改前 / 改后 md5 与安全点**
+
+| 文件 | 改前 | 改后 |
+|---|---|---|
+| `emacs/seshat-reader/seshat-reader.el` | `bbb9dedcf4b265f94eaabe2398b30487` | `e2abda852f3a8a0885c3731e3dd26b74` |
+| `emacs/tests/seshat-reader-multipage-async-render-test.el` | `086a30046be98bd5af5bc442048f091b` | `00db3636f47ce63e17c1e2bf478289a5` |
+| `emacs/tests/seshat-reader-multipage-sync-async-test.el` | `54505853d3b529da991a9f4332cfd46f` | 未改（同值） |
+| `openspec/completed/2026-10-28-reader-multipage-p2b-async-render.md` | `1793bf78c57fc33ff07432ed4cafb177` | 追加本节后的值（本行在写入前计算，故不含自身回填） |
+
+安全点 = `git stash create` → `d86525c6261d80da66edd04b96fc8a63848583e7`（起点 `HEAD` = `d240b5616bfea3db42d7230904b5879d5fe27239`；工作区带 T8/T9 与并发会话的未提交改动，**未 commit、未 stash 掉**）。本批未触发回滚。

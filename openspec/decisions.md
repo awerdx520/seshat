@@ -1022,3 +1022,53 @@ refit 按当前窗口尺寸做一次几何适配 + 重渲染，一次到位。
 **遗留（详见 `openspec/tech-debt.md`）**：P2-5「内存与驻留策略」降级为**部分缓解**（Lisp 字符串副本与 `CachedPage.img_data` 已消除；Emacs canvas 缓冲、渲染期 MuPDF pixmap + BGRA 中间缓冲仍在）；新增四项——`--page-text` 0 参路径引入 C→elisp 反向依赖、`.so` 未用 `-fvisibility=hidden`（仍导出 60+ 内部符号）、`transform-smoothing` 默认未开、单页渲染比旧版慢 0.6~1.0 ms。真机 L3 七项验收未做（见计划「验证标准」）。
 
 **来源**：`openspec/completed/2026-10-28-reader-canvas-backend-migration.md`（T0–T8 执行记录）+ `openspec/completed/2026-10-28-reader-canvas-s0-spike.md`（可行性实测）。
+
+## 2026-10-29 · 阅读器两阶段异步渲染：不做 worker 线程池（P2-B D1）
+
+**决策**：像素渲染的异步化**不**重建后台线程/线程池，改为「同步查页尺寸 + idle/周期 timer 补像素」两阶段。同步路径只调 C 入口 `--page-size`（`fz_load_page → fz_bound_page → fz_drop_page`，实测中位 4.5–10.3 µs），像素仍由主线程在 timer 回调里渲染（每轮 ≤ `render-idle-batch` 页）。
+
+**理由**：① 布局真正需要的只有**页高**，它来自页面 bounds（MediaBox/CropBox × scale × rotate），与栅格化无关——「异步」不必等于「后台线程」；② 线程池的既有设施已不存在：`render-threads.c/.h`、`CachedPage`、`EmacsWinState` 在 2026-10-28 的 canvas 迁移中**整族删除**，重建等于重做调度器 + 快照 + 生命周期；③ `DocState` 有单线程纪律、装饰表由主线程拥有、`canvas_data` 指针不可跨调用缓存（每次必须重取），跨线程共享这些结构属高危改动；④ 收益对比：S1 实测单页 p95 最高 49 ms（扫描书），把渲染移出命令路径即可把这条延迟从「每条滚动命令」降为「timer 拍子里的分片」，无需线程。
+
+**代价**：① 渲染仍在主线程 ⇒ 每轮必须**有界**（`render-idle-batch`，默认 2 页；扫描书单轮可达 ~100 ms）；② 需要三条兜底（视口内同步 / 超时强制同步 / 周期推进），因为 timer 在 daemon 与忙碌时都不可靠；③ 引入「已定尺寸未渲染」第三态，页高一致性成为必须机械断言的不变量（占位态 vs 已渲染态逐像素相等，实测差 0 px）。
+
+（来源计划：[openspec/completed/2026-10-28-reader-multipage-p2b-async-render.md](completed/2026-10-28-reader-multipage-p2b-async-render.md) 的 D1 与非目标表第 1 条）
+
+## 2026-10-29 · 三层兜底：idle 只作首轮启动，队列推进靠 `run-at-time`（P2-B D5）
+
+**决策**：异步队列的驱动 = ① 视口内同步（point 页 + 沿 `--multipage-scroll-direction` 相邻的一页）；② 超时强制同步（`render-async-timeout` 默认 1.0 s，唯一不依赖 timer 的保险）；③ **idle timer 用 `nil REPEAT` 只作首轮启动** + `run-at-time` 周期 timer（周期 = `render-idle-delay`）承担持续推进。
+
+**理由**：批次 0 的 S3 探针实测（daemon + `emacsclient -c`，手离开键鼠静置）——`run-with-idle-timer` 在一个 idle 窗口**只 fire 一次**（ticks=1，无新输入不 re-arm），普通 `run-at-time` 正常重复。因此把 idle 当自续驱动会让队列在首轮后**静默停摆**、占位页长期空白；而完全不用 idle 又会让「用户停手后立刻补像素」退化成固定延迟。三层各自覆盖不同的失败面：同步兜住「正在看的页」，超时兜住「timer 全都没跑」，周期 timer 兜住「idle 不 re-arm」。
+
+**代价**：① 两个 timer 需要成对 cancel / 重排，任何新出口都必须同时处置它们与计时起点（态 C 的幸存队项若不重启计时会立刻再判超时，导致每条命令全量同步）；② 参数语义被拉伸——`render-idle-delay` 既是 idle 延迟又是周期，docstring 必须写明「它是**周期推进间隔**，不是 idle 延迟」；③ `render-async-timeout` 的判据是**单一 buffer 时间戳**的粗粒度近似，多窗口下 A 的超时会连带影响 B 的判定（已记 tech-debt）。
+
+（来源计划：[openspec/completed/2026-10-28-reader-multipage-p2b-async-render.md](completed/2026-10-28-reader-multipage-p2b-async-render.md) 的 D5、批次 0 的 G3/G3b 与「S3 daemon idle」记录）
+
+## 2026-10-29 · pending 队列是 buffer 级并集，强制同步是窗口级操作（P2-B D8 的两处出口）
+
+**决策**：`seshat-reader--multipage-pending-renders` 的语义定为「**所有**显示该 buffer 的窗口请求的并集」，因此两个出口都按并集/窗口级口径实现：① 态 B 的裁剪用 `--multipage-all-visible-pages`（遍历 `frame-list` → `window-list FRAME` → 过滤显示本 buffer 的窗口 → 各窗口可见范围取并集）；② 态 C 的强制同步只把**本窗口这一轮同步渲染的页**出队（`--multipage-clear-synced-pending`，range 取 `--multipage-sync-blocking` 的返回值 = 同步前 range），幸存队项保留并重启计时起点 + 重排 timer；只有出队后队列为空才整清（态 A 仍用 `--multipage-reset-async-state` 全清）。
+
+**理由**：队列是 buffer 级资源、强制同步是窗口级动作，两者粒度不同——任何一方按单窗口实现都会让**另一窗口的占位页失去唯一驱动源**（真机表现：另一窗口变成背景色且永不恢复）。这条与 P1 L3-⑪（双窗口各自滚动）同源，但本项只修**队列级**违规；布局模型级问题（单 buffer 行驻留集、一份 buffer-local `--multipage-last-range`、`--ensure-window-layout` 对非当前窗口 `set-window-start`）**不在本项范围**，另立 P1 follow-up 计划。
+
+**代价**：① `--multipage-prune-pending` 的 nil 语义必须改成「不动队列」（nil 在并集口径下表示「没有窗口报出范围」，清队会丢掉仍有效的工作）；② 出队集合依赖 `--multipage-sync-blocking` 的返回值，该函数早退时返回 nil ⇒ 不出队（这个副作用是刻意保留的正确性）；③ 并集口径在「窗口长期不可见」时可能长期非空 ⇒ 每条命令都可能因超时走强制同步（**性能退化，不会渲染错**，已记 tech-debt）。
+
+（来源计划：[openspec/completed/2026-10-28-reader-multipage-p2b-async-render.md](completed/2026-10-28-reader-multipage-p2b-async-render.md) 的 D8、「T8 执行记录」与「T9 D8 清空路径修复」两节）
+
+## 2026-10-29 · 布局是基准、算术跟随：分隔区 span 按实测高度补偿
+
+**决策**：页间分隔区的**实际**像素高度由 `--multipage-page-gap-pixels` 回答（gap 行 + 名义分隔区 + `--multipage-separator-extra-pixels` 补偿），`--multipage-page-span` / `--multipage-page-max-offset` / 跨页累减距离一律消费它；**不为算术而改观感**——分隔行的构造、face、`:height` 三段分配逐字未改。
+
+**理由**：规则行是 `(space :align-to (- right 0))` 的 stretch space，行高恒为一个 `frame-char-height`、不吃 face 的 `:height` 相对高度，故实际高度恒比名义多 `frame-char-height − thickness`（char-h 20 → +18 px/页）。此前把「名义值」当实际值用，等于让滚动算术与真实布局分叉——**分叉本身就是缺陷**，正确方向是让算术去测布局，而不是反过来压布局去凑算术（压缩规则行是观感变更，用户已排除）。修后独立 GUI 实测 span vs row→row 差 0 px（修前 +18/页、5 页累计 +90 px）。
+
+**代价**：① `--multipage-page-gap-pixels` 的 docstring 从「名义值」改为「实测值」，任何依赖名义值的未来消费方必须改用 `--multipage-separator-pixels`；② 补偿量依赖 `frame-char-height`，多 frame 且字体不同时仍有 ±1–2 px 的残余（`--multipage-page-span` 未透传 window，已记 tech-debt）；③ 既有两条几何用例的期望值按新语义更新（gap 25 → 33、span 525 → 533 等），属补偿的直接后果而非顺手改断言。
+
+（来源计划：[openspec/completed/2026-10-28-reader-multipage-p2b-async-render.md](completed/2026-10-28-reader-multipage-p2b-async-render.md) 的「T9 分隔区 span 修复」）
+
+## 2026-10-29 · 双窗口独立滚动另立项：P2-B 只修队列级 D8，布局模型级问题归 P1 follow-up
+
+**决策**：P2-B 的真机验收第 ⑥ 项（双窗口各自滚动）判**不通过**，但**不**在本项内修。边界划分：本项只交付「D8 的两处出口」（队列级并集 / 窗口级强制同步，已修）；「单 buffer 行驻留集、`--multipage-last-range` buffer 一份、`--ensure-window-layout` 对非当前窗口 `set-window-start`、居中/贴左决策写 buffer 全局文本属性」属 **P1 布局模型**，另立 `openspec/active/2026-10-29-reader-multiwindow-independent-scroll.md`（草案，候选池，未走 Phase 1/2 门禁）。
+
+**理由**：① 两件事的失败面不同——队列级修复只能保证「另一窗口的占位页仍有驱动源」（不永久空白），无法保证「另一窗口的位置不塌陷」，后者要改驻留集与每窗口布局状态；② 混在一批会让 P2-B 的验收口径失焦（异步机制的验收被布局缺陷拖成不通过）；③ 布局模型重构涉及内存（驻留行数可能翻倍，每页 canvas ≈1.9 MB，需复核 75 MB 告警线）与 T9 的全部几何断言，属独立风险面。
+
+**代价**：① 用户侧「双窗口」体验在 follow-up 落地前仍不达标（已知缺陷，写入 `docs/emacs-reader.md` §7 与 `openspec/tech-debt.md`）；② 两条线索（队列级已修 / 布局级待修）需要文档同时交代，否则后人会把「已修 D8」误当成「双窗口已可用」。
+
+（来源计划：[openspec/completed/2026-10-28-reader-multipage-p2b-async-render.md](completed/2026-10-28-reader-multipage-p2b-async-render.md) 的「T9 真机主观验收」与「T9 D8 清空路径修复」；follow-up：[openspec/active/2026-10-29-reader-multiwindow-independent-scroll.md](active/2026-10-29-reader-multiwindow-independent-scroll.md)）

@@ -1507,11 +1507,24 @@ can be missed while Emacs is busy, so a queue that never drains would leave
 blank placeholder pages on screen for as long as the reader stays there.
 
 The rule: when the queue has been non-empty for longer than this many seconds
--- measured from the moment it first became non-empty -- the next
-`post-command-hook' entry of `seshat-reader--multipage-sync' renders the whole
-visible range synchronously, empties the queue and cancels both timers.  The
-visible pages are therefore blank for at most this long, whatever the timers
-do.
+-- measured from the moment it first became non-empty, or from the last forced
+pass that left entries behind -- the next `post-command-hook' entry of
+`seshat-reader--multipage-sync' renders the visible range of **its own
+window** synchronously and drops exactly the pages that pass covered from the
+queue (`seshat-reader--multipage-clear-synced-pending'): their pixels are in
+hand now.  What survives -- the pages another window queued, plus the page the
+synchronous prefetch just queued -- is kept, gets the pending clock restarted
+and both timers re-armed, so it owns a full timeout window of its own; without
+that restart the survivors would still look overdue, the very next command
+would force another synchronous pass, and the net meant to rescue the queue
+would switch the asynchronous path off for good.  Only a queue that is empty
+after the drop takes the whole asynchronous state with it (queue, both timers
+and the timestamp): nothing is left to drive.
+
+The queue is buffer-local and shared by every window showing the buffer
+\(decision D8), which is why a forced pass -- a window-level operation -- never
+empties it as a whole.  The visible pages of a window are therefore blank for
+at most this long, whatever the timers do.
 
 1.0 s is above the worst case the timers can be late by (one pulse of
 `seshat-reader-render-idle-delay' per batch of pages, i.e. tens of
@@ -2065,6 +2078,70 @@ no page rows and no page count is known either."
       (cons (max 1 (- first-page preload))
             (min highest (+ (max first-page last-page) preload))))))
 
+(defun seshat-reader--multipage-all-visible-pages (&optional window)
+  "Return the union of the pages every window on this buffer keeps visible.
+
+The pages of one window are what `seshat-reader--multipage-visible-range'
+reports for it, i.e. its viewport widened by
+`seshat-reader--multipage-preload'; the answer here is the union of those page
+ranges over every window showing the current buffer **on any live frame**,
+ascending and without duplicates.  A window whose range is nil (nothing known
+about the buffer yet) contributes nothing.
+
+The walk is `(frame-list)' -> `(window-list FRAME)' -> keep the windows whose
+`window-buffer' is the current buffer, and it has to stay that way: plain
+`(window-list)' answers the windows of the **selected frame only**, so a buffer
+shown in two frames would leave the other frame's windows out of the union.
+That is not cosmetic -- the union is the argument
+`seshat-reader--multipage-prune-pending' trims the render queue with, so a
+window left out of it has the pages it queued deleted and its placeholder pages
+stay blank until it scrolls again.  That is the D8 defect of T8 reappearing
+across frames.  Dead frames are skipped (`window-list' would signal on them);
+a minibuffer-only frame reports no windows and drops out by itself.
+
+WINDOW is merged into the set explicitly, nil meaning \"the selected window\";
+it is normally the window the caller is working for, and naming it keeps the
+answer independent of what the frame walk happens to report (a caller can work
+for a window whose frame the walk does not reach, e.g. while a frame is being
+made).
+
+`window-list' is filtered by hand instead of `get-buffer-window-list' on
+purpose: the latter resolves \"all frames\" through an extra layer that behaves
+differently in batch and in a daemon, while `(eq (window-buffer w)
+\(current-buffer))' is exactly the condition the rest of the layout uses.
+
+Why a union and not just the calling window's range: the render queue
+`seshat-reader--multipage-pending-renders' is buffer-local and shared by every
+window (decision D8), so entries another window queued must survive a pass
+made for this one.  Pruning it with a single window's range is the defect fixed
+in T8 -- see `seshat-reader--multipage-prune-pending'.  The layout itself stays
+per window: only the queue is shared.
+
+nil means no window reported a page range at all; callers must read that as
+\"nothing to prune against\" and leave the queue alone."
+  (let ((windows nil)
+        (pages nil))
+    ;; 遍历**所有** frame 的窗口，不能用无参 `(window-list)'：它只答选中 frame
+    ;; 的窗口，同一 buffer 显示在另一个 frame 时那个窗口不进并集，它的队项会被
+    ;; `--multipage-prune-pending' 裁掉（D8 的跨 frame 缺口）。
+    (dolist (frame (frame-list))
+      (when (frame-live-p frame)
+        (dolist (win (window-list frame))
+          (when (and (windowp win)
+                     (eq (window-buffer win) (current-buffer)))
+            (push win windows)))))
+    ;; 调用方自己的窗口显式并入：frame 遍历不保证覆盖它（见 docstring）。
+    (when (and (windowp window) (window-live-p window))
+      (push window windows))
+    (dolist (win windows)
+      (let ((range (seshat-reader--multipage-visible-range win)))
+        (when (consp range)
+          (let ((page (car range)))
+            (while (<= page (cdr range))
+              (push page pages)
+              (setq page (1+ page)))))))
+    (sort (delete-dups pages) #'<)))
+
 ;;; Multi-page layout residency (P1 T1b)
 
 ;; The resident set is the pages the viewport shows plus
@@ -2291,7 +2368,7 @@ may have changed."
 
 ;; 两阶段渲染的第二阶段：滚动路径只登记「哪些页还缺像素」，像素交给
 ;; 「idle 首轮 + 周期 timer 推进」的队列。下面每条约束都来自批次 0 的实测
-;; （数值见 `openspec/active/2026-10-28-reader-multipage-p2b-async-render.md'）：
+;; （数值见 `openspec/completed/2026-10-28-reader-multipage-p2b-async-render.md'）：
 ;;
 ;; - **idle timer 只做首轮启动，REPEAT 必须 nil**：daemon 下一个 idle 窗口只
 ;;   fire 一次，回调自续不会让它再触发（探针 G3b：ticks = 1），所以它不是驱动
@@ -2369,9 +2446,11 @@ stretch began, not when a page was queued last, so a queue that keeps being
 refilled with new pages still ages out.
 
 It is cleared by every path that empties the queue -- the pass itself, a full
-invalidation, the forced synchronous render and the switch to
-`seshat-reader-render-async' = nil -- so a stale timestamp can never make the
-next scroll take the slow path.")
+invalidation, the forced synchronous pass of state C when its drop takes the
+last entry and the switch to `seshat-reader-render-async' = nil -- so a stale
+timestamp can never make the next scroll take the slow path.  The forced pass
+also *restarts* it when entries survive the drop (they belong to another
+window); see `seshat-reader--multipage-clear-synced-pending'.")
 
 (defun seshat-reader--multipage-pending-add (page)
   "Queue PAGE for the asynchronous render pass, return non-nil when queued.
@@ -2427,23 +2506,33 @@ timestamp goes with them -- an empty queue has no age."
 (defun seshat-reader--multipage-prune-pending (pages)
   "Keep only the queued pages that are also in PAGES.
 
-PAGES is a list of 1-based page numbers -- typically the visible range the
-caller just computed -- and the queue is trimmed to its intersection with it,
-so pages the reader scrolled past are never rendered.  The order of the
-surviving entries is kept.
+PAGES is a list of 1-based page numbers -- in production the union of the pages
+every window showing this buffer keeps visible, as returned by
+`seshat-reader--multipage-all-visible-pages' -- and the queue is trimmed to its
+intersection with it, so pages nobody can see are never rendered.  The order of
+the surviving entries is kept, and so is the recorded generation while the
+queue stays non-empty.
 
-T6 calls this from `seshat-reader--multipage-sync' once it decides which pages
-are visible; T5 only provides it, because the sync path is deliberately left
-untouched in this batch."
-  (let (kept)
-    (dolist (page seshat-reader--multipage-pending-renders)
-      (when (memq page pages)
-        (push page kept)))
-    (setq seshat-reader--multipage-pending-renders (nreverse kept))
-    (unless seshat-reader--multipage-pending-renders
-      (setq seshat-reader--multipage-pending-generation nil
-            seshat-reader--multipage-async-pending-since nil))
-    seshat-reader--multipage-pending-renders))
+The argument is deliberately the union of all windows and **not** the calling
+window's own range: the queue is buffer-local and shared (decision D8), so
+pruning it with one window's range drops the entries another window just
+queued -- two windows scrolled apart could then keep deleting each other's
+pending pages.  Rendering, recycling and failure clearing keep walking the
+calling window's own range: only the queue is shared, the layout is not.
+
+nil PAGES leaves the queue untouched.  nil means \"no window reported a page
+range\", not \"nothing is visible\"; emptying the queue on it would throw away
+job that is still valid (the 1-based page list of a real pass is never nil)."
+  (when pages
+    (let (kept)
+      (dolist (page seshat-reader--multipage-pending-renders)
+        (when (memq page pages)
+          (push page kept)))
+      (setq seshat-reader--multipage-pending-renders (nreverse kept))
+      (unless seshat-reader--multipage-pending-renders
+        (setq seshat-reader--multipage-pending-generation nil
+              seshat-reader--multipage-async-pending-since nil))))
+  seshat-reader--multipage-pending-renders)
 
 (defun seshat-reader--multipage-render-failure-count (page)
   "Return how many times the render of PAGE has failed.
@@ -2502,17 +2591,73 @@ nil, and a plain nil test keeps the function testable with a stub
     (cancel-timer seshat-reader--multipage-async-render-timer))
   (setq seshat-reader--multipage-async-render-timer nil))
 
-(defun seshat-reader--multipage-clear-async-state ()
+(defun seshat-reader--multipage-reset-async-state ()
   "Drop the render queue, both timers and the pending timestamp.
 
-The one call that returns the buffer to \"no asynchronous work in flight\":
-the switch to `seshat-reader-render-async' = nil uses it, and so does the
-timeout net before it renders the range synchronously.  Keeping the three
-pieces of state together means no path can clear two of them and leave the
-third to age out on its own."
+The one call that returns the buffer to \"no asynchronous work in flight\", and
+it is only right where the queue as a whole has become meaningless: state A of
+`seshat-reader--multipage-sync' (`seshat-reader-render-async' = nil) renders
+every visible page synchronously and never uses the queue, so emptying it
+there throws nothing away.
+
+State C must **not** use it: the forced pass is a window-level operation while
+the queue is a buffer-level resource shared by every window (decision D8), so
+wiping it there drops the entries another window queued.  That case belongs to
+`seshat-reader--multipage-clear-synced-pending', which drops only the pages
+the pass synchronised.
+
+Keeping the three pieces of state together means no path can clear two of them
+and leave the third to age out on its own."
   (seshat-reader--multipage-pending-clear)
   (seshat-reader--cancel-async-render-timers)
   (setq seshat-reader--multipage-async-pending-since nil))
+
+(defun seshat-reader--multipage-clear-synced-pending (range)
+  "Drop what RANGE just rendered from the queue and keep everything else.
+
+RANGE is the cons \(FIRST . LAST) the forced synchronous pass of state C
+synchronised, i.e. the visible range of the calling window as
+`seshat-reader--multipage-visible-range' answered it **before** that pass
+touched the layout (the pass recycles out-of-range rows and inserts missing
+ones, so asking afterwards answers a different range).  nil means the pass did
+nothing, and then this function returns at once: the queue, the pending clock
+and both timers are left exactly as they are.  There is nothing to drop in that
+case, and re-arming the timers for a pass that rendered nothing would only
+disguise a queue that never drains.
+
+State C renders one window's range synchronously; the queue, however, is the
+union of what every window showing this buffer asked for (decision D8).  So
+only the pages RANGE covers leave the queue -- their pixels are in hand now --
+and the entries another window queued stay: dropping them would leave that
+window's placeholder pages without a driver, i.e. permanently blank until it
+scrolls again.  That was the second exit of the D8 defect, after the pruning
+fixed in T8 (`seshat-reader--multipage-prune-pending').
+
+What is left keeps a full timeout window of its own: the forced pass just
+spent this buffer's `seshat-reader-render-async-timeout', so the pending clock
+is restarted here and both timers are re-armed
+\(`seshat-reader--schedule-async-render').  Without the restart the surviving
+entries would still carry the old timestamp, the very next command would find
+them overdue again, and the net that is supposed to rescue the queue would
+switch the asynchronous path off for good.
+
+An empty queue after the drop is the one case where the whole asynchronous
+state goes (`seshat-reader--multipage-reset-async-state'): nothing is left to
+drive, so the queue, both timers and the timestamp all go, exactly as state C
+always did.
+
+The queue is returned, i.e. what is still pending."
+  (when (consp range)
+    (let ((page (car range)))
+      (while (<= page (cdr range))
+        (seshat-reader--multipage-pending-remove page)
+        (setq page (1+ page))))
+    (if seshat-reader--multipage-pending-renders
+        (progn
+          (setq seshat-reader--multipage-async-pending-since (float-time))
+          (seshat-reader--schedule-async-render (current-buffer)))
+      (seshat-reader--multipage-reset-async-state)))
+  seshat-reader--multipage-pending-renders)
 
 (defun seshat-reader--multipage-note-pending-since ()
   "Keep the pending timestamp in step with the queue.
@@ -2522,8 +2667,12 @@ yet, clears it when the queue is empty.  A queue that is already aged keeps
 its original timestamp, which is the point: the deadline is the age of the
 *stretch*, not of the last page queued into it.  Idempotent, so every path
 that leaves the queue in an unknown state (the dispatch of
-`seshat-reader--multipage-sync', the forced synchronous pass) can call it
-without checking first."
+`seshat-reader--multipage-sync') can call it without checking first.
+
+The forced synchronous pass of state C does not call it any more: that pass
+restarts the clock unconditionally, because the entries that survive its drop
+must get a full window rather than inherit the age of the stretch that just
+timed out (`seshat-reader--multipage-clear-synced-pending')."
   (cond
    ((null seshat-reader--multipage-pending-renders)
     (setq seshat-reader--multipage-async-pending-since nil))
@@ -2940,16 +3089,20 @@ the three states of the two-phase render (P2-B T6):
      gets its row built at its final size but no pixels
      (`seshat-reader--multipage-placeholder-row') and is queued
      (`seshat-reader--multipage-pending-add' +
-     `seshat-reader--schedule-async-render'), the queue is pruned to the
-     visible range (`seshat-reader--multipage-prune-pending') and the pages
-     that just came back into view get their failure count cleared
+     `seshat-reader--schedule-async-render'), the queue is pruned to the union
+     of the visible ranges of every window on the buffer
+     (`seshat-reader--multipage-all-visible-pages') and the pages that just
+     came back into view get their failure count cleared
      (`seshat-reader--multipage-reset-render-failure').
   C. asynchronous and overdue -- the queue has been non-empty for longer than
      `seshat-reader-render-async-timeout', i.e. neither the idle nor the
-     periodic timer managed to drain it; the whole visible range is rendered
-     synchronously, the queue is emptied and both timers are cancelled
-     (`seshat-reader--multipage-force-sync').  This is the net that keeps a
-     broken timer from leaving the reader on blank pages.
+     periodic timer managed to drain it; the visible range of this window is
+     rendered synchronously and its pages leave the queue, while the entries
+     other windows queued stay (`seshat-reader--multipage-force-sync' drops
+     those pages through `seshat-reader--multipage-clear-synced-pending').  Both
+     timers are re-armed for what is left, and dropped only when nothing is
+     left.  This is the net that keeps a broken timer from leaving the reader
+     on blank pages.
 
 The returned value is unchanged in all three states: the range that was
 synchronised, or nil when there was nothing to do.  The four groups of callers
@@ -2963,12 +3116,12 @@ the switch is invisible to them."
       (progn
         (when seshat-reader--multipage-pending-renders
           (setq seshat-reader--multipage-last-range nil))
-        (seshat-reader--multipage-clear-async-state)
+        (seshat-reader--multipage-reset-async-state)
         ;; 同步路径的预取现在按开关分流（`--multipage-prefetch' 内部）：态 A 下
         ;; 它同步取 spec、不入队、不排 timer，所以这里跑完的第二次清理只是兜底
         ;; （防某条尚未覆盖的路径留下残留），不再是「丢掉预取页」的代价。
         (prog1 (seshat-reader--multipage-sync-blocking window)
-          (seshat-reader--multipage-clear-async-state)))
+          (seshat-reader--multipage-reset-async-state)))
     (let* ((win (or window (selected-window)))
            (range (and (window-live-p win)
                        (not seshat-reader--multipage-syncing)
@@ -2995,11 +3148,16 @@ with `seshat-reader--page-size' and built at the size it will finally have, so
 the scroll extent is final before any pixel exists (decision D1/D2, and the
 reason T3 introduced the placeholder row) -- and is then queued.
 
-The queue is pruned to this range afterwards, which is what keeps pages the
-reader scrolled past from ever being rendered, and the pages that were not in
-the previous range get their failure count cleared so that a transient failure
-is never turned into a permanent one (the second clearing point the
-non-blocking-render invariant requires).
+The queue is pruned afterwards to the pages **any** window on this buffer keeps
+visible (`seshat-reader--multipage-all-visible-pages', decision D8) and not to
+RANGE: the queue is buffer-local and shared, so trimming it to one window's
+range would delete the entries another window queued.  Rendering, recycling and
+the failure clearing below still walk RANGE only -- the layout is per window,
+only the queue is shared.  Pruning is what keeps pages nobody can see from ever
+being rendered, and the pages that were not in the previous range get their
+failure count cleared so that a transient failure is never turned into a
+permanent one (the second clearing point the non-blocking-render invariant
+requires).
 
 Out-of-range rows are recycled exactly like the synchronous path does, and
 both the prefetch and the memory check run once the range is settled, so the
@@ -3037,7 +3195,12 @@ The monitored range is returned."
       (let ((page (car entry)))
         (when (or (< page first) (> page last))
           (seshat-reader--multipage-recycle-page page))))
-    (seshat-reader--multipage-prune-pending pages)
+    ;; 队列是 buffer-local 的，每个显示本 buffer 的窗口共用一份，所以裁剪口径
+    ;; 必须是「所有窗口的可见页并集」而不是本窗口的 PAGES：后者会把另一个窗口
+    ;; 刚登记的队项剪掉（D8 的缺陷，T8 修复）。下面三个循环（渲染 / 回收 /
+    ;; 失败清零）仍然只看本窗口的 PAGES —— 布局是窗口的，只有队列是共享的。
+    (seshat-reader--multipage-prune-pending
+     (seshat-reader--multipage-all-visible-pages window))
     (dolist (page pages)
       (when (and (not (and previous
                            (>= page (car previous))
@@ -3056,21 +3219,37 @@ The monitored range is returned."
 The timeout net: the queue has been non-empty for longer than
 `seshat-reader-render-async-timeout', so the timers are not doing their job
 \(or Emacs never went idle) and the pages they were supposed to fill in are
-still blank.  The queue and both timers are dropped first -- a half-rendered
-queue must not be resumed after a forced pass -- and the synchronous path is
-then run with `seshat-reader--multipage-last-range' bound to nil so that it
-really redoes the range instead of returning early on the unchanged one (the
-asynchronous step already recorded it).
+still blank.  The synchronous path is run with
+`seshat-reader--multipage-last-range' bound to nil so that it really redoes the
+range instead of returning early on the unchanged one (the asynchronous step
+already recorded it).
 
-The pending timestamp is re-armed from whatever the forced pass left queued:
-the prefetch of the synchronous path still queues its page, and that page has
-its own full timeout window.
+Only the pages of that pass leave the queue
+\(`seshat-reader--multipage-clear-synced-pending'): state C is a window-level
+operation while the queue is a buffer-level resource shared by every window
+\(decision D8), so emptying it here would drop the entries another window
+queued and leave its placeholder pages without a driver -- blank until it
+scrolls again.  That was the second exit of the D8 defect (T9); the first one
+was the pruning of T8.  Whatever survives the drop (another window's pages,
+plus the page the synchronous prefetch queues) gets its pending clock
+restarted and both timers re-armed, so it has a full timeout window of its own.
+
+The range used for the drop is the one `seshat-reader--multipage-sync-blocking'
+returns: it computes it on entry, before any row is recycled or inserted, i.e.
+exactly the \"before the layout changed\" value the drop must be keyed on -- and
+it is nil when the pass did nothing, in which case nothing is dropped either.
 
 The range the synchronous pass synchronised is returned."
-  (seshat-reader--multipage-clear-async-state)
-  (prog1 (let ((seshat-reader--multipage-last-range nil))
-           (seshat-reader--multipage-sync-blocking window))
-    (seshat-reader--multipage-note-pending-since)))
+  ;; `seshat-reader--multipage-last-range' 的 let 绑定**有意**只作用于本次调用：
+  ;; 目的是让 `--multipage-sync-blocking' 绕过「区间未变即早退」的检查、真正重做
+  ;; 一遍范围；blocking 内部对它的 `setq' 写的是这个 let 绑定，退出即丢弃 —— 不
+  ;; 打算持久化。改成「先 setq nil 再调用」会让强制同步之后留下
+  ;; `last-range' = 本次区间，下一次 `--multipage-sync' 就因区间未变而早退，那是
+  ;; 可观察的行为变化，故维持 let 绑定 + 本注释。
+  (let* ((seshat-reader--multipage-last-range nil)
+         (synced (seshat-reader--multipage-sync-blocking window)))
+    (seshat-reader--multipage-clear-synced-pending synced)
+    synced))
 
 
 (defun seshat-reader--multipage--show-page (page)
@@ -3189,28 +3368,100 @@ and is only used to find the frame."
              (top (/ (- total line) 2)))
         (list top line (- total line top))))))
 
+(defun seshat-reader--multipage-separator-extra-pixels (&optional window)
+  "Return the pixels the separator renders beyond its nominal height.
+
+`seshat-reader--multipage-separator-pixels' answers with the **nominal** height
+of the region -- the sum of the three segments
+`seshat-reader--multipage-separator-segments' reports -- but the region renders
+taller than that, and the scroll arithmetic has to know by how much.
+
+The rule row is the reason.  `seshat-reader--multipage-separator-row' builds it
+as a stretch space, `(space :align-to (- right 0))', painted by
+`seshat-reader-page-separator-face' with a `:height' ratio equal to LINE
+divided by the default line height.  A stretch space takes the height of one
+default text line no matter what the face asks for: the `:height' ratio is
+simply ignored for that row, which is why the rule row measures a full
+`seshat-reader--default-line-pixels' instead of the LINE segment.  The two blank
+rows above and below it are ordinary text lines and do honour their `:height'
+ratio, so the padding is exact and only the rule row drifts.  Measured on a
+real frame: default 0.5 line of separator on a 20px line is 10px nominal and
+28px actual -- an 18px drift, i.e. exactly CHAR-HEIGHT minus THICKNESS
+\\(reproduced with 25/35/17px line heights: +25/+33/+15).
+
+The drift is therefore CHAR-HEIGHT minus the effective thickness of the rule,
+and this function returns it, with these boundaries:
+
+- 0 when `seshat-reader-page-separator' is off or the region takes no space
+  (`--multipage-separator-segments' returns nil), because no rule row exists.
+- 0 when the effective LINE of that geometry is 0 -- a non-numeric or
+  non-positive `seshat-reader-page-separator-thickness', or a total that the
+  clamp leaves with no thickness -- because a region without a rule row has
+  nothing that can grow.
+- 0 when the character height cannot be read at all, so that a frame without a
+  usable font never turns into an error inside the scroll code.
+- Otherwise `max 0 (CHAR-HEIGHT - LINE)'.  LINE is taken from
+  `--multipage-separator-segments' itself rather than recomputed from the
+  customisation, so the `min THICKNESS TOTAL' clamp and the \"non-numeric counts
+  as 0\" reading exist in exactly one place and the geometry cannot drift from
+  the compensation.
+
+Why the compensation lives here and not in the row: giving the rule row a
+smaller `:height' does not work (a stretch space ignores it, see above) and
+shortening the row would change what the reader looks like.  The layout is the
+fixed point and the arithmetic follows it -- the visual must not get narrower,
+that being the user's call, so the missing pixels are added to the number the
+scroll code uses.  Without them every page is short by one character height,
+and the error accumulates into the landing point of a cross-page scroll: five
+pages on a 20px line lose 90px.
+
+WINDOW defaults to the selected one and is only used to find the frame."
+  (let ((segments (seshat-reader--multipage-separator-segments window)))
+    (if (null segments)
+        0
+      (let ((line (nth 1 segments)))
+        (if (and (numberp line) (> line 0))
+            (let ((height (ignore-errors
+                            (seshat-reader--default-line-pixels window))))
+              (if (numberp height) (max 0 (- height line)) 0))
+          0)))))
+
 (defun seshat-reader--multipage-page-gap-pixels (&optional window)
   "Return the pixel height of everything that follows a page row.
 
-Two parts add up here: the gap lines, i.e. `seshat-reader-page-gap-lines'
+Three parts add up here: the gap lines, i.e. `seshat-reader-page-gap-lines'
 empty lines of one default line height each
 \(`seshat-reader--default-line-pixels'), plus the separator region of
-`seshat-reader--multipage-separator-pixels'.  Both of them sit between a page
-row and the row of the next page, so the scroll code needs their sum.
+`seshat-reader--multipage-separator-pixels', plus the pixels that region
+renders beyond its nominal height
+\(`seshat-reader--multipage-separator-extra-pixels' -- the rule row is a
+stretch space and therefore one character height tall whatever thickness the
+geometry asks for).  All of them sit between a page row and the row of the next
+page, so the scroll code needs their sum: this function answers with what the
+layout **measures**, not with what the customisation nominally asks for, and
+every scroll number downstream inherits that.
 
-Neither part is taken with `line-pixel-height', which would report the height
-of the page row the gap belongs to.  The value is 0 when both parts are 0.
-WINDOW defaults to the selected one and is only used to find the frame."
+None of the parts is taken with `line-pixel-height', which would report the
+height of the page row the gap belongs to.  The value is 0 when all parts are
+0.  WINDOW defaults to the selected one and is only used to find the frame."
   (let ((lines (max 0 seshat-reader-page-gap-lines)))
     (+ (if (> lines 0) (* lines (seshat-reader--default-line-pixels window)) 0)
-       (seshat-reader--multipage-separator-pixels window))))
+       (seshat-reader--multipage-separator-pixels window)
+       (seshat-reader--multipage-separator-extra-pixels window))))
 
 (defun seshat-reader--multipage-page-span (page)
   "Return the pixel distance from the top of PAGE's row to the next row.
 
 That is the page height plus the gap that follows it, floored at 1 so that the
 scrolling loop always advances: a page without a rendered spec has a span of
-0 pixels otherwise, and stepping through it would never move the target."
+0 pixels otherwise, and stepping through it would never move the target.
+
+The gap is the measured one, separator drift included (see
+`seshat-reader--multipage-page-gap-pixels'), so the span is the real distance
+from this page row to the next one and a cross-page scroll lands where the
+pixels say it should.  Computing the gap from the customisation alone would
+short-change every page by one character height and lose that much on each
+crossing."
   (max 1 (+ (seshat-reader--multipage-page-pixel-height page)
             (seshat-reader--multipage-page-gap-pixels))))
 

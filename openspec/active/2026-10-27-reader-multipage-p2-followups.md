@@ -4,7 +4,7 @@
 - 阶段：跟踪中（P2-1 已单独立计划；P2-6 验收清单已交付用户）
 - 前置：P1（T1–T10）已完成并归档 → `openspec/completed/2026-10-26-reader-multipage-p1-layout.md`
 - 已确认：用户 2026-10-28 圈定本轮范围 = P2-1（异步渲染两阶段方案）+ P2-6 真机验收清单
-- 下一步：P2-1 走独立计划 `openspec/active/2026-10-28-reader-multipage-p2b-async-render.md`（Phase 2 待审查确认）；P2-6 清单已给用户，结果待回报；P2-3 / P2-7 待验收结论再定
+- 下一步：P2-1 走独立计划 `openspec/completed/2026-10-28-reader-multipage-p2b-async-render.md`（Phase 2 待审查确认）；P2-6 清单已给用户，结果待回报；P2-3 / P2-7 待验收结论再定
 
 ## 背景
 
@@ -16,7 +16,7 @@ P2-2 / P2-8 已于 2026-10-27 交付并归档；P2-4 已随 canvas 后端迁移�
 
 | # | 任务 | 来源 | 依赖 | 规模 | 风险 |
 |---|---|---|---|---|---|
-| P2-1 | **异步渲染 + idle 预取**：滚动进入新页时不再同步阻塞主线程（现 0.7–11 ms/页）；需先复验 daemon 下 idle timer 的可靠性（tech-debt 有历史记录） —— **已立项（2026-10-28）**，见 `openspec/active/2026-10-28-reader-multipage-p2b-async-render.md` | tech-debt「异步渲染未做」 | 无 | 中 | 中（daemon/批量场景差异） |
+| P2-1 | **异步渲染 + idle 预取 ✅ 已完成（2026-10-29，见 `openspec/completed/2026-10-28-reader-multipage-p2b-async-render.md`）**：滚动进入新页时不再同步阻塞主线程（现 0.7–11 ms/页）；需先复验 daemon 下 idle timer 的可靠性（tech-debt 有历史记录） —— **已立项（2026-10-28）** | tech-debt「异步渲染未做」 | 无 | 中 | 中（daemon/批量场景差异） |
 | P2-2 | **跨页选区 ✅ 已完成（2026-10-27，见 `openspec/completed/2026-10-27-reader-multipage-p2a-cross-page-selection.md`）**：按阅读顺序拼接两页文本；`seshat-reader-select-last` 新增 `:page-rects`（带页号的分段矩形）；`location` 新增 `pages:<a>-<b>;rect@<p>:…` 形态（单页仍写旧形态、逐字节不变） | D7 / tech-debt | P1 | 中 | 中（协议、坐标、批注位置） |
 | P2-3 | **横向滚动整栏平移**：`height` 模式与手动放大下宽页让整栏（含邻页）一起平移。候选方案：① 宽页改「缩到窗宽」不裁字（改变 `height` 语义）；② 每页加左右 margin 用 buffer 内空白模拟横向滚动；③ 保持现状 + 文档化 | D5b / tech-debt | 无 | 小–中 | 中（观感取舍） |
 | P2-4 | **C 侧单页 overlay 机制退役**：`init_overlay` / `init_win_state_ptr` / `get_win_state_ptr` / `--refresh-highlights` / `--window-close` 现仅剩兼容外壳；先给 `elisp-helpers.c:279-287` 的 `overlay-put` 补 nil 守卫，再整族删除并重建 `.so` | tech-debt | P2-1（若同时改渲染线程） | 中 | 中（C 改动需真机重启验证） |
