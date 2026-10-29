@@ -412,7 +412,9 @@ pending。占位行必须已按最终尺寸建好（600x800），否则滚动范
         (should seshat-reader--multipage-async-idle-timer)
         (should seshat-reader--multipage-async-render-timer)
         (should seshat-reader--multipage-async-pending-since)
-        (should (equal '(1 . 5) seshat-reader--multipage-last-range))))))
+        (should (equal '(1 . 5)
+                       (seshat-reader--multipage-last-range-for
+                        (selected-window))))))))
 
 (ert-deftest seshat-reader-sync-async-test--state-b-inserts-placeholder-rows ()
   "A queued page without a row gets its row right away, at its final size.
@@ -791,8 +793,8 @@ observable level: same rows, same positions, same sizes."
 A 的预取页 7 —— 否则修前也会被预取重新登记，用例就分不出对错）、3 与 5（A 自己
 的可见页，模拟「另一窗口登记过的同一页」）。时钟推过 timeout ⇒ A 这一轮走态 C。
 
-期望：3/4/5/6 同步渲染并**全部出队**；8 仍在队列；A 的预取页 7 照旧入队（预取页
-是本轮**新增**的，不属于「已渲染」）；两个 timer 仍有效；计时起点重置到强制同步
+期望：3/4/5/6 同步渲染并**全部出队**；8 仍在队列；预取页按 A 自己的范围 (3 . 6)
+取 ⇒ 7，而 7 不在队列里 ⇒ 队列 (8 7)；两个 timer 仍有效；计时起点重置到强制同步
 那一刻（1001.5，不是旧的 1000.0），否则存活队项会立刻再次超时、每轮命令都全量
 同步。"
   (seshat-reader-sync-async-test--with-buffer (number-sequence 1 8)
@@ -828,7 +830,7 @@ A 的预取页 7 —— 否则修前也会被预取重新登记，用例就分�
                   (dolist (page '(3 4 5 6))
                     (should-not (memq page
                                       seshat-reader--multipage-pending-renders)))
-                  ;; 队列 = B 的 8 + 本轮同步预取的 7（预取页不是「已渲染」）
+                  ;; 队列 = B 的 8 + A 自己的预取页 7（按 A 的 range 取边界）
                   (should (equal '(8 7)
                                  seshat-reader--multipage-pending-renders))
                   ;; 队列非空 ⇒ 两个 timer 继续有效，计时起点重置
@@ -909,6 +911,146 @@ A 的预取页 7 —— 否则修前也会被预取重新登记，用例就分�
               (should-not seshat-reader--multipage-async-idle-timer)
               (should-not seshat-reader--multipage-async-render-timer)))
         (delete-window win-b)))))
+
+;;; T3：每窗口 range（D2）与 force 形参（D6）
+
+(ert-deftest seshat-reader-sync-async-test--range-is-per-window ()
+  "The synchronised range is recorded per window, not per buffer (D2).
+
+修前「上次同步区间」是 **buffer 级** 变量：两个窗口显示同一 buffer 时，早退与否
+取决于「上一轮是哪个窗口跑的」，用户感到的「随机」正是这条。修后它存在
+`seshat-reader--range-parameter' 这个 **窗口参数** 里，值形如 (BUFFER . RANGE)。
+
+判别性（本用例的红灯来源）：
+① A 同步后 A 的参数 = A 的范围、B 的参数仍为 nil（buffer 级变量下 B 永远拿不到
+   自己的值，而 A 的值会被 B 覆盖）；
+③ A 的区间没变时，A 再同步必须**早退**（渲染 0 次）—— buffer 级变量下记账已被 B
+   写成 (8 . 11)，A 会白跑一整轮；
+④ A 移到 B 刚同步过的区间 (8 . 11) 时，A 必须**重做**—— buffer 级变量下记账恰好
+   等于新范围，A 会早退、行表却停在 A 的旧区间（「早退但行表已清」的永久空白正是
+   这条路径）；故断言 A 旧范围的行 4 被回收，而不是「不早退」这种弱断言。
+⑤ `--multipage-clear` 必须清**所有**显示本 buffer 的窗口（陷阱 3）。
+
+夹具：12 页、preload 1、窗口 A 视口 (4 . 5) ⇒ 范围 (3 . 6)、窗口 B 视口 (9 . 10)
+⇒ 范围 (8 . 11)。态 A（`seshat-reader-render-async' = nil）使每轮渲染页序等于整
+个范围，计数才有意义。"
+  (seshat-reader-sync-async-test--with-buffer (number-sequence 1 12)
+    (setq seshat-reader-current-doc-pagecount 12)
+    (let* ((win-a (selected-window))
+           (win-b (split-window win-a)))
+      (unwind-protect
+          (let ((seshat-reader-sync-async-test--viewports
+                 (list (cons win-a '(4 . 5))
+                       (cons win-b '(9 . 10)))))
+            (seshat-reader-sync-async-test--with-timer-stubs _i _p _c
+              (let ((seshat-reader-render-async nil))
+                ;; ① A 同步：范围 (3 . 6)，只给 A 记账
+                (seshat-reader-sync-async-test--with-renderer calls
+                  (should (equal '(3 . 6) (seshat-reader--multipage-sync win-a)))
+                  (should (equal '(3 4 5 6)
+                                 (cl-remove-if-not (lambda (page) (<= 3 page 6))
+                                                   calls))))
+                (should (equal '(3 . 6)
+                               (seshat-reader--multipage-last-range-for win-a)))
+                (should-not (seshat-reader--multipage-last-range-for win-b))
+                ;; 参数值的形状是 (BUFFER . RANGE)：buffer 部分是多窗口下唯一能
+                ;; 区分「这条记录说的是哪个 buffer」的东西（窗口切 buffer 不清参数）
+                (let ((value (window-parameter
+                              win-a seshat-reader--range-parameter)))
+                  (should (eq (car value) (current-buffer)))
+                  (should (equal '(3 . 6) (cdr value))))
+                ;; ② B 同步：各自独立，B 不碰 A 的页
+                (seshat-reader-sync-async-test--with-renderer calls
+                  (should (equal '(8 . 11) (seshat-reader--multipage-sync win-b)))
+                  (should (equal '(8 9 10 11)
+                                 (cl-remove-if-not (lambda (page) (<= 8 page 11))
+                                                   calls)))
+                  (should-not (cl-intersection calls '(3 4 5 6))))
+                (should (equal '(8 . 11)
+                               (seshat-reader--multipage-last-range-for win-b)))
+                (should (equal '(3 . 6)
+                               (seshat-reader--multipage-last-range-for win-a)))
+                ;; ③ A 自己的区间没变 ⇒ 按 A 的记账早退，不重做（B 没覆盖它）。
+                ;; 态 A 的早退在 `--multipage-sync-blocking' 内部，返回 nil
+                ;; （「无事可做」），与 async 半侧「返回本区间」不同。
+                (seshat-reader-sync-async-test--with-renderer calls
+                  (should-not (seshat-reader--multipage-sync win-a))
+                  (should-not calls))
+                ;; ④ A 移到 B 刚同步过的区间：A 的记账是 (3 . 6)，故必须重做。
+                ;; 判据用「A 旧范围的行被回收」—— 早退时它们会原封不动留着。
+                (setq seshat-reader-sync-async-test--viewports
+                      (list (cons win-a '(9 . 10))
+                            (cons win-b '(9 . 10))))
+                (seshat-reader-sync-async-test--with-renderer _calls
+                  (should (equal '(8 . 11)
+                                 (seshat-reader--multipage-sync win-a))))
+                (should-not (assq 4 seshat-reader--pages))
+                (should (assq 9 seshat-reader--pages))
+                ;; ⑤ 两个窗口都记了账之后，`--multipage-clear' 必须把它们一起清掉
+                (should (seshat-reader--multipage-last-range-for win-a))
+                (should (seshat-reader--multipage-last-range-for win-b))
+                (seshat-reader--multipage-clear)
+                (dolist (window (list win-a win-b))
+                  (should-not (window-parameter
+                               window seshat-reader--range-parameter))))))
+        (delete-window win-b)))))
+
+(ert-deftest seshat-reader-sync-async-test--force-sync-does-not-persist-range ()
+  "A forced pass leaves the recorded range untouched and does not count as a sync.
+
+D6：`--multipage-force-sync' 走 `--multipage-sync-blocking' 的 FORCE 形参 —— 它既
+绕过早退（真重做一遍），又**跳过写回**（强制同步 ≠ 已同步）。原实现靠 let 遮蔽
+buffer 级变量达到同一效果；改成窗口参数后必须由 `(unless force …)` 保住这个契约，
+否则「强制同步」之后同区间的普通同步会因区间相等而早退。
+
+判据是**参数值逐位不变**（比「不早退」强）：去掉 `unless force` 之后，③ 的前后值
+就不再相等，④ 的同步也会早退（渲染 0 次）。⑤ 反过来锁 FORCE 的另一半：区间**未
+变**时强制同步仍要真的干活。
+
+夹具：8 页、preload 1、单窗口；视口逐轮下移，使每轮的「记账区间」与「本轮区间」
+不同。态 A 下预取页 7 每轮都会重新取 spec（`--with-renderer' 的桩不填缓存），这
+就是「本轮真的干活了」的计数来源。"
+  (seshat-reader-sync-async-test--with-buffer (number-sequence 1 6)
+    (setq seshat-reader-current-doc-pagecount 8)
+    (let ((win (selected-window)))
+      (seshat-reader-sync-async-test--with-timer-stubs _i _p _c
+        (let ((seshat-reader-render-async nil))
+          ;; ① 视口 (2 . 4) ⇒ 范围 (1 . 5)，记账 (1 . 5)
+          (setq seshat-reader-sync-async-test--viewport '(2 . 4))
+          (seshat-reader-sync-async-test--with-renderer calls
+            (should (equal '(1 . 5) (seshat-reader--multipage-sync win)))
+            ;; 范围内逐页 + 预取页 6（驻留跨距 1..5 的下沿 +1；页 6 的行本轮被回收）
+            (should (equal '(1 2 3 4 5 6) calls)))
+          (should (equal '(1 . 5) (seshat-reader--multipage-last-range-for win)))
+          ;; ② 视口 (3 . 4) ⇒ 范围 (2 . 5)，记账 (2 . 5)
+          (setq seshat-reader-sync-async-test--viewport '(3 . 4))
+          (seshat-reader-sync-async-test--with-renderer _calls
+            (should (equal '(2 . 5) (seshat-reader--multipage-sync win))))
+          (should (equal '(2 . 5) (seshat-reader--multipage-last-range-for win)))
+          ;; ③ 视口 (4 . 5) ⇒ 范围 (3 . 6)：强制同步。记账仍须是 (2 . 5)
+          (setq seshat-reader-sync-async-test--viewport '(4 . 5))
+          (let ((before (window-parameter win seshat-reader--range-parameter)))
+            (seshat-reader-sync-async-test--with-renderer calls
+              (should (equal '(3 . 6)
+                             (seshat-reader--multipage-force-sync win)))
+              ;; 强制同步真的跑了：页 6 的行在 ② 被回收，本轮重新插回并渲染；
+              ;; 预取页 7 也重新取 spec
+              (should (equal '(6 7) calls)))
+            (should (equal before (window-parameter
+                                   win seshat-reader--range-parameter)))
+            (should (equal '(2 . 5)
+                           (seshat-reader--multipage-last-range-for win))))
+          ;; ④ 同一区间再走普通同步：记账仍是 (2 . 5) ⇒ 必须重做
+          (seshat-reader-sync-async-test--with-renderer calls
+            (should (equal '(3 . 6) (seshat-reader--multipage-sync win)))
+            (should (equal '(7) calls)))
+          (should (equal '(3 . 6) (seshat-reader--multipage-last-range-for win)))
+          ;; ⑤ 区间未变时强制同步仍绕过「早退」（FORCE 的另一半）
+          (seshat-reader-sync-async-test--with-renderer calls
+            (should (equal '(3 . 6) (seshat-reader--multipage-force-sync win)))
+            (should (equal '(7) calls)))
+          (should (equal '(3 . 6)
+                         (seshat-reader--multipage-last-range-for win))))))))
 
 (provide 'seshat-reader-multipage-sync-async-test)
 

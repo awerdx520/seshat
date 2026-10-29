@@ -204,6 +204,8 @@
 
 ### 修复
 
+- **双窗口各自滚动不再互相干扰（2026-10-29）**：同一文档开两个窗口时，滚 A 会让 B 的视口塌陷、且位置看起来「随机」，B 的页还可能变成背景色且不恢复（P1 布局模型的缺口，P2-B 只修掉队列级那一半）。三处改动：① **驻留集并集化**——回收判据由「本窗口区间」改为「所有显示该 buffer 的窗口可见范围的并集」（`--multipage-all-visible-pages`），渲染 / 失败清零 / 预取边界 / 早退判据仍按本窗口；② **每窗口同步区间**——`--multipage-last-range`（buffer 一份）换成 window-parameter `seshat-reader--range-parameter`（值 `(BUFFER . RANGE)`，读时校验 buffer），`--multipage-clear` 与态 A 复位改为遍历所有窗口清（否则会「行表已空 + 区间相等 → 早退 → 行永不重建」的永久空白）；`--multipage-force-sync` 改走 `force` 形参，绕过早退且不记账；③ **重锚换锚点**——`--ensure-window-layout` 仍对所有窗口执行，但锚点由「最小驻留页」改为「最近的页行」（新增 `--multipage-row-nearest`）。同批把 near-resident / 淘汰判据的集合来源改为并集成员（各自保留原有边界口径），预取边界改用调用窗口的 range。验证：新增 7 例 ERT（双窗口并集回收、淘汰无边界松弛、per-window 区间、force 不记账、锚点取最近行、预取用调用窗口边界），逐条做**变异测试**（把判据换回修前写法 ⇒ 对应用例转红）；全量 ERT 47 文件 **1610** 例 0 unexpected / 0 skipped、`check-criteria` PASS；L1 `clean all` EXIT 0、C 0 error 0 warning、elisp `Warning:` **20**（基线）；真机 6 项（重启、双窗口 30 页不塌不跳、页间空行行为可接受、跨 frame、单窗口无退化、内存无告警）用户验收**全部通过**。**横向**（居中/贴左按单窗口宽度写 buffer 全局几何）与**预取方向 buffer 级**仍为已知限制，见 `docs/emacs-reader.md` §7 与 `openspec/tech-debt.md`。
+
 - **EPUB 解压炸弹防护：封面提取改为流式字节上限（2026-10-29）**：`unzip -p` 的输出此前先整段读进 buffer、读完才判体积——deflate 炸弹可以在 10 秒超时内把内存撑爆（4 MiB 的压缩包解出几 GB 是常规手法）。改为在收输出时**逐块累计字节数**，一旦超过 `seshat-covers-max-bytes` 就当场 `delete-process` 并按失败降级（写负缓存），因此内存峰值 = 上限 + 一个 chunk，与解压后的真实体积无关。
 
 - **下载字节上限兜底：`Content-Length` 缺失时按实际落盘大小校验（2026-10-29）**：`seshat-library-max-download-bytes` 原本只按响应头 `Content-Length` 在**写盘前**预判，而 chunked 分段响应不带该头（常态），此时上限完全失效、磁盘可被写满。改为**两道闸**：有该头时照旧预判；缺失时落盘后按**实际文件大小**兜底，超限即删掉刚写的文件并报 `:too-large`。

@@ -2401,7 +2401,9 @@ the cache, so the reader finds it ready when it scrolls one page further."
           (seshat-reader-multipage-test--with-fake-renderer counter 600 800
             (seshat-reader-multipage-test--with-silent-timers
               (setq-local seshat-reader--multipage-scroll-direction 1)
-              (seshat-reader--multipage-prefetch (selected-window))
+              (seshat-reader--multipage-prefetch
+               (selected-window)
+               (seshat-reader--multipage-resident-page-range))
               ;; 登记但未渲染：滚动这一步零像素成本。
               (should (equal '(5) seshat-reader--multipage-pending-renders))
               (should (= 0 (car counter)))
@@ -2411,7 +2413,9 @@ the cache, so the reader finds it ready when it scrolls one page further."
               ;; 清空后反向预取
               (seshat-reader--page-spec-clear-cache)
               (setq-local seshat-reader--multipage-scroll-direction -1)
-              (seshat-reader--multipage-prefetch (selected-window))
+              (seshat-reader--multipage-prefetch
+               (selected-window)
+               (seshat-reader--multipage-resident-page-range))
               (should (equal '(1) seshat-reader--multipage-pending-renders))
               (seshat-reader--async-render-tick buffer)
               (should (seshat-reader--multipage-spec-cached-p 1))
@@ -2434,7 +2438,9 @@ page without a row is only cached."
             (seshat-reader-multipage-test--with-silent-timers
               (let ((rows (length seshat-reader--pages)))
                 (setq-local seshat-reader--multipage-scroll-direction 1)
-                (seshat-reader--multipage-prefetch (selected-window))
+                (seshat-reader--multipage-prefetch
+                 (selected-window)
+                 (seshat-reader--multipage-resident-page-range))
                 (should (= rows (length seshat-reader--pages)))
                 (should (equal '(5) seshat-reader--multipage-pending-renders))
                 (should-not (assq 5 seshat-reader--pages))
@@ -2461,7 +2467,9 @@ rendered at."
               ;; 先用不同 scale 把第 5 页放进缓存
               (seshat-reader--page-spec 5 1.0)
               (let ((after-warm (car counter)))
-                (seshat-reader--multipage-prefetch (selected-window))
+                (seshat-reader--multipage-prefetch
+                 (selected-window)
+                 (seshat-reader--multipage-resident-page-range))
                 (should (= after-warm (car counter)))
                 (should-not seshat-reader--multipage-pending-renders)
                 (should (seshat-reader--multipage-spec-cached-p 5))))))
@@ -2796,7 +2804,14 @@ T7 的验收是「不崩」：跨页选区的 `user-error' 属 T8，本批只要
               (let ((inhibit-read-only t)) (erase-buffer))
               (seshat-reader--multipage-clear)
               (should-not seshat-reader--pages)
-              (should-not seshat-reader--multipage-last-range)
+              ;; 「上次同步区间」是**窗口**参数（D2）：所有显示本 buffer 的窗口
+              ;; 都必须被清，只清一个窗口会留下「行表已空 + 区间恰好相等 → 早退
+              ;; → 行永不重建」的永久空白。
+              (let ((windows (get-buffer-window-list (current-buffer) nil t)))
+                (should windows)
+                (dolist (win windows)
+                  (should-not (window-parameter
+                               win seshat-reader--range-parameter))))
               ;; 页表为空时 `--multipage-visible-range' 只能靠文档页数判断有页可
               ;; 渲染：真机上这个值由原生模块写入 buffer-local，夹具里手工给。
               (setq seshat-reader-current-doc-pagecount 3)

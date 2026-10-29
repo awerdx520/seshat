@@ -1095,13 +1095,13 @@ refit 按当前窗口尺寸做一次几何适配 + 重渲染，一次到位。
 
 ## 2026-10-29 · 双窗口独立滚动另立项：P2-B 只修队列级 D8，布局模型级问题归 P1 follow-up
 
-**决策**：P2-B 的真机验收第 ⑥ 项（双窗口各自滚动）判**不通过**，但**不**在本项内修。边界划分：本项只交付「D8 的两处出口」（队列级并集 / 窗口级强制同步，已修）；「单 buffer 行驻留集、`--multipage-last-range` buffer 一份、`--ensure-window-layout` 对非当前窗口 `set-window-start`、居中/贴左决策写 buffer 全局文本属性」属 **P1 布局模型**，另立 `openspec/active/2026-10-29-reader-multiwindow-independent-scroll.md`（草案，候选池，未走 Phase 1/2 门禁）。
+**决策**：P2-B 的真机验收第 ⑥ 项（双窗口各自滚动）判**不通过**，但**不**在本项内修。边界划分：本项只交付「D8 的两处出口」（队列级并集 / 窗口级强制同步，已修）；「单 buffer 行驻留集、`--multipage-last-range` buffer 一份、`--ensure-window-layout` 对非当前窗口 `set-window-start`、居中/贴左决策写 buffer 全局文本属性」属 **P1 布局模型**，另立 `openspec/completed/2026-10-29-reader-multiwindow-independent-scroll.md`（已归档，2026-10-29，见 `openspec/completed/2026-10-29-reader-multiwindow-independent-scroll.md`）。
 
 **理由**：① 两件事的失败面不同——队列级修复只能保证「另一窗口的占位页仍有驱动源」（不永久空白），无法保证「另一窗口的位置不塌陷」，后者要改驻留集与每窗口布局状态；② 混在一批会让 P2-B 的验收口径失焦（异步机制的验收被布局缺陷拖成不通过）；③ 布局模型重构涉及内存（驻留行数可能翻倍，每页 canvas ≈1.9 MB，需复核 75 MB 告警线）与 T9 的全部几何断言，属独立风险面。
 
 **代价**：① 用户侧「双窗口」体验在 follow-up 落地前仍不达标（已知缺陷，写入 `docs/emacs-reader.md` §7 与 `openspec/tech-debt.md`）；② 两条线索（队列级已修 / 布局级待修）需要文档同时交代，否则后人会把「已修 D8」误当成「双窗口已可用」。
 
-（来源计划：[openspec/completed/2026-10-28-reader-multipage-p2b-async-render.md](completed/2026-10-28-reader-multipage-p2b-async-render.md) 的「T9 真机主观验收」与「T9 D8 清空路径修复」；follow-up：[openspec/active/2026-10-29-reader-multiwindow-independent-scroll.md](active/2026-10-29-reader-multiwindow-independent-scroll.md)）
+（来源计划：[openspec/completed/2026-10-28-reader-multipage-p2b-async-render.md](completed/2026-10-28-reader-multipage-p2b-async-render.md) 的「T9 真机主观验收」与「T9 D8 清空路径修复」；follow-up：[openspec/completed/2026-10-29-reader-multiwindow-independent-scroll.md](completed/2026-10-29-reader-multiwindow-independent-scroll.md)）
 
 ## 2026-10-29 · I-OOM 反假绿：显示判断必须在构造之前
 
@@ -1122,4 +1122,34 @@ refit 按当前窗口尺寸做一次几何适配 + 重渲染，一次到位。
 **代价**：会话中从未加载过队列模块时，启动汇总的批注数显示「不可用」而非 `0`——比「显示 0」信息量低，但诚实（`0` 会被误读成「确实没有待同步批注」）。同理，`seshat-status` 对 `seshat-state` / `seshat-reads` 也走「已加载才查、未加载不催」的口径；确需完整数据时由用户显式打开 `*Seshat Status*`（交互命令，可接受加载成本）。
 
 （来源计划：[openspec/completed/2026-10-29-emacs-offline-library.md](completed/2026-10-29-emacs-offline-library.md) 的 D7 与 T6）
+
+## 2026-10-29 · 多窗口驻留集并集化：只改回收判据，渲染仍按本窗口
+
+**决策**：`--multipage-sync-blocking` / `--multipage-sync-async` 的**回收**判据由「本窗口 range」改为「所有显示该 buffer 的窗口可见范围的并集」（`--multipage-all-visible-pages`，遍历 `frame-list`），`keep` 在**渲染循环之前**取一次快照并沿调用链传下去；**渲染循环、渲染失败清零、预取边界、早退判据一律不动**，仍用本窗口 range。
+
+**理由**：① 修前的双窗口症状是「滚 A 时 B 的视口塌陷」——直接动作就是回收循环删掉了 B 还在看的行（marker 随文本删除前移，`window-start` 因此前移数页）；② 反过来把并集**喂给渲染**会付出两个代价：态 B 下并集里的页全部登记进 pending 队列（队列膨胀到并集大小），以及一个窗口的占位行覆盖另一个窗口刚补好的像素（行是 buffer 文本，只能有一种状态）；③ 快照必须在渲染循环之前取——渲染插行 / 回收删行都会让 `window-start` 落到另一个页行上，取得越晚越可能漏掉本轮真正可见的页（T1+T2 实测：放在渲染循环之后会让 3 个既有用例转红）；④ 无窗口报范围时回退到行表跨距展开，使 batch 夹具与「buffer 不在任何窗口里」的路径与并集化之前逐位等价，而不是「回收一切」。
+
+**代价**：① 驻留行数从「单窗口 ± preload」涨到「并集 ± preload」，内存按窗口数线性增长（每页 canvas ≈1.9 MB，75 MB 告警线未改，真机双窗口相距 30 页实测无告警）；② 每次 sync 多一次并集计算 `O(F × W + U)`，故 near-resident / recycle 增可选 `keep` 形参避免在回收循环里逐页重算（`O(R²)`）；③ 「并集」是**近似**——被 bury 到不可见 frame 的窗口仍算在并集里（队列长期非空与驻留偏多的残余风险已记 tech-debt）。
+
+（来源计划：[openspec/completed/2026-10-29-reader-multiwindow-independent-scroll.md](completed/2026-10-29-reader-multiwindow-independent-scroll.md) 的 D1、D4 与 T1、T2）
+
+## 2026-10-29 · 每窗口同步区间用 window-parameter，值带 buffer 校验
+
+**决策**：删掉 buffer-local 的 `--multipage-last-range`，改为 window-parameter `seshat-reader--range-parameter`（值 `(BUFFER . RANGE)`），读写统一走 `--multipage-last-range-for` / `--multipage-set-last-range` 两个封装；`--multipage-clear` 与态 A 复位改为 `--multipage-clear-last-ranges` **遍历所有显示本 buffer 的窗口**清；`--multipage-force-sync` 改走 `force` 形参（绕过早退**且**不写回记账）。
+
+**理由**：① buffer 级单值让「区间未变即早退」在多窗口下永远按「最后一个跑过的窗口」记账，早退与否取决于命令顺序——这正是用户感到「随机」的来源；② 值里必须带 `BUFFER`：窗口参数不会因为 `set-window-buffer` 自动清除，窗口切到别的文档再切回来时会读到别的 buffer 的区间，早退即变成「该渲染却不渲染」；③ 清理必须**全窗口**：只清本窗口会留下「行表已空 + 另一窗口区间恰好相等 → 早退 → 行永不重建」的**永久空白**，与用户报的现象 2 同形，排障时极易误判为「异步渲染没补上」；④ `force` 必须同时绕过写回（不能用「先 setq nil 再调用」——blocking 内部会写回，等价于把「强制同步」持久化成「已同步」），这正是原 `let*` 遮蔽的语义；⑤ async 半侧也加了 `force` 形参并用 `(unless force …)` 包裹写回，与 blocking 对称，避免将来 async 强制路径静默把「强制」变成「已同步」。
+
+**代价**：① 三处 docstring / 注释改写，`--multipage-sync` 的签名不变（force 的唯一入口直接调 blocking）；② 两条既有断言从「读变量」改为「读窗口参数」（`seshat-reader-multipage-sync-async-test.el` / `seshat-reader-multipage-test.el`），语义不变；③ 窗口参数对 `window-state-get/put` 与 `C-x r w` 会话保存可见——只是多一个属性，无行为影响；④ 态 A 的早退仍返回 nil（既有契约，`--multipage-clear-synced-pending` 依赖它），与 async 半侧「早退返回本区间」的不对称保持不变。
+
+（来源计划：[openspec/completed/2026-10-29-reader-multiwindow-independent-scroll.md](completed/2026-10-29-reader-multiwindow-independent-scroll.md) 的 D2、D6 与 T3）
+
+## 2026-10-29 · 跨窗口重锚换锚点（最近页行），而不是移除跨窗口重锚
+
+**决策**：`--ensure-window-layout` **保留**对 hook 报告的每一个窗口（含非当前窗口）执行 `set-window-start`，但锚点由「最小驻留页」改为「**最近的页行**」（新增纯函数 `--multipage-row-nearest`：起点 ≤ POS 的最后一个页行，优先前驱、否则后继）。同时把触发条件由「`window-start` 不在页行内（`--multipage-page-at-pos` 为 nil）」扩展为「最近页行的 `marker-position` **小于**窗口起点」。顺序固定 sync → 重锚 → `--ensure-centered`。
+
+**理由**：① 它**不能移除**——是 `split-window` / 换 buffer / `--render-buffer` 重载 / 回收删行四条路径上唯一的纠正点（唯一注册点，无其它直接调用），移除会引入新的错位；② 但旧锚点（最小驻留页）正是「把 B 钉到当前驻留集下沿」的直接动作，用户看到的「塌到 p6」就是它；换成最近页行后，B 回到**它自己**那一页；③ 触发条件必须扩展：真机缺陷路径里 B 的 `window-start` 被删除操作推到**页间空行**，而空行按 `--multipage-page-at-pos` 的语义属于上一页 ⇒ 旧守卫不触发 ⇒ 换锚点在这种情形下是**死代码**；④ `--multipage-window-start-page` 与其 `first` 兜底**不改**——它还被 5 处用于「派生窗口顶页号（显示页码）」，first 兜底在那里是正确的。
+
+**代价**：① 视口**不能再停在页间空行上**（会被拉回上一页行首）——这是「页号稳定」的代价，2026-10-29 真机确认可接受，已写入 `docs/emacs-reader.md` §7 已知限制；② 「什么时候重锚」的集合比修前更大（行中 / 页间空行 / 末行之后都会回到行首），每次多一次 `--pages` 线性遍历（行数 = 驻留页数，量级个位数）；③ `--multipage-row-nearest` 答不了「POS 属于哪一页」，与 `--multipage-page-at-pos` 并存（后者语义不变）。
+
+（来源计划：[openspec/completed/2026-10-29-reader-multiwindow-independent-scroll.md](completed/2026-10-29-reader-multiwindow-independent-scroll.md) 的 D3 与 T4）
 

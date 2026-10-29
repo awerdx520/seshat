@@ -518,7 +518,8 @@ defcustom 的默认值。"
       (seshat-reader-multipage-async-test--with-renderer calls
         (should (equal 5 (let ((seshat-reader-render-async t))
                            (seshat-reader--multipage-prefetch
-                            (selected-window)))))
+                            (selected-window)
+                            (seshat-reader--multipage-resident-page-range)))))
         ;; 零渲染、零缓存、零新行：滚动这一步不付像素成本。
         (should (= 0 (car calls)))
         (should-not seshat-reader--page-spec-cache)
@@ -545,16 +546,15 @@ defcustom 的默认值。"
 
 夹具：文档 12 页、preload 1、滚动方向向前（-1，即朝更小的页号）。
 窗口 A 视口 (4 . 5) ⇒ 范围 (3 . 6)；窗口 B 视口 (5 . 6) ⇒ 范围 (4 . 7)；
-并集 3..7。两轮的预取页都朝前（A 取 2、B 取 3），不会把并集之外的页补回来，
-所以下面的断言不会被预取掩盖。
+并集 3..7。两轮的预取边界都按**调用窗口**自己的范围取（D5）：A 取 2（3 - 1）、
+B 取 3（4 - 1）。
 
 第一轮（A，point 在 5）：同步渲染 5、4，登记 3、6，预取 2 ⇒ 队列 (3 6 2)。
-第二轮（B，point 在 6）：同步渲染 6、5，登记 7，预取 3 ⇒ 队列 (3 2 7) 里 2 不在
-并集内被裁掉 ⇒ (3 7)。**3 是 A 的队项且落在 B 的范围 (4..7) 之外** —— 按交集
-裁剪的实现会在这里把它删掉。
-第三轮（A，point 在 5）：同步渲染 5、4（已有 spec，不再取像素），登记 3（队列
-里已有），预取 2 ⇒ 队列 (3 7 2)。**7 是 B 的队项且落在 A 的范围 (3..6) 之外**
-—— 交集实现同样会删掉它。"
+第二轮（B，point 在 6）：同步渲染 6、5，登记 7，预取 2 ⇒ 队列 (3 2 7) 里 2 不在
+并集内被裁掉 ⇒ (3 7)，随后预取页 3 已在队列里 ⇒ 队列就是 (3 7)。**3 是 A 的队项
+且落在 B 的范围 (4..7) 之外** —— 按交集裁剪的实现会在这里把它删掉。
+第三轮（A，point 在 5）：A 的区间与第一轮相同 ⇒ 早退（T3 之后记账按窗口），
+队列保持 (3 7)。"
   (seshat-reader-multipage-async-test--with-body (number-sequence 1 12) 1000 800
     (setq seshat-reader-current-doc-pagecount 12
           seshat-reader--multipage-scroll-direction -1)
@@ -582,16 +582,21 @@ defcustom 的默认值。"
                 (goto-char (seshat-reader-multipage-async-test--row-start 6))
                 (should (equal '(4 . 7)
                                (seshat-reader--multipage-sync win-b)))
+                ;; 预取边界按 B 自己的范围 (4 . 7) 取 ⇒ 预取页 3，而 3 已在
+                ;; 队列里 ⇒ 队列不变（按并集跨距取会预取 2，见 T5 的用例）。
                 (should (equal '(3 7)
                                seshat-reader--multipage-pending-renders))
-                ;; 第三轮：窗口 A 单独再跑一次
+                ;; 第三轮：窗口 A 单独再跑一次。T3 之后「上次同步区间」按窗口
+                ;; 记账，A 的区间与第一轮相同 ⇒ **早退**（B 的记账覆盖不了 A），
+                ;; 所以本轮不重做、队列原样。注意「B 的队项 7 穿过 A 的裁剪」
+                ;; 这条由 `seshat-reader-sync-async-test--state-c-keeps-other-
+                ;; windows-pending' 覆盖 —— 那里是强制同步，一定真的跑裁剪。
                 (goto-char (seshat-reader-multipage-async-test--row-start 5))
                 (should (equal '(3 . 6)
                                (seshat-reader--multipage-sync win-a)))
-                ;; B 的队项 7 仍在（A 的范围 3..6 之外，靠并集保住）。
                 (should (memq 7 seshat-reader--multipage-pending-renders))
                 (should (memq 3 seshat-reader--multipage-pending-renders))
-                (should (equal '(3 7 2)
+                (should (equal '(3 7)
                                seshat-reader--multipage-pending-renders)))))
         (delete-window win-b)))))
 
@@ -778,6 +783,226 @@ marker 位置与页高共同决定，所以两样都必须逐字节不变：mark
 晰」），改动它必须是有意的，不能随着某次重构漂移。"
   (should (eq t seshat-reader-render-async))
   (should (equal 1.0 seshat-reader-render-async-timeout)))
+
+;;; T1/T2 并集判据（多窗口布局模型：回收 / 保留 / 淘汰）
+
+(ert-deftest seshat-reader-multipage-async-test--residency-union-keeps-other-window-rows ()
+  "同步回收按**并集**保留：另一个窗口还在显示的页不被本窗口这一轮删掉。
+
+行表 `seshat-reader--pages' 是 buffer 唯一的一份，回收判据若只看本窗口的
+range，窗口 A 滚动时会把窗口 B 的行删掉 —— 删行让 B 的 marker 前移、
+`window-start' 跟着塌陷，就是真机现象 1。夹具：文档 12 页、preload 1、窗口 A
+视口 (4 . 5) ⇒ 范围 (3 . 6)、窗口 B 视口 (9 . 10) ⇒ 范围 (8 . 11)，并集
+3..6 ∪ 8..11。
+
+A 跑一轮同步（态 A，blocking）之后：B 的 9/10 行必须还在；A 范围之外、也不在
+任何窗口里的页（1/2/7/12）必须被回收 —— 后半句是本用例的判别性所在，它排除了
+「干脆什么都不回收」这种也能让前半句通过的实现。"
+  (seshat-reader-multipage-async-test--with-body (number-sequence 1 12) 1000 800
+    (setq-local seshat-reader-current-doc-pagecount 12)
+    (let* ((win-a (selected-window))
+           (win-b (split-window win-a)))
+      (unwind-protect
+          (let ((seshat-reader-multipage-async-test--viewports
+                 (list (cons win-a '(4 . 5))
+                       (cons win-b '(9 . 10)))))
+            (seshat-reader-multipage-async-test--with-timer-stubs
+                _idle _periodic _cancelled
+              (seshat-reader-multipage-async-test--with-renderer _calls
+                (should (equal '(3 4 5 6 8 9 10 11)
+                               (seshat-reader--multipage-all-visible-pages
+                                win-a)))
+                (goto-char (seshat-reader-multipage-async-test--row-start 5))
+                (let ((seshat-reader-render-async nil))
+                  (should (equal '(3 . 6)
+                                 (seshat-reader--multipage-sync win-a))))
+                ;; B 的两行都还在：它们属于并集，不属于 A 的 range。
+                (should (memq 9 (seshat-reader--multipage-page-numbers)))
+                (should (assq 9 seshat-reader--pages))
+                (should (assq 10 seshat-reader--pages))
+                ;; A 自己的范围被渲染成行（3..6 全在）。
+                (should (assq 3 seshat-reader--pages))
+                (should (assq 6 seshat-reader--pages))
+                ;; A 范围之外、任何窗口都看不到的页仍然被回收。
+                (should-not (memq 12 (seshat-reader--multipage-page-numbers)))
+                (should-not (memq 1 (seshat-reader--multipage-page-numbers)))
+                (should-not (memq 7 (seshat-reader--multipage-page-numbers))))))
+        (delete-window win-b)))))
+
+(ert-deftest seshat-reader-multipage-async-test--recycle-keeps-specs-inside-union-not-span ()
+  "回收时的保留口径是**并集成员**，不是首尾行之间的跨距。
+
+夹具：行 {1 5 9 10}、preload 0、窗口 A 视口 (1 . 1)、窗口 B 视口 (9 . 10)
+⇒ 并集 {1 9 10}，而 `--multipage-resident-page-range' 报的跨距是 (1 . 10) ——
+第 5 页落在跨距内，却不在任何窗口的可见范围里。按跨距判定它算「驻留 ±1」，
+位图白留；按并集判定它不是，回收时释放。
+
+判别性：把成员判定换回跨距（变异测试）⇒ 第 5 页的 spec 被保留 ⇒ 本用例转红。"
+  (seshat-reader-multipage-async-test--with-body '(1 5 9 10) 1000 800
+    (setq-local seshat-reader-current-doc-pagecount 10
+                seshat-reader--multipage-preload 0)
+    (let* ((win-a (selected-window))
+           (win-b (split-window win-a)))
+      (unwind-protect
+          (let ((seshat-reader-multipage-async-test--viewports
+                 (list (cons win-a '(1 . 1))
+                       (cons win-b '(9 . 10)))))
+            (seshat-reader-multipage-async-test--with-renderer _calls
+              (should (equal '(1 9 10)
+                             (seshat-reader--multipage-all-visible-pages
+                              win-a)))
+              ;; 跨距确实是 1..10：第 5 页「看起来」在驻留范围里。
+              (should (equal (cons 1 10)
+                             (seshat-reader--multipage-resident-page-range)))
+              ;; 跨距内但不是并集成员 ⇒ 不是 near-resident。
+              (should-not (seshat-reader--multipage-page-near-resident-p 5))
+              ;; 并集成员（含上沿页 10）⇒ 是 near-resident。
+              (should (seshat-reader--multipage-page-near-resident-p 9))
+              (should (seshat-reader--multipage-page-near-resident-p 10))
+              (dolist (page '(1 5 9 10))
+                ;; 行必须是**有像素**的（占位行的 spec 是 nil，回收时
+                ;; `--multipage-recycle-page' 只对「删下来的 spec 非 nil」的行
+                ;; 释放缓存），所以把取到的 spec 装回行上。
+                (seshat-reader--multipage-insert-page
+                 page (seshat-reader--page-spec page 1.0)))
+              (should (seshat-reader--multipage-spec-cached-p 5))
+              (seshat-reader--multipage-recycle-page 5)
+              ;; 第 5 页不在并集里 ⇒ 位图随行一起释放；第 9 页仍在并集里 ⇒ 留。
+              (should-not (seshat-reader--multipage-spec-cached-p 5))
+              (should (seshat-reader--multipage-spec-cached-p 9))))
+        (delete-window win-b)))))
+
+(ert-deftest seshat-reader-multipage-async-test--eviction-victim-has-no-boundary-slack ()
+  "淘汰判据是**并集成员、无 ±1**；near-resident 的 ±1 不跟着一起丢。
+
+夹具：行 {1 9}、preload 0、窗口 A 视口 (1 . 1)、窗口 B 视口 (9 . 9) ⇒ 并集
+{1 9}。entries 顺序写死为「页 10 最新、页 1 最旧」。第 10 页紧贴并集的上沿
+\(9 + 1)，但**不在**并集里 ⇒ 淘汰首选它。
+
+判别性：若给淘汰判据加上 near-resident 的 ±1，第 10 页会被当成驻留页，victim
+退化成 FIFO 兜底的末项（页 1），本用例转红 —— 这正是 D4「两个函数各自保留原有
+边界口径」的机械守护。同一夹具下 `--multipage-page-near-resident-p' 对第 10 页
+必须是 t、对第 11 页必须是 nil，证明 ±1 只留在 near-resident 一侧。"
+  (seshat-reader-multipage-async-test--with-body '(1 9) 1000 800
+    (setq-local seshat-reader-current-doc-pagecount 10
+                seshat-reader--multipage-preload 0)
+    (let* ((win-a (selected-window))
+           (win-b (split-window win-a)))
+      (unwind-protect
+          (let ((seshat-reader-multipage-async-test--viewports
+                 (list (cons win-a '(1 . 1))
+                       (cons win-b '(9 . 9)))))
+            (should (equal '(1 9)
+                           (seshat-reader--multipage-all-visible-pages win-a)))
+            (let ((entries (list (list (cons 10 1.0) 'spec-10)
+                                 (list (cons 1 1.0) 'spec-1))))
+              (should (= 10 (car (car (seshat-reader--cache-eviction-victim
+                                       entries))))))
+            ;; near-resident 的 ±1 仍在：第 10 页是「即将看见」，第 11 页不是。
+            (should (seshat-reader--multipage-page-near-resident-p 10))
+            (should-not (seshat-reader--multipage-page-near-resident-p 11)))
+        (delete-window win-b)))))
+
+;;; T4：重锚换锚点（D3）与 T5：预取边界按调用窗口（D5）
+
+(ert-deftest seshat-reader-multipage-async-test--ensure-window-layout-anchors-nearest-row ()
+  "重锚把窗口移到**最近的页行**，而不是布局的最小驻留页（D3 / T4）。
+
+修前 `--ensure-window-layout' 的锚点来自 `--multipage-window-start-page' 的
+`first' 兜底，也就是整份布局的最小驻留页。T1 把行表按**并集**保留之后，那个
+「最小驻留页」属于另一个窗口 ⇒ 窗口 B 会被钉在窗口 A 正在读的那一端（真机
+p12 → p6 的直接动作）。
+
+夹具：行 {3 4 5 6 9 10}（页 9 / 10 是「本窗口」的，3..6 是另一个窗口的）、
+preload 1、文档 12 页。`--multipage-sync' 被桩成只记顺序 —— 本用例锁的是锚点
+来源与「sync → 重锚 → 居中」的顺序，sync 自己的渲染 / 回收由既有用例覆盖；不桩
+的话桩出来的 `window-start' 会先改变 sync 算出的范围，把回收副作用搅进锚点断言。
+把 `--multipage-sync' 桩成 no-op 正是为了把锚点来源与顺序隔离出来：「sync 移动
+marker 后 anchor 读到新位置」的集成语义由真机 L3 与既有 sync 用例覆盖，**不要**
+为此改本用例的断言 —— 本用例的 `window-start' 是桩，改断言只会锁住桩的行为。
+
+判别性：锚点换回最小驻留页（`(car (car seshat-reader--pages))`）或换回
+`--multipage-window-start-page' ⇒ ② 拿到的位置是页 3 的行首，用例转红。"
+  (seshat-reader-multipage-async-test--with-body '(3 4 5 6 9 10) 1000 800
+    (setq-local seshat-reader-current-doc-pagecount 12)
+    (let* ((window (selected-window))
+           (start nil)
+           (set-calls nil)
+           (order nil))
+      (cl-letf (((symbol-function 'seshat-reader--multipage-sync)
+                 (lambda (&optional _window) (push 'sync order) nil))
+                ((symbol-function 'window-start)
+                 (lambda (&optional _window) start))
+                ((symbol-function 'set-window-start)
+                 (lambda (win position &optional _noforce)
+                   (push 'anchor order)
+                   (push (list win position) set-calls)
+                   nil)))
+        ;; ① `--multipage-row-nearest'：最近**前驱**页行；行中间也算该页；
+        ;;    最后一个页行之后取末行。`--multipage-page-at-pos' 答不了这件事
+        ;;    （它只答「包含 POS 的页」，POS 落在行外就是 nil）。
+        (should (equal 5 (car (seshat-reader--multipage-row-nearest
+                               (1+ (seshat-reader-multipage-async-test--row-start
+                                    5))))))
+        (should (equal 9 (car (seshat-reader--multipage-row-nearest
+                               (1+ (seshat-reader-multipage-async-test--row-start
+                                    9))))))
+        (should (equal 3 (car (seshat-reader--multipage-row-nearest
+                               (point-min)))))
+        (should (equal 10 (car (seshat-reader--multipage-row-nearest
+                                (1+ (point-max))))))
+        (should-not (let ((seshat-reader--pages nil))
+                      (seshat-reader--multipage-row-nearest (point-min))))
+        ;; ② 窗口起点落在页 9 的行中间 ⇒ 重锚到**页 9 的行首**。
+        (setq start (1+ (seshat-reader-multipage-async-test--row-start 9)))
+        (seshat-reader--ensure-window-layout window)
+        (should (= 1 (length set-calls)))
+        (should (eq window (car (car set-calls))))
+        (should (equal (seshat-reader-multipage-async-test--row-start 9)
+                       (cadr (car set-calls))))
+        ;; 锚点页属于本窗口自己的页（9 / 10），不是最小驻留页 3。
+        (should-not (equal (seshat-reader-multipage-async-test--row-start 3)
+                           (cadr (car set-calls))))
+        ;; ③ 顺序不可换：sync 会移动 marker，锚点必须在它之后算。
+        (should (equal '(sync anchor) (reverse order)))
+        ;; ④ 起点本来就在页行行首时不移动（否则每次窗口状态变化都白改一次）。
+        (setq set-calls nil order nil
+              start (seshat-reader-multipage-async-test--row-start 9))
+        (seshat-reader--ensure-window-layout window)
+        (should-not set-calls)))))
+
+(ert-deftest seshat-reader-multipage-async-test--prefetch-uses-calling-window-edge ()
+  "预取边界取**调用窗口**的 range，不取行表跨距（D5 / T5）。
+
+夹具：12 页、preload 0、滚动方向向前；窗口 A 视口 (4 . 5) ⇒ 范围 (4 . 5)、
+窗口 B 视口 (9 . 10) ⇒ 范围 (9 . 10)。A 走一轮态 B（异步）之后，A 的预取页是
+**A 的上沿 + 1 = 6**。若按行表跨距取边界（T1 的并集把 B 的页 9 / 10 保住了 ⇒
+跨距 4..10），预取页会变成 11 —— 那是另一个窗口那一端，永远用不上。
+
+判别性：把 `range' 换回 `--multipage-resident-page-range' ⇒ 队列变成 (11)，
+本用例转红。"
+  (seshat-reader-multipage-async-test--with-body (number-sequence 1 12) 1000 800
+    (setq seshat-reader-current-doc-pagecount 12
+          seshat-reader--multipage-scroll-direction 1)
+    (setq-local seshat-reader--multipage-preload 0)
+    (let* ((win-a (selected-window))
+           (win-b (split-window win-a)))
+      (unwind-protect
+          (let ((seshat-reader-multipage-async-test--viewports
+                 (list (cons win-a '(4 . 5))
+                       (cons win-b '(9 . 10)))))
+            (seshat-reader-multipage-async-test--with-timer-stubs
+                _idle _periodic _cancelled
+              (seshat-reader-multipage-async-test--with-renderer _calls
+                ;; point 放在 A 的视口首行，让 4 / 5 都走同步渲染 ⇒ 队列里只
+                ;; 剩预取页，断言才是「预取边界」而不是「范围里剩下的页」。
+                (goto-char (seshat-reader-multipage-async-test--row-start 4))
+                (should (equal '(4 . 5)
+                               (seshat-reader--multipage-sync win-a)))
+                (should (equal '(6)
+                               seshat-reader--multipage-pending-renders))
+                (should-not (memq 11 seshat-reader--multipage-pending-renders)))))
+        (delete-window win-b)))))
 
 (provide 'seshat-reader-multipage-async-render-test)
 

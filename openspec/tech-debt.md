@@ -1849,13 +1849,15 @@
 
 > 来源：`openspec/completed/2026-10-28-reader-multipage-p2b-async-render.md`（T9 真机验收 ①–⑤ 通过、⑥ 双窗口不通过；D8 的两处出口已修）。本节的条目**都不是**本项引入的回归，而是本项暴露或未覆盖的缺口。
 
-### 1. 双窗口独立滚动不成立（P1 L3-⑪ 违反，主缺口）
+### 1. 双窗口独立滚动不成立（P1 L3-⑪ 违反，主缺口）——**已解决（2026-10-29）**
+
+> **状态**：已由 P1 follow-up 落地并归档，见 [`openspec/completed/2026-10-29-reader-multiwindow-independent-scroll.md`](completed/2026-10-29-reader-multiwindow-independent-scroll.md)（驻留集并集化 + 每窗口同步区间 + 重锚换锚点；真机 6 项全部通过）。下列内容保留为**历史根因记录**，行号已按 2026-10-29 改后实测更新——**优先按函数名 grep**，行号仍会漂移。
 
 - **现象**（用户 2026-10-29 真机回报）：同一文档开两个窗口，滚 A 时 B 跟着动、**且位置看起来「随机」**；B 的页还会变成**背景色**（占位态无像素）且不再恢复。
 - **证据**（T9 客观测量量化）：两窗口视口相隔 11 页时，B 的 `window-start` 从 p12 **塌到 p6**，2 条 `--multipage-sync` 只恢复到 p7，需 1 次显式 `goto-page` 才回位。P2-B 修掉的 D8 违规只解释「不恢复」这一半（态 C 整队清空丢掉另一窗口的 pending），**位置塌陷与「随机」感**属布局模型。
-- **根因**（已定位，带行号）：① `seshat-reader--pages` 是**单 buffer** 的驻留行表（`seshat-reader.el:462`）；② 回收循环遍历整个 buffer、只保留**本窗口**区间（`:3100-3104`，同步路径 `:2971-2976`）；③ `delete-region` 回收后 B 的 `window-start` 随之前移（`:2004`）；④ `--ensure-window-layout` 对**非当前窗口**显式 `set-window-start` 并钉到最小驻留页（`:3727-3734`）；⑤ `--multipage-last-range` 是 **buffer 一份**（`:2139` / `:3040` / `:3079`）⇒ 「区间未变即早退」的判据在多窗口下永远错、结果依赖命令顺序 ⇒ 「随机」感；⑥ 居中/贴左决策按**单窗口**宽度写入 buffer 全局文本属性（`:1771` / `:2217`）⇒ 横向症状。（行号为 2026-10-29 实测，`seshat-reader.el` 后续改动会漂移，按函数名 grep 定位。）
-- **影响**：P1 L3-⑪（「双窗口各自滚动正常」）**不成立**；用户实际只能单窗口阅读，或接受另一窗口被拖走。
-- **建议方向**：另立 P1 follow-up 计划 `openspec/active/2026-10-29-reader-multiwindow-independent-scroll.md`（草案，含 A/B/C 三方案与影响面）。**不要**在修其它问题时顺手改这一段——涉及驻留集语义、内存上限与 T9 的全部几何断言。
+- **根因**（2026-10-29 改后实测行号，按函数名 grep 定位）：① `seshat-reader--pages` 是**单 buffer** 的驻留行表（`seshat-reader.el:462`）；② 回收循环遍历整个 buffer、只保留**本窗口**区间（`--multipage-sync-blocking` 回收判据 `:3259`、`--multipage-sync-async` 回收判据 `:3416`，修前是 `(or (< page first) (> page last))`）；③ 回收删行让另一窗口的 `window-start` 随 marker 前移（`--multipage-remove-page` 的 `delete-region` `:2049`）；④ `--ensure-window-layout` 对**非当前窗口**显式 `set-window-start` 并钉到最小驻留页（`:4059`，`set-window-start` 在 `:4102`；旧锚点来源是 `--multipage-window-start-page` `:3954` 的 `first` 兜底）；⑤ 同步区间的早退记账是 **buffer 一份**（修前 `--multipage-last-range`，现已删除，改为 window-parameter `seshat-reader--range-parameter` `:2225` + `--multipage-last-range-for` `:2253` / `--multipage-clear-last-ranges` `:2282`）⇒ 「区间未变即早退」在多窗口下永远错、结果依赖命令顺序 ⇒ 「随机」感；⑥ 居中/贴左决策按**单窗口**宽度写入 buffer 全局文本属性（`--multipage-set-page-centered` `:1760` / `--multipage-page-should-center-p` `:1808`）⇒ 横向症状。
+- **影响**：P1 L3-⑪（「双窗口各自滚动正常」）修前**不成立**，用户实际只能单窗口阅读，或接受另一窗口被拖走。**修后**：纵向已达标（同 frame 上下分窗 + 跨 frame 各一轮真机验收通过，30 页交替滚动不塌不跳）；横向（⑥）与预取方向仍是已知限制，见本节 §7、§8。
+- **建议方向**：已落地，落点 `openspec/completed/2026-10-29-reader-multiwindow-independent-scroll.md`（T1–T6，含 D1–D6 决策与逐条变异测试）。**不要**在修其它问题时顺手回退这三处（驻留集回收判据 / 窗口级区间记账 / 重锚锚点）——涉及驻留集语义、内存上限与全部几何断言；横向 ⑥ 与预取方向另见 §7 / §8。
 
 ### 2. `--multipage-async-overdue-p` 用单一 buffer 时间戳（多窗口粗粒度近似）
 
@@ -1891,6 +1893,20 @@
 - **证据**：与 P2-B 代码审查 ① major 完全同类（`--multipage-all-visible-pages` 修前也这么写，docstring 却称「walks every frame」）；该 major 的修法是 `frame-list` → `frame-live-p` 过滤 → `window-list FRAME`。
 - **影响**：面板窗口在另一个 frame 时，`--windows` 看不到它 ⇒ 依赖它的路径（`--window-for-kind` 判「同 kind 是否已显示」、`seshat-reader-sidebar-toggle-width` 取「最近的」面板、kind 全关）在跨 frame 时会误判：可能重复开面板，或 `C-c w` 找不到面板只提示。**不涉及阅读器渲染正确性**。
 - **建议方向**：把实现改成与 `--multipage-all-visible-pages` 同构（`frame-list` → `frame-live-p` → `window-list FRAME`，保持 docstring 的「全体」语义），并补一条桩用例（桩 `frame-list` / `window-list` 按 frame 作答、断言无参调用零次）。**同一轮里检查其它 docstring 写「全体」但实现用无参 `window-list` 的函数**——这类不一致会反复被写出来。
+
+### 7. 横向：居中/贴左按**单窗口**宽度决策，却写进 buffer 全局几何（左右分窗 / 跨 frame 不同宽时一个窗口位置错）
+
+- **现象**：上下分窗（同宽）时两个窗口的页面位置一致；**左右分窗、或两个 frame 宽度不同**时，两个窗口里同一个页面的水平位置/宽度必有一个是错的——看起来像「有一边的页面没对齐 / 宽度不对」，且换窗口重绘也修不好（错的那份是共享的）。
+- **证据**：居中决策是 `--multipage-page-should-center-p`（`seshat-reader.el:1808`，按**某个窗口**的宽度算「页面能否完整放下」），结果由 `--multipage-set-page-centered`（`:1760`）写成**每页行的 `display` 文本属性**（`align-to` + spec）——行是 buffer 文本，所有窗口共享；贴左路径同理改的是窗口 hscroll + `line-prefix`。写几何的 5 处入口：`--multipage-sync` 的 refit（`:558` / `:741`）、`--multipage-rerender-page`（`:2369` / `:2389`）、异步补位的 `:3008`、`--refit-window`（`:4436`，`--multipage-refit-page` 调用在 `:4468`）、`--redisplay-all-windows`（`:5484`）。修前 P2-B 的 D8 只统一了**队列**口径，没有触及这族「窗口宽度 → buffer 文本属性」的写入。
+- **影响**：**横向**布局正确性（纵向已由 `openspec/completed/2026-10-29-reader-multiwindow-independent-scroll.md` 解决）。上下分窗同宽不受影响，因此不影响日常单窗口与上下对照阅读；左右对照（宽页、`width` 模式）时会看到一个窗口的页面宽度/位置不对。
+- **建议方向**：把「居中/贴左」从 buffer 级文本属性改为**窗口级**表达——`display` 属性只表达「页宽」（与窗口无关的那部分），水平偏移交给窗口级手段（`window-hscroll` 的 per-page 口径，或 `:align-to` 用窗口相对的表达式而非常量像素）。改造面覆盖 refit / rerender / 异步补位 / `--redisplay-all-windows` 四处，且要与「页间空行、相邻页整栏平移」的既有语义（见 §P2-3 横向滚动整栏平移）一并重估，属独立立项范畴，不建议顺手改。
+
+### 8. 预取方向按窗口（`--multipage-scroll-direction` 仍是 buffer 级）
+
+- **现象**：双窗口交替向相反方向滚动时，预取可能预热**另一侧**的一页——被最后滚动的窗口覆盖方向后，另一个窗口的「下一页」没有被预热，而「上一页」被预热了。
+- **证据**：`seshat-reader--multipage-scroll-direction` 是 `defvar-local`（buffer 一份），由 `--multipage-scroll` 每次滚动写回；`--multipage-prefetch`（`:3055`）的边界计算读它。驻留集并集化与「预取边界改用调用窗口 range」（`openspec/completed/2026-10-29-reader-multiwindow-independent-scroll.md` 的 T5）只解决了**边界**，没有解决**方向**。
+- **影响**：**不影响正确性**，只影响预取命中率：另一侧一页多渲染一次（canvas 实测 1.16–2.77 ms/页），且被并集回收 + spec 缓存上限双重兜住，内存不会越线。单窗口无影响。
+- **建议方向**：方向也改窗口参数（与 `seshat-reader--range-parameter` 同一范式，值同样带 `BUFFER` 校验），`--multipage-prefetch` 的 `WINDOW` 形参已经就位（T5 保留了它）。改造要动像素滚动路径（`--multipage-scroll` 写回点）与全部滚动用例，回归面比看起来大——先量化「预热错侧的实测代价」，再决定是否值得做。
 
 ## 书架封面依赖外部命令（Emacs 离线书架，2026-10-29）
 

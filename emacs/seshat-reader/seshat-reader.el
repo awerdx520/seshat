@@ -1109,7 +1109,16 @@ cannot push the cache past what memory allows."
 The rows are kept sorted by page, so the first and the last row give the range
 the viewport is allowed to draw from.  nil is returned when the buffer has no
 page row at all, which is what makes the cache fall back to plain FIFO and the
-recycle keep no spec."
+recycle keep no spec.
+
+This is the **cross distance** of the row table, not the resident set: the rows
+are kept for the union of every window showing the buffer (decision D1), so the
+span covers the pages between two windows as well.  It is no longer used as the
+prefetch boundary -- `seshat-reader--multipage-prefetch' takes the calling
+window's own range (decision D5) -- but it still describes \"the pages the
+layout holds\" for the callers that want exactly that (the cache limit derived
+from the resident set and the no-window fallback of
+`seshat-reader--multipage-resident-pages')."
   (when seshat-reader--pages
     (cons (car (car seshat-reader--pages))
           (car (car (last seshat-reader--pages))))))
@@ -1134,21 +1143,36 @@ page counts, because a cached bitmap of the page is what makes the render cheap
 
 ENTRIES is a page cache list, newest entry first, i.e. the shape of both
 `seshat-reader--page-spec-cache' and `seshat-reader--multipage-page-sizes'.
-Entries whose page is outside the resident range go first, oldest of them
-first: the reader cannot see those pages any more, so their bitmaps are worth
-less than the ones on screen.  When every entry belongs to a resident page the
+Entries whose page is outside the resident set go first, oldest of them first:
+the reader cannot see those pages any more, so their bitmaps are worth less
+than the ones on screen.  When every entry belongs to a resident page the
 oldest entry is dropped, which is the plain FIFO behaviour of P0.
+
+The resident set is the union of what every window on the buffer shows
+\(`seshat-reader--multipage-resident-pages', decision D4), not the cross
+distance between the first and the last row: with two windows far apart, the
+pages between them are on screen nowhere.
+
+There is **no boundary slack here**, unlike
+`seshat-reader--multipage-page-near-resident-p', which also accepts the pages
+one step outside the set.  The two functions keep the boundary they always had
+and only changed the source of the set:
+
+- near-resident decides whether a recycled page keeps its bitmap, and a page
+  one step away is exactly the page the way back needs;
+- this function decides what to throw away, and a page one step outside the set
+  is the page about to be seen -- counting it as resident would postpone its
+  eviction, push the cache peak up (against the memory budget) and make the
+  eviction timing differ from the single-window baseline for no gain.
 
 Both caches evict through this one function, so the spec cache and the size
 cache stay in step as the viewport moves and neither grows a policy of its
 own."
-  (let* ((range (seshat-reader--multipage-resident-page-range))
-         (victim nil))
+  (let ((pages (seshat-reader--multipage-resident-pages))
+        (victim nil))
     (dolist (entry entries)
       (let ((page (car (car entry))))
-        (unless (and range
-                     (>= page (car range))
-                     (<= page (cdr range)))
+        (unless (memq page pages)
           ;; The list is newest first: the last match is the oldest match.
           (setq victim entry))))
     (or victim (car (last entries)))))
@@ -2142,6 +2166,39 @@ nil means no window reported a page range at all; callers must read that as
               (setq page (1+ page)))))))
     (sort (delete-dups pages) #'<)))
 
+(defun seshat-reader--multipage-resident-pages (&optional window)
+  "Return the pages the layout must keep, as an ascending list of page numbers.
+
+The row table `seshat-reader--pages' is buffer-local and shared by every window
+showing the buffer, so \"resident\" cannot mean \"what this window sees\":
+recycling a page another window still shows deletes the row under that window's
+`window-start' and drags it forward.  The set is therefore the union of the
+visible ranges of every window on the buffer --
+`seshat-reader--multipage-all-visible-pages', with WINDOW merged in explicitly
+-- and **not** the cross distance `seshat-reader--multipage-resident-page-range'
+reports: two windows eleven pages apart would make every page between them
+\"resident\", which keeps bitmaps alive for pages nobody sees and hides the real
+victims from the cache eviction rule (decision D4 of the multi-window plan).
+
+WINDOW is merged only when it is live and shows this buffer; nil means \"no
+calling window to merge\", which is what the callers that work for the buffer
+rather than for a window pass.
+
+The fallback, and why it exists: when no window reports a range -- a buffer no
+window displays, which is how the geometry fixtures run, or a buffer whose
+layout is not built yet -- the answer is every page between the first and the
+last row, i.e. exactly the cross distance of
+`seshat-reader--multipage-resident-page-range'.  That is not a second policy:
+with one window, and with no window at all, union and cross distance describe
+the same set, so the fallback keeps the no-window path behaving as it did before
+the union existed instead of recycling every row.
+
+nil means \"nothing is known about visibility\": there is no row and no window
+reports a range."
+  (or (seshat-reader--multipage-all-visible-pages window)
+      (when-let* ((range (seshat-reader--multipage-resident-page-range)))
+        (number-sequence (car range) (cdr range)))))
+
 ;;; Multi-page layout residency (P1 T1b)
 
 ;; The resident set is the pages the viewport shows plus
@@ -2165,12 +2222,74 @@ Inserting or deleting a page row can report a window state change, which
 runs `seshat-reader--ensure-window-layout' and would re-enter the sync.
 The flag breaks that cycle.")
 
-(defvar-local seshat-reader--multipage-last-range nil
-  "Page range the resident set was last synchronised for, as (FIRST . LAST).
+(defconst seshat-reader--range-parameter 'seshat-reader-range
+  "Window parameter holding the page range a window was last synchronised for.
 
-`seshat-reader--multipage-sync' returns immediately while the range asked
-for is still this one, so the `post-command-hook' entry costs one range
-computation per command instead of a full pass over the resident pages.")
+The value is a cons (BUFFER . RANGE): BUFFER is the buffer whose layout was
+synchronised in that window and RANGE is the (FIRST . LAST) cons
+`seshat-reader--multipage-visible-range' returned for it.
+
+`seshat-reader--multipage-sync' returns immediately while the range asked for
+is still the recorded one, so the record decides whether any work happens at
+all and the `post-command-hook' entry costs one range computation per command
+instead of a full pass over the resident pages.  It is a **window** parameter
+and not a buffer-local variable because the record is per window: a
+buffer-local one is shared by every window showing the buffer, so which window
+ran the previous command decided whether the current one was skipped -- the
+\"random\" jumping of the two-window report (decision D2 of the multi-window
+plan).  With the parameter each window is skipped or redone on its own
+account.
+
+BUFFER is part of the value because a window keeps its parameters when it
+switches to another buffer and back.  Without the check a stale range left by
+an earlier visit would compare equal to the range of the new visit while the
+row table is empty (it was cleared on the way in), the sync would return early
+and the rows would never be rebuilt: a permanently blank reader.
+
+Use `seshat-reader--multipage-last-range-for' and
+`seshat-reader--multipage-set-last-range' instead of the parameter directly,
+so the buffer check stays in one place.")
+
+(defun seshat-reader--multipage-last-range-for (window)
+  "Return the page range WINDOW was last synchronised for, or nil.
+
+WINDOW defaults to the selected window when it is not live.  The range is read
+from the window parameter `seshat-reader--range-parameter' and only returned
+when the buffer stored next to it is the current buffer, because a window
+keeps its parameters across a buffer switch.  nil therefore means \"this
+window has not been synchronised for this buffer\", which is exactly the
+condition the early return of `seshat-reader--multipage-sync-blocking' and of
+`seshat-reader--multipage-sync' test."
+  (let ((win (if (window-live-p window) window (selected-window))))
+    (when (window-live-p win)
+      (let ((value (window-parameter win seshat-reader--range-parameter)))
+        (when (eq (car-safe value) (current-buffer))
+          (cdr value))))))
+
+(defun seshat-reader--multipage-set-last-range (window range)
+  "Record RANGE as the page range WINDOW was last synchronised for.
+
+WINDOW defaults to the selected window when it is not live and RANGE is the
+\(FIRST . LAST) cons the synchronisation ran for.  The current buffer is
+stored next to the range, because the parameter outlives the visit it was
+recorded in; see `seshat-reader--range-parameter' for the failure that
+prevents."
+  (let ((win (if (window-live-p window) window (selected-window))))
+    (when (window-live-p win)
+      (set-window-parameter win seshat-reader--range-parameter
+                            (cons (current-buffer) range)))))
+
+(defun seshat-reader--multipage-clear-last-ranges ()
+  "Forget the synchronised range of every window showing this buffer.
+
+Every window on every frame, not just the selected one, because the record is
+what makes a sync return early: a window that keeps a range equal to the one
+about to be asked for skips the rebuild, and with the row table just cleared
+that means its rows are never inserted again -- the window stays blank for
+good, the same shape as the \"page turned background colour\" report, which is
+why this loops over `get-buffer-window-list' instead of clearing one window."
+  (dolist (window (get-buffer-window-list (current-buffer) nil t))
+    (set-window-parameter window seshat-reader--range-parameter nil)))
 
 (defun seshat-reader--multipage-pagecount ()
   "Return the number of pages of the loaded document, or nil.
@@ -2196,12 +2315,17 @@ value is only checked to be a positive integer."
 
 The buffer text is left untouched; callers that want it gone erase the
 buffer themselves, which is why this is separate from
-`seshat-reader--multipage-remove-page'."
+`seshat-reader--multipage-remove-page'.
+
+The recorded range of every window showing the buffer is dropped too
+\(`seshat-reader--multipage-clear-last-ranges'): the rows are gone, so a window
+that kept a range equal to the next one asked for would return early from the
+sync and its rows would never be rebuilt -- a permanently blank reader."
   (dolist (entry seshat-reader--pages)
     (when (markerp (cadr entry))
       (set-marker (cadr entry) nil)))
-  (setq seshat-reader--pages nil
-        seshat-reader--multipage-last-range nil))
+  (setq seshat-reader--pages nil)
+  (seshat-reader--multipage-clear-last-ranges))
 
 (defun seshat-reader--multipage-render-page (page &optional force window)
   "Make sure PAGE has a row displaying its image spec and return the spec.
@@ -2325,38 +2449,67 @@ sharp after a resize without ever rendering a page twice."
                     seshat-reader--refit-scale-tolerance))
       (seshat-reader--multipage-rerender-page page window))))
 
-(defun seshat-reader--multipage-page-near-resident-p (page)
-  "Return non-nil when PAGE is resident or within one page of the set.
+(defun seshat-reader--multipage-page-near-resident-p (page &optional keep)
+  "Return non-nil when PAGE is resident or one page away from the set.
 
-PAGE is a 1-based page number.  The resident range is read from the rows that
-are still in the buffer, so the answer is about the viewport as it is now; nil
-is returned when no row is left."
-  (let ((range (seshat-reader--multipage-resident-page-range)))
-    (and range
-         (>= page (1- (car range)))
-         (<= page (1+ (cdr range))))))
+PAGE is a 1-based page number.  The set is what
+`seshat-reader--multipage-resident-pages' reports, i.e. the union of the pages
+every window on the buffer keeps visible (decision D4); PAGE counts when it is a
+member of that set or one page before/after a member, which is the \"±1\"
+boundary this predicate always had.  Only the **source** of the set changed,
+from the cross distance between the first and the last row to the union, so a
+page sitting between two distant windows is no longer near-resident: nobody sees
+it, and keeping its bitmap is what the eviction rule would undo first anyway.
 
-(defun seshat-reader--multipage-recycle-page (page)
+For a contiguous union (one window, or windows whose ranges touch) the answer is
+exactly the old `(>= page (1- first))' / `(<= page (1+ last))' interval.  For a
+gap it extends the boundary around the real members instead of filling the gap,
+so the page just before a window that starts at 20 still keeps its bitmap for
+the way back.
+
+KEEP, when non-nil, is the set to test against, as
+`seshat-reader--multipage-resident-pages' returns it.  Callers that test many
+pages in a row pass it so the frame/window walk happens once instead of once per
+page: the recycle loops of `seshat-reader--multipage-sync-blocking' and
+`seshat-reader--multipage-sync-async' would otherwise be quadratic in the number
+of rows.
+
+nil is returned when the set is empty, i.e. when no row is left and no window
+reports a range."
+  (let ((pages (or keep (seshat-reader--multipage-resident-pages))))
+    (and pages
+         (or (memq page pages)
+             (memq (1- page) pages)
+             (memq (1+ page) pages)))))
+
+(defun seshat-reader--multipage-recycle-page (page &optional keep)
   "Remove the row of PAGE and release the cached spec of that page.
 
 PAGE is a 1-based page number and the spec the row was displaying is
 returned.  Dropping the cached spec is what actually releases the bitmap.
 
-The spec of a page that is resident or one page next to the resident range is
+The spec of a page that is resident or one page next to the resident set is
 kept, which is what makes scrolling one page back hit the cache instead of
 rendering the page again: in P0 every recycled page lost its bitmap
 immediately and a single page back was a full re-render (a 0% hit rate while
 scanning 20 pages, the measurement this batch exists to fix).  Only pages
 further away -- the ones the eviction rule of
 `seshat-reader--page-spec-eviction-victim' would drop first anyway -- lose
-their bitmap here.
+their bitmap here.  \"Resident\" means the union of the pages every window on
+the buffer shows (`seshat-reader--multipage-resident-pages'), so the bitmap of a
+page another window still displays is never released here.
+
+KEEP, when non-nil, is the resident set to test PAGE against, as
+`seshat-reader--multipage-resident-pages' returns it.  The recycle loops compute
+it once and pass it down: testing every page against a freshly computed union
+would walk every frame and window once per row.
 
 The recorded native size and render scale are dropped either way, so a page
 that comes back is measured again instead of reusing a size that a rotation
 may have changed."
   (let ((spec (seshat-reader--multipage-remove-page page)))
     (when (and spec
-               (not (seshat-reader--multipage-page-near-resident-p page)))
+               (not (seshat-reader--multipage-page-near-resident-p page keep)))
       (seshat-reader--multipage-forget-specs page))
     (setq seshat-reader--page-native-sizes
           (assq-delete-all page seshat-reader--page-native-sizes)
@@ -2899,15 +3052,30 @@ idle timer fires once per idle window and cannot drive a queue."
           (seshat-reader--cancel-async-render-timers))
         nil)))))
 
-(defun seshat-reader--multipage-prefetch (&optional window)
-  "Warm the page just beyond WINDOW's resident set, queued or synchronously.
+(defun seshat-reader--multipage-prefetch (window range)
+  "Warm the page just beyond RANGE, the resident set of WINDOW.
 
-WINDOW defaults to the selected window.  The page is chosen from
-`seshat-reader--multipage-scroll-direction': scrolling down takes the page
-after the last resident one, scrolling up the page before the first.  It is
-clamped to the document and skipped when it is resident, already cached under
-any scale (`seshat-reader--multipage-spec-cached-p'), already queued, or
-already given up on.
+RANGE is the cons (FIRST . LAST) `seshat-reader--multipage-visible-range'
+returned for WINDOW, i.e. **that window's** viewport widened by the preload,
+and the page is chosen from its edges: scrolling down takes the page after
+LAST, scrolling up the page before FIRST.  The cross distance of the row table
+\(`seshat-reader--multipage-resident-page-range') must not be used here: the
+rows are kept for the union of every window showing the buffer (decision D1),
+so their span reaches from one window's pages to the other's, and the edge of
+that span is a page neither window is about to show -- two windows eleven
+pages apart warmed the wrong end of the document systematically (decision D5
+of the multi-window plan).  RANGE is also the set the page is checked against
+before it is warmed: a page inside RANGE is on screen already.
+
+WINDOW is still needed, and must not be dropped in favour of
+`selected-window': the synchronous branch below renders at
+`seshat-reader--multipage-target-scale' of WINDOW, so a prefetch for a
+non-selected window would otherwise be pre-rendered at the wrong scale and
+size.
+
+The page is clamped to the document and skipped when it is inside RANGE,
+already cached under any scale (`seshat-reader--multipage-spec-cached-p'),
+already queued, or already given up on.
 
 `seshat-reader-render-async' decides **how** the page is warmed, and this
 function is the only place that decision is made -- the signature and every
@@ -2934,29 +3102,28 @@ Errors are swallowed -- a prefetch is an optimisation and must never break
 scrolling.  The page number is returned when it was warmed (queued or
 rendered), nil when there was nothing to do."
   (ignore-errors
-    (let ((range (seshat-reader--multipage-resident-page-range)))
-      (when range
-        (let* ((direction (if (eq seshat-reader--multipage-scroll-direction -1)
-                              -1 1))
-               (edge (if (> direction 0) (cdr range) (car range)))
-               (page (seshat-reader--multipage-clamp-page (+ edge direction))))
-          (when (and page
-                     (not (and (>= page (car range)) (<= page (cdr range)))))
-            (if seshat-reader-render-async
-                (when (seshat-reader--multipage-pending-add page)
-                  (seshat-reader--schedule-async-render (current-buffer))
-                  page)
-              ;; 态 A 的同步预取：与 T5 之前的实现同口径（同样的「已缓存即跳
-              ;; 过」守卫、同样按窗口算目标 scale），但**不入队、不排 timer**
-              ;; —— 态 A 收尾时会把异步状态清干净，登记了也会被丢掉。走
-              ;; `--page-spec' 才进缓存，这一页的提前量才真的存在。
-              (unless (seshat-reader--multipage-spec-cached-p page)
-                (seshat-reader--page-spec
-                 page
-                 (seshat-reader--multipage-target-scale
-                  page (if (window-live-p window) window (selected-window)))
-                 seshat-reader--multipage-rotate)
-                page))))))))
+    (when range
+      (let* ((direction (if (eq seshat-reader--multipage-scroll-direction -1)
+                            -1 1))
+             (edge (if (> direction 0) (cdr range) (car range)))
+             (page (seshat-reader--multipage-clamp-page (+ edge direction))))
+        (when (and page
+                   (not (and (>= page (car range)) (<= page (cdr range)))))
+          (if seshat-reader-render-async
+              (when (seshat-reader--multipage-pending-add page)
+                (seshat-reader--schedule-async-render (current-buffer))
+                page)
+            ;; 态 A 的同步预取：与 T5 之前的实现同口径（同样的「已缓存即跳
+            ;; 过」守卫、同样按窗口算目标 scale），但**不入队、不排 timer**
+            ;; —— 态 A 收尾时会把异步状态清干净，登记了也会被丢掉。走
+            ;; `--page-spec' 才进缓存，这一页的提前量才真的存在。
+            (unless (seshat-reader--multipage-spec-cached-p page)
+              (seshat-reader--page-spec
+               page
+               (seshat-reader--multipage-target-scale
+                page (if (window-live-p window) window (selected-window)))
+               seshat-reader--multipage-rotate)
+              page)))))))
 
 (defun seshat-reader--multipage-resident-spec-megabytes ()
   "Estimate the memory the cached page specs hold, in megabytes.
@@ -3008,7 +3175,7 @@ WINDOW is accepted for symmetry with the other sync helpers and is not used."
                  (length seshat-reader--page-spec-cache)
                  megabytes budget)))))
 
-(defun seshat-reader--multipage-sync-blocking (&optional window)
+(defun seshat-reader--multipage-sync-blocking (&optional window force)
   "Keep the resident page rows of WINDOW in sync with its viewport.
 
 This is the synchronous half of `seshat-reader--multipage-sync', moved here
@@ -3021,14 +3188,25 @@ diffing this function against the pre-T6 one.
 
 WINDOW defaults to the selected window.  The pages
 `seshat-reader--multipage-visible-range' asks for are rendered when they
-are missing and every page outside that range is recycled, so the buffer
-only holds the visible pages plus the preload around them.  The range of
-the previous run is remembered in `seshat-reader--multipage-last-range' and
-an unchanged range returns at once, which keeps the `post-command-hook'
+are missing and every page outside the **union** of what all windows on this
+buffer show (`seshat-reader--multipage-resident-pages', decision D1) is
+recycled, so the buffer only holds the pages some window can see plus the
+preload around them -- with one window that is exactly its own range.  The
+range of
+the previous run of this window is remembered in the window parameter
+`seshat-reader--range-parameter' and an unchanged range returns at once, which
+keeps the `post-command-hook'
 entry from redoing the work on every command.  Nothing is done while a sync
 is already running, which is what stops a buffer modification made here
 from re-entering through `window-state-change-functions'.  The range that
 was synchronised is returned, or nil when there was nothing to do.
+
+FORCE non-nil bypasses that early return **and** the bookkeeping: the range is
+not recorded, so a forced pass leaves the window with the range of the
+previous unforced one and the next `seshat-reader--multipage-sync' for the
+same range redoes the work.  \"Forced\" therefore never means \"already
+synchronised\" (decision D6); that contract used to be kept by binding the
+buffer-local record around the call, which the per-window parameter replaced.
 
 Scrolling never changes the zoom: the base scale is read by
 `seshat-reader--multipage-target-scale' and is only ever written by the zoom
@@ -3050,21 +3228,40 @@ when the asynchronous pass is enabled."
                      (not seshat-reader--multipage-syncing)
                      (eq (window-buffer win) (current-buffer))
                      (seshat-reader--multipage-visible-range win))))
-    (when (and range (not (equal range seshat-reader--multipage-last-range)))
+    (when (and range
+               (or force
+                   (not (equal range
+                               (seshat-reader--multipage-last-range-for win)))))
       (let ((seshat-reader--multipage-syncing t)
             (first (car range))
             (last (cdr range)))
-        (setq seshat-reader--multipage-last-range range)
-        (let ((page first))
+        ;; FORCE 只作用于本次调用：跳过写回，于是「强制同步」之后该窗口记的仍是
+        ;; **上一次**同步的区间 —— 强制同步 ≠ 已同步（D6）。照常写回的话，下一次
+        ;; 同一区间的 `--multipage-sync' 会因区间相等而早退，那是可观察的行为变化。
+        (unless force
+          (seshat-reader--multipage-set-last-range win range))
+        ;; 回收按**并集**、渲染按本窗口（D1）：行表 `seshat-reader--pages' 是
+        ;; buffer 唯一的一份，另一个窗口还在显示的页不能因为本窗口滚走就被删 ——
+        ;; 删行会把那个窗口的 `window-start' 一起往前拖，正是真机现象 1。
+        ;; 并集在**改动 buffer 之前**取快照：`--multipage-visible-range' 的页号
+        ;; 来自 `window-start' 的 `page-at-pos'，渲染插行 / 回收删行都会让
+        ;; `window-start' 落到另一个页行上，取得越晚越可能漏掉本轮真正可见的页。
+        ;; 放在渲染循环之前，并集必然包含本窗口本轮的 RANGE。
+        ;; 只算一次：循环内每页重算就是「行数 × 遍历所有 frame 的窗口」，见
+        ;; `seshat-reader--multipage-page-near-resident-p' 的 KEEP 说明。
+        (let ((keep (seshat-reader--multipage-resident-pages win))
+              (page first))
           (while (<= page last)
             (seshat-reader--multipage-render-page page nil win)
-            (setq page (1+ page))))
-        (dolist (entry (copy-sequence seshat-reader--pages))
-          (let ((page (car entry)))
-            (when (or (< page first) (> page last))
-              (seshat-reader--multipage-recycle-page page))))
+            (setq page (1+ page)))
+          (dolist (entry (copy-sequence seshat-reader--pages))
+            (let ((page (car entry)))
+              (when (not (memq page keep))
+                (seshat-reader--multipage-recycle-page page keep)))))
         ;; 区间定型后才预热与体检：此时驻留集就是最终的视口 ± preload。
-        (seshat-reader--multipage-prefetch win)
+        ;; 预取边界用**本窗口**的 RANGE（D5）：行表按并集保留，跨距的边界可能
+        ;; 是另一个窗口那一端的页。
+        (seshat-reader--multipage-prefetch win range)
         (seshat-reader--multipage-check-memory win))
       range)))
 
@@ -3111,11 +3308,13 @@ that value and at the side effects on the layout, so splitting the body behind
 the switch is invisible to them."
   (if (not seshat-reader-render-async)
       ;; 态 A：逐页同步渲染 + 预取。先丢掉异步侧的状态，切回异步时不会拿一份
-      ;; 「旧几何 + 已渲染」的队列继续跑；队列非空时把 `last-range' 置空，迫使
-      ;; 本轮的 blocking 真正重做一遍范围（否则区间没变即早退，占位页会一直空白）。
+      ;; 「旧几何 + 已渲染」的队列继续跑；队列非空时把所有窗口的「上次同步区间」
+      ;; 作废，迫使本轮的 blocking 真正重做一遍范围（否则区间没变即早退，占位页会
+      ;; 一直空白）。必须遍历**所有**显示本 buffer 的窗口：只清本窗口会留下
+      ;; 「行表已空 + 另一窗口的区间恰好相等 → 早退 → 行永不重建」的永久空白。
       (progn
         (when seshat-reader--multipage-pending-renders
-          (setq seshat-reader--multipage-last-range nil))
+          (seshat-reader--multipage-clear-last-ranges))
         (seshat-reader--multipage-reset-async-state)
         ;; 同步路径的预取现在按开关分流（`--multipage-prefetch' 内部）：态 A 下
         ;; 它同步取 spec、不入队、不排 timer，所以这里跑完的第二次清理只是兜底
@@ -3131,14 +3330,22 @@ the switch is invisible to them."
        ((null range) nil)
        ((seshat-reader--multipage-async-overdue-p)
         (seshat-reader--multipage-force-sync win))
-       ((equal range seshat-reader--multipage-last-range) range)
+       ((equal range (seshat-reader--multipage-last-range-for win)) range)
        (t (seshat-reader--multipage-sync-async win range))))))
 
-(defun seshat-reader--multipage-sync-async (window range)
+(defun seshat-reader--multipage-sync-async (window range &optional force)
   "Render the within-reach pages of RANGE and queue the rest (state B).
 
 WINDOW is the live window the range belongs to and RANGE is the cons
 \(FIRST . LAST) `seshat-reader--multipage-visible-range' returned for it.
+FORCE non-nil keeps this pass from recording RANGE as the range WINDOW was
+synchronised for, exactly like the same argument of
+`seshat-reader--multipage-sync-blocking' (decision D6).  No caller passes it
+today -- the only forced path goes through the blocking half -- but the
+argument exists so that an asynchronous forced pass, if one is ever added,
+cannot silently turn \"forced\" into \"already synchronised\"; the bookkeeping
+is wrapped in `unless' rather than the argument left unbound, which would be
+a void variable.
 
 The two pages rendered here are the page point is on and the page one step
 further in `seshat-reader--multipage-scroll-direction', i.e. the one the
@@ -3151,15 +3358,17 @@ reason T3 introduced the placeholder row) -- and is then queued.
 The queue is pruned afterwards to the pages **any** window on this buffer keeps
 visible (`seshat-reader--multipage-all-visible-pages', decision D8) and not to
 RANGE: the queue is buffer-local and shared, so trimming it to one window's
-range would delete the entries another window queued.  Rendering, recycling and
-the failure clearing below still walk RANGE only -- the layout is per window,
-only the queue is shared.  Pruning is what keeps pages nobody can see from ever
-being rendered, and the pages that were not in the previous range get their
-failure count cleared so that a transient failure is never turned into a
-permanent one (the second clearing point the non-blocking-render invariant
-requires).
+range would delete the entries another window queued.  Rendering and the failure
+clearing below still walk RANGE only, because the layout is per window and only
+the queue is shared; **recycling** does not, it keeps every page another window
+still shows (`seshat-reader--multipage-resident-pages', decision D1) -- deleting
+a row another window displays would drag that window's `window-start' forward.
+Pruning is what keeps pages nobody can see from ever being rendered, and the
+pages that were not in the previous range get their failure count cleared so
+that a transient failure is never turned into a permanent one (the second
+clearing point the non-blocking-render invariant requires).
 
-Out-of-range rows are recycled exactly like the synchronous path does, and
+Rows outside the union are recycled exactly like the synchronous path does, and
 both the prefetch and the memory check run once the range is settled, so the
 buffer state after this function is the one the blocking path would leave,
 except that the pixels of the queued pages do not exist yet.
@@ -3167,10 +3376,17 @@ except that the pixels of the queued pages do not exist yet.
 The monitored range is returned."
   (let ((seshat-reader--multipage-syncing t)
         (first (car range))
-        (last (cdr range))
-        (previous seshat-reader--multipage-last-range)
+        (previous (seshat-reader--multipage-last-range-for window))
+        ;; 回收口径的快照必须在**改动 buffer 之前**取（D1）：渲染插行 / 回收删行
+        ;; 都会让 `window-start' 落到另一个页行上，而 `--multipage-visible-range'
+        ;; 的页号正是由 `window-start' 的 `page-at-pos' 得来 —— 取得越晚，并集
+        ;; 越可能漏掉本轮真正可见的页（本窗口的 RANGE 一定包含在内）。
+        ;; 只算一次：循环内每页重算 = 每行都遍历一遍所有 frame 的窗口。
+        (keep (seshat-reader--multipage-resident-pages window))
         (pages (number-sequence (car range) (cdr range))))
-    (setq seshat-reader--multipage-last-range range)
+    ;; FORCE 下不写回，与 blocking 对称（D6）：强制同步 ≠ 已同步。
+    (unless force
+      (seshat-reader--multipage-set-last-range window range))
     (let* ((point-page (or (seshat-reader--multipage-page-at-pos (point))
                            (seshat-reader--multipage-page-at-pos
                             (window-start window))
@@ -3191,14 +3407,18 @@ The monitored range is returned."
               (seshat-reader--multipage-pending-remove page))
           (seshat-reader--multipage-placeholder-row page window)
           (seshat-reader--multipage-pending-add page))))
+    ;; 回收按**并集**、渲染与失败清零按本窗口（D1、陷阱 1）：PAGES 只喂渲染
+    ;; 与失败清零；回收用所有窗口的可见页并集（KEEP，函数入口处取的快照），
+    ;; 否则另一个窗口还在显示的行会被本窗口这一轮删掉（删行拖前它的
+    ;; `window-start'）。
     (dolist (entry (copy-sequence seshat-reader--pages))
       (let ((page (car entry)))
-        (when (or (< page first) (> page last))
-          (seshat-reader--multipage-recycle-page page))))
+        (when (not (memq page keep))
+          (seshat-reader--multipage-recycle-page page keep))))
     ;; 队列是 buffer-local 的，每个显示本 buffer 的窗口共用一份，所以裁剪口径
     ;; 必须是「所有窗口的可见页并集」而不是本窗口的 PAGES：后者会把另一个窗口
-    ;; 刚登记的队项剪掉（D8 的缺陷，T8 修复）。下面三个循环（渲染 / 回收 /
-    ;; 失败清零）仍然只看本窗口的 PAGES —— 布局是窗口的，只有队列是共享的。
+    ;; 刚登记的队项剪掉（D8 的缺陷，T8 修复）。渲染与失败清零仍然只看本窗口的
+    ;; PAGES —— 布局是窗口的，只有队列是共享的；回收已在上面改成并集（D1）。
     (seshat-reader--multipage-prune-pending
      (seshat-reader--multipage-all-visible-pages window))
     (dolist (page pages)
@@ -3207,7 +3427,7 @@ The monitored range is returned."
                            (<= page (cdr previous))))
                  (> (seshat-reader--multipage-render-failure-count page) 0))
         (seshat-reader--multipage-reset-render-failure page)))
-    (seshat-reader--multipage-prefetch window)
+    (seshat-reader--multipage-prefetch window range)
     (seshat-reader--multipage-check-memory window)
     (seshat-reader--schedule-async-render (current-buffer))
     (seshat-reader--multipage-note-pending-since)
@@ -3219,10 +3439,11 @@ The monitored range is returned."
 The timeout net: the queue has been non-empty for longer than
 `seshat-reader-render-async-timeout', so the timers are not doing their job
 \(or Emacs never went idle) and the pages they were supposed to fill in are
-still blank.  The synchronous path is run with
-`seshat-reader--multipage-last-range' bound to nil so that it really redoes the
-range instead of returning early on the unchanged one (the asynchronous step
-already recorded it).
+still blank.  The synchronous path is run with FORCE, i.e. with the early
+return of `seshat-reader--multipage-sync-blocking' bypassed and its bookkeeping
+skipped: it really redoes the range instead of returning early on the unchanged
+one (the asynchronous step already recorded it), and it does not record the
+range either -- a forced pass is not a synchronised one.
 
 Only the pages of that pass leave the queue
 \(`seshat-reader--multipage-clear-synced-pending'): state C is a window-level
@@ -3240,14 +3461,13 @@ exactly the \"before the layout changed\" value the drop must be keyed on -- and
 it is nil when the pass did nothing, in which case nothing is dropped either.
 
 The range the synchronous pass synchronised is returned."
-  ;; `seshat-reader--multipage-last-range' 的 let 绑定**有意**只作用于本次调用：
-  ;; 目的是让 `--multipage-sync-blocking' 绕过「区间未变即早退」的检查、真正重做
-  ;; 一遍范围；blocking 内部对它的 `setq' 写的是这个 let 绑定，退出即丢弃 —— 不
-  ;; 打算持久化。改成「先 setq nil 再调用」会让强制同步之后留下
-  ;; `last-range' = 本次区间，下一次 `--multipage-sync' 就因区间未变而早退，那是
-  ;; 可观察的行为变化，故维持 let 绑定 + 本注释。
-  (let* ((seshat-reader--multipage-last-range nil)
-         (synced (seshat-reader--multipage-sync-blocking window)))
+  ;; FORCE 形参（D6）**有意**只作用于本次调用：它让
+  ;; `--multipage-sync-blocking' 绕过「区间未变即早退」的检查、真正重做一遍范围，
+  ;; 同时跳过写回 —— 强制同步之后该窗口记的仍是上一次同步的区间，下一次
+  ;; `--multipage-sync' 因此仍会重做（「强制同步 ≠ 已同步」）。改成「先 setq nil
+  ;; 再调用」会让强制同步之后留下本次区间，下一次 `--multipage-sync' 就因区间未变
+  ;; 而早退，那是可观察的行为变化，故维持 FORCE 形参 + 本注释。
+  (let ((synced (seshat-reader--multipage-sync-blocking window t)))
     (seshat-reader--multipage-clear-synced-pending synced)
     synced))
 
@@ -3813,6 +4033,29 @@ was."
     (seshat-reader--multipage-relayout page)
     (force-mode-line-update)))
 
+(defun seshat-reader--multipage-row-nearest (pos)
+  "Return the page row closest to POS as a cons (PAGE . MARKER), or nil.
+
+The rows are sorted by page, so \"closest\" is the last row that starts at or
+before POS -- the page the reader was looking at when POS moved off a row --
+and only a POS before every row falls through to the first row after it.  nil
+means there is no row at all.
+
+`seshat-reader--multipage-page-at-pos' cannot answer this: it reports the page
+*containing* POS and nothing else, so it returns nil for a POS that is before
+the first row or past the end of the buffer, and it has no notion of \"the
+nearest row\" for a POS that sits between two of them.  The re-anchor of
+`seshat-reader--ensure-window-layout' needs exactly the row to move back to,
+which is why the lookup lives here (decision D3)."
+  (when (and seshat-reader--pages (integer-or-marker-p pos))
+    (let ((previous nil)
+          (next nil))
+      (dolist (entry seshat-reader--pages)
+        (let ((start (marker-position (cadr entry))))
+          (cond ((and start (<= start pos)) (setq previous entry))
+                ((and start (null next)) (setq next entry)))))
+      (or previous next))))
+
 (defun seshat-reader--ensure-window-layout (window)
   "Make WINDOW show the multi-page layout of the current buffer.
 
@@ -3821,9 +4064,33 @@ gives a new window, a resized window and a window that just switched to
 this buffer their layout.  The window gets its starting fit mode recorded,
 its resident pages synchronised and its rows centred for its own width --
 a new window can be wider or narrower than the one the rows were placed
-for.  When the window start is no longer inside a page row, the window is
-moved to the nearest page row so that the page number derived from the
-viewport stays meaningful."
+for.  When the window start is no longer at the start of a page row, the
+window is moved to the **nearest** page row, so that the page number derived
+from the viewport stays what the reader was looking at.
+
+A scroll is a trigger path as well, and not only a native one: any scroll that
+leaves `window-start' in the middle of a page row or on a blank line between
+two rows -- `scroll-up' / `scroll-down', `recenter', a wheel event, the pixel
+scrolling of a GUI frame alike -- is pulled back to the start of the nearest
+page row on the next `window-state-change-functions' run, so the viewport
+cannot come to rest between rows.  That is the deliberate price of anchoring
+to the nearest row (a blank line between two rows carries no page number of
+its own, so it belongs to the page above it) and not a defect; see
+`docs/emacs-reader.md', section 7, \"已知限制（多窗口滚动）\", item 2.
+
+The anchor used to be the smallest resident page -- the `first' fallback of
+`seshat-reader--multipage-window-start-page' -- which pinned a window to the
+lower edge of the whole layout: with the rows kept for the union of every
+window (decision D1) that edge belongs to the *other* window, so window B was
+dragged from page 12 to the pages window A was reading.  The nearest row is
+this window's own page, and it is the reason the re-anchor still runs for
+every window the hook reports and not only for the selected one: a
+`split-window', a buffer switch, a `--render-buffer' reload and the rows a
+recycle deletes all change the state of a window that is not current, and this
+function is the only place that puts such a window back on a page row (D3).
+`seshat-reader--multipage-window-start-page' itself is untouched: five callers
+derive the page number to display from it, where its `first' fallback is the
+right answer."
   (when (and (window-live-p window)
              (eq (window-buffer window) (current-buffer)))
     (with-current-buffer (window-buffer window)
@@ -3834,14 +4101,20 @@ viewport stays meaningful."
         (unless seshat-reader--multipage-fit-mode
           (setq seshat-reader--multipage-fit-mode
                 (seshat-reader--window-fit-mode window)))
+        ;; 顺序不可换：sync 会插行 / 删行并移动 marker，锚点必须在它之后算。
         (seshat-reader--multipage-sync window)
-        (when (and seshat-reader--pages
-                   (not (seshat-reader--multipage-page-at-pos
-                         (window-start window))))
-          (when-let* ((entry (assq (seshat-reader--multipage-window-start-page
-                                    window)
-                                   seshat-reader--pages)))
-            (set-window-start window (marker-position (cadr entry)))))
+        (when seshat-reader--pages
+          (let* ((start (window-start window))
+                 (entry (seshat-reader--multipage-row-nearest start)))
+            ;; 只在起点不在页行行首时移动：落在页行中间、页间空行或最后一个
+            ;; 页行之后都算「不在行首」，回到该行行首后页号就稳定了。
+            ;; 不需要重入守卫：守卫是严格 (< (marker-position entry) start)，
+            ;; 而这里写入的正是页行 marker 的精确行首位置，锚定后
+            ;; start 与 marker 位置相等、下一轮守卫即为 nil —— 自终止，最多
+            ;; 多跑一轮。若将来锚点改成非幂等逻辑（写入位置不等于该行行首），
+            ;; 必须补重入守卫，否则会与 window-state-change 互相触发。
+            (when (and entry (< (marker-position (cadr entry)) start))
+              (set-window-start window (marker-position (cadr entry))))))
         (seshat-reader--ensure-centered window)))))
 
 ;; Most of the scrolling functions here exist because of our handling

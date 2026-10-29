@@ -348,6 +348,17 @@ M12 把 M11 的「单个底部面板」升级为「左目录 / 右信息 / 中�
 
 **与 `--scale 1` 修复的关系**：canvas spec 缺 `:scale` 会让 Emacs 按 `image-scaling-factor` 放大 1.2×，而 `--multipage-page-pixel-height` 读声明值 ⇒ 页高系统性少算约 20%（单页最多 365 px）。该缺陷由本计划的批次 0 S2 真机测量暴露并同批修掉；不修则「占位页高 == 真实 image 行高」这条不变量在 canvas 后端下根本不成立，两阶段渲染会引入跳变。
 
+## 多窗口布局状态的两级归属（2026-10-29）
+
+同一文档可以同时显示在多个窗口（同 frame 上下分窗，或跨 frame 各一个）。**纵向**上每个窗口各自滚动、互不干扰（2026-10-29 起，P1 follow-up 交付）；本节说明哪些状态放在 buffer 级、哪些必须放在窗口级，以及为什么这么分。背景与验收记录见 `openspec/completed/2026-10-29-reader-multiwindow-independent-scroll.md`。
+
+- **buffer 级**（一个文档一份，所有窗口共享）：驻留行表 `seshat-reader--pages`（升序 `(PAGE MARKER . SPEC)`——页行**本身就是 buffer 文本**，不可能按窗口各存一套，那等于复活多套布局）、spec 缓存与页尺寸缓存、渲染代际与失败计数、`seshat-reader--multipage-scroll-direction`（预取方向）。
+- **窗口级**（每个窗口一份）：**可见范围**（由 `window-start` / `window-end` 经 `--multipage-visible-range` 派生，不单独存储）、**上次同步区间**（window-parameter `seshat-reader--range-parameter`，值 `(BUFFER . RANGE)`，读时校验 buffer——窗口切 buffer 再切回时参数不会自动清除）、`window-vscroll` / `window-hscroll`、`fit-mode` 与缩放。
+- **驻留集语义：从「某窗口视口 ± preload」扩大为「所有显示该 buffer 的窗口可见范围的并集」**（`--multipage-all-visible-pages`，遍历 `frame-list` → `window-list FRAME`，只留显示本 buffer 的窗口）。**回收只按并集**（`--multipage-sync-blocking` / `--multipage-sync-async` 的回收判据是 `(not (memq page keep))`），而**渲染循环、渲染失败清零、预取边界、早退判据仍按本窗口 range**。两者不能混：并集只回答「哪些行不能删」，不回答「哪些页该由本窗口渲染」；用并集喂渲染会让队列膨胀到并集大小，并让一个窗口的占位行覆盖另一个窗口刚补好的像素。
+- **早退判据按窗口**：`--multipage-last-range-for` / `--multipage-set-last-range` 读写窗口参数；修前是 buffer 级单值，于是「区间未变即早退」在多窗口下永远按「最后一个跑过的窗口」记账，早退与否取决于命令顺序（用户感知为**「随机」**）。`--multipage-force-sync` 走 `force` 形参：既绕过早退、也**不**写回记账（保持「强制同步 ≠ 已同步」的契约）。`--multipage-clear` 与态 A 复位必须**遍历所有窗口**清参数，否则会留下「行表已空 + 区间恰好相等 → 早退 → 行永不重建」的永久空白。
+- **重锚的锚点是「最近的页行」**（`--multipage-row-nearest`：起点 ≤ POS 的最后一个页行，优先前驱、否则后继），不是「最小驻留页」；`--ensure-window-layout` 仍对 hook 报告的**每一个**窗口执行——它是 `split-window` / 换 buffer / `--render-buffer` 重载 / 回收删行四条路径上**唯一**的纠正点，移除会引入新的错位。锚点换掉后，回收删行把某窗口的 `window-start` 推到页间空行时也能回到**它自己**那一页，而不是被钉到当前驻留集的下沿。顺序固定为 sync → 重锚 → `--ensure-centered`（sync 会移动 marker）。
+- **与 P2-B 决策 D8 的一致性**：pending 渲染队列是 buffer 级并集（与驻留集同一来源 `--multipage-all-visible-pages`），强制同步是窗口级操作（只把本窗口这一轮同步渲染的页出队）。两者是同一条口径的两个消费方——队列管「谁的像素还没补上」，驻留集管「哪些行不能删」。内存上限也按这条口径算：并集 = 两窗口之和，`--multipage-resident-spec-megabytes` 的估算与 75 MB 告警线不变。
+
 ## 搜索与 ink 渲染流程（2026-10-25）
 
 两条能力的共同点：**装饰只有一个出口**——文档级装饰表 + `seshat-reader-annotation--redraw-highlights` 的全量重投。因此新增能力不新建渲染管线，只往同一次投喂里加一路几何。
