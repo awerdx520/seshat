@@ -209,9 +209,9 @@ nil 窗口走到那里就是 `wrong-type-argument windowp nil'。"
       ;; 正常基准原样返回
       (let ((seshat-reader--multipage-base-scale 1.75))
         (should (= 1.75 (seshat-reader--multipage-target-scale 1))))
-      ;; 上限：20.0 被 clamp 到 11.0
+      ;; 上限：20.0 被 clamp 到 6.0（T5b 把上限从 11.0 降到 6.0 控内存）
       (let ((seshat-reader--multipage-base-scale 20.0))
-        (should (= 11.0 (seshat-reader--multipage-target-scale 1)))))))
+        (should (= 6.0 (seshat-reader--multipage-target-scale 1)))))))
 
 (ert-deftest seshat-reader-fit-window-test--fit-scale-nil-without-window ()
   "解析出 nil 窗口时 `--multipage-fit-scale' 返回 nil（无几何可fit）。"

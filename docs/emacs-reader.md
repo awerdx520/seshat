@@ -485,7 +485,7 @@ P1 起阅读器不再「一次只显示一页 + 翻页」，而是把整本排�
 | 滚动 | 像素级、连续：`j` / `k`（及 `C-n` / `C-p`、remap 的 `next-line` / `previous-line`）与**滚轮每档**都按 `seshat-reader-scroll-step-ratio`（默认 `0.15` ≈ 1/7 屏）移动；`SPC` / `DEL`、`C-v` / `M-v` 滚一屏（= 窗口文本区高 − `seshat-reader-screen-context-lines` 行）。想要固定手感时用 `seshat-reader-scroll-step-pixels` 把步长钉成绝对像素 |
 | 滚轮 / 触控板 | 每档一步、双击 2 步、三击 3 步。由 `pixel-scroll-precision` 的命令 **remap** 到本 mode（`pixel-scroll-precision-mode` 是全局 minor mode，键表优先级高于本 mode 的局部键表，故用 remap 而非局部绑定） |
 | 整页跳转 | `n` / `p` / `M-<` / `M->` / `M-g g` **停在页首**（页内像素偏移归零），不继承上一页滚到一半的位置 |
-| 缩放 | `+` / `-`（`=` 同 `+`）= 当前**基准** × `seshat-reader-enlarge-factor`(1.25) / `seshat-reader-shrink-factor`(0.75)；`W` / `H` = 按**打开文档那一页**（基准页）的宽度 / 高度适配；`0` = 重新首屏适配（回到 `seshat-reader-default-fit` 的模式与比例）。缩放后**布局立即定型**，point 所在页与相邻页同步重渲染、首屏即清晰，其余可见页走两阶段渲染（占位 → 像素由 idle 补上，见下「两阶段异步渲染」） |
+| 缩放 | `+` / `-`（`=` 同 `+`）= 当前**基准** × `seshat-reader-enlarge-factor`(1.25) / `seshat-reader-shrink-factor`(0.75)；`W` / `H` = 按**打开文档那一页**（基准页）的宽度 / 高度适配；`0` = 重新首屏适配（回到 `seshat-reader-default-fit` 的模式与比例）。缩放后**布局立即定型**（scale / 页尺寸 / 居中都在命令返回前写完），**像素时机分两档**：`+` / `-` 连按期间页面按旧像素拉伸（**短暂模糊**），停手 `seshat-reader-zoom-refit-delay`（默认 `0.2` 秒）后一次性重渲常驻页转清晰（见下「缩放去抖（2026-10-29）」）；`W` / `H` / `0` 返回时即清晰。其余可见页走两阶段渲染（占位 → 像素由 idle 补上，见下「两阶段异步渲染」） |
 | 拖窗口 | 松手后**所有可见页**重新渲染到新分辨率（同步 refit，实测 0.7–11 ms/页）；拖动过程中只做几何缩放、不重渲染，避免卡顿 |
 | 页号 | 「当前页」= **视口顶页**；状态行 `[当前页/总页]` 同理 |
 | 横向滚动 | `S-<wheel-up>` / `S-<wheel-down>`、`C-a` / `C-e`（以及 emacs 预设的 `C-f` / `C-b`）。**只在页面宽于窗口时可用**（`W` 或手动放大到超宽时），且**整栏会一起平移**——见 §12 已知限制 |
@@ -535,9 +535,35 @@ P1 起阅读器不再「一次只显示一页 + 翻页」，而是把整本排�
 
 **失败后如何恢复**：渲染失败不抛错——页保持占位、队列继续推进。想重试某页，把它滚出视口再滚回来（重新进入可见范围即清零计数并重新登记），或按 `C-l` / 改一次缩放触发重渲染。
 
-**耗时与手感**：默认每轮最多渲染 `seshat-reader-render-idle-batch`（`2`）页，扫描书单页 p95 ≈ 49 ms ⇒ 单轮可达约 100 ms（约一条命令的延迟）。**大页 / 扫描书觉得卡就把它降到 `1`**；`seshat-reader-render-idle-delay`（默认 `0.05`）是**周期推进间隔**，不是「idle 延迟」——daemon Emacs 里 idle timer 的一个空闲窗口只触发一次，队列推进实际由周期 timer 承担。
+**耗时与手感**：默认每轮最多渲染 `seshat-reader-render-idle-batch`（`2`）页，扫描书单页 p95 ≈ 49 ms ⇒ 单轮可达约 100 ms（约一条命令的延迟）。**大页 / 扫描书觉得卡就把它降到 `1`**（自 2026-10-29 起大页会**自动**降到单轮 1 页，一般不需要手动设置，见 `seshat-reader-render-batch-area-threshold`）；`seshat-reader-render-idle-delay`（默认 `0.05`）是**周期推进间隔**，不是「idle 延迟」——daemon Emacs 里 idle timer 的一个空闲窗口只触发一次，队列推进实际由周期 timer 承担。
 
-**已知限制**：`fit-width` 模式下单页渲染成本高，卡顿比 `fit-height` 明显（虽已比改造前好）；连按缩放（`+` / `-`）每次都会清缓存并同步重渲染 point 页与相邻页，**没有去抖**，连按会感到明显延迟。两者都记在 `openspec/tech-debt.md`。
+**已知限制**：`fit-width` 模式下单页渲染成本高，卡顿比 `fit-height` 明显（虽已比改造前好；2026-10-29 起单轮渲染页数按页面积自适应，大页单轮最长停顿由约 100 ms 降到约 50 ms，见 `seshat-reader-render-batch-area-threshold`）。连按缩放（`+` / `-`）自 2026-10-29 起有 0.2 秒去抖（见下「缩放去抖（2026-10-29）」）：连按期间短暂模糊、停手后一次性清晰，不再逐次同步重渲染。单页渲染本身的成本（扫描书 p95 ≈ 49 ms）是 C 侧渲染的固有开销，不在该轮范围。
+
+### 缩放去抖（2026-10-29）
+
+**你会看到什么**：连按 `+` / `-`（含 `=`、`C-<wheel-up>` / `C-<wheel-down>`）时，页面**尺寸立刻到位、像素短暂模糊**——旧像素被按新尺寸拉伸；停手约 `seshat-reader-zoom-refit-delay`（默认 `0.2` 秒）后，常驻页一次性重渲染、画面转清晰。因此连按 5 次只发生 **1 轮**整页渲染，而改造前是 5 轮。
+
+**什么不受影响**：`W` / `H` / `0`（切换 fit 模式）**按下即清晰**，没有去抖——它们是一次性模式切换，不是连按操作。它们与 `+` / `-` 的区别只在「像素什么时候到」，布局结果一致。
+
+**布局与位置始终正确**：scale、每页 spec 尺寸、居中的写入都在命令返回前完成，只有像素延后。所以缩放后立刻拖选、加书签、看状态栏页码，读到的都是新 scale 下的值；短暂模糊只影响观感。
+
+**回退口径（无需重启、无需重编 `.so`）**：`(setq seshat-reader-zoom-refit-enabled nil)` 即回到改造前的同步行为——每次 `+` / `-` 都在命令返回前渲完常驻页、立即清晰，代价是连按 N 次渲 N 轮。想让模糊期更短可调小 `seshat-reader-zoom-refit-delay`（如 `0.1`）；设成 `0` 只是把延迟压到最短（仍走 idle timer），要**关闭**去抖请用 `zoom-refit-enabled`。
+
+**批渲染同批改为按页面积自适应**：`fit-width` 大页场景下，单轮渲染的页数由 `seshat-reader-render-batch-area-threshold`（默认 `800000` px²）决定——本轮待渲页中任一页面积 ≥ 阈值就单轮渲 1 页，否则仍渲 `seshat-reader-render-idle-batch` 页。两个开关的完整说明见 [`docs/configuration.md`](configuration.md)「阅读器缩放去抖与批渲染自适应（2026-10-29）」，取舍理由见 `openspec/decisions.md` 2026-10-29 条。
+
+### 缩放内存与上限（2026-10-30）
+
+**缩放会吃内存，因为每换一次尺寸就多一块位图**：canvas 位图的大小随显示尺寸**平方**增长，而 image cache 的键是 spec 的**内容**。原地改 `:width`/`:height` 之后，旧尺寸那块位图在 Lisp 世界里再也没有任何对象能匹配它，只能等淘汰。2026-10-30 起分三层处理：改尺寸前保存旧内容快照（`copy-sequence`）→ 行不再显示某个 spec 时登记它 → 每次同步与缩放回调把登记表排空并 `image-flush`。实测连按 `+` / `-` 多轮后，image cache 从 **2125 MB 降到 224 MB（−89%）**。
+
+**上限从 11.0 降到 6.0**：缩放上限（`seshat-reader--multipage-clamp-scale`）此前是渲染器允许的 `11.0`，单页位图在 11.0 时约 **250 MB**、6.0 时约 **67 MB**。`11.0` 在实际使用中没有场景（6.0 已能把整宽页放大 4 倍以上），故把上限降到 **6.0**，`+` 到顶即停。这是**行为变更**：此前能放到 11 倍的文档现在最多 6 倍。
+
+**`image-cache-eviction-delay` 已设为 30 秒**：这是**全局**变量（`setq`，`setq-local` 无效），默认 `300` 秒改为 `30` 秒。注意 Emacs 的淘汰是**懒触发**的——只有后续还有图片操作时才会顺手淘汰，静置不动**不会**立即回收，所以「等 30 秒就降下来」这个预期不成立；30 秒缩短的是「孤儿被钉住的时长上限」，不是「保证回收的时限」。副作用：**其他包**的图片（EWW / dired / image-mode）闲置 30 秒后也会重新解码，这是本包唯一外溢到全局的设置。
+
+**`seshat-reader-image-cache-budget-mb`（默认 512 MB）是兜底**：缩放回调把快照排空之后，若当前 frame 的 image cache 仍超过预算，就 `clear-image-cache`（无参 = 只清当前 frame）。代价是该 frame 里**其他 buffer 的图片**会被重解码（一次性卡顿）；其他 frame 不受影响。`nil` / 非正数 = 关闭兜底。它防的是「自清路径漏了某种共享形态」这一意外，不是日常路径。
+
+**一个重要认知：`(image-cache-size)` 是记账值，不是进程真实内存**。它按每个条目的 `w × h × bpp / 8` 累加，而**共享同一 canvas 缓冲的条目会被重复计数**（同一个 buffer 被多个 spec 引用时，每个 spec 各算一份）。因此：判断真实内存占用要**同时看系统内存**（`free` / `M-x memory-info`），不能只看这个数；它偏高时可能只是重复计数，偏低时才是真的没泄漏。
+
+**已知剩余**：`--page-spec-remember` 的缓存超限时会静默 `delq` 淘汰条目，被淘汰且当前不在任何页行里的 spec 仍可能成为孤儿（剩余约 200 MB 的来源之一），见 `openspec/tech-debt.md`。另外 `Blocking call to accept-process-output with quit inhibited!!` 这条消息与阅读器无关（是 Emacs 异步 native-comp 的 sentinel），也记在 tech-debt。
 
 ### 已知限制（多窗口滚动，2026-10-29）
 
@@ -736,6 +762,8 @@ uid 形态本身**不可读**，可读性由 org 链接描述承担（`[[seshat:
 |---|---|---|
 | `seshat-reader-enlarge-factor` | `1.25` | 放大倍率 |
 | `seshat-reader-shrink-factor` | `0.75` | 缩小倍率 |
+| `seshat-reader-zoom-refit-delay` | `0.2` | `+` / `-` / `=` / `C-<wheel>` 缩放的去抖延迟（秒）：布局同步、像素延后；停手后一次性重渲常驻页。`W` / `H` / `0` 不受影响 |
+| `seshat-reader-zoom-refit-enabled` | `t` | 缩放去抖开关。设 `nil` = 回到改造前的同步行为（每次缩放立即清晰、连按 N 次渲 N 轮），**无需重启** |
 | `seshat-reader-default-fit` | `contain` | 新窗口 / 新文档的**初始适配模式**：`contain`（整页可见）/ `width`（填满宽度）/ `height`（填满高度）；`W` / `H` 只覆盖当前窗口且不跨会话；旧值 `seshat-reader-fit-to-width` / `-fit-to-height` 仍被接受（分别归一为 `width` / `contain`） |
 | `seshat-reader-page-gap-lines` | `0` | 页间空行数（连续布局）：`0` = 相邻页紧贴。这是**分隔区之外**再追加的整行空白（见下四行）；改动在下次重建版式（重开文档 / 触发一次重排）后生效 |
 | `seshat-reader-page-separator` | `t` | 是否显示页间**分隔区**（横贯窗口的线 + 上下各约 0.25 行留白）。设 `nil` 且 `page-gap-lines` 为 `0` 时完全回到改造前的「两页紧贴」——没有额外像素。选项在**页行插入时**读取，改后需重开文档或触发一次重排（无 `:set` 自动重排） |
@@ -1031,7 +1059,7 @@ evil 是 globalized minor mode，会在 mode body 之后重新启用自己，所
 18. **手动缩放的来源不随书签保存**：书签只存 `scale` 数值、不存 `fit` / `manual` 来源，恢复后按 `fit` 处理——一旦窗口尺寸变化就会重新贴合，上次手选的比例可能被重置。
 19. **同一文档重设到同一窗口时页面可能贴右边缘**：用 `set-window-buffer` 把**同一条文档**重新指给同一个窗口（而非新窗口 / 新 frame）时，Emacs 同样归零 hscroll 但不触发 `window-buffer-change-functions`，兜底 recentre 覆盖不到；需重开文档或触发一次尺寸变化（见 tech-debt）。
 20. **尺寸变化期间的画面是位图插值缩放，清晰化有延迟**：几何在同一帧内到位（改的是 image spec 的 `:width` / `:height`，不是位图），清晰度靠 idle 阶段重渲染一次补齐，因此缩放后约 0.15 秒内页面是「正确尺寸 + 略模糊」，拖分割线过程中始终是缩放位图。只读表格等细线条内容时观感差异明显（见 tech-debt「位图缩放与 `image-flush` 的交互未在真机长时间验证」）。
-21. **反复缩放会让旧尺寸的 entry 滞留在 image cache**：image cache 以 spec 内容（含 `:width` / `:height`）为键，改写尺寸后旧键条目要到 `image-cache-eviction-delay`（默认 300s）才回收；拖分割线可在数秒内造出几十个条目。canvas 后端下每个条目**共享同一个像素缓冲**（缓冲尺寸由 `:data-width` / `:data-height` 决定、缩放不改它），所以滞留的不是多份整页位图，而是多条指向同一 canvas 的缓存记录；`image-flush` 已随 legacy 路径删除，不再有主动 flush 手段。长时间拖拽的峰值内存仍未真机观测（见 tech-debt「image cache 条目累积」）。
+21. **反复缩放会让旧尺寸的 entry 滞留在 image cache**（**2026-10-30 更新：本条已过时，见本节「缩放内存与上限（2026-10-30）」**——`image-flush` 对 canvas image **有效**（实测一次释放 5.12 MB）、`image-cache-eviction-delay` 已由 `300` s 改为 `30` s、三层回收（resize 快照 + `insert-page` 旧 spec 登记 + 每次 sync drain）+ 512 MB 预算兜底落地后实测多轮缩放从 **2125 MB 降到 224 MB**；下列原文保留作历史记录，其中「不再有主动 flush 手段」与「滞留的不是多份整页位图」两条结论已被实测推翻——实测每按一次 `+` 每驻留页新增约 5.12 MB，即一块独立位图）：image cache 以 spec 内容（含 `:width` / `:height`）为键，改写尺寸后旧键条目要到 `image-cache-eviction-delay`（默认 300s）才回收；拖分割线可在数秒内造出几十个条目。canvas 后端下每个条目**共享同一个像素缓冲**（缓冲尺寸由 `:data-width` / `:data-height` 决定、缩放不改它），所以滞留的不是多份整页位图，而是多条指向同一 canvas 的缓存记录；`image-flush` 已随 legacy 路径删除，不再有主动 flush 手段。长时间拖拽的峰值内存仍未真机观测（见 tech-debt「image cache 条目累积」）。
 22. **manual 窗口在极端情形下会多一次重渲染**：`--refit-window` 的清晰度闸（比较已渲染分辨率 `render-scale` 与目标 `scale`）写在 `unless manual` 守卫之外；manual 窗口正常不改 `scale`、两者恒相等故不触发，但若将来 manual 路径写入不同值，会出现一次隐蔽的额外重渲染（见 tech-debt「image cache 条目累积」的附记）。
 23. **居中机制两套并存**：页面能完整放下时由 redisplay 求值居中（`before-string` + `:align-to`）；页面比窗口宽时仍走旧的 `line-prefix` + 横向滚动，只能**左对齐**、不居中。两套机制由 `--center-page` 的几何判定选择，`--centered-p` 与它各有判据（见 tech-debt）。
 24. **异步渲染是两阶段的，point 所在页与滚动方向相邻页仍同步**：自 P2-B 起默认走**两阶段异步渲染**（见 §7「两阶段异步渲染」）——新页先以占位形态插入（占位态与已渲染态页高逐像素相等，故不跳变），像素由 idle / 周期 timer 补上（通常几十毫秒到几百毫秒，扫描书可能约 1 秒）；**point 所在页 + 沿滚动方向相邻的一页始终同步渲染**（canvas 后端实测 1.16–2.77 ms/页，见本手册「渲染后端、观感与性能」），因此不会停在正在读的那一页上空白，但快速滚动大页文档时「空白 → 清晰」的过渡可见；预取只暖滚动方向那一页（且方向是 buffer 级，见 §7 已知限制）。回退口：`seshat-reader-render-async` 设 `nil` 即**完全**走旧的逐页同步路径（布局与默认路径等价，只差渲染时机）；队列超 `seshat-reader-render-async-timeout`（默认 1.0 秒）未排空时下一条命令强制同步渲染本窗口可见范围。

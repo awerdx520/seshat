@@ -150,6 +150,26 @@ back as another size change.  Size-change events arriving while this flag
 is non-nil are dropped instead of being queued, so a single refit cannot
 trigger the next one.")
 
+(defvar-local seshat-reader--zoom-refit-timer nil
+  "Pending debounced re-render of a manual zoom of the current buffer.
+
+The timer is separate from `seshat-reader--resize-refit-timer' on purpose:
+the two events are unrelated (a window resize versus a keypress), so a
+resize arriving while a zoom is waiting must not cancel the zoom's
+re-render, and a zoom must not postpone the refit of a window whose size
+changed.  Sharing one timer would silently drop one of the two.")
+
+(defvar-local seshat-reader--zoom-refitting nil
+  "Non-nil while a pending zoom re-render is being applied for this buffer.
+
+A zoom re-render ends with `seshat-reader--multipage-sync', which rebuilds
+rows and can report a size change back through the window state hooks.
+This flag marks that span, so a command that looks at the reader state can
+tell \"the zoom is being applied right now\" from \"nothing is pending\".
+It is deliberately not `seshat-reader--refitting': that one belongs to the
+passive resize refit and carries the minibuffer freeze with it, which a
+zoom typed by the user must ignore.")
+
 (defvar-local seshat-reader--last-size-change-time nil
   "Time of the last window size change handled for this buffer.")
 
@@ -177,6 +197,55 @@ Setting this to nil restores the previous behaviour, where a size change
 only recentred the page, without touching the rendering resolution or the
 vertical scroll.  It is an internal switch, not a user option.")
 
+(defcustom seshat-reader-zoom-refit-delay 0.2
+  "Idle delay, in seconds, before a manual zoom is rendered again.
+
+`+' / `-' write the new scale and the new page sizes synchronously, so the
+geometry is final as soon as the command returns; only the bitmaps are
+re-rendered, once, after this many seconds without another keypress.  A
+burst of keypresses therefore costs one re-render of the resident pages
+instead of one per press, at the price of a page that stays blurry until
+the burst stops.  Lower values sharpen sooner and re-render more often."
+  :type 'number
+  :group 'seshat-reader)
+
+(defcustom seshat-reader-zoom-refit-enabled t
+  "Non-nil means a manual zoom is re-rendered after a short idle delay.
+
+Setting this to nil restores the synchronous behaviour: every `+' / `-'
+renders the resident pages before the command returns, so the page is
+sharp immediately and a burst of keypresses renders once per press.  It is
+the rollback switch of the debounce, and the reference branch of the
+equivalence test: with nil the manual zoom behaves exactly as it did
+  before the debounce landed.  The fit commands (`W' / `H' / `0') are not
+affected by it -- they are synchronous either way."
+  :type 'boolean
+  :group 'seshat-reader)
+
+(defcustom seshat-reader-image-cache-budget-mb 512
+  "Image cache budget in megabytes, the ceiling of the safety net.
+
+The zoom path releases the bitmaps it orphans itself (one per resident page
+per zoom step, see `seshat-reader--multipage-flush-stale-specs'), so this
+value is not a target but a backstop: when the image cache of the frame is
+still larger than this many megabytes after a zoom re-render has drained its
+snapshots, something on the path leaked a bitmap nobody can name any more,
+and the whole cache of that frame is dropped
+\\(`clear-image-cache' without arguments, i.e. the current frame only -- other
+frames keep theirs).
+
+Clearing is the reliable way out (it is what a manual `clear-image-cache'
+does) but it is not free: every image still on screen in that frame is
+decoded again on the next redisplay, so it only runs when the budget is
+exceeded, never as part of a normal zoom.  Set it to nil or to a
+non-positive number to switch the backstop off entirely.
+
+The number is a frame-wide total, not this buffer's share: other buffers
+showing images in the same frame are counted too, which is why the default
+is generous."
+  :type 'number
+  :group 'seshat-reader)
+
 (defcustom seshat-reader-freeze-layout-during-minibuffer t
   "Non-nil means keep the page layout frozen while the minibuffer is open.
 
@@ -196,6 +265,21 @@ as the minibuffer is closed.
 Set it to nil to let the pages follow the shrinking window again."
   :group 'seshat-reader
   :type 'boolean)
+
+;;; Image cache eviction (T5b memory fallback)
+
+;; `image-cache-eviction-delay' 是**全局**变量（C 侧 DEFVAR_LISP，image.c），
+;; `setq-local' 对它无效：一旦改成 buffer-local，Emacs 会为当前 buffer 复制一份
+;; 绑定，而真正读它的 C 代码只认全局值，改动等于没做。故这里用 `setq'。
+;;
+;; 为什么改：阅读器的位图都是 canvas spec，每次原地改尺寸都会让旧尺寸的 cache
+;; 条目失去所有 `equal' 引用（见 `seshat-reader--multipage-stale-specs'），几何
+;; 路径的 flush 只覆盖其中一部分（refit 覆盖 1/7，T5b 真机诊断）。剩下的孤儿
+;; 只能等淘汰；默认 300 s 意味着连续缩放几分钟就能把几百 MB 的位图钉在 cache
+;; 里。30 s 把滞留时间缩短一个数量级，代价是**其他包**的图片（EWW、dired、
+;; image-mode）在闲置 30 s 后也会重新解码——这是本包唯一会外溢到全局的设置，
+;; 有意为之：孤儿位图是内存泄漏，重解码只是一次可感知的延迟。
+(setq image-cache-eviction-delay 30)
 
 ;; Setting of `auto-mode-list' fails if not autoloaded.
 ;;;###autoload
@@ -506,13 +590,24 @@ SCALE is a multiple of 72 dpi.  The bounds are those of the native renderer
 top end: a scale the module would clamp silently would make the recorded
 native size of the page wrong, because that size is the spec size divided by
 the scale the page was requested at.  A non-numeric SCALE falls back to 1.0
-so that a caller which lost its value still renders."
+so that a caller which lost its value still renders.
+
+The top end is 6.0 rather than the 11.0 the renderer allows (T5b): the memory
+a resident page costs grows with the square of the scale, and the layout keeps
+the viewport plus `seshat-reader--multipage-preload' pages on each side, so an
+A4 page (about 612x792 pt) needs roughly 250 MB of bitmap at 11.0 against
+about 67 MB at 6.0 -- the first zooms past the point where the reader stayed
+responsive on a real document.  6.0 still enlarges a full-width page by more
+than 4x, which is far beyond what the manual zoom is used for."
   (cond ((not (numberp scale)) 1.0)
         ((<= scale 0) 1.0)
-        (t (max 0.25 (min 11.0 (float scale))))))
+        (t (max 0.25 (min 6.0 (float scale))))))
 
 (defun seshat-reader--multipage-set-scale (base &optional source mode)
-  "Display every page row at BASE scale, synchronously and sharply.
+  "Display every page row at BASE scale, deferring only the pixels.
+
+The scale, the spec sizes and the window parameters are written before the
+command returns; which of the two paths renders the pages depends on SOURCE.
 
 BASE becomes the buffer local base scale, so every page keeps the same zoom
 factor and no page is cropped for its own width (decision D5: the manual
@@ -520,24 +615,37 @@ factor and no page is cropped for its own width (decision D5: the manual
 source of the selected window (`fit' or `manual'); MODE, when non-nil,
 replaces the buffer local fit mode.
 
-The order is the one every zoom command needs, and it is what makes one
-keypress produce a finished frame:
+The scale itself, and the geometry with it, is always written synchronously:
 
   1. clamp BASE into the range the native renderer can draw
      (`seshat-reader--multipage-clamp-scale');
-  2. `seshat-reader--apply-display-scale' -- rewrite the `:width'/`:height' of
+  2. mirror it into the `scale' window parameter of every window showing the
+     buffer, so the selection code and the bookmarks read the new value the
+     moment the command returns;
+  3. `seshat-reader--apply-display-scale' -- rewrite the `:width'/`:height' of
      every resident spec in place, so the geometry is final without touching a
      bitmap;
-  3. `seshat-reader--center-page' -- re-place every row for its new width;
-  4. `seshat-reader--multipage-refit-page' for every resident page -- render
-     the pages whose bitmap resolution no longer matches the target, once each;
-  5. `seshat-reader--multipage-sync' -- pull in the pages the viewport now
-     asks for (they are rendered straight at the target scale).
+  4. `seshat-reader--center-page' -- re-place every row for its new width.
 
-The refit is synchronous on purpose: zooming and opening a document are user
-actions that may block for a few milliseconds per page (0.7-11 ms measured),
-whereas leaving the bitmap stretched until an idle timer fires shows a blurry
-page for as long as the user keeps typing.  BASE is returned."
+What happens to the pixels depends on SOURCE, and that is the one thing the
+debounce changed:
+
+  - `manual' (with `seshat-reader-zoom-refit-enabled' non-nil) -- the bitmap
+    re-render (`seshat-reader--multipage-refit-page' for every resident page)
+    and the sync (`seshat-reader--multipage-sync') are *scheduled* by
+    `seshat-reader--schedule-zoom-refit' instead of being run here.  The page
+    is blurry for `seshat-reader-zoom-refit-delay' seconds after the last
+    keypress and sharp again afterwards, which turns a burst of `+' / `-'
+    presses into a single re-render.  Only the pixels are deferred, never the
+    scale or the spec sizes: the selection and the bookmark code read both
+    when the command returns.
+  - `fit' or nil -- rendered and synced here, synchronously and sharply:
+    opening a document and `W' / `H' / `0' are one-shot geometry changes
+    whose whole point is a finished frame, and they cost a few milliseconds
+    per page (0.7-11 ms measured).  `seshat-reader-zoom-refit-enabled' set to
+    nil puts the manual path back on this branch.
+
+BASE is returned."
   (let ((base (seshat-reader--multipage-clamp-scale base))
         (window (selected-window)))
     (setq seshat-reader--multipage-base-scale base)
@@ -554,9 +662,13 @@ page for as long as the user keeps typing.  BASE is returned."
       (set-window-parameter window 'scale-source source))
     (seshat-reader--apply-display-scale window)
     (seshat-reader--center-page window)
-    (dolist (page (seshat-reader--multipage-page-numbers))
-      (seshat-reader--multipage-refit-page page window))
-    (seshat-reader--multipage-sync window)
+    (if (and seshat-reader-zoom-refit-enabled (eq source 'manual))
+        ;; 中文：manual 缩放只延后像素（重渲 + sync），scale / spec 尺寸 /
+        ;; 窗口参数都已在上面的同步四步里就位，选区与书签读到的都是新值。
+        (seshat-reader--schedule-zoom-refit)
+      (dolist (page (seshat-reader--multipage-page-numbers))
+        (seshat-reader--multipage-refit-page page window))
+      (seshat-reader--multipage-sync window))
     base))
 
 (defun seshat-reader--multipage-base-fit-scale (mode &optional window)
@@ -606,7 +718,10 @@ scale instead of jumping to an arbitrary one."
 FACTOR is a multiplier, not an absolute scale, which is what decision D5 asks
 for: `+' / `-' keep zooming relative to the scale the document was opened
 with, so the same number of keypresses always ends at the same zoom.  SOURCE
-defaults to `manual' and is recorded as the scale source of the window."
+defaults to `manual' and is recorded as the scale source of the window.  The
+scale is applied at once; the pages are rendered again once the keypresses
+stop (`seshat-reader-zoom-refit-delay'), so the page is briefly blurry in
+between."
   (seshat-reader--multipage-set-scale
    (* (or seshat-reader--multipage-base-scale 1.0) (or factor 1.0))
    (or source 'manual)
@@ -617,8 +732,11 @@ defaults to `manual' and is recorded as the scale source of the window."
 
 FACTOR multiplies the current base scale, so 20 presses of `+' end at
 \\(enlarge-factor)^20 times the opening scale (clamped by
-`seshat-reader--multipage-set-scale').  The visible pages are re-rendered
-synchronously, so the page is sharp as soon as the command returns."
+`seshat-reader--multipage-set-scale').  The new size is in place as soon as
+the command returns, and the visible pages are rendered again once the
+keypresses stop (`seshat-reader-zoom-refit-delay', 0.2 s by default), so the
+page is sharp again shortly afterwards and a burst of presses renders once
+instead of once per press."
   (interactive (list seshat-reader-enlarge-factor))
   (seshat-reader--multipage-zoom (or factor seshat-reader-enlarge-factor) 'manual))
 
@@ -626,7 +744,9 @@ synchronously, so the page is sharp as soon as the command returns."
   "Zoom out by FACTOR, `seshat-reader-shrink-factor' by default.
 
 FACTOR multiplies the current base scale, mirroring
-`seshat-reader-enlarge-size'; the visible pages are re-rendered synchronously."
+`seshat-reader-enlarge-size'; the visible pages are rendered again once the
+keypresses stop (`seshat-reader-zoom-refit-delay'), so a burst of presses
+renders once."
   (interactive (list seshat-reader-shrink-factor))
   (seshat-reader--multipage-zoom (or factor seshat-reader-shrink-factor) 'manual))
 
@@ -638,7 +758,9 @@ The base scale goes back to the fit of the reference page under
 would have computed -- and the fit mode returns to that mode, so `0' really
 means \"start over\" instead of \"scale 1.0\".
 
-The zoom command is re-rendered synchronously, like every other zoom."
+The command is re-rendered synchronously, because it is a fit switch, not a
+manual zoom: unlike `+' / `-', `0' does not wait for
+`seshat-reader-zoom-refit-delay'."
   (interactive)
   (let* ((window (selected-window))
          (mode (seshat-reader--initial-fit-mode))
@@ -651,7 +773,9 @@ The zoom command is re-rendered synchronously, like every other zoom."
 
 The base scale is the height fit of the *reference* page (the one the document
 was opened on), and the fit mode becomes `height'; every page is then rendered
-at that scale, so the frame that follows is already sharp.
+at that scale, so the frame that follows is already sharp.  Unlike the manual
+zoom (`+' / `-'), the fit switch is not debounced: it does not wait for
+`seshat-reader-zoom-refit-delay'.
 
 The page is scaled on both dimensions, so a wide page overflows horizontally
 and is left aligned; horizontal scrolling brings the rest into view.  That is
@@ -671,7 +795,8 @@ becomes `width'; every page is then rendered at that scale.
 
 Every page is fitted to its own width, so pages of different widths all end
 up exactly as wide as the window and none of them overflows (decision D5,
-`width' mode)."
+`width' mode).  The pages are rendered before the command returns: unlike the
+manual zoom (`+' / `-'), the fit switch is not debounced."
   (interactive)
   (let* ((window (selected-window))
          (scale (or (seshat-reader--multipage-base-fit-scale 'width window) 1.0)))
@@ -1021,6 +1146,37 @@ what lets a page row take the exact image height before the pixels exist.
 Unlike the specs, these entries also survive a single-page recycle: see
 `seshat-reader--multipage-forget-specs' for why that is load bearing.")
 
+(defvar-local seshat-reader--multipage-stale-specs nil
+  "Buffer-local list of **old content snapshots** of resized page specs.
+
+Each element is a `copy-sequence' of a page spec taken right before
+`seshat-reader--multipage-resize-spec' rewrote its `:width'/`:height' in
+place, so the copy still carries the *old* size.  Its only purpose is to be
+handed to `image-flush': the image cache of Emacs is keyed by spec content
+\\(compared with `equal'), and rewriting a spec in place leaves the cached
+entry of the old size unreachable -- no Lisp object matches it any more, so
+`image-flush' cannot find it and the bitmap of the old size (about 5 MB for a
+full page) survives until `image-cache-eviction-delay' expires.  One zoom step
+therefore used to leak one such orphan per resident page.
+
+A snapshot is **never displayed** and never written into a page row; it holds
+no pixels of its own (it is a shallow copy of a plist, so `:data' still points
+at the live canvas buffer), which is why keeping it around costs a few words.
+The entries come from two places, and both are \"a bitmap a row used to show\":
+`seshat-reader--multipage-resize-spec' pushes a **copy** taken before it
+rewrites `:width'/`:height' in place, and
+`seshat-reader--multipage-insert-page' pushes the **live object** it replaces
+in a row (T5c: the geometry path only covered in-place resizes, so every row
+that got a different spec object leaked its bitmap until the eviction delay).
+The list is drained by `seshat-reader--multipage-flush-stale-specs' from every
+`seshat-reader--multipage-sync' (both its early return and its normal return:
+a user who stops pressing `+' must not have to wait for the next command) and
+from the zoom re-render callback, and it is emptied whenever the whole spec
+cache is dropped
+\\(`seshat-reader--page-spec-clear-cache') or the layout is torn down
+\\(`seshat-reader--multipage-clear'), so snapshots cannot pile up across
+documents.")
+
 (defvar-local seshat-reader--multipage-render-generation 0
   "Generation counter of the two-phase multi-page render, per buffer.
 
@@ -1362,11 +1518,34 @@ the cost this plan exists to remove (review finding N1).  Full invalidation
 bumps the generation; a recycle or a single-page re-render does not.
 
 The memory warning is re-armed as well: a reloaded document starts from an
-empty cache, so the budget is worth reporting again if it is exceeded again."
+empty cache, so the budget is worth reporting again if it is exceeded again.
+
+**Nothing is flushed here, on purpose.**  Dropping the cache releases only the
+Lisp references; the canvas buffer of every dropped spec stays in Emacs's
+image cache until `image-cache-eviction-delay' (300 s by default) expires.
+Flushing them here is not attempted because this path runs while the rows may
+still display those very specs -- `seshat-reader--multipage-relayout' (rotate,
+reload) rebuilds the rows right after, and closing the document does not clear
+the buffer first -- and flushing a displayed spec forces a re-decode of the
+whole page, which is the 1-2 s stall the old pbm backend caused when it flushed
+every frame.  The single-page path can flush because it replaces the row
+before releasing the old spec (`seshat-reader--multipage-rerender-page'); this
+one cannot, so its old bitmaps are left to the eviction delay.
+
+That is a deliberate boundary, not an omission: the callers that re-render
+every page after dropping the cache (`seshat-reader--redisplay-all-windows')
+do reach the per-page flush through `--multipage-rerender-page', while the
+callers that rebuild the layout (`--multipage-rotate-by', the reload path) and
+the close path leave their old bitmaps to the eviction delay."
   (setq seshat-reader--multipage-render-generation
         (1+ seshat-reader--multipage-render-generation)
         seshat-reader--page-spec-cache nil
         seshat-reader--multipage-page-sizes nil
+        ;; T5b：几何路径的旧内容快照随 spec 缓存一起作废——它们对应的旧位图
+        ;; 已经被本函数的调用方（重排 / 重载 / 关文档）整体抛弃，逐条 flush 会
+        ;; 撞上「行可能仍显示这些 spec」的禁区（见上面的边界说明），交给淘汰
+        ;; 延迟处理；这里只保证列表不会跨文档累积。
+        seshat-reader--multipage-stale-specs nil
         ;; T5 使用：失败计数只在「全量失效」与「该页重新可见」两处清零。
         seshat-reader--multipage-render-failures nil
         seshat-reader--multipage-memory-warned nil))
@@ -1499,6 +1678,34 @@ thread time, i.e. one command's worth of delay per pulse, which is the
 reason this is a knob and not a constant."
   :group 'seshat-reader
   :type 'integer)
+
+(defcustom seshat-reader-render-batch-area-threshold 800000
+  "Page area, in square pixels, from which one pass renders a single page.
+
+The asynchronous pass renders at most `seshat-reader-render-idle-batch'
+pages per pulse, so the cost of a pulse is the cost of one page times
+that count.  A page of a scanned book costs 40-100 ms at fit-width and
+two of them already make a stall the reader can feel; two letter-sized
+pages at 100% cost 8 ms each and are worth batching.  The bound is
+therefore lowered to one page when a page the pulse would touch is at
+least this many square pixels.
+
+The area is what `seshat-reader--multipage-page-display-size' reports for
+that page, i.e. the size its row occupies now: 612 x 792 = 484704 for a
+letter page at 100%, 1000 x 1294 = 1294000 for an A4 page fitted to the
+width of a 1000px window.  The default sits between the two on purpose --
+batching stays on for small pages and off for the big ones -- and it is a
+starting point to be tuned on a real machine, not a measured budget: the
+render cost is not linear in the area.
+
+A page whose area is unknown -- neither rendered nor measured, so
+`seshat-reader--multipage-page-display-size' answers nil -- counts as
+large: one pulse too many costs a few milliseconds, one stall is felt.
+
+nil, or any non-positive number, turns the test off and leaves
+`seshat-reader-render-idle-batch' as the only bound."
+  :group 'seshat-reader
+  :type 'number)
 
 (defcustom seshat-reader-render-async t
   "When nil, scroll rendering runs entirely on the command path.
@@ -1934,6 +2141,16 @@ rewriting a `:width' on a nil spec would signal."
              (new-width (max 1 (round (* (car native) target))))
              (new-height (max 1 (round (* (cdr native) target)))))
         (unless (and (equal width new-width) (equal height new-height))
+          ;; 快照必须在 `setf' **之前**取，且必须取在**同一个对象**上：此刻
+          ;; 浅拷贝出来的内容仍是旧尺寸，因而 `equal' 匹配 image cache 里那条
+          ;; 旧条目——这是唯一还能让 `image-flush' 找到旧位图的对象。原地改完
+          ;; 尺寸之后，旧条目的键（spec 内容）在 Lisp 世界里再无任何对象能
+          ;; `equal' 到，flush 无从下手，只能等 `image-cache-eviction-delay'
+          ;; 淘汰（T5b 真机诊断：每按一次 `+' 新增约 5.12 MB 孤儿）。
+          ;;
+          ;; 每次改尺寸都 push 一份：每次改之前的**内容**各对应一个 cache 条目，
+          ;; 少 push 一份就少释放一块位图。
+          (push (copy-sequence spec) seshat-reader--multipage-stale-specs)
           ;; canvas spec 没有 flush 语义：`:data-width'/`:data-height' 与缓冲
           ;; 内容只允许渲染函数写一次（那里才第一次分配并填像素），可随时 setf
           ;; 的只有 `:width'/`:height' 这一对。改尺寸因此只是重排，不会重渲染
@@ -1950,6 +2167,79 @@ of the layout or that it is part of it but not rendered yet; callers that
 must tell those two cases apart test `seshat-reader--pages' with `assq'."
   (cddr (assq page seshat-reader--pages)))
 
+(defun seshat-reader--multipage-spec-in-use-p (spec)
+  "Return non-nil when SPEC is still displayed by some page row.
+
+SPEC is an image spec.  Every entry of `seshat-reader--pages' is
+\(PAGE MARKER . SPEC), so the specs the layout displays right now are the
+`cddr' of its entries, and the comparison is `eq': two rows showing the same
+bitmap share the very same spec object, because a spec is never copied.
+
+The guard exists for `image-flush' (see
+`seshat-reader--multipage-rerender-page'): flushing a spec that a row still
+displays forces Emacs to decode the page
+again on the next redisplay, which is the 1-2 s stall the old pbm backend
+caused when it flushed on every frame.  Only a spec no row refers to any more
+can be released without costing a re-decode."
+  (let ((entries seshat-reader--pages)
+        (found nil))
+    (while (and entries (not found))
+      (when (eq (cddr (car entries)) spec)
+        (setq found t))
+      (setq entries (cdr entries)))
+    found))
+
+(defun seshat-reader--multipage-spec-content-in-use-p (spec)
+  "Return non-nil when some page row displays a spec `equal' to SPEC.
+
+SPEC is an image spec, usually one of the old content snapshots of
+`seshat-reader--multipage-stale-specs'.  The image cache is keyed by content,
+not by object identity, so a snapshot is the cache key of a live bitmap
+whenever a row shows a spec with the same properties -- the case a
+zoom-in/zoom-out burst produces, because the geometry returns to the value it
+had before the burst.  Flushing that key would drop the bitmap the row is
+displaying, and the next redisplay would decode the page again (the 1-2 s
+stall of the old pbm backend), so the flush has to skip it.
+
+The `eq' test of `seshat-reader--multipage-spec-in-use-p' is not enough here:
+a snapshot is by construction a copy, so it is never `eq' to any row spec."
+  (let ((entries seshat-reader--pages)
+        (found nil))
+    (while (and entries (not found))
+      (when (equal (cddr (car entries)) spec)
+        (setq found t))
+      (setq entries (cdr entries)))
+    found))
+
+(defun seshat-reader--multipage-flush-stale-specs ()
+  "Release the orphaned bitmaps left behind by in-place spec resizes.
+
+Each entry of `seshat-reader--multipage-stale-specs' is a snapshot of a page
+spec as it was *before* `seshat-reader--multipage-resize-spec' rewrote its
+`:width'/`:height' in place.  Since the image cache is keyed by spec content,
+that snapshot is the only object left in Lisp that matches the stale cache
+entry, which is what makes `image-flush' able to free the bitmap of the old
+size instead of waiting for `image-cache-eviction-delay'.
+
+A snapshot is skipped when a row still displays it
+\\(`seshat-reader--multipage-spec-in-use-p', which is defensive: a snapshot is
+never inserted into a row) or when a row displays a spec of the same content
+\\(`seshat-reader--multipage-spec-content-in-use-p'): the cache is keyed by
+content, so flushing then would force a re-decode of a page that is on screen.
+A skipped snapshot is simply left to the eviction delay, and the list is
+emptied in every case, so a failure to release one bitmap can never block the
+next zoom step.
+
+Flushing a spec that no row displays costs nothing visible: no row shows that
+bitmap any more, so redisplay has nothing to decode."
+  (dolist (stale seshat-reader--multipage-stale-specs)
+    (unless (or (seshat-reader--multipage-spec-in-use-p stale)
+                (seshat-reader--multipage-spec-content-in-use-p stale))
+      ;; 释放失败只说明位图仍留在 image cache 里（等淘汰延迟），不该让缩放
+      ;; 回调整体失败。
+      (ignore-errors (image-flush stale))))
+  (setq seshat-reader--multipage-stale-specs nil))
+
 (defun seshat-reader--multipage-insert-page (page spec &optional window)
   "Insert the row of PAGE holding SPEC, keeping the layout sorted by page.
 
@@ -1959,7 +2249,12 @@ size is already known gets a row of that size instead of an empty one (see
 `seshat-reader--multipage-page-row'), so the layout is final before the
 bitmap exists and filling it in later moves nothing.  A page that already has
 a row only gets its SPEC replaced and the function returns nil, so it is
-idempotent and can be called on every scroll step.  A new row goes before the
+idempotent and can be called on every scroll step.  The spec being replaced
+is pushed onto `seshat-reader--multipage-stale-specs' first (unless it is
+the very object handed in), because once the row points elsewhere the old
+bitmap has no Lisp object left that matches it and `image-flush' could never
+free it: this is the one place where a row changes the object it displays,
+so it is the one place that has to record the orphan.  A new row goes before the
 first row of a greater page and at the end of the buffer when PAGE is greater
 than every page present; the newline count from
 `seshat-reader-page-gap-lines' is
@@ -1985,6 +2280,23 @@ otherwise come from two different character heights and drift apart."
               ;; 贴左再居中。
               (centered (seshat-reader--multipage-page-centered-p page)))
           (seshat-reader--multipage-write-row start spec centered page)
+          ;; 旧 spec 在**被替换之前**入快照队列：换完 `cddr' 之后旧对象在 Lisp
+          ;; 世界里可能再无引用，image cache 里那条以旧内容为键的位图就再也
+          ;; `equal' 不到（`image-flush' 按内容匹配），只能等
+          ;; `image-cache-eviction-delay' 淘汰——T5c 真机实测的 1726 MB 孤儿
+          ;; 正是这条路径（几何重排改了尺寸，行又被换掉）。
+          ;;
+          ;; 为什么这里才是唯一正确的位置：所有「把某行的 spec 换成另一个
+          ;; 对象」的路径都必须经过本函数的 entry 分支（渲染、占位补位、几何
+          ;; 重排都调 `--multipage-insert-page'），而 `--multipage-resize-spec'
+          ;; 的原地改尺寸只覆盖「同一个对象被改」，覆盖不到「对象被换掉」。
+          ;; 只在这一处 push，既不漏也不重复。
+          ;;
+          ;; 只换到**另一个**对象时才 push：`(eq old spec)' 说明行还是同一个
+          ;; spec（重写行文本的重放），旧位图仍被显示，不能进释放队列。
+          (let ((old (cddr entry)))
+            (when (and old (not (eq old spec)))
+              (push old seshat-reader--multipage-stale-specs)))
           (setcdr (cdr entry) spec)
           nil)
       (let ((inhibit-read-only t)
@@ -2325,6 +2637,10 @@ sync and its rows would never be rebuilt -- a permanently blank reader."
     (when (markerp (cadr entry))
       (set-marker (cadr entry) nil)))
   (setq seshat-reader--pages nil)
+  ;; 布局被拆掉后，几何路径留下的旧内容快照既无行可对应、也无位图值得再等：
+  ;; 一并清空，避免跨文档累积（真正的释放交给
+  ;; `seshat-reader--multipage-flush-stale-specs' 或淘汰延迟）。
+  (setq seshat-reader--multipage-stale-specs nil)
   (seshat-reader--multipage-clear-last-ranges))
 
 (defun seshat-reader--multipage-render-page (page &optional force window)
@@ -2383,12 +2699,34 @@ invalid -- dark mode inverted the document, the page was rotated, the window
 was resized -- are rebuilt at the resolution the current geometry asks for.
 Nothing is done for a page without a row."
   (when (assq page seshat-reader--pages)
-    (seshat-reader--multipage-forget-specs page)
-    (let ((spec (seshat-reader--multipage-render-page page t window)))
-      (when spec
-        (seshat-reader--multipage-set-page-centered
-         page (seshat-reader--multipage-page-should-center-p page window)))
-      spec)))
+    ;; 旧 spec 必须在 `--multipage-forget-specs' **之前**取：那个函数只删缓存
+    ;; 条目（`seshat-reader--page-spec-cache'），不碰 spec 对象，而行的 `cddr'
+    ;; 正是唯一还指向旧位图的地方；forget 之后再取仍能取到（行还没被重写），
+    ;; 但先取能把「旧对象」与「即将替换的新对象」明确分开，也避免以后有人把
+    ;; forget 挪到别处时这条依赖悄悄失效。
+    (let ((old (seshat-reader--multipage-page-spec page)))
+      (seshat-reader--multipage-forget-specs page)
+      (let ((spec (seshat-reader--multipage-render-page page t window)))
+        (when spec
+          (seshat-reader--multipage-set-page-centered
+           page (seshat-reader--multipage-page-should-center-p page window)))
+        ;; flush 落在**新 spec 已写进行之后**：`--multipage-render-page' 先经
+        ;; `--multipage-insert-page' 把行的 `cddr' 换成新 spec 才返回，此时旧
+        ;; 位图已无人显示，释放它不会让屏幕闪一帧空白。反过来（写行之前
+        ;; flush）会让正在显示旧位图的行短暂失去图像。
+        ;;
+        ;; 守卫 `--multipage-spec-in-use-p' 不可省：同一 spec 可能被另一行
+        ;; 共享（两个窗口显示同一页），flush 一个仍在显示的 spec 会强制它
+        ;; 重新解码整页位图——历史上逐帧 flush 正是拖拽卡 1–2 s 的来源。加上
+        ;; `(not (eq old spec))'，渲染失败返回 nil 时行已被换成占位（旧 spec
+        ;; 同样无人引用），也走同一条释放路径。
+        (when (and old
+                   (not (eq old spec))
+                   (not (seshat-reader--multipage-spec-in-use-p old)))
+          ;; 释放失败只说明位图仍留在 image cache 里（等
+          ;; `image-cache-eviction-delay' 自然淘汰），不该让重渲染整体失败。
+          (ignore-errors (image-flush old)))
+        spec))))
 
 (defun seshat-reader--multipage-refresh-decorations (&optional window)
   "Re-render every resident page of WINDOW so its decorations are up to date.
@@ -2941,8 +3279,50 @@ nil when there was nothing to do."
             (setq seshat-reader--multipage-async-render-timer timer))))
       seshat-reader--multipage-pending-renders)))
 
+(defun seshat-reader--async-render-batch-size (queue)
+  "Return how many pages of QUEUE one asynchronous pass may render.
+
+QUEUE is the render queue of the current buffer, i.e. a list of 1-based
+page numbers in request order.  Only its head is examined: the pass stops
+at the bound answered here anyway, so the pages behind it cost nothing
+this pulse.
+
+The bound is `seshat-reader-render-idle-batch', lowered to 1 when one of
+the pages the pass would touch is at least
+`seshat-reader-render-batch-area-threshold' square pixels.  A pulse costs
+one page times its bound, so batching only pays while the pages are
+cheap.
+
+An unknown area -- `seshat-reader--multipage-page-display-size' answering
+nil, or a cons with a nil dimension -- counts as large: the conservative
+side is one page too few, not one stall too many.  A nil or non-positive
+threshold turns the test off and leaves the option alone as the bound.
+The answer is never below 1: a pass that rendered nothing would hand the
+queue to the timeout net instead of draining it."
+  (let ((limit (max 1 (or seshat-reader-render-idle-batch 1)))
+        (threshold seshat-reader-render-batch-area-threshold)
+        (pages queue)
+        (large nil))
+    (when (and (numberp threshold) (> threshold 0))
+      (dotimes (_ limit)
+        (when (and pages (not large))
+          (let* ((size (seshat-reader--multipage-page-display-size (car pages)))
+                 (width (car-safe size))
+                 (height (cdr-safe size))
+                 (area (and (numberp width) (numberp height)
+                            (* width height))))
+            (unless (and area (< area threshold))
+              (setq large t)))
+          (setq pages (cdr pages)))))
+    (if large 1 limit)))
+
 (defun seshat-reader--async-render-batch ()
-  "Render at most `seshat-reader-render-idle-batch' queued pages.
+  "Render one bounded batch of queued pages.
+
+The bound is `seshat-reader--async-render-batch-size': the option
+`seshat-reader-render-idle-batch', lowered to a single page when the
+pages the pass would touch are big
+\(`seshat-reader-render-batch-area-threshold').
 
 The queue of the current buffer is walked in request order.  For every page
 the scale is re-derived (`seshat-reader--multipage-target-scale', nil window
@@ -2969,8 +3349,8 @@ dropped instead.
 
 The number of pages the pass actually attempted is returned."
   (let* ((generation seshat-reader--multipage-pending-generation)
-         (batch (max 1 (or seshat-reader-render-idle-batch 1)))
          (queue seshat-reader--multipage-pending-renders)
+         (batch (seshat-reader--async-render-batch-size queue))
          (attempted 0)
          (invalidated nil))
     (while (and queue (< attempted batch) (not invalidated))
@@ -3125,6 +3505,25 @@ rendered), nil when there was nothing to do."
                seshat-reader--multipage-rotate)
               page)))))))
 
+(defun seshat-reader--image-cache-megabytes ()
+  "Return the size of the global image cache in megabytes, or nil.
+
+The image cache is where the bitmaps of **evicted** specs live on: dropping a
+spec from `seshat-reader--page-spec-cache' only drops the Lisp reference, and
+the canvas buffer behind it is released by `image-flush' or by
+`image-cache-eviction-delay' (300 s by default).  A zoom step therefore costs
+one bitmap per scale it passes through, none of which
+`seshat-reader--multipage-resident-spec-megabytes' can see.
+
+The number is global to the Emacs session, not per buffer: other images in
+other buffers are counted too, which is why it is reported next to the spec
+estimate rather than folded into it.  nil is returned when the running Emacs
+predates `image-cache-size' (Emacs 29) or reports nothing usable."
+  (when (fboundp 'image-cache-size)
+    (let ((bytes (ignore-errors (image-cache-size))))
+      (when (and (integerp bytes) (>= bytes 0))
+        (/ (float bytes) (* 1024.0 1024.0))))))
+
 (defun seshat-reader--multipage-resident-spec-megabytes ()
   "Estimate the memory the cached page specs hold, in megabytes.
 
@@ -3139,7 +3538,17 @@ Specs that carry no `:data-width'/`:data-height' fall back to
 a device pixel ratio of 1, so it under-estimates on a scaled frame.  The
 fallback exists for specs the canvas renderer never produced (a placeholder
 row, or a stub in a test); a spec with neither pair is skipped.  nil is
-returned when nothing measurable is cached."
+returned when nothing measurable is cached.
+
+This counts **only** `seshat-reader--page-spec-cache', i.e. at most
+`--multipage-cache-limit' entries (6 with the default preload).  It does *not*
+count the bitmaps of older sizes that Emacs still holds in its image cache: a
+spec evicted from the cache leaves this estimate the moment it is dropped,
+while its canvas buffer stays allocated until `image-flush' releases it or
+`image-cache-eviction-delay' (300 s by default) expires.  Zooming out and back
+in therefore allocates a bitmap per scale step and this function reports only
+the newest handful -- see `seshat-reader--image-cache-megabytes' for the total
+that includes the stragglers."
   (let ((bytes 0)
         (seen 0))
     (dolist (entry seshat-reader--page-spec-cache)
@@ -3164,6 +3573,16 @@ recorded in `seshat-reader--multipage-memory-warned' so that it fires once per
 buffer (scrolling would otherwise repeat it on every command), and the flag is
 cleared when the document is reloaded or the cache is dropped.
 
+The budget is compared against the **spec cache only**, which is at most
+`--multipage-cache-limit' specs; the bitmaps of older sizes that Emacs keeps
+in its image cache are not part of that number (see
+`seshat-reader--multipage-resident-spec-megabytes'), so the message reports
+`seshat-reader--image-cache-megabytes' next to it: the two together are what
+the reader actually costs, and the gap between them is exactly what a zoom
+in/out cycle leaves behind for `image-cache-eviction-delay' to collect.  Read
+the message as \"the visible specs are X MB, the whole image cache is Y MB\",
+not as \"the reader uses X MB\".
+
 WINDOW is accepted for symmetry with the other sync helpers and is not used."
   (unless seshat-reader--multipage-memory-warned
     (let ((budget seshat-reader-multipage-memory-warning-mb)
@@ -3171,9 +3590,13 @@ WINDOW is accepted for symmetry with the other sync helpers and is not used."
       (when (and (numberp budget) (numberp megabytes)
                  (> megabytes budget))
         (setq seshat-reader--multipage-memory-warned t)
-        (message "seshat-reader: %d page specs hold about %.0f MB of bitmaps (budget %s MB); consider lowering seshat-reader--multipage-preload or the render resolution"
-                 (length seshat-reader--page-spec-cache)
-                 megabytes budget)))))
+        (let ((cache (seshat-reader--image-cache-megabytes)))
+          (message "seshat-reader: %d page specs hold about %.0f MB of bitmaps (budget %s MB); the image cache holds %s (it also counts bitmaps of older sizes, which the budget above ignores); consider lowering seshat-reader--multipage-preload or the render resolution"
+                   (length seshat-reader--page-spec-cache)
+                   megabytes budget
+                   (if (numberp cache)
+                       (format "about %.0f MB" cache)
+                     "an unknown amount")))))))
 
 (defun seshat-reader--multipage-sync-blocking (&optional window force)
   "Keep the resident page rows of WINDOW in sync with its viewport.
@@ -3320,7 +3743,11 @@ the switch is invisible to them."
         ;; 它同步取 spec、不入队、不排 timer，所以这里跑完的第二次清理只是兜底
         ;; （防某条尚未覆盖的路径留下残留），不再是「丢掉预取页」的代价。
         (prog1 (seshat-reader--multipage-sync-blocking window)
-          (seshat-reader--multipage-reset-async-state)))
+          (seshat-reader--multipage-reset-async-state)
+          ;; 快照在这里一并释放：态 A 是同步路径，缩放命令返回时不再有去抖
+          ;; 回调来兜底，孤儿只能等淘汰延迟（T5c 的缺口之一）。
+          (when seshat-reader--multipage-stale-specs
+            (seshat-reader--multipage-flush-stale-specs))))
     (let* ((win (or window (selected-window)))
            (range (and (window-live-p win)
                        (not seshat-reader--multipage-syncing)
@@ -3330,8 +3757,16 @@ the switch is invisible to them."
        ((null range) nil)
        ((seshat-reader--multipage-async-overdue-p)
         (seshat-reader--multipage-force-sync win))
-       ((equal range (seshat-reader--multipage-last-range-for win)) range)
-       (t (seshat-reader--multipage-sync-async win range))))))
+       ((equal range (seshat-reader--multipage-last-range-for win))
+        ;; 区间未变即早退——但**早退也必须释放快照**：用户停手后不会再有下一条
+        ;; 命令来兜底，孤儿会一直留到 `image-cache-eviction-delay' 淘汰。
+        ;; 列表空时只是一次 nil 判断（O(1)）。
+        (when seshat-reader--multipage-stale-specs
+          (seshat-reader--multipage-flush-stale-specs))
+        range)
+       (t (prog1 (seshat-reader--multipage-sync-async win range)
+            (when seshat-reader--multipage-stale-specs
+              (seshat-reader--multipage-flush-stale-specs))))))))
 
 (defun seshat-reader--multipage-sync-async (window range &optional force)
   "Render the within-reach pages of RANGE and queue the rest (state B).
@@ -4447,6 +4882,101 @@ short span of an ongoing refit, where the `let' binding restores it."
   (when (timerp seshat-reader--resize-refit-timer)
     (cancel-timer seshat-reader--resize-refit-timer))
   (setq seshat-reader--resize-refit-timer nil))
+
+(defun seshat-reader--schedule-zoom-refit ()
+  "Schedule the re-render of a manual zoom, cancelling the previous one.
+
+A burst of `+' / `-' presses writes the base scale, the spec sizes and the
+window parameters synchronously (`seshat-reader--multipage-set-scale'), and
+only this call defers the pixels: the page stays blurry for
+`seshat-reader-zoom-refit-delay' seconds after the last press and is sharp
+again when the timer runs, which is one re-render for the whole burst
+instead of one per press.
+
+Nothing is checked before arming, and that is deliberate.  The minibuffer
+freeze (`seshat-reader--layout-frozen-p'), the resize refit switch
+\(`seshat-reader--resize-refit-enabled') and `seshat-reader--refitting' all
+belong to the passive geometry adaptation; honouring any of them here would
+leave a zoom the user typed at \"right size, old pixels\" with no hint at
+all.  The timer is its own, not `seshat-reader--resize-refit-timer', so a
+window resize cannot cancel a pending zoom and a zoom cannot postpone the
+refit of a resized window."
+  (when (timerp seshat-reader--zoom-refit-timer)
+    (cancel-timer seshat-reader--zoom-refit-timer))
+  (let ((buffer (current-buffer)))
+    (setq seshat-reader--zoom-refit-timer
+          (run-with-idle-timer seshat-reader-zoom-refit-delay nil
+                               #'seshat-reader--run-pending-zoom-refit
+                               buffer))))
+
+(defun seshat-reader--run-pending-zoom-refit (buffer)
+  "Re-render the pages of BUFFER at the scale a manual zoom asked for.
+
+This is the idle timer callback of `seshat-reader--schedule-zoom-refit'.  It
+runs in whatever buffer is current at the time, so it switches to BUFFER
+first, clears the pending timer and binds `seshat-reader--zoom-refitting'
+while it works.
+
+The sequence is a shortened `seshat-reader--refit-window' plus the sync the
+zoom path has always done, in this order:
+
+  1. `seshat-reader--multipage-clear-last-ranges' -- forget the synchronised
+     range of every window showing BUFFER.  A sync that keeps a range equal
+     to the one it is asked for returns early, so without this the placeholder
+     rows of a page that came in between the keypress and the timer would
+     never get their pixels (\"the page turned background colour\").  Every
+     window, not just the selected one: the `force' argument of
+     `seshat-reader--multipage-sync-blocking' only covers the window it is
+     given.
+  2. For every window of BUFFER, on every frame, in this order:
+     `seshat-reader--apply-display-scale' -- the geometry follows the scale
+     the command already wrote, and a `goto-page' or a resize that happened
+     between the keypress and the timer is repaired here; then
+     `seshat-reader--multipage-refit-page' for every resident page -- the
+     bitmaps that are too coarse for the new size are rendered again, once
+     each; then `seshat-reader--center-page' -- the rows are placed for their
+     new width; then `seshat-reader--multipage-sync' -- the pages the viewport
+     now asks for are pulled in.
+
+`seshat-reader--refit-window' is deliberately not reused.  It never syncs,
+and its body is a no-op while the layout is frozen for an open minibuffer
+\(`seshat-reader-freeze-layout-during-minibuffer').  A zoom is a command the
+user typed, so it has to take effect with the minibuffer open as well:
+freezing exists to keep a prompt from relaying out the pages, not to swallow
+a keypress.  The price is about ten lines running parallel to the refit."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (when (derived-mode-p 'seshat-reader-mode)
+        (setq seshat-reader--zoom-refit-timer nil)
+        (let ((seshat-reader--zoom-refitting t))
+          (seshat-reader--multipage-clear-last-ranges)
+          (dolist (window (get-buffer-window-list buffer nil t))
+            (seshat-reader--apply-display-scale window)
+            (dolist (page (seshat-reader--multipage-page-numbers))
+              (seshat-reader--multipage-refit-page page window))
+            (seshat-reader--center-page window)
+            (seshat-reader--multipage-sync window))
+          ;; 快照统一在这里释放，且必须放在**整个窗口循环之后**：
+          ;; ① 循环里的 `--apply-display-scale' 自己也会 push 快照（键位与
+          ;;    定时器之间若发生过 `goto-page' 或窗口尺寸变化，几何会在回调里
+          ;;    再改一次），放在循环之前会把这些新快照留到下一次缩放；
+          ;; ② 循环之后所有 spec 都已是最终尺寸、所有旧位图也已被
+          ;;    `--multipage-rerender-page' 逐页 flush 过，此刻再按内容匹配
+          ;;    释放几何路径的孤儿，屏幕上没有任何一行还在显示它们；
+          ;; ③ 放在逐页重渲之后也让「先换行、后释放」的纪律保持一致
+          ;;    （先释放再重渲会让行短暂失去图像）。
+          (seshat-reader--multipage-flush-stale-specs)
+          ;; 兜底（T5c ③）：上面的释放按「对象 / 内容」匹配，只能收回还叫得出
+          ;; 名字的孤儿；若缓存仍超预算，说明某条路径漏了记录，整帧清空是唯一
+          ;; 可靠的办法（真机实测：手动 `M-x clear-image-cache' 把 1726 MB 降回
+          ;; 3.34 MB）。`clear-image-cache' **不带参数** = 只清当前 frame，别的
+          ;; frame 的图片不受影响；代价是本 frame 其它 buffer 的图片下次显示时
+          ;; 重解码，所以只在超预算时触发，且可用 nil / 非正数把兜底关掉。
+          (when (and (numberp seshat-reader-image-cache-budget-mb)
+                     (> seshat-reader-image-cache-budget-mb 0)
+                     (> (or (ignore-errors (image-cache-size)) 0)
+                        (* seshat-reader-image-cache-budget-mb 1048576)))
+            (clear-image-cache)))))))
 
 (defun seshat-reader--refit-window (window)
   "Refit every page row of WINDOW to the current window size.

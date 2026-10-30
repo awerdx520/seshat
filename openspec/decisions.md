@@ -1153,3 +1153,71 @@ refit 按当前窗口尺寸做一次几何适配 + 重渲染，一次到位。
 
 （来源计划：[openspec/completed/2026-10-29-reader-multiwindow-independent-scroll.md](completed/2026-10-29-reader-multiwindow-independent-scroll.md) 的 D3 与 T4）
 
+## 2026-10-29 · 缩放去抖改变 P1 的「故意同步」约定（manual 去抖、fit 仍同步）
+
+**决策**：`seshat-reader--multipage-set-scale` 的重渲染序列中，**前四步保持同步**（写 base scale、写各窗口 `scale` 参数、改写 spec `:width`/`:height`、居中），只有「逐页 refit + `--multipage-sync`」按**调用来源**分流：`source` 为 `'manual'` 且 `seshat-reader-zoom-refit-enabled` 非 nil 时改为「排一次 idle timer、停手后执行一次」；`source` 为 `'fit'` 或 nil 时原样同步。新增 defcustom `seshat-reader-zoom-refit-delay`（默认 `0.2`）与 `seshat-reader-zoom-refit-enabled`（默认 `t`，`nil` = 回滚到同步）。
+
+**理由**：① 原 `--multipage-set-scale` docstring 明确写「refit is synchronous on purpose … leaving the bitmap stretched until an idle timer fires shows a blurry page」——同步是 P1 的**故意**选择，本项是对该约定的**有意识修改**，不是修 bug；② 触发条件是「连按缩放」这一**高频批量**操作：连按 N 次会做 N 轮整页渲染（常驻 5 页 × N，其中 N−1 轮被最后一次完全覆盖，纯浪费），实测连按 5 次的可感停顿大于 0.2 秒的模糊，取舍方向明确（用户 2026-10-29 方案确认）；③ **保留 fit 路径同步**：`W` / `H` / `0` 是「一次性切换 fit 模式」，用户期望按下即清晰，且 `0` 还会重置 fit 模式，对它们去抖等于引入计划外的新行为；④ 判据用 `source` 而**不用** `mode`：presentation-mode 退出路径的 `mode` 可能来自 buffer-local 的 `'manual`，按 mode 判会把一次「同步恢复视图」误去抖。
+
+**代价**：① 连按期间画面**短暂模糊**（旧像素按新尺寸拉伸），停手 0.2 秒后清晰——观感代价，用户已确认接受；② 回调与 `--refit-window` 逻辑**平行但不等价**（多一次 `--multipage-sync`、不查 `--layout-frozen-p`），约 10 行重复，理由写在回调 docstring 里：缩放是用户主动命令，minibuffer 打开时按 `+` / `-` 也应生效，查冻结会让它静默停在「尺寸对、像素旧」；③ 独立 timer 与独立门禁（`--zoom-refit-timer` / `--zoom-refitting`），不复用 refit 那一套——共用会引入三个静默退化（minibuffer 冻结、用户关掉 resize refit、refit 执行中）；④ 回滚口 `seshat-reader-zoom-refit-enabled` = nil 时行为与改造前等价（有 ERT 对照分支 `--zoom-debounce-disabled-stays-synchronous` 守护）。
+
+（来源计划：[openspec/completed/2026-10-29-reader-zoom-debounce-and-batch.md](completed/2026-10-29-reader-zoom-debounce-and-batch.md) 的 F9 / F12、D2 / D3 / D6 与 T2；同批的批渲染面积自适应见该计划 D1 / T1）
+
+## 2026-10-30 · canvas image 可以被 `image-flush` 释放（推翻旧断言）
+
+**决策**：继续用 `image-flush` 作为缩放路径的位图释放手段，并把「canvas 无 flush 语义」这条旧结论作废。
+
+**理由**：官方语义里 `image-flush` 的适用性**与 image 类型无关**——它按 spec 内容在 image cache 里查找条目并释放其缓存图像，canvas 与 pbm / png 走同一条路径。实测：手动对一个 canvas spec 调 `image-flush`，`(image-cache-size)` 减少 **5.12 MB**，返回的 `:flush-error` 为 nil。因此 2026-10-28 canvas 迁移时「`image-flush` 全部删除」的做法在**手段**上过度收缩了，真正的问题从来不是「flush 不生效」，而是**覆盖率不足**（见下一条）。
+
+**代价 / 边界**：flush 一个**仍在显示**的 spec 会让下一帧强制重解码（历史上逐帧 flush 曾致拖拽卡 1–2 秒），所以释放前必须有「是否仍在显示」的守卫——这也是 `eq` + `equal` 双守卫的由来。
+
+（来源计划：[openspec/completed/2026-10-29-reader-zoom-debounce-and-batch.md](completed/2026-10-29-reader-zoom-debounce-and-batch.md) 的 T5 执行记录与真机诊断第 1 条）
+
+## 2026-10-30 · image cache 的键是 spec 内容（`equal`），不是对象身份
+
+**决策**：任何会**改变 spec 内容**（`:width` / `:height`）的操作，都必须在改之前保存一份**旧内容快照**；任何会**替换行里的 spec 对象**的操作，都必须在替换之前登记**旧对象**。
+
+**理由**：Emacs 的 image cache 以 spec 的**内容**为键（`equal` 比较），不是以 Lisp 对象身份为键。`--multipage-resize-spec` 原地 `setf` 改尺寸之后，旧尺寸那条 cache 条目的键在 Lisp 世界里**再无任何对象能 `equal` 到**——`image-flush` 按内容匹配，因此找不到它，只能等 `image-cache-eviction-delay` 淘汰。这就是「每按一次 `+` 新增约 5 MB 孤儿、每驻留页一块」的机制。同理，`--multipage-insert-page` 用 `setcdr` 把行里的 spec 换成另一个对象时，旧对象也立刻不可寻址。
+
+**代价**：① 每次改尺寸 push 一份 `copy-sequence`（浅拷贝足够——`:width`/`:height` 是不可变整数，`:data` 仍指向同一 canvas 缓冲，快照本身不持有像素，成本只有几个 cons）；② 快照列表需要**排空点**，否则快照自己变成新的内存增长源（见下一条的三层设计）。
+
+（来源计划：[openspec/completed/2026-10-29-reader-zoom-debounce-and-batch.md](completed/2026-10-29-reader-zoom-debounce-and-batch.md) 的 T5b 真机诊断第 2 条与 T5c 缺口分析）
+
+## 2026-10-30 · 孤儿回收的三层设计（快照 + 换对象登记 + 每命令排空）
+
+**决策**：位图回收分三层，缺一层就留一块孤儿：① **resize 快照**——`--multipage-resize-spec` 在 `setf` 之前 `(push (copy-sequence spec) --multipage-stale-specs)`（覆盖「同一对象被原地改内容」）；② **insert-page 旧 spec 回收**——`--multipage-insert-page` 的 entry 存在分支在 `setcdr` 之前 push 旧对象（覆盖「行换成了另一个对象」；它是**唯一**的换对象入口，所有路径都经过它）；③ **sync 每命令 drain**——`--multipage-sync` 的三个返回点都调 `--multipage-flush-stale-specs`，**早退分支也 drain**。
+
+**理由**：三层分别对应三种「旧位图失去所有可达引用」的成因，而不是三份重复保险——T5 只做 refit 前后 flush 时覆盖率是 1/7，T5b 补快照后真机仍是 1726 MB（漏了换对象路径），T5c 补齐三层后才降到 224 MB。早退分支必须 drain 的理由是：用户停手后不会再有下一条命令，孤儿会一直留到淘汰延迟；且 `drain` 在列表为空时只是一次 nil 判断（O(1)，滚动手感无可测变化）。
+
+**代价**：释放前必须有 `eq` + `equal` 双守卫——`eq` 是防御（快照从不进页行，恒 nil），`equal` 是**必需**（`+` 后立刻 `-` 会让快照内容等于某个仍在显示的行 spec，flush 它等于强制重解码可见页）。被守卫跳过的快照不保留、列表照样清空，滞留交给 30 s 淘汰兜底。
+
+（来源计划：[openspec/completed/2026-10-29-reader-zoom-debounce-and-batch.md](completed/2026-10-29-reader-zoom-debounce-and-batch.md) 的 T5 / T5b / T5c 执行记录）
+
+## 2026-10-30 · 兜底取舍：淘汰延迟 30 s + 512 MB 预算清当前 frame
+
+**决策**：① `(setq image-cache-eviction-delay 30)`（全局，`setq-local` 无效，默认 300 s）；② 新 defcustom `seshat-reader-image-cache-budget-mb`（默认 `512`，`nil` / 非正数关闭），缩放回调排空快照后若当前 frame 的 `image-cache-size` 仍超预算就 `clear-image-cache`（**无参 = 只清当前 frame**）。
+
+**理由**：三层自清是主路径，但自清依赖「每一种共享形态都被想到」——一旦漏一种，泄漏就无声地回来（T5b → T5c 就是这么暴露的）。兜底必须满足「可靠」：实测「整帧清空」是唯一能立刻把 1726 MB 拉回 3.34 MB 的动作，因此编码为超预算自动动作。淘汰延迟调短是**辅助**而非兜底：Emacs 的淘汰是**懒触发**的（只有后续还有图片操作时才顺手淘汰），静置不动不会立即回收，所以 30 s 缩短的是「孤儿被钉住的时长上限」，不是「保证回收的时限」。
+
+**代价**：① `image-cache-eviction-delay` 是**全局**变量，是本包唯一外溢到全局的设置——其他包（EWW / dired / image-mode）的图片闲置 30 s 后也会重新解码；② `clear-image-cache` 无参会清掉该 frame 里**其他 buffer** 的图片，下次 redisplay 重新解码（一次性卡顿），故只在超预算时触发、绝不做成日常路径；③ 预算是**帧级总量、不是本 buffer 的份额**，默认值取宽松（512 MB）正是为此。
+
+（来源计划：[openspec/completed/2026-10-29-reader-zoom-debounce-and-batch.md](completed/2026-10-29-reader-zoom-debounce-and-batch.md) 的 T5b 兜底两行与 T5c 改动 ③④）
+
+## 2026-10-30 · 缩放上限 11.0 → 6.0
+
+**决策**：`--multipage-clamp-scale` 的上限由渲染器允许的 `11.0` 降到 `6.0`（下限 `0.25` 不变）。
+
+**理由**：canvas 位图内存随显示尺寸**平方**增长——A4 页在 scale 11.0 时单页约 **250 MB**、6.0 时约 **67 MB**。`11.0` 在实际使用中没有场景（6.0 已能把整宽页放大 4 倍以上），保留它只会在用户误触长按时制造一次几百 MB 的分配。
+
+**代价**：**行为变更**——此前能放到 11 倍的文档现在最多 6 倍；两个既有用例（`seshat-reader-multipage-test.el` 与 `seshat-reader-fit-window-test.el` 的 clamp 断言）同步改为 6.0。
+
+（来源计划：[openspec/completed/2026-10-29-reader-zoom-debounce-and-batch.md](completed/2026-10-29-reader-zoom-debounce-and-batch.md) 的 T5b 改动点）
+
+## 2026-10-30 · 选区两个问题单独立项（不在本轮修）
+
+**决策**：选区（`seshat-reader-select.el`）暴露的两个问题**不在本轮范围**，单独立项进 `openspec/tech-debt.md`：① `posn-object` 必须是 `image` 与 `--multipage-page-at-pos` 对间隙宽容的**口径不对称**——拖到左边距 / 行尾 / 分隔行 / 占位行会报 `position is not over a page image`，而页号反查对这些间隙是宽容的；② `seshat-reader-select-highlight-scope` 默认 `'line` 导致「高亮按整行、复制按矩形」的**口径不一致**（复制走 `--text-in-rect` 按矩形，用户感知为「高亮到光标行末」）。
+
+**理由**：两者都在选区模块，与本轮（缩放去抖 / 批渲染 / 内存）无耦合，混入会扩大回归面并拖慢本轮收尾；且 ① 需要先定「间隙算不算命中」的产品口径（宽容或严格），② 需要先定「高亮与复制是否必须同口径」，都属用户决策而非实现细节。
+
+（来源计划：[openspec/completed/2026-10-29-reader-zoom-debounce-and-batch.md](completed/2026-10-29-reader-zoom-debounce-and-batch.md) 的 T4 真机记录；条目落在 `openspec/tech-debt.md`）
+

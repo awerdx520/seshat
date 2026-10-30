@@ -278,10 +278,15 @@ fail by setting the variable to nil inside BODY."
 (ert-deftest seshat-reader-multipage-async-test--tick-renders-one-batch ()
   "pending 5 页、batch 2 ⇒ 一次 tick 只渲染 2 页（验收 ③）。
 
-上限的意义在主线程：一轮渲染整队等于把多次短停顿合并成一次长停顿。"
+上限的意义在主线程：一轮渲染整队等于把多次短停顿合并成一次长停顿。
+
+阈值显式绑 nil（面积自适应关闭）：夹具里是**裸占位行**，既未渲染也未测量，
+面积未知按大页处理会恒得到 batch 1，本用例就测不到上限本身了。面积判定的
+行为由 `--batch-adapts-to-page-area' 覆盖。"
   (seshat-reader-multipage-async-test--with-body '(1 2 3 4 5) 1000 800
     (seshat-reader-multipage-async-test--with-renderer calls
-      (let ((seshat-reader-render-idle-batch 2))
+      (let ((seshat-reader-render-idle-batch 2)
+            (seshat-reader-render-batch-area-threshold nil))
         (dolist (page '(1 2 3 4 5))
           (should (seshat-reader--multipage-pending-add page)))
         (should (= 5 (length seshat-reader--multipage-pending-renders)))
@@ -295,9 +300,86 @@ fail by setting the variable to nil inside BODY."
         (should (equal '(5) seshat-reader--multipage-pending-renders))))))
 
 (ert-deftest seshat-reader-multipage-async-test--batch-default-is-two ()
-  "默认 batch 为 2（本批新增的 defcustom）。"
+  "默认 batch 为 2（本批新增的 defcustom）。
+
+阈值默认 800000 px²：letter@100%（484704）在下方、A4 fit-width（≈1.29M）在
+上方，是「保守起点」，改动它必须是有意的。"
   (should (= 2 seshat-reader-render-idle-batch))
-  (should (= 0.05 seshat-reader-render-idle-delay)))
+  (should (= 0.05 seshat-reader-render-idle-delay))
+  (should (= 800000 seshat-reader-render-batch-area-threshold)))
+
+(ert-deftest seshat-reader-multipage-async-test--batch-adapts-to-page-area ()
+  "大页单轮渲 1 页、小页仍渲 2 页，面积未知按大页（批次 1 / T1）。
+
+一次 tick 的主线程停顿 = 单页耗时 × 本轮页数，所以页数要跟着页的**面积**走：
+扫描书 fit-width 的单页 p50/p95 是 19/49 ms，两页就是一次能感觉到的顿；letter
+在 100% 下单页 8 ms，两页反而值得批量。判据是「本轮可能渲到的页里任一页面积
+≥ `seshat-reader-render-batch-area-threshold'」⇒ 1 页。
+
+四条断言各自都是判别性的，去掉面积判定（恒用
+`seshat-reader-render-idle-batch'）时 ①②③ 全红：
+① 大页 1600x2400 = 3.84M ⇒ 1 页；② 小页 612x792 = 484704 ⇒ 2 页；
+③ 面积 nil（既未渲染也未测量）⇒ 保守按大页，1 页；④ 阈值 nil、⑤ 阈值为 0
+⇒ 判定关闭，回到默认 2 页。
+
+`--multipage-page-display-size' 一律桩住：这里要钉的是**判定**，真去渲染大图
+既慢又与本层（调度时序）无关。"
+  ;; ① 大页：面积 3.84M ≥ 阈值 ⇒ 一轮只渲 1 页，队列剩 2 页。
+  (seshat-reader-multipage-async-test--with-body '(1 2 3) 1000 800
+    (cl-letf (((symbol-function 'seshat-reader--multipage-page-display-size)
+               (lambda (_page) '(1600 . 2400))))
+      (seshat-reader-multipage-async-test--with-renderer calls
+        (dolist (page '(1 2 3))
+          (should (seshat-reader--multipage-pending-add page)))
+        (should (= 1 (seshat-reader--async-render-batch-size
+                      seshat-reader--multipage-pending-renders)))
+        (seshat-reader--async-render-tick (current-buffer))
+        (should (= 1 (car calls)))
+        (should (equal '(2 3) seshat-reader--multipage-pending-renders)))))
+  ;; ② 小页：letter 612x792 = 484704 < 阈值 ⇒ 仍按默认 batch 渲 2 页。
+  (seshat-reader-multipage-async-test--with-body '(1 2 3) 1000 800
+    (cl-letf (((symbol-function 'seshat-reader--multipage-page-display-size)
+               (lambda (_page) '(612 . 792))))
+      (seshat-reader-multipage-async-test--with-renderer calls
+        (dolist (page '(1 2 3))
+          (should (seshat-reader--multipage-pending-add page)))
+        (should (= 2 (seshat-reader--async-render-batch-size
+                      seshat-reader--multipage-pending-renders)))
+        (seshat-reader--async-render-tick (current-buffer))
+        (should (= 2 (car calls)))
+        (should (equal '(3) seshat-reader--multipage-pending-renders)))))
+  ;; ③ 面积未知（nil）：保守按大页 ⇒ 1 页。
+  (seshat-reader-multipage-async-test--with-body '(1 2 3) 1000 800
+    (cl-letf (((symbol-function 'seshat-reader--multipage-page-display-size)
+               (lambda (_page) nil)))
+      (seshat-reader-multipage-async-test--with-renderer calls
+        (dolist (page '(1 2 3))
+          (should (seshat-reader--multipage-pending-add page)))
+        (seshat-reader--async-render-tick (current-buffer))
+        (should (= 1 (car calls)))
+        (should (equal '(2 3) seshat-reader--multipage-pending-renders)))))
+  ;; ④ 阈值 nil / 0：面积判定关闭，大页也回到默认 batch。
+  (seshat-reader-multipage-async-test--with-body '(1 2 3) 1000 800
+    (cl-letf (((symbol-function 'seshat-reader--multipage-page-display-size)
+               (lambda (_page) '(1600 . 2400))))
+      (seshat-reader-multipage-async-test--with-renderer calls
+        (let ((seshat-reader-render-batch-area-threshold nil))
+          (dolist (page '(1 2 3))
+            (should (seshat-reader--multipage-pending-add page)))
+          (seshat-reader--async-render-tick (current-buffer))
+          (should (= 2 (car calls)))
+          (should (equal '(3) seshat-reader--multipage-pending-renders))))))
+  ;; ⑤ 阈值为 0（非正数）：同上，判定关闭。
+  (seshat-reader-multipage-async-test--with-body '(1 2 3) 1000 800
+    (cl-letf (((symbol-function 'seshat-reader--multipage-page-display-size)
+               (lambda (_page) '(1600 . 2400))))
+      (seshat-reader-multipage-async-test--with-renderer calls
+        (let ((seshat-reader-render-batch-area-threshold 0))
+          (dolist (page '(1 2 3))
+            (should (seshat-reader--multipage-pending-add page)))
+          (seshat-reader--async-render-tick (current-buffer))
+          (should (= 2 (car calls)))
+          (should (equal '(3) seshat-reader--multipage-pending-renders)))))))
 
 
 ;;; 4) 失败 3 次后停止

@@ -1086,12 +1086,14 @@
 - 建议：二选一 —— ① 删除该 defcustom（破坏性变更，需在 CHANGELOG 记 BREAKING 并同步 `docs/configuration.md`）；② 重新定义为「首次打开时写入的 `fit-mode` 初值」（`fit-to-width` → `width`、`fit-to-height` → `height`，其余 → `contain`），这样它重新有意义且不新增选项。②更贴合「默认适配维度」诉求，但需与「`fit-mode` 是否跨会话记忆」一并定稿（当前不记忆）。
 - 已解决（2026-10-23）：同上条；`fit-mode` 与 defcustom 现已分工明确（前者管窗口、后者管起点），该选项重新具备可观察效果。
 
-## `image-flush` 已从 `--apply-display-scale` 移除，「C 侧下次重渲染即清旧缓存」已观测：无线性泄漏（2026-10-23 真机 T4-3）
+## `image-flush` 已从 `--apply-display-scale` 移除，「C 侧下次重渲染即清旧缓存」已观测：无线性泄漏（2026-10-23 真机 T4-3）——**结论已作废（2026-10-30 更正）**
+
+- **更正（2026-10-30）**：下面「已观测」那条**不构成证据**，结论作废。该实验（开合目录面板 20 次）里 spec 的**内容相同**（同一文档、同一 scale），image cache 按键内容索引 ⇒ 本就不产生新条目，`(image-cache-size)` 不涨是**必然**结果，与「C 侧重渲染是否回收旧缓存」无关。真正的泄漏在**尺寸真的变化**时才发生（原地改 `:width`/`:height` 会让旧内容键再无对象可 `equal`），T5b 真机已把 1726 MB 的孤儿量到手上。**当前状态**：已由 T5 / T5b / T5c 的「resize 快照 + `insert-page` 旧 spec 回收 + 每命令 sync drain」解决，实测 `+` / `-` 多轮后 image cache 从 **2125 MB 降到 224 MB**；详见 `openspec/completed/2026-10-29-reader-zoom-debounce-and-batch.md` 的 T5–T5c 执行记录与 `openspec/decisions.md` 2026-10-30 各条。以下原文作为**历史记录**保留（其中「canvas 无 flush 语义」「flush 整个移除」两条也已被 2026-10-30 的实测推翻：canvas image 可以被 `image-flush` 释放，实测一次释放 5.12 MB）。
 
 - 现状：`--apply-display-scale` 只改 image spec 的 `:width` / `:height`，实测（pure 实例）原地修改后无需 `image-flush` 即生效；早期版本在改写前调 `(ignore-errors (image-flush spec))` 主动丢弃旧缓存条目，但拖动分割线时每帧 flush 会强制 redisplay 重解码整页位图（真机实测拖一次卡 1–2 秒），**本轮已把 flush 整个移除**，改为依赖「C 侧下次重渲染替换 spec 时清掉旧缓存条目」。这条断言是读代码得出的推断，**该断言已于 2026-10-23 真机观测（T4-3），见下方「已观测」。**
 - 影响：批量 ERT 全程在 batch 下跑（`image-property` / `image-flush` 可用，但**没有真实 GUI image cache**），因此「反复缩放数千次后的内存曲线」「不 flush 时旧位图是否真的被替换清掉」「image cache 峰值内存」这三件事只有真机能回答。若推断不成立，旧位图会滞留到 `image-cache-eviction-delay`（默认 300s，见下一条「image cache 条目累积」）。
 - 建议：T6 真机验收（拖分割线）时顺带观测——拖拽期间与停手后各取一次 `memory-info`，并在同一文档上反复开合面板 20 次以上，若与 image cache 相关的计数持续上涨则按 H6 降级（改为「只在 idle 做 apply，接受一帧中间态」）；如需定量，可在 GUI 下用 `(image-cache-size)` 前后对比。若确认必须 flush，则只能加在「停手后的那次 refit」里（每帧加不起）。
-- 已观测（2026-10-23 真机 T4-3，GUI Emacs 31.1 / pgtk）：同一文档开合目录 20 次，`(image-cache-size)` 59,985,948 → 61,860,828 B（+1,874,880 B ≈ +1.79 MB，≈90 KB/次），`(nth 1 (memory-info))` 22,090,868 → 22,010,188 kB。若无回收，20 次应至少涨一个数量级（整页位图约 2 MB/张），实测为常数级增量 → **「C 侧下次重渲染替换 spec 时旧缓存被回收」成立**，未见线性泄漏。剩余风险：长时间（数小时）曲线仍未观测，`image-cache-eviction-delay` 到期前的滞留量未定量。
+- 已观测（2026-10-23 真机 T4-3，GUI Emacs 31.1 / pgtk）——**该结论已于 2026-10-30 作废，见本节开头「更正」**：同一文档开合目录 20 次，`(image-cache-size)` 59,985,948 → 61,860,828 B（+1,874,880 B ≈ +1.79 MB，≈90 KB/次），`(nth 1 (memory-info))` 22,090,868 → 22,010,188 kB。~~若无回收，20 次应至少涨一个数量级（整页位图约 2 MB/张），实测为常数级增量 → 「C 侧下次重渲染替换 spec 时旧缓存被回收」成立，未见线性泄漏。~~ 作废理由：该实验的 spec **内容相同**，本就不产生新 cache 条目，「不涨」不能推出「会回收」——真正的结论是「尺寸不变时本来就没有新条目」。原记录中的「剩余风险：长时间（数小时）曲线仍未观测，`image-cache-eviction-delay` 到期前的滞留量未定量」已被 T5b 的真机测量回答（1726 MB 孤儿，见本节开头「更正」）。
 
 ## image cache 条目累积（原地改 spec 尺寸，2026-10-23）——已部分观测：拖拽期间零增长（真机 T4-4）
 
@@ -1873,8 +1875,9 @@
 - **影响**：每条命令都可能因「超时」走强制同步（**性能退化，不会渲染错**）；单窗口、窗口都可见时无影响。
 - **建议方向**：二选一——① 并集口径纳入窗口/frame 可见性（`window-visible-p` + `frame-visible-p`）；② 给队项加登记时间戳、按龄淘汰（与 §2 的队项结构改动可合并）。
 
-### 4. `fit-width` 单页渲染成本高 + 连按缩放无去抖
+### 4. `fit-width` 单页渲染成本高 + 连按缩放无去抖 —— 已解决（2026-10-30）
 
+- **状态**：**已解决（2026-10-30）**。落点 `openspec/completed/2026-10-29-reader-zoom-debounce-and-batch.md`（**已归档 2026-10-30**）。① 连按缩放：`+` / `-` / `=` / `C-<wheel>` 改为 manual 去抖（停手 `seshat-reader-zoom-refit-delay` 默认 `0.2` 秒后渲一次，连按 5 次由 5 轮降为 1 轮；scale / 页尺寸 / 居中仍同步写入，仅像素延后），`W` / `H` / `0` 保持同步；回滚口 `seshat-reader-zoom-refit-enabled` = nil。② `fit-width` 单页成本：异步渲染的单轮页数改为按页面积自适应（`seshat-reader-render-batch-area-threshold` 默认 `800000` px²，大页单轮渲 1 页，单轮最长停顿 ~100 ms → ~50 ms），不再需要用户手动把 `render-idle-batch` 降到 `1`。**真机验收（2026-10-30 用户回报）：fit-width 有改善、缩放去抖生效、接受当前状态**（四项口径由用户主观验收，未逐项签字）；同轮真机还暴露并修掉了既有缩放内存泄漏（2125 → 224 MB，见该计划 T5–T5c）。「缩放后首屏清晰度不变」这一判据由 fit 路径保持同步 + 8 例验收用例 + 4 组变异守护。以下现象、证据与建议方向作为**历史记录**保留。
 - **现象**（用户 2026-10-29 真机回报）：`fit-width` 模式卡顿较长（虽已比改造前好）；连按 `+` / `-` 缩放卡顿明显。
 - **证据**：T9 主观项 ②（fit-width 卡顿）与 ④（连按缩放卡顿）；缩放路径每次 `clear-cache` + 同步渲染 point 页与相邻页，无 debounce；单页渲染成本随显示面积增长（canvas 后端实测 0.589 → 1.22 ms 只是 scale 1.0 的口径）。
 - **影响**：观感问题，不影响正确性；`render-idle-batch` 默认 `2` 是「大页场景单轮 ~100 ms」的取舍点，用户可自行降到 `1`。
@@ -1937,6 +1940,30 @@
 - **现象**：书架一次只显示一页（`seshat-library-page-size` 默认 **30** 条），**没有连续滚动**——浏览大书库要靠 `n` / `p` / `M-<` / `M->` 翻页。
 - **影响**：翻页会整屏换内容，跨页比较（「刚才那本在哪」）不方便；过滤 / 排序后页码归零也会跳回第一页。这是 I-OOM（驻留 image ≤ 一页条目数）的**直接代价**：连续滚动意味着同时驻留更多封面 image。
 - **建议方向**：`seshat-library-page-size` 可调大（如 200+ 近似「一屏到底」），但内存**线性增长**（每页封面 ≈ 数十 KB 级，实际取决于封面尺寸），且 I-OOM 的上界随之放宽——调整时应在文档里明示这条权衡。真正的连续滚动需要「可视区按需构造 + 离屏立即 flush」的虚拟化机制，属另立项范畴，不建议顺手改。
+
+## `--page-spec-remember` 淘汰条目时留下孤儿 spec（阅读器缩放内存，2026-10-30）
+
+- **现象**：`seshat-reader--page-spec-remember` 维护的 spec 缓存超过上限时**静默 `delq`** 淘汰最旧条目——只丢 Lisp 引用，不 flush、也不登记。被淘汰的 spec 若**当前不在任何页行里**（典型：缩放到某个 scale 后又缩回，中间尺寸的 spec 已离开行），它的位图立刻不可寻址（image cache 按键**内容**索引），只能等 `image-cache-eviction-delay` 淘汰。这是 T5–T5c 修完后 image cache 仍停在 **224 MB** 而非更低的主要来源之一（剩余约 200 MB）。
+- **影响**：**不会无界增长**（512 MB 预算兜底 + 30 s 淘汰接管），但「自清」不彻底——内存曲线在预算内呈锯齿，且每次兜底触发都会带来该 frame 其他 buffer 图片重解码的一次性卡顿。属**已知残留**，不是回归。
+- **建议方向**：淘汰时不要只 `delq`——把被淘汰的 spec `push` 进 `seshat-reader--multipage-stale-specs`（与 T5b / T5c 同一登记表），让下一次 sync / 缩放回调的 drain 顺手 flush。判据上要注意**不能无条件 push**：被淘汰的 spec 可能仍在行里（行引用与缓存引用是两套），所以 push 后仍需走 `--multipage-spec-content-in-use-p` 的 `equal` 守卫，否则会 flush 可见位图、把内存问题换成卡顿问题。
+
+## 选区 `posn-object` 口径与页号反查不对称（阅读器选区，2026-10-30）
+
+- **现象**：拖选时 `seshat-reader-select.el:938` 一带要求 `posn-object` **必须是 `image`**，否则报 `position is not over a page image`；而页号反查 `--multipage-page-at-pos` 对间隙（左边距、行尾空白、页间分隔行、占位行）是**宽容**的。因此拖到左边距 / 行尾 / 分隔行 / 占位行时，明明「看着在同一页上」，拖选却直接报错。
+- **影响**：观感与可用性问题，不影响数据正确性。用户在页边留白处起拖会失败一次，需要重新对准文字起拖；占位行（异步渲染未完成）上起拖同样报错——而占位行恰恰是最容易误触的区域。
+- **建议方向**：先定产品口径再改代码，二选一——① **宽容**：把 `posn-object` 判据放宽为「`image` 或（间隙且 `--multipage-page-at-pos` 能反查到页）」，与页号反查同口径；② **严格**：反过来让页号反查也拒绝间隙。①更符合拖选直觉，但需要处理「起拖点在页外、终点在页内」的矩形归页（起点归哪一页）。两个方向的取舍要用户定，不宜实现方自行选择。
+
+## 高亮按整行、复制按矩形（阅读器选区口径不一致，2026-10-30）
+
+- **现象**：`seshat-reader-select-highlight-scope` 默认 `'line` —— 拖选高亮按**整行**铺满（视觉上一直高亮到行尾），而复制走 `--text-in-rect` 按**矩形**取文。两者口径不同，用户感知为「高亮到光标行末，但复制出来没有那么多」。
+- **影响**：观感与预期不符，容易误判「复制丢了内容」；不影响批注落库的坐标（批注走矩形口径，与复制一致）。默认值改成 `'rect` 会改变所有用户的视觉观感，属**行为变更**，故不在本轮顺手改。
+- **建议方向**：二选一——① 把默认值改为 `'rect`（视觉与复制一致，CHANGELOG 记行为变更）；② 保留 `'line` 但把「高亮的行尾延伸」在视觉上弱化（如只给矩形部分实色、行尾延伸用淡色），让两个口径可区分。①更简单、②更贴阅读习惯，取舍要用户定。
+
+## `Blocking call to accept-process-output with quit inhibited!!`（非阅读器问题，2026-10-30）
+
+- **现象**：用户在使用阅读器时偶见该消息，一度怀疑与缩放 / 渲染有关。已定位为 **Emacs 自带异步 native-comp** 的 sentinel（`/usr/share/emacs/<ver>/lisp/emacs-lisp/comp-run.el` 的 `comp--accept-and-process-async-output`，两处 `(accept-process-output process)` **无超时**，由异步编译 worker 的 `:sentinel` 调用）。C 侧（`src/process.c` 的 `wait_reading_process_output`）的打印条件是**同时**满足「无超时」+「指定了进程」+「`inhibit-quit` 非 nil」，而 sentinel / filter 执行期间 C 侧 `specbind (Qinhibit_quit, Qt)` ⇒ 只要后台 native 编译有输出就会报，**与用户当前在做什么无关**。
+- **影响**：纯消息噪声，无功能影响。阅读器全仓 `accept-process-output` / `sit-for` / `sleep-for` / `make-process` / `start-process` **零命中**（缩放路径不碰子进程）；全仓唯一调用点 `seshat-covers.el` 带 `0.05` 超时轮询，**不可能**触发该消息（带超时的调用不会打印）。
+- **建议方向**：不改阅读器。若要消掉这条消息，在配置里 `(setq native-comp-async-report-warnings-errors 'silent)`（只影响警告上报，不改变编译行为），或等上游修 `comp-run`。**不要**把 `seshat-covers` 的超时轮询改成无超时——那反而会触发该消息。
 
 
 
